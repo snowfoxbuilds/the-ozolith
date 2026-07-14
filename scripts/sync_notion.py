@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-sync_notion_specs.py
+sync_notion.py — Notion -> repo docs, one-way (ADR-0001; Notion is the source
+of truth, synced docs are never hand-edited in the repo).
 
-Exports Notion spec pages to a local repo directory:
-  - AGENTS.md   -> <output_dir>/AGENTS.md
-  - Specs/*     -> <output_dir>/docs/specs/<page_title>
+Project tooling, not product (ARCHITECTURE.md). Exports:
+  - AGENTS.md      -> <output_dir>/AGENTS.md
+  - CONTEXT.md     -> <output_dir>/CONTEXT.md
+  - Specs/*        -> <output_dir>/docs/specs/<page_title>
+  - ADRs/*         -> <output_dir>/docs/adr/<page_title>
+  - TODO           -> <output_dir>/TODO.md
+  - TODO_COMPLETED -> <output_dir>/docs/TODO_COMPLETED.md
 
 Usage:
-  python3 sync_notion_specs.py
+  python3 scripts/sync_notion.py
+
+After a sync, regenerate this repo's CLAUDE.md from AGENTS.md:
+  theozolith-knowledge sync --source . --scope project --target .
 
 Requires: pip install requests
 """
@@ -15,10 +23,12 @@ Requires: pip install requests
 import argparse
 import os
 import re
+
 import requests
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -26,20 +36,25 @@ except ImportError:
 NOTION_VERSION = "2022-06-28"
 HEADERS = {}
 
-PROJECT_ROOT_PAGE_ID = "3796a7adc8ed80e7bc9df7177ceb7910"  # <-- set this to your project root page ID
+PROJECT_ROOT_PAGE_ID = (
+    "3796a7adc8ed80e7bc9df7177ceb7910"  # <-- set this to your project root page ID
+)
 
 
 def init_headers():
     token = os.environ.get("NOTION_TOKEN")
     if not token:
         raise RuntimeError("Set NOTION_TOKEN environment variable")
-    HEADERS.update({
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": NOTION_VERSION,
-    })
+    HEADERS.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+        }
+    )
 
 
 # --- Notion API helpers ---
+
 
 def get_child_pages(parent_id: str) -> list[dict]:
     """Return child pages of a block: [{"id": ..., "title": ...}, ...]"""
@@ -51,15 +66,18 @@ def get_child_pages(parent_id: str) -> list[dict]:
         data = r.json()
         for block in data["results"]:
             if block["type"] == "child_page":
-                pages.append({
-                    "id": block["id"],
-                    "title": block["child_page"]["title"],
-                })
+                pages.append(
+                    {
+                        "id": block["id"],
+                        "title": block["child_page"]["title"],
+                    }
+                )
         cursor = data.get("next_cursor")
         url = (
             f"https://api.notion.com/v1/blocks/{parent_id}/children"
             f"?page_size=100&start_cursor={cursor}"
-            if cursor else None
+            if cursor
+            else None
         )
     return pages
 
@@ -73,21 +91,21 @@ def get_blocks(block_id: str) -> list[dict]:
         r.raise_for_status()
         data = r.json()
         for block in data["results"]:
-            if block.get("has_children") and block["type"] not in (
-                "child_page", "child_database"
-            ):
+            if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
                 block["_children"] = get_blocks(block["id"])
             blocks.append(block)
         cursor = data.get("next_cursor")
         url = (
             f"https://api.notion.com/v1/blocks/{block_id}/children"
             f"?page_size=100&start_cursor={cursor}"
-            if cursor else None
+            if cursor
+            else None
         )
     return blocks
 
 
 # --- Rich text -> Markdown ---
+
 
 def rich_text_to_md(rich_texts: list[dict]) -> str:
     """Convert Notion rich_text array to inline markdown."""
@@ -113,6 +131,7 @@ def rich_text_to_md(rich_texts: list[dict]) -> str:
 
 
 # --- Block -> Markdown ---
+
 
 def blocks_to_markdown(blocks: list[dict], indent: int = 0) -> str:
     """Convert a list of Notion blocks to a markdown string."""
@@ -194,8 +213,14 @@ def blocks_to_markdown(blocks: list[dict], indent: int = 0) -> str:
             lines.append("")
 
         elif btype in (
-            "child_page", "child_database", "embed",
-            "bookmark", "image", "video", "file", "pdf",
+            "child_page",
+            "child_database",
+            "embed",
+            "bookmark",
+            "image",
+            "video",
+            "file",
+            "pdf",
         ):
             pass  # skip non-exportable blocks
 
@@ -226,6 +251,7 @@ def _table_to_md(table_block: dict, prefix: str) -> list[str]:
 
 
 # --- Export logic ---
+
 
 def export_page(page_id: str, filepath: str):
     """Fetch a Notion page's blocks and write as markdown."""
@@ -266,7 +292,7 @@ def sync(project_root_id: str, output_dir: str):
             export_page(spec["id"], filepath)
     else:
         print("  ! No 'Specs' page found under project root")
-    
+
     # 3. Export TODO -> <output_dir>/TODO.md
     todo_page = next((c for c in children if c["title"] == "TODO"), None)
     if todo_page:
@@ -277,11 +303,12 @@ def sync(project_root_id: str, output_dir: str):
     # 4. Export TODO_COMPLETED -> <output_dir>/TODO_COMPLETED.md
     todo_completed_page = next((c for c in children if c["title"] == "TODO_COMPLETED"), None)
     if todo_completed_page:
-        export_page(todo_completed_page["id"], os.path.join(output_dir, "docs", "TODO_COMPLETED.md"))
+        export_page(
+            todo_completed_page["id"], os.path.join(output_dir, "docs", "TODO_COMPLETED.md")
+        )
     else:
         print("  ! No 'TODO_COMPLETED.md' page found under project root")
 
-    
     # 5. Export CONTEXT -> <output_dir>/CONTEXT.md
     context_page = next((c for c in children if c["title"] == "CONTEXT.md"), None)
     if context_page:
@@ -289,9 +316,7 @@ def sync(project_root_id: str, output_dir: str):
     else:
         print("  ! No 'CONTEXT.md' page found under project root")
 
-
-
-    # 2. Export ADRs/* -> <output_dir>/docs/adrs/<title>
+    # 6. Export ADRs/* -> <output_dir>/docs/adr/<title>
     adrs_page = next((c for c in children if c["title"] == "ADRs"), None)
     if adrs_page:
         adrs_children = get_child_pages(adrs_page["id"])
@@ -301,10 +326,14 @@ def sync(project_root_id: str, output_dir: str):
             filename = adr["title"]
             if not filename.endswith(".md"):
                 filename += ".md"
-            filepath = os.path.join(output_dir, "docs", "adrs", filename)
+            filepath = os.path.join(output_dir, "docs", "adr", filename)
             export_page(adr["id"], filepath)
+    else:
+        print("  ! No 'ADRs' page found under project root")
+
 
 # --- CLI ---
+
 
 def main():
     parser = argparse.ArgumentParser(description="Export Notion specs to repo")
@@ -314,7 +343,8 @@ def main():
         default=PROJECT_ROOT_PAGE_ID,
     )
     parser.add_argument(
-        "--output-dir", default=".",
+        "--output-dir",
+        default=".",
         help="Repo root directory to write files into (default: current dir)",
     )
     args = parser.parse_args()

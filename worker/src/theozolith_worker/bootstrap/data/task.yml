@@ -1,0 +1,59 @@
+# TheOzolith pipeline issue form. Placed by theozolith-bootstrap; re-running
+# the tool restores this file (do not hand-edit in the target repo).
+#
+# The two hard artifacts of planning are acceptance criteria and baseline
+# risk; every other field is a prompt, never enforced — the human is the lint
+# (AGENTIC-CODING-PIPELINE.md). Applying the plan_ready label is the act of
+# issue approval and asserts both artifacts.
+name: Task
+description: A unit of work for the agentic coding pipeline.
+labels: ["draft"]
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What this change accomplishes and why.
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: >-
+        Hard artifact: the checks the Reviewer judges the PR against,
+        authored at planning time.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: baseline-risk
+    attributes:
+      label: Baseline risk
+      description: >-
+        Hard artifact: proposed baseline risk, judged on sensitive paths
+        (auth, data model, migrations, public API), blast radius, and
+        reversibility. The human confirms it by applying the matching
+        risk:* label together with plan_ready.
+      options:
+        - low
+        - medium
+        - high
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What this change must not touch.
+    validations:
+      required: false
+  - type: textarea
+    id: pointers
+    attributes:
+      label: Pointers
+      description: Relevant files, specs, ADRs, and prior art.
+    validations:
+      required: false
