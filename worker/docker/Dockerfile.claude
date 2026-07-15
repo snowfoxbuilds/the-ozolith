@@ -1,0 +1,54 @@
+# The Claude Worker image: one Worker image per Agent config, with the
+# vendor-specific adapter contained in the image (AGENTIC-CODING-PIPELINE.md,
+# agent swap boundary). The same image runs the Reviewer actor with a
+# different command and model (deploy/docker-compose.yml).
+#
+# Build from the repo root:
+#   docker build -f worker/docker/Dockerfile.claude \
+#     [--build-arg KNOWLEDGE_SOURCE=https://…/my-knowledge.git \
+#      --build-arg KNOWLEDGE_PIN=<commit-sha>] \
+#     .
+#
+# The optional Knowledge Source is baked at BUILD time by the M1 bake CLI;
+# nothing syncs or executes at container start (NODE-SUBSTRATE.md).
+
+FROM python:3.13-slim
+
+# git: clones/pushes and the bake CLI. tmux: the agent process runs inside a
+# tmux session by convention so the M4 web terminal can attach at any time.
+# nodejs/npm: the Claude Code CLI.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git tmux ca-certificates nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code
+
+# The agent must not run as root (the Claude CLI refuses
+# --dangerously-skip-permissions for root, and the Run needs no privileges).
+RUN useradd --create-home --shell /bin/bash ozolith
+
+# Install the knowledge machinery and the worker component from the context.
+COPY knowledge /opt/theozolith/knowledge
+COPY worker /opt/theozolith/worker
+RUN pip install --no-cache-dir /opt/theozolith/knowledge /opt/theozolith/worker
+
+# Bake the pinned Knowledge Source (skills, subagents, workflows) into the
+# image's Claude config dir when one is declared.
+ARG KNOWLEDGE_SOURCE=""
+ARG KNOWLEDGE_PIN=""
+RUN if [ -n "$KNOWLEDGE_SOURCE" ]; then \
+        theozolith-knowledge bake \
+            --source "$KNOWLEDGE_SOURCE" \
+            --pin "$KNOWLEDGE_PIN" \
+            --target /home/ozolith/.claude \
+        && chown -R ozolith:ozolith /home/ozolith/.claude; \
+    fi
+
+COPY worker/docker/entrypoint.sh /usr/local/bin/theozolith-entrypoint
+RUN chmod +x /usr/local/bin/theozolith-entrypoint
+
+USER ozolith
+WORKDIR /home/ozolith
+ENV THEOZOLITH_WORKDIR=/home/ozolith/runs
+
+ENTRYPOINT ["theozolith-entrypoint"]
+CMD ["theozolith-worker"]

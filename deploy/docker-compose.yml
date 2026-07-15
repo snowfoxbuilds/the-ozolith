@@ -1,0 +1,55 @@
+# M2: one Worker and the Reviewer on one box. No Control Node exists yet —
+# GitHub-only operation is the permanent degraded mode (ADR-0002), so this
+# compose file plus a .env is a complete deployment (NODE-SUBSTRATE.md
+# deletion test).
+#
+#   cp .env.example .env   # fill in tokens
+#   docker compose up --build -d
+#
+# Every service honors the VAR_FILE convention: any variable below may be
+# replaced by <NAME>_FILE pointing at a mounted secret file.
+
+services:
+  worker:
+    build:
+      context: ..
+      dockerfile: worker/docker/Dockerfile.claude
+      args:
+        KNOWLEDGE_SOURCE: ${KNOWLEDGE_SOURCE:-}
+        KNOWLEDGE_PIN: ${KNOWLEDGE_PIN:-}
+    image: theozolith-worker-claude:local
+    restart: unless-stopped
+    init: true
+    command: ["theozolith-worker"]
+    environment:
+      # Worker identity = one machine-user PAT per Worker.
+      GITHUB_TOKEN: ${WORKER_GITHUB_TOKEN:-}
+      GITHUB_TOKEN_FILE: ${WORKER_GITHUB_TOKEN_FILE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_API_KEY_FILE: ${ANTHROPIC_API_KEY_FILE:-}
+      THEOZOLITH_REPO: ${THEOZOLITH_REPO}
+      THEOZOLITH_MODEL: ${WORKER_MODEL:-claude-sonnet-5}
+      THEOZOLITH_WORKER_ID: ${WORKER_ID:-worker-1}
+      THEOZOLITH_POLL_SECONDS: ${POLL_SECONDS:-60}
+      THEOZOLITH_RECYCLE_RUNS: ${RECYCLE_RUNS:-10}
+      # Optional claim pre-filter; empty = cleanly skipped (degraded mode).
+      CONTROL_NODE_URL: ${CONTROL_NODE_URL:-}
+
+  reviewer:
+    # Same image, different actor: own identity, stronger model, own loop.
+    image: theozolith-worker-claude:local
+    restart: unless-stopped
+    init: true
+    command: ["theozolith-reviewer"]
+    depends_on:
+      - worker
+    environment:
+      # The Reviewer has its own distinct machine-user identity.
+      GITHUB_TOKEN: ${REVIEWER_GITHUB_TOKEN:-}
+      GITHUB_TOKEN_FILE: ${REVIEWER_GITHUB_TOKEN_FILE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_API_KEY_FILE: ${ANTHROPIC_API_KEY_FILE:-}
+      THEOZOLITH_REPO: ${THEOZOLITH_REPO}
+      # Must be a stronger model than the Worker adapter's (ADR-0008).
+      THEOZOLITH_MODEL: ${REVIEWER_MODEL:-claude-fable-5}
+      THEOZOLITH_POLL_SECONDS: ${POLL_SECONDS:-60}
