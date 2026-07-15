@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages
+      - run: uv run pytest
+
+  # The laptop-only user path (ADR-0007): knowledge/ must install and run
+  # with zero dependencies on cluster components.
+  knowledge-isolated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install knowledge/ alone in a fresh venv
+        run: |
+          uv venv /tmp/iso
+          uv pip install --python /tmp/iso/bin/python ./knowledge pytest
+      - name: Run the knowledge tests against the isolated install
+        run: /tmp/iso/bin/python -m pytest knowledge/tests

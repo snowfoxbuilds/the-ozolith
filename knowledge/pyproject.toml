@@ -1,0 +1,21 @@
+[project]
+name = "theozolith-knowledge"
+version = "0.1.0"
+description = "Agent-knowledge machinery: knowledge config format, per-tool compilers, one-way sync engine, and bake CLI."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+theozolith-knowledge = "theozolith_knowledge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/theozolith_knowledge"]
+
+[dependency-groups]
+dev = ["pytest>=8"]

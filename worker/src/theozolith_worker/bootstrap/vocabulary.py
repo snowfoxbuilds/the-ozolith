@@ -1,0 +1,62 @@
+"""The pipeline substrate vocabulary: labels and issue forms.
+
+The verbatim label set from AGENTIC-CODING-PIPELINE.md. attempt-N is
+concretized as attempt-1..attempt-3: the round budget is 3 review rounds per
+issue, tracked on the PR by the Reviewer (ADR-0008).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from importlib import resources
+
+ROUND_BUDGET = 3
+
+
+@dataclass(frozen=True)
+class Label:
+    name: str
+    color: str  # hex, no leading '#', as the GitHub API expects
+    description: str
+
+
+LABELS: tuple[Label, ...] = (
+    Label("draft", "ededed", "Planning in progress; not claimable."),
+    Label(
+        "plan_ready",
+        "0e8a16",
+        "Plan approved and claimable; asserts acceptance criteria and a baseline risk label.",
+    ),
+    Label("in_progress", "fbca04", "Claimed by a Worker; a Run is in flight."),
+    Label("pr_ready", "1d76db", "PR ready for the automated Reviewer."),
+    Label("blocked", "b60205", "Progress needs a decision; paired with needs_human."),
+    Label("needs_human", "d93f0b", "Awaiting human review or decision."),
+    Label("risk:low", "c2e0c6", "Risk grade: low (sensitive paths, blast radius, reversibility)."),
+    Label(
+        "risk:medium",
+        "fef2c0",
+        "Risk grade: medium (sensitive paths, blast radius, reversibility).",
+    ),
+    Label(
+        "risk:high", "f9d0c4", "Risk grade: high (sensitive paths, blast radius, reversibility)."
+    ),
+    Label("deviation:low", "c5def5", "Reviewer grade: implementation stayed on plan."),
+    Label("deviation:medium", "bfd4f2", "Reviewer grade: notable divergence from the plan."),
+    Label("deviation:high", "e99695", "Reviewer grade: major divergence from the plan."),
+    *(
+        Label(
+            f"attempt-{n}",
+            "d4c5f9",
+            f"Review round {n} of {ROUND_BUDGET} (ADR-0008).",
+        )
+        for n in range(1, ROUND_BUDGET + 1)
+    ),
+)
+
+
+def form_files() -> dict[str, bytes]:
+    """Issue-form files to place in the target repo, keyed by repo path."""
+    data = resources.files("theozolith_worker.bootstrap") / "data"
+    return {
+        ".github/ISSUE_TEMPLATE/task.yml": (data / "task.yml").read_bytes(),
+    }

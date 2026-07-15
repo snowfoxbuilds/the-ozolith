@@ -1,0 +1,33 @@
+[project]
+name = "theozolith-workspace"
+version = "0.1.0"
+description = "Workspace root for TheOzolith monorepo. Not a package; see the component directories."
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["knowledge", "worker", "control", "nodeagent"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+    "pyyaml>=6",
+    # for scripts/sync_notion.py (project tooling)
+    "requests>=2.32",
+    "python-dotenv>=1",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["knowledge/tests", "worker/tests"]
+addopts = "-q"
