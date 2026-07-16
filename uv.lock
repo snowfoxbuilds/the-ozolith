@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 members = [
     "theozolith-control",
     "theozolith-knowledge",
-    "theozolith-nodeagent",
+    "theozolith-nodedaemon",
     "theozolith-worker",
     "theozolith-workspace",
 ]
@@ -299,9 +299,9 @@ dev = [
 dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
-name = "theozolith-nodeagent"
+name = "theozolith-nodedaemon"
 version = "0.1.0"
-source = { editable = "nodeagent" }
+source = { editable = "nodedaemon" }
 
 [package.dev-dependencies]
 dev = [
@@ -315,22 +315,18 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "theozolith-worker"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "worker" }
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
-    { name = "pyyaml" },
 ]
 
 [package.metadata]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "pyyaml", specifier = ">=6" },
-]
+dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "theozolith-workspace"

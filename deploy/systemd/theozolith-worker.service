@@ -1,0 +1,25 @@
+# Optional systemd unit for the Worker driver (M2: plain host process).
+# Daemon-grade supervision (Node Daemon, cgroup kill-the-tree) lands in M3;
+# until then this unit is a convenience, not the deployment contract.
+#
+#   sudo cp deploy/systemd/theozolith-worker.service /etc/systemd/system/
+#   sudo systemctl edit theozolith-worker   # set User= and the paths below
+#   sudo systemctl enable --now theozolith-worker
+
+[Unit]
+Description=TheOzolith Worker driver (poll plan_ready issues, run per-Run containers)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Never run drivers as root: run containers default to the image's ozolith
+# user, and job-dir ownership should match this user (deploy/README.md).
+User=ozolith
+EnvironmentFile=/etc/theozolith/.env
+ExecStart=/usr/local/bin/theozolith-worker
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

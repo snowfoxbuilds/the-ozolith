@@ -291,7 +291,6 @@ def sync(project_root_id: str, output_dir: str):
     else:
         print("  ! No 'Specs' page found under project root")
 
-
     # 3. Export CONTEXT -> <output_dir>/CONTEXT.md
     context_page = next((c for c in children if c["title"] == "CONTEXT.md"), None)
     if context_page:

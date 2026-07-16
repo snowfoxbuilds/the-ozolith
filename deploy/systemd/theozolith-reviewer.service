@@ -1,0 +1,23 @@
+# Optional systemd unit for the Reviewer driver (M2: plain host process).
+# Daemon-grade supervision (Node Daemon, cgroup kill-the-tree) lands in M3;
+# until then this unit is a convenience, not the deployment contract.
+#
+#   sudo cp deploy/systemd/theozolith-reviewer.service /etc/systemd/system/
+#   sudo systemctl edit theozolith-reviewer   # set User= and the paths below
+#   sudo systemctl enable --now theozolith-reviewer
+
+[Unit]
+Description=TheOzolith Reviewer driver (poll pr_ready PRs, run review containers)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ozolith
+EnvironmentFile=/etc/theozolith/.env
+ExecStart=/usr/local/bin/theozolith-reviewer
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

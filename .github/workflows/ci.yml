@@ -23,6 +23,14 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run pytest
 
+  # The run-container image must always build (M2 brief: image rot is caught
+  # here, not at the first Run on a box).
+  run-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f worker/docker/Dockerfile.claude -t theozolith-run-claude:ci .
+
   # The laptop-only user path (ADR-0007): knowledge/ must install and run
   # with zero dependencies on cluster components.
   knowledge-isolated:
