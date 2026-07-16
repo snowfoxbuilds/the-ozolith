@@ -31,4 +31,7 @@ See [CONTEXT.md](http://context.md/) for the project's domain glossary. All spec
 | docs/adr/[ADR-0006-config-repo-source-of-truth.md](http://adr-0006-config-repo-source-of-truth.md/) | Git-backed Config Repo is the deployment source of truth |
 | docs/adr/[ADR-0007-consolidate-into-theozolith.md](http://adr-0007-consolidate-into-theozolith.md/) | One public monorepo (TheOzolith); snow-maker renamed, homeserver reduces to a private config repo |
 | docs/adr/[ADR-0008-reviewer-owned-state-best-effort-pr.md](http://adr-0008-reviewer-owned-state-best-effort-pr.md/) | Best-effort PRs with Decisions Sections; a separate Reviewer actor owns all post-PR state and drives review rounds |
+| docs/adr/ADR-0009-knowledge-format-compiler-sync.md | Knowledge-root layout, Claude compiler mapping, manifest-based mirror sync (source wins on hand-edits) |
+| docs/adr/ADR-0010-python-tooling-and-packaging.md | uv workspace, per-component hatchling packages, ruff + pytest; bootstrap CLI lives in worker/ |
 | docs/adr/[ADR-0013-node-resident-drivers-per-run-containers.md](http://adr-0013-node-resident-drivers-per-run-containers.md/) | Actors split into node-resident drivers (Node Daemon children) and credential-free agent harnesses; Runs execute in ephemeral, attachable containers |
+| docs/adr/ADR-0014-m2-execution-contracts.md | M2 execution contracts: job directory, harness, gate-as-jobs, strict one-strike verdict validation, run outcomes (empty PR / failed-Run retry), evidence bundles |
