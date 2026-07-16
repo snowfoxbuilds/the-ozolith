@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 # Agentic Coding Pipeline
 
@@ -43,17 +43,20 @@ PR:    pr_ready               -> ready for the automated Reviewer (under round b
 - Transition authority: the human applies initial plan_ready, answers blocked decisions (comment + re-queue), and closes issues. The Worker applies in_progress + assignee at claim and pr_ready at PR push. The Reviewer owns all post-PR state — deviation:*, risk:*, attempt-N, blocked, needs_human — and, under explicitly delegated authority, the claim strip + plan_ready re-queue that starts the next round. No other transitions exist.
 - Best-effort PR contract: every Run that reaches a checkout ends by pushing what it has and opening/updating the PR with a mandatory Decisions Section (decisions with rationale, open questions, remaining work, dead ends tried), then applies pr_ready. The Worker never stops mid-Run to ask; judgment calls are made, recorded, and adjudicated by the Reviewer afterward (ADR-0008). The hyphenated needs-human label is retired in favor of needs_human.
 - Claim Protocol: the Worker self-assigns and adds the in_progress label, then re-reads to verify it is the sole assignee; backs off otherwise. When the Control Node is reachable, claim requests route through it first as a race pre-filter; the GitHub assign-and-verify step still runs and remains the only authority.
-- Zombie claims: the Control Node strips in_progress and the assignee from issues whose Worker has missed heartbeats past a grace period, returning them to plan_ready. Optional slow GitHub Action cron as a backstop.
+- Zombie claims: the Control Node strips in_progress and the assignee from issues whose claiming Worker has been absent from Node Daemon heartbeats past a grace period, returning them to plan_ready. Optional slow GitHub Action cron as a backstop.
 - Round budget: 3 review rounds per issue, tracked as attempt-N labels on the PR, incremented by the Reviewer at each revise verdict — never on claim. Round input is the Reviewer's revised plan plus its designated resume commit. Runs that produce no PR (crash, infra failure) consume no rounds; the zombie janitor re-queues them. The Control Node cross-checks attempt labels against Run and review events and flags mismatches; it does not auto-correct.
 - On round-budget exhaustion the Reviewer escalates: blocked + needs_human with the evidence bundle link. The Reviewer also escalates early when a Decisions Section surfaces a call only a human may make; the human answers with a comment and re-queues the issue to plan_ready.
 ### Execution model
 
-- A Worker is a long-lived container bound to one Agent config; it polls for plan_ready issues and executes Runs sequentially, one at a time. Long-lived Workers keep warm caches and suit local-server resource budgets.
-- Every Run starts from a fresh clone/worktree and fresh context. No agent session state, build artifacts, or scratch files carry over between Runs; the only carryover is PR branch content at the Reviewer-designated resume commit, plus the Reviewer's revised plan (ADR-0008).
-- Workers are recycled on a schedule (every N Runs or on resource thresholds) so long-lived never becomes immortal.
+- A Worker is a long-lived **driver process** on a container-host, bound to one Agent config: a supervised Node Daemon child declared as a process-kind Stack (see [NODE-SUBSTRATE.md](http://node-substrate.md/)). It polls for plan_ready issues and executes Runs sequentially, one at a time. Workers are not containers — the long-lived-container design is retracted (ADR-0013).
+- The driver is the trusted, credentialed half: it runs the Claim Protocol, materializes job inputs, sequences gate steps, creates run containers, and performs every GitHub read and write. It never executes repo code or model output.
+- Each Run executes as an **ephemeral run container** created by the driver from the Agent config's image; container lifetime = Run lifetime. PID 1 is the **agent harness** — credential-free plumbing that starts the tmux session, injects the prompt, awaits the completion marker or timeout, writes outputs, and exits. Driver and harness communicate only through the per-Run job directory (inputs, outputs, transcript, status) — no network channel (ADR-0013).
+- Gate steps run agent-authored code, so they execute as harness jobs on the credential-free side — never inside the credentialed driver.
+- Every Run starts from a fresh clone/worktree, fresh container, and fresh context. No agent session state, build artifacts, or scratch files carry over between Runs; the only carryover is PR branch content at the Reviewer-designated resume commit, plus the Reviewer's revised plan (ADR-0008). Warm caches are named volumes mounted into run containers.
+- The Reviewer has the same shape: a node-resident reviewer driver executing review rounds as ephemeral containers.
 ### Monitoring (Control Node)
 
-- The Control Node (TheOzolith's control/ component) receives Node Agent heartbeats (60s, carrying node and stack status), Run events (worker, issue ref, attempt, phase: claimed / gate / pr-open / failed / escalated), and Reviewer review events, and renders the fleet dashboard. Heartbeat responses carry infrastructure commands (drain, recycle, update, rebuild) that the Node Agent reconciles.
+- The Control Node (TheOzolith's control/ component) receives Node Daemon heartbeats (60s, carrying node, stack, and labeled run-container status), Run events (worker, issue ref, attempt, phase: claimed / gate / pr-open / failed / escalated), and Reviewer review events, and renders the fleet dashboard. Heartbeat responses carry infrastructure commands (drain, recycle, update, rebuild) that the Node Daemon reconciles.
 - Infrastructure commands are not coordination: the Control Node is authoritative for node and docker lifecycle but never writes claim state; GitHub owns issue coordination (ADR-0002).
 - Coordination invariant: a coordination action is valid only once committed to GitHub. The Control Node is advisory — claim pre-filter, zombie-claim janitor, retry auditor — and is never required for correctness (ADR-0002).
 - Control Node down = degraded mode: no dashboard, slower zombie cleanup, slightly higher duplicate-claim odds. Workers keep claiming and shipping via GitHub alone.
@@ -68,11 +71,12 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 - Evidence bundles give per-run traceability and per-agent metrics.
 ### Review loop
 
-- The Reviewer is a separate long-lived actor (own container, own GitHub identity, configured with a stronger model than the Worker adapters; no self-grading by construction). It polls PRs labeled pr_ready without needs_human and under the round budget, and owns all post-PR state.
+- The Reviewer is a separate long-lived actor (own node-resident driver, own GitHub identity, configured with a stronger model than the Worker adapters; no self-grading by construction). It polls PRs labeled pr_ready without needs_human and under the round budget, and owns all post-PR state.
 - Verdicts:
   - Approve: add needs_human (keeping pr_ready) plus deviation:* and risk:* labels and an evidence-citing comment; the human stamps and merges.
   - Revise: increment attempt-N on the PR, remove pr_ready, comment a clear revised plan plus a resume commit ID (or cherry-picked commits), strip the issue claim, and re-queue the issue to plan_ready under explicitly delegated authority.
   - Escalate: blocked + needs_human when a human decision is required to move forward, or when the round budget is exhausted, with the evidence bundle link.
+- Verdict emission: the Reviewer's agent writes its verdict as a file (verdict.json) in its session working directory; the Reviewer driver renders the published verdict comment (human-readable plus machine block) and applies all labels under its own identity (see Agent session contract). A missing or unparseable verdict file applies no state and is retried on the next poll.
 - Retries reuse the same PR and branch — never a duplicate PR. The next Run (any Worker) claims the re-queued issue, detects the existing PR, checks out the Reviewer's resume commit, and executes the revised plan from fresh context. The Reviewer, as the stronger model, holds the decision-making power in this loop; Workers execute plans.
 - For blocked + needs_human PRs, the human comments the decision and re-queues the issue to plan_ready (human authority).
 - Reviewer downtime degrades throughput, never correctness: PRs queue at pr_ready; all state lives on GitHub, so a restarted Reviewer picks up cleanly.
@@ -94,17 +98,24 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 ### Agent swap boundary
 
 - Contract: input = issue ref + repo checkout + repo-resident instructions ([AGENTS.md](http://agents.md/), [CONTEXT.md](http://context.md/), specs, skills). Output = branch pushed through the gate + evidence bundle. Everything between is a black box.
-- One Worker image per Agent config with a common poll-claim-run entrypoint. Vendor-specific flags, permissions, and headless modes are contained in the per-image adapter.
+- One run-container image per Agent config, with the agent harness as its entrypoint. Vendor-specific flags, permissions, and session-driving details are contained in the per-image adapter; headless one-shot modes are banned by the Agent session contract.
 - [AGENTS.md](http://agents.md/) is the canonical instruction file; vendor files (e.g. [CLAUDE.md](http://claude.md/)) are generated copies, never sources.
 - Skills are files in the repo; the knowledge machinery (knowledge/) generates per-tool placement and format. Two scopes: global skills live in the private config repo and travel with the operator; project skills live in the target project's repo and travel with the project.
 - No code-level LLM abstraction layer. The swap boundary is the process/artifact contract above.
+### Agent session contract (always interactive)
+
+- Every agent process — a Run's implementing agent and the Reviewer's judging agent — runs in interactive mode inside a dedicated tmux session; headless one-shot invocation is banned. Sessions follow a naming convention (`run-<run-id>` for Runs, `review-<pr>-round-<n>` for reviews) so the dashboard terminal can discover and attach to any live session at any time to monitor and interact.
+- The **agent harness** — PID 1 of the run container, credential-free plumbing — starts the session, injects the prompt, and detects completion mechanically (a per-adapter completion hook plus a timeout backstop, never parsing of terminal output), then writes outputs and exits. The **driver** — the trusted node-resident process — commissions jobs and reads results only through the per-Run job directory (ADR-0013).
+- All agent I/O is files. Inputs are materialized into the session's working directory (the repo checkout for Runs; issue, diff, Decisions Section, and mechanical signals as files for reviews). Outputs are files the driver reads: the decisions file (.theozolith/decisions.json) for Runs, the verdict file (verdict.json) for reviews. Drivers render every published artifact (PR body, verdict comment, labels) from these files; no pipeline state is ever parsed out of model prose.
+- Credential isolation: agent processes hold no GitHub credentials — no tokens in their environment, no tokened remotes in their worktrees. Drivers hold the PATs and perform all GitHub reads and writes, so the transition-authority matrix is enforced by construction: a compromised or prompt-injected agent session can corrupt only its own output files, never write GitHub state.
+- Human input into an attached session is permitted mid-Run and mid-review; the session transcript is captured into the evidence bundle and is the audit trail for any human steering. Residual risk: isolation protects authority, not output integrity — a bad session can still emit a bad diff or verdict; the human merge gate absorbs this.
 ### Upgrade path
 
 - A new model or agent is a new adapter image. Route a fraction of plan_ready issues to the new adapter.
 - Compare gate pass rate, retry count, escalation rate, and cost per merged PR from evidence bundles and GitHub data. Promote on wins.
 ### Deployment and substrate
 
-The Control Node, Node Agent, Config Repo, secrets, extension points, and the deployment boundary are specified in [NODE-SUBSTRATE.md](http://node-substrate.md/). The pipeline is one consumer of that substrate; nothing pipeline-side may depend on private deployment specifics.
+The Control Node, Node Daemon, Config Repo, secrets, extension points, and the deployment boundary are specified in [NODE-SUBSTRATE.md](http://node-substrate.md/). The pipeline is one consumer of that substrate; nothing pipeline-side may depend on private deployment specifics.
 
 ## Decisions
 
@@ -130,3 +141,5 @@ The Control Node, Node Agent, Config Repo, secrets, extension points, and the de
 - **Grilling 2026-07-14**: Advisor deferred past V1. [SUPERSEDED 2026-07-14: Advisor removed entirely — the Reviewer's revised-plan loop plus human decision comments replace it. See ADR-0008.]
 - **Grilling 2026-07-14**: V1 planning = human-authored issues via GitHub issue forms; no in-pipeline planning agent. plan_ready authority is human by default and delegable to an agent only by explicit human permission. [SETTLED]
 - **Grilling 2026-07-14 (late)**: review-loop redesign — the Worker always ships a best-effort PR with a mandatory Decisions Section (no mid-Run parking); a separate long-lived Reviewer actor (stronger model) owns all post-PR state and drives revise rounds via a revised plan plus a designated resume commit on the same PR; 3 review rounds tracked as attempt-N on the PR; the gate is first-party. See ADR-0008. [SETTLED]
+- **Grilling 2026-07-15**: always-interactive contract — every agent process (Run implementer, Reviewer judgment) runs in an interactive, attachable tmux session, never headless one-shot; all agent I/O is files (decisions file, verdict file, materialized review inputs) with drivers rendering all published artifacts; agents hold no GitHub credentials, so the transition-authority matrix is enforced by construction; human input into attached sessions is permitted and audited via evidence-bundle transcripts. [SETTLED]
+- **Grilling 2026-07-15 (late)**: execution topology — Workers-as-long-lived-containers retracted. Each actor = a trusted node-resident driver (Node Daemon child via a process-kind Stack; owns all GitHub I/O and pipeline decisions) plus a credential-free agent harness (PID 1 of an ephemeral per-Run container; interactive tmux session; job-directory file interface). Gate steps execute as harness jobs; warm caches move to named volumes. See ADR-0013. [SETTLED]
