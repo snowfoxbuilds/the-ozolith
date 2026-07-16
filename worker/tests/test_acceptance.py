@@ -33,8 +33,10 @@ from theozolith_worker.bootstrap.vocabulary import (
 )
 from theozolith_worker.claim import attempt_claim
 from theozolith_worker.githubapi import GitHubClient
+from theozolith_worker.gitops import GitError
+from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.prefilter import ControlNodePrefilter, NullPrefilter, make_prefilter
-from theozolith_worker.runner import branch_for
+from theozolith_worker.runner import branch_for, parse_run_failed
 from theozolith_worker.sessions import SessionError
 
 CRITERIA_BODY = "## Acceptance criteria\n- change.txt exists on the branch\n"
@@ -281,7 +283,13 @@ def test_escalation_and_human_decision_round(harness: Harness):
 # -- 5. round budget and the final-round rule ---------------------------------
 
 
-def test_final_round_revise_is_rejected_then_escalation_exhausts_budget(harness: Harness):
+def review_containers(harness: Harness) -> list[str]:
+    return [n for n in harness.record.launched if n.startswith("ozolith-review-")]
+
+
+def test_final_round_revise_escalates_immediately(harness: Harness):
+    """A revise on the last budgeted round is an invalid verdict: one strike,
+    straight to a human — never a retry, never a Run without a review round."""
     number = harness.file_issue("Forever failing", CRITERIA_BODY)
     for round_number in (1, 2):
         harness.worker_once()
@@ -293,27 +301,27 @@ def test_final_round_revise_is_rejected_then_escalation_exhausts_budget(harness:
     harness.worker_once()  # the round-3 Run ships on the same PR
     assert PR_READY in harness.fake.labels_of(pr_number)
 
-    # The model tries to revise at the last budgeted round: the driver rejects
-    # the verdict file and applies zero PR-side state (no Run is ever
-    # commissioned without a remaining review round).
-    writes_before = len(harness.fake.write_log)
+    calls_before = len(review_containers(harness))
     harness.reviewer_replies.append(revise_reply("one more try"))
-    assert harness.reviewer_once() == 0
-    assert len(harness.fake.write_log) == writes_before  # not one write
-    labels = harness.fake.labels_of(pr_number)
-    assert PR_READY in labels and f"{ATTEMPT_PREFIX}3" not in labels
-    assert PLAN_READY not in harness.fake.labels_of(number)  # no re-queue either
-    assert any("final-round" in line for line in harness.logs)
+    assert harness.reviewer_once() == 1  # the escalation IS the verdict
 
-    # The retried round obeys and escalates: budget exhausted, human takes over.
-    harness.reviewer_replies.append(escalate_reply("Round budget spent without green criteria."))
-    assert harness.reviewer_once() == 1
+    # Exactly one model call was spent on the invalid round.
+    assert len(review_containers(harness)) == calls_before + 1
     labels = harness.fake.labels_of(pr_number)
     assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
+    assert f"{ATTEMPT_PREFIX}3" not in labels  # invalid verdicts never spend rounds
+    assert PLAN_READY not in harness.fake.labels_of(number)  # no re-queue
     last = harness.fake.comments[pr_number][-1]["body"]
     parsed = verdict.parse_comment(last)
     assert parsed is not None and parsed.verdict == verdict.ESCALATE
-    assert f"tree/theozolith/evidence/runs/issue-{number}" in last
+    assert "final-round" in last  # the raw validation error is in the comment
+    assert f"tree/theozolith/evidence/runs/issue-{number}" in last  # bundle link
+    assert "-invalid-verdict.json" in last  # evidence path of the bad file
+    assert any("-invalid-verdict.json" in p for p in harness.evidence_paths())
+
+    # No re-poll of the same PR: the next pass launches nothing.
+    assert harness.reviewer_once() == 0
+    assert len(review_containers(harness)) == calls_before + 1
     assert harness.fake.open_pr_numbers() == [pr_number]  # one PR through it all
 
 
@@ -336,6 +344,8 @@ def test_exhausted_attempt_labels_escalate_deterministically(harness: Harness):
     parsed = verdict.parse_comment(harness.fake.comments[pr_number][-1]["body"])
     assert parsed is not None and parsed.verdict == verdict.ESCALATE
     assert "budget" in parsed.evidence.lower()
+    # Cosmetic contract: never "round 4" of a 3-round budget.
+    assert "(round 3)" in harness.fake.comments[pr_number][-1]["body"]
 
 
 # -- 6. statelessness ---------------------------------------------------------
@@ -366,7 +376,7 @@ def test_statelessness_between_runs(harness: Harness):
     assert "First" not in harness.worker_calls[1][0]
 
 
-def test_crashed_run_leaves_no_pr_side_state(harness: Harness):
+def test_container_crash_is_a_failed_run_with_marker_and_requeue(harness: Harness):
     number = harness.file_issue("Doomed", CRITERIA_BODY)
 
     def boom(prompt: str, cwd: Path) -> None:
@@ -376,13 +386,195 @@ def test_crashed_run_leaves_no_pr_side_state(harness: Harness):
     harness.worker_once()
 
     assert harness.fake.open_pr_numbers() == []  # no PR, no PR labels, no rounds
-    # The stale claim remains for the M3 zombie janitor (manual cleanup in M2).
-    assert harness.fake.assignees_of(number) == [WORKER_LOGIN]
-    assert IN_PROGRESS in harness.fake.labels_of(number)
-    assert any("crashed" in line for line in harness.logs)
+    # The failed-Run path: claim stripped, plan_ready restored, marker stamped.
+    assert harness.fake.assignees_of(number) == []
+    labels = harness.fake.labels_of(number)
+    assert PLAN_READY in labels and IN_PROGRESS not in labels
+    (comment,) = harness.fake.comments[number]
+    parsed = parse_run_failed(comment["body"])
+    assert parsed is not None and "exited before" in parsed[1]
+    assert any("failed" in line for line in harness.logs)
     assert harness.record.alive == set()  # the dead container was removed
     jobs_root = Path(harness.worker_config.jobs_dir)
     assert not jobs_root.exists() or list(jobs_root.iterdir()) == []
+
+
+# -- run-outcome classification (ADR-0014) ------------------------------------
+
+
+def _no_op(prompt: str, cwd: Path) -> None:
+    """Completed session that neither edits nor records anything."""
+
+
+def _empty_decisions(prompt: str, cwd: Path) -> None:
+    write_decisions(cwd)  # a skeleton file with no content is not reasoning
+
+
+def _timeout_with_changes(prompt: str, cwd: Path):
+    (cwd / "half-done.txt").write_text("partial\n")
+    return AgentOutcome(timed_out=True)
+
+
+def _session_death(prompt: str, cwd: Path):
+    return AgentOutcome(session_died=True)
+
+
+def _assert_failed(harness: Harness, number: int, reason_fragment: str) -> None:
+    assert harness.fake.assignees_of(number) == []
+    labels = harness.fake.labels_of(number)
+    assert PLAN_READY in labels and IN_PROGRESS not in labels
+    marker = parse_run_failed(harness.fake.comments[number][-1]["body"])
+    assert marker is not None and reason_fragment in marker[1]
+    run_id = marker[0]
+    # Evidence shipped for the failed Run, recording the marker's reason.
+    run_json = harness.evidence_file(f"runs/issue-{number}/{run_id}/run.json")
+    record = json.loads(run_json)
+    assert record["phase"] == "failed" and reason_fragment in record["reason"]
+    # Park the re-queued issue so the next matrix case claims a fresh one.
+    harness.fake.issues[number]["labels"] = [
+        label for label in harness.fake.issues[number]["labels"] if label["name"] != PLAN_READY
+    ]
+
+
+def test_run_outcome_classification_matrix(harness: Harness):
+    """commits / no-commits-with-reasoning / no-commits-no-reasoning /
+    timeout / session death → normal PR / empty PR / failed / failed / failed."""
+    # commits → normal PR (default behavior writes change.txt).
+    with_commits = harness.file_issue("With commits", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+    (pr_normal,) = harness.fake.open_pr_numbers()
+    assert PR_READY in harness.fake.labels_of(pr_normal)
+    assert harness.remote_file(branch_for(with_commits), "change.txt")
+
+    # no commits + reasoning → empty PR (asserted in depth in its own test).
+    no_change = harness.file_issue("No change needed", CRITERIA_BODY)
+    harness.worker_behaviors.append(
+        lambda p, cwd: write_decisions(
+            cwd, decisions=[{"what": "no change needed", "why": "already handled"}]
+        )
+    )
+    assert harness.worker_once() == 1
+    assert len(harness.fake.open_pr_numbers()) == 2
+    assert PLAN_READY not in harness.fake.labels_of(no_change)
+
+    # no commits + no reasoning → failed (both no-file and empty-file forms).
+    silent = harness.file_issue("Silent", CRITERIA_BODY)
+    harness.worker_behaviors.append(_no_op)
+    harness.worker_once()
+    _assert_failed(harness, silent, "no no-change reasoning")
+
+    hollow = harness.file_issue("Hollow", CRITERIA_BODY)
+    harness.worker_behaviors.append(_empty_decisions)
+    harness.worker_once()
+    _assert_failed(harness, hollow, "no no-change reasoning")
+
+    # timeout → failed, even with changes in the tree.
+    timed = harness.file_issue("Timed out", CRITERIA_BODY)
+    harness.worker_behaviors.append(_timeout_with_changes)
+    harness.worker_once()
+    _assert_failed(harness, timed, "timed out")
+
+    # session death → failed.
+    died = harness.file_issue("Died", CRITERIA_BODY)
+    harness.worker_behaviors.append(_session_death)
+    harness.worker_once()
+    _assert_failed(harness, died, "session died")
+
+    # Only the two shipping Runs opened PRs.
+    assert len(harness.fake.open_pr_numbers()) == 2
+
+
+def test_empty_pr_carries_reasoning_and_allow_empty_commit(harness: Harness):
+    number = harness.file_issue("Already implemented", CRITERIA_BODY)
+    harness.worker_behaviors.append(
+        lambda p, cwd: write_decisions(
+            cwd,
+            decisions=[{"what": "no change needed", "why": "util.py already covers this"}],
+        )
+    )
+    assert harness.worker_once() == 1
+
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    body = harness.fake.issues[pr_number]["body"]
+    assert "no code change is needed" in body  # the reasoning, in the PR body
+    assert "util.py already covers this" in body
+    section = decisions.parse(body)
+    assert section is not None and section.decisions  # plus the standard section
+
+    # One driver-synthesized allow-empty commit: new head, identical tree.
+    branch = branch_for(number)
+    assert harness.remote_sha(branch) != harness.remote_sha("main")
+    assert harness.remote_paths(branch) == harness.remote_paths("main")
+    history = subprocess.run(
+        ["git", "--git-dir", str(harness.remote), "log", "--format=%s", branch],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "no changes required" in history
+
+    # Evidence records the empty-PR outcome; the Reviewer judges it normally.
+    paths = harness.evidence_paths()
+    run_json = next(
+        p for p in paths if p.startswith(f"runs/issue-{number}/") and p.endswith("run.json")
+    )
+    assert json.loads(harness.evidence_file(run_json))["phase"] == "empty-pr"
+    harness.reviewer_replies.append(
+        approve_reply(evidence="Justified no-change: util.py already covers the criteria.")
+    )
+    assert harness.reviewer_once() == 1
+    assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
+
+
+def test_failed_run_budget_is_one_retry_then_escalation(harness: Harness):
+    number = harness.file_issue("Cursed", CRITERIA_BODY)
+
+    harness.worker_behaviors.append(_no_op)  # first failure
+    assert harness.worker_once() == 1
+    labels = harness.fake.labels_of(number)
+    assert PLAN_READY in labels  # re-queued for the one retry
+    assert len(harness.fake.comments[number]) == 1
+
+    harness.worker_behaviors.append(_session_death)  # the retry fails too
+    assert harness.worker_once() == 1
+    labels = harness.fake.labels_of(number)
+    assert {BLOCKED, NEEDS_HUMAN} <= labels
+    assert PLAN_READY not in labels and IN_PROGRESS not in labels
+    assert harness.fake.assignees_of(number) == []
+    markers = [
+        parse_run_failed(c["body"])
+        for c in harness.fake.comments[number]
+        if parse_run_failed(c["body"])
+    ]
+    assert len(markers) == 2  # both failures are stamped
+    assert "escalating to a human" in harness.fake.comments[number][-1]["body"]
+    # Two distinct fresh Runs: different run ids, different containers.
+    assert markers[0][0] != markers[1][0]
+    assert len({n for n in harness.record.launched if n.startswith("ozolith-run-")}) == 2
+
+    # blocked + needs_human is not claimable: nothing left to do.
+    assert harness.worker_once() == 0
+
+
+def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypatch):
+    def down(*args, **kwargs):
+        raise GitError("evidence remote down")
+
+    monkeypatch.setattr("theozolith_worker.evidence.push_bundle", down)
+
+    harness.file_issue("Traceability", CRITERIA_BODY)
+    assert harness.worker_once() == 1  # the Run still ships its PR
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    worker_failures = [line for line in harness.logs if "evidence push failed" in line]
+    assert worker_failures and "evidence remote down" in worker_failures[-1]
+
+    harness.reviewer_replies.append(approve_reply())
+    assert harness.reviewer_once() == 1  # the verdict still applies
+    assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
+    reviewer_failures = [line for line in harness.logs if "evidence push failed" in line]
+    assert len(reviewer_failures) > len(worker_failures)
 
 
 # -- 7. authority -------------------------------------------------------------
@@ -408,15 +600,23 @@ def _audit_write(actor: str, method: str, path: str, payload, issues: set[int], 
             assert payload["assignees"] == [actor], "workers only (un)assign themselves"
             assert number in issues
             return
+        if tail.endswith("/comments") and method == "POST":
+            # The only worker comment is the run-failed marker (ADR-0014).
+            assert number in issues, "worker comments only on issues"
+            assert "theozolith:run-failed" in payload["body"]
+            return
         if tail.endswith("/labels") and method == "POST":
             wanted = set(payload["labels"])
             if number in prs:
                 assert wanted <= {PR_READY}, f"worker set {wanted} on a PR"
             else:
-                assert wanted <= {IN_PROGRESS}, f"worker set {wanted} on an issue"
+                # claim, failed-Run re-queue, and failed-Run escalation
+                allowed = {IN_PROGRESS, PLAN_READY, BLOCKED, NEEDS_HUMAN}
+                assert wanted <= allowed, f"worker set {wanted} on an issue"
             return
         if method == "DELETE" and "/labels/" in tail:
-            assert tail.endswith(f"/labels/{PLAN_READY}") and number in issues
+            label = tail.rsplit("/", 1)[1]
+            assert label in (PLAN_READY, IN_PROGRESS) and number in issues
             return
         raise AssertionError(f"unexpected worker write: {method} {tail}")
 
@@ -468,7 +668,15 @@ def test_authority_matrix_via_write_transcript(harness: Harness):
     harness.reviewer_replies.append(approve_reply())
     harness.reviewer_once()
 
-    issues = {issue_number, contested}
+    # A failed Run (covers the marker comment + re-queue writes), then its
+    # failed retry (covers the blocked + needs_human escalation writes).
+    doomed = harness.file_issue("Doomed", CRITERIA_BODY)
+    harness.worker_behaviors.append(_session_death)
+    harness.worker_once()
+    harness.worker_behaviors.append(_no_op)
+    harness.worker_once()
+
+    issues = {issue_number, contested, doomed}
     prs = set(harness.fake.pulls)
     assert harness.fake.write_log, "the transcript must not be empty"
     for actor, method, path, payload in harness.fake.write_log:
@@ -562,29 +770,59 @@ def test_hostile_git_metadata_cannot_reach_the_driver(harness: Harness):
 # -- 10. verdict robustness ---------------------------------------------------
 
 
-def test_malformed_or_missing_verdict_applies_no_state_then_retries(harness: Harness):
+def test_malformed_verdict_escalates_immediately_with_the_raw_error(harness: Harness):
     number = harness.file_issue("Judged", CRITERIA_BODY)
     harness.worker_once()
     (pr_number,) = harness.fake.open_pr_numbers()
-    writes_before = len(harness.fake.write_log)
-    comments_before = len(harness.fake.comments[pr_number])
 
     harness.reviewer_replies.append("this is not json {")  # malformed file
-    assert harness.reviewer_once() == 0
-    harness.reviewer_replies.append(None)  # no verdict file at all
-    assert harness.reviewer_once() == 0
+    assert harness.reviewer_once() == 1  # one strike: the escalation applies
 
-    # Zero label or comment writes from either failed round.
-    assert len(harness.fake.write_log) == writes_before
-    assert len(harness.fake.comments[pr_number]) == comments_before
-    assert harness.fake.labels_of(pr_number) == {PR_READY}
-    assert harness.record.alive == set()  # both round containers were removed
+    assert len(review_containers(harness)) == 1  # exactly one model call
+    labels = harness.fake.labels_of(pr_number)
+    assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
+    comment = harness.fake.comments[pr_number][-1]["body"]
+    assert "not valid JSON" in comment  # the raw validation error
+    assert f"tree/theozolith/evidence/runs/issue-{number}" in comment  # bundle link
+    assert "-invalid-verdict.json" in comment  # evidence path of the bad file
+    # The offending file really is preserved at the cited path.
+    invalid_path = next(p for p in harness.evidence_paths() if p.endswith("-invalid-verdict.json"))
+    assert harness.evidence_file(invalid_path).startswith("this is not json")
+    assert harness.record.alive == set()
 
-    # The next poll retries the round; a valid verdict then applies normally.
-    harness.reviewer_replies.append(approve_reply())
+    # No re-poll: the PR is out of the Reviewer's queue for good.
+    assert harness.reviewer_once() == 0
+    assert len(review_containers(harness)) == 1
+
+
+def test_missing_and_schema_invalid_verdicts_also_escalate(harness: Harness):
+    first = harness.file_issue("No file", CRITERIA_BODY)
+    harness.worker_once()
+    harness.reviewer_replies.append(None)  # the session emitted no file at all
     assert harness.reviewer_once() == 1
-    assert {PR_READY, NEEDS_HUMAN, "deviation:low", "risk:low"} <= harness.fake.labels_of(pr_number)
-    assert number  # silence unused warning
+    (pr_one,) = [
+        n
+        for n in harness.fake.open_pr_numbers()
+        if branch_for(first) == harness.fake.pulls[n]["head"]
+    ]
+    comment = harness.fake.comments[pr_one][-1]["body"]
+    assert {BLOCKED, NEEDS_HUMAN} <= harness.fake.labels_of(pr_one)
+    assert "no verdict file emitted" in comment
+    assert "emitted no verdict file" in comment  # and no evidence path is cited
+
+    second = harness.file_issue("Schema fail", CRITERIA_BODY)
+    harness.worker_once()
+    harness.reviewer_replies.append({"verdict": "approve", "evidence": "ok"})  # grades missing
+    assert harness.reviewer_once() == 1
+    (pr_two,) = [
+        n
+        for n in harness.fake.open_pr_numbers()
+        if branch_for(second) == harness.fake.pulls[n]["head"]
+    ]
+    comment = harness.fake.comments[pr_two][-1]["body"]
+    assert {BLOCKED, NEEDS_HUMAN} <= harness.fake.labels_of(pr_two)
+    assert "deviation" in comment  # the raw schema error names the field
+    assert len(review_containers(harness)) == 2  # one call per PR, never more
 
 
 # -- 11. degraded mode --------------------------------------------------------

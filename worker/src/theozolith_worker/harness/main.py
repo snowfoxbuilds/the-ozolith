@@ -149,7 +149,9 @@ def run_harness(
     transcript = job / TRANSCRIPT_FILE
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.touch()
-    env = adapter.prepare(workdir, job)
+    # THEOZOLITH_JOB lets in-session tools (theozolith-validate-verdict)
+    # find the manifest and outputs from inside the workdir.
+    env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
     tmux.new_session(manifest.session, adapter.command(manifest), workdir, env)
     try:
         tmux.pipe_pane(manifest.session, transcript)

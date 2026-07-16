@@ -10,16 +10,21 @@ a file, and the driver validates the file, renders the evidence-citing
 comment, and applies exactly one verdict:
 
 - approve: needs_human (keeping pr_ready) + deviation:* + risk:* + an
-  evidence-citing comment; the human stamps and merges.
+  evidence-citing comment; the human stamps and merges. Approve means no
+  revisions are needed at all.
 - revise: verdict comment (revised plan + resume commit) first, then
   attempt-N, then pr_ready comes off, then the issue claim is stripped and
   the issue re-queued to plan_ready — explicitly delegated human authority.
 - escalate: blocked + needs_human with the evidence bundle link; also forced
   deterministically when the round budget is exhausted.
 
-A missing or unparseable verdict file — including a revise at the final
-budgeted round, which would commission a Run with no remaining review round —
-applies NO PR-side state; the round is retried on the next poll.
+ANY invalid verdict — missing file, unparseable JSON, schema failure, or a
+revise on the final budgeted round — escalates immediately (ADR-0014): the
+driver applies blocked + needs_human with a comment carrying the raw
+validation error, the bundle link, and the evidence path of the offending
+verdict file. One strike; there is no driver-side retry — the judging
+agent's second chances live inside its own session via the validate-verdict
+harness job.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import json
 import shutil
 import sys
 import time
+from pathlib import Path
 
 from theozolith_worker import evidence, gitops, jobdir, runner, verdict
 from theozolith_worker.bootstrap.vocabulary import (
@@ -59,6 +65,8 @@ from theozolith_worker.worker import container_session_factory
 
 DIFF_LIMIT = 200_000
 
+NO_PATCH_NOTE = "(no patch available — binary or very large file; see signals.md)"
+
 REVIEW_PROMPT = """\
 You are the Reviewer in TheOzolith agentic coding pipeline. A Worker shipped \
 a best-effort PR; you own the verdict. You never implement — you judge the \
@@ -68,7 +76,10 @@ the decisions the Worker recorded, not just the code.
 Your working directory contains the review inputs as files:
 
 - `issue.md` — the issue: stated intent and acceptance criteria
-- `diff.patch` — the full diff of the PR as shipped
+- `diff.patch` — the diff of the PR as shipped, built from the PR-files \
+API. Binary and very large files carry no patch (marked "{no_patch_note}" \
+and listed in `signals.md`): the diff is partial for those entries — say so \
+in your evidence rather than guessing at their contents.
 - `decisions.md` — the PR's Decisions Section (recorded by the Worker)
 - `signals.md` — mechanical diff signals (computed evidence — weigh it, it \
 is not a grader)
@@ -76,6 +87,20 @@ is not a grader)
 ## Review round
 
 This verdict closes round {round} of {budget}. {round_rule}
+
+## Verdict semantics
+
+- **approve** means NO revisions are needed at all. Approve-with-nits is \
+forbidden: anything worth fixing is a revise; anything not worth fixing is \
+dropped, not mentioned as a condition of approval.
+- An empty PR (a single no-change commit) whose body and Decisions Section \
+carry justified no-change reasoning earns approve — the human closes the \
+issue.
+- **revise** re-queues the issue: give a numbered, concrete revised plan and \
+the resume commit the next Run starts from.
+- **escalate** hands the PR to a human (blocked + needs_human) when a \
+decision only a human may make is blocking (contradictory acceptance \
+criteria, an open question the Worker flagged that you cannot settle).
 
 ## Your verdict
 
@@ -95,18 +120,22 @@ deviation grades divergence from the plan (files outside the plan's \
 footprint, unrequested behavior, new dependencies, size far beyond \
 expectation). risk is your own overall read of the change as implemented, \
 independent of the issue's baseline label. approve only when the acceptance \
-criteria are met by the diff as shipped. Escalate when a decision only a \
-human may make is blocking (contradictory acceptance criteria, an open \
-question the Worker flagged that you cannot settle).
+criteria are met by the diff as shipped.
+
+Any INVALID verdict — missing file, unparseable JSON, schema violation, or \
+a revise on the final budgeted round — escalates this PR straight to a \
+human; there is NO retry. Before finishing, run `theozolith-validate-verdict` \
+in your working directory: it applies the exact validation the driver will \
+(schema and round rules) and reports errors while you can still fix them.
 """
 
 MIDDLE_ROUND_RULE = (
     "A revise verdict re-queues the issue for another Run that a later round reviews."
 )
 FINAL_ROUND_RULE = (
-    "This is the LAST budgeted round: you must NOT emit revise — approve or "
-    "escalate only. A revise would commission a Run with no remaining review "
-    "round and will be rejected."
+    "This is the LAST budgeted round: revise is unavailable — approve or "
+    "escalate only. A revise would be an invalid verdict and escalate this "
+    "PR to a human."
 )
 
 
@@ -127,7 +156,9 @@ def _review_inputs(client: GitHubClient, pr: PullRequest, issue_number: int) -> 
     issue = client.get_issue(issue_number)
     files = client.pr_files(pr.number)
     signals = compute_signals(files)
-    diff = "\n".join(f"--- {f.path} ({f.status})\n{f.patch}" for f in files)
+    diff = "\n".join(
+        f"--- {f.path} ({f.status})\n{f.patch if f.patch else NO_PATCH_NOTE}" for f in files
+    )
     if len(diff) > DIFF_LIMIT:
         diff = diff[:DIFF_LIMIT] + "\n[diff truncated]"
     return {
@@ -138,6 +169,13 @@ def _review_inputs(client: GitHubClient, pr: PullRequest, issue_number: int) -> 
     }
 
 
+def _read_transcript(job: Path) -> str:
+    try:
+        return (job / jobdir.TRANSCRIPT_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def review_pr(
     config: DriverConfig,
     client: GitHubClient,
@@ -146,7 +184,7 @@ def review_pr(
     *,
     log=_log,
 ) -> verdict.Verdict | None:
-    """Run one review round and apply the verdict. None = no state this cycle."""
+    """Run one review round and apply the verdict. None = PR skipped."""
     issue_number = runner.issue_for_branch(pr.head_ref)
     if issue_number is None:
         log(f"PR #{pr.number} head {pr.head_ref!r} is not a pipeline branch; skipping")
@@ -156,20 +194,22 @@ def review_pr(
     bundle_url = evidence.issue_evidence_url(config.repo, issue_number)
 
     if rounds_spent >= ROUND_BUDGET:
-        # The budget check cannot be argued with: no model call.
+        # The budget check cannot be argued with: no model call. The verdict
+        # closes no new round, so it is stamped with the last budgeted one.
         result = verdict.Verdict(
             verdict=verdict.ESCALATE,
-            round=round_number,
+            round=ROUND_BUDGET,
             evidence=(
                 f"Round budget exhausted: {ROUND_BUDGET} review rounds spent on this "
                 "issue. A human decision is required to continue."
             ),
             bundle_url=bundle_url,
         )
-        _apply(config, client, pr, issue_number, result, log)
+        _apply(config, client, pr, issue_number, result, log, container="")
         return result
 
     review_id = f"review-{pr.number}-round-{round_number}"
+    container = review_container_name(pr.number, round_number)
     job = jobdir.create_job_dir(config.jobs_dir, review_id)
     try:
         work = job / jobdir.WORK_DIR
@@ -177,9 +217,12 @@ def review_pr(
         for name, content in _review_inputs(client, pr, issue_number).items():
             (work / name).write_text(content, encoding="utf-8")
 
-        round_rule = FINAL_ROUND_RULE if round_number >= ROUND_BUDGET else MIDDLE_ROUND_RULE
+        final_round = round_number >= ROUND_BUDGET
         prompt = REVIEW_PROMPT.format(
-            round=round_number, budget=ROUND_BUDGET, round_rule=round_rule
+            round=round_number,
+            budget=ROUND_BUDGET,
+            round_rule=FINAL_ROUND_RULE if final_round else MIDDLE_ROUND_RULE,
+            no_patch_note=NO_PATCH_NOTE,
         )
         jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
         manifest = jobdir.Manifest(
@@ -191,10 +234,12 @@ def review_pr(
             workdir=jobdir.WORK_DIR,
             agent_timeout_seconds=config.agent_timeout_seconds,
             settle_seconds=config.settle_seconds,
+            round=round_number,
+            round_budget=ROUND_BUDGET,
         )
         jobdir.write_manifest(job, manifest)
         spec = ContainerSpec(
-            name=review_container_name(pr.number, round_number),
+            name=container,
             image=config.run_image,
             labels=container_labels(review_id, config.stack),
             mounts=((str(job), jobdir.CONTAINER_JOB_PATH),),
@@ -213,27 +258,104 @@ def review_pr(
         result, reason = verdict.validate_verdict_file(
             job / jobdir.VERDICT_FILE,
             round_number=round_number,
-            final_round=round_number >= ROUND_BUDGET,
+            final_round=final_round,
             default_resume=pr.head_sha,
             bundle_url=bundle_url,
         )
-        if result is None:
-            # No PR-side state whatsoever; the round retries next poll.
-            log(f"PR #{pr.number}: verdict rejected ({reason}); will retry next poll")
-            return None
-
         transcript = _read_transcript(job)
-        _apply(config, client, pr, issue_number, result, log, transcript=transcript)
+        if result is None:
+            # One strike: an invalid verdict escalates immediately — no
+            # second model call, no re-poll of this PR (ADR-0014).
+            return _escalate_invalid_verdict(
+                config,
+                client,
+                pr,
+                issue_number,
+                round_number,
+                reason,
+                job,
+                bundle_url,
+                transcript,
+                container,
+                log,
+            )
+
+        _apply(
+            config,
+            client,
+            pr,
+            issue_number,
+            result,
+            log,
+            transcript=transcript,
+            container=container,
+        )
         return result
     finally:
         shutil.rmtree(job, ignore_errors=True)
 
 
-def _read_transcript(job) -> str:
+def _escalate_invalid_verdict(
+    config: DriverConfig,
+    client: GitHubClient,
+    pr: PullRequest,
+    issue_number: int,
+    round_number: int,
+    reason: str,
+    job: Path,
+    bundle_url: str,
+    transcript: str,
+    container: str,
+    log,
+) -> verdict.Verdict:
+    """Apply the one-strike rule: evidence first (so the cited path
+    resolves), then blocked + needs_human with the raw validation error."""
+    prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-invalid"
+    record = {
+        "pr": pr.number,
+        "issue": issue_number,
+        "round": round_number,
+        "verdict": None,
+        "error": reason,
+        "head": pr.head_sha,
+        "model": config.model,
+        "container": container,
+    }
+    files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
+    verdict_path: str | None = None
     try:
-        return (job / jobdir.TRANSCRIPT_FILE).read_text(encoding="utf-8")
+        raw = (job / jobdir.VERDICT_FILE).read_text(encoding="utf-8")
     except OSError:
-        return ""
+        raw = None
+    if raw is not None:
+        verdict_path = f"{prefix}-verdict.json"
+        files[verdict_path] = raw if raw.endswith("\n") else raw + "\n"
+    if transcript:
+        files[f"{prefix}-transcript.txt"] = transcript
+    _push_evidence_files(
+        config,
+        files,
+        message=f"Evidence: invalid verdict, review round {round_number} (issue #{issue_number})",
+        log=log,
+        context=f"PR #{pr.number}",
+    )
+
+    location = (
+        f"The offending verdict file is preserved in the evidence bundle at `{verdict_path}`."
+        if verdict_path
+        else "The session emitted no verdict file."
+    )
+    result = verdict.Verdict(
+        verdict=verdict.ESCALATE,
+        round=round_number,
+        evidence=(
+            "The review session produced an invalid verdict; escalating to a human "
+            f"(one strike, no retry — ADR-0014). Validation error: {reason}. {location}"
+        ),
+        bundle_url=bundle_url,
+    )
+    _publish(client, pr, issue_number, result, log)
+    return result
 
 
 def _apply(
@@ -245,6 +367,18 @@ def _apply(
     log,
     *,
     transcript: str = "",
+    container: str = "",
+) -> None:
+    _publish(client, pr, issue_number, result, log)
+    _push_review_evidence(config, pr, issue_number, result, transcript, container, log)
+
+
+def _publish(
+    client: GitHubClient,
+    pr: PullRequest,
+    issue_number: int,
+    result: verdict.Verdict,
+    log,
 ) -> None:
     # The verdict comment lands first: no observable verdict state without
     # the plan and evidence that explain it.
@@ -264,7 +398,28 @@ def _apply(
         client.remove_label(pr.number, PR_READY)
         client.add_labels(pr.number, BLOCKED, NEEDS_HUMAN)
     log(f"PR #{pr.number}: {result.verdict} (round {result.round})")
-    _push_review_evidence(config, pr, issue_number, result, transcript)
+
+
+def _push_evidence_files(
+    config: DriverConfig,
+    files: dict[str, str],
+    *,
+    message: str,
+    log,
+    context: str,
+) -> None:
+    """Push evidence, logging failures — never silently, never fatally."""
+    try:
+        evidence.push_bundle(
+            config.clone_url,
+            files,
+            message=message,
+            author_name=config.worker_id,
+            author_email=f"{config.worker_id}@theozolith.invalid",
+            env=gitops.auth_env(config.token),
+        )
+    except Exception as exc:
+        log(f"evidence push failed for {context}: {exc}")
 
 
 def _push_review_evidence(
@@ -273,6 +428,8 @@ def _push_review_evidence(
     issue_number: int,
     result: verdict.Verdict,
     transcript: str,
+    container: str,
+    log,
 ) -> None:
     record = {
         "pr": pr.number,
@@ -285,23 +442,20 @@ def _push_review_evidence(
         "evidence": result.evidence,
         "head": pr.head_sha,
         "model": config.model,
-        "container": review_container_name(pr.number, result.round),
+        # Empty when no review container ran (deterministic escalation).
+        "container": container,
     }
     prefix = f"runs/issue-{issue_number}/reviews/round-{result.round}-{pr.head_sha[:12]}"
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
     if transcript:
         files[f"{prefix}-transcript.txt"] = transcript
-    try:  # noqa: SIM105 - traceability never blocks coordination
-        evidence.push_bundle(
-            config.clone_url,
-            files,
-            message=f"Evidence: review round {result.round} (issue #{issue_number})",
-            author_name=config.worker_id,
-            author_email=f"{config.worker_id}@theozolith.invalid",
-            env=gitops.auth_env(config.token),
-        )
-    except Exception:
-        pass
+    _push_evidence_files(
+        config,
+        files,
+        message=f"Evidence: review round {result.round} (issue #{issue_number})",
+        log=log,
+        context=f"PR #{pr.number}",
+    )
 
 
 def reviewable(labels: set[str]) -> bool:

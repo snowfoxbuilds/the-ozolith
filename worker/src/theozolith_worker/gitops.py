@@ -153,6 +153,12 @@ def commit_all(cwd: Path, message: str, name: str, email: str) -> bool:
     return True
 
 
+def commit_empty(cwd: Path, message: str, name: str, email: str) -> None:
+    """One empty commit: how a concluded no-change Run ships (ADR-0014)."""
+    identity = ["-c", f"user.name={name}", "-c", f"user.email={email}"]
+    git([*identity, "commit", "--quiet", "--allow-empty", "-m", message], cwd)
+
+
 def fetch(cwd: Path, ref: str, *, env: dict[str, str] | None = None) -> None:
     git(["fetch", "--quiet", "origin", ref], cwd, env=env)
 

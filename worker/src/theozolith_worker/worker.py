@@ -71,7 +71,7 @@ def run_worker(
             runs += 1
             log(f"claimed #{claimed.number} ({claimed.title}); starting run {runs}")
             try:
-                report = execute_run(config, client, claimed, session_factory)
+                report = execute_run(config, client, claimed, session_factory, log=log)
                 log(
                     f"run {report.run_id} finished: phase={report.phase} "
                     f"pr={report.pr_number} round={report.round} "

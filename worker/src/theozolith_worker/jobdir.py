@@ -108,10 +108,19 @@ class Manifest:
     settle_seconds: float = DEFAULT_SETTLE_SECONDS
     startup_seconds: float = DEFAULT_STARTUP_SECONDS
     jobs_idle_timeout_seconds: float = DEFAULT_JOBS_IDLE_TIMEOUT
+    # Review mode: the round this session judges, so the in-session
+    # validate-verdict job applies the final-round rule exactly as the
+    # driver will (ADR-0014). 0/0 = not a review round.
+    round: int = 0
+    round_budget: int = 0
 
     @property
     def serve_jobs(self) -> bool:
         return self.mode == MODE_RUN
+
+    @property
+    def final_round(self) -> bool:
+        return self.round_budget > 0 and self.round >= self.round_budget
 
 
 def write_manifest(job: Path, manifest: Manifest) -> None:

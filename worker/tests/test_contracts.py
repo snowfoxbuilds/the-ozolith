@@ -9,6 +9,9 @@ from theozolith_worker import decisions, jobdir, verdict
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
 from theozolith_worker.harness.adapters import ClaudeHarnessAdapter
+from theozolith_worker.harness.validate import main as validate_main
+from theozolith_worker.harness.validate import validate_session_verdict
+from theozolith_worker.runner import parse_run_failed, render_run_failed
 
 
 def sample_section() -> decisions.DecisionsSection:
@@ -241,3 +244,100 @@ def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
 
     adapter.collect(workdir, tmp_path, jobdir.MODE_REVIEW)
     assert (tmp_path / jobdir.VERDICT_FILE).read_text() == '{"verdict": "approve"}'
+
+
+# -- the shared validator: one implementation, two call sites (ADR-0014) ------
+
+VALIDATOR_FIXTURES = [
+    # (verdict.json content, round, budget) — dicts are serialized, strings raw.
+    ({"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}, 1, 3),
+    ({"verdict": "approve", "evidence": "fine"}, 1, 3),  # grades missing
+    ({"verdict": "revise", "evidence": "off plan", "revised_plan": "1. redo"}, 2, 3),
+    ({"verdict": "revise", "evidence": "off plan"}, 2, 3),  # plan missing
+    ({"verdict": "revise", "evidence": "again", "revised_plan": "1. redo"}, 3, 3),  # final round
+    ({"verdict": "escalate", "evidence": "human needed"}, 3, 3),
+    ("this is not json {", 1, 3),
+    (None, 2, 3),  # no file at all
+]
+
+
+def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path:
+    job = jobdir.create_job_dir(tmp_path, f"review-r{round_number}")
+    (job / jobdir.WORK_DIR).mkdir(parents=True, exist_ok=True)
+    if content is not None:
+        text = content if isinstance(content, str) else json.dumps(content)
+        (job / jobdir.WORK_DIR / "verdict.json").write_text(text)
+    jobdir.write_manifest(
+        job,
+        jobdir.Manifest(
+            run_id=f"review-r{round_number}",
+            mode=jobdir.MODE_REVIEW,
+            session=f"review-1-round-{round_number}",
+            adapter="claude",
+            model="m",
+            workdir=jobdir.WORK_DIR,
+            round=round_number,
+            round_budget=budget,
+        ),
+    )
+    return job
+
+
+def test_driver_and_harness_job_validate_identically(tmp_path):
+    for index, (content, round_number, budget) in enumerate(VALIDATOR_FIXTURES):
+        job = _review_job(tmp_path / str(index), content, round_number, budget)
+        driver_result, driver_reason = verdict.validate_verdict_file(
+            job / jobdir.WORK_DIR / "verdict.json",
+            round_number=round_number,
+            final_round=round_number >= budget,
+            default_resume="HEAD",
+            bundle_url="",
+        )
+        harness_valid, harness_message = validate_session_verdict(job)
+        assert harness_valid == (driver_result is not None), f"fixture {index} diverged"
+        if driver_result is None:
+            assert harness_message == driver_reason, f"fixture {index}: reasons diverged"
+
+
+def test_final_round_rule_matches_in_session(tmp_path):
+    final_revise = {"verdict": "revise", "evidence": "again", "revised_plan": "1. redo"}
+    job = _review_job(tmp_path / "final", final_revise, 3, 3)
+    valid, message = validate_session_verdict(job)
+    assert not valid and "final-round" in message
+    # The same verdict one round earlier is fine.
+    job = _review_job(tmp_path / "middle", final_revise, 2, 3)
+    valid, _ = validate_session_verdict(job)
+    assert valid
+
+
+def test_validate_verdict_cli(tmp_path, capsys):
+    good = {"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}
+    job = _review_job(tmp_path / "good", good, 1, 3)
+    assert validate_main(["--job", str(job)]) == 0
+    assert "valid" in capsys.readouterr().out
+
+    job = _review_job(tmp_path / "bad", "not json {", 1, 3)
+    assert validate_main(["--job", str(job)]) == 1
+    assert "INVALID" in capsys.readouterr().out
+
+
+# -- the run-failed marker (ADR-0014 failed-Run budget) ------------------------
+
+
+def test_run_failed_marker_roundtrip():
+    reason = 'agent session "timed out"\nafter 3600s'
+    body = render_run_failed("20260716T1200-w1-9", reason, escalated=False)
+    assert "Re-queued for one retry" in body
+    parsed = parse_run_failed(body)
+    assert parsed is not None
+    run_id, parsed_reason = parsed
+    assert run_id == "20260716T1200-w1-9"
+    assert "timed out" in parsed_reason
+    assert '"' not in parsed_reason and "\n" not in parsed_reason  # sanitized
+
+    escalated = render_run_failed("r-2", "x" * 500, escalated=True)
+    assert "escalating to a human" in escalated.lower() or "Retry budget exhausted" in escalated
+    parsed = parse_run_failed(escalated)
+    assert parsed is not None and len(parsed[1]) <= 300  # reason truncated
+
+    assert parse_run_failed("an ordinary comment") is None

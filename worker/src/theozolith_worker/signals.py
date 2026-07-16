@@ -48,12 +48,19 @@ class DiffSignals:
     deletions: int = 0
     dependency_files: list[str] = field(default_factory=list)
     sensitive_files: list[str] = field(default_factory=list)
+    # Entries the PR-files API returned without a patch (binary or very
+    # large): diff.patch is partial for these, and the Reviewer must say so
+    # rather than guess (ADR-0014).
+    patchless_files: list[str] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
             f"- files changed: {self.files_changed} (+{self.additions} / -{self.deletions})",
             "- dependency manifests touched: " + (", ".join(self.dependency_files) or "none"),
             "- sensitive paths touched: " + (", ".join(self.sensitive_files) or "none"),
+            "- files without patches (binary/very large; diff.patch omits their "
+            "content — the diff is partial for these): "
+            + (", ".join(self.patchless_files) or "none"),
         ]
         return "\n".join(lines)
 
@@ -69,4 +76,6 @@ def compute_signals(files: list[PrFile]) -> DiffSignals:
         lowered = entry.path.lower()
         if any(fragment in lowered for fragment in SENSITIVE_FRAGMENTS):
             signals.sensitive_files.append(entry.path)
+        if not entry.patch:
+            signals.patchless_files.append(entry.path)
     return signals

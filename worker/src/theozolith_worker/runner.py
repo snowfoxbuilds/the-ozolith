@@ -11,24 +11,37 @@ commissioned through the job directory; the driver performs the side effects
 (commit, push, PR, labels) after sanitizing the container-touched checkout's
 git metadata.
 
-Best-effort PR contract: every Run that reaches a checkout ends by pushing
-whatever it has and opening/updating the one PR for the issue with a
-Decisions Section, then applying pr_ready. The Worker never stops mid-Run to
-ask; a Run that cannot produce a PR (nothing to push and no PR yet) leaves no
-PR-side state and consumes no round budget.
+Run outcomes (ADR-0014): a completed session with commits ships the normal
+best-effort PR; a completed session with zero commits but no-change
+reasoning in the decisions payload ships an EMPTY PR (one driver-synthesized
+allow-empty commit) the Reviewer judges like any other; everything else — no
+commits and no reasoning, a timed-out or dead session, a container/harness
+crash — is a FAILED Run: evidence is pushed, the claim is stripped, the
+issue returns to plan_ready, and a machine-readable run-failed marker is
+stamped on the issue. The failed-Run budget is one retry: a failure with a
+marker already present escalates blocked + needs_human instead. Every Run
+that reaches a checkout pushes its evidence bundle before job-dir cleanup.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from theozolith_worker import decisions, evidence, gitops, jobdir, verdict
-from theozolith_worker.bootstrap.vocabulary import PR_READY, attempts_on
+from theozolith_worker.bootstrap.vocabulary import (
+    BLOCKED,
+    IN_PROGRESS,
+    NEEDS_HUMAN,
+    PLAN_READY,
+    PR_READY,
+    attempts_on,
+)
 from theozolith_worker.config import DriverConfig
 from theozolith_worker.containers import (
     ContainerSpec,
@@ -49,6 +62,10 @@ EXCLUDED_METADATA = (".theozolith/decisions.json", ".claude/settings.local.json"
 _RUN_SEQUENCE = itertools.count(1)
 
 
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
 def branch_for(issue_number: int) -> str:
     return f"{BRANCH_PREFIX}{issue_number}"
 
@@ -56,6 +73,37 @@ def branch_for(issue_number: int) -> str:
 def issue_for_branch(head_ref: str) -> int | None:
     suffix = head_ref.removeprefix(BRANCH_PREFIX)
     return int(suffix) if head_ref != suffix and suffix.isdigit() else None
+
+
+# -- the run-failed marker (issue-comment bookkeeping, ADR-0014) --------------
+
+RUN_FAILED_RE = re.compile(r'<!-- theozolith:run-failed run_id=(\S+) reason="([^"]*)" -->')
+
+
+def _sanitize_reason(reason: str) -> str:
+    return re.sub(r"\s+", " ", reason).replace('"', "'").strip()[:300]
+
+
+def render_run_failed(run_id: str, reason: str, *, escalated: bool) -> str:
+    outcome = (
+        "Retry budget exhausted — escalating to a human (`blocked` + `needs_human`)."
+        if escalated
+        else "Re-queued for one retry (the failed-Run budget, ADR-0014)."
+    )
+    return (
+        f"Run `{run_id}` failed: {reason}. {outcome}\n\n"
+        f'<!-- theozolith:run-failed run_id={run_id} reason="{_sanitize_reason(reason)}" -->'
+    )
+
+
+def parse_run_failed(body: str) -> tuple[str, str] | None:
+    """(run_id, reason) from a run-failed marker comment, or None."""
+    match = RUN_FAILED_RE.search(body)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _issue_has_failure_marker(client: GitHubClient, issue_number: int) -> bool:
+    return any(parse_run_failed(comment.body) for comment in client.list_comments(issue_number))
 
 
 PROMPT_TEMPLATE = """\
@@ -83,6 +131,10 @@ with exactly this JSON shape:
 a human can make; remaining_work is what a follow-up round still needs; \
 dead_ends are approaches you tried and abandoned (so the next Run does not \
 repeat them).
+- If you conclude that NO code change is needed, change nothing and record \
+why in the decisions file — the pipeline ships an empty PR carrying your \
+reasoning for review. A run with no changes and no recorded reasoning is \
+treated as a failure.
 - Do not run git commit/push and do not open PRs; the pipeline owns version \
 control.
 - Do not edit `.theozolith/gate.toml` or CI workflows unless the issue \
@@ -117,13 +169,14 @@ class RunReport:
     run_id: str
     issue: int
     round: int
-    phase: str = "claimed"  # claimed | checkout | agent | gate | pr-open | no-pr
+    phase: str = "claimed"  # claimed | checkout | agent | gate | empty-pr | pr-open | failed
     pr_number: int | None = None
     branch: str = ""
     head: str = ""
     container: str = ""
-    agent_outcome: str = ""  # completed | timed out | session died | unknown
+    agent_outcome: str = ""  # completed | timed out | session died | harness-failed | unknown
     gate_findings: int = 0
+    reason: str = ""  # failed Runs: the reason stamped in the marker
     notes: list[str] = field(default_factory=list)
 
 
@@ -173,6 +226,22 @@ def _read_output(job: Path, relpath: str) -> str:
         return ""
 
 
+def _has_reasoning(section: decisions.DecisionsSection | None) -> bool:
+    """Did the agent record anything that can justify a no-change Run?"""
+    return section is not None and bool(
+        section.decisions or section.open_questions or section.remaining_work or section.dead_ends
+    )
+
+
+def _no_change_intro(section: decisions.DecisionsSection) -> str:
+    lines = ["This Run concluded that **no code change is needed**. The Worker's reasoning:", ""]
+    if section.decisions:
+        lines += [f"- **{d.what}**" + (f" — {d.why}" if d.why else "") for d in section.decisions]
+    else:
+        lines += [f"- {item}" for item in section.open_questions + section.dead_ends]
+    return "\n".join(lines)
+
+
 def execute_run(
     config: DriverConfig,
     client: GitHubClient,
@@ -180,6 +249,7 @@ def execute_run(
     session_factory: SessionFactory,
     *,
     run_id: str | None = None,
+    log=_log,
 ) -> RunReport:
     """One Run on one claimed issue. Assumes the claim already succeeded."""
     run_id = run_id or (
@@ -189,6 +259,10 @@ def execute_run(
     login = client.viewer_login()
     email = f"{login}@users.noreply.github.com"
     auth = gitops.auth_env(config.token)
+
+    # The failed-Run budget check happens at claim time: a marker already on
+    # the issue means this Run is the one retry (ADR-0014).
+    already_failed = _issue_has_failure_marker(client, issue.number)
 
     job = jobdir.create_job_dir(config.jobs_dir, run_id)
     workdir = job / jobdir.CHECKOUT_DIR
@@ -279,32 +353,36 @@ def execute_run(
         session = session_factory(spec, job, manifest)
         session.launch()
         report.phase = "agent"
+        outcome: jobdir.AgentOutcome | None = None
+        harness_error = ""
+        gate = GateResult()
         try:
-            outcome = session.wait_for_agent()
-            report.agent_outcome = outcome.describe()
-            if not outcome.completed:
-                report.notes.append(
-                    f"agent session {outcome.describe()}; shipping best-effort state"
-                )
             try:
-                gate = run_gate(
-                    workdir,
-                    runner=lambda command, timeout: session.run_job("gate", command, timeout),
-                )
+                outcome = session.wait_for_agent()
+                report.agent_outcome = outcome.describe()
             except SessionError as exc:
-                # The agent's work is already in the checkout: ship it
-                # best-effort with the gate failure recorded as a finding.
-                gate = GateResult(
-                    findings=[
-                        Finding(
-                            step="gate",
-                            severity="error",
-                            summary=f"gate infrastructure failed: {exc}",
-                        )
-                    ]
-                )
-            report.phase = "gate"
-            report.gate_findings = len(gate.findings)
+                harness_error = str(exc)
+                report.agent_outcome = "harness-failed"
+            if outcome is not None and outcome.completed:
+                try:
+                    gate = run_gate(
+                        workdir,
+                        runner=lambda command, timeout: session.run_job("gate", command, timeout),
+                    )
+                except SessionError as exc:
+                    # The agent's work is already in the checkout: ship it
+                    # best-effort with the gate failure recorded as a finding.
+                    gate = GateResult(
+                        findings=[
+                            Finding(
+                                step="gate",
+                                severity="error",
+                                summary=f"gate infrastructure failed: {exc}",
+                            )
+                        ]
+                    )
+                report.phase = "gate"
+                report.gate_findings = len(gate.findings)
         finally:
             session.finish()
 
@@ -312,50 +390,128 @@ def execute_run(
         gitops.sanitize_checkout(workdir, config.clone_url)
         _exclude_metadata(workdir)
 
-        section = decisions.read_agent_decisions(workdir)
-        if section is None:
-            reason = (
-                "agent exited without a valid .theozolith/decisions.json"
-                if report.agent_outcome == "completed"
-                else f"agent session {report.agent_outcome or 'failed'}"
+        agent_section = decisions.read_agent_decisions(workdir)
+
+        # -- Run-outcome classification (ADR-0014) ---------------------------
+
+        if outcome is None or not outcome.completed:
+            reason = harness_error or f"agent session {outcome.describe()}"
+            return _fail_run(
+                config,
+                client,
+                issue,
+                report,
+                job,
+                workdir,
+                base_branch,
+                agent_section,
+                gate,
+                reason,
+                already_failed,
+                auth,
+                log,
             )
-            section = decisions.fallback_section(reason)
+
+        section = agent_section or decisions.fallback_section(
+            "agent exited without a valid .theozolith/decisions.json"
+        )
         section.gate_findings = gate.findings
 
         committed = gitops.commit_all(
             workdir, f"Run {run_id} for #{issue.number} (round {report.round})", login, email
         )
-        head = gitops.head_sha(workdir)
-        report.head = head
-
-        base_sha = gitops.git(["rev-parse", f"origin/{base_branch}"], workdir)
-        if existing_pr is None and not committed and head == base_sha:
-            # Nothing to push and no PR to update: no PR-side state, no round.
-            report.phase = "no-pr"
-            report.notes.append("run produced no changes and no PR exists; nothing shipped")
-            return report
+        empty = not committed
+        if empty and not _has_reasoning(agent_section):
+            return _fail_run(
+                config,
+                client,
+                issue,
+                report,
+                job,
+                workdir,
+                base_branch,
+                agent_section,
+                gate,
+                "run completed with no commits and no no-change reasoning",
+                already_failed,
+                auth,
+                log,
+            )
+        if empty:
+            # A concluded no-change Run still ships: one allow-empty commit,
+            # reasoning in the PR body, judged like any PR (ADR-0014).
+            gitops.commit_empty(
+                workdir,
+                f"Run {run_id} for #{issue.number} (round {report.round}): no changes required",
+                login,
+                email,
+            )
+        report.head = gitops.head_sha(workdir)
 
         gitops.push(workdir, branch, force=force, env=auth)
 
         title = f"#{issue.number}: {issue.title}"
         if existing_pr is None:
+            body = f"Closes #{issue.number}."
+            if empty:
+                body += "\n\n" + _no_change_intro(section)
             pr = client.create_pr(
-                head=branch,
-                base=base_branch,
-                title=title,
-                body=decisions.upsert(f"Closes #{issue.number}.", section),
+                head=branch, base=base_branch, title=title, body=decisions.upsert(body, section)
             )
         else:
             pr = existing_pr
             client.update_pr(pr.number, body=decisions.upsert(pr.body, section))
         report.pr_number = pr.number
         client.add_labels(pr.number, PR_READY)
-        report.phase = "pr-open"
+        report.phase = "empty-pr" if empty else "pr-open"
 
-        _push_run_evidence(config, report, issue, job, gate, section, workdir, base_branch, auth)
+        _push_run_evidence(
+            config, report, issue, job, gate, section, workdir, base_branch, auth, log
+        )
         return report
     finally:
         shutil.rmtree(job, ignore_errors=True)
+
+
+def _fail_run(
+    config: DriverConfig,
+    client: GitHubClient,
+    issue: Issue,
+    report: RunReport,
+    job: Path,
+    workdir: Path,
+    base_branch: str,
+    agent_section: decisions.DecisionsSection | None,
+    gate: GateResult,
+    reason: str,
+    already_failed: bool,
+    auth: dict[str, str],
+    log,
+) -> RunReport:
+    """The failed-Run path: evidence, claim strip, re-queue or escalate,
+    run-failed marker. Failed Runs never touch attempt-N and open no PR."""
+    report.phase = "failed"
+    report.reason = reason
+    section = agent_section or decisions.fallback_section(reason)
+    _push_run_evidence(config, report, issue, job, gate, section, workdir, base_branch, auth, log)
+
+    me = client.viewer_login()
+    fresh = client.get_issue(issue.number)
+    if me in fresh.assignees:
+        client.remove_assignee(issue.number, me)
+    client.remove_label(issue.number, IN_PROGRESS)
+    if already_failed:
+        # The one-retry budget is spent: a human takes over.
+        client.add_labels(issue.number, BLOCKED, NEEDS_HUMAN)
+        report.notes.append("failed-Run budget exhausted; escalated to a human")
+    else:
+        client.add_labels(issue.number, PLAN_READY)
+        report.notes.append("re-queued for one retry")
+    client.add_comment(
+        issue.number, render_run_failed(report.run_id, reason, escalated=already_failed)
+    )
+    log(f"run {report.run_id} failed ({reason}); " + report.notes[-1])
+    return report
 
 
 def _push_run_evidence(
@@ -363,12 +519,15 @@ def _push_run_evidence(
     report: RunReport,
     issue: Issue,
     job: Path,
-    gate,
+    gate: GateResult,
     section: decisions.DecisionsSection,
     workdir: Path,
     base_branch: str,
     auth: dict[str, str],
+    log,
 ) -> None:
+    """Every Run that reached a checkout pushes its bundle (ADR-0014) —
+    normal, empty-PR, and failed Runs alike, before job-dir cleanup."""
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
     files = {
@@ -387,6 +546,7 @@ def _push_run_evidence(
                 "head": report.head,
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
+                "reason": report.reason,
                 "notes": report.notes,
             },
             indent=2,
@@ -412,6 +572,7 @@ def _push_run_evidence(
             author_email=f"{config.worker_id}@theozolith.invalid",
             env=auth,
         )
-    except gitops.GitError as exc:
-        # Evidence is traceability, not coordination: never fail the Run on it.
+    except Exception as exc:
+        # Never fail the Run on evidence, but never swallow it silently.
         report.notes.append(f"evidence push failed: {exc}")
+        log(f"evidence push failed for run {report.run_id}: {exc}")

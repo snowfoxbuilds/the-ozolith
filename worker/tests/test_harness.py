@@ -231,6 +231,7 @@ def test_run_mode_full_cycle(tmp_path):
     settings = json.loads((workdir / ".claude" / "settings.local.json").read_text())
     assert "Stop" in settings["hooks"] and "UserPromptSubmit" in settings["hooks"]
     assert session["env"]["THEOZOLITH_HOOK_LOG"] == str(job / jobdir.HOOK_EVENTS_FILE)
+    assert session["env"]["THEOZOLITH_JOB"] == str(job)  # in-session tools find the job dir
     # The gate job ran inside the workdir.
     assert (workdir / "gate.txt").read_text() == "ok"
 
