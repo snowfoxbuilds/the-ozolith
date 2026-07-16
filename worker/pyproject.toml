@@ -1,6 +1,6 @@
 [project]
 name = "theozolith-worker"
-version = "0.2.0"
+version = "0.3.0"
 description = "Coding-pipeline component: the Worker and Reviewer drivers (poll-claim-run loop, Claim Protocol, per-Run containers, first-party quality gate, best-effort PRs with Decisions Sections, verdict-file review rounds), the agent harness that is PID 1 of every run container, and the repo bootstrap tool (label vocabulary + issue forms) that the pipeline substrate requires."
 readme = "README.md"
 license = { text = "MIT" }

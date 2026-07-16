@@ -58,6 +58,7 @@ from theozolith_worker.containers import (
     review_session_name,
 )
 from theozolith_worker.decisions import section_text
+from theozolith_worker.events import EventSink, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
 from theozolith_worker.signals import compute_signals
@@ -183,8 +184,10 @@ def review_pr(
     session_factory: SessionFactory,
     *,
     log=_log,
+    sink: EventSink | None = None,
 ) -> verdict.Verdict | None:
     """Run one review round and apply the verdict. None = PR skipped."""
+    sink = sink or make_sink(config, log)
     issue_number = runner.issue_for_branch(pr.head_ref)
     if issue_number is None:
         log(f"PR #{pr.number} head {pr.head_ref!r} is not a pipeline branch; skipping")
@@ -206,6 +209,15 @@ def review_pr(
             bundle_url=bundle_url,
         )
         _apply(config, client, pr, issue_number, result, log, container="")
+        sink.emit(
+            review_event(
+                config,
+                pr=pr.number,
+                issue=issue_number,
+                round_number=result.round,
+                verdict=result.verdict,
+            )
+        )
         return result
 
     review_id = f"review-{pr.number}-round-{round_number}"
@@ -266,7 +278,7 @@ def review_pr(
         if result is None:
             # One strike: an invalid verdict escalates immediately — no
             # second model call, no re-poll of this PR (ADR-0014).
-            return _escalate_invalid_verdict(
+            escalated = _escalate_invalid_verdict(
                 config,
                 client,
                 pr,
@@ -279,6 +291,16 @@ def review_pr(
                 container,
                 log,
             )
+            sink.emit(
+                review_event(
+                    config,
+                    pr=pr.number,
+                    issue=issue_number,
+                    round_number=escalated.round,
+                    verdict=escalated.verdict,
+                )
+            )
+            return escalated
 
         _apply(
             config,
@@ -289,6 +311,15 @@ def review_pr(
             log,
             transcript=transcript,
             container=container,
+        )
+        sink.emit(
+            review_event(
+                config,
+                pr=pr.number,
+                issue=issue_number,
+                round_number=result.round,
+                verdict=result.verdict,
+            )
         )
         return result
     finally:
@@ -470,10 +501,12 @@ def run_reviewer(
     sleep=time.sleep,
     once: bool = False,
     log=_log,
+    sink: EventSink | None = None,
 ) -> int:
     """The Reviewer poll loop; returns the number of verdicts applied."""
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
+    sink = sink or make_sink(config, log)
     me = client.viewer_login()
     log(f"reviewer driver ({me}) polling {config.repo} for {PR_READY} without {NEEDS_HUMAN}")
 
@@ -484,7 +517,7 @@ def run_reviewer(
                 if not reviewable(candidate.labels):
                     continue
                 pr = client.get_pull(candidate.number)
-                if review_pr(config, client, pr, session_factory, log=log) is not None:
+                if review_pr(config, client, pr, session_factory, log=log, sink=sink) is not None:
                     verdicts += 1
         except Exception as exc:
             log(f"review pass failed: {exc}")

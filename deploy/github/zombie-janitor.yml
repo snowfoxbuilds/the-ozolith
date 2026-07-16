@@ -1,0 +1,53 @@
+# OPTIONAL slow backstop for the Control Node's zombie-claim janitor (M3
+# brief). Pure GitHub data, deliberately conservative (24h staleness — the
+# Control Node janitor's 10-minute grace period is the primary mechanism):
+# an issue stuck in_progress with no timeline activity for a day has lost
+# its Worker AND its Control Node. Copy into the TARGET repo's
+# .github/workflows/ to enable.
+#
+# Mirrors the janitor's guard (ADR-0015): issues whose open PR carries
+# pr_ready are the Reviewer's to drive and are never re-queued here.
+
+name: theozolith-zombie-janitor
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const STALE_MS = 24 * 60 * 60 * 1000;
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: "open", labels: "in_progress", per_page: 100,
+            });
+            for (const issue of issues) {
+              if (issue.pull_request) continue;
+              if (Date.now() - new Date(issue.updated_at).getTime() < STALE_MS) continue;
+              const head = `${owner}:ozolith/issue-${issue.number}`;
+              const prs = await github.rest.pulls.list({ owner, repo, state: "open", head });
+              const prReady = prs.data.some(pr => pr.labels.some(l => l.name === "pr_ready"));
+              if (prReady) continue; // the Reviewer owns that path
+              for (const assignee of issue.assignees ?? []) {
+                await github.rest.issues.removeAssignees({
+                  owner, repo, issue_number: issue.number, assignees: [assignee.login],
+                });
+              }
+              await github.rest.issues.removeLabel({
+                owner, repo, issue_number: issue.number, name: "in_progress",
+              }).catch(() => {});
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: issue.number, labels: ["plan_ready"],
+              });
+              core.notice(`issue #${issue.number}: stale claim returned to plan_ready`);
+            }

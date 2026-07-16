@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from theozolith_worker import decisions, evidence, gitops, jobdir, verdict
+from theozolith_worker import decisions, events, evidence, gitops, jobdir, verdict
 from theozolith_worker.bootstrap.vocabulary import (
     BLOCKED,
     IN_PROGRESS,
@@ -60,6 +60,11 @@ EXCLUDED_METADATA = (".theozolith/decisions.json", ".claude/settings.local.json"
 
 # Distinguishes Runs started within the same second by one driver process.
 _RUN_SEQUENCE = itertools.count(1)
+
+
+def new_run_id(config: DriverConfig) -> str:
+    """run-id = <utc-timestamp>-<worker-id>-<seq> (ADR-0014)."""
+    return f"{time.strftime('%Y%m%dT%H%M%S')}-{config.worker_id}-{next(_RUN_SEQUENCE)}"
 
 
 def _log(message: str) -> None:
@@ -250,11 +255,11 @@ def execute_run(
     *,
     run_id: str | None = None,
     log=_log,
+    sink: events.EventSink | None = None,
 ) -> RunReport:
     """One Run on one claimed issue. Assumes the claim already succeeded."""
-    run_id = run_id or (
-        f"{time.strftime('%Y%m%dT%H%M%S')}-{config.worker_id}-{next(_RUN_SEQUENCE)}"
-    )
+    run_id = run_id or new_run_id(config)
+    sink = sink or events.make_sink(config, log)
     branch = branch_for(issue.number)
     login = client.viewer_login()
     email = f"{login}@users.noreply.github.com"
@@ -383,6 +388,15 @@ def execute_run(
                     )
                 report.phase = "gate"
                 report.gate_findings = len(gate.findings)
+                sink.emit(
+                    events.run_event(
+                        config,
+                        issue=issue.number,
+                        run_id=run_id,
+                        phase=events.PHASE_GATE,
+                        attempt=report.round,
+                    )
+                )
         finally:
             session.finish()
 
@@ -410,6 +424,7 @@ def execute_run(
                 already_failed,
                 auth,
                 log,
+                sink,
             )
 
         section = agent_section or decisions.fallback_section(
@@ -436,6 +451,7 @@ def execute_run(
                 already_failed,
                 auth,
                 log,
+                sink,
             )
         if empty:
             # A concluded no-change Run still ships: one allow-empty commit,
@@ -464,6 +480,16 @@ def execute_run(
         report.pr_number = pr.number
         client.add_labels(pr.number, PR_READY)
         report.phase = "empty-pr" if empty else "pr-open"
+        sink.emit(
+            events.run_event(
+                config,
+                issue=issue.number,
+                run_id=run_id,
+                phase=events.PHASE_PR_OPEN,
+                attempt=report.round,
+                pr=pr.number,
+            )
+        )
 
         _push_run_evidence(
             config, report, issue, job, gate, section, workdir, base_branch, auth, log
@@ -487,6 +513,7 @@ def _fail_run(
     already_failed: bool,
     auth: dict[str, str],
     log,
+    sink: events.EventSink,
 ) -> RunReport:
     """The failed-Run path: evidence, claim strip, re-queue or escalate,
     run-failed marker. Failed Runs never touch attempt-N and open no PR."""
@@ -509,6 +536,15 @@ def _fail_run(
         report.notes.append("re-queued for one retry")
     client.add_comment(
         issue.number, render_run_failed(report.run_id, reason, escalated=already_failed)
+    )
+    sink.emit(
+        events.run_event(
+            config,
+            issue=issue.number,
+            run_id=report.run_id,
+            phase=events.PHASE_ESCALATED if already_failed else events.PHASE_FAILED,
+            attempt=report.round,
+        )
     )
     log(f"run {report.run_id} failed ({reason}); " + report.notes[-1])
     return report

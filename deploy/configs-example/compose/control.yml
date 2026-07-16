@@ -1,0 +1,16 @@
+# Compose document for the control Stack, distributed to its node over the
+# channel as desired state. Digest-pinned product image (never :latest).
+services:
+  control:
+    image: ghcr.io/snowfoxbuilds/theozolith-control:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      THEOZOLITH_NODE_TOKEN_FILE: /run/secrets/node-token
+      THEOZOLITH_ADMIN_TOKEN_FILE: /run/secrets/admin-token
+    volumes:
+      - control-data:/data
+      - /home/ozolith/.theozolith/configs:/configs:ro
+volumes:
+  control-data:

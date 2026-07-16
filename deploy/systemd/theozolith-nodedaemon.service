@@ -1,0 +1,36 @@
+# The Node Daemon unit — the deployment contract from M3 on (ADR-0013).
+# Installed by deploy/install-nodedaemon.sh; edit /etc/theozolith/.env to
+# configure. Every TheOzolith process on this node (the daemon, the driver
+# processes it supervises) lives in this unit's cgroup:
+# KillMode=control-group means they are live descendants or do not exist —
+# no zombie processes by construction. Orphaned run CONTAINERS are reaped by
+# the daemon at startup/each pass; the zombie-claim janitor (Control Node)
+# restores GitHub claim state.
+
+[Unit]
+Description=TheOzolith Node Daemon (Container-Host: Stacks, drivers, builds, heartbeats)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Not root: the daemon only needs docker access and its own state dirs.
+User=ozolith
+Group=ozolith
+SupplementaryGroups=docker
+EnvironmentFile=/etc/theozolith/.env
+ExecStart=/opt/theozolith/bin/theozolith-nodedaemon
+KillMode=control-group
+Restart=always
+RestartSec=10
+# /var/lib/theozolith: config cache + materialized compose files (disk).
+StateDirectory=theozolith
+Environment=THEOZOLITH_STATE_DIR=/var/lib/theozolith
+# /run/theozolith: secrets tmpfs — values never touch node disk and vanish
+# with the daemon (NODE-SUBSTRATE.md).
+RuntimeDirectory=theozolith
+RuntimeDirectoryMode=0700
+Environment=THEOZOLITH_RUNTIME_DIR=/run/theozolith
+
+[Install]
+WantedBy=multi-user.target

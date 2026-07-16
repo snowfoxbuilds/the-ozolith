@@ -1,0 +1,16 @@
+# A derived run-container image (a "worker type"): digest-pinned base +
+# setup instructions + optional Knowledge Source, compiled locally by each
+# container-host into a deterministic tag (base tag + instruction hash).
+# Changing anything here changes the tag; nodes rebuild on their next pass
+# and heartbeats report the new build metadata (skew is visible, ADR-0006).
+
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+setup = [
+    "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",
+    "pip install --no-cache-dir uv",
+]
+
+# Baked at IMAGE BUILD time by the M1 bake CLI — never at container start.
+knowledge_source = "https://github.com/acme/my-knowledge.git"
+knowledge_pin = "0000000000000000000000000000000000000000"

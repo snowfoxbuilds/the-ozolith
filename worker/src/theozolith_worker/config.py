@@ -93,7 +93,10 @@ class DriverConfig:
     run_image: str  # the run-container image the driver launches
     stack: str  # theozolith.owner label on containers this driver creates
     poll_seconds: float
-    control_node_url: str | None  # optional claim pre-filter; None = skipped
+    control_node_url: str | None  # optional pre-filter + events; None = skipped
+    control_token: str  # node bearer token for the Control Node channel
+    control_ca: str | None  # CA bundle pinning a self-signed Control Node
+    node_name: str  # the physical node, for events (M3 heartbeat identity)
     worker_id: str
     jobs_dir: Path  # where per-Run job directories live
     agent_timeout_seconds: float
@@ -142,6 +145,9 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         stack=_first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role,
         poll_seconds=_float(environ, "THEOZOLITH_POLL_SECONDS", "POLL_SECONDS", default="60"),
         control_node_url=env_value(environ, "CONTROL_NODE_URL"),
+        control_token=env_value(environ, "THEOZOLITH_NODE_TOKEN") or "",
+        control_ca=env_value(environ, "THEOZOLITH_TLS_CA"),
+        node_name=env_value(environ, "THEOZOLITH_NODE_NAME") or os.uname().nodename,
         worker_id=worker_id,
         jobs_dir=Path(env_value(environ, "THEOZOLITH_JOBS_DIR", "/var/tmp/theozolith/jobs") or ""),
         agent_timeout_seconds=_float(environ, "THEOZOLITH_AGENT_TIMEOUT_SECONDS", default="3600"),

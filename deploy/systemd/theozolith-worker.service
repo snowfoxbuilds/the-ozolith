@@ -1,6 +1,7 @@
-# Optional systemd unit for the Worker driver (M2: plain host process).
-# Daemon-grade supervision (Node Daemon, cgroup kill-the-tree) lands in M3;
-# until then this unit is a convenience, not the deployment contract.
+# Optional systemd unit for the Worker driver (daemon-less dev shape).
+# From M3 on the deployment contract is the Node Daemon supervising this
+# driver as a process-kind Stack (theozolith-nodedaemon.service, cgroup
+# kill-the-tree; ADR-0013) — this standalone unit remains a convenience.
 #
 #   sudo cp deploy/systemd/theozolith-worker.service /etc/systemd/system/
 #   sudo systemctl edit theozolith-worker   # set User= and the paths below

@@ -22,9 +22,10 @@ from theozolith_worker.bootstrap.vocabulary import PLAN_READY
 from theozolith_worker.claim import attempt_claim, claimable
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import DockerEngine, Engine
+from theozolith_worker.events import PHASE_CLAIMED, EventSink, make_sink, run_event
 from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.prefilter import ClaimPrefilter, make_prefilter
-from theozolith_worker.runner import execute_run
+from theozolith_worker.runner import execute_run, new_run_id
 from theozolith_worker.sessions import ContainerSession, SessionFactory
 
 
@@ -52,11 +53,15 @@ def run_worker(
     sleep=time.sleep,
     once: bool = False,
     log=_log,
+    sink: EventSink | None = None,
 ) -> int:
     """The poll-claim-run loop; returns the number of Runs executed."""
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
-    prefilter = prefilter or make_prefilter(config.control_node_url)
+    prefilter = prefilter or make_prefilter(
+        config.control_node_url, config.control_token, config.control_ca
+    )
+    sink = sink or make_sink(config, log)
     me = client.viewer_login()
     log(f"worker driver {config.worker_id} ({me}) polling {config.repo} for {PLAN_READY}")
 
@@ -70,8 +75,14 @@ def run_worker(
         if claimed is not None:
             runs += 1
             log(f"claimed #{claimed.number} ({claimed.title}); starting run {runs}")
+            # The claimed event goes out before any slow work (clone, agent):
+            # from here the zombie-claim janitor can see this claim (ADR-0015).
+            run_id = new_run_id(config)
+            sink.emit(run_event(config, issue=claimed.number, run_id=run_id, phase=PHASE_CLAIMED))
             try:
-                report = execute_run(config, client, claimed, session_factory, log=log)
+                report = execute_run(
+                    config, client, claimed, session_factory, run_id=run_id, log=log, sink=sink
+                )
                 log(
                     f"run {report.run_id} finished: phase={report.phase} "
                     f"pr={report.pr_number} round={report.round} "

@@ -1,11 +1,15 @@
 [project]
 name = "theozolith-nodedaemon"
-version = "0.1.0"
-description = "Node Daemon: uncontainerized host daemon — heartbeat, command reconciliation, local builds, stack + driver supervision, run-container reaping. Stub; behavior lands in M3."
+version = "0.3.0"
+description = "Node Daemon: uncontainerized host daemon — registration + 60s heartbeats, infrastructure-command reconciliation (drain/recycle/update/rebuild), declarative Stacks (container + supervised process kinds, kill-the-tree), local derived-image builds, tmpfs secret materialization, orphaned run-container reaping."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+# Stdlib only (ADR-0010/0015): the daemon must install trivially on any host.
 dependencies = []
+
+[project.scripts]
+theozolith-nodedaemon = "theozolith_nodedaemon.daemon:main"
 
 [build-system]
 requires = ["hatchling"]
