@@ -1,0 +1,307 @@
+"""End-to-end harness: real drivers + real git remote + in-memory GitHub.
+
+The pipeline under test is the real thing except at three edges: the GitHub
+REST transport is FakeGitHub, run containers are replaced by an in-process
+FakeSession speaking the same job-dir protocol at the driver's session seam,
+and the agents are scripted. Branches, clones, pushes, resets, and
+cherry-picks all hit a genuine bare repo; gate jobs execute for real in the
+checkout under the container's (credential-free) environment.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+from fakegithub import FakeGitHub
+from theozolith_worker import jobdir
+from theozolith_worker.bootstrap.vocabulary import PLAN_READY
+from theozolith_worker.config import DriverConfig, load_config
+from theozolith_worker.containers import ContainerSpec
+from theozolith_worker.evidence import EVIDENCE_BRANCH
+from theozolith_worker.githubapi import GitHubClient
+from theozolith_worker.jobdir import AgentOutcome, Manifest
+from theozolith_worker.prefilter import NullPrefilter
+from theozolith_worker.reviewer import run_reviewer
+from theozolith_worker.shell import run_shell
+from theozolith_worker.worker import run_worker
+
+WORKER_LOGIN = "ozolith-worker-a"
+REVIEWER_LOGIN = "ozolith-reviewer"
+
+# What a run container's process environment looks like from the inside:
+# whatever the driver put in the ContainerSpec, plus the image basics —
+# and nothing from the driver's own environment.
+CONTAINER_BASE_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/home/ozolith"}
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def write_decisions(cwd: Path, **kwargs) -> None:
+    """Write the agent-side decisions file the way a well-behaved agent does."""
+    payload = {
+        "decisions": [],
+        "open_questions": [],
+        "remaining_work": [],
+        "dead_ends": [],
+        **kwargs,
+    }
+    target = cwd / ".theozolith" / "decisions.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload))
+
+
+# A Run behavior: (prompt, checkout) -> AgentOutcome | None (None = completed).
+RunBehavior = Callable[[str, Path], AgentOutcome | None]
+
+
+def behavior_write(files: dict[str, str], **decisions_kwargs) -> RunBehavior:
+    def behavior(prompt: str, cwd: Path) -> None:
+        for relpath, content in files.items():
+            target = cwd / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        write_decisions(cwd, **decisions_kwargs)
+
+    return behavior
+
+
+@dataclass
+class SessionRecord:
+    """What containers the drivers created and whether they were removed."""
+
+    specs: list[ContainerSpec] = field(default_factory=list)
+    launched: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+    @property
+    def alive(self) -> set[str]:
+        return set(self.launched) - set(self.removed)
+
+
+class FakeSession:
+    """In-process stand-in for ContainerSession: same seam, same job dir.
+
+    The scripted "agent" acts on the real checkout/workspace; job commands
+    (gate steps) run in a real shell with the container's env — which is how
+    the credential-isolation test can prove there is nothing to exfiltrate.
+    """
+
+    def __init__(self, spec: ContainerSpec, job: Path, manifest: Manifest, harness: Harness):
+        self.spec = spec
+        self.job = job
+        self.manifest = manifest
+        self.harness = harness
+        self.workdir = job / manifest.workdir
+
+    def _container_env(self) -> dict[str, str]:
+        return {**CONTAINER_BASE_ENV, **self.spec.env}
+
+    def launch(self) -> None:
+        self.harness.record.specs.append(self.spec)
+        self.harness.record.launched.append(self.spec.name)
+
+    def _write_transcript(self, prompt: str) -> None:
+        transcript = self.job / jobdir.TRANSCRIPT_FILE
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(f"[tmux session {self.manifest.session}]\n{prompt}\n")
+
+    def wait_for_agent(self) -> AgentOutcome:
+        prompt = (self.job / jobdir.PROMPT_FILE).read_text()
+        self._write_transcript(prompt)
+        if self.manifest.mode == jobdir.MODE_RUN:
+            self.harness.worker_calls.append((prompt, str(self.workdir)))
+            if self.harness.worker_behaviors:
+                behavior = self.harness.worker_behaviors.pop(0)
+            else:
+                behavior = behavior_write(
+                    {"change.txt": f"run {len(self.harness.worker_calls)}\n"},
+                    decisions=[{"what": "made the change", "why": "the issue asked"}],
+                )
+            outcome = behavior(prompt, self.workdir)
+            return outcome or AgentOutcome(completed=True)
+
+        self.harness.reviewer_prompts.append(prompt)
+        assert self.harness.reviewer_replies, "review round started without a scripted reply"
+        reply = self.harness.reviewer_replies.pop(0)
+        if callable(reply):
+            reply = reply(prompt, self.workdir)
+        if reply is not None:
+            content = reply if isinstance(reply, str) else json.dumps(reply)
+            (self.workdir / "verdict.json").write_text(content)
+        # Mimic the harness adapter's collect step.
+        emitted = self.workdir / "verdict.json"
+        if emitted.is_file():
+            target = self.job / jobdir.VERDICT_FILE
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(emitted.read_text())
+        return AgentOutcome(completed=True)
+
+    def run_job(self, name: str, command: str, timeout: float) -> tuple[bool, str]:
+        self.harness.gate_jobs.append(command)
+        ok, _, output = run_shell(command, self.workdir, timeout, env=self._container_env())
+        return ok, output
+
+    def finish(self) -> None:
+        self.harness.record.removed.append(self.spec.name)
+
+
+@dataclass
+class Harness:
+    fake: FakeGitHub
+    remote: Path
+    worker_config: DriverConfig
+    reviewer_config: DriverConfig
+    worker_client: GitHubClient
+    reviewer_client: GitHubClient
+    record: SessionRecord = field(default_factory=SessionRecord)
+    worker_behaviors: list[RunBehavior] = field(default_factory=list)
+    worker_calls: list[tuple[str, str]] = field(default_factory=list)  # (prompt, workdir)
+    reviewer_replies: list = field(default_factory=list)  # dict | str | None | callable
+    reviewer_prompts: list[str] = field(default_factory=list)
+    gate_jobs: list[str] = field(default_factory=list)
+    worker_sleeps: list[float] = field(default_factory=list)
+    logs: list[str] = field(default_factory=list)
+
+    # -- driving the drivers --------------------------------------------------
+
+    def session_factory(self, spec: ContainerSpec, job: Path, manifest: Manifest) -> FakeSession:
+        return FakeSession(spec, job, manifest, self)
+
+    def worker_once(self, prefilter=None, client: GitHubClient | None = None) -> int:
+        return run_worker(
+            self.worker_config,
+            client or self.worker_client,
+            self.session_factory,
+            prefilter or NullPrefilter(),
+            once=True,
+            log=self.logs.append,
+        )
+
+    def reviewer_once(self) -> int:
+        return run_reviewer(
+            self.reviewer_config,
+            self.reviewer_client,
+            self.session_factory,
+            once=True,
+            log=self.logs.append,
+        )
+
+    # -- GitHub-side helpers --------------------------------------------------
+
+    def file_issue(self, title: str, body: str, risk: str = "medium") -> int:
+        """A human files an issue and approves the plan (plan_ready + risk)."""
+        return self.fake.create_issue(title, body, {PLAN_READY, f"risk:{risk}"})
+
+    def human_comment(self, number: int, body: str) -> None:
+        self.fake.comments[number].append(
+            {
+                "id": 90_000 + len(self.fake.comments[number]),
+                "user": {"login": "sean"},
+                "body": body,
+                "created_at": self.fake._timestamp(),
+            }
+        )
+
+    def human_requeue(self, issue_number: int, pr_number: int) -> None:
+        """The human answers a blocked PR and re-queues the issue."""
+        issue = self.fake.issues[issue_number]
+        issue["assignees"] = []
+        issue["labels"] = [label for label in issue["labels"] if label["name"] != "in_progress"] + [
+            {"name": PLAN_READY}
+        ]
+        pr = self.fake.issues[pr_number]
+        pr["labels"] = [
+            label for label in pr["labels"] if label["name"] not in ("blocked", "needs_human")
+        ]
+
+    # -- git-side helpers -----------------------------------------------------
+
+    def remote_sha(self, branch: str) -> str:
+        args = ["--git-dir", str(self.remote), "rev-parse", f"refs/heads/{branch}"]
+        return _git(args, self.remote)
+
+    def remote_file(self, branch: str, path: str) -> str:
+        args = ["--git-dir", str(self.remote), "show", f"refs/heads/{branch}:{path}"]
+        return _git(args, self.remote)
+
+    def remote_paths(self, branch: str) -> set[str]:
+        listing = _git(
+            ["--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", f"refs/heads/{branch}"],
+            self.remote,
+        )
+        return set(listing.splitlines())
+
+    def evidence_paths(self) -> set[str]:
+        try:
+            return self.remote_paths(EVIDENCE_BRANCH)
+        except subprocess.CalledProcessError:
+            return set()
+
+    def evidence_file(self, path: str) -> str:
+        return self.remote_file(EVIDENCE_BRANCH, path)
+
+
+def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
+    remote = tmp_path / "remote.git"
+    _git(["init", "--bare", "--quiet", "--initial-branch", "main", str(remote)], tmp_path)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(["init", "--quiet", "--initial-branch", "main"], seed)
+    (seed / "README.md").write_text("# sandbox\n")
+    if gate_toml is not None:
+        gate_path = seed / ".theozolith" / "gate.toml"
+        gate_path.parent.mkdir(parents=True)
+        gate_path.write_text(gate_toml)
+    _git(["add", "--all"], seed)
+    identity = ["-c", "user.name=seed", "-c", "user.email=seed@example.com"]
+    _git([*identity, "commit", "--quiet", "-m", "seed"], seed)
+    _git(["remote", "add", "origin", str(remote)], seed)
+    _git(["push", "--quiet", "origin", "main"], seed)
+
+    fake = FakeGitHub(git_dir=remote)
+    fake.register("tok-worker-a", WORKER_LOGIN)
+    fake.register("tok-reviewer", REVIEWER_LOGIN)
+
+    base_env = {
+        "THEOZOLITH_REPO": fake.repo,
+        "THEOZOLITH_CLONE_URL": f"file://{remote}",
+        "THEOZOLITH_POLL_SECONDS": "0",
+        "THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs"),
+        "THEOZOLITH_WORKER_ID": "worker-a",
+        # The model API key is ALLOWED in run containers (a rotatable spend
+        # credential); the GitHub PATs are not (ADR-0013).
+        "ANTHROPIC_API_KEY": "model-key",
+    }
+    worker_config = load_config({**base_env, "GITHUB_TOKEN": "tok-worker-a"}, role="worker")
+    reviewer_config = load_config({**base_env, "GITHUB_TOKEN": "tok-reviewer"}, role="reviewer")
+
+    harness = Harness(
+        fake=fake,
+        remote=remote,
+        worker_config=worker_config,
+        reviewer_config=reviewer_config,
+        worker_client=GitHubClient(fake.repo, "tok-worker-a", transport=fake, sleep=lambda s: None),
+        reviewer_client=GitHubClient(
+            fake.repo, "tok-reviewer", transport=fake, sleep=lambda s: None
+        ),
+    )
+    harness.worker_client._sleep = harness.worker_sleeps.append  # type: ignore[attr-defined]
+    return harness
+
+
+@pytest.fixture
+def harness(tmp_path: Path) -> Harness:
+    """Sandbox repo with a green one-step gate (the common case)."""
+    return make_harness(
+        tmp_path,
+        gate_toml='[steps.test]\nrun = "test -f README.md"\n',
+    )

@@ -1,7 +1,7 @@
 [project]
 name = "theozolith-worker"
-version = "0.1.0"
-description = "Coding-pipeline component: Worker + Reviewer actors (later milestones) and the repo bootstrap tool (label vocabulary + issue forms) that the pipeline substrate requires."
+version = "0.2.0"
+description = "Coding-pipeline component: the Worker and Reviewer drivers (poll-claim-run loop, Claim Protocol, per-Run containers, first-party quality gate, best-effort PRs with Decisions Sections, verdict-file review rounds), the agent harness that is PID 1 of every run container, and the repo bootstrap tool (label vocabulary + issue forms) that the pipeline substrate requires."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -9,6 +9,10 @@ dependencies = []
 
 [project.scripts]
 theozolith-bootstrap = "theozolith_worker.bootstrap.cli:main"
+theozolith-worker = "theozolith_worker.worker:main"
+theozolith-reviewer = "theozolith_worker.reviewer:main"
+theozolith-harness = "theozolith_worker.harness.main:main"
+theozolith-validate-verdict = "theozolith_worker.harness.validate:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -18,4 +22,4 @@ build-backend = "hatchling.build"
 packages = ["src/theozolith_worker"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pyyaml>=6"]
+dev = ["pytest>=8"]

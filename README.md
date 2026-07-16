@@ -7,10 +7,12 @@ An open-source agent-orchestration monorepo with three separable concerns:
   a one-way sync engine into local tool config dirs; and a bake CLI for installing a pinned
   Knowledge Source into a container image at build time.
 - **Agentic coding pipeline** (`worker/`) — staged autonomous development on GitHub issues
-  and PRs: Workers, Runs, a first-party gate, and a Reviewer actor. M1 ships the repo
-  bootstrap tool (label vocabulary + issue forms); the actors land in later milestones.
-- **Cluster substrate** (`control/`, `nodeagent/`, `deploy/`) — Control Node, Node Agents,
-  and Stacks. Stubs in M1; they land in later milestones.
+  and PRs: Worker and Reviewer drivers, per-Run containers with the agent harness as PID 1,
+  the Claim Protocol, a first-party gate, best-effort PRs with Decisions Sections, and
+  verdict-file review rounds (M2; ADR-0013). Plus the repo bootstrap tool from M1.
+- **Cluster substrate** (`control/`, `nodedaemon/`, `deploy/`) — Control Node, Node Daemons,
+  and Stacks. `deploy/` documents the M2 one-box driver deployment; the Control Node and
+  Node Daemon land in M3.
 
 Every top-level component is independently installable. A laptop-only user of the knowledge
 machinery never installs the cluster manager.

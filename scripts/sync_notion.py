@@ -8,8 +8,6 @@ Project tooling, not product (ARCHITECTURE.md). Exports:
   - CONTEXT.md     -> <output_dir>/CONTEXT.md
   - Specs/*        -> <output_dir>/docs/specs/<page_title>
   - ADRs/*         -> <output_dir>/docs/adr/<page_title>
-  - TODO           -> <output_dir>/TODO.md
-  - TODO_COMPLETED -> <output_dir>/docs/TODO_COMPLETED.md
 
 Usage:
   python3 scripts/sync_notion.py
@@ -293,30 +291,14 @@ def sync(project_root_id: str, output_dir: str):
     else:
         print("  ! No 'Specs' page found under project root")
 
-    # 3. Export TODO -> <output_dir>/TODO.md
-    todo_page = next((c for c in children if c["title"] == "TODO"), None)
-    if todo_page:
-        export_page(todo_page["id"], os.path.join(output_dir, "TODO.md"))
-    else:
-        print("  ! No 'TODO.md' page found under project root")
-
-    # 4. Export TODO_COMPLETED -> <output_dir>/TODO_COMPLETED.md
-    todo_completed_page = next((c for c in children if c["title"] == "TODO_COMPLETED"), None)
-    if todo_completed_page:
-        export_page(
-            todo_completed_page["id"], os.path.join(output_dir, "docs", "TODO_COMPLETED.md")
-        )
-    else:
-        print("  ! No 'TODO_COMPLETED.md' page found under project root")
-
-    # 5. Export CONTEXT -> <output_dir>/CONTEXT.md
+    # 3. Export CONTEXT -> <output_dir>/CONTEXT.md
     context_page = next((c for c in children if c["title"] == "CONTEXT.md"), None)
     if context_page:
         export_page(context_page["id"], os.path.join(output_dir, "CONTEXT.md"))
     else:
         print("  ! No 'CONTEXT.md' page found under project root")
 
-    # 6. Export ADRs/* -> <output_dir>/docs/adr/<title>
+    # 4. Export ADRs/* -> <output_dir>/docs/adr/<title>
     adrs_page = next((c for c in children if c["title"] == "ADRs"), None)
     if adrs_page:
         adrs_children = get_child_pages(adrs_page["id"])

@@ -1,0 +1,66 @@
+# The Claude run-container image: what a Worker or Reviewer driver launches
+# for every Run and review round (ADR-0013). PID 1 is the agent harness —
+# credential-free plumbing that runs the interactive Claude session in tmux,
+# serves driver-sequenced gate jobs, and exits; container lifetime = Run
+# lifetime. The driver bind-mounts the per-Run job directory at /job.
+#
+# Build from the repo root:
+#   docker build -f worker/docker/Dockerfile.claude \
+#     [--build-arg KNOWLEDGE_SOURCE=https://…/my-knowledge.git \
+#      --build-arg KNOWLEDGE_PIN=<commit-sha>] \
+#     [--build-arg OZOLITH_UID=1000] \
+#     -t theozolith-run-claude:local .
+#
+# The optional Knowledge Source is baked at BUILD time by the M1 bake CLI;
+# nothing syncs or executes at container start (NODE-SUBSTRATE.md).
+#
+# No GitHub credential ever enters this image or its containers: the driver
+# holds the PAT and performs all GitHub I/O. The only secret a run container
+# sees is the model API key (a rotatable spend credential, ADR-0013).
+
+FROM python:3.13-slim
+
+# git: the agent inspects the checkout (the driver does all pushes).
+# tmux: every agent session is interactive and attachable
+#   (docker exec -it <container> tmux attach).
+# nodejs/npm: the Claude Code CLI.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git tmux ca-certificates nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code
+
+# The agent must not run as root (the Claude CLI refuses
+# --dangerously-skip-permissions for root, and the Run needs no privileges).
+# Match OZOLITH_UID to the driver user's uid so files written to the mounted
+# job directory stay owned by the driver (deploy/README.md); alternatively
+# launch with THEOZOLITH_CONTAINER_USER and rely on the a+rwX home below.
+ARG OZOLITH_UID=1000
+RUN useradd --create-home --shell /bin/bash --uid "${OZOLITH_UID}" ozolith
+
+# Install the knowledge machinery and the worker component (for the
+# theozolith-harness entrypoint) from the build context.
+COPY knowledge /opt/theozolith/knowledge
+COPY worker /opt/theozolith/worker
+RUN pip install --no-cache-dir /opt/theozolith/knowledge /opt/theozolith/worker
+
+# Bake the pinned Knowledge Source (skills, subagents, workflows) into the
+# image's Claude config dir when one is declared.
+ARG KNOWLEDGE_SOURCE=""
+ARG KNOWLEDGE_PIN=""
+RUN if [ -n "$KNOWLEDGE_SOURCE" ]; then \
+        theozolith-knowledge bake \
+            --source "$KNOWLEDGE_SOURCE" \
+            --pin "$KNOWLEDGE_PIN" \
+            --target /home/ozolith/.claude \
+        && chown -R ozolith:ozolith /home/ozolith/.claude; \
+    fi
+
+# Keep the home usable when the driver overrides the container user to its
+# own uid (THEOZOLITH_CONTAINER_USER): the CLI reads and writes ~/.claude.
+RUN chmod -R a+rwX /home/ozolith
+
+USER ozolith
+ENV HOME=/home/ozolith
+WORKDIR /job
+
+ENTRYPOINT ["theozolith-harness"]

@@ -10,6 +10,12 @@ The entire configuration for one coding tool — Claude, Codex, or Pi. Tool-scop
 
 *Avoid*: confusing with "Claude agent" (a single subagent file, a much smaller unit).
 
+**Agent Harness**
+
+The credential-free half of a Worker or Reviewer: PID 1 of an ephemeral run container. Starts the interactive tmux session, injects the prompt, awaits the per-adapter completion marker (timeout as backstop), writes outputs (decisions or verdict file, transcript, status) into the job directory, and exits — container lifetime = Run lifetime. Dumb plumbing by design: no GitHub knowledge, no policy, no state; it never appears in pipeline-state sentences.
+
+*Avoid*: "driver" (the credentialed node-resident half); giving the harness any credential or decision authority.
+
 **Claim Protocol**
 
 How a Worker takes exclusive ownership of a plan_ready issue: self-assign plus the in_progress label on GitHub, then re-read to verify sole assignee (back off otherwise). Claims may route through the Control Node as a race pre-filter when it is reachable; the GitHub assign-and-verify step remains the only authority.
@@ -30,13 +36,13 @@ The single source of truth for one deployment's customizations: Stack definition
 
 **Container-Host**
 
-The node type a physical machine becomes when the Node Agent is installed on it: it runs Stacks as containers under desired-state control and builds derived images locally when instructed. The daemon runs on the host; only workloads are containerized.
+The node type a physical machine becomes when the Node Daemon is installed on it: it runs Stacks (container workloads and supervised driver processes) under desired-state control and builds derived images locally when instructed. The daemon runs on the host; only agent workloads are containerized.
 
-*Avoid*: containerizing the Node Agent; "builder node" (removed — every container-host builds its own images).
+*Avoid*: containerizing the Node Daemon; "builder node" (removed — every container-host builds its own images).
 
 **Control Node**
 
-The product's central service, shipped in TheOzolith's control/ component (deployed on the Pi). Renders the fleet dashboard; receives Node Agent heartbeats and Run events; answers heartbeats with infrastructure commands (drain, recycle, update); sweeps zombie claims and audits retry counts. Authoritative for node and docker lifecycle; advisory only in issue coordination — the pipeline ships PRs without it.
+The product's central service, shipped in TheOzolith's control/ component (deployed on the Pi). Renders the fleet dashboard; receives Node Daemon heartbeats and Run events; answers heartbeats with infrastructure commands (drain, recycle, update); sweeps zombie claims and audits retry counts. Authoritative for node and docker lifecycle; advisory only in issue coordination — the pipeline ships PRs without it.
 
 *Avoid*: "dispatcher"; treating it as claim or coordination authority.
 
@@ -46,17 +52,23 @@ The mandatory section of every best-effort PR description. Fixed schema (inherit
 
 *Avoid*: "Handoff Doc" (retired term — the schema now lives in the PR description); relying on agent-native session files (never load-bearing).
 
+**Driver**
+
+The trusted, credentialed half of a Worker or Reviewer: a node-resident process, spawned and supervised by the Node Daemon as a process-kind Stack. Polls GitHub, runs the Claim Protocol, materializes job inputs, creates per-Run containers, sequences gate steps as harness jobs, and performs every GitHub read and write. Holds the actor's PAT; never executes repo code or model output.
+
+*Avoid*: "agent harness" (the credential-free in-container half); running driver logic inside a container or inside the Node Daemon process.
+
 **Knowledge Source**
 
 An optional field on a worker-type definition: a git URL + pin pointing at a repo of agent knowledge (skills, subagents, workflows) that the knowledge machinery bakes into the derived image at build time. The same content syncs to laptop tool dirs.
 
 *Avoid*: putting machinery in the knowledge repo (it is pure data); baking at container start.
 
-**Node Agent**
+**Node Daemon**
 
-The uncontainerized TheOzolith daemon installed on every physical node, registering it as a Container-Host. Sends heartbeats (node and stack status) to the Control Node; reconciles infrastructure commands (drain, recycle, update, rebuild); pulls config and node-scoped secrets; builds derived images locally and manages docker stack lifecycle on its box. The private config repo's stacks (former homeserver workloads) run through it.
+The uncontainerized TheOzolith daemon installed on every physical node, registering it as a Container-Host. Runs as a systemd unit with cgroup kill semantics — every TheOzolith process on the node is a live descendant of the Node Daemon or does not exist. Sends heartbeats (node, stack, and run-container status) to the Control Node; reconciles infrastructure commands (drain, recycle, update, rebuild); pulls config and node-scoped secrets; builds derived images locally; supervises container and process Stacks (Worker/Reviewer drivers are its children); reaps orphaned run containers by label. The private config repo's stacks (former homeserver workloads) run through it.
 
-*Avoid*: "agent" (an Agent is a tool config); the legacy Home Server node agent (replaced by this); running the daemon itself in a container.
+*Avoid*: "Node Agent" (retired 2026-07-15 — Agent is reserved for tool configs; ADR-0013); the legacy Home Server node agent (replaced by this); running the daemon itself in a container.
 
 **Orchestrator**
 
@@ -66,13 +78,13 @@ The whole agentic coding pipeline system: planning, execution, review, and monit
 
 **Reviewer**
 
-A separate long-lived actor — own container, own GitHub identity, configured with a stronger model than the Worker adapters — that polls PRs labeled pr_ready without needs_human and owns all post-PR state. Verdicts: approve (needs_human + deviation/risk labels), revise (attempt-N on the PR, revised plan + resume commit, issue re-queued to plan_ready under delegated authority), escalate (blocked + needs_human). Never implements; no self-grading by construction.
+A separate long-lived actor — own node-resident driver, own GitHub identity, configured with a stronger model than the Worker adapters — that polls PRs labeled pr_ready without needs_human and owns all post-PR state. Verdicts: approve (needs_human + deviation/risk labels), revise (attempt-N on the PR, revised plan + resume commit, issue re-queued to plan_ready under delegated authority), escalate (blocked + needs_human). Review rounds execute as ephemeral containers; the verdict is emitted as a file and published by the reviewer driver. Never implements; no self-grading by construction.
 
 *Avoid*: running review as a gate step inside the Run.
 
 **Run**
 
-One attempt at one GitHub issue by a Worker, always ending in a best-effort PR when a checkout is reached. Stateless and disposable: fresh clone/worktree and fresh context; the only carryover is PR branch content at the Reviewer-designated resume commit. The unit of review rounds (3 max) and evidence bundles.
+One attempt at one GitHub issue by a Worker, always ending in a best-effort PR when a checkout is reached. Stateless and disposable: fresh clone/worktree, fresh run container, and fresh context; the only carryover is PR branch content at the Reviewer-designated resume commit. Executes in exactly one ephemeral, attachable run container with the agent harness as PID 1. The unit of review rounds (3 max) and evidence bundles.
 
 *Avoid*: "job"; "task" (that is the issue).
 
@@ -84,15 +96,15 @@ A reusable instruction module: a folder containing `SKILL.md` plus optional scri
 
 **Stack**
 
-A declarative unit of workload the Node Agent runs: name, image or compose file (plus overlays), placement, desired state. Built-in Stacks (worker, reviewer, control) and user-defined Stacks (e.g. a script runner) share the same format.
+A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command run as a supervised Node Daemon child — how Worker and Reviewer drivers deploy). Built-in Stacks (worker, reviewer, control) and user-defined Stacks (e.g. a script runner) share the same format.
 
 *Avoid*: "role" (legacy Home Server term).
 
 **Worker**
 
-A long-lived container bound to one Agent config. Polls GitHub for plan_ready issues, claims via the Claim Protocol, and executes Runs sequentially, one at a time — each Run ends in a best-effort PR with a Decisions Section. Recycled on a schedule; holds no authoritative state and owns no post-PR labels.
+A long-lived driver process on a container-host, bound to one Agent config (ADR-0013 — not a container). Polls GitHub for plan_ready issues, claims via the Claim Protocol, and executes Runs sequentially, one at a time, each as an ephemeral run container — every Run ends in a best-effort PR with a Decisions Section. Holds no authoritative state and owns no post-PR labels.
 
-*Avoid*: "runner"; "agent" (an Agent is a config, not a process).
+*Avoid*: "runner"; "agent" (an Agent is a config, not a process); "long-lived container" (retracted 2026-07-15).
 
 **Workflow**
 
@@ -108,12 +120,13 @@ A configuration that involves multiple agents working together.
 - A Workflow involves two or more agents.
 - The Orchestrator comprises planning (GitHub issues), execution (Workers and Runs), review (Reviewer actor plus human), and monitoring (Control Node).
 - A Worker is bound to exactly one Agent config and executes one Run at a time.
+- A Worker or Reviewer = one node-resident driver plus one ephemeral run container per Run or review round; driver and harness communicate only through the job directory.
 - A Run belongs to exactly one Worker and targets exactly one GitHub issue.
 - The Control Node observes Workers and Runs; GitHub owns all coordination state.
 - A Decisions Section belongs to exactly one PR; all review rounds for an issue reuse that one PR and branch.
 - The Reviewer owns all post-PR state and never implements; the Worker implements and owns only claim state plus pr_ready at push.
-- A Node Agent runs on exactly one box, manages its docker stacks, and heartbeats to the Control Node.
-- The Config Repo declares Stacks; Node Agents reconcile them from desired state received over the heartbeat/command channel.
+- A Node Daemon runs on exactly one box, supervises its Stacks (container workloads and driver processes in its cgroup), and heartbeats to the Control Node.
+- The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
 - The command channel carries desired state and references; the only payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
 - Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision). Issues and PRs carry separate label sets; each actor polls exactly one label.
-- TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodeagent, deploy); all private content is data in one private config repo (ADR-0007).
+- TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content is data in one private config repo (ADR-0007).

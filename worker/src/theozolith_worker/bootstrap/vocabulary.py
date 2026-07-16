@@ -12,6 +12,32 @@ from importlib import resources
 
 ROUND_BUDGET = 3
 
+# Label names as constants for the actors (names must match LABELS below).
+DRAFT = "draft"
+PLAN_READY = "plan_ready"
+IN_PROGRESS = "in_progress"
+PR_READY = "pr_ready"
+BLOCKED = "blocked"
+NEEDS_HUMAN = "needs_human"
+RISK_PREFIX = "risk:"
+DEVIATION_PREFIX = "deviation:"
+ATTEMPT_PREFIX = "attempt-"
+
+
+def attempt_label(round_number: int) -> str:
+    return f"{ATTEMPT_PREFIX}{round_number}"
+
+
+def attempts_on(labels: set[str]) -> int:
+    """Highest attempt-N present in ``labels`` (0 if none)."""
+    rounds = [0]
+    for name in labels:
+        if name.startswith(ATTEMPT_PREFIX):
+            suffix = name.removeprefix(ATTEMPT_PREFIX)
+            if suffix.isdigit():
+                rounds.append(int(suffix))
+    return max(rounds)
+
 
 @dataclass(frozen=True)
 class Label:
