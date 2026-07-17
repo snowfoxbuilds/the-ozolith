@@ -29,6 +29,11 @@ def issue_evidence_url(repo: str, issue_number: int) -> str:
     return f"https://github.com/{repo}/tree/{EVIDENCE_BRANCH}/runs/issue-{issue_number}"
 
 
+def run_evidence_url(repo: str, issue_number: int, run_id: str) -> str:
+    """Web URL of one Run's evidence bundle."""
+    return f"https://github.com/{repo}/tree/{EVIDENCE_BRANCH}/{run_dir(issue_number, run_id)}"
+
+
 def _prepare_checkout(clone_url: str, workdir: Path, env: dict[str, str] | None) -> None:
     try:
         gitops.clone(clone_url, workdir, branch=EVIDENCE_BRANCH, env=env)

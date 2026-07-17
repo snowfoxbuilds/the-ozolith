@@ -11,6 +11,14 @@ One pass every heartbeat interval (60s):
    Stacks: build missing derived images, start/stop process children and
    container workloads, and reap orphaned run containers (owner gone).
 
+Queue-behind (NODE-SUBSTRATE, grilling 2026-07-17): recycle and update
+received mid-Run defer behind the current Run — job-dir presence under a
+live driver child is the in-flight signal; a dead child proceeds
+immediately (orphaned dirs never block). A deferred command is simply not
+acknowledged (the Control Node re-delivers it every heartbeat) and the
+heartbeat reports the deferral; --force keeps ADR-0013 kill-the-tree
+semantics. Drain stays immediate by design.
+
 Command acknowledgements persist to disk before they ride the next
 heartbeat, so a crash (or the update command's re-exec) never replays a
 completed command. Drain marks persist too: a drained Stack stays down
@@ -44,6 +52,10 @@ from theozolith_nodedaemon.stacks import (
 )
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
+
+# Where a driver Stack keeps per-Run job directories unless its env says
+# otherwise — must match the worker config default (ADR-0013).
+DEFAULT_JOBS_DIR = "/var/tmp/theozolith/jobs"
 
 
 def _log(message: str) -> None:
@@ -99,6 +111,8 @@ class NodeDaemon:
         self._completed: list[int] = _read_json(self._acks_path, [])
         self._applied_compose: dict[str, str] = {}
         self._rebuild_targets: set[str] = set()
+        # Queue-behind: command id -> deferral reason, reported in heartbeats.
+        self._deferrals: dict[int, str] = {}
 
     @property
     def _acks_path(self) -> Path:
@@ -161,6 +175,11 @@ class NodeDaemon:
             "images": [image_status(self._docker, img) for img in self._images().values()],
             "config_commit": self._desired.get("commit", ""),
             "completed_commands": list(self._completed),
+            # Queue-behind visibility: what is waiting behind an in-flight Run.
+            "deferred_commands": [
+                {"id": command_id, "reason": reason}
+                for command_id, reason in sorted(self._deferrals.items())
+            ],
         }
 
     def _exchange_heartbeat(self) -> list[dict[str, Any]]:
@@ -194,6 +213,19 @@ class NodeDaemon:
         verb = command.get("verb", "")
         target = command.get("target") or None
         command_id = command.get("id")
+        if verb in ("recycle", "update") and not command.get("force"):
+            blocker = self._inflight_blocker([target] if verb == "recycle" and target else None)
+            if blocker is not None and isinstance(command_id, int):
+                # Queue-behind: no ack, so the Control Node re-delivers the
+                # command every heartbeat and this check re-runs until the
+                # Run ends (or a --force arrives). Grants to this node pause
+                # meanwhile (dispatch gate), bounding the deferral.
+                if self._deferrals.get(command_id) != blocker:
+                    self._log(f"command {command_id}: {verb} deferred ({blocker})")
+                self._deferrals[command_id] = blocker
+                return
+        if isinstance(command_id, int):
+            self._deferrals.pop(command_id, None)
         self._log(f"command {command_id}: {verb}" + (f" {target}" if target else ""))
         try:
             if verb == "drain":
@@ -221,6 +253,24 @@ class NodeDaemon:
 
     def _stack_by_name(self, name: str) -> WireStack | None:
         return next((s for s in self._stacks() if s.name == name), None)
+
+    def _inflight_blocker(self, names: list[str] | None) -> str | None:
+        """The in-flight signal for queue-behind: a live driver child whose
+        jobs dir holds a job directory. A dead child never blocks — its
+        orphaned dirs are the boot sweep's business, not a Run."""
+        for stack in self._stacks():
+            if names is not None and stack.name not in names:
+                continue
+            if stack.kind != "process" or not self._supervisor.alive(stack.name):
+                continue
+            jobs_dir = Path(stack.env.get("THEOZOLITH_JOBS_DIR", DEFAULT_JOBS_DIR))
+            try:
+                running = sorted(p.name for p in jobs_dir.iterdir() if p.is_dir())
+            except OSError:
+                running = []
+            if running:
+                return f"behind run {running[0]} (stack {stack.name})"
+        return None
 
     def _stop_stack(self, stack: WireStack) -> None:
         """Stop a Stack AND its labeled run containers (kill-the-tree)."""

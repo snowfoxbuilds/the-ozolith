@@ -1,10 +1,14 @@
 """Driver-side Run/review event emission to the Control Node.
 
 Events are the drivers' observability channel (NODE-SUBSTRATE.md typed event
-API): namespaced facts about the past, emitted best-effort. The Control Node
-is advisory (ADR-0002), so every failure mode — no CONTROL_NODE_URL, node
-down, TLS trouble, garbled answer — is a clean skip that never delays or
-fails a Run. The zombie-claim janitor and the retry auditor read these
+API): namespaced facts about the past plus advisory run-progress telemetry
+(ADR-0016), emitted best-effort. Every failure mode — node down, TLS
+trouble, garbled answer — is a swallowed skip that never fails a Run;
+``emit`` answers whether the event landed so the one delivery that matters
+(the claimed event that activates a dispatch grant, ADR-0017) can be
+retried and acted on.
+
+The zombie-claim janitor, the quarantine gate, and the dashboard read these
 events; the pipeline itself never does.
 """
 
@@ -12,33 +16,45 @@ from __future__ import annotations
 
 import json
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Protocol
 
+from theozolith_worker import jobdir
 from theozolith_worker.config import DriverConfig
 
 RUN_EVENT = "theozolith.run"
 REVIEW_EVENT = "theozolith.review"
+PROGRESS_EVENT = "theozolith.run.progress"
 
-# The Worker Run phases (ADR-0015): claimed and gate are "in flight" (what
-# the janitor watches); pr-open, failed, and escalated are terminal.
+# The Worker Run phases (ADR-0015/0016): claimed and gate are "in flight"
+# (what the janitor watches); pr-open, failed, and escalated are terminal.
+# Every non-completed Run emits failed; a spent local-retry budget adds
+# escalated for the claim.
 PHASE_CLAIMED = "claimed"
 PHASE_GATE = "gate"
 PHASE_PR_OPEN = "pr-open"
 PHASE_FAILED = "failed"
 PHASE_ESCALATED = "escalated"
 
+# Kept below the Control Node's ingestion cap (ADR-0016) with headroom.
+TRANSCRIPT_TAIL_CHARS = 4_000
+
 
 class EventSink(Protocol):
-    def emit(self, event: dict[str, Any]) -> None: ...
+    def emit(self, event: dict[str, Any]) -> bool:
+        """True when the event demonstrably landed on the Control Node."""
+        ...
 
 
 class NullSink:
-    """No Control Node configured: events go nowhere, silently."""
+    """No Control Node configured (tests, tooling): events go nowhere."""
 
-    def emit(self, event: dict[str, Any]) -> None:
-        return None
+    def emit(self, event: dict[str, Any]) -> bool:
+        return True
 
 
 class ControlNodeSink:
@@ -59,7 +75,7 @@ class ControlNodeSink:
         self._timeout = timeout
         self._log = log
 
-    def emit(self, event: dict[str, Any]) -> None:
+    def emit(self, event: dict[str, Any]) -> bool:
         request = urllib.request.Request(
             self._url,
             data=json.dumps(event).encode(),
@@ -83,6 +99,8 @@ class ControlNodeSink:
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             if self._log:
                 self._log(f"event emission skipped ({event.get('type')}): {exc}")
+            return False
+        return True
 
 
 def make_sink(config: DriverConfig, log=None) -> EventSink:
@@ -131,3 +149,110 @@ def review_event(
         "round": round_number,
         "verdict": verdict,
     }
+
+
+# -- run-progress telemetry (ADR-0016) ------------------------------------------
+
+
+def _count_hook_events(job: Path) -> dict[str, int]:
+    try:
+        lines = (job / jobdir.HOOK_EVENTS_FILE).read_text(encoding="utf-8").split()
+    except OSError:
+        lines = []
+    counts: dict[str, int] = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    return counts
+
+
+def progress_event(
+    config: DriverConfig,
+    job: Path,
+    *,
+    issue: int,
+    run_id: str,
+    attempt: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """A snapshot of the job directory as advisory telemetry. The transcript
+    tail is agent-authored text: untrusted wherever displayed, size-capped
+    here and again at ingestion."""
+    status = jobdir.read_status(job)
+    try:
+        transcript = (job / jobdir.TRANSCRIPT_FILE).read_text(encoding="utf-8")
+    except OSError:
+        transcript = ""
+    counts = _count_hook_events(job)
+    return {
+        "type": PROGRESS_EVENT,
+        "worker": config.worker_id,
+        "node": config.node_name,
+        "stack": config.stack,
+        "issue": issue,
+        "run_id": run_id,
+        "attempt": attempt,
+        "phase": status.phase if status else "starting",
+        "elapsed_seconds": round(elapsed_seconds, 1),
+        # Counters: tool calls and operator prompts from the adapter's hook
+        # log; token counts need adapter support the claude adapter does not
+        # have yet (recorded as remaining work in the M4 ADR).
+        "tool_calls": counts.get("tool", 0),
+        "prompts": counts.get("prompt", 0),
+        "tokens": None,
+        "transcript_bytes": len(transcript.encode("utf-8")),
+        "transcript_tail": transcript[-TRANSCRIPT_TAIL_CHARS:],
+    }
+
+
+class ProgressReporter:
+    """Emits a progress event immediately and then on an interval while a
+    Run's agent phase is in flight. Best-effort by construction: the thread
+    only reads the job directory and every emission failure is swallowed."""
+
+    def __init__(
+        self,
+        config: DriverConfig,
+        sink: EventSink,
+        job: Path,
+        *,
+        issue: int,
+        run_id: str,
+        attempt: int,
+    ):
+        self._config = config
+        self._sink = sink
+        self._job = job
+        self._issue = issue
+        self._run_id = run_id
+        self._attempt = attempt
+        self._interval = config.progress_seconds
+        self._started_at = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="run-progress")
+
+    def _emit_once(self) -> None:
+        self._sink.emit(
+            progress_event(
+                self._config,
+                self._job,
+                issue=self._issue,
+                run_id=self._run_id,
+                attempt=self._attempt,
+                elapsed_seconds=time.monotonic() - self._started_at,
+            )
+        )
+
+    def _loop(self) -> None:
+        self._emit_once()
+        while not self._stop.wait(self._interval):
+            self._emit_once()
+
+    def __enter__(self) -> ProgressReporter:
+        if self._interval > 0:
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)

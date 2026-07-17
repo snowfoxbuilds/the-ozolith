@@ -18,6 +18,7 @@ PLAN_READY = "plan_ready"
 IN_PROGRESS = "in_progress"
 PR_READY = "pr_ready"
 BLOCKED = "blocked"
+FAILED = "failed"
 NEEDS_HUMAN = "needs_human"
 RISK_PREFIX = "risk:"
 DEVIATION_PREFIX = "deviation:"
@@ -56,6 +57,12 @@ LABELS: tuple[Label, ...] = (
     Label("in_progress", "fbca04", "Claimed by a Worker; a Run is in flight."),
     Label("pr_ready", "1d76db", "PR ready for the automated Reviewer."),
     Label("blocked", "b60205", "Progress needs a decision; paired with needs_human."),
+    Label(
+        "failed",
+        "6e0000",
+        "Execution broke twice; autopsy the evidence. Overrides plan_ready at dispatch;"
+        " only a human removes it, as part of re-queueing (ADR-0016).",
+    ),
     Label("needs_human", "d93f0b", "Awaiting human review or decision."),
     Label("risk:low", "c2e0c6", "Risk grade: low (sensitive paths, blast radius, reversibility)."),
     Label(

@@ -375,3 +375,110 @@ def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
     recorded = rig.docker.stacks["ozolith-stack-control"]
     host_path = recorded["env_files"]["THEOZOLITH_ADMIN_TOKEN"]
     assert host_path == str(rig.config.secrets_dir / "admin-token")
+
+
+# -- queue-behind recycle/update (NODE-SUBSTRATE, grilling 2026-07-17) -----------
+
+
+def _driver_stack(tmp_path) -> tuple[dict, "Path"]:
+    """A worker Stack whose jobs dir lives under tmp_path (the in-flight
+    signal the daemon watches)."""
+    jobs = tmp_path / "jobs"
+    stack = process_stack(
+        "worker",
+        env={"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_JOBS_DIR": str(jobs)},
+    )
+    return stack, jobs
+
+
+def test_recycle_mid_run_queues_behind_and_applies_after_the_run(rig: Rig, tmp_path):
+    """Acceptance 12: a recycle issued mid-Run applies only after the Run
+    ends, with the deferral visible in heartbeats."""
+    import shutil
+
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "20260717T1200-worker-a-1").mkdir(parents=True)
+    recycle = {"id": 8, "verb": "recycle", "target": "worker", "force": False}
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    # Mid-Run: the command defers — no kill, no ack (control re-delivers).
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is None and len(rig.popen.spawned) == 1
+    assert rig.daemon._completed == []
+    assert any("deferred" in line for line in rig.logs)
+
+    # The next heartbeat carries the deferral; the re-delivered command
+    # re-checks and stays deferred while the Run is still in flight.
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    reported = rig.control.transcript[-1][2]["deferred_commands"]
+    assert reported == [{"id": 8, "reason": "behind run 20260717T1200-worker-a-1 (stack worker)"}]
+    assert first.returncode is None
+
+    # The Run ends (job dir gone): the re-delivered command now applies.
+    shutil.rmtree(jobs / "20260717T1200-worker-a-1")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is not None  # kill-the-tree, then restart
+    assert rig.daemon._supervisor.alive("worker")
+    assert 8 in rig.daemon._completed
+    # The deferral cleared from the next status payload.
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert rig.control.transcript[-1][2]["deferred_commands"] == []
+
+
+def test_force_recycle_mid_run_keeps_kill_the_tree(rig: Rig, tmp_path):
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "r1").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    forced = {"id": 9, "verb": "recycle", "target": "worker", "force": True}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[forced]))
+    rig.daemon.once()
+    assert first.returncode is not None  # ADR-0013 semantics, immediately
+    assert 9 in rig.daemon._completed
+
+
+def test_dead_driver_child_never_defers(rig: Rig, tmp_path):
+    """Orphaned job dirs under a dead child are the boot sweep's business —
+    the command proceeds immediately."""
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "r-orphan").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    rig.popen.spawned[0].returncode = 0  # the driver died on its own
+
+    recycle = {"id": 10, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert 10 in rig.daemon._completed  # executed, not deferred
+
+
+def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "r1").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+
+    update = {"id": 11, "verb": "update", "target": None, "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls == [] and rig.execv_calls == []  # deferred
+    assert rig.daemon._deferrals[11].startswith("behind run r1")
+
+    import shutil
+
+    shutil.rmtree(jobs / "r1")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls and rig.execv_calls  # applied after the Run

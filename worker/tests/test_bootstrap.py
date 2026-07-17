@@ -12,6 +12,7 @@ EXPECTED_LABEL_NAMES = {
     "in_progress",
     "pr_ready",
     "blocked",
+    "failed",
     "needs_human",
     "risk:low",
     "risk:medium",

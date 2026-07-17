@@ -1,10 +1,14 @@
 """Control Node persistence: one SQLite database, one writer process.
 
-Everything the Control Node knows is observational or advisory (ADR-0002):
-node/stack/container/image status from heartbeats, namespaced events from
-drivers, queued infrastructure commands, short-lived claim intents, encrypted
-secret values, and the janitor/auditor records. Nothing here is coordination
-state — GitHub owns that.
+The database is a cache, never an archive (ADR-0016): the evidence bundle is
+the sole durable audit trail, nothing here may ever be the only copy of
+anything, and everything is deletable by policy. What it caches: node/stack/
+container/image status from heartbeats, namespaced events from drivers
+(terminal Run events kept indefinitely — they are tiny and are the metrics
+substrate; progress telemetry evicted oldest-first under a byte budget),
+queued infrastructure commands, dispatch grants awaiting activation
+(ADR-0017), node health for the quarantine gate, dashboard flags, and the
+encrypted secret values.
 
 The connection is shared across FastAPI handlers and the sweep threads, so
 every access serializes on one lock; at control-plane cadence (a heartbeat
@@ -74,19 +78,18 @@ CREATE TABLE IF NOT EXISTS events (
     verdict TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
+CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     node TEXT NOT NULL,
     verb TEXT NOT NULL,
     target TEXT,
+    force INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     delivered_at REAL,
-    completed_at REAL
-);
-CREATE TABLE IF NOT EXISTS claim_intents (
-    issue INTEGER PRIMARY KEY,
-    worker TEXT NOT NULL,
-    expires_at REAL NOT NULL
+    completed_at REAL,
+    deferred_reason TEXT,
+    deferred_at REAL
 );
 CREATE TABLE IF NOT EXISTS secrets (
     name TEXT PRIMARY KEY,
@@ -101,24 +104,71 @@ CREATE TABLE IF NOT EXISTS janitor_actions (
     reason TEXT NOT NULL,
     acted_at REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS audit_findings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pr INTEGER NOT NULL,
-    issue INTEGER,
-    expected INTEGER NOT NULL,
-    actual INTEGER NOT NULL,
+-- Write-through claim grants awaiting activation (ADR-0017): a row lives
+-- from the GitHub claim write until the driver's claimed event lands; the
+-- janitor releases rows that outlive the activation window.
+CREATE TABLE IF NOT EXISTS grants (
+    issue INTEGER PRIMARY KEY,
+    worker TEXT NOT NULL,
+    node TEXT NOT NULL DEFAULT '',
+    login TEXT NOT NULL,
+    granted_at REAL NOT NULL
+);
+-- Driver registration (ADR-0017 prerequisite): each dispatch request
+-- carries the driver's GitHub login; the registry feeds the dashboard.
+CREATE TABLE IF NOT EXISTS drivers (
+    worker TEXT PRIMARY KEY,
+    node TEXT NOT NULL DEFAULT '',
+    login TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    registered_at REAL NOT NULL,
+    last_dispatch_at REAL NOT NULL
+);
+-- The quarantine gate (ADR-0016): 2 consecutive failed Runs stop grants to
+-- a node; release is human action only, never a timer.
+CREATE TABLE IF NOT EXISTS node_health (
+    node TEXT PRIMARY KEY,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    quarantined INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    since REAL
+);
+-- Phase-1 zombie escalation (ADR-0016): a silent claim is flagged for the
+-- dashboard without touching GitHub; the row clears when the Worker
+-- resurfaces or the janitor escalates with evidence.
+CREATE TABLE IF NOT EXISTS zombie_flags (
+    issue INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    worker TEXT NOT NULL DEFAULT '',
+    node TEXT NOT NULL DEFAULT '',
+    flagged_at REAL NOT NULL,
+    PRIMARY KEY (issue, run_id)
+);
+-- Malformed coordination states dispatch refuses to launder (ADR-0016):
+-- failed + plan_ready stays refused and visible until a human fixes it.
+CREATE TABLE IF NOT EXISTS malformed_states (
+    issue INTEGER PRIMARY KEY,
     detail TEXT NOT NULL,
-    found_at REAL NOT NULL,
-    UNIQUE (pr, expected, actual)
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
 );
 """
 
+# Tables of earlier schema generations, dropped on open: the advisory
+# claim-intent pre-filter (replaced by dispatch grants, ADR-0017) and the
+# retry auditor's findings (died with the marker machinery, ADR-0016).
+_DROPPED_TABLES = ("claim_intents", "audit_findings")
+
 EVENT_RUN = "theozolith.run"
 EVENT_REVIEW = "theozolith.review"
+EVENT_PROGRESS = "theozolith.run.progress"
 
 RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # Phases meaning "a Run is in flight" — what the zombie janitor watches.
 LIVE_RUN_PHASES = ("claimed", "gate")
+
+# Consecutive failed Runs on one node before the dispatch gate closes.
+QUARANTINE_AFTER_FAILURES = 2
 
 
 @dataclass(frozen=True)
@@ -142,6 +192,21 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock, self._db:
             self._db.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring an M3-era database up to this schema. The store is a cache
+        (ADR-0016), so dropped tables lose nothing durable."""
+        for table in _DROPPED_TABLES:
+            self._db.execute(f"DROP TABLE IF EXISTS {table}")
+        present = {r["name"] for r in self._db.execute("PRAGMA table_info(commands)")}
+        for column, decl in (
+            ("force", "INTEGER NOT NULL DEFAULT 0"),
+            ("deferred_reason", "TEXT"),
+            ("deferred_at", "REAL"),
+        ):
+            if column not in present:
+                self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._db.close()
@@ -229,7 +294,13 @@ class Store:
     # -- typed events --------------------------------------------------------
 
     def record_event(self, event: dict[str, Any]) -> None:
-        """Store any namespaced event; known types get extracted columns."""
+        """Store any namespaced event; known types get extracted columns.
+
+        Run events also drive the coordination caches that hang off them:
+        a claimed event activates (and retires) its dispatch grant, and
+        failed/pr-open events move the node's consecutive-failure counter
+        for the quarantine gate (ADR-0016/0017).
+        """
 
         def _int(key: str) -> int | None:
             value = event.get(key)
@@ -239,25 +310,62 @@ class Store:
             value = event.get(key)
             return str(value) if isinstance(value, str) and value else None
 
+        event_type = str(event.get("type", ""))
+        issue, phase, node = _int("issue"), _str("phase"), _str("node")
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO events (type, received_at, payload, node, worker, issue,"
                 " run_id, attempt, phase, pr, round, verdict)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    str(event.get("type", "")),
+                    event_type,
                     self._clock(),
                     json.dumps(event, sort_keys=True),
-                    _str("node"),
+                    node,
                     _str("worker") or _str("reviewer"),
-                    _int("issue"),
+                    issue,
                     _str("run_id"),
                     _int("attempt"),
-                    _str("phase"),
+                    phase,
                     _int("pr"),
                     _int("round"),
                     _str("verdict"),
                 ),
+            )
+            if event_type != EVENT_RUN:
+                return
+            if phase == "claimed" and issue is not None:
+                # Activation: the grant did its job; the events record owns
+                # claim tracking from here (ADR-0017).
+                self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+            if node and phase == "failed":
+                self._bump_failures(node, issue, _str("run_id"))
+            if node and phase == "pr-open":
+                # A consecutive completed Run resets the counter — but never
+                # releases a quarantine (human-only, ADR-0016).
+                self._db.execute(
+                    "UPDATE node_health SET consecutive_failures = 0 WHERE node = ?", (node,)
+                )
+
+    def _bump_failures(self, node: str, issue: int | None, run_id: str | None) -> None:
+        self._db.execute(
+            "INSERT INTO node_health (node, consecutive_failures) VALUES (?, 1)"
+            " ON CONFLICT (node) DO UPDATE SET consecutive_failures = consecutive_failures + 1",
+            (node,),
+        )
+        row = self._db.execute(
+            "SELECT consecutive_failures, quarantined FROM node_health WHERE node = ?", (node,)
+        ).fetchone()
+        if row["consecutive_failures"] >= QUARANTINE_AFTER_FAILURES and not row["quarantined"]:
+            reason = (
+                f"{row['consecutive_failures']} consecutive failed Runs"
+                f" (latest run {run_id or 'unknown'}"
+                + (f", issue #{issue}" if issue is not None else "")
+                + ")"
+            )
+            self._db.execute(
+                "UPDATE node_health SET quarantined = 1, reason = ?, since = ? WHERE node = ?",
+                (reason, self._clock(), node),
             )
 
     def events(self, *, type: str | None = None, issue: int | None = None) -> list[dict[str, Any]]:
@@ -275,6 +383,23 @@ class Store:
             rows = self._db.execute(query + " ORDER BY id", params).fetchall()
         return [
             {"type": r["type"], "received_at": r["received_at"], **json.loads(r["payload"])}
+            for r in rows
+        ]
+
+    def recent_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Newest-first feed for the dashboard."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, type, received_at, payload FROM events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "received_at": r["received_at"],
+                "payload": json.loads(r["payload"]),
+            }
             for r in rows
         ]
 
@@ -301,6 +426,42 @@ class Store:
             if r["phase"] in LIVE_RUN_PHASES
         ]
 
+    def run_states(self) -> list[dict[str, Any]]:
+        """Per issue: the latest Run event, joined with the latest progress
+        telemetry for that run_id (the dashboard's Runs view)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT e.issue, e.worker, e.node, e.run_id, e.attempt, e.phase, e.pr,"
+                " e.received_at FROM events e JOIN ("
+                "   SELECT issue, MAX(id) AS latest FROM events"
+                "   WHERE type = ? AND issue IS NOT NULL GROUP BY issue"
+                " ) last ON e.id = last.latest ORDER BY e.issue",
+                (EVENT_RUN,),
+            ).fetchall()
+            progress: dict[str, dict[str, Any]] = {}
+            for row in self._db.execute(
+                "SELECT p.run_id, p.payload FROM events p JOIN ("
+                "   SELECT run_id, MAX(id) AS latest FROM events"
+                "   WHERE type = ? AND run_id IS NOT NULL GROUP BY run_id"
+                " ) last ON p.id = last.latest",
+                (EVENT_PROGRESS,),
+            ).fetchall():
+                progress[row["run_id"]] = json.loads(row["payload"])
+        return [
+            {
+                "issue": r["issue"],
+                "worker": r["worker"] or "",
+                "node": r["node"] or "",
+                "run_id": r["run_id"] or "",
+                "attempt": r["attempt"],
+                "phase": r["phase"] or "",
+                "pr": r["pr"],
+                "last_event_at": r["received_at"],
+                "progress": progress.get(r["run_id"] or ""),
+            }
+            for r in rows
+        ]
+
     def worker_last_seen(self, worker: str) -> float | None:
         with self._lock:
             row = self._db.execute(
@@ -308,23 +469,172 @@ class Store:
             ).fetchone()
         return row["seen"] if row and row["seen"] is not None else None
 
-    # -- commands ------------------------------------------------------------
+    def evict_progress(self, budget_bytes: int) -> int:
+        """Cache, never archive (ADR-0016): drop the oldest progress events
+        until their payloads fit the byte budget. Terminal Run events are
+        never touched. Returns the number of rows evicted."""
+        with self._lock, self._db:
+            total = self._db.execute(
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) AS total FROM events WHERE type = ?",
+                (EVENT_PROGRESS,),
+            ).fetchone()["total"]
+            excess = total - budget_bytes
+            if excess <= 0:
+                return 0
+            doomed: list[int] = []
+            for row in self._db.execute(
+                "SELECT id, LENGTH(payload) AS size FROM events WHERE type = ? ORDER BY id",
+                (EVENT_PROGRESS,),
+            ):
+                doomed.append(row["id"])
+                excess -= row["size"]
+                if excess <= 0:
+                    break
+            self._db.executemany(
+                "DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed]
+            )
+            return len(doomed)
 
-    def queue_command(self, node: str, verb: str, target: str | None) -> int:
+    # -- dispatch grants and driver registry (ADR-0017) ------------------------
+
+    def upsert_driver(self, worker: str, node: str, login: str, role: str) -> None:
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO drivers (worker, node, login, role, registered_at, last_dispatch_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (worker) DO UPDATE SET node = ?, login = ?, role = ?,"
+                " last_dispatch_at = ?",
+                (worker, node, login, role, now, now, node, login, role, now),
+            )
+
+    def drivers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM drivers ORDER BY worker").fetchall()
+        return [dict(r) for r in rows]
+
+    def record_grant(self, issue: int, worker: str, node: str, login: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO grants (issue, worker, node, login, granted_at) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (issue) DO UPDATE SET worker = ?, node = ?, login = ?,"
+                " granted_at = ?",
+                (issue, worker, node, login, self._clock(), worker, node, login, self._clock()),
+            )
+
+    def granted_issues(self) -> set[int]:
+        with self._lock:
+            rows = self._db.execute("SELECT issue FROM grants").fetchall()
+        return {r["issue"] for r in rows}
+
+    def expired_grants(self, window_seconds: float) -> list[dict[str, Any]]:
+        """Grants past the activation window with no claimed event seen."""
+        cutoff = self._clock() - window_seconds
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT issue, worker, node, login, granted_at FROM grants"
+                " WHERE granted_at <= ? ORDER BY issue",
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def release_grant(self, issue: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+
+    # -- node health: the quarantine gate (ADR-0016) ---------------------------
+
+    def node_quarantine(self, node: str) -> str | None:
+        """The quarantine reason, or None when the node may receive work."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT quarantined, reason FROM node_health WHERE node = ?", (node,)
+            ).fetchone()
+        if row and row["quarantined"]:
+            return row["reason"] or "quarantined"
+        return None
+
+    def quarantines(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT node, consecutive_failures, reason, since FROM node_health"
+                " WHERE quarantined = 1 ORDER BY node"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def release_quarantine(self, node: str) -> bool:
+        """Human-only release (ADR-0016); True when a quarantine was lifted."""
         with self._lock, self._db:
             cursor = self._db.execute(
-                "INSERT INTO commands (node, verb, target, created_at) VALUES (?, ?, ?, ?)",
-                (node, verb, target, self._clock()),
+                "UPDATE node_health SET quarantined = 0, reason = '', since = NULL,"
+                " consecutive_failures = 0 WHERE node = ? AND quarantined = 1",
+                (node,),
+            )
+        return cursor.rowcount > 0
+
+    # -- dashboard flags -------------------------------------------------------
+
+    def flag_zombie(self, issue: int, run_id: str, worker: str, node: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO zombie_flags (issue, run_id, worker, node, flagged_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (issue, run_id, worker, node, self._clock()),
+            )
+
+    def clear_zombie_flag(self, issue: int, run_id: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "DELETE FROM zombie_flags WHERE issue = ? AND run_id = ?", (issue, run_id)
+            )
+
+    def zombie_flags(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT issue, run_id, worker, node, flagged_at FROM zombie_flags ORDER BY issue"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_malformed(self, issue: int, detail: str) -> None:
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO malformed_states (issue, detail, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (issue) DO UPDATE SET detail = ?, last_seen = ?",
+                (issue, detail, now, now, detail, now),
+            )
+
+    def clear_malformed(self, issue: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM malformed_states WHERE issue = ?", (issue,))
+
+    def malformed_states(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT issue, detail, first_seen, last_seen FROM malformed_states ORDER BY issue"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- commands ------------------------------------------------------------
+
+    def queue_command(self, node: str, verb: str, target: str | None, force: bool = False) -> int:
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "INSERT INTO commands (node, verb, target, force, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (node, verb, target, 1 if force else 0, self._clock()),
             )
         return int(cursor.lastrowid or 0)
 
     def pending_commands(self, node: str) -> list[dict[str, Any]]:
         """Undelivered AND unacknowledged commands: re-delivered every
-        heartbeat until the node reports them completed."""
+        heartbeat until the node reports them completed (a deferred command
+        — queue-behind — simply stays here and is re-delivered)."""
         now = self._clock()
         with self._lock, self._db:
             rows = self._db.execute(
-                "SELECT id, verb, target FROM commands"
+                "SELECT id, verb, target, force FROM commands"
                 " WHERE node = ? AND completed_at IS NULL ORDER BY id",
                 (node,),
             ).fetchall()
@@ -333,35 +643,53 @@ class Store:
                 " WHERE node = ? AND completed_at IS NULL AND delivered_at IS NULL",
                 (now, node),
             )
-        return [{"id": r["id"], "verb": r["verb"], "target": r["target"]} for r in rows]
+        return [
+            {"id": r["id"], "verb": r["verb"], "target": r["target"], "force": bool(r["force"])}
+            for r in rows
+        ]
 
     def complete_commands(self, node: str, ids: list[int]) -> None:
         if not ids:
             return
         with self._lock, self._db:
             self._db.executemany(
-                "UPDATE commands SET completed_at = ? WHERE id = ? AND node = ?",
+                "UPDATE commands SET completed_at = ?, deferred_reason = NULL"
+                " WHERE id = ? AND node = ?",
                 [(self._clock(), int(i), node) for i in ids],
             )
 
-    # -- claim intents (the advisory pre-filter, ADR-0002) --------------------
-
-    def claim_intent(self, issue: int, worker: str, ttl_seconds: float) -> tuple[bool, str]:
-        """Grant or refuse a short exclusive intent; (allow, holder)."""
+    def record_deferrals(self, node: str, deferrals: list[dict[str, Any]]) -> None:
+        """Heartbeat-reported queue-behind state: mark the named pending
+        commands deferred and clear the mark on every other pending one."""
         now = self._clock()
+        reasons = {
+            int(d["id"]): str(d.get("reason", ""))
+            for d in deferrals
+            if isinstance(d, dict) and isinstance(d.get("id"), int)
+        }
         with self._lock, self._db:
-            self._db.execute("DELETE FROM claim_intents WHERE expires_at <= ?", (now,))
-            row = self._db.execute(
-                "SELECT worker FROM claim_intents WHERE issue = ?", (issue,)
-            ).fetchone()
-            if row is not None and row["worker"] != worker:
-                return False, row["worker"]
             self._db.execute(
-                "INSERT INTO claim_intents (issue, worker, expires_at) VALUES (?, ?, ?)"
-                " ON CONFLICT (issue) DO UPDATE SET worker = ?, expires_at = ?",
-                (issue, worker, now + ttl_seconds, worker, now + ttl_seconds),
+                "UPDATE commands SET deferred_reason = NULL, deferred_at = NULL"
+                " WHERE node = ? AND completed_at IS NULL",
+                (node,),
             )
-            return True, worker
+            self._db.executemany(
+                "UPDATE commands SET deferred_reason = ?, deferred_at = ?"
+                " WHERE id = ? AND node = ? AND completed_at IS NULL",
+                [(reason, now, id_, node) for id_, reason in reasons.items()],
+            )
+
+    def pending_lifecycle_commands(self, node: str) -> list[str]:
+        """Pending drain/recycle/update verbs for the dispatch gate: a node
+        about to be drained, recycled, or updated gets no new work, which
+        bounds a queued-behind command by the current Run (NODE-SUBSTRATE)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT verb FROM commands WHERE node = ? AND completed_at IS NULL"
+                " AND verb IN ('drain', 'recycle', 'update') ORDER BY verb",
+                (node,),
+            ).fetchall()
+        return [r["verb"] for r in rows]
 
     # -- secrets (encrypted values only; crypto lives in crypto.py) ----------
 
@@ -391,7 +719,7 @@ class Store:
                 [(token, name) for name, token in tokens.items()],
             )
 
-    # -- janitor + auditor records --------------------------------------------
+    # -- janitor records --------------------------------------------------------
 
     def record_janitor_action(self, issue: int, run_id: str, worker: str, reason: str) -> None:
         with self._lock, self._db:
@@ -415,30 +743,7 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def record_audit_finding(
-        self, pr: int, issue: int | None, expected: int, actual: int, detail: str
-    ) -> bool:
-        """Store a mismatch; False when this exact finding is already known."""
-        with self._lock, self._db:
-            try:
-                self._db.execute(
-                    "INSERT INTO audit_findings (pr, issue, expected, actual, detail, found_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (pr, issue, expected, actual, detail, self._clock()),
-                )
-            except sqlite3.IntegrityError:
-                return False
-        return True
-
-    def audit_findings(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT pr, issue, expected, actual, detail, found_at"
-                " FROM audit_findings ORDER BY id"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    # -- the fleet read model (CLI now, M4 dashboard later) --------------------
+    # -- the fleet read model (CLI + dashboard) --------------------------------
 
     def fleet_state(self) -> dict[str, Any]:
         with self._lock:
@@ -447,13 +752,15 @@ class Store:
             containers = self._db.execute("SELECT * FROM containers ORDER BY node, name").fetchall()
             images = self._db.execute("SELECT * FROM images ORDER BY node, name").fetchall()
             commands = self._db.execute(
-                "SELECT id, node, verb, target, created_at, delivered_at, completed_at"
-                " FROM commands ORDER BY id"
+                "SELECT id, node, verb, target, force, created_at, delivered_at, completed_at,"
+                " deferred_reason FROM commands ORDER BY id"
             ).fetchall()
+            health = self._db.execute("SELECT * FROM node_health ORDER BY node").fetchall()
         return {
             "nodes": [dict(r) for r in nodes],
             "stacks": [dict(r) for r in stacks],
             "run_containers": [dict(r) for r in containers],
             "images": [dict(r) for r in images],
             "commands": [dict(r) for r in commands],
+            "node_health": [dict(r) for r in health],
         }

@@ -11,23 +11,27 @@ commissioned through the job directory; the driver performs the side effects
 (commit, push, PR, labels) after sanitizing the container-touched checkout's
 git metadata.
 
-Run outcomes (ADR-0014): a completed session with commits ships the normal
-best-effort PR; a completed session with zero commits but no-change
-reasoning in the decisions payload ships an EMPTY PR (one driver-synthesized
-allow-empty commit) the Reviewer judges like any other; everything else — no
-commits and no reasoning, a timed-out or dead session, a container/harness
-crash — is a FAILED Run: evidence is pushed, the claim is stripped, the
-issue returns to plan_ready, and a machine-readable run-failed marker is
-stamped on the issue. The failed-Run budget is one retry: a failure with a
-marker already present escalates blocked + needs_human instead. Every Run
-that reaches a checkout pushes its evidence bundle before job-dir cleanup.
+Run outcomes (ADR-0014, failure lane replaced by ADR-0016): a completed
+session with commits ships the normal best-effort PR; a completed session
+with zero commits but no-change reasoning in the decisions payload ships an
+EMPTY PR (one driver-synthesized allow-empty commit) the Reviewer judges
+like any other; everything else is a FAILED Run. The failed lane is local
+retry (``execute_claim``): the driver keeps the claim and launches one full
+second Run — new run_id, fresh clone and container, its own evidence
+bundle — under a uniform budget across failure classes. A second
+non-completion releases the claim and applies failed + needs_human with
+both evidence links and each failure's class. Nothing is re-queued and no
+state lives in comments.
+
+Evidence is the sole durable audit trail (ADR-0016): every Run pushes its
+bundle, and a job directory is deleted only after that push confirmed —
+otherwise it is left for the boot-time evidence sweep.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
-import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -35,7 +39,7 @@ from pathlib import Path
 
 from theozolith_worker import decisions, events, evidence, gitops, jobdir, verdict
 from theozolith_worker.bootstrap.vocabulary import (
-    BLOCKED,
+    FAILED,
     IN_PROGRESS,
     NEEDS_HUMAN,
     PLAN_READY,
@@ -57,6 +61,11 @@ BRANCH_PREFIX = "ozolith/issue-"
 
 # Paths in the checkout that are pipeline metadata, never repo content.
 EXCLUDED_METADATA = (".theozolith/decisions.json", ".claude/settings.local.json")
+
+# Runs per claim: the original plus exactly one local retry (ADR-0016).
+CLAIM_RUN_BUDGET = 2
+# Delivery attempts for the claimed event that activates a grant (ADR-0017).
+ACTIVATION_ATTEMPTS = 3
 
 # Distinguishes Runs started within the same second by one driver process.
 _RUN_SEQUENCE = itertools.count(1)
@@ -80,37 +89,6 @@ def issue_for_branch(head_ref: str) -> int | None:
     return int(suffix) if head_ref != suffix and suffix.isdigit() else None
 
 
-# -- the run-failed marker (issue-comment bookkeeping, ADR-0014) --------------
-
-RUN_FAILED_RE = re.compile(r'<!-- theozolith:run-failed run_id=(\S+) reason="([^"]*)" -->')
-
-
-def _sanitize_reason(reason: str) -> str:
-    return re.sub(r"\s+", " ", reason).replace('"', "'").strip()[:300]
-
-
-def render_run_failed(run_id: str, reason: str, *, escalated: bool) -> str:
-    outcome = (
-        "Retry budget exhausted — escalating to a human (`blocked` + `needs_human`)."
-        if escalated
-        else "Re-queued for one retry (the failed-Run budget, ADR-0014)."
-    )
-    return (
-        f"Run `{run_id}` failed: {reason}. {outcome}\n\n"
-        f'<!-- theozolith:run-failed run_id={run_id} reason="{_sanitize_reason(reason)}" -->'
-    )
-
-
-def parse_run_failed(body: str) -> tuple[str, str] | None:
-    """(run_id, reason) from a run-failed marker comment, or None."""
-    match = RUN_FAILED_RE.search(body)
-    return (match.group(1), match.group(2)) if match else None
-
-
-def _issue_has_failure_marker(client: GitHubClient, issue_number: int) -> bool:
-    return any(parse_run_failed(comment.body) for comment in client.list_comments(issue_number))
-
-
 PROMPT_TEMPLATE = """\
 You are a Worker in TheOzolith agentic coding pipeline, executing one \
 stateless Run against the checked-out repository (your working directory). \
@@ -127,7 +105,7 @@ they shaped your work.
 - Implement the issue's acceptance criteria directly in the working tree.
 - Never stop to ask questions. When a judgment call comes up, decide, then \
 record the decision and its rationale. A separate Reviewer adjudicates your \
-decisions afterward.
+decisions afterwards.
 - Record your run summary in `.theozolith/decisions.json` (create the file) \
 with exactly this JSON shape:
   {{"decisions": [{{"what": "...", "why": "..."}}], "open_questions": [], \
@@ -181,8 +159,30 @@ class RunReport:
     container: str = ""
     agent_outcome: str = ""  # completed | timed out | session died | harness-failed | unknown
     gate_findings: int = 0
-    reason: str = ""  # failed Runs: the reason stamped in the marker
+    reason: str = ""  # failed Runs: what broke
+    # ADR-0016 uniform budget classes: timeout | session-died | harness |
+    # no-changes | infra ("" for completed Runs).
+    failure_class: str = ""
+    evidence_pushed: bool = False
     notes: list[str] = field(default_factory=list)
+
+
+class _RunFailed(Exception):
+    """Internal control flow: this Run is a FAILED Run (ADR-0016)."""
+
+    def __init__(self, reason: str, failure_class: str):
+        super().__init__(reason)
+        self.reason = reason
+        self.failure_class = failure_class
+
+
+@dataclass
+class _RunContext:
+    """What the failure path needs from however far the Run body got."""
+
+    base_branch: str = ""
+    gate: GateResult = field(default_factory=GateResult)
+    section: decisions.DecisionsSection | None = None
 
 
 def _resume_context(
@@ -257,111 +257,149 @@ def execute_run(
     log=_log,
     sink: events.EventSink | None = None,
 ) -> RunReport:
-    """One Run on one claimed issue. Assumes the claim already succeeded."""
+    """One Run on one claimed issue. Assumes the claim already exists on
+    GitHub (written by the Control Node, ADR-0017). Never raises: every
+    failure mode returns a failed report under the uniform budget."""
     run_id = run_id or new_run_id(config)
     sink = sink or events.make_sink(config, log)
-    branch = branch_for(issue.number)
-    login = client.viewer_login()
-    email = f"{login}@users.noreply.github.com"
-    auth = gitops.auth_env(config.token)
-
-    # The failed-Run budget check happens at claim time: a marker already on
-    # the issue means this Run is the one retry (ADR-0014).
-    already_failed = _issue_has_failure_marker(client, issue.number)
-
     job = jobdir.create_job_dir(config.jobs_dir, run_id)
-    workdir = job / jobdir.CHECKOUT_DIR
     report = RunReport(
         run_id=run_id,
         issue=issue.number,
         round=1,
-        branch=branch,
+        branch=branch_for(issue.number),
         container=run_container_name(run_id),
     )
+    context = _RunContext()
     try:
-        gitops.clone(config.clone_url, workdir, env=auth)
-        gitops.sanitize_checkout(workdir, config.clone_url)
-        _exclude_metadata(workdir)
-        report.phase = "checkout"
-
-        base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
-        existing_pr = client.find_open_pr_by_head(branch)
-        revised: verdict.Verdict | None = None
-        discussion: list[Comment] = []
-        force = False
-        if existing_pr is not None:
-            report.round = attempts_on(existing_pr.labels) + 1
-            report.pr_number = existing_pr.number
-            gitops.fetch(workdir, branch, env=auth)
-            gitops.checkout_branch(workdir, branch, create=True)
-            gitops.reset_hard(workdir, "FETCH_HEAD")
-            revised, discussion = _resume_context(client, existing_pr.number)
-            if revised is not None and revised.resume_commit:
-                if gitops.commit_exists(workdir, revised.resume_commit):
-                    if revised.resume_commit != gitops.head_sha(workdir):
-                        gitops.reset_hard(workdir, revised.resume_commit)
-                        force = True
-                    if revised.cherry_pick:
-                        gitops.cherry_pick(workdir, login, email, *revised.cherry_pick)
-                else:
-                    report.notes.append(
-                        f"designated resume commit {revised.resume_commit} not found; "
-                        "resuming from branch head"
-                    )
+        _run_to_pr(config, client, issue, session_factory, job, report, context, log, sink)
+    except _RunFailed as failed:
+        _fail_run(config, issue, report, job, context, failed, log, sink)
+    except Exception as exc:  # pre/post-session driver-side breakage
+        _fail_run(
+            config,
+            issue,
+            report,
+            job,
+            context,
+            _RunFailed(f"driver-side failure: {exc}", "infra"),
+            log,
+            sink,
+        )
+    finally:
+        if report.evidence_pushed:
+            shutil.rmtree(job, ignore_errors=True)
         else:
-            gitops.checkout_branch(workdir, branch, create=True)
-            if gitops.ref_exists(workdir, f"origin/{branch}"):
-                # A previous Run pushed but crashed before opening the PR.
-                # That state was never Reviewer-designated: overwrite it.
-                force = True
+            # The bundle is the sole durable audit trail: never delete a job
+            # dir whose push is unconfirmed — the evidence sweep retries it.
+            log(f"run {run_id}: job directory kept for the evidence sweep ({job})")
+    return report
+
+
+def _run_to_pr(
+    config: DriverConfig,
+    client: GitHubClient,
+    issue: Issue,
+    session_factory: SessionFactory,
+    job: Path,
+    report: RunReport,
+    context: _RunContext,
+    log,
+    sink: events.EventSink,
+) -> None:
+    """The Run body: checkout, agent session, gate, ship. Raises _RunFailed
+    for every non-shipping outcome (ADR-0016 classification)."""
+    workdir = job / jobdir.CHECKOUT_DIR
+    branch = report.branch
+    login = client.viewer_login()
+    email = f"{login}@users.noreply.github.com"
+    auth = gitops.auth_env(config.token)
+
+    gitops.clone(config.clone_url, workdir, env=auth)
+    gitops.sanitize_checkout(workdir, config.clone_url)
+    _exclude_metadata(workdir)
+    report.phase = "checkout"
+
+    context.base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
+    existing_pr = client.find_open_pr_by_head(branch)
+    revised: verdict.Verdict | None = None
+    discussion: list[Comment] = []
+    force = False
+    if existing_pr is not None:
+        report.round = attempts_on(existing_pr.labels) + 1
+        report.pr_number = existing_pr.number
+        gitops.fetch(workdir, branch, env=auth)
+        gitops.checkout_branch(workdir, branch, create=True)
+        gitops.reset_hard(workdir, "FETCH_HEAD")
+        revised, discussion = _resume_context(client, existing_pr.number)
+        if revised is not None and revised.resume_commit:
+            if gitops.commit_exists(workdir, revised.resume_commit):
+                if revised.resume_commit != gitops.head_sha(workdir):
+                    gitops.reset_hard(workdir, revised.resume_commit)
+                    force = True
+                if revised.cherry_pick:
+                    gitops.cherry_pick(workdir, login, email, *revised.cherry_pick)
+            else:
                 report.notes.append(
-                    "stale branch from a crashed Run overwritten (no PR referenced it)"
+                    f"designated resume commit {revised.resume_commit} not found; "
+                    "resuming from branch head"
                 )
+    else:
+        gitops.checkout_branch(workdir, branch, create=True)
+        if gitops.ref_exists(workdir, f"origin/{branch}"):
+            # A previous Run pushed but crashed before opening the PR.
+            # That state was never Reviewer-designated: overwrite it.
+            force = True
+            report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
 
-        prompt = _build_prompt(issue, report.round, revised, discussion)
-        jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
-        jobdir.atomic_write(
-            job / "input" / "issue.json",
-            json.dumps(
-                {
-                    "number": issue.number,
-                    "title": issue.title,
-                    "body": issue.body,
-                    "labels": sorted(issue.labels),
-                    "round": report.round,
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-        )
-        manifest = jobdir.Manifest(
-            run_id=run_id,
-            mode=jobdir.MODE_RUN,
-            session=run_session_name(run_id),
-            adapter=config.adapter,
-            model=config.model,
-            workdir=jobdir.CHECKOUT_DIR,
-            agent_timeout_seconds=config.agent_timeout_seconds,
-            settle_seconds=config.settle_seconds,
-        )
-        jobdir.write_manifest(job, manifest)
-        spec = ContainerSpec(
-            name=run_container_name(run_id),
-            image=config.run_image,
-            labels=container_labels(run_id, config.stack),
-            mounts=((str(job), jobdir.CONTAINER_JOB_PATH),),
-            volumes=config.cache_volumes,
-            env=dict(config.agent_env),  # never the GitHub PAT (ADR-0013)
-            user=config.container_user,
-        )
+    prompt = _build_prompt(issue, report.round, revised, discussion)
+    jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
+    jobdir.atomic_write(
+        job / "input" / "issue.json",
+        json.dumps(
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body,
+                "labels": sorted(issue.labels),
+                "round": report.round,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+    manifest = jobdir.Manifest(
+        run_id=report.run_id,
+        mode=jobdir.MODE_RUN,
+        session=run_session_name(report.run_id),
+        adapter=config.adapter,
+        model=config.model,
+        workdir=jobdir.CHECKOUT_DIR,
+        agent_timeout_seconds=config.agent_timeout_seconds,
+        settle_seconds=config.settle_seconds,
+    )
+    jobdir.write_manifest(job, manifest)
+    spec = ContainerSpec(
+        name=run_container_name(report.run_id),
+        image=config.run_image,
+        labels=container_labels(report.run_id, config.stack),
+        mounts=((str(job), jobdir.CONTAINER_JOB_PATH),),
+        volumes=config.cache_volumes,
+        env=dict(config.agent_env),  # never the GitHub PAT (ADR-0013)
+        user=config.container_user,
+    )
 
-        session = session_factory(spec, job, manifest)
-        session.launch()
-        report.phase = "agent"
-        outcome: jobdir.AgentOutcome | None = None
-        harness_error = ""
-        gate = GateResult()
-        try:
+    session = session_factory(spec, job, manifest)
+    session.launch()
+    report.phase = "agent"
+    outcome: jobdir.AgentOutcome | None = None
+    harness_error = ""
+    gate = GateResult()
+    reporter = events.ProgressReporter(
+        config, sink, job, issue=issue.number, run_id=report.run_id, attempt=report.round
+    )
+    try:
+        with reporter:
             try:
                 outcome = session.wait_for_agent()
                 report.agent_outcome = outcome.describe()
@@ -388,166 +426,119 @@ def execute_run(
                     )
                 report.phase = "gate"
                 report.gate_findings = len(gate.findings)
+                context.gate = gate
                 sink.emit(
                     events.run_event(
                         config,
                         issue=issue.number,
-                        run_id=run_id,
+                        run_id=report.run_id,
                         phase=events.PHASE_GATE,
                         attempt=report.round,
                     )
                 )
-        finally:
-            session.finish()
-
-        # The container touched the checkout: distrust its git metadata.
-        gitops.sanitize_checkout(workdir, config.clone_url)
-        _exclude_metadata(workdir)
-
-        agent_section = decisions.read_agent_decisions(workdir)
-
-        # -- Run-outcome classification (ADR-0014) ---------------------------
-
-        if outcome is None or not outcome.completed:
-            reason = harness_error or f"agent session {outcome.describe()}"
-            return _fail_run(
-                config,
-                client,
-                issue,
-                report,
-                job,
-                workdir,
-                base_branch,
-                agent_section,
-                gate,
-                reason,
-                already_failed,
-                auth,
-                log,
-                sink,
-            )
-
-        section = agent_section or decisions.fallback_section(
-            "agent exited without a valid .theozolith/decisions.json"
-        )
-        section.gate_findings = gate.findings
-
-        committed = gitops.commit_all(
-            workdir, f"Run {run_id} for #{issue.number} (round {report.round})", login, email
-        )
-        empty = not committed
-        if empty and not _has_reasoning(agent_section):
-            return _fail_run(
-                config,
-                client,
-                issue,
-                report,
-                job,
-                workdir,
-                base_branch,
-                agent_section,
-                gate,
-                "run completed with no commits and no no-change reasoning",
-                already_failed,
-                auth,
-                log,
-                sink,
-            )
-        if empty:
-            # A concluded no-change Run still ships: one allow-empty commit,
-            # reasoning in the PR body, judged like any PR (ADR-0014).
-            gitops.commit_empty(
-                workdir,
-                f"Run {run_id} for #{issue.number} (round {report.round}): no changes required",
-                login,
-                email,
-            )
-        report.head = gitops.head_sha(workdir)
-
-        gitops.push(workdir, branch, force=force, env=auth)
-
-        title = f"#{issue.number}: {issue.title}"
-        if existing_pr is None:
-            body = f"Closes #{issue.number}."
-            if empty:
-                body += "\n\n" + _no_change_intro(section)
-            pr = client.create_pr(
-                head=branch, base=base_branch, title=title, body=decisions.upsert(body, section)
-            )
-        else:
-            pr = existing_pr
-            client.update_pr(pr.number, body=decisions.upsert(pr.body, section))
-        report.pr_number = pr.number
-        client.add_labels(pr.number, PR_READY)
-        report.phase = "empty-pr" if empty else "pr-open"
-        sink.emit(
-            events.run_event(
-                config,
-                issue=issue.number,
-                run_id=run_id,
-                phase=events.PHASE_PR_OPEN,
-                attempt=report.round,
-                pr=pr.number,
-            )
-        )
-
-        _push_run_evidence(
-            config, report, issue, job, gate, section, workdir, base_branch, auth, log
-        )
-        return report
     finally:
-        shutil.rmtree(job, ignore_errors=True)
+        session.finish()
 
+    # The container touched the checkout: distrust its git metadata.
+    gitops.sanitize_checkout(workdir, config.clone_url)
+    _exclude_metadata(workdir)
 
-def _fail_run(
-    config: DriverConfig,
-    client: GitHubClient,
-    issue: Issue,
-    report: RunReport,
-    job: Path,
-    workdir: Path,
-    base_branch: str,
-    agent_section: decisions.DecisionsSection | None,
-    gate: GateResult,
-    reason: str,
-    already_failed: bool,
-    auth: dict[str, str],
-    log,
-    sink: events.EventSink,
-) -> RunReport:
-    """The failed-Run path: evidence, claim strip, re-queue or escalate,
-    run-failed marker. Failed Runs never touch attempt-N and open no PR."""
-    report.phase = "failed"
-    report.reason = reason
-    section = agent_section or decisions.fallback_section(reason)
-    _push_run_evidence(config, report, issue, job, gate, section, workdir, base_branch, auth, log)
+    agent_section = decisions.read_agent_decisions(workdir)
+    context.section = agent_section
 
-    me = client.viewer_login()
-    fresh = client.get_issue(issue.number)
-    if me in fresh.assignees:
-        client.remove_assignee(issue.number, me)
-    client.remove_label(issue.number, IN_PROGRESS)
-    if already_failed:
-        # The one-retry budget is spent: a human takes over.
-        client.add_labels(issue.number, BLOCKED, NEEDS_HUMAN)
-        report.notes.append("failed-Run budget exhausted; escalated to a human")
-    else:
-        client.add_labels(issue.number, PLAN_READY)
-        report.notes.append("re-queued for one retry")
-    client.add_comment(
-        issue.number, render_run_failed(report.run_id, reason, escalated=already_failed)
+    # -- Run-outcome classification (ADR-0014/0016) ---------------------------
+
+    if outcome is None or not outcome.completed:
+        if harness_error:
+            raise _RunFailed(harness_error, "harness")
+        if outcome is not None and outcome.timed_out:
+            raise _RunFailed("agent session timed out", "timeout")
+        if outcome is not None and outcome.session_died:
+            raise _RunFailed("agent session died", "session-died")
+        raise _RunFailed(f"agent session {(outcome or jobdir.AgentOutcome()).describe()}", "harness")
+
+    section = agent_section or decisions.fallback_section(
+        "agent exited without a valid .theozolith/decisions.json"
     )
+    section.gate_findings = gate.findings
+    context.section = section
+
+    committed = gitops.commit_all(
+        workdir, f"Run {report.run_id} for #{issue.number} (round {report.round})", login, email
+    )
+    empty = not committed
+    if empty and not _has_reasoning(agent_section):
+        raise _RunFailed("run completed with no commits and no no-change reasoning", "no-changes")
+    if empty:
+        # A concluded no-change Run still ships: one allow-empty commit,
+        # reasoning in the PR body, judged like any PR (ADR-0014).
+        gitops.commit_empty(
+            workdir,
+            f"Run {report.run_id} for #{issue.number} (round {report.round}): no changes required",
+            login,
+            email,
+        )
+    report.head = gitops.head_sha(workdir)
+
+    gitops.push(workdir, branch, force=force, env=auth)
+
+    title = f"#{issue.number}: {issue.title}"
+    if existing_pr is None:
+        body = f"Closes #{issue.number}."
+        if empty:
+            body += "\n\n" + _no_change_intro(section)
+        pr = client.create_pr(
+            head=branch, base=context.base_branch, title=title, body=decisions.upsert(body, section)
+        )
+    else:
+        pr = existing_pr
+        client.update_pr(pr.number, body=decisions.upsert(pr.body, section))
+    report.pr_number = pr.number
+    client.add_labels(pr.number, PR_READY)
+    report.phase = "empty-pr" if empty else "pr-open"
     sink.emit(
         events.run_event(
             config,
             issue=issue.number,
             run_id=report.run_id,
-            phase=events.PHASE_ESCALATED if already_failed else events.PHASE_FAILED,
+            phase=events.PHASE_PR_OPEN,
+            attempt=report.round,
+            pr=pr.number,
+        )
+    )
+
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+
+
+def _fail_run(
+    config: DriverConfig,
+    issue: Issue,
+    report: RunReport,
+    job: Path,
+    context: _RunContext,
+    failed: _RunFailed,
+    log,
+    sink: events.EventSink,
+) -> None:
+    """The FAILED-Run path (ADR-0016): evidence and the failed event, nothing
+    else. The claim stays with the driver — retry or escalation is
+    ``execute_claim``'s call; no state is stamped into comments."""
+    report.phase = "failed"
+    report.reason = failed.reason
+    report.failure_class = failed.failure_class
+    if context.section is None:
+        context.section = decisions.fallback_section(failed.reason)
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+    sink.emit(
+        events.run_event(
+            config,
+            issue=issue.number,
+            run_id=report.run_id,
+            phase=events.PHASE_FAILED,
             attempt=report.round,
         )
     )
-    log(f"run {report.run_id} failed ({reason}); " + report.notes[-1])
-    return report
+    log(f"run {report.run_id} failed [{report.failure_class}]: {report.reason}")
 
 
 def _push_run_evidence(
@@ -555,15 +546,20 @@ def _push_run_evidence(
     report: RunReport,
     issue: Issue,
     job: Path,
-    gate: GateResult,
-    section: decisions.DecisionsSection,
-    workdir: Path,
-    base_branch: str,
-    auth: dict[str, str],
+    context: _RunContext,
     log,
-) -> None:
-    """Every Run that reached a checkout pushes its bundle (ADR-0014) —
-    normal, empty-PR, and failed Runs alike, before job-dir cleanup."""
+) -> bool:
+    """Every Run pushes its bundle (ADR-0014) — normal, empty-PR, and failed
+    Runs alike. True only when the push confirmed (ADR-0016: the job dir
+    outlives an unconfirmed push)."""
+    workdir = job / jobdir.CHECKOUT_DIR
+    diffstat = ""
+    if context.base_branch and workdir.is_dir():
+        try:
+            diffstat = gitops.diff_stat(workdir, f"origin/{context.base_branch}")
+        except Exception as exc:
+            diffstat = f"(diffstat unavailable: {exc})"
+    section = context.section or decisions.fallback_section(report.reason or "no decisions recorded")
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
     files = {
@@ -583,6 +579,7 @@ def _push_run_evidence(
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
                 "reason": report.reason,
+                "failure_class": report.failure_class,
                 "notes": report.notes,
             },
             indent=2,
@@ -590,14 +587,14 @@ def _push_run_evidence(
         )
         + "\n",
         f"{prefix}/findings.json": json.dumps(
-            [f.__dict__ for f in gate.findings], indent=2, sort_keys=True
+            [f.__dict__ for f in context.gate.findings], indent=2, sort_keys=True
         )
         + "\n",
         f"{prefix}/decisions.json": section.to_json() + "\n",
         # The full tmux session transcript: the audit trail for any human
         # interaction mid-Run (M2 brief; captured via pipe-pane).
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
-        f"{prefix}/diffstat.txt": gitops.diff_stat(workdir, f"origin/{base_branch}") + "\n",
+        f"{prefix}/diffstat.txt": diffstat + "\n",
     }
     try:
         evidence.push_bundle(
@@ -606,9 +603,110 @@ def _push_run_evidence(
             message=f"Evidence: run {report.run_id} (issue #{issue.number})",
             author_name=config.worker_id,
             author_email=f"{config.worker_id}@theozolith.invalid",
-            env=auth,
+            env=gitops.auth_env(config.token),
         )
     except Exception as exc:
         # Never fail the Run on evidence, but never swallow it silently.
         report.notes.append(f"evidence push failed: {exc}")
         log(f"evidence push failed for run {report.run_id}: {exc}")
+        return False
+    return True
+
+
+# -- the claim lane: local retry, then escalation (ADR-0016) -------------------
+
+
+def render_claim_escalation(repo: str, issue_number: int, reports: list[RunReport]) -> str:
+    lines = ["Both Runs for this claim failed; the local-retry budget is spent (ADR-0016).", ""]
+    for report in reports:
+        url = evidence.run_evidence_url(repo, issue_number, report.run_id)
+        lines.append(
+            f"- Run `{report.run_id}` — **{report.failure_class}**: {report.reason}"
+            f" ([evidence]({url}))"
+        )
+    lines += [
+        "",
+        f"The claim is released and escalated: `{FAILED}` + `{NEEDS_HUMAN}`."
+        f" A human re-queues by removing `{FAILED}` and restoring `{PLAN_READY}`.",
+    ]
+    return "\n".join(lines)
+
+
+def execute_claim(
+    config: DriverConfig,
+    client: GitHubClient,
+    issue: Issue,
+    session_factory: SessionFactory,
+    *,
+    log=_log,
+    sink: events.EventSink | None = None,
+) -> list[RunReport]:
+    """Everything one granted claim owes: up to CLAIM_RUN_BUDGET Runs (the
+    original and one local retry), then release + failed + needs_human with
+    complete forensics. Returns the reports, one per Run executed."""
+    sink = sink or events.make_sink(config, log)
+    reports: list[RunReport] = []
+    for run_number in range(1, CLAIM_RUN_BUDGET + 1):
+        run_id = new_run_id(config)
+        claimed = events.run_event(
+            config, issue=issue.number, run_id=run_id, phase=events.PHASE_CLAIMED
+        )
+        activated = any(sink.emit(claimed) for _ in range(ACTIVATION_ATTEMPTS))
+        if run_number == 1 and not activated:
+            # The activation handshake (ADR-0017): without a landed claimed
+            # event the Control Node releases this grant after ~60s; running
+            # anyway would fork ownership. Walk away and let it.
+            log(
+                f"issue #{issue.number}: claimed event never reached the Control Node;"
+                " abandoning the grant (it will be released, ADR-0017)"
+            )
+            return reports
+        report = execute_run(
+            config, client, issue, session_factory, run_id=run_id, log=log, sink=sink
+        )
+        reports.append(report)
+        if report.phase != "failed":
+            return reports
+        if run_number < CLAIM_RUN_BUDGET:
+            log(
+                f"run {report.run_id} failed [{report.failure_class}]; keeping the claim and"
+                " launching the one local retry (ADR-0016)"
+            )
+    _escalate_claim(config, client, issue, reports, log, sink)
+    return reports
+
+
+def _escalate_claim(
+    config: DriverConfig,
+    client: GitHubClient,
+    issue: Issue,
+    reports: list[RunReport],
+    log,
+    sink: events.EventSink,
+) -> None:
+    """The local-retry budget is spent: release the claim and hand the issue
+    to a human with both failures' forensics (ADR-0016). failed means
+    execution broke — autopsy the evidence; only a human removes it."""
+    me = client.viewer_login()
+    fresh = client.get_issue(issue.number)
+    if me in fresh.assignees:
+        client.remove_assignee(issue.number, me)
+    client.remove_label(issue.number, IN_PROGRESS)
+    client.add_labels(issue.number, FAILED, NEEDS_HUMAN)
+    client.add_comment(
+        issue.number, render_claim_escalation(config.repo, issue.number, reports)
+    )
+    last = reports[-1]
+    sink.emit(
+        events.run_event(
+            config,
+            issue=issue.number,
+            run_id=last.run_id,
+            phase=events.PHASE_ESCALATED,
+            attempt=last.round,
+        )
+    )
+    log(
+        f"issue #{issue.number}: local-retry budget spent; claim released and escalated"
+        f" ({FAILED} + {NEEDS_HUMAN})"
+    )

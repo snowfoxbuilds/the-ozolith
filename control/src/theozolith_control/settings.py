@@ -3,10 +3,11 @@
 Every variable honors the VAR_FILE convention (NODE-SUBSTRATE.md) via the
 worker component's ``env_value``. Two static bearer tokens gate the API
 (ADR-0015): the node token (Node Daemons and drivers) and the admin token
-(CLI now, the M4 web form later). GitHub credentials are optional — without
-them the janitor and auditor are disabled and the Control Node is a pure
-observer, which is a legal deployment (ADR-0002: the pipeline never needs
-the Control Node).
+(the CLI and the dashboard). GitHub credentials are required for the
+pipeline (ADR-0017: the Control Node writes every claim) — without them
+claim dispatch answers 503, the janitor is disabled, and the Control Node
+is a pure substrate observer, which is still a legal non-pipeline
+deployment.
 """
 
 from __future__ import annotations
@@ -35,14 +36,17 @@ class ControlSettings:
     data_dir: Path  # SQLite DB, master key, TLS material
     config_repo: Path  # the Config Repo working home (ADR-0006)
     node_token: str  # bearer for Node Daemons and drivers
-    admin_token: str  # bearer for the CLI / M4 web UI
-    repo: str | None  # target repo (owner/name) for janitor + auditor
-    github_token: str | None  # janitor/auditor GitHub credential
+    admin_token: str  # the one admin credential: CLI, dashboard, terminal
+    repo: str | None  # target repo (owner/name) for dispatch + janitor
+    github_token: str | None  # the control PAT (claim writes, janitor)
     api_url: str
     zombie_grace_seconds: float
     janitor_sweep_seconds: float
-    audit_sweep_seconds: float
-    claim_ttl_seconds: float
+    # ADR-0017: a grant with no claimed event inside this window is released.
+    activation_window_seconds: float
+    # ADR-0016 cache-not-archive: progress-telemetry byte budget (oldest-first
+    # eviction; terminal events are never evicted).
+    tail_budget_bytes: int
     # True only when the server terminates TLS itself or an operator
     # explicitly opted into insecure dev mode: gates the secret endpoints.
     secrets_channel_ok: bool = False
@@ -60,8 +64,12 @@ class ControlSettings:
         return self.data_dir / "tls"
 
     @property
+    def terminal_audit_path(self) -> Path:
+        return self.data_dir / "terminal-audit.log"
+
+    @property
     def coordination_jobs_enabled(self) -> bool:
-        """Janitor + auditor need a GitHub identity and a target repo."""
+        """Dispatch + janitor need a GitHub identity and a target repo."""
         return bool(self.repo and self.github_token)
 
 
@@ -94,6 +102,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",
         zombie_grace_seconds=_float(environ, "THEOZOLITH_ZOMBIE_GRACE_SECONDS", "600"),
         janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
-        audit_sweep_seconds=_float(environ, "THEOZOLITH_AUDIT_SWEEP_SECONDS", "300"),
-        claim_ttl_seconds=_float(environ, "THEOZOLITH_CLAIM_TTL_SECONDS", "120"),
+        activation_window_seconds=_float(environ, "THEOZOLITH_ACTIVATION_WINDOW_SECONDS", "60"),
+        tail_budget_bytes=int(
+            _float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))
+        ),
     )

@@ -10,6 +10,7 @@ shell under the container's environment.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -26,17 +27,15 @@ from theozolith_worker import decisions, verdict
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
     BLOCKED,
+    FAILED,
     IN_PROGRESS,
     NEEDS_HUMAN,
     PLAN_READY,
     PR_READY,
 )
-from theozolith_worker.claim import attempt_claim
-from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.gitops import GitError
 from theozolith_worker.jobdir import AgentOutcome
-from theozolith_worker.prefilter import ControlNodePrefilter, NullPrefilter, make_prefilter
-from theozolith_worker.runner import branch_for, parse_run_failed
+from theozolith_worker.runner import branch_for
 from theozolith_worker.sessions import SessionError
 
 CRITERIA_BODY = "## Acceptance criteria\n- change.txt exists on the branch\n"
@@ -112,54 +111,45 @@ def test_happy_path(harness: Harness):
     assert harness.record.alive == set()
 
 
-# -- 2. race ------------------------------------------------------------------
+# -- 2. claims (write-through dispatch, ADR-0017) ------------------------------
 
 
-def test_claim_race_exactly_one_survives(harness: Harness):
-    number = harness.file_issue("Contested", CRITERIA_BODY)
-    harness.fake.register("tok-worker-b", "ozolith-worker-b")
-    client_b = GitHubClient(
-        harness.fake.repo, "tok-worker-b", transport=harness.fake, sleep=lambda s: None
-    )
+def test_worker_never_writes_claim_state(harness: Harness):
+    """The Control Node is the single writer of claim creation: the driver
+    acts on an already-claimed issue and never assigns, labels a claim, or
+    dequeues plan_ready itself."""
+    number = harness.file_issue("Dispatched", CRITERIA_BODY)
+    assert harness.worker_once() == 1
 
-    # Both Workers polled while the issue was unclaimed (stale snapshots).
-    snapshot_a = harness.worker_client.get_issue(number)
-    snapshot_b = client_b.get_issue(number)
-
-    assert attempt_claim(harness.worker_client, snapshot_a) is True
-    assert attempt_claim(client_b, snapshot_b) is False
-
-    # Exactly one claim survives; the loser left no net side effects.
+    # The claim exists (written by dispatch), the Run shipped on top of it.
     assert harness.fake.assignees_of(number) == [WORKER_LOGIN]
     assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+    claim_writes = [
+        (actor, method, path)
+        for actor, method, path, _ in harness.fake.write_log
+        if path.endswith("/assignees")
+        or (path.endswith("/labels") and f"/issues/{number}/" in path)
+        or path.endswith(f"/labels/{PLAN_READY}")
+    ]
+    assert claim_writes == [], f"driver wrote claim state itself: {claim_writes}"
 
 
-def test_claim_race_simultaneous_assign_earliest_wins(harness: Harness):
-    number = harness.file_issue("Contested", CRITERIA_BODY)
-    fired: list[bool] = []
-
-    def concurrent_assign(actor: str, method: str, path: str) -> None:
-        if method == "POST" and path.endswith("/assignees") and not fired:
-            fired.append(True)
-            harness.fake.force_assign(number, "ozolith-worker-b")
-
-    harness.fake.after_request = concurrent_assign
-    snapshot = harness.worker_client.get_issue(number)
-
-    # Both assigns land before the verify read; the earliest-assigned wins.
-    assert attempt_claim(harness.worker_client, snapshot) is True
-    assert WORKER_LOGIN in harness.fake.assignees_of(number)
-    assert PLAN_READY not in harness.fake.labels_of(number)
-
-
-def test_claim_race_later_assignee_backs_off(harness: Harness):
-    number = harness.file_issue("Contested", CRITERIA_BODY)
-    snapshot = harness.worker_client.get_issue(number)
-    harness.fake.force_assign(number, "ozolith-worker-b")  # b landed first
-
-    assert attempt_claim(harness.worker_client, snapshot) is False
+def test_no_grant_means_no_run(harness: Harness):
+    """Issues spoken for on GitHub are never granted; the driver idles."""
+    number = harness.file_issue("Busy", CRITERIA_BODY)
+    harness.fake.force_assign(number, "ozolith-worker-b")  # someone else owns it
+    assert harness.worker_once() == 0
+    assert harness.record.launched == []
     assert harness.fake.assignees_of(number) == ["ozolith-worker-b"]
-    assert PLAN_READY in harness.fake.labels_of(number)  # loser never dequeues
+
+
+def test_failed_label_is_refused_at_dispatch(harness: Harness):
+    """ADR-0016: failed overrides plan_ready — the issue is never granted."""
+    number = harness.file_issue("Broken state", CRITERIA_BODY)
+    harness.fake.issues[number]["labels"].append({"name": FAILED})
+    assert harness.worker_once() == 0
+    assert harness.record.launched == []
+    assert PLAN_READY in harness.fake.labels_of(number)  # never laundered
 
 
 # -- 3. review loop -----------------------------------------------------------
@@ -376,30 +366,42 @@ def test_statelessness_between_runs(harness: Harness):
     assert "First" not in harness.worker_calls[1][0]
 
 
-def test_container_crash_is_a_failed_run_with_marker_and_requeue(harness: Harness):
-    number = harness.file_issue("Doomed", CRITERIA_BODY)
+def test_container_crash_retries_locally_and_the_retry_ships(harness: Harness):
+    """ADR-0016 local retry: the driver keeps the claim and launches one
+    full second Run — new run_id, fresh clone, fresh container — with no
+    GitHub label churn in between."""
+    number = harness.file_issue("Shaky", CRITERIA_BODY)
 
     def boom(prompt: str, cwd: Path) -> None:
         raise SessionError("run container exited before the agent phase completed")
 
-    harness.worker_behaviors.append(boom)
-    harness.worker_once()
+    harness.worker_behaviors.append(boom)  # first Run crashes; retry succeeds
+    assert harness.worker_once() == 2
 
-    assert harness.fake.open_pr_numbers() == []  # no PR, no PR labels, no rounds
-    # The failed-Run path: claim stripped, plan_ready restored, marker stamped.
-    assert harness.fake.assignees_of(number) == []
-    labels = harness.fake.labels_of(number)
-    assert PLAN_READY in labels and IN_PROGRESS not in labels
-    (comment,) = harness.fake.comments[number]
-    parsed = parse_run_failed(comment["body"])
-    assert parsed is not None and "exited before" in parsed[1]
-    assert any("failed" in line for line in harness.logs)
-    assert harness.record.alive == set()  # the dead container was removed
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    # The claim never left this Worker and nothing touched the issue labels.
+    assert harness.fake.assignees_of(number) == [WORKER_LOGIN]
+    assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+    assert harness.fake.comments[number] == []  # no marker comments exist
+    # Two distinct fresh Runs, two containers, none left behind.
+    run_containers = [n for n in harness.record.launched if n.startswith("ozolith-run-")]
+    assert len(set(run_containers)) == 2
+    assert harness.record.alive == set()
+    # Both Runs pushed their own evidence bundle (the failed one included).
+    run_dirs = {
+        p.split("/")[2]
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    }
+    assert len(run_dirs) == 2
+    # The events tell the story: claimed, failed, claimed, gate, pr-open.
+    assert harness.sink.run_phases(number) == ["claimed", "failed", "claimed", "gate", "pr-open"]
     jobs_root = Path(harness.worker_config.jobs_dir)
     assert not jobs_root.exists() or list(jobs_root.iterdir()) == []
 
 
-# -- run-outcome classification (ADR-0014) ------------------------------------
+# -- run-outcome classification (ADR-0014, failure lane per ADR-0016) ---------
 
 
 def _no_op(prompt: str, cwd: Path) -> None:
@@ -419,26 +421,33 @@ def _session_death(prompt: str, cwd: Path):
     return AgentOutcome(session_died=True)
 
 
-def _assert_failed(harness: Harness, number: int, reason_fragment: str) -> None:
+def _assert_escalated(
+    harness: Harness, number: int, failure_class: str, reason_fragment: str
+) -> None:
+    """The local-retry budget is spent: claim released, failed + needs_human,
+    both evidence links and each failure's class in the comment."""
     assert harness.fake.assignees_of(number) == []
     labels = harness.fake.labels_of(number)
-    assert PLAN_READY in labels and IN_PROGRESS not in labels
-    marker = parse_run_failed(harness.fake.comments[number][-1]["body"])
-    assert marker is not None and reason_fragment in marker[1]
-    run_id = marker[0]
-    # Evidence shipped for the failed Run, recording the marker's reason.
-    run_json = harness.evidence_file(f"runs/issue-{number}/{run_id}/run.json")
-    record = json.loads(run_json)
-    assert record["phase"] == "failed" and reason_fragment in record["reason"]
-    # Park the re-queued issue so the next matrix case claims a fresh one.
-    harness.fake.issues[number]["labels"] = [
-        label for label in harness.fake.issues[number]["labels"] if label["name"] != PLAN_READY
-    ]
+    assert {FAILED, NEEDS_HUMAN} <= labels
+    assert PLAN_READY not in labels and IN_PROGRESS not in labels and BLOCKED not in labels
+    (comment,) = harness.fake.comments[number]
+    body = comment["body"]
+    assert "local-retry budget is spent" in body
+    assert failure_class in body and reason_fragment in body
+    run_ids = re.findall(r"Run `([^`]+)`", body)
+    assert len(run_ids) == 2 and run_ids[0] != run_ids[1]  # two distinct Runs
+    for run_id in run_ids:
+        assert f"tree/theozolith/evidence/runs/issue-{number}/{run_id}" in body
+        record = json.loads(harness.evidence_file(f"runs/issue-{number}/{run_id}/run.json"))
+        assert record["phase"] == "failed"
+        assert record["failure_class"] == failure_class
+        assert reason_fragment in record["reason"]
 
 
 def test_run_outcome_classification_matrix(harness: Harness):
     """commits / no-commits-with-reasoning / no-commits-no-reasoning /
-    timeout / session death → normal PR / empty PR / failed / failed / failed."""
+    timeout / session death → normal PR / empty PR / failed / failed /
+    failed, with the uniform local-retry budget on every failure class."""
     # commits → normal PR (default behavior writes change.txt).
     with_commits = harness.file_issue("With commits", CRITERIA_BODY)
     assert harness.worker_once() == 1
@@ -459,26 +468,26 @@ def test_run_outcome_classification_matrix(harness: Harness):
 
     # no commits + no reasoning → failed (both no-file and empty-file forms).
     silent = harness.file_issue("Silent", CRITERIA_BODY)
-    harness.worker_behaviors.append(_no_op)
-    harness.worker_once()
-    _assert_failed(harness, silent, "no no-change reasoning")
+    harness.worker_behaviors.extend([_no_op, _no_op])
+    assert harness.worker_once() == 2  # the original and the one local retry
+    _assert_escalated(harness, silent, "no-changes", "no no-change reasoning")
 
     hollow = harness.file_issue("Hollow", CRITERIA_BODY)
-    harness.worker_behaviors.append(_empty_decisions)
+    harness.worker_behaviors.extend([_empty_decisions, _empty_decisions])
     harness.worker_once()
-    _assert_failed(harness, hollow, "no no-change reasoning")
+    _assert_escalated(harness, hollow, "no-changes", "no no-change reasoning")
 
     # timeout → failed, even with changes in the tree.
     timed = harness.file_issue("Timed out", CRITERIA_BODY)
-    harness.worker_behaviors.append(_timeout_with_changes)
+    harness.worker_behaviors.extend([_timeout_with_changes, _timeout_with_changes])
     harness.worker_once()
-    _assert_failed(harness, timed, "timed out")
+    _assert_escalated(harness, timed, "timeout", "timed out")
 
     # session death → failed.
     died = harness.file_issue("Died", CRITERIA_BODY)
-    harness.worker_behaviors.append(_session_death)
+    harness.worker_behaviors.extend([_session_death, _session_death])
     harness.worker_once()
-    _assert_failed(harness, died, "session died")
+    _assert_escalated(harness, died, "session-died", "session died")
 
     # Only the two shipping Runs opened PRs.
     assert len(harness.fake.open_pr_numbers()) == 2
@@ -527,33 +536,38 @@ def test_empty_pr_carries_reasoning_and_allow_empty_commit(harness: Harness):
     assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
 
 
-def test_failed_run_budget_is_one_retry_then_escalation(harness: Harness):
+def test_failed_run_budget_is_one_local_retry_then_escalation(harness: Harness):
+    """Acceptance 10: a Run killed mid-flight retries locally exactly once
+    (same claim, new run_id, both evidence bundles pushed); a second kill
+    releases the claim and applies failed + needs_human with both evidence
+    links and each failure's class — mixed classes stay one uniform budget."""
     number = harness.file_issue("Cursed", CRITERIA_BODY)
 
-    harness.worker_behaviors.append(_no_op)  # first failure
-    assert harness.worker_once() == 1
-    labels = harness.fake.labels_of(number)
-    assert PLAN_READY in labels  # re-queued for the one retry
-    assert len(harness.fake.comments[number]) == 1
+    harness.worker_behaviors.extend([_no_op, _session_death])
+    assert harness.worker_once() == 2  # both Runs happened under ONE claim
 
-    harness.worker_behaviors.append(_session_death)  # the retry fails too
-    assert harness.worker_once() == 1
-    labels = harness.fake.labels_of(number)
-    assert {BLOCKED, NEEDS_HUMAN} <= labels
-    assert PLAN_READY not in labels and IN_PROGRESS not in labels
     assert harness.fake.assignees_of(number) == []
-    markers = [
-        parse_run_failed(c["body"])
-        for c in harness.fake.comments[number]
-        if parse_run_failed(c["body"])
-    ]
-    assert len(markers) == 2  # both failures are stamped
-    assert "escalating to a human" in harness.fake.comments[number][-1]["body"]
+    labels = harness.fake.labels_of(number)
+    assert {FAILED, NEEDS_HUMAN} <= labels
+    assert PLAN_READY not in labels and IN_PROGRESS not in labels
+    (comment,) = harness.fake.comments[number]  # one escalation, no markers
+    assert "no-changes" in comment["body"] and "session-died" in comment["body"]
     # Two distinct fresh Runs: different run ids, different containers.
-    assert markers[0][0] != markers[1][0]
+    run_ids = re.findall(r"Run `([^`]+)`", comment["body"])
+    assert len(set(run_ids)) == 2
     assert len({n for n in harness.record.launched if n.startswith("ozolith-run-")}) == 2
+    # The first Run completed its session (so the gate ran) but classified
+    # failed; the retry died before its gate.
+    assert harness.sink.run_phases(number) == [
+        "claimed",
+        "gate",
+        "failed",
+        "claimed",
+        "failed",
+        "escalated",
+    ]
 
-    # blocked + needs_human is not claimable: nothing left to do.
+    # failed + needs_human is not claimable: nothing left to do.
     assert harness.worker_once() == 0
 
 
@@ -596,27 +610,29 @@ def _audit_write(actor: str, method: str, path: str, payload, issues: set[int], 
             return  # open the best-effort PR
         if tail.startswith("/pulls/") and method == "PATCH":
             return  # update the PR body (Decisions Section)
-        if tail.endswith("/assignees") and method in ("POST", "DELETE"):
-            assert payload["assignees"] == [actor], "workers only (un)assign themselves"
+        if tail.endswith("/assignees") and method == "DELETE":
+            # Workers never CREATE claim state (ADR-0017: the Control Node
+            # writes claims); the escalation release is the only unassign.
+            assert payload["assignees"] == [actor], "workers only unassign themselves"
             assert number in issues
             return
         if tail.endswith("/comments") and method == "POST":
-            # The only worker comment is the run-failed marker (ADR-0014).
+            # The only worker comment is the escalation record (ADR-0016).
             assert number in issues, "worker comments only on issues"
-            assert "theozolith:run-failed" in payload["body"]
+            assert "local-retry budget is spent" in payload["body"]
             return
         if tail.endswith("/labels") and method == "POST":
             wanted = set(payload["labels"])
             if number in prs:
                 assert wanted <= {PR_READY}, f"worker set {wanted} on a PR"
             else:
-                # claim, failed-Run re-queue, and failed-Run escalation
-                allowed = {IN_PROGRESS, PLAN_READY, BLOCKED, NEEDS_HUMAN}
-                assert wanted <= allowed, f"worker set {wanted} on an issue"
+                # The spent-budget escalation — never a claim, never a
+                # re-queue (plan_ready is the Control Node's and the human's).
+                assert wanted <= {FAILED, NEEDS_HUMAN}, f"worker set {wanted} on an issue"
             return
         if method == "DELETE" and "/labels/" in tail:
             label = tail.rsplit("/", 1)[1]
-            assert label in (PLAN_READY, IN_PROGRESS) and number in issues
+            assert label == IN_PROGRESS and number in issues
             return
         raise AssertionError(f"unexpected worker write: {method} {tail}")
 
@@ -648,17 +664,6 @@ def _audit_write(actor: str, method: str, path: str, payload, issues: set[int], 
 
 def test_authority_matrix_via_write_transcript(harness: Harness):
     issue_number = harness.file_issue("Audited", CRITERIA_BODY)
-    contested = harness.file_issue("Contested", CRITERIA_BODY)
-
-    # A second worker loses a claim race (covers the back-off writes).
-    harness.fake.register("tok-worker-b", "ozolith-worker-b")
-    client_b = GitHubClient(
-        harness.fake.repo, "tok-worker-b", transport=harness.fake, sleep=lambda s: None
-    )
-    stale_a = harness.worker_client.get_issue(contested)
-    stale_b = client_b.get_issue(contested)
-    assert attempt_claim(harness.worker_client, stale_a)
-    assert not attempt_claim(client_b, stale_b)
 
     # A full revise round then an approve on the first issue.
     harness.worker_once()
@@ -668,15 +673,13 @@ def test_authority_matrix_via_write_transcript(harness: Harness):
     harness.reviewer_replies.append(approve_reply())
     harness.reviewer_once()
 
-    # A failed Run (covers the marker comment + re-queue writes), then its
-    # failed retry (covers the blocked + needs_human escalation writes).
+    # A doubly-failed claim (covers the escalation writes: unassign,
+    # in_progress off, failed + needs_human on, the escalation comment).
     doomed = harness.file_issue("Doomed", CRITERIA_BODY)
-    harness.worker_behaviors.append(_session_death)
-    harness.worker_once()
-    harness.worker_behaviors.append(_no_op)
+    harness.worker_behaviors.extend([_session_death, _no_op])
     harness.worker_once()
 
-    issues = {issue_number, contested, doomed}
+    issues = {issue_number, doomed}
     prs = set(harness.fake.pulls)
     assert harness.fake.write_log, "the transcript must not be empty"
     for actor, method, path, payload in harness.fake.write_log:
@@ -825,24 +828,64 @@ def test_missing_and_schema_invalid_verdicts_also_escalate(harness: Harness):
     assert len(review_containers(harness)) == 2  # one call per PR, never more
 
 
-# -- 11. degraded mode --------------------------------------------------------
+# -- 11. Control Node availability (ADR-0017) ---------------------------------
 
 
-def test_degraded_mode_without_control_node(harness: Harness):
-    """No Control Node configured or reachable: everything still works
-    (GitHub-only operation is the permanent degraded mode, ADR-0002)."""
-    assert isinstance(make_prefilter(None), NullPrefilter)
+class _FirstEmitOnlySink:
+    """The Control Node dies right after grant activation: the claimed
+    event lands, everything after it does not."""
 
-    number = harness.file_issue("Degraded", CRITERIA_BODY)
-    unreachable = ControlNodePrefilter("http://127.0.0.1:1", timeout=0.2)
-    assert harness.worker_once(prefilter=unreachable) == 1
+    def __init__(self):
+        self.calls = 0
+
+    def emit(self, event: dict) -> bool:
+        self.calls += 1
+        return self.calls == 1
+
+
+class _DeadSink:
+    def emit(self, event: dict) -> bool:
+        return False
+
+
+def test_control_node_down_pauses_new_claims_and_reviews(harness: Harness):
+    """Acceptance 9, availability half: with the Control Node down no new
+    claims occur and review rounds pause — there is no second claim path."""
+    number = harness.file_issue("Waiting", CRITERIA_BODY)
+    harness.dispatch.paused = True
+
+    assert harness.worker_once() == 0
+    assert harness.record.launched == []
+    assert PLAN_READY in harness.fake.labels_of(number)  # untouched
+    assert harness.reviewer_once() == 0
+    assert any("paused" in line for line in harness.logs)
+
+    harness.dispatch.paused = False  # the Control Node returns
+    assert harness.worker_once() == 1
+    assert PR_READY in harness.fake.labels_of(harness.fake.open_pr_numbers()[0])
+
+
+def test_in_flight_run_finishes_and_publishes_with_control_down(harness: Harness):
+    """The grant activated, then the Control Node died mid-Run: the Run
+    finishes and publishes (drivers hold their own PATs for all non-claim
+    GitHub writes); only telemetry is lost."""
+    number = harness.file_issue("Survivor", CRITERIA_BODY)
+    assert harness.worker_once(sink=_FirstEmitOnlySink()) == 1
 
     (pr_number,) = harness.fake.open_pr_numbers()
     assert PR_READY in harness.fake.labels_of(pr_number)
-    harness.reviewer_replies.append(approve_reply())
-    harness.reviewer_once()
-    assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
     assert harness.remote_file(branch_for(number), "change.txt")
+
+
+def test_unacknowledged_claimed_event_abandons_the_grant(harness: Harness):
+    """The activation handshake: a grant whose claimed event never lands is
+    walked away from — the Control Node releases it after the activation
+    window, and running anyway would fork ownership (ADR-0017)."""
+    harness.file_issue("Lost handshake", CRITERIA_BODY)
+    assert harness.worker_once(sink=_DeadSink()) == 0
+    assert harness.record.launched == []  # no Run was started
+    assert harness.fake.open_pr_numbers() == []
+    assert any("abandoning the grant" in line for line in harness.logs)
 
 
 # -- 12. rate limits ----------------------------------------------------------
