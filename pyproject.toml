@@ -29,5 +29,8 @@ extend-exclude = ["venv"]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pytest.ini_options]
-testpaths = ["knowledge/tests", "worker/tests"]
+# worker/tests must stay LAST: its modules do `from conftest import …`, which
+# binds to the last conftest.py pytest loads. The other test dirs keep their
+# shared helpers in uniquely named modules (daemonrig, controlrig) instead.
+testpaths = ["knowledge/tests", "control/tests", "nodedaemon/tests", "worker/tests"]
 addopts = "-q"

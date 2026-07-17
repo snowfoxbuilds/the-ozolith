@@ -1,0 +1,99 @@
+"""Control Node configuration from the environment.
+
+Every variable honors the VAR_FILE convention (NODE-SUBSTRATE.md) via the
+worker component's ``env_value``. Two static bearer tokens gate the API
+(ADR-0015): the node token (Node Daemons and drivers) and the admin token
+(CLI now, the M4 web form later). GitHub credentials are optional — without
+them the janitor and auditor are disabled and the Control Node is a pure
+observer, which is a legal deployment (ADR-0002: the pipeline never needs
+the Control Node).
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from theozolith_worker.config import ConfigError, env_value
+
+DEFAULT_CONFIG_REPO = "~/.theozolith/configs"
+DEFAULT_DATA_DIR = "~/.theozolith/control"
+
+
+def _float(environ: Mapping[str, str], name: str, default: str) -> float:
+    raw = env_value(environ, name, default) or default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+
+
+@dataclass(frozen=True)
+class ControlSettings:
+    data_dir: Path  # SQLite DB, master key, TLS material
+    config_repo: Path  # the Config Repo working home (ADR-0006)
+    node_token: str  # bearer for Node Daemons and drivers
+    admin_token: str  # bearer for the CLI / M4 web UI
+    repo: str | None  # target repo (owner/name) for janitor + auditor
+    github_token: str | None  # janitor/auditor GitHub credential
+    api_url: str
+    zombie_grace_seconds: float
+    janitor_sweep_seconds: float
+    audit_sweep_seconds: float
+    claim_ttl_seconds: float
+    # True only when the server terminates TLS itself or an operator
+    # explicitly opted into insecure dev mode: gates the secret endpoints.
+    secrets_channel_ok: bool = False
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "control.db"
+
+    @property
+    def key_path(self) -> Path:
+        return self.data_dir / "master.key"
+
+    @property
+    def tls_dir(self) -> Path:
+        return self.data_dir / "tls"
+
+    @property
+    def coordination_jobs_enabled(self) -> bool:
+        """Janitor + auditor need a GitHub identity and a target repo."""
+        return bool(self.repo and self.github_token)
+
+
+def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
+    environ = os.environ if environ is None else environ
+
+    node_token = env_value(environ, "THEOZOLITH_NODE_TOKEN")
+    admin_token = env_value(environ, "THEOZOLITH_ADMIN_TOKEN")
+    if not node_token or not admin_token:
+        raise ConfigError(
+            "set THEOZOLITH_NODE_TOKEN and THEOZOLITH_ADMIN_TOKEN (or their _FILE forms)"
+        )
+
+    repo = env_value(environ, "THEOZOLITH_REPO")
+    if repo and "/" not in repo:
+        raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
+
+    return ControlSettings(
+        data_dir=Path(
+            env_value(environ, "THEOZOLITH_CONTROL_DATA", DEFAULT_DATA_DIR) or DEFAULT_DATA_DIR
+        ).expanduser(),
+        config_repo=Path(
+            env_value(environ, "THEOZOLITH_CONFIG_REPO", DEFAULT_CONFIG_REPO) or DEFAULT_CONFIG_REPO
+        ).expanduser(),
+        node_token=node_token,
+        admin_token=admin_token,
+        repo=repo,
+        github_token=env_value(environ, "CONTROL_GITHUB_TOKEN")
+        or env_value(environ, "GITHUB_TOKEN"),
+        api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",
+        zombie_grace_seconds=_float(environ, "THEOZOLITH_ZOMBIE_GRACE_SECONDS", "600"),
+        janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
+        audit_sweep_seconds=_float(environ, "THEOZOLITH_AUDIT_SWEEP_SECONDS", "300"),
+        claim_ttl_seconds=_float(environ, "THEOZOLITH_CLAIM_TTL_SECONDS", "120"),
+    )

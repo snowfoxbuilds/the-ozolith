@@ -1,0 +1,47 @@
+# The Control Node as the `control` built-in Stack (a container Stack).
+# Run it directly for bootstrap (the Control Node must exist before any node
+# can reconcile Stacks), or declare it in the Config Repo like any Stack.
+#
+# From the repo root:
+#
+#   docker compose -f deploy/compose/control.yml up -d
+#
+# One-time TLS provisioning (mandatory — secrets transit this channel):
+#
+#   docker compose -f deploy/compose/control.yml run --rm control \
+#     tls-init --host <LAN name or IP of this box>
+#
+# then distribute the minted CA:  docker compose ... cp control:/data/tls/ca.pem .
+# (install-nodedaemon.sh --ca ca.pem pins it on every node).
+#
+# Configuration comes from the environment (see deploy/.env.example):
+#   docker compose --env-file .env -f deploy/compose/control.yml up -d
+
+services:
+  control:
+    build:
+      context: ../..
+      dockerfile: control/docker/Dockerfile
+    image: theozolith-control:local
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      THEOZOLITH_NODE_TOKEN: ${THEOZOLITH_NODE_TOKEN:?set in .env}
+      THEOZOLITH_ADMIN_TOKEN: ${THEOZOLITH_ADMIN_TOKEN:?set in .env}
+      # Janitor + auditor (optional: unset disables both, ADR-0002).
+      THEOZOLITH_REPO: ${THEOZOLITH_REPO:-}
+      CONTROL_GITHUB_TOKEN: ${CONTROL_GITHUB_TOKEN:-}
+      THEOZOLITH_ZOMBIE_GRACE_SECONDS: ${THEOZOLITH_ZOMBIE_GRACE_SECONDS:-600}
+      THEOZOLITH_JANITOR_SWEEP_SECONDS: ${THEOZOLITH_JANITOR_SWEEP_SECONDS:-60}
+      THEOZOLITH_AUDIT_SWEEP_SECONDS: ${THEOZOLITH_AUDIT_SWEEP_SECONDS:-300}
+      THEOZOLITH_CLAIM_TTL_SECONDS: ${THEOZOLITH_CLAIM_TTL_SECONDS:-120}
+    volumes:
+      # SQLite DB, master key, TLS material. The master key protects every
+      # secret: this volume is the thing to back up and to guard.
+      - control-data:/data
+      # The Config Repo working home (ADR-0006), read-only in the container.
+      - ${THEOZOLITH_CONFIG_REPO:-~/.theozolith/configs}:/configs:ro
+
+volumes:
+  control-data:

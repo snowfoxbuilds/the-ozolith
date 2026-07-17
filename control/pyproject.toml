@@ -1,11 +1,23 @@
 [project]
 name = "theozolith-control"
-version = "0.1.0"
-description = "Control Node: fleet dashboard, heartbeat/command + run-event API, janitor jobs. Stub in M1; behavior lands in a later milestone."
+version = "0.3.0"
+description = "Control Node: heartbeat/command + typed-event API, claim pre-filter, zombie-claim janitor, retry auditor, and the encrypted node-scoped secret store. Advisory in coordination (ADR-0002); authoritative for node and docker lifecycle."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-dependencies = []
+# The one component allowed runtime dependencies (ADR-0015 amending ADR-0010):
+# it always ships as a container, so its footprint never lands on a host.
+# theozolith-worker supplies the rate-limited GitHub client and the label
+# vocabulary the janitor/auditor jobs need (pipeline-aware by design, ADR-0002).
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "cryptography>=42",
+    "theozolith-worker",
+]
+
+[project.scripts]
+theozolith-control = "theozolith_control.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -14,5 +26,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/theozolith_control"]
 
+[tool.uv.sources]
+theozolith-worker = { workspace = true }
+
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx>=0.27"]

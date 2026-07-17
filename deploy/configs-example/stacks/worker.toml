@@ -1,0 +1,25 @@
+# The Worker driver as a process-kind Stack (ADR-0013: node-resident driver,
+# supervised Node Daemon child). Copy this tree into your Config Repo
+# (default ~/.theozolith/configs on the Control Node) and adjust.
+
+kind = "process"
+node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
+state = "running"
+command = "theozolith-worker"
+
+# The derived run-container image this driver launches per Run: an
+# images/<name>.toml recipe, built locally by the node that hosts this
+# driver and injected as THEOZOLITH_RUN_IMAGE.
+run_image = "claude-dev"
+
+[env]
+THEOZOLITH_REPO = "acme/sandbox"
+WORKER_MODEL = "claude-sonnet-5"
+WORKER_ID = "worker-box1"
+
+# Secret NAMES only — values live encrypted on the Control Node, entered
+# once via `theozolith-control secret set <name>`, pulled node-scoped at
+# deploy time, and delivered as <ENV>_FILE from tmpfs (never node disk).
+[secrets]
+WORKER_GITHUB_TOKEN = "github-worker"
+ANTHROPIC_API_KEY = "anthropic-api-key"

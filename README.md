@@ -11,8 +11,14 @@ An open-source agent-orchestration monorepo with three separable concerns:
   the Claim Protocol, a first-party gate, best-effort PRs with Decisions Sections, and
   verdict-file review rounds (M2; ADR-0013). Plus the repo bootstrap tool from M1.
 - **Cluster substrate** (`control/`, `nodedaemon/`, `deploy/`) — Control Node, Node Daemons,
-  and Stacks. `deploy/` documents the M2 one-box driver deployment; the Control Node and
-  Node Daemon land in M3.
+  and Stacks (M3; ADR-0015). The Control Node serves the heartbeat/command channel, typed
+  Run events, the advisory claim pre-filter, the zombie-claim janitor and retry auditor,
+  and the encrypted node-scoped secret store. The Node Daemon registers a box as a
+  Container-Host: declarative Stacks (container + supervised driver processes,
+  kill-the-tree), local derived-image builds, tmpfs secrets, orphan reaping. `deploy/`
+  carries the installer, the control compose file, and a starter Config Repo; the M2
+  daemon-less one-box deployment remains fully supported (the pipeline never needs the
+  Control Node; ADR-0002).
 
 Every top-level component is independently installable. A laptop-only user of the knowledge
 machinery never installs the cluster manager.

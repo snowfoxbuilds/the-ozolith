@@ -1,0 +1,16 @@
+# The Reviewer driver: its own process Stack, its own GitHub identity —
+# no self-grading by construction (ADR-0008).
+
+kind = "process"
+node = "box1"
+state = "running"
+command = "theozolith-reviewer"
+run_image = "claude-dev"
+
+[env]
+THEOZOLITH_REPO = "acme/sandbox"
+REVIEWER_MODEL = "claude-fable-5"
+
+[secrets]
+REVIEWER_GITHUB_TOKEN = "github-reviewer"
+ANTHROPIC_API_KEY = "anthropic-api-key"

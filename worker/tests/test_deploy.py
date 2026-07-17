@@ -71,3 +71,92 @@ def test_ci_builds_the_run_container_image():
     caught (a PR #2 review finding, absorbed here)."""
     ci = CI.read_text()
     assert "docker build -f worker/docker/Dockerfile.claude" in ci
+
+
+# -- M3 substrate artifacts -------------------------------------------------------
+
+
+def test_env_example_covers_the_substrate_config_surface():
+    documented = documented_env_names()
+    required = {
+        "CONTROL_NODE_URL",
+        "THEOZOLITH_NODE_TOKEN",
+        "THEOZOLITH_ADMIN_TOKEN",
+        "THEOZOLITH_TLS_CA",
+        "THEOZOLITH_NODE_NAME",
+        "CONTROL_GITHUB_TOKEN",
+        "THEOZOLITH_CONTROL_DATA",
+        "THEOZOLITH_CONFIG_REPO",
+        "THEOZOLITH_HEARTBEAT_SECONDS",
+        "THEOZOLITH_ZOMBIE_GRACE_SECONDS",
+        "THEOZOLITH_JANITOR_SWEEP_SECONDS",
+        "THEOZOLITH_AUDIT_SWEEP_SECONDS",
+        "THEOZOLITH_CLAIM_TTL_SECONDS",
+        "THEOZOLITH_STOP_GRACE_SECONDS",
+        "THEOZOLITH_STATE_DIR",
+        "THEOZOLITH_RUNTIME_DIR",
+    }
+    missing = required - documented
+    assert not missing, f".env.example is missing: {sorted(missing)}"
+
+
+def test_nodedaemon_unit_enforces_kill_the_tree():
+    unit = (DEPLOY / "systemd" / "theozolith-nodedaemon.service").read_text()
+    assert "KillMode=control-group" in unit  # ADR-0013: no zombie processes
+    assert "RuntimeDirectory=theozolith" in unit  # secrets tmpfs under /run
+    assert "StateDirectory=theozolith" in unit
+    assert "EnvironmentFile=" in unit
+    assert "Restart=always" in unit
+    assert "User=ozolith" in unit  # never root
+
+
+def test_installer_provisions_tls_and_the_unit():
+    installer = (DEPLOY / "install-nodedaemon.sh").read_text()
+    assert "--ca" in installer and "ca.pem" in installer  # TLS provisioning
+    assert "systemctl enable --now theozolith-nodedaemon" in installer
+    assert "THEOZOLITH_NODE_TOKEN" in installer
+    assert "usermod -aG docker ozolith" in installer
+    # Tokens never travel through argv.
+    assert "read -r -s" in installer
+
+
+def test_control_compose_mounts_data_and_the_config_repo():
+    compose = (DEPLOY / "compose" / "control.yml").read_text()
+    assert "control-data:/data" in compose
+    assert ":/configs:ro" in compose
+    assert "tls-init" in compose  # the mandatory-TLS bootstrap is documented
+    assert "8443" in compose
+
+
+def test_ci_builds_the_control_image():
+    assert "docker build -f control/docker/Dockerfile" in CI.read_text()
+
+
+def test_no_tailscale_anywhere_in_product_code_or_deploy():
+    """NODE-SUBSTRATE.md: Tailscale is a private-side deployment detail —
+    never in product code, images, or deploy scripts (overlays may name it
+    as an example of the extension point, nothing more)."""
+    for component in ("worker", "control", "nodedaemon", "knowledge"):
+        for path in (REPO_ROOT / component / "src").rglob("*.py"):
+            assert "tailscale" not in path.read_text().lower(), path
+    for name in ("install-nodedaemon.sh", "compose/control.yml", ".env.example"):
+        assert "tailscale" not in (DEPLOY / name).read_text().lower(), name
+
+
+def test_configs_example_parses_and_places_the_builtin_stacks():
+    """The starter Config Repo must stay valid: worker/reviewer as process
+    Stacks, control as a container Stack (ADR-0013)."""
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    kinds = {stack.name: stack.kind for stack in config.stacks}
+    assert kinds == {"worker": "process", "reviewer": "process", "control": "container"}
+    assert config.product_version
+    assert "claude-dev" in config.images
+    # The worker Stack's node gets exactly its referenced secrets.
+    worker = next(s for s in config.stacks if s.name == "worker")
+    assert config.secret_names_for(worker.node) >= {"github-worker", "anthropic-api-key"}
+    # Desired state renders (compose text inlines) for every placed node.
+    for node in {stack.node for stack in config.stacks}:
+        state = config.desired_state_for(node)
+        assert state["commit"]

@@ -1,0 +1,6 @@
+# The product version the `update` infrastructure command installs on nodes
+# (ADR-0013 §8). Bump this, commit, and issue `theozolith-control command
+# update --node <name>`. Absent or empty = latest.
+
+[product]
+version = "0.3.0"
