@@ -18,9 +18,9 @@ The credential-free half of a Worker or Reviewer: PID 1 of an ephemeral run cont
 
 **Claim Protocol**
 
-How a Worker takes exclusive ownership of a plan_ready issue: self-assign plus the in_progress label on GitHub, then re-read to verify sole assignee (back off otherwise). Claims may route through the Control Node as a race pre-filter when it is reachable; the GitHub assign-and-verify step remains the only authority.
+How a Worker takes exclusive ownership of a plan_ready issue: the Worker requests work from the Control Node; the Control Node selects an issue, writes the claim to GitHub itself (assigns the Worker's GitHub login, adds in_progress), and returns the issue in the same response — claim-write-through, single serialized claim-writer (ADR-0017). GitHub remains the sole source of coordination truth. A granted claim that never activates (no claimed event within the activation window) is released by the Control Node. Control Node down = new claims pause; in-flight Runs are unaffected.
 
-*Avoid*: treating the Control Node as claim arbiter.
+*Avoid*: drivers claiming directly against GitHub (retired 2026-07-17); "assign-and-verify" (deleted by ADR-0017).
 
 **Claude agent**
 
@@ -42,9 +42,9 @@ The node type a physical machine becomes when the Node Daemon is installed on it
 
 **Control Node**
 
-The product's central service, shipped in TheOzolith's control/ component (deployed on the Pi). Renders the fleet dashboard; receives Node Daemon heartbeats and Run events; answers heartbeats with infrastructure commands (drain, recycle, update); sweeps zombie claims and audits retry counts. Authoritative for node and docker lifecycle; advisory only in issue coordination — the pipeline ships PRs without it.
+The product's central service, shipped in TheOzolith's control/ component (deployed on the Pi). Renders the fleet dashboard; receives Node Daemon heartbeats and Run events; answers heartbeats with infrastructure commands (drain, recycle, update, rebuild); dispatches claims as the single writer of claim creation on GitHub (ADR-0017); escalates zombie claims evidence-first and quarantines failing nodes at dispatch (ADR-0016). Authoritative for node and docker lifecycle and for claim dispatch; never originates other coordination — it cannot approve, revise, or advance an issue, and GitHub remains the sole source of coordination truth. Control Node down: in-flight Runs finish and publish; new claims and review rounds pause.
 
-*Avoid*: "dispatcher"; treating it as claim or coordination authority.
+*Avoid*: treating its database as coordination truth (GitHub is); "advisory" for the claim path (retired 2026-07-17; ADR-0017).
 
 **Decisions Section**
 
@@ -76,17 +76,23 @@ The whole agentic coding pipeline system: planning, execution, review, and monit
 
 *Avoid*: using it for the Control Node or a Worker.
 
+**Review Run**
+
+The Run kind that executes one review round: a fresh container reads the PR, diff, evidence, and Decisions Section, and emits a verdict file that the reviewer driver publishes. The round (attempt-N, 3 max per PR) is the budget unit; the Review Run is its execution. One invalid verdict = immediate escalation, no retry.
+
+*Avoid*: conflating with "review round" (the round is the budget unit; the Review Run is its execution).
+
 **Reviewer**
 
-A separate long-lived actor — own node-resident driver, own GitHub identity, configured with a stronger model than the Worker adapters — that polls PRs labeled pr_ready without needs_human and owns all post-PR state. Verdicts: approve (needs_human + deviation/risk labels), revise (attempt-N on the PR, revised plan + resume commit, issue re-queued to plan_ready under delegated authority), escalate (blocked + needs_human). Review rounds execute as ephemeral containers; the verdict is emitted as a file and published by the reviewer driver. Never implements; no self-grading by construction.
+A separate long-lived actor — own node-resident driver, own GitHub identity, configured with a stronger model than the Worker adapters — that discovers pr_ready PRs without needs_human through Control Node dispatch (ADR-0017) and owns all post-PR state. Verdicts: approve (needs_human + deviation/risk labels), revise (attempt-N on the PR, revised plan + resume commit, issue re-queued to plan_ready under delegated authority), escalate (blocked + needs_human). Review rounds execute as Review Runs; the verdict is emitted as a file and published by the reviewer driver. Never implements; no self-grading by construction.
 
 *Avoid*: running review as a gate step inside the Run.
 
 **Run**
 
-One attempt at one GitHub issue by a Worker, always ending in a best-effort PR when a checkout is reached. Stateless and disposable: fresh clone/worktree, fresh run container, and fresh context; the only carryover is PR branch content at the Reviewer-designated resume commit. Executes in exactly one ephemeral, attachable run container with the agent harness as PID 1. The unit of review rounds (3 max) and evidence bundles.
+One ephemeral container lifecycle executing one agent session: exactly one attachable run container with the agent harness as PID 1, fresh context, container lifetime = Run lifetime. Two kinds: Worker Run and Review Run. Stateless and disposable. Every Run that reaches a checkout pushes an evidence bundle — the Run is the unit of evidence.
 
-*Avoid*: "job"; "task" (that is the issue).
+*Avoid*: "job"; "task" (that is the issue); bare "Run" where the Worker/Review distinction matters.
 
 **Skill**
 
@@ -102,9 +108,15 @@ A declarative unit of workload the Node Daemon runs: name, workload, placement, 
 
 **Worker**
 
-A long-lived driver process on a container-host, bound to one Agent config (ADR-0013 — not a container). Polls GitHub for plan_ready issues, claims via the Claim Protocol, and executes Runs sequentially, one at a time, each as an ephemeral run container — every Run ends in a best-effort PR with a Decisions Section. Holds no authoritative state and owns no post-PR labels.
+A long-lived driver process on a container-host, bound to one Agent config (ADR-0013 — not a container). Requests work from the Control Node (Claim Protocol; ADR-0017) and executes Worker Runs sequentially, one at a time — every completed agent session ends in a best-effort PR with a Decisions Section. Holds no authoritative state and owns no post-PR labels.
 
 *Avoid*: "runner"; "agent" (an Agent is a config, not a process); "long-lived container" (retracted 2026-07-15).
+
+**Worker Run**
+
+The Run kind that attempts one GitHub issue: fresh clone/worktree; the only carryover is PR branch content at the Reviewer-designated resume commit. A completed agent session ends in a best-effort PR — including a justified no-change empty PR; a failed one (timeout, session death, harness crash, or zero commits with no reasoning) ends in evidence plus one local retry or a failed + needs_human escalation, never a PR (ADR-0016).
+
+*Avoid*: "attempt-N" (a review-round counter, not a Worker Run counter).
 
 **Workflow**
 
@@ -119,14 +131,14 @@ A configuration that involves multiple agents working together.
 - A Skill can be reused across agents.
 - A Workflow involves two or more agents.
 - The Orchestrator comprises planning (GitHub issues), execution (Workers and Runs), review (Reviewer actor plus human), and monitoring (Control Node).
-- A Worker is bound to exactly one Agent config and executes one Run at a time.
-- A Worker or Reviewer = one node-resident driver plus one ephemeral run container per Run or review round; driver and harness communicate only through the job directory.
-- A Run belongs to exactly one Worker and targets exactly one GitHub issue.
-- The Control Node observes Workers and Runs; GitHub owns all coordination state.
+- A Worker is bound to exactly one Agent config and executes one Worker Run at a time.
+- A Worker or Reviewer = one node-resident driver plus one ephemeral run container per Run; driver and harness communicate only through the job directory.
+- A Worker Run belongs to exactly one Worker and targets exactly one GitHub issue; a Review Run belongs to the Reviewer and executes exactly one round of one PR.
+- The Control Node dispatches claims and review rounds, observes Workers and Runs, and writes claim creation to GitHub; GitHub owns all coordination state (ADR-0017).
 - A Decisions Section belongs to exactly one PR; all review rounds for an issue reuse that one PR and branch.
 - The Reviewer owns all post-PR state and never implements; the Worker implements and owns only claim state plus pr_ready at push.
 - A Node Daemon runs on exactly one box, supervises its Stacks (container workloads and driver processes in its cgroup), and heartbeats to the Control Node.
 - The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
-- The command channel carries desired state and references; the only payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
-- Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision). Issues and PRs carry separate label sets; each actor polls exactly one label.
+- The heartbeat/command channel carries desired state, references, and advisory telemetry (typed, size-capped, never coordination authority; ADR-0016); the only secret payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
+- Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision), failed + needs_human (on the issue: execution failure escalated with evidence; only the human removes failed, and failed overrides plan_ready at dispatch — ADR-0016). Issues and PRs carry separate label sets; each actor polls exactly one label.
 - TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content is data in one private config repo (ADR-0007).

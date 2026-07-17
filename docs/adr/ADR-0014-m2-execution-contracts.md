@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended in part by ADR-0016 (2026-07-17): the failed-Run marker/re-queue path is replaced by local retry with failed + needs_human escalation; zombie re-queue by evidence-first escalation.
 
 Date: 2026-07-16
 
@@ -26,7 +26,7 @@ The regenerated M2 brief (ADR-0013 topology: node-resident drivers, ephemeral pe
 - **Completion detection (Claude adapter)**: the harness writes `.claude/settings.local.json` in the workdir with `Stop` and `UserPromptSubmit` hooks that append `stop` / `prompt` lines to `output/hook-events.log` (path via `THEOZOLITH_HOOK_LOG` in the session env). Complete when the last event is `stop` and the log has been quiet for `settle_seconds` — the settle window is what lets an attached human's queued input re-arm the wait instead of ending the Run under them. Backstops: the hard `agent_timeout_seconds`, and session death (agent process exited). All three outcomes are recorded in the status file; the driver ships best-effort regardless (only harness/container infrastructure failure classifies the Run as failed — see Run outcomes).
 - **Validate-verdict harness job** (review mode, added 2026-07-16): the harness exposes a job that runs the same verdict-validation logic as the driver (one shared implementation, never forked) against the in-progress `verdict.json` and returns errors to the agent, so the model can check and fix its verdict before the session ends. Only verdicts that escape the container hit the one-strike escalation rule.
 - The interactive command is `claude --model <model> --dangerously-skip-permissions` — which is exactly why Runs execute inside a disposable container: the agent has no credentials to misuse and nothing durable to break (ADR-0013).
-### Run outcomes (Worker driver, amended 2026-07-16)
+### Run outcomes (Worker driver, amended 2026-07-16; superseded in part by ADR-0016, 2026-07-17 — the marker-comment retry ledger and plan_ready re-queue below are replaced by a local retry that keeps the claim, with failed + needs_human escalation on the second non-completion)
 
 The driver classifies every Run from the job dir; the PR channel is the only signal path (the agent has no GitHub access):
 

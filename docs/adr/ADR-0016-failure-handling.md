@@ -1,0 +1,31 @@
+Status: ACCEPTED
+
+Date: 2026-07-17
+
+# ADR-0016: Failure handling — local retry, failed label, evidence-first escalation
+
+## Context
+
+ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the retry budget in a machine-readable run-failed marker comment) put distributed state in prose comments: marker parsing, a sanitizer, and a budget check at claim time, with a restore-then-comment ordering race. The zombie janitor's automatic re-queue discarded forensics and could re-burn tokens on undiagnosed failures. Heartbeats were too strict a channel to carry agent progress. Grilling 2026-07-17 (with the 2026-07-16/17 design discussion) replaced the whole lane. Operator priority ordering, stated and binding: stability and token efficiency over uptime.
+
+## Decision
+
+- **Local retry**: on a failed Run the driver keeps the claim and re-launches once, locally. The retry is a full second Run — new run_id, fresh clone/worktree, fresh container, its own evidence bundle. Uniform budget: any non-completed Run burns the single retry regardless of class (timeout, session death, harness crash, zero commits without reasoning, pre-session infra failure). On a second non-completion the driver releases the claim and escalates, linking both evidence bundles and stating each failure's class. The run-failed marker machinery (marker comment, sanitizer, budget-check-at-claim) is deleted.
+- **failed label**: escalations from execution failures apply failed + needs_human on the issue (driver: second local failure; janitor: zombie). Review-lane escalations keep blocked + needs_human on the PR — two queryable flavors: failed = execution broke, autopsy the evidence; blocked = a decision is owed. Only the human removes failed, as part of re-queueing. failed overrides plan_ready: dispatch refuses to grant an issue carrying failed and surfaces it on the dashboard as a malformed state.
+- **Control-side node quarantine**: after 2 consecutive failed Runs on a node, the Control Node stops granting work to it (it already receives the failed-phase run events and holds the grant gate per ADR-0017). The dashboard shows the quarantine and its reason. Release is human action only — recycle/update or explicit unquarantine — never a timer. A consecutive completed Run resets the counter.
+- **Progress telemetry**: drivers emit typed [theozolith.run](http://theozolith.run/).progress events — phase, elapsed time, token/tool-call counters, a size-capped transcript tail. The channel invariant is restated, not gutted: the channel never carries secrets (beyond node-scoped pulls over TLS) or coordination authority; telemetry payloads are advisory and size-capped, enforced at ingestion. Agent-authored text is treated as untrusted (prompt-injection-shaped) wherever displayed.
+- **Cache, never archive**: the Control Node database is a cache; the evidence bundle is the sole durable audit trail, so nothing in the control database may ever be the only copy of anything and everything in it is deletable by policy. Transcript tails live under a ~10GB disk budget with oldest-first eviction; terminal events (claimed / pr-open / failed / escalated) are kept — they are tiny and are the metrics substrate.
+- **Boot-time evidence sweep**: at startup the driver (the PAT holder — the daemon never receives a credential) sweeps orphaned job directories and pushes them to the evidence branch. A job dir is deleted only after the push is confirmed on the remote; on push failure it is left in place, logged, and retried at the next startup or poll cycle. Swept bundles are pushed under the original run_id path with a swept: true marker and sweep timestamp, so post-mortem-recovered evidence is distinguishable from live-pushed evidence.
+- **Two-phase zombie escalation, evidence first**: the janitor detects a claim whose Worker has been silent past the grace period and surfaces it on the dashboard, but does not touch GitHub yet. Only when the swept evidence bundle lands (driver returned and swept) does it release the claim and apply failed + needs_human with the real evidence link. There is no automatic re-queue and no escalate-before-evidence: a node that never returns is a human call made from the dashboard, where the stuck zombie is visible.
+## Consequences
+
+- **Positive**: no distributed state in comments — marker parsing, sanitizer, and claim-time budget checks are deleted; every escalation carries complete forensics; the queue is protected from sick nodes at the grant gate; retry cost is bounded and local.
+- **Negative**: a down node stalls its zombie issues until it returns or a human intervenes (accepted — uptime ranks below stability and token efficiency); a local retry can re-hit node-local causes (accepted — quarantine catches the pattern); the control database stores agent-authored text, an untrusted display surface.
+- **Amends**: ADR-0014 (failed-Run marker/re-queue path replaced by local retry); ADR-0015 (janitor escalates instead of re-queueing; the heartbeat/event channel carries telemetry under the restated invariant); ADR-0002 phrasing (janitorial liveness corrections are the enumerated exception to never-originates-coordination — see also ADR-0017).
+## Alternatives Considered
+
+- **Marker-comment retry ledger (ADR-0014 status quo)**: rejected — distributed state in prose comments, with parsing and ordering races the fast-follow audit surfaced.
+- **Re-queue to plan_ready on failure**: rejected — burns tokens repeating undiagnosed failures and hands a broken issue to another node without forensics.
+- **Escalate zombies before evidence, link the expected path**: rejected by the operator — faster issue turnaround is not worth escalations without complete forensics.
+- **Driver-side circuit breaker for sick nodes**: rejected — the Control Node holds the grant gate (ADR-0017) and the fleet view, so it can distinguish a failing node from a failing issue; a driver cannot.
+- **Auto-strip failed at dispatch when plan_ready is present**: rejected — launders a forgotten label into silence; a visibly stalled grant is preferable to an unnoticed failure loop.
