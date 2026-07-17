@@ -490,9 +490,7 @@ class Store:
                 excess -= row["size"]
                 if excess <= 0:
                     break
-            self._db.executemany(
-                "DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed]
-            )
+            self._db.executemany("DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed])
             return len(doomed)
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------

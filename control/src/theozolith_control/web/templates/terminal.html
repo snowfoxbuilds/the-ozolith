@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Terminal · {{ container }} · TheOzolith{% endblock %}
+{% block content %}
+<h2>Terminal <span class="muted">{{ stack }} · {{ container }} on {{ node }}</span></h2>
+{% if not ok %}
+<p class="flash flash-error">✕ {{ error }}</p>
+<p><a href="/">Back to the dashboard</a></p>
+{% else %}
+<p class="muted">Attached input is permitted and audited (this session is in the terminal audit
+log; in-session keystrokes land in the Run's evidence transcript).</p>
+<link rel="stylesheet" href="/static/xterm.css">
+<div id="terminal"></div>
+<script src="/static/xterm.js"></script>
+<script src="/static/xterm-addon-fit.js"></script>
+<script>
+  (function () {
+    var term = new Terminal({ fontSize: 14, cursorBlink: true, scrollback: 5000 });
+    var fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById("terminal"));
+    fit.fit();
+
+    var params = new URLSearchParams({
+      node: {{ node | tojson }}, stack: {{ stack | tojson }}, container: {{ container | tojson }}
+    });
+    var scheme = location.protocol === "https:" ? "wss" : "ws";
+    var socket = new WebSocket(scheme + "://" + location.host + "/terminal/ws?" + params);
+    socket.binaryType = "arraybuffer";
+    var encoder = new TextEncoder();
+
+    function sendResize() {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
+      }
+    }
+    socket.onopen = function () { term.focus(); sendResize(); };
+    socket.onmessage = function (event) { term.write(new Uint8Array(event.data)); };
+    socket.onclose = function (event) {
+      term.write("\r\n\x1b[2m[session closed" + (event.reason ? ": " + event.reason : "") + "]\x1b[0m\r\n");
+    };
+    term.onData(function (data) {
+      if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
+    });
+    term.onResize(sendResize);
+    window.addEventListener("resize", function () { fit.fit(); });
+  })();
+</script>
+{% endif %}
+{% endblock %}

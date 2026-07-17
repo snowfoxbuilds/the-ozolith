@@ -56,9 +56,7 @@ class LiveControl:
         github = GitHubClient(
             harness.fake.repo, "tok-control", transport=harness.fake, sleep=lambda s: None
         )
-        app = create_app(
-            settings, self.store, SecretBox(generate_key()), github_client=github
-        )
+        app = create_app(settings, self.store, SecretBox(generate_key()), github_client=github)
         self._server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
         )
@@ -122,9 +120,7 @@ def worker_once(harness: Harness, *, sink, dispatch) -> int:
 # -- write-through dispatch against a live Control Node -------------------------
 
 
-def test_live_dispatch_claims_on_github_before_the_driver_acts(
-    harness: Harness, tmp_path: Path
-):
+def test_live_dispatch_claims_on_github_before_the_driver_acts(harness: Harness, tmp_path: Path):
     """Acceptance 9 end to end: real driver, real Control Node, real client
     — the claim on GitHub is the Control Node's write, not the driver's."""
     issue = harness.file_issue("dispatched", "claim me through the control node")

@@ -1,0 +1,77 @@
+<h2>Nodes</h2>
+{% if fleet.skewed_images %}
+<p class="flash flash-warning">⚠ build skew across the fleet:
+  {% for name in fleet.skewed_images %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+  — same image name, different base digest or instruction hash (rebuild to converge).</p>
+{% endif %}
+{% for node in fleet.nodes %}
+<article class="node">
+  <h3>{{ node.name }}
+    <span class="muted">{{ node.version }}</span>
+    {% if node.stale %}<span class="badge b-warning">● stale ({{ node.last_seen }})</span>
+    {% else %}<span class="badge b-good">● seen {{ node.last_seen }}</span>{% endif %}
+    {% if node.quarantine %}<span class="badge b-critical">● quarantined: {{ node.quarantine.reason }}</span>{% endif %}
+  </h3>
+  {% if node.stacks %}
+  <table>
+    <thead><tr><th>Stack</th><th>Kind</th><th>Desired</th><th>Actual</th><th>Detail</th></tr></thead>
+    <tbody>
+    {% for stack in node.stacks %}
+      <tr>
+        <td>{{ stack.name }}</td><td class="muted">{{ stack.kind }}</td>
+        <td>{{ stack.desired }}</td>
+        <td>{% if stack.converged %}<span class="badge b-good">● {{ stack.actual }}</span>
+            {% else %}<span class="badge b-warning">● {{ stack.actual }}</span>{% endif %}</td>
+        <td class="muted">{{ stack.detail }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if node.containers %}
+  <p class="muted">run containers:</p>
+  <ul class="flags">
+    {% for c in node.containers %}
+    <li><code>{{ c.name }}</code> <span class="muted">run {{ c.run_id }} · owner {{ c.owner }}
+        · {{ c.status }}</span>
+      {% if c.attachable %}
+      <a class="button" href="/terminal?node={{ node.name }}&amp;stack={{ c.owner }}&amp;container={{ c.name }}">attach</a>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if node.images %}
+  <table>
+    <thead><tr><th>Image</th><th>Tag</th><th>Base digest</th><th>Instruction hash</th><th>Built</th></tr></thead>
+    <tbody>
+    {% for image in node.images %}
+      <tr{% if image.skewed %} class="skewed"{% endif %}>
+        <td>{{ image.name }}
+            {% if image.skewed %}<span class="badge b-warning">● skew</span>{% endif %}</td>
+        <td><code>{{ image.tag }}</code></td>
+        <td><code>{{ image.base_digest[:19] }}…</code></td>
+        <td><code>{{ image.instruction_hash[:12] }}</code></td>
+        <td class="muted">{{ image.built_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</article>
+{% else %}
+<p class="muted">No nodes have registered yet.</p>
+{% endfor %}
+{% if fleet.pending_commands %}
+<h3>Pending commands</h3>
+<ul class="flags">
+  {% for c in fleet.pending_commands %}
+  <li><code>{{ c.verb }}{% if c.target %} {{ c.target }}{% endif %}</code> on {{ c.node }}
+    {% if c.deferred_reason %}
+      <span class="badge b-info">● deferred</span>
+      <span class="muted">{{ c.deferred_reason }} (queue-behind; --force overrides)</span>
+    {% else %}<span class="badge b-info">● pending</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}

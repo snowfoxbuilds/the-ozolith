@@ -380,7 +380,7 @@ def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
 # -- queue-behind recycle/update (NODE-SUBSTRATE, grilling 2026-07-17) -----------
 
 
-def _driver_stack(tmp_path) -> tuple[dict, "Path"]:
+def _driver_stack(tmp_path) -> tuple[dict, object]:
     """A worker Stack whose jobs dir lives under tmp_path (the in-flight
     signal the daemon watches)."""
     jobs = tmp_path / "jobs"

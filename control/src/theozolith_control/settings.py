@@ -103,7 +103,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         zombie_grace_seconds=_float(environ, "THEOZOLITH_ZOMBIE_GRACE_SECONDS", "600"),
         janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
         activation_window_seconds=_float(environ, "THEOZOLITH_ACTIVATION_WINDOW_SECONDS", "60"),
-        tail_budget_bytes=int(
-            _float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))
-        ),
+        tail_budget_bytes=int(_float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))),
     )

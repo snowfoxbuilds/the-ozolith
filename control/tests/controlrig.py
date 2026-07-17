@@ -61,7 +61,7 @@ class ControlRig:
     box: SecretBox
     client: TestClient
     clock: FakeClock
-    github: "FakeGitHubLite"
+    github: FakeGitHubLite
 
     def node_post(self, path: str, body: dict, token: str = NODE_TOKEN):
         return self.client.post(path, json=body, headers={"Authorization": f"Bearer {token}"})
@@ -104,7 +104,9 @@ def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
     box = SecretBox(generate_key())
     github = FakeGitHubLite()
     app = create_app(
-        settings, store, box,
+        settings,
+        store,
+        box,
         github_client=github if settings.coordination_jobs_enabled else None,
     )
     return ControlRig(settings, store, box, TestClient(app), clock, github)
@@ -181,9 +183,7 @@ class FakeGitHubLite:
         ]
 
     def list_open_issues(self, label: str) -> list[Issue]:
-        return [
-            self.get_issue(n) for n, d in sorted(self.issues.items()) if label in d["labels"]
-        ]
+        return [self.get_issue(n) for n, d in sorted(self.issues.items()) if label in d["labels"]]
 
     def path_exists(self, path: str, *, ref: str) -> bool:
         return path in self.evidence

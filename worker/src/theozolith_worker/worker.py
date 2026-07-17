@@ -89,9 +89,7 @@ def run_worker(
             issue = _granted_issue(granted, me)
             log(f"granted #{issue.number} ({issue.title}); executing the claim")
             try:
-                reports = execute_claim(
-                    config, client, issue, session_factory, log=log, sink=sink
-                )
+                reports = execute_claim(config, client, issue, session_factory, log=log, sink=sink)
                 runs += len(reports)
                 for report in reports:
                     log(

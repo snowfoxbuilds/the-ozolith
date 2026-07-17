@@ -295,4 +295,10 @@ def create_app(
             "quarantines": store.quarantines(),
         }
 
+    # -- the web surface: dashboard, secret form, terminal (M4) ---------------
+
+    from theozolith_control.web import mount_web
+
+    mount_web(app, settings, store, box, _config)
+
     return app

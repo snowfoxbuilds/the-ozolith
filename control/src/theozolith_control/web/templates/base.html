@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}TheOzolith{% endblock %}</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  {% block nav %}
+  <header class="topbar">
+    <span class="brand">TheOzolith <span class="muted">control</span></span>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/secrets">Secrets</a>
+      <form method="post" action="/logout" class="inline"><button class="linklike">Log out</button></form>
+    </nav>
+  </header>
+  {% endblock %}
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

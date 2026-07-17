@@ -455,7 +455,9 @@ def _run_to_pr(
             raise _RunFailed("agent session timed out", "timeout")
         if outcome is not None and outcome.session_died:
             raise _RunFailed("agent session died", "session-died")
-        raise _RunFailed(f"agent session {(outcome or jobdir.AgentOutcome()).describe()}", "harness")
+        raise _RunFailed(
+            f"agent session {(outcome or jobdir.AgentOutcome()).describe()}", "harness"
+        )
 
     section = agent_section or decisions.fallback_section(
         "agent exited without a valid .theozolith/decisions.json"
@@ -559,7 +561,9 @@ def _push_run_evidence(
             diffstat = gitops.diff_stat(workdir, f"origin/{context.base_branch}")
         except Exception as exc:
             diffstat = f"(diffstat unavailable: {exc})"
-    section = context.section or decisions.fallback_section(report.reason or "no decisions recorded")
+    section = context.section or decisions.fallback_section(
+        report.reason or "no decisions recorded"
+    )
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
     files = {
@@ -693,9 +697,7 @@ def _escalate_claim(
         client.remove_assignee(issue.number, me)
     client.remove_label(issue.number, IN_PROGRESS)
     client.add_labels(issue.number, FAILED, NEEDS_HUMAN)
-    client.add_comment(
-        issue.number, render_claim_escalation(config.repo, issue.number, reports)
-    )
+    client.add_comment(issue.number, render_claim_escalation(config.repo, issue.number, reports))
     last = reports[-1]
     sink.emit(
         events.run_event(

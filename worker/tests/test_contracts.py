@@ -327,12 +327,20 @@ def test_validate_verdict_cli(tmp_path, capsys):
 def test_claim_escalation_comment_carries_both_failures():
     reports = [
         RunReport(
-            run_id="r-1", issue=7, round=1, phase="failed",
-            reason="agent session timed out", failure_class="timeout",
+            run_id="r-1",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="agent session timed out",
+            failure_class="timeout",
         ),
         RunReport(
-            run_id="r-2", issue=7, round=1, phase="failed",
-            reason="run container exited early", failure_class="harness",
+            run_id="r-2",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="run container exited early",
+            failure_class="harness",
         ),
     ]
     body = render_claim_escalation("acme/sandbox", 7, reports)

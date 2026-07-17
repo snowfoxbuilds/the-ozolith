@@ -1,0 +1,18 @@
+<h2>Events</h2>
+{% if events %}
+<ul class="events">
+  {% for event in events %}
+  <li>
+    <span class="muted">{{ event.when }}</span>
+    <code class="etype">{{ event.type }}</code>
+    {% if event.known %}
+      {{ event.summary }}
+    {% else %}
+      {# the typed-event extension point: unknown namespaced types render
+         generically — custom Stacks get visibility with no product change #}
+      <details><summary class="muted">payload</summary><pre>{{ event.payload }}</pre></details>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p class="muted">No events yet.</p>{% endif %}

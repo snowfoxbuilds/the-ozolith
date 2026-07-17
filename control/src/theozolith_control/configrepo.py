@@ -106,6 +106,11 @@ class StackDef:
     volumes: tuple[str, ...] = ()
     compose: str = ""  # container kind, compose form (repo-relative path)
     overlays: tuple[str, ...] = ()
+    # Web-terminal attach command template ({host}, {container} placeholders),
+    # run by the Control Node's PTY bridge. Empty = no terminal exposed for
+    # this Stack (NODE-SUBSTRATE: dashboard and operator access). Consumed
+    # control-side only; it never travels to nodes.
+    attach: str = ""
 
     def as_wire(self, compose_files: list[dict[str, str]]) -> dict[str, Any]:
         return {
@@ -218,6 +223,7 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
         volumes=_str_list(data, "volumes", context),
         compose=_require_str(data, "compose", context, default=""),
         overlays=_str_list(data, "overlays", context),
+        attach=_require_str(data, "attach", context, default=""),
     )
     if stack.kind == "process" and not stack.command:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")

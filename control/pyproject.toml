@@ -13,6 +13,10 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
     "cryptography>=42",
+    # The dashboard (M4): server-rendered Jinja + vendored htmx/xterm.js
+    # static files — no frontend build step exists (M4 acceptance 8).
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",  # starlette form parsing (login + secret form)
     "theozolith-worker",
 ]
 
