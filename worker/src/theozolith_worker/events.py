@@ -50,11 +50,26 @@ class EventSink(Protocol):
         ...
 
 
-class NullSink:
-    """No Control Node configured (tests, tooling): events go nowhere."""
+def ssl_context_for(url: str, ca: str | None) -> ssl.SSLContext | None:
+    """The TLS context for a Control Node URL (shared by every stdlib
+    client on the channel: sink, dispatch)."""
+    if not url.startswith("https"):
+        return None
+    return ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
 
-    def emit(self, event: dict[str, Any]) -> bool:
-        return True
+
+def control_request(url: str, token: str, payload: dict[str, Any]) -> urllib.request.Request:
+    """One Control Node POST, headers included (shared request builder)."""
+    return urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "theozolith-worker",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+    )
 
 
 class ControlNodeSink:
@@ -76,23 +91,8 @@ class ControlNodeSink:
         self._log = log
 
     def emit(self, event: dict[str, Any]) -> bool:
-        request = urllib.request.Request(
-            self._url,
-            data=json.dumps(event).encode(),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "theozolith-worker",
-                **({"Authorization": f"Bearer {self._token}"} if self._token else {}),
-            },
-        )
-        context = None
-        if self._url.startswith("https"):
-            context = (
-                ssl.create_default_context(cafile=self._ca)
-                if self._ca
-                else ssl.create_default_context()
-            )
+        request = control_request(self._url, self._token, event)
+        context = ssl_context_for(self._url, self._ca)
         try:
             with urllib.request.urlopen(request, timeout=self._timeout, context=context) as resp:
                 resp.read()
@@ -104,11 +104,9 @@ class ControlNodeSink:
 
 
 def make_sink(config: DriverConfig, log=None) -> EventSink:
-    if config.control_node_url:
-        return ControlNodeSink(
-            config.control_node_url, token=config.control_token, ca=config.control_ca, log=log
-        )
-    return NullSink()
+    return ControlNodeSink(
+        config.control_node_url, token=config.control_token, ca=config.control_ca, log=log
+    )
 
 
 def run_event(
@@ -165,6 +163,20 @@ def _count_hook_events(job: Path) -> dict[str, int]:
     return counts
 
 
+def _transcript_snapshot(path: Path) -> tuple[int, str]:
+    """(size in bytes, decoded tail) without reading the whole file — a
+    multi-hour session transcript can be tens of MB and this runs every
+    progress interval."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - 4 * TRANSCRIPT_TAIL_CHARS))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0, ""
+    return size, tail[-TRANSCRIPT_TAIL_CHARS:]
+
+
 def progress_event(
     config: DriverConfig,
     job: Path,
@@ -178,10 +190,7 @@ def progress_event(
     tail is agent-authored text: untrusted wherever displayed, size-capped
     here and again at ingestion."""
     status = jobdir.read_status(job)
-    try:
-        transcript = (job / jobdir.TRANSCRIPT_FILE).read_text(encoding="utf-8")
-    except OSError:
-        transcript = ""
+    transcript_bytes, tail = _transcript_snapshot(job / jobdir.TRANSCRIPT_FILE)
     counts = _count_hook_events(job)
     return {
         "type": PROGRESS_EVENT,
@@ -199,8 +208,8 @@ def progress_event(
         "tool_calls": counts.get("tool", 0),
         "prompts": counts.get("prompt", 0),
         "tokens": None,
-        "transcript_bytes": len(transcript.encode("utf-8")),
-        "transcript_tail": transcript[-TRANSCRIPT_TAIL_CHARS:],
+        "transcript_bytes": transcript_bytes,
+        "transcript_tail": tail,
     }
 
 

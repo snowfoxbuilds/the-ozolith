@@ -40,6 +40,13 @@ def attempts_on(labels: set[str]) -> int:
     return max(rounds)
 
 
+def reviewable(labels: set[str]) -> bool:
+    """A PR the Reviewer may judge: pr_ready without a human hold. The one
+    predicate shared by the Control Node's discovery and the Reviewer's own
+    re-check (ADR-0017) so the two can never drift."""
+    return PR_READY in labels and NEEDS_HUMAN not in labels and BLOCKED not in labels
+
+
 @dataclass(frozen=True)
 class Label:
     name: str

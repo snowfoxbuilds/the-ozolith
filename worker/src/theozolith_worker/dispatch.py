@@ -16,10 +16,11 @@ non-claim GitHub writes).
 from __future__ import annotations
 
 import json
-import ssl
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
+
+from theozolith_worker.events import control_request, ssl_context_for
 
 
 class WorkDispatch(Protocol):
@@ -53,23 +54,8 @@ class DispatchClient:
         self._log = log
 
     def _post(self, body: dict[str, Any]) -> dict[str, Any] | None:
-        request = urllib.request.Request(
-            self._url,
-            data=json.dumps(body).encode(),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "theozolith-worker",
-                **({"Authorization": f"Bearer {self._token}"} if self._token else {}),
-            },
-        )
-        context = None
-        if self._url.startswith("https"):
-            context = (
-                ssl.create_default_context(cafile=self._ca)
-                if self._ca
-                else ssl.create_default_context()
-            )
+        request = control_request(self._url, self._token, body)
+        context = ssl_context_for(self._url, self._ca)
         try:
             with urllib.request.urlopen(request, timeout=self._timeout, context=context) as resp:
                 answer = json.loads(resp.read() or b"{}")
@@ -91,7 +77,15 @@ class DispatchClient:
         issue = answer.get("issue")
         if issue is None and self._log and answer.get("reason"):
             self._log(f"dispatch: no grant ({answer['reason']})")
-        return issue if isinstance(issue, dict) else None
+        if not isinstance(issue, dict):
+            return None
+        if not isinstance(issue.get("number"), int):
+            # A malformed grant must not crash the driver — the claim is
+            # already on GitHub; the activation-window release unwinds it.
+            if self._log:
+                self._log(f"dispatch: malformed grant payload ignored: {issue!r:.200}")
+            return None
+        return issue
 
     def review_targets(self, worker: str, node: str, login: str) -> list[int] | None:
         answer = self._post({"role": "reviewer", "worker": worker, "node": node, "login": login})

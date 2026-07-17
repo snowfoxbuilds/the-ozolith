@@ -96,7 +96,10 @@ async def bridge(websocket: WebSocket, command: str) -> None:
             if message.get("type") == "websocket.disconnect":
                 break
             if message.get("bytes") is not None:
-                os.write(master, message["bytes"])
+                # Off the loop: a full PTY buffer (Ctrl-S, stalled remote)
+                # blocks os.write, and a stuck terminal must never stall
+                # every other connection on this server.
+                await asyncio.to_thread(os.write, master, message["bytes"])
             elif message.get("text"):
                 with contextlib.suppress(ValueError, TypeError):
                     control = json.loads(message["text"])

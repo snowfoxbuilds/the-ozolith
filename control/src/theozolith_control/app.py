@@ -21,6 +21,7 @@ ADR-0015/0018, and shared with stdlib-only clients that cannot see pydantic.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from typing import Any
@@ -31,9 +32,7 @@ from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_co
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
 from theozolith_control.settings import ControlSettings
-from theozolith_control.store import EVENT_PROGRESS, Store
-
-COMMAND_VERBS = ("drain", "recycle", "update", "rebuild")
+from theozolith_control.store import COMMAND_VERBS, EVENT_PROGRESS, Store
 
 # Ingestion size caps (ADR-0016): the transcript tail inside a progress
 # event, and any single event payload. Oversized tails are truncated (the
@@ -201,9 +200,12 @@ def create_app(
         worker = _require(body, "worker", str)
         login = _require(body, "login", str)
         node = str(body.get("node", ""))
+        # Off the event loop: the grant path does real GitHub round-trips
+        # (with rate-limit sleeps) that must never stall heartbeats or the
+        # terminal websockets. The dispatcher's own lock still serializes.
         if role == "worker":
-            return dispatcher.grant_work(worker, node, login)
-        return dispatcher.review_targets(worker, node, login)
+            return await asyncio.to_thread(dispatcher.grant_work, worker, node, login)
+        return await asyncio.to_thread(dispatcher.review_targets, worker, node, login)
 
     @app.post("/api/v1/secrets/pull")
     async def secrets_pull(request: Request) -> dict[str, Any]:

@@ -192,3 +192,31 @@ def test_a_fresh_grant_is_left_alone(control, github):
     control.clock.advance(30)
     assert release(control, github) == []
     assert control.store.granted_issues() == {7}
+
+
+def test_one_broken_claim_never_starves_the_sweep(control, github):
+    """A deleted/transferred issue must not abort the whole pass."""
+    claimed_issue(control, github, issue=5)
+    github.add_issue(6, labels={"in_progress"}, assignees=["ozolith-worker-a"])
+    control.node_post("/api/v1/events", run_event(6, "claimed", run_id="r6"))
+    del github.issues[5]  # gone on GitHub: get_issue raises
+    control.clock.advance(GRACE + 60)
+    github.evidence.add("runs/issue-6/r6/swept.json")
+
+    assert sweep(control, github) == [6]  # issue 6 still escalates
+
+
+def test_a_driver_dead_between_failed_run_and_retry_stays_visible(control, github):
+    """ADR-0016: the driver holds the claim through the local retry, so a
+    failed-latest claim is still LIVE — a death in the retry window flags
+    and (with the failed Run's own evidence) escalates."""
+    claimed_issue(control, github)
+    control.node_post("/api/v1/events", run_event(5, "failed", run_id="r1"))
+    control.clock.advance(GRACE + 60)  # the driver never came back
+
+    assert sweep(control, github) == []  # flagged, waiting on evidence
+    assert control.store.zombie_flags() != []
+    github.evidence.add("runs/issue-5/r1/run.json")  # the failed Run's live push
+    assert sweep(control, github) == [5]
+    labels = github.get_issue(5).labels
+    assert "failed" in labels and "needs_human" in labels

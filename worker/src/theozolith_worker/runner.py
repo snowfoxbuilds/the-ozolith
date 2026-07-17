@@ -231,6 +231,23 @@ def _read_output(job: Path, relpath: str) -> str:
         return ""
 
 
+def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:
+    jobdir.atomic_write(
+        job / "input" / "issue.json",
+        json.dumps(
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body,
+                "labels": sorted(issue.labels),
+                "round": round_number,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+
+
 def _has_reasoning(section: decisions.DecisionsSection | None) -> bool:
     """Did the agent record anything that can justify a no-change Run?"""
     return section is not None and bool(
@@ -263,6 +280,11 @@ def execute_run(
     run_id = run_id or new_run_id(config)
     sink = sink or events.make_sink(config, log)
     job = jobdir.create_job_dir(config.jobs_dir, run_id)
+    # Issue metadata lands BEFORE any slow work (clone can take minutes):
+    # a driver death from here on leaves a job dir the boot sweep can file
+    # under the correct runs/issue-N path (ADR-0016). Rewritten with the
+    # final round number once the checkout settles it.
+    _write_issue_metadata(job, issue, round_number=1)
     report = RunReport(
         run_id=run_id,
         issue=issue.number,
@@ -354,20 +376,7 @@ def _run_to_pr(
 
     prompt = _build_prompt(issue, report.round, revised, discussion)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
-    jobdir.atomic_write(
-        job / "input" / "issue.json",
-        json.dumps(
-            {
-                "number": issue.number,
-                "title": issue.title,
-                "body": issue.body,
-                "labels": sorted(issue.labels),
-                "round": report.round,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-    )
+    _write_issue_metadata(job, issue, round_number=report.round)
     manifest = jobdir.Manifest(
         run_id=report.run_id,
         mode=jobdir.MODE_RUN,
@@ -649,22 +658,30 @@ def execute_claim(
     original and one local retry), then release + failed + needs_human with
     complete forensics. Returns the reports, one per Run executed."""
     sink = sink or events.make_sink(config, log)
-    reports: list[RunReport] = []
-    for run_number in range(1, CLAIM_RUN_BUDGET + 1):
-        run_id = new_run_id(config)
+
+    def _emit_claimed(run_id: str) -> bool:
         claimed = events.run_event(
             config, issue=issue.number, run_id=run_id, phase=events.PHASE_CLAIMED
         )
-        activated = any(sink.emit(claimed) for _ in range(ACTIVATION_ATTEMPTS))
-        if run_number == 1 and not activated:
+        return sink.emit(claimed)
+
+    reports: list[RunReport] = []
+    for run_number in range(1, CLAIM_RUN_BUDGET + 1):
+        run_id = new_run_id(config)
+        if run_number == 1:
             # The activation handshake (ADR-0017): without a landed claimed
             # event the Control Node releases this grant after ~60s; running
             # anyway would fork ownership. Walk away and let it.
-            log(
-                f"issue #{issue.number}: claimed event never reached the Control Node;"
-                " abandoning the grant (it will be released, ADR-0017)"
-            )
-            return reports
+            if not any(_emit_claimed(run_id) for _ in range(ACTIVATION_ATTEMPTS)):
+                log(
+                    f"issue #{issue.number}: claimed event never reached the Control Node;"
+                    " abandoning the grant (it will be released, ADR-0017)"
+                )
+                return reports
+        else:
+            # The claim is already activated: the retry's claimed event is
+            # best-effort visibility, never a gate.
+            _emit_claimed(run_id)
         report = execute_run(
             config, client, issue, session_factory, run_id=run_id, log=log, sink=sink
         )
@@ -690,14 +707,20 @@ def _escalate_claim(
 ) -> None:
     """The local-retry budget is spent: release the claim and hand the issue
     to a human with both failures' forensics (ADR-0016). failed means
-    execution broke — autopsy the evidence; only a human removes it."""
+    execution broke — autopsy the evidence; only a human removes it.
+
+    Write order matters: the escalation labels and forensics land BEFORE the
+    claim is stripped, so a GitHub failure mid-sequence can never leave the
+    issue label-less and invisible — the worst partial outcome is an
+    escalated issue still wearing its claim, which a human sees either way.
+    """
+    client.add_labels(issue.number, FAILED, NEEDS_HUMAN)
+    client.add_comment(issue.number, render_claim_escalation(config.repo, issue.number, reports))
     me = client.viewer_login()
     fresh = client.get_issue(issue.number)
     if me in fresh.assignees:
         client.remove_assignee(issue.number, me)
     client.remove_label(issue.number, IN_PROGRESS)
-    client.add_labels(issue.number, FAILED, NEEDS_HUMAN)
-    client.add_comment(issue.number, render_claim_escalation(config.repo, issue.number, reports))
     last = reports[-1]
     sink.emit(
         events.run_event(

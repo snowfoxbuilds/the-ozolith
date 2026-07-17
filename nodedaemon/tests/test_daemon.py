@@ -482,3 +482,30 @@ def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls and rig.execv_calls  # applied after the Run
+
+
+def test_a_deferred_command_blocks_later_commands_in_the_queue(rig: Rig, tmp_path):
+    """Queue-behind blocks the QUEUE: a drain issued after a deferred
+    recycle must not jump it (it would be undone when the recycle lands)."""
+    import shutil
+
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "r1").mkdir(parents=True)
+    queued = [
+        {"id": 20, "verb": "recycle", "target": "worker", "force": False},
+        {"id": 21, "verb": "drain", "target": "worker", "force": False},
+    ]
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=queued))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")  # neither command ran
+    assert rig.daemon._completed == []
+
+    # The Run ends: both apply, in order — the node ends up drained.
+    shutil.rmtree(jobs / "r1")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=queued))
+    rig.daemon.once()
+    assert rig.daemon._completed == [20, 21]
+    assert not rig.daemon._supervisor.alive("worker")

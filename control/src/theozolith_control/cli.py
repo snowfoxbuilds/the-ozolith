@@ -85,26 +85,36 @@ def _admin_env(args) -> tuple[str, str, str | None]:
 # -- serve ---------------------------------------------------------------------
 
 
-def _sweep_pass(settings: ControlSettings, store: Store, client) -> None:
+EVICTION_EVERY_SECONDS = 3600.0  # scanning progress payloads is not a per-minute job
+
+
+def _sweep_pass(settings: ControlSettings, store: Store, client, *, evict: bool = True) -> None:
     """One janitor pass: zombie escalation, never-activated grant release,
-    and the progress-telemetry eviction (all ADR-0016/0017 duties)."""
+    and (on its slower cadence) progress-telemetry eviction (ADR-0016/0017)."""
     janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
     janitor.release_never_activated(
         store, client, window_seconds=settings.activation_window_seconds, log=_log
     )
-    evicted = store.evict_progress(settings.tail_budget_bytes)
-    if evicted:
-        _log(f"evicted {evicted} progress event(s) past the tail budget (cache, not archive)")
+    if evict:
+        evicted = store.evict_progress(settings.tail_budget_bytes)
+        if evicted:
+            _log(f"evicted {evicted} progress event(s) past the tail budget (cache, not archive)")
 
 
 def _sweep_loop(settings: ControlSettings, store: Store, stop: threading.Event) -> None:
     """The janitor on its cadence, in one thread (ADR-0015)."""
+    import time as _time
+
     from theozolith_worker.githubapi import GitHubClient
 
     client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
+    next_eviction = 0.0
     while not stop.wait(settings.janitor_sweep_seconds):
+        evict = _time.monotonic() >= next_eviction
+        if evict:
+            next_eviction = _time.monotonic() + EVICTION_EVERY_SECONDS
         try:
-            _sweep_pass(settings, store, client)
+            _sweep_pass(settings, store, client, evict=evict)
         except Exception as exc:
             _log(f"janitor sweep failed: {exc}")
 

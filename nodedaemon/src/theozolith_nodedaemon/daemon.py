@@ -131,7 +131,11 @@ class NodeDaemon:
     def once(self) -> None:
         commands = self._exchange_heartbeat()
         for command in commands:
-            self._execute(command)
+            if not self._execute(command):
+                # Queue-behind blocks the QUEUE: commands after a deferred
+                # one wait too, or a later drain could land before the
+                # recycle it was issued after and be undone by it.
+                break
         self._reconcile()
 
     def run(self, *, sleep=time.sleep) -> None:
@@ -209,7 +213,9 @@ class NodeDaemon:
 
     # -- commands -----------------------------------------------------------------
 
-    def _execute(self, command: dict[str, Any]) -> None:
+    def _execute(self, command: dict[str, Any]) -> bool:
+        """Run one command; False = deferred (queue-behind), so the caller
+        must not execute anything queued after it this pass."""
         verb = command.get("verb", "")
         target = command.get("target") or None
         command_id = command.get("id")
@@ -223,7 +229,7 @@ class NodeDaemon:
                 if self._deferrals.get(command_id) != blocker:
                     self._log(f"command {command_id}: {verb} deferred ({blocker})")
                 self._deferrals[command_id] = blocker
-                return
+                return False
         if isinstance(command_id, int):
             self._deferrals.pop(command_id, None)
         self._log(f"command {command_id}: {verb}" + (f" {target}" if target else ""))
@@ -236,15 +242,16 @@ class NodeDaemon:
                 self._rebuild_targets.update([target] if target else self._images())
             elif verb == "update":
                 self._update(command_id)
-                return  # unreachable when the update re-execs
+                return True  # unreachable when the update re-execs
             else:
                 self._log(f"command {command_id}: unknown verb {verb!r}; acking as a no-op")
         except Exception as exc:
             # No ack: the Control Node re-delivers next heartbeat (logged loop
             # beats a silently dropped command).
             self._log(f"command {command_id} failed: {exc}")
-            return
+            return True
         self._ack(command_id)
+        return True
 
     def _ack(self, command_id: Any) -> None:
         if isinstance(command_id, int):

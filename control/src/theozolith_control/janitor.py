@@ -66,11 +66,17 @@ def _last_seen(store: Store, claim: LiveClaim) -> float:
 def _evidence_landed(client: GitHubClient, claim: LiveClaim) -> bool:
     """Is this Run's bundle on the evidence branch? Either the returned
     driver's boot sweep pushed it (swept.json) or a live push landed before
-    the driver died (run.json) — both are complete forensics (ADR-0016)."""
+    the driver died (run.json) — both are complete forensics (ADR-0016).
+    The sweeps/ path is the fallback for a job dir swept before its issue
+    metadata could be read (ADR-0018)."""
     prefix = run_dir(claim.issue, claim.run_id)
     return any(
-        client.path_exists(f"{prefix}/{name}", ref=EVIDENCE_BRANCH)
-        for name in ("swept.json", "run.json")
+        client.path_exists(path, ref=EVIDENCE_BRANCH)
+        for path in (
+            f"{prefix}/swept.json",
+            f"{prefix}/run.json",
+            f"sweeps/{claim.run_id}/swept.json",
+        )
     )
 
 
@@ -95,55 +101,74 @@ def sweep(
     """One zombie pass; returns the issues escalated with evidence."""
     escalated: list[int] = []
     for claim in store.live_claims():
-        if store.janitor_acted(claim.issue, claim.run_id):
-            continue  # this Run's zombie claim was already handled
-        silence = clock() - _last_seen(store, claim)
-        if silence <= grace_seconds:
-            # The Worker resurfaced (or never left): drop any stale flag.
-            store.clear_zombie_flag(claim.issue, claim.run_id)
-            continue
-
-        # Phase 1: dashboard flag only — GitHub is untouched.
-        store.flag_zombie(claim.issue, claim.run_id, claim.worker, claim.node)
-
-        # Events are advisory: GitHub decides what actually needs releasing.
-        issue = client.get_issue(claim.issue)
-        if IN_PROGRESS not in issue.labels and not issue.assignees:
-            store.record_janitor_action(
-                claim.issue, claim.run_id, claim.worker, "claim already released on GitHub"
-            )
-            store.clear_zombie_flag(claim.issue, claim.run_id)
-            continue
-        pr = client.find_open_pr_by_head(branch_for(claim.issue))
-        if pr is not None and PR_READY in pr.labels:
-            # A shipped PR awaits the Reviewer; the Run did not die mid-flight
-            # (or its death no longer matters). Never touch the claim under it.
-            store.record_janitor_action(
-                claim.issue, claim.run_id, claim.worker, f"skipped: PR #{pr.number} is pr_ready"
-            )
-            store.clear_zombie_flag(claim.issue, claim.run_id)
-            continue
-
-        # Phase 2: evidence first. No bundle yet = the driver has not
-        # returned to sweep; the claim stays flagged for a human call.
-        if not _evidence_landed(client, claim):
-            continue
-
-        for login in issue.assignees:
-            client.remove_assignee(claim.issue, login)
-        client.remove_label(claim.issue, IN_PROGRESS)
-        client.add_labels(claim.issue, FAILED, NEEDS_HUMAN)
-        client.add_comment(claim.issue, _escalation_comment(claim, client.repo, silence))
-        reason = (
-            f"worker {claim.worker or 'unknown'} silent {silence:.0f}s"
-            f" (grace {grace_seconds:.0f}s); run {claim.run_id or 'unknown'} escalated"
-            f" {FAILED} + {NEEDS_HUMAN} with swept evidence"
-        )
-        store.record_janitor_action(claim.issue, claim.run_id, claim.worker, reason)
-        store.clear_zombie_flag(claim.issue, claim.run_id)
-        escalated.append(claim.issue)
-        log(f"janitor: issue #{claim.issue} escalated ({reason})")
+        try:
+            if _sweep_one(store, client, claim, grace_seconds, clock, log):
+                escalated.append(claim.issue)
+        except Exception as exc:
+            # One broken claim (deleted issue, transient GitHub error) must
+            # never starve the rest of the pass.
+            log(f"janitor: issue #{claim.issue} sweep failed: {exc}")
     return escalated
+
+
+def _sweep_one(
+    store: Store,
+    client: GitHubClient,
+    claim: LiveClaim,
+    grace_seconds: float,
+    clock: Callable[[], float],
+    log,
+) -> bool:
+    if store.janitor_acted(claim.issue, claim.run_id):
+        return False  # this Run's zombie claim was already handled
+    silence = clock() - _last_seen(store, claim)
+    if silence <= grace_seconds:
+        # The Worker resurfaced (or never left): drop any stale flag.
+        store.clear_zombie_flag(claim.issue, claim.run_id)
+        return False
+
+    # Phase 1: dashboard flag only — GitHub is untouched.
+    store.flag_zombie(claim.issue, claim.run_id, claim.worker, claim.node)
+
+    # Events are advisory: GitHub decides what actually needs releasing.
+    issue = client.get_issue(claim.issue)
+    if IN_PROGRESS not in issue.labels and not issue.assignees:
+        store.record_janitor_action(
+            claim.issue, claim.run_id, claim.worker, "claim already released on GitHub"
+        )
+        store.clear_zombie_flag(claim.issue, claim.run_id)
+        return False
+    pr = client.find_open_pr_by_head(branch_for(claim.issue))
+    if pr is not None and PR_READY in pr.labels:
+        # A shipped PR awaits the Reviewer; the Run did not die mid-flight
+        # (or its death no longer matters). Never touch the claim under it.
+        store.record_janitor_action(
+            claim.issue, claim.run_id, claim.worker, f"skipped: PR #{pr.number} is pr_ready"
+        )
+        store.clear_zombie_flag(claim.issue, claim.run_id)
+        return False
+
+    # Phase 2: evidence first. No bundle yet = the driver has not
+    # returned to sweep; the claim stays flagged for a human call.
+    if not _evidence_landed(client, claim):
+        return False
+
+    # The forensics and the human-facing labels land before the claim is
+    # stripped, so a mid-sequence failure can never leave the issue bare.
+    client.add_labels(claim.issue, FAILED, NEEDS_HUMAN)
+    client.add_comment(claim.issue, _escalation_comment(claim, client.repo, silence))
+    for login in issue.assignees:
+        client.remove_assignee(claim.issue, login)
+    client.remove_label(claim.issue, IN_PROGRESS)
+    reason = (
+        f"worker {claim.worker or 'unknown'} silent {silence:.0f}s"
+        f" (grace {grace_seconds:.0f}s); run {claim.run_id or 'unknown'} escalated"
+        f" {FAILED} + {NEEDS_HUMAN} with swept evidence"
+    )
+    store.record_janitor_action(claim.issue, claim.run_id, claim.worker, reason)
+    store.clear_zombie_flag(claim.issue, claim.run_id)
+    log(f"janitor: issue #{claim.issue} escalated ({reason})")
+    return True
 
 
 def release_never_activated(
@@ -156,17 +181,35 @@ def release_never_activated(
     """Unwind grants with no claimed event inside the activation window
     (ADR-0017): the Control Node wrote these claims, so it reverts them."""
     released: list[int] = []
+    live = {claim.issue for claim in store.live_claims()}
     for grant in store.expired_grants(window_seconds):
         number = grant["issue"]
-        issue = client.get_issue(number)
-        if grant["login"] in issue.assignees:
-            client.remove_assignee(number, grant["login"])
-        client.remove_label(number, IN_PROGRESS)
-        client.add_labels(number, PLAN_READY)
-        store.release_grant(number)
+        if number in live:
+            # A claimed event exists after all (activation raced or a
+            # retried release re-recorded the grant): the claim is real,
+            # only the bookkeeping row goes.
+            store.release_grant(number)
+            continue
+        try:
+            # Deleting the grant row FIRST decides the race against a
+            # late-landing activation: whoever removes the row owns the
+            # issue's fate, so an activated claim is never unwound.
+            if not store.release_grant(number):
+                continue
+            issue = client.get_issue(number)
+            for login in issue.assignees:
+                client.remove_assignee(number, login)
+            client.remove_label(number, IN_PROGRESS)
+            client.add_labels(number, PLAN_READY)
+        except Exception as exc:
+            # Put the row back so the next pass retries: a half-unwound
+            # claim with no grant row would be invisible to every reaper.
+            store.record_grant(number, grant["worker"], grant["node"], grant["login"])
+            log(f"janitor: releasing grant for #{number} failed (will retry): {exc}")
+            continue
         store.record_janitor_action(
             number,
-            "",
+            "(never-activated)",
             grant["worker"],
             f"released never-activated grant to {grant['worker']}"
             f" (no claimed event within {window_seconds:.0f}s)",

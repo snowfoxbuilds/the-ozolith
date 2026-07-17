@@ -29,12 +29,11 @@ import threading
 from typing import Any
 
 from theozolith_worker.bootstrap.vocabulary import (
-    BLOCKED,
     FAILED,
     IN_PROGRESS,
-    NEEDS_HUMAN,
     PLAN_READY,
     PR_READY,
+    reviewable,
 )
 from theozolith_worker.githubapi import GitHubClient
 
@@ -74,24 +73,28 @@ class Dispatcher:
 
             granted = self._store.granted_issues()
             live = {claim.issue for claim in self._store.live_claims()}
+            flagged = {row["issue"] for row in self._store.malformed_states()}
             for issue in self._client.list_open_issues(PLAN_READY):
                 if FAILED in issue.labels:
                     detail = "carries failed + plan_ready; dispatch refuses to grant (ADR-0016)"
                     self._store.record_malformed(issue.number, detail)
                     self._log(f"dispatch: issue #{issue.number} {detail}")
                     continue
-                self._store.clear_malformed(issue.number)
+                if issue.number in flagged:
+                    self._store.clear_malformed(issue.number)  # human fixed the labels
                 if issue.assignees or IN_PROGRESS in issue.labels:
                     continue  # spoken for on GitHub (hand-edited labels stay meaningful)
                 if issue.number in granted or issue.number in live:
                     continue
 
-                # Write-through: the claim exists on GitHub before the driver
-                # ever sees the issue (ADR-0017).
+                # The grant row lands BEFORE the GitHub writes: if any write
+                # fails midway (or this process dies), the janitor's
+                # never-activated release finds the row and unwinds whatever
+                # landed — a half-written claim is never orphaned.
+                self._store.record_grant(issue.number, worker, node, login)
                 self._client.add_assignees(issue.number, login)
                 self._client.add_labels(issue.number, IN_PROGRESS)
                 self._client.remove_label(issue.number, PLAN_READY)
-                self._store.record_grant(issue.number, worker, node, login)
                 self._log(f"dispatch: issue #{issue.number} granted to {worker} ({login})")
                 return {
                     "issue": {
@@ -109,6 +112,6 @@ class Dispatcher:
         numbers = [
             candidate.number
             for candidate in self._client.list_open_prs_by_label(PR_READY)
-            if NEEDS_HUMAN not in candidate.labels and BLOCKED not in candidate.labels
+            if reviewable(candidate.labels)
         ]
         return {"prs": numbers}

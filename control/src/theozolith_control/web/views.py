@@ -27,21 +27,17 @@ RUN_PHASE_STATUS = {
 }
 
 
-def ago(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    if seconds < 90:
-        return f"{seconds:.0f}s ago"
-    if seconds < 5400:
-        return f"{seconds / 60:.0f}m ago"
-    return f"{seconds / 3600:.1f}h ago"
-
-
 def elapsed(seconds: float) -> str:
+    seconds = max(0.0, seconds)
     if seconds < 90:
         return f"{seconds:.0f}s"
     if seconds < 5400:
         return f"{seconds / 60:.0f}m"
     return f"{seconds / 3600:.1f}h"
+
+
+def ago(seconds: float) -> str:
+    return f"{elapsed(seconds)} ago"
 
 
 def image_skew(images: list[dict[str, Any]]) -> set[str]:
@@ -112,7 +108,13 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
         for c in state["commands"]
         if c["completed_at"] is None
     ]
-    return {"nodes": nodes, "skewed_images": sorted(skewed), "pending_commands": pending}
+    drivers = [{**d, "last_dispatch": ago(now - d["last_dispatch_at"])} for d in store.drivers()]
+    return {
+        "nodes": nodes,
+        "skewed_images": sorted(skewed),
+        "pending_commands": pending,
+        "drivers": drivers,
+    }
 
 
 def runs_view(store: Store, repo: str | None, *, now: float | None = None) -> list[dict[str, Any]]:

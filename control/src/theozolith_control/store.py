@@ -88,8 +88,7 @@ CREATE TABLE IF NOT EXISTS commands (
     created_at REAL NOT NULL,
     delivered_at REAL,
     completed_at REAL,
-    deferred_reason TEXT,
-    deferred_at REAL
+    deferred_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS secrets (
     name TEXT PRIMARY KEY,
@@ -164,8 +163,16 @@ EVENT_REVIEW = "theozolith.review"
 EVENT_PROGRESS = "theozolith.run.progress"
 
 RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
-# Phases meaning "a Run is in flight" — what the zombie janitor watches.
-LIVE_RUN_PHASES = ("claimed", "gate")
+# Phases meaning "the driver still holds the claim" — what the zombie
+# janitor watches. failed is live (ADR-0016): the driver keeps the claim
+# through the local retry, so only pr-open and escalated end its watch —
+# a driver that dies between the failed Run and its retry stays visible.
+LIVE_RUN_PHASES = ("claimed", "gate", "failed")
+
+# The command verbs (ADR-0015), and the subset whose pending presence
+# closes the dispatch gate for a node (queue-behind, ADR-0018).
+COMMAND_VERBS = ("drain", "recycle", "update", "rebuild")
+LIFECYCLE_VERBS = ("drain", "recycle", "update")
 
 # Consecutive failed Runs on one node before the dispatch gate closes.
 QUARANTINE_AFTER_FAILURES = 2
@@ -203,7 +210,6 @@ class Store:
         for column, decl in (
             ("force", "INTEGER NOT NULL DEFAULT 0"),
             ("deferred_reason", "TEXT"),
-            ("deferred_at", "REAL"),
         ):
             if column not in present:
                 self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
@@ -536,9 +542,12 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def release_grant(self, issue: int) -> None:
+    def release_grant(self, issue: int) -> bool:
+        """True when the grant row was still there — i.e. the caller won
+        the race against a late activation and owns the GitHub unwind."""
         with self._lock, self._db:
-            self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+            cursor = self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+        return cursor.rowcount > 0
 
     # -- node health: the quarantine gate (ADR-0016) ---------------------------
 
@@ -659,7 +668,6 @@ class Store:
     def record_deferrals(self, node: str, deferrals: list[dict[str, Any]]) -> None:
         """Heartbeat-reported queue-behind state: mark the named pending
         commands deferred and clear the mark on every other pending one."""
-        now = self._clock()
         reasons = {
             int(d["id"]): str(d.get("reason", ""))
             for d in deferrals
@@ -667,25 +675,26 @@ class Store:
         }
         with self._lock, self._db:
             self._db.execute(
-                "UPDATE commands SET deferred_reason = NULL, deferred_at = NULL"
+                "UPDATE commands SET deferred_reason = NULL"
                 " WHERE node = ? AND completed_at IS NULL",
                 (node,),
             )
             self._db.executemany(
-                "UPDATE commands SET deferred_reason = ?, deferred_at = ?"
+                "UPDATE commands SET deferred_reason = ?"
                 " WHERE id = ? AND node = ? AND completed_at IS NULL",
-                [(reason, now, id_, node) for id_, reason in reasons.items()],
+                [(reason, id_, node) for id_, reason in reasons.items()],
             )
 
     def pending_lifecycle_commands(self, node: str) -> list[str]:
         """Pending drain/recycle/update verbs for the dispatch gate: a node
         about to be drained, recycled, or updated gets no new work, which
         bounds a queued-behind command by the current Run (NODE-SUBSTRATE)."""
+        placeholders = ", ".join("?" for _ in LIFECYCLE_VERBS)
         with self._lock:
             rows = self._db.execute(
                 "SELECT DISTINCT verb FROM commands WHERE node = ? AND completed_at IS NULL"
-                " AND verb IN ('drain', 'recycle', 'update') ORDER BY verb",
-                (node,),
+                f" AND verb IN ({placeholders}) ORDER BY verb",
+                (node, *LIFECYCLE_VERBS),
             ).fetchall()
         return [r["verb"] for r in rows]
 

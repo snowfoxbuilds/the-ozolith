@@ -34,6 +34,8 @@ from theozolith_worker.runner import execute_claim
 from theozolith_worker.sessions import ContainerSession, SessionFactory
 from theozolith_worker.sweep import sweep_orphans
 
+SWEEP_RETRY_SECONDS = 900.0  # backoff between failed-evidence-push retries
+
 
 def _log(message: str) -> None:
     print(message, flush=True)
@@ -76,19 +78,19 @@ def run_worker(
     sink = sink or make_sink(config, log)
     me = client.viewer_login()
     log(f"worker driver {config.worker_id} ({me}) requesting work for {config.repo} via dispatch")
-    sweep_orphans(config, log=log)  # boot-time evidence sweep (ADR-0016)
+    _, kept = sweep_orphans(config, log=log)  # boot-time evidence sweep (ADR-0016)
+    # Failed pushes back off (a down evidence remote is the common cause of
+    # kept dirs; re-cloning it every poll would hammer it for nothing).
+    sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
 
     runs = 0
     while True:
         granted: dict | None = None
         try:
             granted = dispatch.request_work(config.worker_id, config.node_name, me)
-        except Exception as exc:
-            log(f"dispatch pass failed: {exc}")
-        if granted is not None:
-            issue = _granted_issue(granted, me)
-            log(f"granted #{issue.number} ({issue.title}); executing the claim")
-            try:
+            if granted is not None:
+                issue = _granted_issue(granted, me)
+                log(f"granted #{issue.number} ({issue.title}); executing the claim")
                 reports = execute_claim(config, client, issue, session_factory, log=log, sink=sink)
                 runs += len(reports)
                 for report in reports:
@@ -97,12 +99,16 @@ def run_worker(
                         f"pr={report.pr_number} round={report.round} "
                         f"agent={report.agent_outcome or 'n/a'}"
                     )
-            except Exception as exc:
-                log(f"claim for #{issue.number} crashed: {exc}")
+        except Exception as exc:
+            log(f"dispatch pass failed: {exc}")
         if once:
             return runs
         if granted is None:
-            sweep_orphans(config, log=log)  # retry any kept job dirs while idle
+            # An idle-pass sweep with nothing to push is one directory
+            # listing; only failed pushes arm the backoff.
+            if time.monotonic() >= sweep_retry_at:
+                _, kept = sweep_orphans(config, log=log)
+                sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
             sleep(config.poll_seconds)
 
 

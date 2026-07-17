@@ -49,6 +49,7 @@ from theozolith_worker.bootstrap.vocabulary import (
     ROUND_BUDGET,
     attempt_label,
     attempts_on,
+    reviewable,
 )
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import (
@@ -64,6 +65,7 @@ from theozolith_worker.events import EventSink, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
 from theozolith_worker.signals import compute_signals
+from theozolith_worker.sweep import sweep_orphans
 from theozolith_worker.worker import container_session_factory
 
 DIFF_LIMIT = 200_000
@@ -491,10 +493,6 @@ def _push_review_evidence(
     )
 
 
-def reviewable(labels: set[str]) -> bool:
-    return PR_READY in labels and NEEDS_HUMAN not in labels and BLOCKED not in labels
-
-
 def run_reviewer(
     config: DriverConfig,
     client: GitHubClient | None = None,
@@ -521,6 +519,7 @@ def run_reviewer(
     sink = sink or make_sink(config, log)
     me = client.viewer_login()
     log(f"reviewer driver ({me}) requesting {PR_READY} PRs for {config.repo} via dispatch")
+    sweep_orphans(config, log=log)  # recover orphaned review workspaces (ADR-0016)
 
     verdicts = 0
     while True:

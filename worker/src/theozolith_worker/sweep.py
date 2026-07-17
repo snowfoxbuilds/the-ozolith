@@ -9,10 +9,17 @@ orphaned job directory to the evidence branch under the original run_id
 path with a ``swept: true`` marker and a sweep timestamp, so post-mortem-
 recovered evidence is distinguishable from live-pushed evidence.
 
-A job directory is deleted only after the push is confirmed on the remote;
-on push failure it is left in place, logged, and retried later. The two-
-phase zombie janitor waits for exactly these bundles before it escalates a
-silent claim (ADR-0016: evidence first, never escalate without forensics).
+Ownership: a driver sweeps only its OWN directories — run dirs carrying its
+worker id in the run_id, plus (for the Reviewer role) review workspaces.
+Two drivers sharing a jobs dir (the default deploy shape) must never sweep
+each other's live work.
+
+A job directory is deleted only after the push is confirmed on the remote.
+On push failure it is moved aside to a ``<jobs-dir>-pending`` sibling (so
+the Node Daemon's job-dir in-flight signal for queue-behind never sees a
+dead dir as a live Run), logged, and retried later. The two-phase zombie
+janitor waits for exactly these bundles before it escalates a silent claim
+(ADR-0016: evidence first, never escalate without forensics).
 """
 
 from __future__ import annotations
@@ -37,14 +44,24 @@ def _read(path: Path) -> str | None:
         return None
 
 
+def pending_dir(config: DriverConfig) -> Path:
+    """Failed-push parking, outside the jobs dir so queue-behind's
+    in-flight signal stays clean."""
+    jobs = Path(config.jobs_dir)
+    return jobs.with_name(jobs.name + "-pending")
+
+
+def owned_by(config: DriverConfig, name: str) -> bool:
+    """Is this job directory this driver's to sweep? Run dirs carry the
+    worker id inside the run_id; review workspaces belong to the Reviewer."""
+    if f"-{config.worker_id}-" in name:
+        return True
+    return config.role == "reviewer" and name.startswith("review-")
+
+
 def _issue_number(job: Path) -> int | None:
-    raw = _read(job / "input" / "issue.json")
-    if raw is None:
-        return None
-    try:
-        number = json.loads(raw).get("number")
-    except json.JSONDecodeError:
-        return None
+    data = jobdir._read_json(job / "input" / "issue.json")
+    number = data.get("number") if data else None
     return number if isinstance(number, int) else None
 
 
@@ -94,19 +111,25 @@ def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
 
 
 def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int, int]:
-    """One sweep pass over the driver's jobs dir; (swept, kept) counts.
+    """One sweep pass over this driver's orphans; (swept, kept) counts.
 
     Runs only while no Run is in flight (startup, idle poll cycles), so
-    every directory found here is an orphan of a dead predecessor — or a
-    live Run's leftover whose evidence push failed, which needs the same
-    recovery.
+    every owned directory found here is an orphan of a dead predecessor —
+    or a live Run's leftover whose evidence push failed, which needs the
+    same recovery.
     """
-    root = Path(config.jobs_dir)
-    if not root.is_dir():
-        return 0, 0
+    jobs = Path(config.jobs_dir)
+    parking = pending_dir(config)
+    candidates = [
+        entry
+        for root in (jobs, parking)
+        if root.is_dir()
+        for entry in sorted(root.iterdir())
+        if entry.is_dir() and owned_by(config, entry.name)
+    ]
     swept = kept = 0
     swept_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))
-    for job in sorted(p for p in root.iterdir() if p.is_dir()):
+    for job in candidates:
         try:
             evidence.push_bundle(
                 config.clone_url,
@@ -118,9 +141,16 @@ def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int
             )
         except Exception as exc:
             # Delete only after a confirmed push (ADR-0016): keep and retry
-            # at the next startup or poll cycle.
+            # at the next startup or poll cycle — parked outside the jobs
+            # dir so it never reads as an in-flight Run.
             kept += 1
             log(f"evidence sweep: push failed for {job.name} (kept for retry): {exc}")
+            if job.parent != parking:
+                try:
+                    parking.mkdir(parents=True, exist_ok=True)
+                    job.rename(parking / job.name)
+                except OSError as move_error:
+                    log(f"evidence sweep: could not park {job.name}: {move_error}")
             continue
         shutil.rmtree(job, ignore_errors=True)
         swept += 1
