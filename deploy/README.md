@@ -1,8 +1,10 @@
 # deploy
 
-The M3 node substrate: Control Node + Node Daemon + secrets, plus the daemon-less dev
-shape from M2 (which remains fully supported — the pipeline never needs the Control
-Node; GitHub-only operation is the permanent degraded mode, ADR-0002).
+The node substrate: Control Node + Node Daemon + secrets + the M4 dashboard/terminal.
+Since ADR-0017 the Control Node is load-bearing for the pipeline — it writes every
+claim (no second claim path exists), so the daemon-less dev shape is `theozolith-control
+serve` on the same box as the drivers, not "no Control Node". With it down, in-flight
+Runs finish and publish; new claims and review rounds pause.
 
 Deployment footprint (the deletion test, NODE-SUBSTRATE.md): **docker + the TheOzolith
 package + a `.env`** — a private Config Repo adds Stacks and worker types on top, never
@@ -60,13 +62,23 @@ below.
        # driver tree, run containers included, and restarts it
    theozolith-control command rebuild --node box1 --target claude-dev
    theozolith-control command update  --node box1             # Config-Repo-pinned version
-   theozolith-control audits                                  # auditor + janitor records
+   theozolith-control flags                                   # zombie/malformed/quarantine flags
+   theozolith-control unquarantine --node box1                # human-only release (ADR-0016)
    ```
 
-   The zombie-claim janitor returns issues whose Worker went silent past the grace
-   period (default 600s) to `plan_ready`; the retry auditor flags `attempt-N` mismatches
-   and never edits GitHub. An optional slow GitHub-Action backstop for the janitor lives
-   in `deploy/github/zombie-janitor.yml` (copy into the target repo).
+   `recycle` and `update` received mid-Run queue behind the current Run (job-dir
+   presence is the in-flight signal; the deferral shows in heartbeats and on the
+   dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
+   (same origin as the API, behind the admin credential) is the read-only fleet view
+   plus secret entry and the web terminal: to expose a Stack's live run containers to
+   the terminal, give it an `attach` command in the Config Repo (see
+   `deploy/configs-example/stacks/worker.toml`).
+
+   The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
+   flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence
+   bundle, the claim is released and the issue escalated `failed` + `needs_human` with
+   the evidence link — never auto-re-queued. An optional slow GitHub-Action backstop
+   lives in `deploy/github/zombie-janitor.yml` (copy into the target repo).
 
 ## Daemon-less dev (the M2 shape)
 
