@@ -50,6 +50,15 @@ class ControlSettings:
     # True only when the server terminates TLS itself or an operator
     # explicitly opted into insecure dev mode: gates the secret endpoints.
     secrets_channel_ok: bool = False
+    # The one randomized hostname browsers reach this deployment by
+    # (ADR-0019); empty only in dev — production serve refuses to start
+    # without it. With the public port it defines the exact Host and
+    # Origin every cookie-authenticated state change must carry.
+    canonical_host: str = ""
+    public_port: int = 8443
+    # Concurrent web-terminal sessions; excess connects are refused before
+    # any attach process launches (ADR-0019).
+    terminal_session_cap: int = 8
 
     @property
     def db_path(self) -> Path:
@@ -74,6 +83,8 @@ class ControlSettings:
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
+    from theozolith_control.origin import read_canonical_host
+
     environ = os.environ if environ is None else environ
 
     node_token = env_value(environ, "THEOZOLITH_NODE_TOKEN")
@@ -87,10 +98,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     if repo and "/" not in repo:
         raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
 
+    data_dir = Path(
+        env_value(environ, "THEOZOLITH_CONTROL_DATA", DEFAULT_DATA_DIR) or DEFAULT_DATA_DIR
+    ).expanduser()
     return ControlSettings(
-        data_dir=Path(
-            env_value(environ, "THEOZOLITH_CONTROL_DATA", DEFAULT_DATA_DIR) or DEFAULT_DATA_DIR
-        ).expanduser(),
+        data_dir=data_dir,
         config_repo=Path(
             env_value(environ, "THEOZOLITH_CONFIG_REPO", DEFAULT_CONFIG_REPO) or DEFAULT_CONFIG_REPO
         ).expanduser(),
@@ -104,4 +116,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
         activation_window_seconds=_float(environ, "THEOZOLITH_ACTIVATION_WINDOW_SECONDS", "60"),
         tail_budget_bytes=int(_float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))),
+        # The env override exists for tests and unusual topologies; the
+        # sanctioned source is the origin-init file in the data dir.
+        canonical_host=env_value(environ, "THEOZOLITH_CANONICAL_HOST")
+        or read_canonical_host(data_dir),
+        terminal_session_cap=int(_float(environ, "THEOZOLITH_TERMINAL_SESSION_CAP", "8")),
     )

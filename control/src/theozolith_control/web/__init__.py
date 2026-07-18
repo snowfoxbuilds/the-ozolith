@@ -1,17 +1,26 @@
-"""The Control Node web surface (M4): read-only fleet dashboard, secret
-entry form, and the web terminal — Jinja + HTMX, no build step.
+"""The Control Node web surface (M4, hardened by ADR-0019): read-only fleet
+dashboard, secret entry form, and the web terminal — Jinja + HTMX, no build
+step.
 
 Everything sits behind the one admin credential (AdminSessions); the
 dashboard refreshes by HTMX polling of server-rendered fragments (ADR-0018
 chose polling over SSE: one mechanism, no connection bookkeeping, and the
 5s cadence is well inside the one-heartbeat acceptance bound). The secret
 form writes through exactly the same store call as PUT /api/v1/secrets —
-never displaying stored values — and the terminal websocket hands off to
-the PTY bridge after the same auth check plus the config/liveness gates.
+never displaying stored values.
+
+M5 hardening: cookie-authenticated state changes and the terminal
+websocket additionally pass the BrowserGuard (exact canonical Host +
+Origin; bearer clients are exempt). The terminal derives its Stack from
+the live container record's ``owner`` — the URL names only the node and
+container, and stale heartbeats, unknown owners, and attach-less Stacks
+are refused before the websocket is accepted. Concurrent terminal
+sessions are capped; a refused session launches no process.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -24,8 +33,8 @@ from theozolith_control.crypto import SecretBox
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_control.web import views
-from theozolith_control.web.auth import SESSION_COOKIE, AdminSessions
-from theozolith_control.web.terminal import audit, bridge
+from theozolith_control.web.auth import SESSION_COOKIE, AdminSessions, BrowserGuard
+from theozolith_control.web.terminal import AttachError, audit, bridge, render_attach_argv
 
 _HERE = Path(__file__).parent
 
@@ -33,6 +42,15 @@ FRAGMENT_POLL_SECONDS = 5  # well inside one heartbeat interval (acceptance 1)
 # Config Repo parses (TOML + a git rev-parse subprocess) are cached briefly:
 # the dashboard polls at 5s but desired state changes at commit cadence.
 CONFIG_CACHE_SECONDS = 10.0
+# Attach requires fresh heartbeat evidence: the same ~2.5-missed-beats
+# bound the dashboard calls a stale node (ADR-0019).
+ATTACH_FRESH_SECONDS = views.STALE_AFTER_SECONDS
+
+# Terminal websocket close codes: auth, browser origin, no target, capacity.
+WS_UNAUTHORIZED = 4401
+WS_WRONG_ORIGIN = 4403
+WS_NO_TARGET = 4404
+WS_OVER_CAPACITY = 4429
 
 
 def mount_web(
@@ -48,6 +66,7 @@ def mount_web(
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
     sessions = AdminSessions(settings.admin_token)
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
+    guard = BrowserGuard(settings.canonical_host, settings.public_port)
 
     cached_config: list = [0.0, None]  # [expires_at, DeployConfig]
 
@@ -66,6 +85,18 @@ def mount_web(
     def _login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=303)
 
+    def _origin_ok(request: Request | WebSocket) -> bool:
+        """The M5 origin contract for state changes: bearer callers are
+        non-browser clients and pass; everything else (cookie sessions and
+        the login form itself) must carry the exact canonical Host+Origin."""
+        return sessions.auth_mode(request) == "bearer" or guard.ok(request)
+
+    def _wrong_origin() -> HTMLResponse:
+        return HTMLResponse(
+            "request rejected: Host/Origin does not match this deployment's canonical origin",
+            status_code=403,
+        )
+
     # -- session -----------------------------------------------------------
 
     @app.get("/login", response_class=HTMLResponse)
@@ -74,6 +105,8 @@ def mount_web(
 
     @app.post("/login")
     async def login(request: Request):
+        if not _origin_ok(request):
+            return _wrong_origin()
         form = await request.form()
         cookie = sessions.login(str(form.get("token", "")))
         if cookie is None:
@@ -81,19 +114,24 @@ def mount_web(
             response.status_code = 401
             return response
         response = RedirectResponse("/", status_code=303)
+        # The __Host- contract: Secure always, Path=/, no Domain — browsers
+        # refuse the cookie anywhere but this exact host over TLS.
         response.set_cookie(
             SESSION_COOKIE,
             cookie,
             httponly=True,
             samesite="strict",
-            secure=request.url.scheme == "https",
+            secure=True,
+            path="/",
         )
         return response
 
     @app.post("/logout")
     async def logout(request: Request):
+        if not _origin_ok(request):
+            return _wrong_origin()
         response = _login_redirect()
-        response.delete_cookie(SESSION_COOKIE)
+        response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True)
         return response
 
     # -- dashboard ---------------------------------------------------------
@@ -148,6 +186,8 @@ def mount_web(
     async def secrets_submit(request: Request):
         if not sessions.authorized(request):
             return _login_redirect()
+        if not _origin_ok(request):
+            return _wrong_origin()
         if not settings.secrets_channel_ok:
             return HTMLResponse("secret values only transit TLS", status_code=403)
         form = await request.form()
@@ -162,28 +202,57 @@ def mount_web(
 
     # -- the web terminal ---------------------------------------------------
 
-    def _attach_target(node: str, stack: str, container: str) -> tuple[str | None, str]:
-        """(attach command, error). Enforces the two gates: an attach
-        template must be configured and the container must be live."""
-        stack_def = next((s for s in _config().stacks if s.name == stack and s.node == node), None)
-        if stack_def is None or not stack_def.attach:
-            return None, f"stack {stack!r} on {node!r} exposes no terminal (no attach command)"
-        live = any(
-            c["node"] == node and c["name"] == container
-            for c in store.fleet_state()["run_containers"]
-        )
-        if not live:
-            return None, f"container {container!r} is not live on {node!r} (per heartbeats)"
-        return stack_def.attach.format(host=node, container=container), ""
+    def _attach_target(node: str, container: str) -> tuple[list[str] | None, str, str]:
+        """(attach argv, owning stack, error). The target is resolved from
+        the live container record and its Stack derived server-side from
+        ``owner`` (ADR-0019) — caller-supplied Stack identity is not an
+        authority. Refusals, in order: unknown/wrong-node container, stale
+        heartbeat, unknown owner, no attach configuration, and identifier
+        validation (forged heartbeat values die here, never in a shell)."""
+        record = store.container_record(node, container)
+        if record is None:
+            return None, "", f"container {container!r} is not live on {node!r} (per heartbeats)"
+        if record["age_seconds"] > ATTACH_FRESH_SECONDS:
+            return (
+                None,
+                "",
+                (
+                    f"heartbeat evidence for {container!r} on {node!r} is stale"
+                    f" ({record['age_seconds']:.0f}s old) — refusing to attach"
+                ),
+            )
+        owner = record["owner"]
+        stack_def = next((s for s in _config().stacks if s.name == owner and s.node == node), None)
+        if stack_def is None:
+            return (
+                None,
+                owner,
+                (
+                    f"container {container!r} has no configured owning Stack on {node!r}"
+                    f" (owner {owner!r})"
+                ),
+            )
+        if not stack_def.attach:
+            return (
+                None,
+                owner,
+                (f"stack {owner!r} on {node!r} exposes no terminal (no attach command)"),
+            )
+        try:
+            argv = render_attach_argv(stack_def.attach, host=node, container=container)
+        except AttachError as exc:
+            return None, owner, str(exc)
+        return argv, owner, ""
+
+    active_terminals = [0]  # concurrent-session accounting (ADR-0019 cap)
 
     @app.get("/terminal", response_class=HTMLResponse)
     def terminal_page(request: Request):
         if not sessions.authorized(request):
             return _login_redirect()
         node = request.query_params.get("node", "")
-        stack = request.query_params.get("stack", "")
         container = request.query_params.get("container", "")
-        command, error = _attach_target(node, stack, container)
+        argv, stack, error = _attach_target(node, container)
         return _page(
             request,
             "terminal.html",
@@ -192,21 +261,32 @@ def mount_web(
                 "stack": stack,
                 "container": container,
                 "error": error,
-                "ok": command is not None,
+                "ok": argv is not None,
             },
         )
 
     @app.websocket("/terminal/ws")
     async def terminal_ws(websocket: WebSocket):
-        if not sessions.authorized(websocket):
-            await websocket.close(code=4401)
+        mode = sessions.auth_mode(websocket)
+        if mode is None:
+            await websocket.close(code=WS_UNAUTHORIZED)
+            return
+        if mode == "cookie" and not guard.ok(websocket):
+            await websocket.close(code=WS_WRONG_ORIGIN)
+            return
+        if active_terminals[0] >= settings.terminal_session_cap:
+            # Refused before target resolution and before any process
+            # launch (acceptance 12).
+            await websocket.close(
+                code=WS_OVER_CAPACITY,
+                reason=f"terminal session cap ({settings.terminal_session_cap}) reached",
+            )
             return
         node = websocket.query_params.get("node", "")
-        stack = websocket.query_params.get("stack", "")
         container = websocket.query_params.get("container", "")
-        command, error = _attach_target(node, stack, container)
-        if command is None:
-            await websocket.close(code=4404, reason=error[:120])
+        argv, stack, error = _attach_target(node, container)
+        if argv is None:
+            await websocket.close(code=WS_NO_TARGET, reason=error[:120])
             return
         await websocket.accept()
         record = {
@@ -214,10 +294,18 @@ def mount_web(
             "node": node,
             "stack": stack,
             "container": container,
-            "command": command,
+            "command": argv,
         }
         audit(settings.terminal_audit_path, {"event": "attach", **record})
+        active_terminals[0] += 1
+        reason = "error"
         try:
-            await bridge(websocket, command)
+            reason = await bridge(websocket, argv)
+        except asyncio.CancelledError:
+            # The server cancelled this task at hang-up; the bridge already
+            # killed the attach tree — record the reason, let it propagate.
+            reason = "client-closed"
+            raise
         finally:
-            audit(settings.terminal_audit_path, {"event": "detach", **record})
+            active_terminals[0] -= 1
+            audit(settings.terminal_audit_path, {"event": "detach", "reason": reason, **record})

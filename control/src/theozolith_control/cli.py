@@ -22,8 +22,9 @@ from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import janitor
+from theozolith_control import janitor, origin
 from theozolith_control.crypto import SecretBox, ensure_key_file, generate_key
+from theozolith_control.origin import OriginError
 from theozolith_control.settings import ControlSettings, load_settings
 from theozolith_control.store import Store
 from theozolith_control.tls import CERT_FILE, KEY_FILE, provision
@@ -135,7 +136,19 @@ def _serve(args) -> int:
             f"error: no TLS material at {settings.tls_dir} — run 'theozolith-control tls-init"
             " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
         )
-    settings = dataclasses.replace(settings, secrets_channel_ok=True)
+    if not args.insecure_dev:
+        # Production requires the persistent randomized canonical origin
+        # (ADR-0019): it arms exact Host/Origin enforcement and is the one
+        # name browsers may reach this deployment by.
+        try:
+            origin.validate_canonical_host(settings.canonical_host)
+        except OriginError as exc:
+            raise SystemExit(
+                f"error: {exc} — production startup requires the installer-generated"
+                " canonical origin (run 'theozolith-control origin-init';"
+                " --insecure-dev for local dev only)"
+            ) from exc
+    settings = dataclasses.replace(settings, secrets_channel_ok=True, public_port=args.port)
     store = Store(settings.db_path)
     box = SecretBox(
         env_value(os.environ, "THEOZOLITH_MASTER_KEY") or ensure_key_file(settings.key_path)
@@ -172,9 +185,42 @@ def _serve(args) -> int:
 # -- local maintenance ----------------------------------------------------------
 
 
+def _origin_init(args) -> int:
+    """Provision the canonical origin (ADR-0019): one randomized hostname
+    with 128 bits of slug entropy, persisted in the data dir."""
+    settings = load_settings()
+    existing = origin.read_canonical_host(settings.data_dir)
+    if existing and not args.force:
+        raise SystemExit(
+            f"error: canonical host already provisioned ({existing}) — the origin is"
+            " persistent by design; pass --force to mint a new one (DNS, TLS, and"
+            " every CONTROL_NODE_URL must then be repointed)"
+        )
+    host = origin.compose_host(origin.generate_slug(), args.base_domain)
+    path = origin.write_canonical_host(settings.data_dir, host)
+    _log(f"wrote {path}")
+    _log(f"canonical host: {host}")
+    _log(
+        "next: create a trusted-network-only DNS record (or hosts entries) for it and run"
+        " 'theozolith-control tls-init' — the Control Node must have no public ingress path"
+    )
+    return 0
+
+
 def _tls_init(args) -> int:
     settings = load_settings()
-    ca, cert, key = provision(settings.tls_dir, args.host)
+    hosts = list(args.host or [])
+    # The canonical origin (when provisioned) belongs in the certificate;
+    # extra --host entries (an IP, a LAN alias) are additive.
+    canonical = settings.canonical_host
+    if canonical and canonical not in hosts:
+        hosts.insert(0, canonical)
+    if not hosts:
+        raise SystemExit(
+            "error: pass --host, or provision the canonical origin first"
+            " ('theozolith-control origin-init')"
+        )
+    ca, cert, key = provision(settings.tls_dir, hosts)
     _log(f"wrote {ca}, {cert}, {key}")
     _log(f"distribute {ca.name} to every node (install script --ca, or THEOZOLITH_TLS_CA)")
     return 0
@@ -294,9 +340,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve.set_defaults(func=_serve)
 
+    origin_init = sub.add_parser(
+        "origin-init",
+        help="Provision the deployment's canonical origin: a randomized hostname with"
+        " 128 bits of entropy under --base-domain, resolved by trusted-network DNS only.",
+    )
+    origin_init.add_argument(
+        "--base-domain",
+        default=origin.DEFAULT_BASE_DOMAIN,
+        help=f"Base domain for the canonical hostname (default: {origin.DEFAULT_BASE_DOMAIN},"
+        " inside the ICANN-reserved private namespace).",
+    )
+    origin_init.add_argument(
+        "--force", action="store_true", help="Replace an already-provisioned canonical host."
+    )
+    origin_init.set_defaults(func=_origin_init)
+
     tls_init = sub.add_parser("tls-init", help="Mint a self-signed CA + server certificate.")
     tls_init.add_argument(
-        "--host", action="append", required=True, help="DNS name or IP (repeatable)."
+        "--host",
+        action="append",
+        help="DNS name or IP (repeatable; the canonical host is always included)."
+        " Wildcards are refused — every deployment gets its own TLS identity.",
     )
     tls_init.set_defaults(func=_tls_init)
 

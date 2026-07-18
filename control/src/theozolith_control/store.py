@@ -234,6 +234,22 @@ class Store:
             row = self._db.execute("SELECT last_seen FROM nodes WHERE name = ?", (name,)).fetchone()
         return row["last_seen"] if row else None
 
+    def container_record(self, node: str, name: str) -> dict[str, Any] | None:
+        """The live-container row a heartbeat last reported for (node, name):
+        the terminal's authority for target resolution (ADR-0019 — the
+        ``owner`` field is where the Stack is derived from, and
+        ``age_seconds`` is the heartbeat-freshness evidence, computed here
+        so callers share this store's clock)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM containers WHERE node = ? AND name = ?", (node, name)
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["age_seconds"] = self._clock() - record["updated_at"]
+        return record
+
     def record_status(
         self,
         node: str,

@@ -113,3 +113,10 @@ def test_plain_http_server_refuses_secret_traffic(tmp_path: Path):
         client = ControlClient(live.url, NODE_TOKEN, insecure_dev=True)  # client would try…
         with pytest.raises(Exception, match="403"):
             client.pull_secrets("box1", ["github-worker"])  # …the server still refuses
+
+
+def test_wildcard_hosts_are_refused(tmp_path):
+    """ADR-0019 acceptance 9: one TLS identity per deployment — the tooling
+    will never mint a shareable wildcard key."""
+    with pytest.raises(ValueError, match="wildcard"):
+        provision(tmp_path / "tls", ["*.theozolith.com"])

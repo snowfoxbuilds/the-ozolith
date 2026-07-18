@@ -109,7 +109,10 @@ def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
         box,
         github_client=github if settings.coordination_jobs_enabled else None,
     )
-    return ControlRig(settings, store, box, TestClient(app), clock, github)
+    # https base URL: the __Host- session cookie is Secure (ADR-0019), and
+    # the client's cookie jar only returns Secure cookies over TLS.
+    client = TestClient(app, base_url="https://testserver")
+    return ControlRig(settings, store, box, client, clock, github)
 
 
 @pytest.fixture

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -30,6 +31,14 @@ from typing import Any
 
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
+
+# Where a node keeps per-Stack jobs directories unless a Stack's env says
+# otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
+# injects <base>/<stack-name> per process Stack; this module enforces that
+# the resolved paths are unique per node (queue-behind ownership, M5).
+DEFAULT_JOBS_BASE = "/var/tmp/theozolith/jobs"
+
+ATTACH_PLACEHOLDERS = ("{host}", "{container}")
 
 
 class ConfigRepoError(RuntimeError):
@@ -106,11 +115,13 @@ class StackDef:
     volumes: tuple[str, ...] = ()
     compose: str = ""  # container kind, compose form (repo-relative path)
     overlays: tuple[str, ...] = ()
-    # Web-terminal attach command template ({host}, {container} placeholders),
-    # run by the Control Node's PTY bridge. Empty = no terminal exposed for
-    # this Stack (NODE-SUBSTRATE: dashboard and operator access). Consumed
-    # control-side only; it never travels to nodes.
-    attach: str = ""
+    # Web-terminal attach command as a structured argv array; ``{host}`` and
+    # ``{container}`` are permitted only as complete elements, substituted
+    # (after validation) by the Control Node's PTY bridge. Empty = no
+    # terminal exposed for this Stack (NODE-SUBSTRATE: dashboard and
+    # operator access). Consumed control-side only; it never travels to
+    # nodes. Free-form command strings are rejected (M5 hardening).
+    attach: tuple[str, ...] = ()
 
     def as_wire(self, compose_files: list[dict[str, str]]) -> dict[str, Any]:
         return {
@@ -192,6 +203,58 @@ def _str_list(data: dict, key: str, context: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _parse_attach(data: dict, context: str) -> tuple[str, ...]:
+    """The attach argv: a list of strings in which ``{host}``/``{container}``
+    appear only as complete elements. The untrusted identifiers can then
+    never splice into trusted command structure — the free-form string-plus-
+    shlex form is rejected outright (M5 hardening)."""
+    value = data.get("attach", [])
+    if isinstance(value, str):
+        raise ConfigRepoError(
+            f"{context}: 'attach' must be an argv array of strings"
+            " (free-form command strings are rejected; write"
+            ' e.g. attach = ["ssh", "{{host}}", "-t", ...])'
+        )
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ConfigRepoError(f"{context}: 'attach' must be a list of strings")
+    for element in value:
+        for placeholder in ATTACH_PLACEHOLDERS:
+            if placeholder in element and element != placeholder:
+                raise ConfigRepoError(
+                    f"{context}: attach element {element!r} embeds {placeholder} —"
+                    " placeholders are permitted only as complete arguments"
+                )
+    return tuple(value)
+
+
+def resolved_jobs_dir(stack: StackDef) -> str:
+    """The jobs directory this process Stack will actually use: its explicit
+    THEOZOLITH_JOBS_DIR, else the per-Stack default the daemon injects."""
+    explicit = stack.env.get("THEOZOLITH_JOBS_DIR", "")
+    return posixpath.normpath(explicit or f"{DEFAULT_JOBS_BASE}/{stack.name}")
+
+
+def _check_jobs_dirs(stacks: tuple[StackDef, ...]) -> None:
+    """Queue-behind ownership (M5): every process Stack on a node owns a
+    distinct jobs directory, so the in-flight signal for one Stack never
+    observes another Stack's Runs. The failed-push parking sibling
+    (``<jobs>-pending``, see worker sweep) is part of the claim."""
+    claims: dict[tuple[str, str], str] = {}
+    for stack in stacks:
+        if stack.kind != "process":
+            continue
+        jobs = resolved_jobs_dir(stack)
+        for path in (jobs, f"{jobs}-pending"):
+            other = claims.get((stack.node, path))
+            if other is not None:
+                raise ConfigRepoError(
+                    f"stacks/{stack.name}.toml: jobs directory {jobs!r} collides with"
+                    f" stack {other!r} on node {stack.node!r} — every process Stack"
+                    " needs a distinct resolved THEOZOLITH_JOBS_DIR"
+                )
+            claims[(stack.node, path)] = stack.name
+
+
 def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
     value = data.get(key, {})
     if not isinstance(value, dict) or any(
@@ -223,7 +286,7 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
         volumes=_str_list(data, "volumes", context),
         compose=_require_str(data, "compose", context, default=""),
         overlays=_str_list(data, "overlays", context),
-        attach=_require_str(data, "attach", context, default=""),
+        attach=_parse_attach(data, context),
     )
     if stack.kind == "process" and not stack.command:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")
@@ -280,6 +343,7 @@ def load_config(repo_dir: Path) -> DeployConfig:
         _parse_stack(path.stem, _load_toml(path))
         for path in sorted((repo_dir / "stacks").glob("*.toml"))
     )
+    _check_jobs_dirs(stacks)
     images = {
         path.stem: _parse_image(path.stem, _load_toml(path))
         for path in sorted((repo_dir / "images").glob("*.toml"))

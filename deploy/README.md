@@ -18,17 +18,25 @@ below.
    cp deploy/.env.example .env         # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN
    docker compose --env-file .env -f deploy/compose/control.yml up -d --build
    docker compose -f deploy/compose/control.yml run --rm control \
-     tls-init --host <LAN name or IP>  # one-time TLS provisioning (mandatory)
+     origin-init                       # one-time canonical origin (mandatory, ADR-0019)
+   docker compose -f deploy/compose/control.yml run --rm control \
+     tls-init                          # one-time TLS provisioning (mandatory);
+                                       # covers the canonical host; --host adds extras
    ```
 
-   Restart after tls-init so the server picks up the certificate. Copy `/data/tls/ca.pem`
-   out of the volume — every node pins it.
+   `origin-init` mints the deployment's one canonical hostname —
+   `<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to change) —
+   which production `serve` requires. Give it a **trusted-network-only** DNS record (or
+   hosts entries); the Control Node must have no public ingress path, and browsers must
+   use exactly this name (cookie-authenticated requests from any other Host/Origin are
+   rejected). Restart after tls-init so the server picks up the certificate. Copy
+   `/data/tls/ca.pem` out of the volume — every node pins it.
 
 2. **Nodes** (every physical box that should run Stacks):
 
    ```sh
    sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
-     --control-url https://<control-host>:8443 --ca ca.pem
+     --control-url https://<canonical-host>:8443 --ca ca.pem
    ```
 
    The installer creates the `ozolith` user, a venv at `/opt/theozolith` (daemon +
@@ -71,8 +79,9 @@ below.
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
    (same origin as the API, behind the admin credential) is the read-only fleet view
    plus secret entry and the web terminal: to expose a Stack's live run containers to
-   the terminal, give it an `attach` command in the Config Repo (see
-   `deploy/configs-example/stacks/worker.toml`).
+   the terminal, give it an `attach` argv array in the Config Repo (see
+   `deploy/configs-example/stacks/worker.toml`; free-form command strings are rejected,
+   ADR-0019).
 
    The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence

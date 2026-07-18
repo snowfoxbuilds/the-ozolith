@@ -35,7 +35,7 @@
     <li><code>{{ c.name }}</code> <span class="muted">run {{ c.run_id }} · owner {{ c.owner }}
         · {{ c.status }}</span>
       {% if c.attachable %}
-      <a class="button" href="/terminal?node={{ node.name }}&amp;stack={{ c.owner }}&amp;container={{ c.name }}">attach</a>
+      <a class="button" href="/terminal?node={{ node.name }}&amp;container={{ c.name }}">attach</a>
       {% endif %}
     </li>
     {% endfor %}
