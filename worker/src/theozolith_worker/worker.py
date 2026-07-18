@@ -1,15 +1,22 @@
-"""The Worker driver: a node-resident poll-claim-run loop bound to one Agent.
+"""The Worker driver: a node-resident dispatch-run loop bound to one Agent.
 
 The trusted, credentialed half of the Worker (ADR-0013): it holds the
-machine-user PAT, performs all GitHub I/O, and never executes repository
-code or model output. It polls one label on one object type (plan_ready
-issues), claims via the Claim Protocol, and executes Runs sequentially, one
-at a time, each in a fresh ephemeral run container.
+machine-user PAT, performs all non-claim GitHub I/O, and never executes
+repository code or model output. Claims arrive through the Control Node's
+dispatch endpoint (ADR-0017): the Control Node writes each claim to GitHub
+itself and hands the issue over in the same response — the driver never
+assigns, labels, or verifies a claim into existence. Runs execute
+sequentially, one at a time, each in a fresh ephemeral run container, with
+the ADR-0016 local-retry budget handled per claim (``execute_claim``).
 
-Two modes: the continuous loop (production; supervised by the Node Daemon
-from M3 on) and ``--once`` — a single poll-claim-run pass, the daemon-less
-dev mode. Crashed Runs are logged and skipped: they leave no PR-side state
-and consume no round budget; the zombie-claim janitor (M3) re-queues them.
+Startup and idle passes run the boot-time evidence sweep: orphaned job
+directories are pushed to the evidence branch (swept: true) and deleted only
+after the push confirms.
+
+Two modes: the continuous loop (production; supervised by the Node Daemon)
+and ``--once`` — a single dispatch-run pass. Both require a reachable
+Control Node: with it down, in-flight Runs finish and publish while new
+claims pause (ADR-0017 — no second claim path exists).
 """
 
 from __future__ import annotations
@@ -18,15 +25,16 @@ import argparse
 import sys
 import time
 
-from theozolith_worker.bootstrap.vocabulary import PLAN_READY
-from theozolith_worker.claim import attempt_claim, claimable
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import DockerEngine, Engine
-from theozolith_worker.events import PHASE_CLAIMED, EventSink, make_sink, run_event
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch
+from theozolith_worker.events import EventSink, make_sink
 from theozolith_worker.githubapi import GitHubClient, Issue
-from theozolith_worker.prefilter import ClaimPrefilter, make_prefilter
-from theozolith_worker.runner import execute_run, new_run_id
+from theozolith_worker.runner import execute_claim
 from theozolith_worker.sessions import ContainerSession, SessionFactory
+from theozolith_worker.sweep import sweep_orphans
+
+SWEEP_RETRY_SECONDS = 900.0  # backoff between failed-evidence-push retries
 
 
 def _log(message: str) -> None:
@@ -37,62 +45,70 @@ def container_session_factory(engine: Engine) -> SessionFactory:
     return lambda spec, job, manifest: ContainerSession(engine, spec, job, manifest)
 
 
-def _claim_next(client: GitHubClient, prefilter: ClaimPrefilter) -> Issue | None:
-    for issue in client.list_open_issues(PLAN_READY):
-        if claimable(issue) and attempt_claim(client, issue, prefilter):
-            return issue
-    return None
+def _granted_issue(granted: dict, login: str) -> Issue:
+    """The dispatch answer as an Issue: the claim already exists on GitHub
+    (assigned to this driver, in_progress applied) — no re-read needed."""
+    return Issue(
+        number=int(granted["number"]),
+        title=str(granted.get("title", "")),
+        body=str(granted.get("body", "")),
+        labels=set(granted.get("labels", [])),
+        assignees=[login],
+        is_pr=False,
+    )
 
 
 def run_worker(
     config: DriverConfig,
     client: GitHubClient | None = None,
     session_factory: SessionFactory | None = None,
-    prefilter: ClaimPrefilter | None = None,
+    dispatch: WorkDispatch | None = None,
     *,
     sleep=time.sleep,
     once: bool = False,
     log=_log,
     sink: EventSink | None = None,
 ) -> int:
-    """The poll-claim-run loop; returns the number of Runs executed."""
+    """The dispatch-run loop; returns the number of Runs executed."""
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
-    prefilter = prefilter or make_prefilter(
-        config.control_node_url, config.control_token, config.control_ca
+    dispatch = dispatch or DispatchClient(
+        config.control_node_url, config.control_token, ca=config.control_ca, log=log
     )
     sink = sink or make_sink(config, log)
     me = client.viewer_login()
-    log(f"worker driver {config.worker_id} ({me}) polling {config.repo} for {PLAN_READY}")
+    log(f"worker driver {config.worker_id} ({me}) requesting work for {config.repo} via dispatch")
+    _, kept = sweep_orphans(config, log=log)  # boot-time evidence sweep (ADR-0016)
+    # Failed pushes back off (a down evidence remote is the common cause of
+    # kept dirs; re-cloning it every poll would hammer it for nothing).
+    sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
 
     runs = 0
     while True:
-        claimed: Issue | None = None
+        granted: dict | None = None
         try:
-            claimed = _claim_next(client, prefilter)
+            granted = dispatch.request_work(config.worker_id, config.node_name, me)
+            if granted is not None:
+                issue = _granted_issue(granted, me)
+                log(f"granted #{issue.number} ({issue.title}); executing the claim")
+                reports = execute_claim(config, client, issue, session_factory, log=log, sink=sink)
+                runs += len(reports)
+                for report in reports:
+                    log(
+                        f"run {report.run_id} finished: phase={report.phase} "
+                        f"pr={report.pr_number} round={report.round} "
+                        f"agent={report.agent_outcome or 'n/a'}"
+                    )
         except Exception as exc:
-            log(f"poll pass failed: {exc}")
-        if claimed is not None:
-            runs += 1
-            log(f"claimed #{claimed.number} ({claimed.title}); starting run {runs}")
-            # The claimed event goes out before any slow work (clone, agent):
-            # from here the zombie-claim janitor can see this claim (ADR-0015).
-            run_id = new_run_id(config)
-            sink.emit(run_event(config, issue=claimed.number, run_id=run_id, phase=PHASE_CLAIMED))
-            try:
-                report = execute_run(
-                    config, client, claimed, session_factory, run_id=run_id, log=log, sink=sink
-                )
-                log(
-                    f"run {report.run_id} finished: phase={report.phase} "
-                    f"pr={report.pr_number} round={report.round} "
-                    f"agent={report.agent_outcome or 'n/a'}"
-                )
-            except Exception as exc:
-                log(f"run for #{claimed.number} crashed: {exc}")
+            log(f"dispatch pass failed: {exc}")
         if once:
             return runs
-        if claimed is None:
+        if granted is None:
+            # An idle-pass sweep with nothing to push is one directory
+            # listing; only failed pushes arm the backoff.
+            if time.monotonic() >= sweep_retry_at:
+                _, kept = sweep_orphans(config, log=log)
+                sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
             sleep(config.poll_seconds)
 
 
@@ -100,12 +116,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="theozolith-worker",
         description=(
-            "TheOzolith Worker driver: poll plan_ready issues, claim, execute Runs in "
+            "TheOzolith Worker driver: request claims from the Control Node, execute Runs in "
             "ephemeral containers, ship best-effort PRs."
         ),
     )
     parser.add_argument(
-        "--once", action="store_true", help="One poll-claim-run pass (at most one Run), then exit."
+        "--once",
+        action="store_true",
+        help="One dispatch-run pass (at most one claim), then exit. Requires a reachable"
+        " Control Node (ADR-0017).",
     )
     args = parser.parse_args(argv)
     try:

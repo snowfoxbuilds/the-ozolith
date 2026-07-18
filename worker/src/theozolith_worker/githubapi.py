@@ -305,6 +305,21 @@ class GitHubClient:
             for item in items
         ]
 
+    # -- repository contents ------------------------------------------------
+
+    def path_exists(self, path: str, *, ref: str) -> bool:
+        """Does ``path`` exist at ``ref``? (contents API, read-only)."""
+        query = urllib.parse.quote(path, safe="/")
+        try:
+            self._request(
+                "GET", self._repo_path(f"/contents/{query}?ref={urllib.parse.quote(ref)}")
+            )
+        except GitHubError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
     # -- pull requests -----------------------------------------------------
 
     def get_pull(self, number: int) -> PullRequest:

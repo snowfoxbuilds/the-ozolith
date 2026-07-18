@@ -20,6 +20,7 @@ from theozolith_worker.jobdir import HOOK_EVENTS_FILE, MODE_REVIEW, VERDICT_FILE
 # Event lines the completion hooks append to output/hook-events.log.
 EVENT_STOP = "stop"
 EVENT_PROMPT = "prompt"
+EVENT_TOOL = "tool"  # feeds the run-progress tool-call counter (ADR-0016)
 
 
 class HarnessAdapterError(RuntimeError):
@@ -80,6 +81,9 @@ class ClaudeHarnessAdapter:
                     "hooks": {
                         "Stop": [hook(EVENT_STOP)],
                         "UserPromptSubmit": [hook(EVENT_PROMPT)],
+                        # Not a completion signal: the tool-call counter for
+                        # run-progress telemetry (ADR-0016).
+                        "PostToolUse": [hook(EVENT_TOOL)],
                     }
                 },
                 indent=2,

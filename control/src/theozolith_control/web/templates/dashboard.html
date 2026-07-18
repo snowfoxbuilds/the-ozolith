@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Fleet · TheOzolith{% endblock %}
+{% block content %}
+{% if repo %}<p class="muted">pipeline repo:
+  <a href="https://github.com/{{ repo }}">{{ repo }}</a></p>{% endif %}
+<section id="runs" hx-get="/fragments/runs" hx-trigger="load, every {{ poll_seconds }}s"
+         aria-label="Workers and Runs"><p class="muted">loading runs…</p></section>
+<section id="fleet" hx-get="/fragments/fleet" hx-trigger="load, every {{ poll_seconds }}s"
+         aria-label="Nodes"><p class="muted">loading fleet…</p></section>
+<section id="activity" hx-get="/fragments/activity" hx-trigger="load, every {{ poll_seconds }}s"
+         aria-label="Events"><p class="muted">loading events…</p></section>
+{% endblock %}

@@ -46,8 +46,8 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         api_url="https://api.github.invalid",
         zombie_grace_seconds=600,
         janitor_sweep_seconds=60,
-        audit_sweep_seconds=300,
-        claim_ttl_seconds=120,
+        activation_window_seconds=60,
+        tail_budget_bytes=10 * 1024**3,
         secrets_channel_ok=True,
     )
     values.update(overrides)
@@ -61,6 +61,7 @@ class ControlRig:
     box: SecretBox
     client: TestClient
     clock: FakeClock
+    github: FakeGitHubLite
 
     def node_post(self, path: str, body: dict, token: str = NODE_TOKEN):
         return self.client.post(path, json=body, headers={"Authorization": f"Bearer {token}"})
@@ -88,6 +89,12 @@ class ControlRig:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
+    def dispatch(self, role: str = "worker", worker: str = "worker-a", node: str = "box1"):
+        return self.node_post(
+            "/api/v1/dispatch",
+            {"role": role, "worker": worker, "node": node, "login": f"ozolith-{worker}"},
+        )
+
 
 def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
     settings = make_settings(tmp_path, **settings_overrides)
@@ -95,8 +102,14 @@ def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(settings.db_path, clock=clock)
     box = SecretBox(generate_key())
-    app = create_app(settings, store, box)
-    return ControlRig(settings, store, box, TestClient(app), clock)
+    github = FakeGitHubLite()
+    app = create_app(
+        settings,
+        store,
+        box,
+        github_client=github if settings.coordination_jobs_enabled else None,
+    )
+    return ControlRig(settings, store, box, TestClient(app), clock, github)
 
 
 @pytest.fixture
@@ -104,17 +117,21 @@ def control(tmp_path: Path) -> ControlRig:
     return make_rig(tmp_path)
 
 
-# -- the GitHub the janitor/auditor see -----------------------------------------
+# -- the GitHub the dispatcher and janitor see -----------------------------------
 
 
 class FakeGitHubLite:
-    """Duck-typed GitHubClient surface for the coordination jobs. Every
-    mutation lands in ``writes`` — the auditor test proves that list stays
-    empty; the janitor test proves it contains only the restorative moves."""
+    """Duck-typed GitHubClient surface for dispatch and the janitor. Every
+    mutation lands in ``writes`` — the janitor tests prove it contains only
+    the sanctioned moves; the dispatch tests prove write-through ordering."""
 
     def __init__(self):
+        self.repo = "acme/sandbox"
         self.issues: dict[int, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
+        self.comments: dict[int, list[str]] = {}
+        # Paths that exist on the evidence branch (janitor phase 2).
+        self.evidence: set[str] = set()
         self.writes: list[tuple] = []
 
     def add_issue(self, number: int, labels: set[str], assignees: list[str]) -> None:
@@ -165,6 +182,12 @@ class FakeGitHubLite:
             if label in d["labels"]
         ]
 
+    def list_open_issues(self, label: str) -> list[Issue]:
+        return [self.get_issue(n) for n, d in sorted(self.issues.items()) if label in d["labels"]]
+
+    def path_exists(self, path: str, *, ref: str) -> bool:
+        return path in self.evidence
+
     # -- writes ---------------------------------------------------------------
 
     def remove_assignee(self, number: int, login: str) -> None:
@@ -172,6 +195,10 @@ class FakeGitHubLite:
         self.issues[number]["assignees"] = [
             a for a in self.issues[number]["assignees"] if a != login
         ]
+
+    def add_assignees(self, number: int, *logins: str) -> None:
+        self.writes.append(("add_assignees", number, *logins))
+        self.issues[number]["assignees"].extend(logins)
 
     def remove_label(self, number: int, label: str) -> None:
         self.writes.append(("remove_label", number, label))
@@ -181,10 +208,14 @@ class FakeGitHubLite:
         self.writes.append(("add_labels", number, *labels))
         self.issues[number]["labels"].update(labels)
 
+    def add_comment(self, number: int, body: str) -> None:
+        self.writes.append(("add_comment", number))
+        self.comments.setdefault(number, []).append(body)
+
 
 @pytest.fixture
-def github() -> FakeGitHubLite:
-    return FakeGitHubLite()
+def github(control: ControlRig) -> FakeGitHubLite:
+    return control.github
 
 
 # -- event factories (the drivers' wire shapes, ADR-0015) --------------------------

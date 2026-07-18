@@ -19,13 +19,12 @@ from pathlib import Path
 import pytest
 from fakegithub import FakeGitHub
 from theozolith_worker import jobdir
-from theozolith_worker.bootstrap.vocabulary import PLAN_READY
+from theozolith_worker.bootstrap.vocabulary import FAILED, IN_PROGRESS, PLAN_READY
 from theozolith_worker.config import DriverConfig, load_config
 from theozolith_worker.containers import ContainerSpec
 from theozolith_worker.evidence import EVIDENCE_BRANCH
 from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.jobdir import AgentOutcome, Manifest
-from theozolith_worker.prefilter import NullPrefilter
 from theozolith_worker.reviewer import run_reviewer
 from theozolith_worker.shell import run_shell
 from theozolith_worker.worker import run_worker
@@ -60,6 +59,70 @@ def write_decisions(cwd: Path, **kwargs) -> None:
 
 # A Run behavior: (prompt, checkout) -> AgentOutcome | None (None = completed).
 RunBehavior = Callable[[str, Path], AgentOutcome | None]
+
+
+class RecordingSink:
+    """Collects driver events; the default 'Control Node is fine' sink."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    def emit(self, event: dict) -> bool:
+        self.events.append(event)
+        return True
+
+    def run_phases(self, issue: int | None = None) -> list[str]:
+        return [
+            e["phase"]
+            for e in self.events
+            if e["type"] == "theozolith.run" and (issue is None or e["issue"] == issue)
+        ]
+
+
+class FakeDispatch:
+    """The Control Node's dispatch in miniature (ADR-0017): write-through
+    claim creation applied directly to the fake GitHub state, so the driver
+    under test receives issues exactly as production does — already
+    assigned, already in_progress, plan_ready gone. `paused` simulates an
+    unreachable Control Node (claims and review rounds pause)."""
+
+    def __init__(self, fake: FakeGitHub):
+        self.fake = fake
+        self.paused = False
+
+    def request_work(self, worker: str, node: str, login: str) -> dict | None:
+        if self.paused:
+            return None
+        for number, issue in sorted(self.fake.issues.items()):
+            if number in self.fake.pulls or issue["state"] != "open":
+                continue
+            labels = self.fake.labels_of(number)
+            if PLAN_READY not in labels or FAILED in labels:
+                continue
+            if IN_PROGRESS in labels or issue["assignees"]:
+                continue
+            self.fake.force_assign(number, login)
+            issue["labels"] = [la for la in issue["labels"] if la["name"] != PLAN_READY] + [
+                {"name": IN_PROGRESS}
+            ]
+            return {
+                "number": number,
+                "title": issue["title"],
+                "body": issue["body"],
+                "labels": sorted(self.fake.labels_of(number)),
+            }
+        return None
+
+    def review_targets(self, worker: str, node: str, login: str) -> list[int] | None:
+        if self.paused:
+            return None
+        return [
+            number
+            for number in sorted(self.fake.pulls)
+            if self.fake.pulls[number]["state"] == "open"
+            and "pr_ready" in self.fake.labels_of(number)
+            and not {"needs_human", "blocked"} & self.fake.labels_of(number)
+        ]
 
 
 def behavior_write(files: dict[str, str], **decisions_kwargs) -> RunBehavior:
@@ -161,6 +224,8 @@ class Harness:
     reviewer_config: DriverConfig
     worker_client: GitHubClient
     reviewer_client: GitHubClient
+    dispatch: FakeDispatch
+    sink: RecordingSink = field(default_factory=RecordingSink)
     record: SessionRecord = field(default_factory=SessionRecord)
     worker_behaviors: list[RunBehavior] = field(default_factory=list)
     worker_calls: list[tuple[str, str]] = field(default_factory=list)  # (prompt, workdir)
@@ -175,23 +240,26 @@ class Harness:
     def session_factory(self, spec: ContainerSpec, job: Path, manifest: Manifest) -> FakeSession:
         return FakeSession(spec, job, manifest, self)
 
-    def worker_once(self, prefilter=None, client: GitHubClient | None = None) -> int:
+    def worker_once(self, client: GitHubClient | None = None, sink=None) -> int:
         return run_worker(
             self.worker_config,
             client or self.worker_client,
             self.session_factory,
-            prefilter or NullPrefilter(),
+            self.dispatch,
             once=True,
             log=self.logs.append,
+            sink=sink or self.sink,
         )
 
-    def reviewer_once(self) -> int:
+    def reviewer_once(self, sink=None) -> int:
         return run_reviewer(
             self.reviewer_config,
             self.reviewer_client,
             self.session_factory,
+            self.dispatch,
             once=True,
             log=self.logs.append,
+            sink=sink or self.sink,
         )
 
     # -- GitHub-side helpers --------------------------------------------------
@@ -277,6 +345,10 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         "THEOZOLITH_POLL_SECONDS": "0",
         "THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs"),
         "THEOZOLITH_WORKER_ID": "worker-a",
+        # Required since ADR-0017 (no second claim path); tests inject a
+        # FakeDispatch and a RecordingSink, so nothing dials this URL.
+        "CONTROL_NODE_URL": "https://control.invalid:8443",
+        "THEOZOLITH_NODE_TOKEN": "node-token",
         # The model API key is ALLOWED in run containers (a rotatable spend
         # credential); the GitHub PATs are not (ADR-0013).
         "ANTHROPIC_API_KEY": "model-key",
@@ -293,6 +365,7 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         reviewer_client=GitHubClient(
             fake.repo, "tok-reviewer", transport=fake, sleep=lambda s: None
         ),
+        dispatch=FakeDispatch(fake),
     )
     harness.worker_client._sleep = harness.worker_sleeps.append  # type: ignore[attr-defined]
     return harness

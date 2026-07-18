@@ -1,12 +1,15 @@
-# OPTIONAL slow backstop for the Control Node's zombie-claim janitor (M3
-# brief). Pure GitHub data, deliberately conservative (24h staleness — the
-# Control Node janitor's 10-minute grace period is the primary mechanism):
-# an issue stuck in_progress with no timeline activity for a day has lost
-# its Worker AND its Control Node. Copy into the TARGET repo's
-# .github/workflows/ to enable.
+# OPTIONAL slow backstop for the Control Node's zombie-claim janitor. Pure
+# GitHub data, deliberately conservative (24h staleness — the Control Node
+# janitor's 10-minute grace period is the primary mechanism): an issue stuck
+# in_progress with no timeline activity for a day has lost its Worker AND its
+# Control Node. Copy into the TARGET repo's .github/workflows/ to enable.
 #
-# Mirrors the janitor's guard (ADR-0015): issues whose open PR carries
-# pr_ready are the Reviewer's to drive and are never re-queued here.
+# ADR-0016: there is NO automatic re-queue — escalate to a human instead
+# (failed + needs_human), exactly like the real janitor, just without the
+# evidence link it would normally wait for (this backstop only fires when the
+# whole substrate has been dark for a day). Mirrors the janitor's guard:
+# issues whose open PR carries pr_ready are the Reviewer's to drive and are
+# never touched here.
 
 name: theozolith-zombie-janitor
 
@@ -47,7 +50,14 @@ jobs:
                 owner, repo, issue_number: issue.number, name: "in_progress",
               }).catch(() => {});
               await github.rest.issues.addLabels({
-                owner, repo, issue_number: issue.number, labels: ["plan_ready"],
+                owner, repo, issue_number: issue.number, labels: ["failed", "needs_human"],
               });
-              core.notice(`issue #${issue.number}: stale claim returned to plan_ready`);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: "This claim was silent for over 24h with its Control Node dark; "
+                  + "escalated by the GitHub-Action backstop (`failed` + `needs_human`, "
+                  + "ADR-0016 — never auto-re-queued). Check the evidence branch for a "
+                  + "swept bundle before re-queueing.",
+              });
+              core.notice(`issue #${issue.number}: stale claim escalated failed + needs_human`);
             }

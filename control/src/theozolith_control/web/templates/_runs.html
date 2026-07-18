@@ -1,0 +1,65 @@
+<h2>Workers &amp; Runs</h2>
+{% if runs %}
+<table>
+  <thead><tr>
+    <th>Issue</th><th>Phase</th><th>Attempt</th><th>Worker · Node</th>
+    <th>Run</th><th>PR</th><th>Last event</th><th>Live progress</th>
+  </tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td>{% if run.issue_url %}<a href="{{ run.issue_url }}">#{{ run.issue }}</a>
+          {% else %}#{{ run.issue }}{% endif %}</td>
+      <td><span class="badge b-{{ run.status }}">● {{ run.phase }}</span></td>
+      <td>{{ run.attempt or "–" }}</td>
+      <td>{{ run.worker }} · {{ run.node }}</td>
+      <td><code>{{ run.run_id }}</code></td>
+      <td>{% if run.pr_url %}<a href="{{ run.pr_url }}">#{{ run.pr }}</a>{% else %}–{% endif %}</td>
+      <td class="muted">{{ run.last_event }}</td>
+      <td>
+        {% if run.progress %}
+          {{ run.progress.phase }} · {{ run.progress_elapsed or "?" }}
+          · {{ run.progress.tool_calls or 0 }} tool call(s)
+          {% if run.progress.transcript_tail %}
+          <details><summary class="muted">transcript tail</summary>
+            {# agent-authored text: untrusted, always escaped #}
+            <pre class="tail">{{ run.progress.transcript_tail }}</pre>
+          </details>
+          {% endif %}
+        {% else %}<span class="muted">no telemetry yet</span>{% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">No Runs on record.</p>{% endif %}
+
+{% if flags.zombies or flags.malformed or flags.quarantines %}
+<h3>Needs attention</h3>
+<ul class="flags">
+  {% for z in flags.zombies %}
+  <li><span class="badge b-warning">● zombie</span>
+      issue #{{ z.issue }} · run <code>{{ z.run_id }}</code> · {{ z.worker }}@{{ z.node }}
+      silent since {{ z.flagged }} — awaiting swept evidence (flag only, ADR-0016)</li>
+  {% endfor %}
+  {% for m in flags.malformed %}
+  <li><span class="badge b-serious">● malformed</span>
+      issue #{{ m.issue }}: {{ m.detail }} <span class="muted">(seen {{ m.last_seen }})</span></li>
+  {% endfor %}
+  {% for q in flags.quarantines %}
+  <li><span class="badge b-critical">● quarantined</span>
+      node {{ q.node }}: {{ q.reason }} <span class="muted">(since {{ q.since }};
+      release: recycle/update or <code>theozolith-control unquarantine</code>)</span></li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if flags.janitor_actions %}
+<details><summary class="muted">janitor actions ({{ flags.janitor_actions | length }} recent)</summary>
+<ul class="flags">
+  {% for a in flags.janitor_actions %}
+  <li class="muted">{{ a.acted }} — {% if a.issue %}issue #{{ a.issue }}: {% endif %}{{ a.reason }}</li>
+  {% endfor %}
+</ul>
+</details>
+{% endif %}

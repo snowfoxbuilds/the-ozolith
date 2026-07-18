@@ -1,8 +1,8 @@
 """The ``theozolith-control`` CLI: serve, TLS init, secrets, commands, state.
 
-Secret entry happens here (M3) and through the M4 web form later — both
-write through the same PUT /api/v1/secrets/{name} API to the same encrypted
-store (NODE-SUBSTRATE.md). Everything except ``serve``, ``tls-init``, and
+Secret entry happens here and through the dashboard's web form — both write
+through the same PUT /api/v1/secrets/{name} API to the same encrypted store
+(NODE-SUBSTRATE.md). Everything except ``serve``, ``tls-init``, and
 ``rotate-key`` talks HTTP to a running Control Node; the admin token comes
 from THEOZOLITH_ADMIN_TOKEN and the server URL from CONTROL_NODE_URL.
 """
@@ -16,14 +16,13 @@ import os
 import ssl
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import auditor, janitor
+from theozolith_control import janitor
 from theozolith_control.crypto import SecretBox, ensure_key_file, generate_key
 from theozolith_control.settings import ControlSettings, load_settings
 from theozolith_control.store import Store
@@ -86,23 +85,38 @@ def _admin_env(args) -> tuple[str, str, str | None]:
 # -- serve ---------------------------------------------------------------------
 
 
+EVICTION_EVERY_SECONDS = 3600.0  # scanning progress payloads is not a per-minute job
+
+
+def _sweep_pass(settings: ControlSettings, store: Store, client, *, evict: bool = True) -> None:
+    """One janitor pass: zombie escalation, never-activated grant release,
+    and (on its slower cadence) progress-telemetry eviction (ADR-0016/0017)."""
+    janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
+    janitor.release_never_activated(
+        store, client, window_seconds=settings.activation_window_seconds, log=_log
+    )
+    if evict:
+        evicted = store.evict_progress(settings.tail_budget_bytes)
+        if evicted:
+            _log(f"evicted {evicted} progress event(s) past the tail budget (cache, not archive)")
+
+
 def _sweep_loop(settings: ControlSettings, store: Store, stop: threading.Event) -> None:
-    """Janitor + auditor on their cadences, in one thread (ADR-0015)."""
+    """The janitor on its cadence, in one thread (ADR-0015)."""
+    import time as _time
+
     from theozolith_worker.githubapi import GitHubClient
 
     client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
-    next_audit = 0.0
+    next_eviction = 0.0
     while not stop.wait(settings.janitor_sweep_seconds):
+        evict = _time.monotonic() >= next_eviction
+        if evict:
+            next_eviction = _time.monotonic() + EVICTION_EVERY_SECONDS
         try:
-            janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
+            _sweep_pass(settings, store, client, evict=evict)
         except Exception as exc:
             _log(f"janitor sweep failed: {exc}")
-        if time.monotonic() >= next_audit:
-            next_audit = time.monotonic() + settings.audit_sweep_seconds
-            try:
-                auditor.sweep(store, client, log=_log)
-            except Exception as exc:
-                _log(f"audit sweep failed: {exc}")
 
 
 def _serve(args) -> int:
@@ -133,9 +147,12 @@ def _serve(args) -> int:
         threading.Thread(
             target=_sweep_loop, args=(settings, store, stop), daemon=True, name="sweeps"
         ).start()
-        _log(f"janitor + auditor sweeping {settings.repo}")
+        _log(f"claim dispatch + janitor active on {settings.repo}")
     else:
-        _log("janitor + auditor disabled (set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN)")
+        _log(
+            "claim dispatch + janitor DISABLED — the pipeline pauses"
+            " (set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN; ADR-0017)"
+        )
 
     _log(f"control node on {args.host}:{args.port} (TLS {'on' if tls else 'OFF — dev mode'})")
     try:
@@ -189,21 +206,8 @@ def _janitor_once(args) -> int:
         raise SystemExit("error: set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN")
     client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
     store = Store(settings.db_path)
-    restored = janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
-    _log(f"janitor: {len(restored)} issue(s) restored")
-    return 0
-
-
-def _auditor_once(args) -> int:
-    from theozolith_worker.githubapi import GitHubClient
-
-    settings = load_settings()
-    if not settings.coordination_jobs_enabled:
-        raise SystemExit("error: set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN")
-    client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
-    store = Store(settings.db_path)
-    findings = auditor.sweep(store, client, log=_log)
-    _log(f"auditor: {len(findings)} new finding(s)")
+    _sweep_pass(settings, store, client)
+    _log("janitor: pass complete")
     return 0
 
 
@@ -240,8 +244,22 @@ def _command(args) -> int:
     body: dict[str, Any] = {"node": args.node, "verb": args.verb}
     if args.target:
         body["target"] = args.target
+    if getattr(args, "force", False):
+        body["force"] = True
     result = _call(url, "/api/v1/commands", token=token, method="POST", body=body, ca=ca)
     _log(f"queued command {result.get('id')} ({args.verb} on {args.node})")
+    return 0
+
+
+def _unquarantine(args) -> int:
+    url, token, ca = _admin_env(args)
+    result = _call(
+        url, f"/api/v1/nodes/{args.node}/quarantine/release", token=token, method="POST", ca=ca
+    )
+    if result.get("released"):
+        _log(f"node {args.node}: quarantine released")
+    else:
+        _log(f"node {args.node}: was not quarantined")
     return 0
 
 
@@ -251,9 +269,9 @@ def _status(args) -> int:
     return 0
 
 
-def _audits(args) -> int:
+def _flags(args) -> int:
     url, token, ca = _admin_env(args)
-    print(json.dumps(_call(url, "/api/v1/audits", token=token, ca=ca), indent=2, sort_keys=True))
+    print(json.dumps(_call(url, "/api/v1/flags", token=token, ca=ca), indent=2, sort_keys=True))
     return 0
 
 
@@ -295,17 +313,27 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("verb", choices=["drain", "recycle", "update", "rebuild"])
     command.add_argument("--node", required=True)
     command.add_argument("--target", help="Stack (drain/recycle) or image (rebuild) name.")
+    command.add_argument(
+        "--force",
+        action="store_true",
+        help="Apply immediately (kill-the-tree) instead of queueing behind an in-flight Run.",
+    )
     command.set_defaults(func=_command)
 
+    unquarantine = sub.add_parser(
+        "unquarantine", help="Release a node's dispatch quarantine (human-only, ADR-0016)."
+    )
+    unquarantine.add_argument("--node", required=True)
+    unquarantine.set_defaults(func=_unquarantine)
+
     sub.add_parser("status", help="Fleet state as JSON.").set_defaults(func=_status)
-    sub.add_parser("audits", help="Auditor findings + janitor actions.").set_defaults(func=_audits)
+    sub.add_parser(
+        "flags", help="Zombie flags, janitor actions, malformed states, quarantines."
+    ).set_defaults(func=_flags)
 
     janitor_cmd = sub.add_parser("janitor", help="Zombie-claim sweep against the local store.")
     janitor_cmd.add_argument("--once", action="store_true", required=True)
     janitor_cmd.set_defaults(func=_janitor_once)
-    auditor_cmd = sub.add_parser("auditor", help="Retry audit against the local store.")
-    auditor_cmd.add_argument("--once", action="store_true", required=True)
-    auditor_cmd.set_defaults(func=_auditor_once)
 
     sub.add_parser(
         "rotate-key", help="Re-encrypt all secrets under a fresh master key (server stopped)."

@@ -115,11 +115,14 @@ def test_assign_order_reflects_event_timeline():
     assert client.assign_order(number) == ["worker-b", "worker-a"]
 
 
+CONTROL_ENV = {"CONTROL_NODE_URL": "https://control.invalid:8443"}
+
+
 def test_config_reads_var_file_convention(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("s3cret\n")
     config = load_config(
-        {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN_FILE": str(token_file)},
+        {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN_FILE": str(token_file), **CONTROL_ENV},
         role="worker",
     )
     assert config.token == "s3cret"
@@ -139,6 +142,7 @@ def test_config_role_prefixed_variables_route_one_shared_env():
         "WORKER_MODEL": "claude-sonnet-5",
         "WORKER_ID": "worker-9",
         "POLL_SECONDS": "5",
+        **CONTROL_ENV,
     }
     worker = load_config(env, role="worker")
     reviewer = load_config(env, role="reviewer")
@@ -149,15 +153,20 @@ def test_config_role_prefixed_variables_route_one_shared_env():
     assert worker.poll_seconds == 5.0
 
 
-def test_config_requires_repo_and_token():
+def test_config_requires_repo_token_and_control_node():
     with pytest.raises(ConfigError):
         load_config({}, role="worker")
     with pytest.raises(ConfigError):
         load_config({"THEOZOLITH_REPO": "acme/sandbox"}, role="worker")
+    # ADR-0017: no Control Node = no claim path = not a runnable driver.
+    with pytest.raises(ConfigError, match="CONTROL_NODE_URL"):
+        load_config({"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x"}, role="worker")
 
 
 def test_config_reviewer_defaults_to_stronger_model():
-    config = load_config({"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x"}, role="reviewer")
+    config = load_config(
+        {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x", **CONTROL_ENV}, role="reviewer"
+    )
     assert config.model == "claude-fable-5"
 
 

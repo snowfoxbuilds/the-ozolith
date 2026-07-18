@@ -1,8 +1,9 @@
 """The Reviewer driver: a separate node-resident process owning all post-PR state.
 
 Own GitHub identity, stronger model than the Worker adapters — no
-self-grading by construction (ADR-0008). Polls one label on one object type
-(pr_ready PRs without needs_human) and runs each review round as an
+self-grading by construction (ADR-0008). Discovers reviewable pr_ready PRs
+through the Control Node's dispatch endpoint (ADR-0017, discovery-only) and
+runs each review round as an
 ephemeral container (ADR-0013): the driver materializes the review inputs as
 files (issue intent, diff, Decisions Section, mechanical signals), the
 judging agent runs in an interactive tmux session and writes its verdict as
@@ -48,6 +49,7 @@ from theozolith_worker.bootstrap.vocabulary import (
     ROUND_BUDGET,
     attempt_label,
     attempts_on,
+    reviewable,
 )
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import (
@@ -58,10 +60,12 @@ from theozolith_worker.containers import (
     review_session_name,
 )
 from theozolith_worker.decisions import section_text
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch
 from theozolith_worker.events import EventSink, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
 from theozolith_worker.signals import compute_signals
+from theozolith_worker.sweep import sweep_orphans
 from theozolith_worker.worker import container_session_factory
 
 DIFF_LIMIT = 200_000
@@ -489,34 +493,45 @@ def _push_review_evidence(
     )
 
 
-def reviewable(labels: set[str]) -> bool:
-    return PR_READY in labels and NEEDS_HUMAN not in labels and BLOCKED not in labels
-
-
 def run_reviewer(
     config: DriverConfig,
     client: GitHubClient | None = None,
     session_factory: SessionFactory | None = None,
+    dispatch: WorkDispatch | None = None,
     *,
     sleep=time.sleep,
     once: bool = False,
     log=_log,
     sink: EventSink | None = None,
 ) -> int:
-    """The Reviewer poll loop; returns the number of verdicts applied."""
+    """The Reviewer loop; returns the number of verdicts applied.
+
+    Discovery goes through the Control Node's dispatch endpoint (ADR-0017,
+    discovery-only — no claim label exists on PRs); the verdict itself is
+    still applied with the Reviewer's own PAT. Control Node down = new
+    review rounds pause.
+    """
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
+    dispatch = dispatch or DispatchClient(
+        config.control_node_url, config.control_token, ca=config.control_ca, log=log
+    )
     sink = sink or make_sink(config, log)
     me = client.viewer_login()
-    log(f"reviewer driver ({me}) polling {config.repo} for {PR_READY} without {NEEDS_HUMAN}")
+    log(f"reviewer driver ({me}) requesting {PR_READY} PRs for {config.repo} via dispatch")
+    sweep_orphans(config, log=log)  # recover orphaned review workspaces (ADR-0016)
 
     verdicts = 0
     while True:
         try:
-            for candidate in client.list_open_prs_by_label(PR_READY):
-                if not reviewable(candidate.labels):
-                    continue
-                pr = client.get_pull(candidate.number)
+            targets = dispatch.review_targets(config.worker_id, config.node_name, me)
+            if targets is None:
+                log("control node unreachable; review rounds paused (ADR-0017)")
+                targets = []
+            for number in targets:
+                pr = client.get_pull(number)
+                if not reviewable(pr.labels):
+                    continue  # discovery is advisory: GitHub decides
                 if review_pr(config, client, pr, session_factory, log=log, sink=sink) is not None:
                     verdicts += 1
         except Exception as exc:

@@ -7,6 +7,12 @@ node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
 state = "running"
 command = "theozolith-worker"
 
+# Web-terminal attach command for this Stack's live run containers, executed
+# by the Control Node's PTY bridge ({host} = node name, {container} = the
+# target run container). This is the default template from NODE-SUBSTRATE.md;
+# omit the key entirely to expose no terminal for this Stack.
+attach = "ssh {host} -t docker exec -it {container} tmux attach"
+
 # The derived run-container image this driver launches per Run: an
 # images/<name>.toml recipe, built locally by the node that hosts this
 # driver and injected as THEOZOLITH_RUN_IMAGE.

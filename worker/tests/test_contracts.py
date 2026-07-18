@@ -11,7 +11,7 @@ from theozolith_worker.githubapi import Comment
 from theozolith_worker.harness.adapters import ClaudeHarnessAdapter
 from theozolith_worker.harness.validate import main as validate_main
 from theozolith_worker.harness.validate import validate_session_verdict
-from theozolith_worker.runner import parse_run_failed, render_run_failed
+from theozolith_worker.runner import RunReport, render_claim_escalation
 
 
 def sample_section() -> decisions.DecisionsSection:
@@ -321,23 +321,36 @@ def test_validate_verdict_cli(tmp_path, capsys):
     assert "INVALID" in capsys.readouterr().out
 
 
-# -- the run-failed marker (ADR-0014 failed-Run budget) ------------------------
+# -- the claim-escalation record (ADR-0016: forensics, never state) ------------
 
 
-def test_run_failed_marker_roundtrip():
-    reason = 'agent session "timed out"\nafter 3600s'
-    body = render_run_failed("20260716T1200-w1-9", reason, escalated=False)
-    assert "Re-queued for one retry" in body
-    parsed = parse_run_failed(body)
-    assert parsed is not None
-    run_id, parsed_reason = parsed
-    assert run_id == "20260716T1200-w1-9"
-    assert "timed out" in parsed_reason
-    assert '"' not in parsed_reason and "\n" not in parsed_reason  # sanitized
-
-    escalated = render_run_failed("r-2", "x" * 500, escalated=True)
-    assert "escalating to a human" in escalated.lower() or "Retry budget exhausted" in escalated
-    parsed = parse_run_failed(escalated)
-    assert parsed is not None and len(parsed[1]) <= 300  # reason truncated
-
-    assert parse_run_failed("an ordinary comment") is None
+def test_claim_escalation_comment_carries_both_failures():
+    reports = [
+        RunReport(
+            run_id="r-1",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="agent session timed out",
+            failure_class="timeout",
+        ),
+        RunReport(
+            run_id="r-2",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="run container exited early",
+            failure_class="harness",
+        ),
+    ]
+    body = render_claim_escalation("acme/sandbox", 7, reports)
+    assert "local-retry budget is spent" in body
+    for run_id, cls, reason in (
+        ("r-1", "timeout", "timed out"),
+        ("r-2", "harness", "exited early"),
+    ):
+        assert f"Run `{run_id}`" in body and cls in body and reason in body
+        assert f"tree/theozolith/evidence/runs/issue-7/{run_id}" in body
+    assert "removing `failed` and restoring `plan_ready`" in body
+    # Forensics, never machine state: no marker comment survives ADR-0016.
+    assert "<!--" not in body

@@ -93,9 +93,10 @@ class DriverConfig:
     run_image: str  # the run-container image the driver launches
     stack: str  # theozolith.owner label on containers this driver creates
     poll_seconds: float
-    control_node_url: str | None  # optional pre-filter + events; None = skipped
+    control_node_url: str  # claim dispatch + events (required, ADR-0017)
     control_token: str  # node bearer token for the Control Node channel
     control_ca: str | None  # CA bundle pinning a self-signed Control Node
+    progress_seconds: float  # run-progress telemetry cadence (0 disables)
     node_name: str  # the physical node, for events (M3 heartbeat identity)
     worker_id: str
     jobs_dir: Path  # where per-Run job directories live
@@ -132,6 +133,15 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
     worker_id = (
         _first(environ, "THEOZOLITH_WORKER_ID", "WORKER_ID", default=os.uname().nodename) or role
     )
+    # ADR-0017: claims dispatch through the Control Node — there is no
+    # second claim path, so a driver without one cannot run. The daemon-less
+    # dev shape is `theozolith-control serve` on the same box.
+    control_node_url = env_value(environ, "CONTROL_NODE_URL")
+    if not control_node_url:
+        raise ConfigError(
+            "set CONTROL_NODE_URL — drivers request work from the Control Node (ADR-0017);"
+            " for local dev run 'theozolith-control serve' and point at it"
+        )
     return DriverConfig(
         role=role,
         repo=repo,
@@ -144,9 +154,10 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         or "theozolith-run-claude:local",
         stack=_first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role,
         poll_seconds=_float(environ, "THEOZOLITH_POLL_SECONDS", "POLL_SECONDS", default="60"),
-        control_node_url=env_value(environ, "CONTROL_NODE_URL"),
+        control_node_url=control_node_url,
         control_token=env_value(environ, "THEOZOLITH_NODE_TOKEN") or "",
         control_ca=env_value(environ, "THEOZOLITH_TLS_CA"),
+        progress_seconds=_float(environ, "THEOZOLITH_PROGRESS_SECONDS", default="30"),
         node_name=env_value(environ, "THEOZOLITH_NODE_NAME") or os.uname().nodename,
         worker_id=worker_id,
         jobs_dir=Path(env_value(environ, "THEOZOLITH_JOBS_DIR", "/var/tmp/theozolith/jobs") or ""),

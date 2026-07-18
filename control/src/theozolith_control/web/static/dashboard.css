@@ -1,0 +1,111 @@
+/* TheOzolith control dashboard — server-rendered, no build step.
+   Status colors are reserved (good/info/warning/serious/critical) and always
+   paired with a dot + text label, never color alone. Dark mode is selected
+   via prefers-color-scheme with its own ink/surface values. */
+
+:root {
+  --surface: #fafaf9;
+  --card: #ffffff;
+  --ink: #1f2328;
+  --ink-2: #59636e;
+  --line: #d9dee3;
+  --accent: #0757ba;
+  --good-bg: #e2f5e5;  --good-ink: #0f6b2f;
+  --info-bg: #e7eef8;  --info-ink: #274f79;
+  --warn-bg: #fcefd1;  --warn-ink: #7a5300;
+  --serious-bg: #fde4d4; --serious-ink: #9a3d10;
+  --critical-bg: #fbdfdf; --critical-ink: #a11d24;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #101418;
+    --card: #171c22;
+    --ink: #e6e9ec;
+    --ink-2: #98a3ad;
+    --line: #2c343d;
+    --accent: #6cb2ff;
+    --good-bg: #12301c;  --good-ink: #7fd396;
+    --info-bg: #16283e;  --info-ink: #93bfef;
+    --warn-bg: #3a2d0d;  --warn-ink: #e7c266;
+    --serious-bg: #3d2113; --serious-ink: #f0a877;
+    --critical-bg: #3e1518; --critical-ink: #f1969b;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+}
+main { max-width: 1100px; margin: 0 auto; padding: 1rem 1.25rem 4rem; }
+h1, h2, h3 { font-weight: 600; }
+h2 { margin: 1.75rem 0 0.5rem; font-size: 1.1rem; }
+h3 { margin: 1rem 0 0.4rem; font-size: 0.95rem; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre { font: 12px/1.45 ui-monospace, monospace; }
+.muted { color: var(--ink-2); font-weight: 400; }
+
+.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--line); background: var(--card);
+}
+.topbar .brand { font-weight: 700; }
+.topbar nav { display: flex; gap: 1rem; align-items: center; }
+.inline { display: inline; margin: 0; }
+.linklike {
+  background: none; border: none; padding: 0; color: var(--accent);
+  font: inherit; cursor: pointer;
+}
+.linklike:hover { text-decoration: underline; }
+
+table { border-collapse: collapse; width: 100%; margin: 0.4rem 0 1rem; background: var(--card); }
+th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--ink-2); font-weight: 500; font-size: 12px; }
+tr.skewed td { background: var(--warn-bg); }
+
+.badge {
+  display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px;
+  font-size: 12px; white-space: nowrap;
+}
+.b-good { background: var(--good-bg); color: var(--good-ink); }
+.b-info { background: var(--info-bg); color: var(--info-ink); }
+.b-warning { background: var(--warn-bg); color: var(--warn-ink); }
+.b-serious { background: var(--serious-bg); color: var(--serious-ink); }
+.b-critical { background: var(--critical-bg); color: var(--critical-ink); }
+
+.flash { padding: 0.5rem 0.75rem; border-radius: 6px; }
+.flash-good { background: var(--good-bg); color: var(--good-ink); }
+.flash-warning { background: var(--warn-bg); color: var(--warn-ink); }
+.flash-error { background: var(--critical-bg); color: var(--critical-ink); }
+
+.node { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: 0.75rem 1rem; margin: 0.75rem 0; }
+.node h3 { margin-top: 0; display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+ul.flags, ul.events { list-style: none; padding-left: 0; }
+ul.flags li, ul.events li { padding: 0.2rem 0; }
+.etype { color: var(--ink-2); }
+pre { overflow-x: auto; background: var(--card); border: 1px solid var(--line);
+      border-radius: 6px; padding: 0.5rem; max-width: 100%; }
+pre.tail { max-height: 16rem; overflow-y: auto; white-space: pre-wrap; }
+.button {
+  border: 1px solid var(--line); border-radius: 6px; padding: 0.1rem 0.6rem;
+  background: var(--card); font-size: 12px;
+}
+
+.login-card, .secret-form { max-width: 26rem; }
+.login-card { margin: 12vh auto 0; }
+label { display: block; margin: 0.75rem 0 0.25rem; color: var(--ink-2); }
+input {
+  width: 100%; padding: 0.45rem 0.6rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--card); color: var(--ink); font: inherit;
+}
+button[type="submit"] {
+  margin-top: 0.9rem; padding: 0.45rem 1rem; border: none; border-radius: 6px;
+  background: var(--accent); color: #fff; font: inherit; cursor: pointer;
+}
+button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
+
+#terminal { height: 70vh; background: #000; border-radius: 6px; padding: 4px; }

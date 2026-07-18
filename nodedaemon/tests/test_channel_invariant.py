@@ -40,6 +40,7 @@ HEARTBEAT_REQUEST_KEYS = {
     "images",
     "config_commit",
     "completed_commands",
+    "deferred_commands",  # queue-behind visibility (references, no values)
 }
 
 
@@ -55,8 +56,8 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
         api_url="",
         zombie_grace_seconds=600,
         janitor_sweep_seconds=60,
-        audit_sweep_seconds=300,
-        claim_ttl_seconds=120,
+        activation_window_seconds=60,
+        tail_budget_bytes=10 * 1024**3,
         secrets_channel_ok=True,  # TLS-mandatory is proven in test_tls.py
     )
     stack_toml = tmp_path / "configs" / "stacks" / "worker.toml"
