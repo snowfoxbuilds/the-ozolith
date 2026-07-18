@@ -37,6 +37,7 @@ from theozolith_worker.gitops import GitError
 from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.runner import branch_for
 from theozolith_worker.sessions import SessionError
+from theozolith_worker.sweep import pending_dir
 
 CRITERIA_BODY = "## Acceptance criteria\n- change.txt exists on the branch\n"
 
@@ -583,6 +584,16 @@ def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypat
     assert PR_READY in harness.fake.labels_of(pr_number)
     worker_failures = [line for line in harness.logs if "evidence push failed" in line]
     assert worker_failures and "evidence remote down" in worker_failures[-1]
+    # ADR-0019: the failure is a structured record naming the bundle…
+    structured = json.loads(worker_failures[-1].partition("evidence push failed: ")[2])
+    assert structured["event"] == "theozolith.evidence-push-failed"
+    assert structured["bundle"].startswith("runs/issue-") and structured["attempts"] >= 1
+    # …and the retained job dir is parked in the -pending sibling, where the
+    # boot sweep retries it and queue-behind never reads it as a live Run.
+    jobs = harness.worker_config.jobs_dir
+    assert [p for p in jobs.iterdir() if p.is_dir()] == []
+    parked = [p.name for p in pending_dir(harness.worker_config).iterdir()]
+    assert parked and structured["run_id"] in parked
 
     harness.reviewer_replies.append(approve_reply())
     assert harness.reviewer_once() == 1  # the verdict still applies

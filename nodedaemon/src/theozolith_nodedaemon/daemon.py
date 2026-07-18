@@ -53,9 +53,17 @@ from theozolith_nodedaemon.stacks import (
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
 
-# Where a driver Stack keeps per-Run job directories unless its env says
-# otherwise — must match the worker config default (ADR-0013).
-DEFAULT_JOBS_DIR = "/var/tmp/theozolith/jobs"
+# Every process Stack gets its own jobs directory — <base>/<stack-name>,
+# injected as THEOZOLITH_JOBS_DIR unless the Stack's env overrides it — so
+# the queue-behind in-flight signal observes exactly one driver's Runs
+# (ADR-0019). Must match control's configrepo.DEFAULT_JOBS_BASE, where
+# duplicate resolved paths are rejected at parse time.
+DEFAULT_JOBS_BASE = "/var/tmp/theozolith/jobs"
+
+
+def stack_jobs_dir(stack: WireStack) -> Path:
+    explicit = stack.env.get("THEOZOLITH_JOBS_DIR", "")
+    return Path(explicit) if explicit else Path(DEFAULT_JOBS_BASE) / stack.name
 
 
 def _log(message: str) -> None:
@@ -270,7 +278,7 @@ class NodeDaemon:
                 continue
             if stack.kind != "process" or not self._supervisor.alive(stack.name):
                 continue
-            jobs_dir = Path(stack.env.get("THEOZOLITH_JOBS_DIR", DEFAULT_JOBS_DIR))
+            jobs_dir = stack_jobs_dir(stack)
             try:
                 running = sorted(p.name for p in jobs_dir.iterdir() if p.is_dir())
             except OSError:
@@ -383,7 +391,13 @@ class NodeDaemon:
             return
         if not self._supervisor.alive(stack.name) and not self._pull_stack_secrets(stack):
             return
-        env = {"THEOZOLITH_NODE_NAME": self._config.node, **stack.env}
+        env = {
+            "THEOZOLITH_NODE_NAME": self._config.node,
+            # The dedicated per-Stack jobs directory (ADR-0019); an explicit
+            # env value in the Stack definition wins.
+            "THEOZOLITH_JOBS_DIR": str(stack_jobs_dir(stack)),
+            **stack.env,
+        }
         if stack.run_image and stack.run_image in images:
             # The derived image this driver launches per Run (ADR-0013).
             env.setdefault("THEOZOLITH_RUN_IMAGE", images[stack.run_image]["tag"])

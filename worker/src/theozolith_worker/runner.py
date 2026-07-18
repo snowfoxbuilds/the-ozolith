@@ -56,6 +56,7 @@ from theozolith_worker.containers import (
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
 from theozolith_worker.sessions import SessionError, SessionFactory
+from theozolith_worker.sweep import pending_dir
 
 BRANCH_PREFIX = "ozolith/issue-"
 
@@ -314,8 +315,26 @@ def execute_run(
         else:
             # The bundle is the sole durable audit trail: never delete a job
             # dir whose push is unconfirmed — the evidence sweep retries it.
-            log(f"run {run_id}: job directory kept for the evidence sweep ({job})")
+            # Parked in the -pending sibling immediately, so the Node
+            # Daemon's queue-behind in-flight signal never reads a finished
+            # Run's retained evidence as a live Run (ADR-0019).
+            kept = _park_for_sweep(config, job, log)
+            log(f"run {run_id}: job directory kept for the evidence sweep ({kept})")
     return report
+
+
+def _park_for_sweep(config: DriverConfig, job: Path, log) -> Path:
+    """Move a retained job dir into the sweep's parking sibling; on failure
+    it stays where it is (the sweep scans both places)."""
+    parking = pending_dir(config)
+    try:
+        parking.mkdir(parents=True, exist_ok=True)
+        target = parking / job.name
+        job.rename(target)
+        return target
+    except OSError as exc:
+        log(f"run {job.name}: could not park the job dir for the sweep: {exc}")
+        return job
 
 
 def _run_to_pr(
@@ -619,9 +638,24 @@ def _push_run_evidence(
             env=gitops.auth_env(config.token),
         )
     except Exception as exc:
-        # Never fail the Run on evidence, but never swallow it silently.
+        # Never fail the Run on evidence, but never swallow it silently: a
+        # structured record (ADR-0019) so operators and log scrapers see
+        # exactly which bundle is missing and why.
         report.notes.append(f"evidence push failed: {exc}")
-        log(f"evidence push failed for run {report.run_id}: {exc}")
+        log(
+            "evidence push failed: "
+            + json.dumps(
+                {
+                    "event": "theozolith.evidence-push-failed",
+                    "run_id": report.run_id,
+                    "issue": issue.number,
+                    "bundle": prefix,
+                    "attempts": evidence.PUSH_ATTEMPTS,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+        )
         return False
     return True
 
@@ -632,11 +666,19 @@ def _push_run_evidence(
 def render_claim_escalation(repo: str, issue_number: int, reports: list[RunReport]) -> str:
     lines = ["Both Runs for this claim failed; the local-retry budget is spent (ADR-0016).", ""]
     for report in reports:
-        url = evidence.run_evidence_url(repo, issue_number, report.run_id)
-        lines.append(
-            f"- Run `{report.run_id}` — **{report.failure_class}**: {report.reason}"
-            f" ([evidence]({url}))"
-        )
+        line = f"- Run `{report.run_id}` — **{report.failure_class}**: {report.reason}"
+        if report.evidence_pushed:
+            url = evidence.run_evidence_url(repo, issue_number, report.run_id)
+            line += f" ([evidence]({url}))"
+        else:
+            # Never a dead link (ADR-0019): name the bundle path the boot
+            # sweep will publish to, best-effort, and say why it is absent.
+            line += (
+                f" — evidence bundle `{evidence.run_dir(issue_number, report.run_id)}` is not"
+                " yet published (push failed after bounded retries; the job directory is"
+                " retained for boot-sweep recovery)"
+            )
+        lines.append(line)
     lines += [
         "",
         f"The claim is released and escalated: `{FAILED}` + `{NEEDS_HUMAN}`."
