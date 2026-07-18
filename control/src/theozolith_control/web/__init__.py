@@ -33,7 +33,12 @@ from theozolith_control.crypto import SecretBox
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_control.web import views
-from theozolith_control.web.auth import SESSION_COOKIE, AdminSessions, BrowserGuard
+from theozolith_control.web.auth import (
+    DEV_SESSION_COOKIE,
+    SESSION_COOKIE,
+    AdminSessions,
+    BrowserGuard,
+)
 from theozolith_control.web.terminal import AttachError, audit, bridge, render_attach_argv
 
 _HERE = Path(__file__).parent
@@ -64,7 +69,7 @@ def mount_web(
     # string (transcript tails, event payloads) renders escaped.
     templates = Jinja2Templates(directory=str(_HERE / "templates"))
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
-    sessions = AdminSessions(settings.admin_token)
+    sessions = AdminSessions(settings.admin_token, secure_cookies=settings.serve_tls)
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
     guard = BrowserGuard(settings.canonical_host, settings.public_port)
 
@@ -114,14 +119,17 @@ def mount_web(
             response.status_code = 401
             return response
         response = RedirectResponse("/", status_code=303)
-        # The __Host- contract: Secure always, Path=/, no Domain — browsers
-        # refuse the cookie anywhere but this exact host over TLS.
+        # Over TLS: the __Host- contract (Secure, Path=/, no Domain — browsers
+        # refuse it anywhere but this exact host over TLS). Over plain HTTP
+        # (--insecure-dev): the unprefixed name without Secure, so the dev
+        # dashboard authenticates over http (a __Host-/Secure cookie would be
+        # dropped by the browser and loop the login).
         response.set_cookie(
-            SESSION_COOKIE,
+            sessions.cookie_name,
             cookie,
             httponly=True,
             samesite="strict",
-            secure=True,
+            secure=sessions.secure,
             path="/",
         )
         return response
@@ -131,7 +139,9 @@ def mount_web(
         if not _origin_ok(request):
             return _wrong_origin()
         response = _login_redirect()
+        # Clear whichever session cookie this scheme uses.
         response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True)
+        response.delete_cookie(DEV_SESSION_COOKIE, path="/", httponly=True)
         return response
 
     # -- dashboard ---------------------------------------------------------
@@ -274,32 +284,37 @@ def mount_web(
         if mode == "cookie" and not guard.ok(websocket):
             await websocket.close(code=WS_WRONG_ORIGIN)
             return
+        # Reserve a slot in one synchronous critical section — check and
+        # increment with no await between them, so concurrent connects
+        # cannot all pass the cap and launch excess processes (acceptance
+        # 12). Every path past this point decrements in the finally.
         if active_terminals[0] >= settings.terminal_session_cap:
-            # Refused before target resolution and before any process
-            # launch (acceptance 12).
             await websocket.close(
                 code=WS_OVER_CAPACITY,
                 reason=f"terminal session cap ({settings.terminal_session_cap}) reached",
             )
             return
-        node = websocket.query_params.get("node", "")
-        container = websocket.query_params.get("container", "")
-        argv, stack, error = _attach_target(node, container)
-        if argv is None:
-            await websocket.close(code=WS_NO_TARGET, reason=error[:120])
-            return
-        await websocket.accept()
-        record = {
-            "actor": "admin",
-            "node": node,
-            "stack": stack,
-            "container": container,
-            "command": argv,
-        }
-        audit(settings.terminal_audit_path, {"event": "attach", **record})
         active_terminals[0] += 1
+        attached = False
+        record: dict = {}
         reason = "error"
         try:
+            node = websocket.query_params.get("node", "")
+            container = websocket.query_params.get("container", "")
+            argv, stack, error = _attach_target(node, container)
+            if argv is None:
+                await websocket.close(code=WS_NO_TARGET, reason=error[:120])
+                return
+            await websocket.accept()
+            record = {
+                "actor": "admin",
+                "node": node,
+                "stack": stack,
+                "container": container,
+                "command": argv,
+            }
+            audit(settings.terminal_audit_path, {"event": "attach", **record})
+            attached = True
             reason = await bridge(websocket, argv)
         except asyncio.CancelledError:
             # The server cancelled this task at hang-up; the bridge already
@@ -308,4 +323,8 @@ def mount_web(
             raise
         finally:
             active_terminals[0] -= 1
-            audit(settings.terminal_audit_path, {"event": "detach", "reason": reason, **record})
+            if attached:
+                audit(
+                    settings.terminal_audit_path,
+                    {"event": "detach", "reason": reason, **record},
+                )

@@ -38,7 +38,12 @@ DESIRED_STATES = ("running", "stopped")
 # the resolved paths are unique per node (queue-behind ownership, M5).
 DEFAULT_JOBS_BASE = "/var/tmp/theozolith/jobs"
 
-ATTACH_PLACEHOLDERS = ("{host}", "{container}")
+# The attach-template placeholders, named once so the parser's embedded-use
+# rejection and the PTY bridge's substitution (web/terminal.py) share one
+# source and cannot drift (ADR-0019).
+ATTACH_HOST = "{host}"
+ATTACH_CONTAINER = "{container}"
+ATTACH_PLACEHOLDERS = (ATTACH_HOST, ATTACH_CONTAINER)
 
 
 class ConfigRepoError(RuntimeError):

@@ -4,9 +4,13 @@
 # everything else flows from config.
 #
 #   sudo ./install-nodedaemon.sh \
-#     --control-url https://controlnode.lan:8443 \
+#     --control-url https://<slug>.theozolith.internal:8443 \
 #     --ca /path/to/ca.pem \
 #     [--node <name>] [--source /path/to/theozolith-checkout]
+#
+# The --control-url host must be the Control Node's canonical origin
+# (ADR-0019: the name minted by `origin-init` and carried in its TLS cert),
+# reachable via trusted-network DNS — cert verification pins that name.
 #
 # The node token is read from THEOZOLITH_NODE_TOKEN in the environment or
 # prompted for (never passed as an argument: argv is world-readable).

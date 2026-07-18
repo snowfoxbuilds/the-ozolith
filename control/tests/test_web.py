@@ -419,6 +419,19 @@ def test_session_cookie_is_host_locked(control: ControlRig):
     assert "domain=" not in lowered
 
 
+def test_insecure_dev_login_works_over_plain_http(tmp_path):
+    """Over plain HTTP (--insecure-dev) the session uses the unprefixed,
+    non-Secure cookie so a browser actually stores it and the dashboard
+    authenticates — a __Host-/Secure cookie would be dropped and loop."""
+    rig = make_rig(tmp_path, base_url="http://control.dev:8443", serve_tls=False)
+    response = rig.client.post("/login", data={"token": ADMIN_TOKEN}, follow_redirects=False)
+    assert response.status_code == 303
+    header = response.headers["set-cookie"].lower()
+    assert header.startswith("ozolith_session=") and "secure" not in header
+    # The stored cookie authenticates a follow-up request over the same scheme.
+    assert rig.client.get("/", follow_redirects=False).status_code == 200
+
+
 def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     rig = make_rig(tmp_path, canonical_host=CANONICAL)
     # The login form is browser-only: enforced from the first POST.

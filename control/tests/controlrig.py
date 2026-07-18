@@ -49,6 +49,7 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         activation_window_seconds=60,
         tail_budget_bytes=10 * 1024**3,
         secrets_channel_ok=True,
+        serve_tls=True,  # production-like default; the dev-cookie test overrides
     )
     values.update(overrides)
     return ControlSettings(**values)
@@ -96,7 +97,9 @@ class ControlRig:
         )
 
 
-def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
+def make_rig(
+    tmp_path: Path, *, base_url: str = "https://testserver", **settings_overrides: Any
+) -> ControlRig:
     settings = make_settings(tmp_path, **settings_overrides)
     clock = FakeClock()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -109,9 +112,11 @@ def make_rig(tmp_path: Path, **settings_overrides: Any) -> ControlRig:
         box,
         github_client=github if settings.coordination_jobs_enabled else None,
     )
-    # https base URL: the __Host- session cookie is Secure (ADR-0019), and
-    # the client's cookie jar only returns Secure cookies over TLS.
-    client = TestClient(app, base_url="https://testserver")
+    # https base URL by default: the __Host- session cookie is Secure
+    # (ADR-0019), and the client's cookie jar only returns Secure cookies
+    # over TLS. Pass base_url="http://..." to exercise the --insecure-dev
+    # cookie path.
+    client = TestClient(app, base_url=base_url)
     return ControlRig(settings, store, box, client, clock, github)
 
 

@@ -142,6 +142,13 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
             "set CONTROL_NODE_URL — drivers request work from the Control Node (ADR-0017);"
             " for local dev run 'theozolith-control serve' and point at it"
         )
+    stack = _first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role
+    # Per-Stack default matching the Node Daemon's injection and control's
+    # uniqueness check (ADR-0019): each driver owns a distinct jobs dir so
+    # queue-behind never observes another Stack's Runs. Under the daemon
+    # THEOZOLITH_JOBS_DIR is always injected; this default only applies to the
+    # daemon-less dev shape, where it keeps worker/reviewer separate.
+    default_jobs_dir = f"/var/tmp/theozolith/jobs/{stack}"
     return DriverConfig(
         role=role,
         repo=repo,
@@ -152,7 +159,7 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         adapter=env_value(environ, "THEOZOLITH_ADAPTER", "claude") or "claude",
         run_image=env_value(environ, "THEOZOLITH_RUN_IMAGE", "theozolith-run-claude:local")
         or "theozolith-run-claude:local",
-        stack=_first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role,
+        stack=stack,
         poll_seconds=_float(environ, "THEOZOLITH_POLL_SECONDS", "POLL_SECONDS", default="60"),
         control_node_url=control_node_url,
         control_token=env_value(environ, "THEOZOLITH_NODE_TOKEN") or "",
@@ -160,7 +167,9 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         progress_seconds=_float(environ, "THEOZOLITH_PROGRESS_SECONDS", default="30"),
         node_name=env_value(environ, "THEOZOLITH_NODE_NAME") or os.uname().nodename,
         worker_id=worker_id,
-        jobs_dir=Path(env_value(environ, "THEOZOLITH_JOBS_DIR", "/var/tmp/theozolith/jobs") or ""),
+        jobs_dir=Path(
+            env_value(environ, "THEOZOLITH_JOBS_DIR", default_jobs_dir) or default_jobs_dir
+        ),
         agent_timeout_seconds=_float(environ, "THEOZOLITH_AGENT_TIMEOUT_SECONDS", default="3600"),
         settle_seconds=_float(environ, "THEOZOLITH_SETTLE_SECONDS", default="20"),
         cache_volumes=_volumes(

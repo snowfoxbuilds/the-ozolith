@@ -47,6 +47,8 @@ from pathlib import Path
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from theozolith_control.configrepo import ATTACH_CONTAINER, ATTACH_HOST
+
 READ_CHUNK = 65_536
 # Per-session PTY output budget: pause reading past HIGH, resume below LOW.
 BUFFER_HIGH = 512 * 1024
@@ -90,7 +92,9 @@ def render_attach_argv(template: tuple[str, ...], *, host: str, container: str) 
         raise AttachError(f"invalid attach host {host!r}")
     if not valid_container(container):
         raise AttachError(f"invalid container name {container!r}")
-    substitutions = {"{host}": host, "{container}": container}
+    # Keyed on the same named placeholders the Config Repo parser rejects
+    # embedded uses of — one source, so the two sets cannot drift.
+    substitutions = {ATTACH_HOST: host, ATTACH_CONTAINER: container}
     return [substitutions.get(element, element) for element in template]
 
 
@@ -106,8 +110,21 @@ def audit(path: Path, record: dict) -> None:
 
 
 def _resize(master: int, cols: int, rows: int) -> None:
+    # TIOCSWINSZ fields are unsigned shorts: clamp so a hostile or fat-
+    # fingered resize frame ({"cols": 100000}) cannot raise struct.error and
+    # tear the session down.
+    cols = max(1, min(cols, 0xFFFF))
+    rows = max(1, min(rows, 0xFFFF))
     with contextlib.suppress(OSError):
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``; os.write on a full PTY input
+    buffer short-writes, and a dropped tail is a corrupted paste."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
 
 
 class PtyBridge:
@@ -201,9 +218,9 @@ class PtyBridge:
                 return "client-closed"
             if message.get("bytes") is not None:
                 # Off the loop: a full PTY buffer (Ctrl-S, stalled remote)
-                # blocks os.write, and a stuck terminal must never stall
+                # blocks the write, and a stuck terminal must never stall
                 # every other connection on this server.
-                await asyncio.to_thread(os.write, master, message["bytes"])
+                await asyncio.to_thread(_write_all, master, message["bytes"])
             elif message.get("text"):
                 with contextlib.suppress(ValueError, TypeError):
                     control = json.loads(message["text"])
@@ -215,16 +232,22 @@ class PtyBridge:
     async def run(self) -> str:
         master, slave = pty.openpty()
         try:
-            process = await asyncio.create_subprocess_exec(
-                *self._argv,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                start_new_session=True,  # its own process group: the kill unit
-                close_fds=True,
-            )
-        finally:
-            os.close(slave)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *self._argv,
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    start_new_session=True,  # its own process group: the kill unit
+                    close_fds=True,
+                )
+            finally:
+                os.close(slave)
+        except OSError as exc:
+            # Spawn failed (e.g. argv[0] not on PATH): close master here — the
+            # relay/cleanup path below never runs — and detach cleanly.
+            os.close(master)
+            return f"spawn-failed: {exc}"
         self.process = process
 
         loop = asyncio.get_running_loop()
@@ -263,21 +286,20 @@ class PtyBridge:
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(process.pid, signal.SIGHUP)
-            if cancelled:
-                # No grace window is possible without awaiting: escalate now.
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.killpg(process.pid, signal.SIGKILL)
-            else:
+            # Give a grace window only when we may still await — a cancelled
+            # task cannot (level-based cancellation re-raises on every await).
+            if not cancelled:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(process.wait(), timeout=10)
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.killpg(process.pid, signal.SIGKILL)
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
         return reason
 
 
-async def bridge(websocket: WebSocket, argv: list[str], **bounds) -> str:
+async def bridge(websocket: WebSocket, argv: list[str]) -> str:
     """Relay one attach argv's PTY over an accepted websocket; returns the
-    detach reason (``process-exited`` | ``client-closed`` | ``stalled``)."""
-    return await PtyBridge(websocket, argv, **bounds).run()
+    detach reason (``process-exited`` | ``client-closed`` | ``stalled`` |
+    ``spawn-failed``). Tests exercising the resource bounds construct
+    ``PtyBridge`` directly with explicit limits."""
+    return await PtyBridge(websocket, argv).run()

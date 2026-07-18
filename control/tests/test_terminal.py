@@ -51,6 +51,22 @@ def test_hostile_container_names_are_rejected():
             render_attach_argv(TEMPLATE, host="box1", container=name)
 
 
+def test_placeholder_sets_stay_in_lockstep():
+    """The parser's rejection set and the renderer's substitution set share
+    named constants — a new placeholder can't be added to one alone."""
+    from theozolith_control.configrepo import (
+        ATTACH_CONTAINER,
+        ATTACH_HOST,
+        ATTACH_PLACEHOLDERS,
+    )
+
+    argv = render_attach_argv(
+        (ATTACH_HOST, ATTACH_CONTAINER), host="box1", container="ozolith-run-r1"
+    )
+    assert argv == ["box1", "ozolith-run-r1"]
+    assert set(ATTACH_PLACEHOLDERS) == {ATTACH_HOST, ATTACH_CONTAINER}
+
+
 def test_hostile_host_names_are_rejected():
     hostile = ["box1;x", "-box", "box 1", "box_1", "box$(x)", "box..lan", "box1-", "", "a" * 254]
     for host in hostile:
@@ -73,6 +89,24 @@ class StuckSocket:
     async def receive(self) -> dict:
         await asyncio.Event().wait()
         return {}
+
+
+class ScriptedSocket:
+    """A client that sends a fixed list of frames, then hangs up."""
+
+    def __init__(self, frames: list[dict]):
+        self._frames = list(frames)
+        self.received = bytearray()
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.received += data
+        await asyncio.sleep(0)
+
+    async def receive(self) -> dict:
+        if self._frames:
+            await asyncio.sleep(0)
+            return self._frames.pop(0)
+        return {"type": "websocket.disconnect"}
 
 
 class CollectingSocket:
@@ -121,3 +155,28 @@ def test_backpressure_resumes_without_losing_output():
     assert reason == "process-exited"
     assert len(socket.received) == total
     assert bridge.max_buffered <= 16_384 + READ_CHUNK
+
+
+# -- teardown/robustness ---------------------------------------------------------
+
+
+def test_out_of_range_resize_does_not_kill_the_session():
+    """A hostile/fat-fingered resize (cols past ushort range) must clamp,
+    not raise struct.error and tear the session down. Without the clamp,
+    the socket pump dies with an 'error: ...' reason on the bad frame."""
+    socket = ScriptedSocket([{"text": '{"resize": {"cols": 100000, "rows": -5}}'}])
+    bridge = PtyBridge(socket, ["sh", "-c", "sleep 0.3"])
+    reason = asyncio.run(bridge.run())
+    # The client hangs up right after the resize; the pump survived it.
+    assert reason == "client-closed"
+    assert not reason.startswith("error")
+
+
+def test_spawn_failure_detaches_cleanly_without_leaking_the_master():
+    """A missing attach binary returns a spawn-failed reason (master fd
+    closed on the failure path, not leaked)."""
+    socket = ScriptedSocket([])
+    bridge = PtyBridge(socket, ["this-binary-does-not-exist-x7", "arg"])
+    reason = asyncio.run(bridge.run())
+    assert reason.startswith("spawn-failed")
+    assert bridge.process is None

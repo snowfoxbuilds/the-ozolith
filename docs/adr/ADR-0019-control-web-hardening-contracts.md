@@ -31,7 +31,7 @@ The post-merge review of PR #5 (M4: dashboard + web terminal) found security and
 
 ### Browser-origin isolation (acceptance 7)
 
-- The session cookie is **`__Host-ozolith_session`**: Secure, HttpOnly, SameSite=Strict, Path=/, no Domain — browsers refuse it off-host, off-path, or over plaintext.
+- The session cookie is **`__Host-ozolith_session`**: Secure, HttpOnly, SameSite=Strict, Path=/, no Domain — browsers refuse it off-host, off-path, or over plaintext. Whether the cookie is issued Secure/`__Host-` is a per-deployment choice keyed on whether `serve` terminates TLS (production always does); `--insecure-dev` over plain HTTP issues the unprefixed `ozolith_session` name without Secure (a browser drops a Secure/`__Host-` cookie set over http from any non-localhost origin, which would otherwise loop the dev login). A deployment only ever issues and accepts one of the two names, so the production guarantee is never downgraded.
 - With a canonical host configured, **cookie-authenticated** state-changing HTTP requests and websockets must carry exactly the canonical `Host` and `Origin` (one correct spelling each, computed from host + public port); missing or mismatched headers fail closed. The login form is enforced identically (it is exclusively a browser surface). **Bearer-authenticated** callers are non-browser clients and are exempt; bearer wins when both credentials appear, so a scripted client with a stray cookie jar never trips the browser contract.
 
 ### Per-deployment TLS (acceptance 9)
@@ -41,8 +41,8 @@ The post-merge review of PR #5 (M4: dashboard + web terminal) found security and
 ### PTY resource bounds (acceptances 10–12)
 
 - PTY output buffers at most **512 KiB** per session; past high-water the bridge stops reading the master fd, letting the kernel PTY buffer fill and block the attach process (true backpressure, bounded memory); reads resume below **64 KiB**.
-- A websocket send that cannot complete within **30s** declares the client dead: the bridge kills the **attach process group only** (SIGHUP, 10s, SIGKILL) — the Run container and its tmux session survive — and the audit log's detach record carries the reason (`process-exited` | `client-closed` | `stalled` | `error`). Server-side task cancellation (client hang-up) escalates to SIGKILL synchronously, since level-based cancellation forbids further awaits.
-- Concurrent terminal sessions are capped (default **8**, `THEOZOLITH_TERMINAL_SESSION_CAP`); an over-cap connect closes with 4429 before target resolution and launches no process. Close codes: 4401 auth, 4403 origin, 4404 target, 4429 capacity.
+- A websocket send that cannot complete within **30s** declares the client dead: the bridge kills the **attach process group only** (SIGHUP, 10s, SIGKILL) — the Run container and its tmux session survive — and the audit log's detach record carries the reason (`process-exited` | `client-closed` | `stalled` | `spawn-failed` | `error`). Server-side task cancellation (client hang-up) escalates to SIGKILL synchronously, since level-based cancellation forbids further awaits. A failed spawn (e.g. a misconfigured attach binary) closes the PTY master and detaches cleanly rather than leaking the fd; resize frames are clamped to the `unsigned short` `TIOCSWINSZ` range so a malformed value cannot tear the session down.
+- Concurrent terminal sessions are capped (default **8**, `THEOZOLITH_TERMINAL_SESSION_CAP`); the slot is reserved in one synchronous critical section (check-then-increment with no intervening await) so concurrent connects cannot all pass the cap, and an over-cap connect closes with 4429 before target resolution and launches no process. Close codes: 4401 auth, 4403 origin, 4404 target, 4429 capacity.
 
 ### Best-effort live-Worker evidence (acceptances 13–14)
 
@@ -50,7 +50,7 @@ The post-merge review of PR #5 (M4: dashboard + web terminal) found security and
 
 ### Per-Stack jobs directories (acceptances 15–17)
 
-- The Node Daemon injects `THEOZOLITH_JOBS_DIR=<base>/<stack-name>` (base `/var/tmp/theozolith/jobs`) into every process Stack; an explicit env value in the Stack definition wins. The queue-behind in-flight signal reads the same resolution, so a targeted recycle observes only the target driver's Runs and a node-wide update waits on each live driver's active Run — dead drivers and `-pending` parking never block.
+- The Node Daemon injects `THEOZOLITH_JOBS_DIR=<base>/<stack-name>` (base `/var/tmp/theozolith/jobs`) into every process Stack; an explicit env value in the Stack definition wins. The driver's own default resolves the same way (`<base>/<stack>`), so the daemon-less dev shape (no injection) keeps worker and reviewer separate too. The queue-behind in-flight signal reads the same resolution, so a targeted recycle observes only the target driver's Runs and a node-wide update waits on each live driver's active Run — dead drivers and `-pending` parking never block.
 - The Config Repo rejects duplicate resolved jobs-directory paths per node, including a path landing on another Stack's `-pending` sibling (normalized comparison). The same path on different nodes is legal (different filesystems).
 
 ## Consequences

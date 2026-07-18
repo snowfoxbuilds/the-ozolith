@@ -7,11 +7,18 @@ second credential exists — and mints a signed session cookie: an expiry
 timestamp HMAC'd with a per-process random key, so sessions are stateless,
 tamper-evident, and die with a Control Node restart (re-login is one paste).
 
-The cookie is host-only ``__Host-ozolith_session`` — Secure, HttpOnly,
-SameSite=Strict, Path=/ (the ``__Host-`` prefix makes browsers refuse it
-from any other origin or path). API-style callers may present the admin
-bearer token instead — same credential, same rights, and no browser-origin
-checks: only cookie-authenticated requests are browser-shaped.
+Over TLS (production) the cookie is host-only ``__Host-ozolith_session`` —
+Secure, HttpOnly, SameSite=Strict, Path=/ (the ``__Host-`` prefix makes
+browsers refuse it from any other origin or path). ``--insecure-dev`` serves
+plain HTTP, where browsers reject a Secure/``__Host-`` cookie from any
+non-localhost origin; there the session uses the unprefixed
+``ozolith_session`` name without Secure, so the dev dashboard authenticates
+over http. This is a per-deployment choice (``secure_cookies``, from whether
+``serve`` terminates TLS), not per-request: a production deployment only ever
+issues and accepts the ``__Host-`` cookie, so its guarantee is never
+downgraded. API-style callers may present the admin bearer token instead —
+same credential, same rights, and no browser-origin checks: only
+cookie-authenticated requests are browser-shaped.
 
 ``BrowserGuard`` enforces the M5 origin contract: with a canonical origin
 configured (mandatory in production, see origin.py), cookie-authenticated
@@ -29,8 +36,13 @@ from collections.abc import Callable
 
 from fastapi import Request, WebSocket
 
-SESSION_COOKIE = "__Host-ozolith_session"
+SESSION_COOKIE = "__Host-ozolith_session"  # over TLS
+DEV_SESSION_COOKIE = "ozolith_session"  # --insecure-dev over plain HTTP
 SESSION_TTL_SECONDS = 12 * 3600.0
+
+
+def session_cookie_name(secure: bool) -> str:
+    return SESSION_COOKIE if secure else DEV_SESSION_COOKIE
 
 
 class AdminSessions:
@@ -40,12 +52,26 @@ class AdminSessions:
         *,
         clock: Callable[[], float] = time.time,
         ttl_seconds: float = SESSION_TTL_SECONDS,
+        secure_cookies: bool = True,
     ):
         self._admin_token = admin_token
         self._clock = clock
         self._ttl = ttl_seconds
+        # A deployment is uniformly TLS (production) or not (--insecure-dev);
+        # that decides the session cookie's name and Secure flag once, not
+        # per request. The __Host- name requires Secure, which requires TLS.
+        self._secure = secure_cookies
+        self._cookie_name = session_cookie_name(secure_cookies)
         # Per-process: sessions are deliberately not durable (ADR-0018).
         self._key = secrets.token_bytes(32)
+
+    @property
+    def cookie_name(self) -> str:
+        return self._cookie_name
+
+    @property
+    def secure(self) -> bool:
+        return self._secure
 
     def _sign(self, expires: str) -> str:
         return hmac.new(self._key, expires.encode(), "sha256").hexdigest()
@@ -73,10 +99,12 @@ class AdminSessions:
         """How this request is authorized: ``"bearer"`` (non-browser client,
         exempt from origin checks), ``"cookie"`` (browser), or None.
         Bearer wins so a scripted client with a stray cookie jar never
-        trips the browser-only origin contract."""
+        trips the browser-only origin contract. The session cookie is read
+        under the name its own scheme sets — ``__Host-`` over TLS, the
+        unprefixed dev name over plain HTTP — never both."""
         if self._bearer_valid(request.headers.get("authorization", "")):
             return "bearer"
-        if self._cookie_valid(request.cookies.get(SESSION_COOKIE)):
+        if self._cookie_valid(request.cookies.get(self._cookie_name)):
             return "cookie"
         return None
 

@@ -51,6 +51,17 @@ def pending_dir(config: DriverConfig) -> Path:
     return jobs.with_name(jobs.name + "-pending")
 
 
+def park_job_dir(config: DriverConfig, job: Path) -> Path:
+    """Move a retained job dir into the parking sibling (same filesystem,
+    so the rename is atomic); returns the parked path. The one mover, shared
+    by the runner's post-Run retention and this sweep's failed-push retry."""
+    parking = pending_dir(config)
+    parking.mkdir(parents=True, exist_ok=True)
+    target = parking / job.name
+    job.rename(target)
+    return target
+
+
 def owned_by(config: DriverConfig, name: str) -> bool:
     """Is this job directory this driver's to sweep? Run dirs carry the
     worker id inside the run_id; review workspaces belong to the Reviewer."""
@@ -147,8 +158,7 @@ def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int
             log(f"evidence sweep: push failed for {job.name} (kept for retry): {exc}")
             if job.parent != parking:
                 try:
-                    parking.mkdir(parents=True, exist_ok=True)
-                    job.rename(parking / job.name)
+                    park_job_dir(config, job)
                 except OSError as move_error:
                     log(f"evidence sweep: could not park {job.name}: {move_error}")
             continue

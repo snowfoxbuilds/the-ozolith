@@ -148,7 +148,9 @@ def _serve(args) -> int:
                 " canonical origin (run 'theozolith-control origin-init';"
                 " --insecure-dev for local dev only)"
             ) from exc
-    settings = dataclasses.replace(settings, secrets_channel_ok=True, public_port=args.port)
+    settings = dataclasses.replace(
+        settings, secrets_channel_ok=True, public_port=args.port, serve_tls=tls
+    )
     store = Store(settings.db_path)
     box = SecretBox(
         env_value(os.environ, "THEOZOLITH_MASTER_KEY") or ensure_key_file(settings.key_path)

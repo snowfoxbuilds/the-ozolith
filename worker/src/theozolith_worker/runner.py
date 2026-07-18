@@ -56,7 +56,7 @@ from theozolith_worker.containers import (
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
 from theozolith_worker.sessions import SessionError, SessionFactory
-from theozolith_worker.sweep import pending_dir
+from theozolith_worker.sweep import park_job_dir
 
 BRANCH_PREFIX = "ozolith/issue-"
 
@@ -326,12 +326,8 @@ def execute_run(
 def _park_for_sweep(config: DriverConfig, job: Path, log) -> Path:
     """Move a retained job dir into the sweep's parking sibling; on failure
     it stays where it is (the sweep scans both places)."""
-    parking = pending_dir(config)
     try:
-        parking.mkdir(parents=True, exist_ok=True)
-        target = parking / job.name
-        job.rename(target)
-        return target
+        return park_job_dir(config, job)
     except OSError as exc:
         log(f"run {job.name}: could not park the job dir for the sweep: {exc}")
         return job

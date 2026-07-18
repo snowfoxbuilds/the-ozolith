@@ -16,21 +16,24 @@ below.
 
    ```sh
    cp deploy/.env.example .env         # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN
-   docker compose --env-file .env -f deploy/compose/control.yml up -d --build
+   # Provision BEFORE the service is healthy (build the image, then two one-shots):
+   docker compose -f deploy/compose/control.yml build
    docker compose -f deploy/compose/control.yml run --rm control \
      origin-init                       # one-time canonical origin (mandatory, ADR-0019)
    docker compose -f deploy/compose/control.yml run --rm control \
      tls-init                          # one-time TLS provisioning (mandatory);
                                        # covers the canonical host; --host adds extras
+   docker compose --env-file .env -f deploy/compose/control.yml up -d
    ```
 
    `origin-init` mints the deployment's one canonical hostname —
    `<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to change) —
-   which production `serve` requires. Give it a **trusted-network-only** DNS record (or
-   hosts entries); the Control Node must have no public ingress path, and browsers must
-   use exactly this name (cookie-authenticated requests from any other Host/Origin are
-   rejected). Restart after tls-init so the server picks up the certificate. Copy
-   `/data/tls/ca.pem` out of the volume — every node pins it.
+   which production `serve` requires: until both one-shots have run, `serve` exits and the
+   container restarts (expected during provisioning). Give the canonical host a
+   **trusted-network-only** DNS record (or hosts entries); the Control Node must have no
+   public ingress path, and browsers must use exactly this name (cookie-authenticated
+   requests from any other Host/Origin are rejected). Copy `/data/tls/ca.pem` out of the
+   volume — every node pins it, and every `CONTROL_NODE_URL` uses the canonical host.
 
 2. **Nodes** (every physical box that should run Stacks):
 

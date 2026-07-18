@@ -59,6 +59,10 @@ class ControlSettings:
     # Concurrent web-terminal sessions; excess connects are refused before
     # any attach process launches (ADR-0019).
     terminal_session_cap: int = 8
+    # True when serve terminates TLS: decides the session cookie's name and
+    # Secure flag (__Host- + Secure over TLS; a plain dev cookie otherwise,
+    # since browsers drop a Secure/__Host- cookie set over http).
+    serve_tls: bool = False
 
     @property
     def db_path(self) -> Path:
