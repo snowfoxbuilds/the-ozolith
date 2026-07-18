@@ -222,7 +222,10 @@ def _tls_init(args) -> int:
             "error: pass --host, or provision the canonical origin first"
             " ('theozolith-control origin-init')"
         )
-    ca, cert, key = provision(settings.tls_dir, hosts)
+    try:
+        ca, cert, key = provision(settings.tls_dir, hosts)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
     _log(f"wrote {ca}, {cert}, {key}")
     _log(f"distribute {ca.name} to every node (install script --ca, or THEOZOLITH_TLS_CA)")
     return 0
