@@ -484,6 +484,24 @@ def test_parked_pending_sibling_never_defers(rig: Rig, tmp_path):
     assert 12 in rig.daemon._completed
 
 
+def test_tombstoned_evidence_never_defers_even_with_a_live_driver(rig: Rig, tmp_path):
+    """The evidence-loss tombstone (a dot-prefixed dir the worker leaves
+    when a completed dir cannot be parked OR deleted, ADR-0019) is never an
+    in-flight Run: a recycle applies immediately over it."""
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / ".evidence-lost-20260721T1400-worker-a-5-cafe0123").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    recycle = {"id": 13, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is not None  # applied immediately, not deferred
+    assert 13 in rig.daemon._completed
+
+
 def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     stack, jobs = _driver_stack(tmp_path)
     (jobs / "r1").mkdir(parents=True)

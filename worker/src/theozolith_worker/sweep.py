@@ -71,6 +71,15 @@ def park_job_dir(config: DriverConfig, job: Path, *, target_name: str | None = N
 # that path).
 _PARKED_SUFFIX_RE = re.compile(r"-parked-[0-9a-f]{8}$")
 
+# Bottom of the runner's parking ladder (ADR-0019): a completed dir whose
+# parking AND removal both failed is renamed in place to this dot-prefixed
+# tombstone form. Dot-prefixed names are never live Runs — the Node
+# Daemon's queue-behind in-flight signal skips them (nodedaemon daemon.py,
+# same rule stated there), and this sweep skips them too: the evidence is
+# declared lost, and re-pushing a gutted, undeletable dir every poll cycle
+# would flap forever.
+TOMBSTONE_PREFIX = ".evidence-lost-"
+
 
 def original_run_id(name: str) -> str:
     return _PARKED_SUFFIX_RE.sub("", name)
@@ -153,7 +162,9 @@ def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int
         for root in (jobs, parking)
         if root.is_dir()
         for entry in sorted(root.iterdir())
-        if entry.is_dir() and owned_by(config, entry.name)
+        if entry.is_dir()
+        and not entry.name.startswith(".")  # tombstones: loss already declared
+        and owned_by(config, entry.name)
     ]
     swept = kept = 0
     swept_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))

@@ -272,7 +272,11 @@ class NodeDaemon:
     def _inflight_blocker(self, names: list[str] | None) -> str | None:
         """The in-flight signal for queue-behind: a live driver child whose
         jobs dir holds a job directory. A dead child never blocks — its
-        orphaned dirs are the boot sweep's business, not a Run."""
+        orphaned dirs are the boot sweep's business, not a Run. Dot-prefixed
+        names are never live Runs (run ids start with a timestamp digit):
+        the driver's evidence-loss tombstone (worker sweep.TOMBSTONE_PREFIX,
+        ADR-0019 parking ladder) renames undeletable remnants to a hidden
+        name exactly so this signal skips them."""
         for stack in self._stacks():
             if names is not None and stack.name not in names:
                 continue
@@ -280,7 +284,11 @@ class NodeDaemon:
                 continue
             jobs_dir = stack_jobs_dir(stack)
             try:
-                running = sorted(p.name for p in jobs_dir.iterdir() if p.is_dir())
+                running = sorted(
+                    p.name
+                    for p in jobs_dir.iterdir()
+                    if p.is_dir() and not p.name.startswith(".")
+                )
             except OSError:
                 running = []
             if running:

@@ -61,7 +61,7 @@ from theozolith_worker.containers import (
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
 from theozolith_worker.sessions import SessionError, SessionFactory
-from theozolith_worker.sweep import park_job_dir, pending_dir
+from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
 BRANCH_PREFIX = "ozolith/issue-"
 
@@ -378,21 +378,39 @@ def _park_for_sweep(config: DriverConfig, job: Path, report: RunReport, log) -> 
             log, "theozolith.evidence-lost", report, job, pending_dir(config) / fallback, exc
         )
     shutil.rmtree(job, ignore_errors=True)
-    if job.exists():
-        # Undeletable remnants (e.g. container-owned files): nothing more
-        # to try without blocking escalation. Say the truth — the dir still
-        # sits in the jobs dir, where the sweep may yet recover it and
-        # queue-behind will defer until an operator clears it.
+    if not job.exists():
+        report.evidence_discarded = True
+        log(
+            f"run {job.name}: parking failed twice — the completed job directory is removed"
+            " unpublished (accepted evidence loss) so queue-behind never mistakes it for an"
+            " active Run"
+        )
+        return
+    # Removal left remnants (e.g. container-owned files the driver cannot
+    # unlink). A tombstone rename WITHIN the jobs dir needs only write
+    # permission on the jobs dir itself, never on the remnants — and the
+    # dot-prefixed form is skipped by both queue-behind's in-flight signal
+    # and the sweep, so it can no longer read as a live Run.
+    tombstone = job.with_name(f"{TOMBSTONE_PREFIX}{job.name}-{secrets.token_hex(4)}")
+    try:
+        job.rename(tombstone)
+    except OSError as exc:
+        # Unwritable jobs dir: the one state with nothing left to try. The
+        # dir stays under its Run name — the sweep may still publish it, so
+        # the comment's retained branch stays truthful — but queue-behind
+        # will defer until an operator clears it. Record exactly that.
+        _park_failure_record(log, "theozolith.evidence-remnants", report, job, tombstone, exc)
         log(
             f"run {job.name}: parking failed twice AND removal left remnants at {job} —"
-            " queue-behind may read it as in-flight until it is cleared"
+            " queue-behind may read it as in-flight until an operator clears it"
         )
         return
     report.evidence_discarded = True
+    shutil.rmtree(tombstone, ignore_errors=True)  # best-effort; the name is inert either way
     log(
-        f"run {job.name}: parking failed twice — the completed job directory is removed"
-        " unpublished (accepted evidence loss) so queue-behind never mistakes it for an"
-        " active Run"
+        f"run {job.name}: parking failed twice and removal left remnants — tombstoned as"
+        f" {tombstone.name} (accepted evidence loss; ignored by queue-behind and the sweep;"
+        " clear it manually)"
     )
 
 
