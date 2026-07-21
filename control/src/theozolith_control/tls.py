@@ -46,6 +46,11 @@ def provision(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
     """Mint a CA and a server cert for ``hosts``; returns (ca, cert, key)."""
     if not hosts:
         raise ValueError("at least one --host (DNS name or IP) is required")
+    for host in hosts:
+        if "*" in host:
+            # Per-deployment TLS identity (ADR-0019): a wildcard key shared
+            # across deployments would make any one compromise fleet-wide.
+            raise ValueError(f"wildcard host {host!r} refused — one TLS identity per deployment")
     now = datetime.datetime.now(datetime.UTC)
     not_before = now - datetime.timedelta(minutes=5)
     not_after = now + datetime.timedelta(days=_VALID_DAYS)

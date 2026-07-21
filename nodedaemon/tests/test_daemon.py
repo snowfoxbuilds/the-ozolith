@@ -463,6 +463,45 @@ def test_dead_driver_child_never_defers(rig: Rig, tmp_path):
     assert 10 in rig.daemon._completed  # executed, not deferred
 
 
+def test_parked_pending_sibling_never_defers(rig: Rig, tmp_path):
+    """Evidence parked in the <jobs>-pending sibling (plain or
+    collision-suffixed names, M5) is never an in-flight Run: with the jobs
+    dir itself empty, a recycle applies immediately."""
+    stack, jobs = _driver_stack(tmp_path)
+    jobs.mkdir(parents=True)
+    pending = jobs.with_name(jobs.name + "-pending")
+    (pending / "20260721T1200-worker-a-1").mkdir(parents=True)
+    (pending / "20260721T1300-worker-a-3-parked-deadbeef").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    recycle = {"id": 12, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is not None  # applied immediately, not deferred
+    assert 12 in rig.daemon._completed
+
+
+def test_tombstoned_evidence_never_defers_even_with_a_live_driver(rig: Rig, tmp_path):
+    """The evidence-loss tombstone (a dot-prefixed dir the worker leaves
+    when a completed dir cannot be parked OR deleted, ADR-0019) is never an
+    in-flight Run: a recycle applies immediately over it."""
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / ".evidence-lost-20260721T1400-worker-a-5-cafe0123").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    recycle = {"id": 13, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is not None  # applied immediately, not deferred
+    assert 13 in rig.daemon._completed
+
+
 def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     stack, jobs = _driver_stack(tmp_path)
     (jobs / "r1").mkdir(parents=True)
@@ -509,3 +548,93 @@ def test_a_deferred_command_blocks_later_commands_in_the_queue(rig: Rig, tmp_pat
     rig.daemon.once()
     assert rig.daemon._completed == [20, 21]
     assert not rig.daemon._supervisor.alive("worker")
+
+
+# -- per-Stack jobs directories (ADR-0019) ---------------------------------------
+
+
+def test_process_stacks_get_dedicated_injected_jobs_dirs(rig: Rig):
+    """Every process Stack receives its own THEOZOLITH_JOBS_DIR by default;
+    an explicit env value wins."""
+    explicit = process_stack("reviewer", env={"THEOZOLITH_JOBS_DIR": "/srv/jobs/custom"})
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker"), explicit]))
+    rig.daemon.once()
+
+    by_name = {p.args[0]: p.env for p in rig.popen.spawned}
+    assert by_name["worker-driver"]["THEOZOLITH_JOBS_DIR"] == "/var/tmp/theozolith/jobs/worker"
+    assert by_name["reviewer-driver"]["THEOZOLITH_JOBS_DIR"] == "/srv/jobs/custom"
+
+
+def test_targeted_recycle_ignores_another_stacks_run(rig: Rig, tmp_path):
+    """Acceptance 16: the reviewer's active Run must not defer a recycle
+    aimed at the worker — each Stack's jobs dir is its own in-flight
+    signal — while the worker's own Run still does."""
+    worker = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs-worker")})
+    reviewer = process_stack(
+        "reviewer", env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs-reviewer")}
+    )
+    (tmp_path / "jobs-reviewer" / "review-77-round-1").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer]))
+    rig.daemon.once()
+
+    recycle = {"id": 30, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[recycle]))
+    rig.daemon.once()
+    assert 30 in rig.daemon._completed  # applied immediately, not deferred
+
+    (tmp_path / "jobs-worker" / "r-own").mkdir(parents=True)
+    own = {"id": 31, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[own]))
+    rig.daemon.once()
+    assert 31 not in rig.daemon._completed  # its own Run defers it
+    assert rig.daemon._deferrals[31].startswith("behind run r-own")
+
+
+def test_node_wide_update_waits_for_every_live_stack_but_not_parked_dirs(rig: Rig, tmp_path):
+    """Acceptance 17: an update waits on each live Stack's active Run in
+    turn; pending-evidence parking (the -pending sibling) and dead drivers
+    never block it."""
+    worker = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs-worker")})
+    reviewer = process_stack(
+        "reviewer", env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs-reviewer")}
+    )
+    (tmp_path / "jobs-worker" / "r1").mkdir(parents=True)
+    (tmp_path / "jobs-reviewer" / "review-9-round-1").mkdir(parents=True)
+    # Retained evidence parked by the drivers: never an in-flight signal.
+    (tmp_path / "jobs-worker-pending" / "r-old").mkdir(parents=True)
+    (tmp_path / "jobs-reviewer-pending" / "review-old").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer]))
+    rig.daemon.once()
+
+    import shutil
+
+    update = {"id": 40, "verb": "update", "target": None, "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls == []  # the worker's Run defers it
+
+    shutil.rmtree(tmp_path / "jobs-worker" / "r1")
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls == []  # …then the reviewer's Run defers it
+
+    shutil.rmtree(tmp_path / "jobs-reviewer" / "review-9-round-1")
+    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls and rig.execv_calls  # parked dirs never blocked
+
+
+def test_dead_drivers_run_dir_never_blocks_node_wide_update(rig: Rig, tmp_path):
+    stack, jobs = _driver_stack(tmp_path)
+    (jobs / "r-orphan").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    rig.popen.spawned[0].returncode = 0  # the driver died on its own
+
+    update = {"id": 41, "verb": "update", "target": None, "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.daemon.once()
+    assert rig.update_calls and rig.execv_calls  # orphaned dir never deferred

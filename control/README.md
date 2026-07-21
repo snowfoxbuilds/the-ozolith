@@ -28,17 +28,21 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
 - **Secret store** — values entered once via `theozolith-control secret set` or the
   dashboard's web form (both write through the same store), encrypted at rest (Fernet,
   file-held master key), pull-only and node-scoped, TLS mandatory, never displayed.
-- **Dashboard + web terminal** (M4, ADR-0018) — read-only fleet view (Jinja + HTMX
-  polling, no build step) and a PTY-bridge terminal running each Stack's config-supplied
-  `attach` command against live run containers, audit-logged to
-  `<data>/terminal-audit.log`. One admin credential fronts all of it.
+- **Dashboard + web terminal** (M4, ADR-0018; hardened by ADR-0019) — read-only fleet
+  view (Jinja + HTMX polling, no build step) and a PTY-bridge terminal running each
+  Stack's config-supplied `attach` argv against live run containers (target and owner
+  derived server-side from fresh heartbeats; identifiers validated; output bounded),
+  audit-logged to `<data>/terminal-audit.log`. One admin credential fronts all of it,
+  behind a randomized public origin with exact Host/Origin enforcement (derived from
+  the origin URL alone — independent of the Uvicorn bind host/port).
 
 Availability (ADR-0017): with this service down, in-flight Runs finish and publish;
 new claims and review rounds pause. Drivers hold their own PATs for all non-claim
 GitHub writes.
 
 ```sh
-theozolith-control tls-init --host controlnode.lan   # once
+theozolith-control origin-init                       # once: mint the public origin (ADR-0019)
+theozolith-control tls-init                          # once: TLS covering the origin's hostname
 theozolith-control serve                             # the service (+ dashboard)
 theozolith-control secret set github-worker          # operator entry
 theozolith-control command recycle --node box1 --target worker   # queues behind a Run

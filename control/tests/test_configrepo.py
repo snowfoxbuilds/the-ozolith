@@ -125,3 +125,99 @@ def test_wire_stack_roundtrips_into_the_daemon_model(tmp_path):
     assert stack.command == "theozolith-worker --once"
     assert stack.env == {"A": "1"} and stack.secrets == {"T": "name"}
     assert stack.state == "running"
+
+
+# -- attach argv + jobs-dir uniqueness (ADR-0019) --------------------------------
+
+
+def test_attach_must_be_an_argv_array(tmp_path):
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        'attach = "ssh {host} -t docker exec -it {container} tmux attach"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="argv array"):
+        load_config(tmp_path)
+
+
+def test_attach_placeholders_only_as_complete_arguments(tmp_path):
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        'attach = ["ssh", "user@{host}", "tmux", "attach"]\n',
+    )
+    with pytest.raises(ConfigRepoError, match="complete arguments"):
+        load_config(tmp_path)
+
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        'attach = ["docker", "exec", "-it", "c-{container}", "sh"]\n',
+    )
+    with pytest.raises(ConfigRepoError, match="complete arguments"):
+        load_config(tmp_path)
+
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\nattach = ["ssh", "{host}", "-t",'
+        ' "docker", "exec", "-it", "{container}", "tmux", "attach"]\n',
+    )
+    stack = load_config(tmp_path).stacks[0]
+    assert stack.attach[1] == "{host}" and stack.attach[6] == "{container}"
+
+
+def test_duplicate_resolved_jobs_dirs_are_rejected_per_node(tmp_path):
+    """Acceptance 15: two process Stacks on one node may not share a
+    resolved jobs directory — including via the -pending parking sibling."""
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        '[env]\nTHEOZOLITH_JOBS_DIR = "/srv/jobs/shared/"\n',
+    )
+    write(
+        tmp_path,
+        "stacks/reviewer.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "r"\n'
+        '[env]\nTHEOZOLITH_JOBS_DIR = "/srv/jobs/shared"\n',  # same after normalization
+    )
+    with pytest.raises(ConfigRepoError, match="collides"):
+        load_config(tmp_path)
+
+    # A jobs dir that lands on another Stack's parking sibling collides too.
+    write(
+        tmp_path,
+        "stacks/reviewer.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "r"\n'
+        '[env]\nTHEOZOLITH_JOBS_DIR = "/srv/jobs/shared-pending"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="collides"):
+        load_config(tmp_path)
+
+    # The same path on DIFFERENT nodes is two different filesystems: legal.
+    write(
+        tmp_path,
+        "stacks/reviewer.toml",
+        'kind = "process"\nnode = "box2"\ncommand = "r"\n'
+        '[env]\nTHEOZOLITH_JOBS_DIR = "/srv/jobs/shared"\n',
+    )
+    assert len(load_config(tmp_path).stacks) == 2
+
+
+def test_default_jobs_dirs_are_per_stack_and_unique(tmp_path):
+    """Two driver Stacks with no explicit jobs dir resolve to distinct
+    per-Stack defaults (the daemon injects the same paths)."""
+    from theozolith_control.configrepo import resolved_jobs_dir
+
+    write(tmp_path, "stacks/worker.toml", 'kind = "process"\nnode = "box1"\ncommand = "w"\n')
+    write(tmp_path, "stacks/reviewer.toml", 'kind = "process"\nnode = "box1"\ncommand = "r"\n')
+    config = load_config(tmp_path)
+    resolved = {resolved_jobs_dir(s) for s in config.stacks}
+    assert resolved == {
+        "/var/tmp/theozolith/jobs/worker",
+        "/var/tmp/theozolith/jobs/reviewer",
+    }

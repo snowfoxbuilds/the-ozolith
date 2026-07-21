@@ -16,19 +16,36 @@ below.
 
    ```sh
    cp deploy/.env.example .env         # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN
-   docker compose --env-file .env -f deploy/compose/control.yml up -d --build
+   # Provision BEFORE the service is healthy (build the image, then two one-shots):
+   docker compose -f deploy/compose/control.yml build
    docker compose -f deploy/compose/control.yml run --rm control \
-     tls-init --host <LAN name or IP>  # one-time TLS provisioning (mandatory)
+     origin-init                       # one-time public origin (mandatory, ADR-0019)
+   docker compose -f deploy/compose/control.yml run --rm control \
+     tls-init                          # one-time TLS provisioning (mandatory); covers
+                                       # the origin's hostname; --host adds extras
+   docker compose --env-file .env -f deploy/compose/control.yml up -d
    ```
 
-   Restart after tls-init so the server picks up the certificate. Copy `/data/tls/ca.pem`
-   out of the volume — every node pins it.
+   `origin-init` mints the deployment's one public origin —
+   `https://<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to
+   change; `--port` only when browsers dial a nonstandard *external* port) — which
+   production `serve` requires: until both one-shots have run, `serve` exits and the
+   container restarts (expected during provisioning). The origin is independent of the
+   Uvicorn bind (`serve --host/--port`): the reference compose publishes external 443
+   onto the container's 8443 bind, so the origin carries no port, and remapping the bind
+   never changes the accepted browser `Host`/`Origin`. Give the origin's hostname a
+   **trusted-network-only** DNS record (or hosts entries); the Control Node must have no
+   public ingress path, and browsers must use exactly this origin (cookie-authenticated
+   requests from any other Host/Origin are rejected). Experts may instead supply
+   `THEOZOLITH_PUBLIC_ORIGIN` (format-checked only — the operator owns slug entropy;
+   see `.env.example`). Copy `/data/tls/ca.pem` out of the volume — every node pins it,
+   and every `CONTROL_NODE_URL` uses the origin's hostname.
 
 2. **Nodes** (every physical box that should run Stacks):
 
    ```sh
    sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
-     --control-url https://<control-host>:8443 --ca ca.pem
+     --control-url https://<slug>.theozolith.internal --ca ca.pem
    ```
 
    The installer creates the `ozolith` user, a venv at `/opt/theozolith` (daemon +
@@ -44,7 +61,7 @@ below.
 4. **Secrets**: enter values once —
 
    ```sh
-   CONTROL_NODE_URL=https://<control-host>:8443 THEOZOLITH_ADMIN_TOKEN=... \
+   CONTROL_NODE_URL=https://<slug>.theozolith.internal THEOZOLITH_ADMIN_TOKEN=... \
      theozolith-control secret set github-worker --ca ca.pem
    ```
 
@@ -71,8 +88,9 @@ below.
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
    (same origin as the API, behind the admin credential) is the read-only fleet view
    plus secret entry and the web terminal: to expose a Stack's live run containers to
-   the terminal, give it an `attach` command in the Config Repo (see
-   `deploy/configs-example/stacks/worker.toml`).
+   the terminal, give it an `attach` argv array in the Config Repo (see
+   `deploy/configs-example/stacks/worker.toml`; free-form command strings are rejected,
+   ADR-0019).
 
    The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence

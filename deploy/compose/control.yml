@@ -2,20 +2,26 @@
 # Run it directly for bootstrap (the Control Node must exist before any node
 # can reconcile Stacks), or declare it in the Config Repo like any Stack.
 #
-# From the repo root:
+# One-time provisioning (BEFORE the long-running service is healthy — until
+# it is done, `serve` exits and the container restarts; that is expected):
 #
-#   docker compose -f deploy/compose/control.yml up -d
+#   docker compose -f deploy/compose/control.yml run --rm control origin-init
+#     # mints the mandatory public origin (ADR-0019): one randomized
+#     # https://<slug>.theozolith.internal origin (--base-domain to change;
+#     # --port only for a nonstandard EXTERNAL port). Give its hostname a
+#     # trusted-network-only DNS record; production serve requires the origin.
+#   docker compose -f deploy/compose/control.yml run --rm control tls-init
+#     # TLS is mandatory (secrets transit this channel); tls-init covers the
+#     # public origin's hostname automatically. `--host <LAN name or IP>` adds
+#     # extras.
 #
-# One-time TLS provisioning (mandatory — secrets transit this channel):
+# then start it and distribute the minted CA:
 #
-#   docker compose -f deploy/compose/control.yml run --rm control \
-#     tls-init --host <LAN name or IP of this box>
-#
-# then distribute the minted CA:  docker compose ... cp control:/data/tls/ca.pem .
+#   docker compose --env-file .env -f deploy/compose/control.yml up -d
+#   docker compose -f deploy/compose/control.yml cp control:/data/tls/ca.pem .
 # (install-nodedaemon.sh --ca ca.pem pins it on every node).
 #
-# Configuration comes from the environment (see deploy/.env.example):
-#   docker compose --env-file .env -f deploy/compose/control.yml up -d
+# Configuration comes from the environment (see deploy/.env.example).
 
 services:
   control:
@@ -25,7 +31,11 @@ services:
     image: theozolith-control:local
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      # External 443 (the https default — the public origin then carries no
+      # port) mapped onto the container's Uvicorn bind (serve --port, 8443).
+      # The two are independent: remapping the bind side never changes the
+      # accepted browser Host/Origin — only the origin artifact does.
+      - "443:8443"
     environment:
       THEOZOLITH_NODE_TOKEN: ${THEOZOLITH_NODE_TOKEN:?set in .env}
       THEOZOLITH_ADMIN_TOKEN: ${THEOZOLITH_ADMIN_TOKEN:?set in .env}

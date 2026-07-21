@@ -333,6 +333,7 @@ def test_claim_escalation_comment_carries_both_failures():
             phase="failed",
             reason="agent session timed out",
             failure_class="timeout",
+            evidence_pushed=True,
         ),
         RunReport(
             run_id="r-2",
@@ -341,6 +342,7 @@ def test_claim_escalation_comment_carries_both_failures():
             phase="failed",
             reason="run container exited early",
             failure_class="harness",
+            evidence_pushed=True,
         ),
     ]
     body = render_claim_escalation("acme/sandbox", 7, reports)
@@ -354,3 +356,34 @@ def test_claim_escalation_comment_carries_both_failures():
     assert "removing `failed` and restoring `plan_ready`" in body
     # Forensics, never machine state: no marker comment survives ADR-0016.
     assert "<!--" not in body
+
+
+def test_claim_escalation_names_unpushed_bundles_without_dead_links():
+    """ADR-0019 acceptance 13: an exhausted evidence push never blocks the
+    escalation and never produces a dead link — the comment names the
+    bundle path the boot sweep will publish to, as text."""
+    reports = [
+        RunReport(
+            run_id="r-1",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="agent session timed out",
+            failure_class="timeout",
+            evidence_pushed=True,
+        ),
+        RunReport(
+            run_id="r-2",
+            issue=7,
+            round=1,
+            phase="failed",
+            reason="evidence remote was down",
+            failure_class="harness",
+            evidence_pushed=False,
+        ),
+    ]
+    body = render_claim_escalation("acme/sandbox", 7, reports)
+    assert "tree/theozolith/evidence/runs/issue-7/r-1" in body  # the landed bundle links
+    assert "tree/theozolith/evidence/runs/issue-7/r-2" not in body  # no dead link
+    assert "runs/issue-7/r-2" in body  # …but the bundle is still named
+    assert "not yet published" in body and "boot-sweep recovery" in body

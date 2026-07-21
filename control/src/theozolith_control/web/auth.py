@@ -1,4 +1,4 @@
-"""Admin session mechanics (ADR-0018).
+"""Admin session mechanics (ADR-0018) and browser-origin isolation (ADR-0019).
 
 One admin credential fronts the dashboard, the secret form, and the
 terminal (NODE-SUBSTRATE trust model: dashboard access = cluster access,
@@ -7,9 +7,25 @@ second credential exists — and mints a signed session cookie: an expiry
 timestamp HMAC'd with a per-process random key, so sessions are stateless,
 tamper-evident, and die with a Control Node restart (re-login is one paste).
 
-The cookie is HttpOnly + SameSite=Strict (the CSRF story for the two POST
-forms) and Secure whenever the request arrived over TLS. API-style callers
-may present the admin bearer token instead — same credential, same rights.
+Over TLS (production) the cookie is host-only ``__Host-ozolith_session`` —
+Secure, HttpOnly, SameSite=Strict, Path=/ (the ``__Host-`` prefix makes
+browsers refuse it from any other origin or path). ``--insecure-dev`` serves
+plain HTTP, where browsers reject a Secure/``__Host-`` cookie from any
+non-localhost origin; there the session uses the unprefixed
+``ozolith_session`` name without Secure, so the dev dashboard authenticates
+over http. This is a per-deployment choice (``secure_cookies``, from whether
+``serve`` terminates TLS), not per-request: a production deployment only ever
+issues and accepts the ``__Host-`` cookie, so its guarantee is never
+downgraded. API-style callers may present the admin bearer token instead —
+same credential, same rights, and no browser-origin checks: only
+cookie-authenticated requests are browser-shaped.
+
+``BrowserGuard`` enforces the M5 origin contract: with a public origin
+configured (mandatory in production, see origin.py), cookie-authenticated
+state-changing requests and websockets must carry exactly the ``Host`` and
+``Origin`` derived from the parsed public-origin URL — a browser on any
+other origin (DNS rebinding, a lured click) fails closed before any
+handler runs.
 """
 
 from __future__ import annotations
@@ -21,8 +37,15 @@ from collections.abc import Callable
 
 from fastapi import Request, WebSocket
 
-SESSION_COOKIE = "ozolith_session"
+from theozolith_control.origin import PublicOrigin
+
+SESSION_COOKIE = "__Host-ozolith_session"  # over TLS
+DEV_SESSION_COOKIE = "ozolith_session"  # --insecure-dev over plain HTTP
 SESSION_TTL_SECONDS = 12 * 3600.0
+
+
+def session_cookie_name(secure: bool) -> str:
+    return SESSION_COOKIE if secure else DEV_SESSION_COOKIE
 
 
 class AdminSessions:
@@ -32,12 +55,26 @@ class AdminSessions:
         *,
         clock: Callable[[], float] = time.time,
         ttl_seconds: float = SESSION_TTL_SECONDS,
+        secure_cookies: bool = True,
     ):
         self._admin_token = admin_token
         self._clock = clock
         self._ttl = ttl_seconds
+        # A deployment is uniformly TLS (production) or not (--insecure-dev);
+        # that decides the session cookie's name and Secure flag once, not
+        # per request. The __Host- name requires Secure, which requires TLS.
+        self._secure = secure_cookies
+        self._cookie_name = session_cookie_name(secure_cookies)
         # Per-process: sessions are deliberately not durable (ADR-0018).
         self._key = secrets.token_bytes(32)
+
+    @property
+    def cookie_name(self) -> str:
+        return self._cookie_name
+
+    @property
+    def secure(self) -> bool:
+        return self._secure
 
     def _sign(self, expires: str) -> str:
         return hmac.new(self._key, expires.encode(), "sha256").hexdigest()
@@ -61,7 +98,53 @@ class AdminSessions:
         scheme, _, token = header.partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), self._admin_token)
 
+    def auth_mode(self, request: Request | WebSocket) -> str | None:
+        """How this request is authorized: ``"bearer"`` (non-browser client,
+        exempt from origin checks), ``"cookie"`` (browser), or None.
+        Bearer wins so a scripted client with a stray cookie jar never
+        trips the browser-only origin contract. The session cookie is read
+        under the name its own scheme sets — ``__Host-`` over TLS, the
+        unprefixed dev name over plain HTTP — never both."""
+        if self._bearer_valid(request.headers.get("authorization", "")):
+            return "bearer"
+        if self._cookie_valid(request.cookies.get(self._cookie_name)):
+            return "cookie"
+        return None
+
     def authorized(self, request: Request | WebSocket) -> bool:
-        return self._cookie_valid(request.cookies.get(SESSION_COOKIE)) or self._bearer_valid(
-            request.headers.get("authorization", "")
+        return self.auth_mode(request) is not None
+
+
+class BrowserGuard:
+    """Exact-match Host and Origin enforcement for browser-shaped requests.
+
+    Armed only when a public origin is configured (production always is;
+    ``--insecure-dev`` may run bare). The expected values derive from the
+    parsed public-origin URL alone — never from the Uvicorn bind host or
+    port, so changing ``serve --port`` cannot silently change what is
+    accepted. Browsers omit the default https port (443) and include any
+    other, so exactly one Host and one Origin spelling is correct for a
+    given deployment."""
+
+    def __init__(self, public_origin: PublicOrigin | None):
+        self._armed = public_origin is not None
+        self._host = public_origin.host_header if public_origin else ""
+        self._origin = public_origin.origin if public_origin else ""
+
+    @property
+    def expected_host(self) -> str:
+        return self._host
+
+    @property
+    def expected_origin(self) -> str:
+        return self._origin
+
+    def ok(self, request: Request | WebSocket) -> bool:
+        """True when the request carries exactly the expected Host and
+        Origin (or the guard is unarmed). Missing headers fail."""
+        if not self._armed:
+            return True
+        return (
+            request.headers.get("host", "") == self._host
+            and request.headers.get("origin", "") == self._origin
         )

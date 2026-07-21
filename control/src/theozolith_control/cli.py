@@ -22,8 +22,9 @@ from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import janitor
+from theozolith_control import janitor, origin
 from theozolith_control.crypto import SecretBox, ensure_key_file, generate_key
+from theozolith_control.origin import OriginError
 from theozolith_control.settings import ControlSettings, load_settings
 from theozolith_control.store import Store
 from theozolith_control.tls import CERT_FILE, KEY_FILE, provision
@@ -135,7 +136,22 @@ def _serve(args) -> int:
             f"error: no TLS material at {settings.tls_dir} — run 'theozolith-control tls-init"
             " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
         )
-    settings = dataclasses.replace(settings, secrets_channel_ok=True)
+    if not args.insecure_dev or settings.public_origin:
+        # Production requires the persistent randomized public origin
+        # (ADR-0019) — from the origin-init artifact or the
+        # THEOZOLITH_PUBLIC_ORIGIN override: it arms exact Host/Origin
+        # enforcement and is the one origin browsers may reach this
+        # deployment by. It is independent of --host/--port (the bind
+        # address); a configured-but-invalid origin fails closed in dev too.
+        try:
+            origin.parse_public_origin(settings.public_origin)
+        except OriginError as exc:
+            raise SystemExit(
+                f"error: {exc} — production startup requires the generated public"
+                " origin (run 'theozolith-control origin-init' or set"
+                " THEOZOLITH_PUBLIC_ORIGIN; --insecure-dev for local dev only)"
+            ) from exc
+    settings = dataclasses.replace(settings, secrets_channel_ok=True, serve_tls=tls)
     store = Store(settings.db_path)
     box = SecretBox(
         env_value(os.environ, "THEOZOLITH_MASTER_KEY") or ensure_key_file(settings.key_path)
@@ -154,7 +170,9 @@ def _serve(args) -> int:
             " (set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN; ADR-0017)"
         )
 
-    _log(f"control node on {args.host}:{args.port} (TLS {'on' if tls else 'OFF — dev mode'})")
+    _log(f"control node bound to {args.host}:{args.port} (TLS {'on' if tls else 'OFF — dev mode'})")
+    if settings.public_origin:
+        _log(f"public origin (exact browser Host/Origin): {settings.public_origin}")
     try:
         uvicorn.run(
             app,
@@ -172,9 +190,56 @@ def _serve(args) -> int:
 # -- local maintenance ----------------------------------------------------------
 
 
+def _origin_init(args) -> int:
+    """Provision the public origin (ADR-0019): one https origin with a
+    128-bit-entropy hostname slug, persisted complete in the data dir.
+    Default HTTPS omits the port; --port includes a nonstandard external
+    port explicitly. Independent of the serve bind host/port."""
+    settings = load_settings()
+    existing = origin.read_public_origin(settings.data_dir)
+    if existing and not args.force:
+        raise SystemExit(
+            f"error: public origin already provisioned ({existing}) — the origin is"
+            " persistent by design; pass --force to mint a new one (DNS, TLS, and"
+            " every CONTROL_NODE_URL must then be repointed)"
+        )
+    try:
+        text = origin.compose_origin(origin.generate_slug(), args.base_domain, port=args.port)
+    except OriginError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    path = origin.write_public_origin(settings.data_dir, text)
+    _log(f"wrote {path}")
+    _log(f"public origin: {text}")
+    _log(
+        "next: create a trusted-network-only DNS record (or hosts entries) for its hostname"
+        " and run 'theozolith-control tls-init' — the Control Node must have no public"
+        " ingress path"
+    )
+    return 0
+
+
 def _tls_init(args) -> int:
     settings = load_settings()
-    ca, cert, key = provision(settings.tls_dir, args.host)
+    hosts = list(args.host or [])
+    # The public origin's hostname (when provisioned) belongs in the
+    # certificate SAN — the hostname alone, never a port; extra --host
+    # entries (an IP, a LAN alias) are additive.
+    if settings.public_origin:
+        try:
+            hostname = origin.parse_public_origin(settings.public_origin).hostname
+        except OriginError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+        if hostname not in hosts:
+            hosts.insert(0, hostname)
+    if not hosts:
+        raise SystemExit(
+            "error: pass --host, or provision the public origin first"
+            " ('theozolith-control origin-init')"
+        )
+    try:
+        ca, cert, key = provision(settings.tls_dir, hosts)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
     _log(f"wrote {ca}, {cert}, {key}")
     _log(f"distribute {ca.name} to every node (install script --ca, or THEOZOLITH_TLS_CA)")
     return 0
@@ -285,8 +350,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="Run the control-plane service.")
-    serve.add_argument("--host", default="0.0.0.0")
-    serve.add_argument("--port", type=int, default=8443)
+    serve.add_argument("--host", default="0.0.0.0", help="Uvicorn bind address only.")
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8443,
+        help="Uvicorn bind port only — the public origin (browser Host/Origin) is"
+        " independent of it (origin-init / THEOZOLITH_PUBLIC_ORIGIN).",
+    )
     serve.add_argument(
         "--insecure-dev",
         action="store_true",
@@ -294,9 +365,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve.set_defaults(func=_serve)
 
+    origin_init = sub.add_parser(
+        "origin-init",
+        help="Provision the deployment's public origin: https:// plus a randomized hostname"
+        " with 128 bits of entropy under --base-domain, resolved by trusted-network DNS"
+        " only. Independent of the serve bind host/port.",
+    )
+    origin_init.add_argument(
+        "--base-domain",
+        default=origin.DEFAULT_BASE_DOMAIN,
+        help=f"Base domain for the origin's hostname (default: {origin.DEFAULT_BASE_DOMAIN},"
+        " inside the ICANN-reserved private namespace).",
+    )
+    origin_init.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Nonstandard EXTERNAL port browsers dial, included explicitly in the origin"
+        " (default: none — https omits :443). Not the Uvicorn bind port.",
+    )
+    origin_init.add_argument(
+        "--force", action="store_true", help="Replace an already-provisioned public origin."
+    )
+    origin_init.set_defaults(func=_origin_init)
+
     tls_init = sub.add_parser("tls-init", help="Mint a self-signed CA + server certificate.")
     tls_init.add_argument(
-        "--host", action="append", required=True, help="DNS name or IP (repeatable)."
+        "--host",
+        action="append",
+        help="DNS name or IP (repeatable; the public origin's hostname is always included)."
+        " Wildcards are refused — every deployment gets its own TLS identity.",
     )
     tls_init.set_defaults(func=_tls_init)
 

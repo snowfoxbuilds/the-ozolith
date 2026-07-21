@@ -5,7 +5,9 @@ services:
     image: ghcr.io/snowfoxbuilds/theozolith-control:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      # External https default (443) onto the Uvicorn bind (8443): the
+      # public origin stays portless; the bind port is invisible to browsers.
+      - "443:8443"
     environment:
       THEOZOLITH_NODE_TOKEN_FILE: /run/secrets/node-token
       THEOZOLITH_ADMIN_TOKEN_FILE: /run/secrets/admin-token

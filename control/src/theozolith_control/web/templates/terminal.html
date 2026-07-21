@@ -21,7 +21,7 @@ log; in-session keystrokes land in the Run's evidence transcript).</p>
     fit.fit();
 
     var params = new URLSearchParams({
-      node: {{ node | tojson }}, stack: {{ stack | tojson }}, container: {{ container | tojson }}
+      node: {{ node | tojson }}, container: {{ container | tojson }}
     });
     var scheme = location.protocol === "https:" ? "wss" : "ws";
     var socket = new WebSocket(scheme + "://" + location.host + "/terminal/ws?" + params);
