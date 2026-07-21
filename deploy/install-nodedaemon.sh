@@ -4,13 +4,15 @@
 # everything else flows from config.
 #
 #   sudo ./install-nodedaemon.sh \
-#     --control-url https://<slug>.theozolith.internal:8443 \
+#     --control-url https://<slug>.theozolith.internal \
 #     --ca /path/to/ca.pem \
 #     [--node <name>] [--source /path/to/theozolith-checkout]
 #
-# The --control-url host must be the Control Node's canonical origin
-# (ADR-0019: the name minted by `origin-init` and carried in its TLS cert),
+# The --control-url host must be the hostname of the Control Node's public
+# origin (ADR-0019: minted by `origin-init` and carried in its TLS cert),
 # reachable via trusted-network DNS — cert verification pins that name.
+# Include a port only when the Control Node is reachable on a nonstandard
+# external port (the reference compose publishes 443).
 #
 # The node token is read from THEOZOLITH_NODE_TOKEN in the environment or
 # prompted for (never passed as an argument: argv is world-readable).

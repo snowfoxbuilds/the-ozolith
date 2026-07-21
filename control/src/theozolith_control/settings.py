@@ -50,12 +50,13 @@ class ControlSettings:
     # True only when the server terminates TLS itself or an operator
     # explicitly opted into insecure dev mode: gates the secret endpoints.
     secrets_channel_ok: bool = False
-    # The one randomized hostname browsers reach this deployment by
-    # (ADR-0019); empty only in dev — production serve refuses to start
-    # without it. With the public port it defines the exact Host and
-    # Origin every cookie-authenticated state change must carry.
-    canonical_host: str = ""
-    public_port: int = 8443
+    # The one public origin browsers reach this deployment by (ADR-0019),
+    # e.g. "https://<slug>.theozolith.internal" — empty only in dev;
+    # production serve refuses to start without it. Parsed, it defines the
+    # exact Host and Origin every cookie-authenticated state change must
+    # carry. Independent of the Uvicorn bind host/port: changing serve
+    # --port never changes the accepted Host or Origin.
+    public_origin: str = ""
     # Concurrent web-terminal sessions; excess connects are refused before
     # any attach process launches (ADR-0019).
     terminal_session_cap: int = 8
@@ -87,7 +88,7 @@ class ControlSettings:
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
-    from theozolith_control.origin import read_canonical_host
+    from theozolith_control.origin import read_public_origin
 
     environ = os.environ if environ is None else environ
 
@@ -120,9 +121,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
         activation_window_seconds=_float(environ, "THEOZOLITH_ACTIVATION_WINDOW_SECONDS", "60"),
         tail_budget_bytes=int(_float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))),
-        # The env override exists for tests and unusual topologies; the
-        # sanctioned source is the origin-init file in the data dir.
-        canonical_host=env_value(environ, "THEOZOLITH_CANONICAL_HOST")
-        or read_canonical_host(data_dir),
+        # The env override is an expert escape hatch (it wins over the
+        # artifact); the sanctioned source is the origin-init file in the
+        # data dir. Format-checked at serve/app startup — but entropy cannot
+        # be inferred from text, so an operator overriding is responsible
+        # for a CSPRNG-generated slug (origin.py).
+        public_origin=env_value(environ, "THEOZOLITH_PUBLIC_ORIGIN")
+        or read_public_origin(data_dir),
         terminal_session_cap=int(_float(environ, "THEOZOLITH_TERMINAL_SESSION_CAP", "8")),
     )

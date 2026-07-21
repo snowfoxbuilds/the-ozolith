@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from theozolith_control.crypto import SecretBox
+from theozolith_control.origin import parse_public_origin
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_control.web import views
@@ -71,7 +72,14 @@ def mount_web(
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
     sessions = AdminSessions(settings.admin_token, secure_cookies=settings.serve_tls)
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
-    guard = BrowserGuard(settings.canonical_host, settings.public_port)
+    # The exact Host/Origin contract derives from the parsed public origin
+    # alone (never the bind host/port); a configured-but-invalid origin
+    # raises OriginError here, so the app fails closed instead of arming a
+    # guard with garbage expectations.
+    guard = BrowserGuard(
+        parse_public_origin(settings.public_origin) if settings.public_origin else None
+    )
+    app.state.browser_guard = guard  # tests assert the derived expectations
 
     cached_config: list = [0.0, None]  # [expires_at, DeployConfig]
 

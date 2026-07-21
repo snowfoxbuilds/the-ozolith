@@ -33,15 +33,16 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   Stack's config-supplied `attach` argv against live run containers (target and owner
   derived server-side from fresh heartbeats; identifiers validated; output bounded),
   audit-logged to `<data>/terminal-audit.log`. One admin credential fronts all of it,
-  behind a randomized canonical origin with exact Host/Origin enforcement.
+  behind a randomized public origin with exact Host/Origin enforcement (derived from
+  the origin URL alone — independent of the Uvicorn bind host/port).
 
 Availability (ADR-0017): with this service down, in-flight Runs finish and publish;
 new claims and review rounds pause. Drivers hold their own PATs for all non-claim
 GitHub writes.
 
 ```sh
-theozolith-control origin-init                       # once: mint the canonical origin (ADR-0019)
-theozolith-control tls-init                          # once: TLS covering the canonical host
+theozolith-control origin-init                       # once: mint the public origin (ADR-0019)
+theozolith-control tls-init                          # once: TLS covering the origin's hostname
 theozolith-control serve                             # the service (+ dashboard)
 theozolith-control secret set github-worker          # operator entry
 theozolith-control command recycle --node box1 --target worker   # queues behind a Run

@@ -57,6 +57,12 @@ BUFFER_LOW = 64 * 1024
 # is gone or wedged: kill the attach, keep the Run.
 SEND_STALL_SECONDS = 30.0
 
+# Operational resize bounds (M5): every real terminal fits inside them, and
+# clamping here means a hostile or malformed resize frame can neither reach
+# TIOCSWINSZ with an absurd geometry nor tear the session down.
+RESIZE_MIN_COLS, RESIZE_MAX_COLS = 20, 500
+RESIZE_MIN_ROWS, RESIZE_MAX_ROWS = 5, 300
+
 # Both identifier whitelists are strictly shell-inert: no whitespace, no
 # control characters, no shell syntax, and no leading ``-`` (a value can
 # never read as an option), so a forged heartbeat value cannot alter the
@@ -110,11 +116,11 @@ def audit(path: Path, record: dict) -> None:
 
 
 def _resize(master: int, cols: int, rows: int) -> None:
-    # TIOCSWINSZ fields are unsigned shorts: clamp so a hostile or fat-
-    # fingered resize frame ({"cols": 100000}) cannot raise struct.error and
-    # tear the session down.
-    cols = max(1, min(cols, 0xFFFF))
-    rows = max(1, min(rows, 0xFFFF))
+    # Clamp to the operational bounds: no value a client sends can raise
+    # struct.error (the TIOCSWINSZ fields are unsigned shorts) or apply a
+    # geometry outside what a real terminal could be.
+    cols = max(RESIZE_MIN_COLS, min(cols, RESIZE_MAX_COLS))
+    rows = max(RESIZE_MIN_ROWS, min(rows, RESIZE_MAX_ROWS))
     with contextlib.suppress(OSError):
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
@@ -222,10 +228,26 @@ class PtyBridge:
                 # every other connection on this server.
                 await asyncio.to_thread(_write_all, master, message["bytes"])
             elif message.get("text"):
-                with contextlib.suppress(ValueError, TypeError):
-                    control = json.loads(message["text"])
-                    resize = control.get("resize") or {}
-                    _resize(master, int(resize.get("cols", 80)), int(resize.get("rows", 24)))
+                self._apply_control(master, message["text"])
+
+    @staticmethod
+    def _apply_control(master: int, text: str) -> None:
+        """Apply one text control frame. Malformed frames — bad JSON, wrong
+        shapes, non-numeric or non-finite dimensions — are dropped whole:
+        a control frame may never tear the session down, and only clamped
+        values (``_resize``) ever reach TIOCSWINSZ."""
+        try:
+            control = json.loads(text)
+            resize = control.get("resize") or {}
+            cols = int(resize.get("cols", 80))
+            rows = int(resize.get("rows", 24))
+        except (ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+            # ValueError: bad JSON, int("x"), int(nan). TypeError: int(None),
+            # int([]). AttributeError: a non-object frame ("[]", '"x"').
+            # OverflowError: int(inf) — JSON "Infinity" parses. RecursionError:
+            # a deeply nested frame ("["*20000) blows the parser's stack.
+            return
+        _resize(master, cols, rows)
 
     # -- the session --------------------------------------------------------
 
@@ -243,11 +265,16 @@ class PtyBridge:
                 )
             finally:
                 os.close(slave)
-        except OSError as exc:
-            # Spawn failed (e.g. argv[0] not on PATH): close master here — the
-            # relay/cleanup path below never runs — and detach cleanly.
+        except BaseException as exc:
+            # EVERY spawn-failure path — OSError (argv[0] not on PATH),
+            # ValueError (a NUL in argv), CancelledError (torn down
+            # mid-spawn) — must close the master exactly once: the
+            # relay/cleanup path below never runs for it. Expected failure
+            # classes detach cleanly; anything else still propagates.
             os.close(master)
-            return f"spawn-failed: {exc}"
+            if isinstance(exc, (OSError, ValueError)):
+                return f"spawn-failed: {exc}"
+            raise
         self.process = process
 
         loop = asyncio.get_running_loop()
@@ -288,12 +315,21 @@ class PtyBridge:
                     os.killpg(process.pid, signal.SIGHUP)
             # Give a grace window only when we may still await — a cancelled
             # task cannot (level-based cancellation re-raises on every await).
+            # A cancellation ARRIVING during the grace wait must not skip the
+            # SIGKILL fallback below: hold it, kill, then re-raise.
+            grace_cancelled: BaseException | None = None
             if not cancelled:
-                with contextlib.suppress(TimeoutError):
+                try:
                     await asyncio.wait_for(process.wait(), timeout=10)
+                except TimeoutError:
+                    pass
+                except asyncio.CancelledError as exc:
+                    grace_cancelled = exc
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(process.pid, signal.SIGKILL)
+            if grace_cancelled is not None:
+                raise grace_cancelled
         return reason
 
 

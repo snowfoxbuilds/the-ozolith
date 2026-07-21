@@ -25,13 +25,18 @@ state lives in comments.
 
 Evidence is the sole durable audit trail (ADR-0016): every Run pushes its
 bundle, and a job directory is deleted only after that push confirmed —
-otherwise it is left for the boot-time evidence sweep.
+otherwise it is parked beside the jobs dir for the boot-time evidence
+sweep. One enumerated exception (M5, ADR-0019): when parking AND its
+collision-safe fallback both fail, the completed directory is removed
+unpublished — accepted evidence loss, because a completed dir left in the
+jobs dir reads as an in-flight Run to queue-behind.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import secrets
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -56,7 +61,7 @@ from theozolith_worker.containers import (
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
 from theozolith_worker.sessions import SessionError, SessionFactory
-from theozolith_worker.sweep import park_job_dir
+from theozolith_worker.sweep import park_job_dir, pending_dir
 
 BRANCH_PREFIX = "ozolith/issue-"
 
@@ -165,6 +170,10 @@ class RunReport:
     # no-changes | infra ("" for completed Runs).
     failure_class: str = ""
     evidence_pushed: bool = False
+    # True only on the compound failure: the push failed AND both parking
+    # attempts failed, so the completed job dir was removed unpublished
+    # (accepted evidence loss, M5 — never a false in-flight signal).
+    evidence_discarded: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -318,19 +327,73 @@ def execute_run(
             # Parked in the -pending sibling immediately, so the Node
             # Daemon's queue-behind in-flight signal never reads a finished
             # Run's retained evidence as a live Run (ADR-0019).
-            kept = _park_for_sweep(config, job, log)
-            log(f"run {run_id}: job directory kept for the evidence sweep ({kept})")
+            _park_for_sweep(config, job, report, log)
     return report
 
 
-def _park_for_sweep(config: DriverConfig, job: Path, log) -> Path:
-    """Move a retained job dir into the sweep's parking sibling; on failure
-    it stays where it is (the sweep scans both places)."""
+def _park_failure_record(log, event: str, report: RunReport, source: Path, destination: Path, exc):
+    """One structured parking-failure record (M5): machine-greppable with
+    everything an operator needs to find what was (or was not) saved."""
+    log(
+        "evidence parking failed: "
+        + json.dumps(
+            {
+                "event": event,
+                "run_id": report.run_id,
+                "issue": report.issue,
+                "source": str(source),
+                "destination": str(destination),
+                "error": str(exc),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _park_for_sweep(config: DriverConfig, job: Path, report: RunReport, log) -> None:
+    """Move a retained job dir into the sweep's parking sibling. Failure
+    ladder (M5): the plain atomic rename; then a structured failure record
+    plus a collision-safe unique destination; then a second structured
+    record and REMOVAL of the completed directory from the active jobs dir
+    — evidence loss in that compound case is explicitly accepted, because
+    a completed dir left in place reads as an in-flight Run to the Node
+    Daemon's queue-behind signal. Never raises: escalation must proceed."""
     try:
-        return park_job_dir(config, job)
+        kept = park_job_dir(config, job)
+        log(f"run {job.name}: job directory kept for the evidence sweep ({kept})")
+        return
     except OSError as exc:
-        log(f"run {job.name}: could not park the job dir for the sweep: {exc}")
-        return job
+        _park_failure_record(
+            log, "theozolith.evidence-park-failed", report, job, pending_dir(config) / job.name, exc
+        )
+    # The unique suffix keeps -<worker-id>- in the name, so the sweep still
+    # recognizes the parked dir as this driver's to push.
+    fallback = f"{job.name}-parked-{secrets.token_hex(4)}"
+    try:
+        kept = park_job_dir(config, job, target_name=fallback)
+        log(f"run {job.name}: job directory kept for the evidence sweep ({kept})")
+        return
+    except OSError as exc:
+        _park_failure_record(
+            log, "theozolith.evidence-lost", report, job, pending_dir(config) / fallback, exc
+        )
+    shutil.rmtree(job, ignore_errors=True)
+    if job.exists():
+        # Undeletable remnants (e.g. container-owned files): nothing more
+        # to try without blocking escalation. Say the truth — the dir still
+        # sits in the jobs dir, where the sweep may yet recover it and
+        # queue-behind will defer until an operator clears it.
+        log(
+            f"run {job.name}: parking failed twice AND removal left remnants at {job} —"
+            " queue-behind may read it as in-flight until it is cleared"
+        )
+        return
+    report.evidence_discarded = True
+    log(
+        f"run {job.name}: parking failed twice — the completed job directory is removed"
+        " unpublished (accepted evidence loss) so queue-behind never mistakes it for an"
+        " active Run"
+    )
 
 
 def _run_to_pr(
@@ -666,6 +729,15 @@ def render_claim_escalation(repo: str, issue_number: int, reports: list[RunRepor
         if report.evidence_pushed:
             url = evidence.run_evidence_url(repo, issue_number, report.run_id)
             line += f" ([evidence]({url}))"
+        elif report.evidence_discarded:
+            # Never a dead link and never a false promise (ADR-0019/M5):
+            # the compound parking failure discarded this bundle for good.
+            line += (
+                f" — evidence bundle `{evidence.run_dir(issue_number, report.run_id)}` was"
+                " lost (push failed after bounded retries and the job directory could not"
+                " be parked for boot-sweep recovery; loss accepted over a false in-flight"
+                " signal)"
+            )
         else:
             # Never a dead link (ADR-0019): name the bundle path the boot
             # sweep will publish to, best-effort, and say why it is absent.

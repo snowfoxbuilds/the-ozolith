@@ -6,12 +6,14 @@
 # it is done, `serve` exits and the container restarts; that is expected):
 #
 #   docker compose -f deploy/compose/control.yml run --rm control origin-init
-#     # mints the mandatory canonical origin (ADR-0019): one randomized
-#     # <slug>.theozolith.internal hostname (--base-domain to change).
-#     # Give it a trusted-network-only DNS record; production serve requires it.
+#     # mints the mandatory public origin (ADR-0019): one randomized
+#     # https://<slug>.theozolith.internal origin (--base-domain to change;
+#     # --port only for a nonstandard EXTERNAL port). Give its hostname a
+#     # trusted-network-only DNS record; production serve requires the origin.
 #   docker compose -f deploy/compose/control.yml run --rm control tls-init
 #     # TLS is mandatory (secrets transit this channel); tls-init covers the
-#     # canonical host automatically. Add `--host <LAN name or IP>` for extras.
+#     # public origin's hostname automatically. `--host <LAN name or IP>` adds
+#     # extras.
 #
 # then start it and distribute the minted CA:
 #
@@ -29,7 +31,11 @@ services:
     image: theozolith-control:local
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      # External 443 (the https default — the public origin then carries no
+      # port) mapped onto the container's Uvicorn bind (serve --port, 8443).
+      # The two are independent: remapping the bind side never changes the
+      # accepted browser Host/Origin — only the origin artifact does.
+      - "443:8443"
     environment:
       THEOZOLITH_NODE_TOKEN: ${THEOZOLITH_NODE_TOKEN:?set in .env}
       THEOZOLITH_ADMIN_TOKEN: ${THEOZOLITH_ADMIN_TOKEN:?set in .env}

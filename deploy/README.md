@@ -19,27 +19,33 @@ below.
    # Provision BEFORE the service is healthy (build the image, then two one-shots):
    docker compose -f deploy/compose/control.yml build
    docker compose -f deploy/compose/control.yml run --rm control \
-     origin-init                       # one-time canonical origin (mandatory, ADR-0019)
+     origin-init                       # one-time public origin (mandatory, ADR-0019)
    docker compose -f deploy/compose/control.yml run --rm control \
-     tls-init                          # one-time TLS provisioning (mandatory);
-                                       # covers the canonical host; --host adds extras
+     tls-init                          # one-time TLS provisioning (mandatory); covers
+                                       # the origin's hostname; --host adds extras
    docker compose --env-file .env -f deploy/compose/control.yml up -d
    ```
 
-   `origin-init` mints the deployment's one canonical hostname —
-   `<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to change) —
-   which production `serve` requires: until both one-shots have run, `serve` exits and the
-   container restarts (expected during provisioning). Give the canonical host a
+   `origin-init` mints the deployment's one public origin —
+   `https://<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to
+   change; `--port` only when browsers dial a nonstandard *external* port) — which
+   production `serve` requires: until both one-shots have run, `serve` exits and the
+   container restarts (expected during provisioning). The origin is independent of the
+   Uvicorn bind (`serve --host/--port`): the reference compose publishes external 443
+   onto the container's 8443 bind, so the origin carries no port, and remapping the bind
+   never changes the accepted browser `Host`/`Origin`. Give the origin's hostname a
    **trusted-network-only** DNS record (or hosts entries); the Control Node must have no
-   public ingress path, and browsers must use exactly this name (cookie-authenticated
-   requests from any other Host/Origin are rejected). Copy `/data/tls/ca.pem` out of the
-   volume — every node pins it, and every `CONTROL_NODE_URL` uses the canonical host.
+   public ingress path, and browsers must use exactly this origin (cookie-authenticated
+   requests from any other Host/Origin are rejected). Experts may instead supply
+   `THEOZOLITH_PUBLIC_ORIGIN` (format-checked only — the operator owns slug entropy;
+   see `.env.example`). Copy `/data/tls/ca.pem` out of the volume — every node pins it,
+   and every `CONTROL_NODE_URL` uses the origin's hostname.
 
 2. **Nodes** (every physical box that should run Stacks):
 
    ```sh
    sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
-     --control-url https://<canonical-host>:8443 --ca ca.pem
+     --control-url https://<slug>.theozolith.internal --ca ca.pem
    ```
 
    The installer creates the `ozolith` user, a venv at `/opt/theozolith` (daemon +
@@ -55,7 +61,7 @@ below.
 4. **Secrets**: enter values once —
 
    ```sh
-   CONTROL_NODE_URL=https://<control-host>:8443 THEOZOLITH_ADMIN_TOKEN=... \
+   CONTROL_NODE_URL=https://<slug>.theozolith.internal THEOZOLITH_ADMIN_TOKEN=... \
      theozolith-control secret set github-worker --ca ca.pem
    ```
 

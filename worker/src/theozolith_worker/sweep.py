@@ -25,6 +25,7 @@ janitor waits for exactly these bundles before it escalates a silent claim
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -51,15 +52,28 @@ def pending_dir(config: DriverConfig) -> Path:
     return jobs.with_name(jobs.name + "-pending")
 
 
-def park_job_dir(config: DriverConfig, job: Path) -> Path:
+def park_job_dir(config: DriverConfig, job: Path, *, target_name: str | None = None) -> Path:
     """Move a retained job dir into the parking sibling (same filesystem,
     so the rename is atomic); returns the parked path. The one mover, shared
-    by the runner's post-Run retention and this sweep's failed-push retry."""
+    by the runner's post-Run retention and this sweep's failed-push retry.
+    ``target_name`` is the runner's collision-safe fallback when the plain
+    name is already taken in the parking directory."""
     parking = pending_dir(config)
     parking.mkdir(parents=True, exist_ok=True)
-    target = parking / job.name
+    target = parking / (target_name or job.name)
     job.rename(target)
     return target
+
+
+# The runner's collision-safe parking rename appends this suffix (M5); the
+# bundle must still publish under the ORIGINAL run_id path (ADR-0016 — the
+# janitor's evidence-first wait and every escalation comment name exactly
+# that path).
+_PARKED_SUFFIX_RE = re.compile(r"-parked-[0-9a-f]{8}$")
+
+
+def original_run_id(name: str) -> str:
+    return _PARKED_SUFFIX_RE.sub("", name)
 
 
 def owned_by(config: DriverConfig, name: str) -> bool:
@@ -78,11 +92,14 @@ def _issue_number(job: Path) -> int | None:
 
 def _bundle_prefix(job: Path) -> str:
     """The original run_id path when the job names its issue; otherwise a
-    generic sweeps/ path (e.g. review-mode workspaces, ADR-0018)."""
+    generic sweeps/ path (e.g. review-mode workspaces, ADR-0018). A
+    collision-parked dir publishes under its original run_id, suffix
+    stripped."""
+    run_id = original_run_id(job.name)
     issue = _issue_number(job)
     if issue is not None:
-        return evidence.run_dir(issue, job.name)
-    return f"sweeps/{job.name}"
+        return evidence.run_dir(issue, run_id)
+    return f"sweeps/{run_id}"
 
 
 # Job-dir artifacts worth preserving post-mortem (never the checkout).
@@ -105,7 +122,7 @@ def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
             {
                 "swept": True,
                 "swept_at": swept_at,
-                "run_id": job.name,
+                "run_id": original_run_id(job.name),
                 "worker_id": worker_id,
                 "reason": "orphaned job directory recovered by the boot-time evidence sweep",
             },

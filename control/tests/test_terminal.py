@@ -5,12 +5,23 @@ exercised directly against PtyBridge with scriptable fake websockets."""
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import gc
+import os
+import pty
+import struct
+import termios
 
 import pytest
 from theozolith_control.web.terminal import (
     READ_CHUNK,
+    RESIZE_MAX_COLS,
+    RESIZE_MAX_ROWS,
+    RESIZE_MIN_COLS,
+    RESIZE_MIN_ROWS,
     AttachError,
     PtyBridge,
+    _resize,
     render_attach_argv,
     valid_container,
     valid_host,
@@ -160,14 +171,51 @@ def test_backpressure_resumes_without_losing_output():
 # -- teardown/robustness ---------------------------------------------------------
 
 
-def test_out_of_range_resize_does_not_kill_the_session():
-    """A hostile/fat-fingered resize (cols past ushort range) must clamp,
-    not raise struct.error and tear the session down. Without the clamp,
-    the socket pump dies with an 'error: ...' reason on the bad frame."""
-    socket = ScriptedSocket([{"text": '{"resize": {"cols": 100000, "rows": -5}}'}])
+def _winsize(fd: int) -> tuple[int, int]:
+    """(rows, cols) actually applied to the PTY."""
+    rows, cols, _, _ = struct.unpack(
+        "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+    )
+    return rows, cols
+
+
+def test_resize_clamps_to_the_operational_bounds():
+    """M5: resize clamps to 20-500 cols and 5-300 rows — nothing outside
+    those bounds ever reaches TIOCSWINSZ."""
+    master, slave = pty.openpty()
+    try:
+        _resize(master, 100_000, 100_000)
+        assert _winsize(master) == (RESIZE_MAX_ROWS, RESIZE_MAX_COLS)  # (300, 500)
+        _resize(master, 1, -5)
+        assert _winsize(master) == (RESIZE_MIN_ROWS, RESIZE_MIN_COLS)  # (5, 20)
+        _resize(master, 120, 40)  # in-range values apply verbatim
+        assert _winsize(master) == (40, 120)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_malformed_resize_frames_never_kill_the_session():
+    """Malformed, negative, missing, non-numeric, and absurd dimensions
+    are dropped or clamped — the pumps survive every one of them (without
+    the guards, a bad frame kills the socket pump with an 'error' reason)."""
+    frames = [
+        {"text": '{"resize": {"cols": 100000, "rows": -5}}'},  # clamped
+        {"text": '{"resize": {"cols": 1e999, "rows": 24}}'},  # JSON inf: OverflowError
+        {"text": '{"resize": {"cols": NaN}}'},  # JSON nan: ValueError
+        {"text": '{"resize": {"cols": "abc", "rows": null}}'},  # non-numeric
+        {"text": '{"resize": {}}'},  # missing dimensions
+        {"text": '{"resize": null}'},
+        {"text": '{"resize": [1, 2]}'},  # wrong shapes
+        {"text": '[1, 2]'},
+        {"text": '"just a string"'},
+        {"text": "not json at all"},
+        {"text": "[" * 20_000},  # parser RecursionError from deep nesting
+    ]
+    socket = ScriptedSocket(frames)
     bridge = PtyBridge(socket, ["sh", "-c", "sleep 0.3"])
     reason = asyncio.run(bridge.run())
-    # The client hangs up right after the resize; the pump survived it.
+    # The client hangs up right after the frames; the pumps survived all.
     assert reason == "client-closed"
     assert not reason.startswith("error")
 
@@ -180,3 +228,28 @@ def test_spawn_failure_detaches_cleanly_without_leaking_the_master():
     reason = asyncio.run(bridge.run())
     assert reason.startswith("spawn-failed")
     assert bridge.process is None
+
+
+def test_repeated_spawn_failures_do_not_accumulate_fds():
+    """The fd-leak regression proof (M5): both spawn-failure classes —
+    OSError (missing binary) and ValueError (a NUL in argv) — leave the
+    process fd table exactly where it started, run after run. Asserting
+    the reason alone would pass with the master fd leaking."""
+    failing_argvs = [["this-binary-does-not-exist-x7"], ["sh\0bad-argv"]]
+
+    async def scenario() -> None:
+        # Warm-up: absorb any lazily created event-loop/subprocess fds.
+        for argv in failing_argvs:
+            await PtyBridge(ScriptedSocket([]), argv).run()
+        gc.collect()  # settle unrelated to-be-GC'd descriptors first
+        baseline = set(os.listdir("/proc/self/fd"))
+        for _ in range(10):
+            for argv in failing_argvs:
+                reason = await PtyBridge(ScriptedSocket([]), argv).run()
+                assert reason.startswith("spawn-failed")
+        # No NEW descriptors may exist (a leak adds 2 per iteration = 40
+        # here); unrelated fds closing concurrently is fine.
+        leaked = set(os.listdir("/proc/self/fd")) - baseline
+        assert leaked == set()
+
+    asyncio.run(scenario())

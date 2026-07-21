@@ -463,6 +463,27 @@ def test_dead_driver_child_never_defers(rig: Rig, tmp_path):
     assert 10 in rig.daemon._completed  # executed, not deferred
 
 
+def test_parked_pending_sibling_never_defers(rig: Rig, tmp_path):
+    """Evidence parked in the <jobs>-pending sibling (plain or
+    collision-suffixed names, M5) is never an in-flight Run: with the jobs
+    dir itself empty, a recycle applies immediately."""
+    stack, jobs = _driver_stack(tmp_path)
+    jobs.mkdir(parents=True)
+    pending = jobs.with_name(jobs.name + "-pending")
+    (pending / "20260721T1200-worker-a-1").mkdir(parents=True)
+    (pending / "20260721T1300-worker-a-3-parked-deadbeef").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    recycle = {"id": 12, "verb": "recycle", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[recycle]))
+    rig.daemon.once()
+    assert first.returncode is not None  # applied immediately, not deferred
+    assert 12 in rig.daemon._completed
+
+
 def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     stack, jobs = _driver_stack(tmp_path)
     (jobs / "r1").mkdir(parents=True)

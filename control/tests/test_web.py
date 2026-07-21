@@ -32,11 +32,12 @@ node = "box1"
 command = "acme-runner"
 """
 
-# A syntactically conforming canonical host (26 base32 chars of slug).
-CANONICAL = "abcdefghijklmnopqrstuvwxyz.theozolith.internal"
-CANONICAL_HOST_HEADER = f"{CANONICAL}:8443"
-CANONICAL_ORIGIN = f"https://{CANONICAL}:8443"
-CANONICAL_HEADERS = {"Host": CANONICAL_HOST_HEADER, "Origin": CANONICAL_ORIGIN}
+# A syntactically conforming public origin (26 base32 chars of slug).
+# Default HTTPS: no port in the origin, the Host header, or anywhere else —
+# the Uvicorn bind port is invisible to browsers (M5).
+CANONICAL_HOST = "abcdefghijklmnopqrstuvwxyz.theozolith.internal"
+CANONICAL_ORIGIN = f"https://{CANONICAL_HOST}"
+CANONICAL_HEADERS = {"Host": CANONICAL_HOST, "Origin": CANONICAL_ORIGIN}
 
 
 def login(control: ControlRig) -> None:
@@ -433,7 +434,12 @@ def test_insecure_dev_login_works_over_plain_http(tmp_path):
 
 
 def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
-    rig = make_rig(tmp_path, canonical_host=CANONICAL)
+    """A default-HTTPS public origin yields Host ``<slug>.<base>`` and the
+    same Origin — no port anywhere, whatever port Uvicorn binds."""
+    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
+    guard = rig.client.app.state.browser_guard
+    assert guard.expected_host == CANONICAL_HOST  # no :8443
+    assert guard.expected_origin == CANONICAL_ORIGIN
     # The login form is browser-only: enforced from the first POST.
     assert rig.client.post("/login", data={"token": ADMIN_TOKEN}).status_code == 403
     ok = rig.client.post(
@@ -442,9 +448,11 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     assert ok.status_code == 303
 
     for headers in (
-        {"Host": CANONICAL_HOST_HEADER},  # missing Origin
-        {"Host": CANONICAL_HOST_HEADER, "Origin": "https://evil.example"},  # wrong Origin
+        {"Host": CANONICAL_HOST},  # missing Origin
+        {"Host": CANONICAL_HOST, "Origin": "https://evil.example"},  # wrong Origin
         {"Host": "testserver", "Origin": CANONICAL_ORIGIN},  # wrong Host
+        # The retired host:serve-port coupling must NOT be accepted.
+        {"Host": f"{CANONICAL_HOST}:8443", "Origin": f"{CANONICAL_ORIGIN}:8443"},
     ):
         refused = rig.client.post("/secrets", data={"name": "n", "value": "v"}, headers=headers)
         assert refused.status_code == 403
@@ -460,9 +468,29 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     assert rig.store.secret_names() == ["n"]
 
 
+def test_nonstandard_public_port_is_enforced_exactly(tmp_path):
+    """An explicit external port in the public origin appears in exactly
+    one accepted Host and Origin spelling."""
+    rig = make_rig(tmp_path, public_origin=f"https://{CANONICAL_HOST}:9443")
+    guard = rig.client.app.state.browser_guard
+    assert guard.expected_host == f"{CANONICAL_HOST}:9443"
+    assert guard.expected_origin == f"https://{CANONICAL_HOST}:9443"
+    with_port = {
+        "Host": f"{CANONICAL_HOST}:9443",
+        "Origin": f"https://{CANONICAL_HOST}:9443",
+    }
+    ok = rig.client.post(
+        "/login", data={"token": ADMIN_TOKEN}, headers=with_port, follow_redirects=False
+    )
+    assert ok.status_code == 303
+    for headers in (CANONICAL_HEADERS, {**with_port, "Host": CANONICAL_HOST}):
+        refused = rig.client.post("/login", data={"token": ADMIN_TOKEN}, headers=headers)
+        assert refused.status_code == 403
+
+
 def test_bearer_clients_work_without_origin(tmp_path):
     """Acceptance 7: non-browser callers keep working with no Origin."""
-    rig = make_rig(tmp_path, canonical_host=CANONICAL)
+    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
     assert rig.admin("PUT", "/api/v1/secrets/gh", body={"value": "v"}).status_code == 200
     form = rig.client.post(
         "/secrets", data={"name": "a", "value": "b"}, headers=ADMIN_BEARER, follow_redirects=False
@@ -471,7 +499,7 @@ def test_bearer_clients_work_without_origin(tmp_path):
 
 
 def test_cookie_websocket_requires_exact_origin(tmp_path):
-    rig = make_rig(tmp_path, canonical_host=CANONICAL)
+    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
     rig.write_config("stacks/worker.toml", WORKER_STACK_TOML)
     heartbeat_worker_node(rig)
     cookie = rig.client.app.state.admin_sessions.login(ADMIN_TOKEN)
@@ -482,7 +510,7 @@ def test_cookie_websocket_requires_exact_origin(tmp_path):
     code = _refused_ws(
         rig,
         "/terminal/ws?node=box1&container=ozolith-run-r1",
-        {**with_cookie, "Host": CANONICAL_HOST_HEADER, "Origin": "https://evil.example"},
+        {**with_cookie, "Host": CANONICAL_HOST, "Origin": "https://evil.example"},
     )
     assert code == 4403
 

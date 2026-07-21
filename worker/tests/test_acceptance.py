@@ -602,6 +602,57 @@ def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypat
     assert len(reviewer_failures) > len(worker_failures)
 
 
+def test_compound_parking_failure_never_blocks_escalation(harness: Harness, monkeypatch):
+    """M5: the evidence push fails AND both parking attempts fail — the
+    escalation still completes in full, every failure is a structured
+    record, and NOTHING remains in the active jobs dir for the Node
+    Daemon's queue-behind signal to misread as a live Run."""
+
+    def down(*args, **kwargs):
+        raise GitError("evidence remote down")
+
+    monkeypatch.setattr("theozolith_worker.evidence.push_bundle", down)
+    parking = pending_dir(harness.worker_config)
+    parking.parent.mkdir(parents=True, exist_ok=True)
+    parking.write_text("a file squatting on the parking path")  # both park attempts fail
+
+    number = harness.file_issue("Doomed", CRITERIA_BODY)
+    harness.worker_behaviors.append(_no_op)
+    harness.worker_behaviors.append(_no_op)  # both Runs fail (no commits, no reasoning)
+    assert harness.worker_once() == 2
+
+    # Escalation completed in full despite the compound failure.
+    assert harness.fake.assignees_of(number) == []
+    labels = harness.fake.labels_of(number)
+    assert {FAILED, NEEDS_HUMAN} <= labels and IN_PROGRESS not in labels
+    (comment,) = harness.fake.comments[number]
+    body = comment["body"]
+    assert "local-retry budget is spent" in body
+    # Honest forensics: no dead links, no false boot-sweep promise.
+    assert "[evidence](" not in body
+    assert "was lost" in body and "loss accepted" in body
+
+    # The active jobs dir shows nothing in flight: targeted recycle and
+    # node-wide update queue behind exactly this signal (daemon side).
+    jobs = Path(harness.worker_config.jobs_dir)
+    assert not jobs.exists() or [p for p in jobs.iterdir() if p.is_dir()] == []
+
+    # Both Runs produced both structured failure records, in order.
+    records = [
+        json.loads(line.partition("evidence parking failed: ")[2])
+        for line in harness.logs
+        if "evidence parking failed: " in line
+    ]
+    assert [r["event"] for r in records] == [
+        "theozolith.evidence-park-failed",
+        "theozolith.evidence-lost",
+    ] * 2
+    for record in records:
+        assert record["issue"] == number
+        assert record["run_id"] and record["source"] and record["destination"]
+        assert record["error"]  # the OSError, verbatim
+
+
 # -- 7. authority -------------------------------------------------------------
 
 GRADE_LABELS = {
