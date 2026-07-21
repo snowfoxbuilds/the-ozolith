@@ -207,7 +207,7 @@ def test_malformed_resize_frames_never_kill_the_session():
         {"text": '{"resize": {}}'},  # missing dimensions
         {"text": '{"resize": null}'},
         {"text": '{"resize": [1, 2]}'},  # wrong shapes
-        {"text": '[1, 2]'},
+        {"text": "[1, 2]"},
         {"text": '"just a string"'},
         {"text": "not json at all"},
         {"text": "[" * 20_000},  # parser RecursionError from deep nesting

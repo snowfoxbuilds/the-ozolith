@@ -138,8 +138,7 @@ def parse_public_origin(text: str) -> PublicOrigin:
     hostname = split.hostname or ""
     if "*" in hostname:
         raise OriginError(
-            f"public origin {raw!r}: wildcard hosts are refused — one exact origin"
-            " per deployment"
+            f"public origin {raw!r}: wildcard hosts are refused — one exact origin per deployment"
         )
     validate_host(hostname)
     port = port or 443

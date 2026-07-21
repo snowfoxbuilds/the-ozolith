@@ -285,9 +285,7 @@ class NodeDaemon:
             jobs_dir = stack_jobs_dir(stack)
             try:
                 running = sorted(
-                    p.name
-                    for p in jobs_dir.iterdir()
-                    if p.is_dir() and not p.name.startswith(".")
+                    p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
                 )
             except OSError:
                 running = []
