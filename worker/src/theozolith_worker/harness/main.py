@@ -1,27 +1,32 @@
-"""The harness main loop: session, completion wait, job serving, exit.
+"""The harness main loop: headless agent process, job serving, exit.
 
 PID 1 of every run container. Everything it knows arrives as files under the
 job directory (mounted at /job); everything it produces leaves the same way.
-It makes no pipeline decision: a timed-out or crashed agent session is
-recorded in ``output/status.json`` and the harness carries on — the driver
-owns what that means (best-effort contract).
+The agent runs headless (ADR-0019): the adapter's one-shot command with the
+prompt passed at invocation, stdout captured as the structured-output
+transcript, completion detected by process exit with the hard agent timeout
+as backstop. It makes no pipeline decision: a timed-out or crashed agent
+process is recorded in ``output/status.json`` and the harness carries on —
+the driver owns what that means (best-effort contract).
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import os
+import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from theozolith_worker import shell
-from theozolith_worker.harness.adapters import EVENT_STOP, make_harness_adapter
-from theozolith_worker.harness.tmux import RealTmux, Tmux
+from theozolith_worker.harness.adapters import make_harness_adapter
 from theozolith_worker.jobdir import (
     CONTAINER_JOB_PATH,
-    HOOK_EVENTS_FILE,
     PHASE_AGENT,
     PHASE_DONE,
     PHASE_FAILED,
@@ -41,6 +46,7 @@ from theozolith_worker.jobdir import (
 )
 
 DEFAULT_POLL_SECONDS = 0.5
+KILL_GRACE_SECONDS = 10.0  # SIGTERM at the deadline, SIGKILL after this
 
 # (command, cwd, timeout) -> (ok, exit code, output). Runs agent-authored
 # code, so the default is a plain shell in this (credential-free) container.
@@ -51,47 +57,86 @@ def _default_runner(command: str, cwd: Path, timeout: float) -> tuple[bool, int,
     return shell.run_shell(command, cwd, timeout)
 
 
-def _events(job: Path) -> list[str]:
-    try:
-        raw = (job / HOOK_EVENTS_FILE).read_text(encoding="utf-8")
-    except OSError:
-        return []
-    return [line.strip() for line in raw.splitlines() if line.strip()]
+class AgentProcess(Protocol):
+    """The running headless agent, as the completion wait sees it."""
+
+    def poll(self) -> int | None:
+        """The exit code once the process has exited, else None."""
+        ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
 
 
-def await_completion(
-    job: Path,
-    tmux: Tmux,
+# (argv, cwd, env, transcript) -> the running agent. Tests provide fakes.
+AgentLauncher = Callable[[list[str], Path, dict[str, str], Path], AgentProcess]
+
+
+class _SubprocessAgent:
+    """The real agent process, signalled as a whole process group."""
+
+    def __init__(self, popen: subprocess.Popen):
+        self._popen = popen
+
+    def poll(self) -> int | None:
+        return self._popen.poll()
+
+    def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._signal(signal.SIGKILL)
+
+    def _signal(self, sig: int) -> None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self._popen.pid, sig)
+
+
+def launch_agent(argv: list[str], cwd: Path, env: dict[str, str], transcript: Path) -> AgentProcess:
+    """Spawn the headless agent: stdout+stderr append to the transcript."""
+    with transcript.open("ab") as handle:
+        popen = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env={**os.environ, **env},
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # its own process group, killable whole
+        )
+    return _SubprocessAgent(popen)
+
+
+def await_exit(
+    process: AgentProcess,
     manifest: Manifest,
     *,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     poll_seconds: float = DEFAULT_POLL_SECONDS,
+    kill_grace_seconds: float = KILL_GRACE_SECONDS,
 ) -> AgentOutcome:
-    """Wait for the adapter's completion hook to fire and settle.
-
-    Mechanical by contract: the last hook event being ``stop`` for a full
-    settle window means the session is done. Any later event (a human
-    attaching and submitting a prompt) re-arms the wait. The hard timeout is
-    the backstop; a session that exits on its own ends the wait immediately.
-    """
+    """Completion is process exit (ADR-0019); the hard timeout kills an
+    overrunning session: SIGTERM at the deadline, SIGKILL after the grace."""
     start = clock()
-    seen: list[str] = []
-    last_change = start
     while True:
-        now = clock()
-        if now - start >= manifest.agent_timeout_seconds:
-            return AgentOutcome(timed_out=True)
-        events = _events(job)
-        if events != seen:
-            seen = events
-            last_change = now
-        settled = bool(seen) and seen[-1] == EVENT_STOP
-        if settled and now - last_change >= manifest.settle_seconds:
-            return AgentOutcome(completed=True)
-        if not tmux.has_session(manifest.session):
-            return AgentOutcome(completed=settled, session_died=True)
+        code = process.poll()
+        if code is not None:
+            return AgentOutcome(completed=code == 0, session_died=code != 0, exit_code=code)
+        if clock() - start >= manifest.agent_timeout_seconds:
+            break
         sleep(poll_seconds)
+    process.terminate()
+    term_deadline = clock() + kill_grace_seconds
+    while process.poll() is None and clock() < term_deadline:
+        sleep(poll_seconds)
+    if process.poll() is None:
+        process.kill()
+        kill_deadline = clock() + kill_grace_seconds
+        while process.poll() is None and clock() < kill_deadline:
+            sleep(poll_seconds)
+    return AgentOutcome(timed_out=True)
 
 
 def serve_jobs(
@@ -130,14 +175,13 @@ def serve_jobs(
 
 def run_harness(
     job: Path,
-    tmux: Tmux | None = None,
+    launcher: AgentLauncher = launch_agent,
     *,
     runner: JobRunner = _default_runner,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
 ) -> int:
-    tmux = tmux or RealTmux()
     manifest = read_manifest(job)
     write_status(job, Status(phase=PHASE_STARTING))
     adapter = make_harness_adapter(manifest.adapter)
@@ -146,22 +190,27 @@ def run_harness(
         write_status(job, Status(phase=PHASE_FAILED, error=f"missing workdir {manifest.workdir}"))
         return 1
 
+    try:
+        prompt = (job / PROMPT_FILE).read_text(encoding="utf-8")
+    except OSError as exc:
+        write_status(job, Status(phase=PHASE_FAILED, error=f"missing prompt: {exc}"))
+        return 1
+
     transcript = job / TRANSCRIPT_FILE
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.touch()
     # THEOZOLITH_JOB lets in-session tools (theozolith-validate-verdict)
     # find the manifest and outputs from inside the workdir.
     env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
-    tmux.new_session(manifest.session, adapter.command(manifest), workdir, env)
+    argv = adapter.command(manifest, prompt)
+    write_status(job, Status(phase=PHASE_AGENT))
     try:
-        tmux.pipe_pane(manifest.session, transcript)
-        sleep(manifest.startup_seconds)  # let the CLI draw its input box
-        tmux.paste(manifest.session, (job / PROMPT_FILE).read_text(encoding="utf-8"))
-        write_status(job, Status(phase=PHASE_AGENT))
-
-        outcome = await_completion(
-            job, tmux, manifest, clock=clock, sleep=sleep, poll_seconds=poll_seconds
-        )
+        process = launcher(argv, workdir, env, transcript)
+    except OSError as exc:
+        write_status(job, Status(phase=PHASE_FAILED, error=f"agent launch failed: {exc}"))
+        return 1
+    try:
+        outcome = await_exit(process, manifest, clock=clock, sleep=sleep, poll_seconds=poll_seconds)
         adapter.collect(workdir, job, manifest.mode)
 
         error = ""
@@ -177,7 +226,9 @@ def run_harness(
                 poll_seconds=poll_seconds,
             )
     finally:
-        tmux.kill(manifest.session)
+        # Whatever happened, no agent process outlives the harness.
+        if process.poll() is None:
+            process.kill()
 
     write_status(
         job,

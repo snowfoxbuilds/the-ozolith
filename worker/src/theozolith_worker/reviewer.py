@@ -6,9 +6,9 @@ through the Control Node's dispatch endpoint (ADR-0017, discovery-only) and
 runs each review round as an
 ephemeral container (ADR-0013): the driver materializes the review inputs as
 files (issue intent, diff, Decisions Section, mechanical signals), the
-judging agent runs in an interactive tmux session and writes its verdict as
-a file, and the driver validates the file, renders the evidence-citing
-comment, and applies exactly one verdict:
+judging agent runs headless (ADR-0019) and writes its verdict as a file,
+and the driver validates the file, renders the evidence-citing comment, and
+applies exactly one verdict:
 
 - approve: needs_human (keeping pr_ready) + deviation:* + risk:* + an
   evidence-citing comment; the human stamps and merges. Approve means no
@@ -57,7 +57,6 @@ from theozolith_worker.containers import (
     DockerEngine,
     container_labels,
     review_container_name,
-    review_session_name,
 )
 from theozolith_worker.decisions import section_text
 from theozolith_worker.dispatch import DispatchClient, WorkDispatch
@@ -244,12 +243,10 @@ def review_pr(
         manifest = jobdir.Manifest(
             run_id=review_id,
             mode=jobdir.MODE_REVIEW,
-            session=review_session_name(pr.number, round_number),
             adapter=config.adapter,
             model=config.model,  # the Reviewer's stronger model (ADR-0008)
             workdir=jobdir.WORK_DIR,
             agent_timeout_seconds=config.agent_timeout_seconds,
-            settle_seconds=config.settle_seconds,
             round=round_number,
             round_budget=ROUND_BUDGET,
         )

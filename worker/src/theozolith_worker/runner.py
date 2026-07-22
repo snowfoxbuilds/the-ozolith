@@ -56,10 +56,10 @@ from theozolith_worker.containers import (
     ContainerSpec,
     container_labels,
     run_container_name,
-    run_session_name,
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.harness.adapters import HarnessAdapterError, make_harness_adapter
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -96,11 +96,10 @@ def issue_for_branch(head_ref: str) -> int | None:
 
 
 PROMPT_TEMPLATE = """\
-You are a Worker in TheOzolith agentic coding pipeline, executing one \
-stateless Run against the checked-out repository (your working directory). \
-You run in an interactive session; a human operator may attach at any time \
-and add instructions — treat those as authoritative input and record how \
-they shaped your work.
+You are an Implementer in TheOzolith agentic coding pipeline, executing one \
+stateless, headless Run against the checked-out repository (your working \
+directory). No human watches or steers this session; everything the pipeline \
+needs from you must land in the working tree and the decisions file.
 
 ## Issue #{number}: {title}
 
@@ -128,8 +127,8 @@ treated as a failure.
 control.
 - Do not edit `.theozolith/gate.toml` or CI workflows unless the issue \
 explicitly asks for it.
-- When you are done, simply finish your reply; the pipeline detects \
-completion and runs the quality gate.
+- When you are done, simply finish your reply and exit; the pipeline treats \
+your process exit as completion and runs the quality gate.
 """
 
 REVISED_PLAN_CONTEXT = """\
@@ -239,6 +238,16 @@ def _read_output(job: Path, relpath: str) -> str:
         return (job / relpath).read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+def _run_tokens(config: DriverConfig, job: Path) -> int | None:
+    """Token usage from the structured output stream (ADR-0019); None when
+    the adapter's stream carries no usage."""
+    try:
+        adapter = make_harness_adapter(config.adapter)
+    except HarnessAdapterError:
+        return None
+    return adapter.stream_stats(job / jobdir.TRANSCRIPT_FILE).tokens
 
 
 def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:
@@ -476,12 +485,10 @@ def _run_to_pr(
     manifest = jobdir.Manifest(
         run_id=report.run_id,
         mode=jobdir.MODE_RUN,
-        session=run_session_name(report.run_id),
         adapter=config.adapter,
         model=config.model,
         workdir=jobdir.CHECKOUT_DIR,
         agent_timeout_seconds=config.agent_timeout_seconds,
-        settle_seconds=config.settle_seconds,
     )
     jobdir.write_manifest(job, manifest)
     spec = ContainerSpec(
@@ -687,6 +694,7 @@ def _push_run_evidence(
                 "head": report.head,
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
+                "tokens": _run_tokens(config, job),
                 "reason": report.reason,
                 "failure_class": report.failure_class,
                 "notes": report.notes,
@@ -700,8 +708,8 @@ def _push_run_evidence(
         )
         + "\n",
         f"{prefix}/decisions.json": section.to_json() + "\n",
-        # The full tmux session transcript: the audit trail for any human
-        # interaction mid-Run (M2 brief; captured via pipe-pane).
+        # The headless session's structured output stream: the Run's full
+        # audit trail (ADR-0019).
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }

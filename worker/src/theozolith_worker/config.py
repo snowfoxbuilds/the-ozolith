@@ -101,7 +101,6 @@ class DriverConfig:
     worker_id: str
     jobs_dir: Path  # where per-Run job directories live
     agent_timeout_seconds: float
-    settle_seconds: float
     cache_volumes: tuple[tuple[str, str], ...]  # warm caches as named volumes
     agent_env: dict[str, str]  # env the run container gets (model API key)
     container_user: str | None  # uid:gid for run containers; None = image user
@@ -171,7 +170,6 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
             env_value(environ, "THEOZOLITH_JOBS_DIR", default_jobs_dir) or default_jobs_dir
         ),
         agent_timeout_seconds=_float(environ, "THEOZOLITH_AGENT_TIMEOUT_SECONDS", default="3600"),
-        settle_seconds=_float(environ, "THEOZOLITH_SETTLE_SECONDS", default="20"),
         cache_volumes=_volumes(
             env_value(environ, "THEOZOLITH_CACHE_VOLUMES", DEFAULT_CACHE_VOLUMES)
             or DEFAULT_CACHE_VOLUMES

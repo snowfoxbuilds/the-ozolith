@@ -96,13 +96,17 @@ def test_happy_path(harness: Harness):
     assert f"tree/theozolith/evidence/runs/issue-{number}" in comment
 
     # The bundle link resolves to a real git ref holding this Run's evidence —
-    # including the full session transcript (M2 brief).
+    # the transcript is the headless session's structured output stream
+    # (ADR-0019), and run.json carries the usage the stream reported.
     paths = harness.evidence_paths()
     run_dirs = [p for p in paths if p.startswith(f"runs/issue-{number}/") and "/reviews/" not in p]
-    assert any(p.endswith("/run.json") for p in run_dirs)
+    (run_json_path,) = [p for p in run_dirs if p.endswith("/run.json")]
+    run_json = json.loads(harness.evidence_file(run_json_path))
+    assert run_json["tokens"] == 180  # extracted from the stream's usage
     (transcript_path,) = [p for p in run_dirs if p.endswith("/transcript.txt")]
     transcript = harness.evidence_file(transcript_path)
-    assert "[tmux session run-" in transcript  # the pipe-pane capture
+    first_event = json.loads(transcript.splitlines()[0])
+    assert first_event["type"] == "system"  # line-per-event JSON stream
     assert any(f"runs/issue-{number}/reviews/round-1" in p for p in paths)
 
     # Containers: run + review round, correctly named, none left behind.
@@ -825,11 +829,12 @@ def test_hostile_git_metadata_cannot_reach_the_driver(harness: Harness):
     assert harness.remote_file(branch_for(number), "change.txt") == "x"
 
 
-# -- 9. interactivity ---------------------------------------------------------
-# The live-session half (attach, inject, transcript capture) is exercised
-# against real tmux in test_harness.py; here we pin the driver-side plumbing:
-# whatever the session transcript contains ends up in the evidence bundle
-# (test_happy_path asserts the pipe-pane capture reaches the git ref).
+# -- 9. headless sessions (ADR-0019) -------------------------------------------
+# The process half (one-shot invocation, exit-is-completion, timeout kill) is
+# exercised against real subprocesses in test_harness.py; here we pin the
+# driver-side plumbing: whatever the structured output stream contains ends
+# up in the evidence bundle (test_happy_path asserts the stream reaches the
+# git ref and that run.json carries its token usage).
 
 
 # -- 10. verdict robustness ---------------------------------------------------

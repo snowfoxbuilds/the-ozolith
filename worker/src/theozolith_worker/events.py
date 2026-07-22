@@ -25,6 +25,7 @@ from typing import Any, Protocol
 
 from theozolith_worker import jobdir
 from theozolith_worker.config import DriverConfig
+from theozolith_worker.harness import adapters
 
 RUN_EVENT = "theozolith.run"
 REVIEW_EVENT = "theozolith.review"
@@ -152,15 +153,12 @@ def review_event(
 # -- run-progress telemetry (ADR-0016) ------------------------------------------
 
 
-def _count_hook_events(job: Path) -> dict[str, int]:
+def _stream_stats(config: DriverConfig, transcript: Path) -> adapters.StreamStats:
     try:
-        lines = (job / jobdir.HOOK_EVENTS_FILE).read_text(encoding="utf-8").split()
-    except OSError:
-        lines = []
-    counts: dict[str, int] = {}
-    for line in lines:
-        counts[line] = counts.get(line, 0) + 1
-    return counts
+        adapter = adapters.make_harness_adapter(config.adapter)
+    except adapters.HarnessAdapterError:
+        return adapters.StreamStats()
+    return adapter.stream_stats(transcript)
 
 
 def _transcript_snapshot(path: Path) -> tuple[int, str]:
@@ -191,7 +189,7 @@ def progress_event(
     here and again at ingestion."""
     status = jobdir.read_status(job)
     transcript_bytes, tail = _transcript_snapshot(job / jobdir.TRANSCRIPT_FILE)
-    counts = _count_hook_events(job)
+    stats = _stream_stats(config, job / jobdir.TRANSCRIPT_FILE)
     return {
         "type": PROGRESS_EVENT,
         "worker": config.worker_id,
@@ -202,12 +200,11 @@ def progress_event(
         "attempt": attempt,
         "phase": status.phase if status else "starting",
         "elapsed_seconds": round(elapsed_seconds, 1),
-        # Counters: tool calls and operator prompts from the adapter's hook
-        # log; token counts need adapter support the claude adapter does not
-        # have yet (recorded as remaining work in the M4 ADR).
-        "tool_calls": counts.get("tool", 0),
-        "prompts": counts.get("prompt", 0),
-        "tokens": None,
+        # Counters from the headless session's structured output stream
+        # (ADR-0019); tokens stay None only for adapters whose stream
+        # carries no usage (the claude stream does — ADR-0018's gap closed).
+        "tool_calls": stats.tool_calls,
+        "tokens": stats.tokens,
         "transcript_bytes": transcript_bytes,
         "transcript_tail": tail,
     }

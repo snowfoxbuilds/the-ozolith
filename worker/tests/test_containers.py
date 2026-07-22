@@ -11,17 +11,13 @@ from theozolith_worker.containers import (
     DockerEngine,
     container_labels,
     review_container_name,
-    review_session_name,
     run_container_name,
-    run_session_name,
 )
 
 
 def test_naming_and_label_conventions():
     assert run_container_name("20260716T1200-w1-1") == "ozolith-run-20260716T1200-w1-1"
     assert review_container_name(41, 2) == "ozolith-review-41-round-2"
-    assert run_session_name("r1") == "run-r1"
-    assert review_session_name(41, 2) == "review-41-round-2"
     assert container_labels("r1", "worker") == {
         "theozolith.run-id": "r1",
         "theozolith.owner": "worker",

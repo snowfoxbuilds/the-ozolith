@@ -58,8 +58,10 @@ def test_run_image_contract():
     # PID 1 is the harness; the actors never run in this image.
     assert 'ENTRYPOINT ["theozolith-harness"]' in dockerfile
     assert "theozolith-worker" not in re.findall(r"ENTRYPOINT.*|CMD.*", dockerfile)
-    # The agent session needs tmux; the agent must not run as root.
-    assert "tmux" in dockerfile
+    # Headless sessions (ADR-0019): no tmux anywhere in the run image — the
+    # session is a one-shot process and the container is never an attach
+    # target. The agent must not run as root.
+    assert "tmux" not in dockerfile
     assert "USER ozolith" in dockerfile
     assert "OZOLITH_UID" in dockerfile  # job-dir ownership knob
     # Knowledge Source is baked at BUILD time (never at container start).

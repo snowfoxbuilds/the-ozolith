@@ -202,35 +202,93 @@ def test_final_round_rule_rejects_revise(tmp_path):
 # -- the Claude harness adapter ----------------------------------------------
 
 
-def test_claude_adapter_interactive_command():
+def test_claude_adapter_headless_command():
     adapter = ClaudeHarnessAdapter()
     manifest = jobdir.Manifest(
         run_id="r1",
         mode=jobdir.MODE_RUN,
-        session="run-r1",
         adapter="claude",
         model="claude-sonnet-5",
     )
-    command = adapter.command(manifest)
-    assert "--model claude-sonnet-5" in command
-    assert "--dangerously-skip-permissions" in command
-    assert " -p " not in f" {command} "  # headless one-shot is banned
-    assert "--output-format" not in command  # no machine mode: it's a session
+    argv = adapter.command(manifest, "do the thing\n")
+    # Headless one-shot (ADR-0019): the prompt rides the invocation and the
+    # structured output stream is the transcript.
+    assert argv[argv.index("-p") + 1] == "do the thing\n"
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
 
 
-def test_claude_adapter_installs_stop_hook(tmp_path):
+def test_claude_adapter_prepare_installs_no_hooks(tmp_path):
     adapter = ClaudeHarnessAdapter()
     workdir = tmp_path / "checkout"
     workdir.mkdir()
     env = adapter.prepare(workdir, tmp_path)
 
-    hook_log = Path(env["THEOZOLITH_HOOK_LOG"])
-    assert hook_log == tmp_path / jobdir.HOOK_EVENTS_FILE
-    assert hook_log.exists()
-    settings = json.loads((workdir / ".claude" / "settings.local.json").read_text())
-    stop_command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert "stop" in stop_command and "THEOZOLITH_HOOK_LOG" in stop_command
-    assert settings["hooks"]["UserPromptSubmit"]  # human input re-arms the wait
+    assert env == {}  # no completion hooks: process exit is completion
+    assert not (workdir / ".claude").exists()
+
+
+def test_claude_adapter_stream_stats_reads_usage_and_tool_calls(tmp_path):
+    adapter = ClaudeHarnessAdapter()
+    stream = tmp_path / "transcript.txt"
+    stream.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "working"},
+                                {"type": "tool_use", "name": "Edit", "input": {}},
+                                {"type": "tool_use", "name": "Bash", "input": {}},
+                            ],
+                            "usage": {"input_tokens": 90, "output_tokens": 10},
+                        },
+                    }
+                ),
+                "not json at all {",
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "usage": {"input_tokens": 120, "output_tokens": 60},
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    stats = adapter.stream_stats(stream)
+    assert stats.tool_calls == 2
+    assert stats.tokens == 180  # the final result's cumulative usage wins
+
+
+def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
+    adapter = ClaudeHarnessAdapter()
+    # No result event (session killed): per-call assistant usage is summed.
+    stream = tmp_path / "transcript.txt"
+    stream.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [], "usage": {"input_tokens": 50, "output_tokens": 5}},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [], "usage": {"input_tokens": 60, "output_tokens": 15}},
+            }
+        )
+        + "\n"
+    )
+    assert adapter.stream_stats(stream).tokens == 130
+    # An empty or missing stream reports no usage, never a crash.
+    assert adapter.stream_stats(tmp_path / "absent.txt").tokens is None
 
 
 def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
@@ -272,7 +330,6 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
         jobdir.Manifest(
             run_id=f"review-r{round_number}",
             mode=jobdir.MODE_REVIEW,
-            session=f"review-1-round-{round_number}",
             adapter="claude",
             model="m",
             workdir=jobdir.WORK_DIR,
