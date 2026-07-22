@@ -198,6 +198,50 @@ def test_unknown_custom_event_renders_generically(control: ControlRig):
     assert "<b>bold?</b>" not in page  # escaped, not interpreted
 
 
+# -- the errors panel (2026-07-21 grilling) ---------------------------------------
+
+
+def _error_event(node: str, component: str, message: str) -> dict:
+    return {
+        "type": "theozolith.error",
+        "node": node,
+        "component": component,
+        "error_class": "RuntimeError",
+        "message": message,
+        "context": "stack trace tail",
+    }
+
+
+def test_errors_panel_lists_and_filters_by_node_and_component(control: ControlRig):
+    login(control)
+    control.node_post("/api/v1/events", _error_event("box1", "node-daemon", "image build failed"))
+    control.node_post(
+        "/api/v1/events", _error_event("box2", "implementer-driver", "evidence push failed")
+    )
+
+    page = control.client.get("/fragments/errors").text
+    assert "image build failed" in page and "evidence push failed" in page
+    assert "node-daemon@box1" in page
+
+    filtered = control.client.get("/fragments/errors?node=box1").text
+    assert "image build failed" in filtered
+    assert "evidence push failed" not in filtered
+
+    filtered = control.client.get("/fragments/errors?component=implementer-driver").text
+    assert "evidence push failed" in filtered
+    assert "image build failed" not in filtered
+
+
+def test_errors_panel_escapes_untrusted_message_text(control: ControlRig):
+    login(control)
+    control.node_post(
+        "/api/v1/events", _error_event("box1", "node-daemon", "<script>alert(1)</script>")
+    )
+    page = control.client.get("/fragments/errors").text
+    assert "<script>alert(1)</script>" not in page  # escaped, not interpreted
+    assert "alert(1)" in page
+
+
 # -- the secret form (acceptance 5) ----------------------------------------------
 
 

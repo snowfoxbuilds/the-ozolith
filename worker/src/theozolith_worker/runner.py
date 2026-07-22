@@ -39,6 +39,7 @@ import json
 import secrets
 import shutil
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -321,6 +322,16 @@ def execute_run(
     except _RunFailed as failed:
         _fail_run(config, issue, report, job, context, failed, log, sink)
     except Exception as exc:  # pre/post-session driver-side breakage
+        # An internal failure, not a Run outcome: container-start and GitHub
+        # write failures land here — summarize for the dashboard errors
+        # panel (2026-07-21 grilling) before the failed-Run machinery runs.
+        events.emit_error(
+            sink,
+            config,
+            error_class=type(exc).__name__,
+            message=f"run {run_id}: driver-side failure: {exc}",
+            context=traceback.format_exc(),
+        )
         _fail_run(
             config,
             issue,
@@ -625,7 +636,7 @@ def _run_to_pr(
         )
     )
 
-    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log, sink)
 
 
 def _fail_run(
@@ -646,7 +657,7 @@ def _fail_run(
     report.failure_class = failed.failure_class
     if context.section is None:
         context.section = decisions.fallback_section(failed.reason)
-    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log, sink)
     sink.emit(
         events.run_event(
             config,
@@ -666,6 +677,7 @@ def _push_run_evidence(
     job: Path,
     context: _RunContext,
     log,
+    sink: events.EventSink | None = None,
 ) -> bool:
     """Every Run pushes its bundle (ADR-0014) — normal, empty-PR, and failed
     Runs alike. True only when the push confirmed (ADR-0016: the job dir
@@ -728,7 +740,7 @@ def _push_run_evidence(
         )
     except Exception as exc:
         # Never fail the Run on evidence, but never swallow it silently: a
-        # structured record (ADR-0019) so operators and log scrapers see
+        # structured record (ADR-0022) so operators and log scrapers see
         # exactly which bundle is missing and why.
         report.notes.append(f"evidence push failed: {exc}")
         log(
@@ -745,6 +757,14 @@ def _push_run_evidence(
                 sort_keys=True,
             )
         )
+        if sink is not None:
+            events.emit_error(
+                sink,
+                config,
+                error_class=type(exc).__name__,
+                message=f"evidence push failed for run {report.run_id}: {exc}",
+                context=f"bundle {prefix}, {evidence.PUSH_ATTEMPTS} attempts",
+            )
         return False
     return True
 

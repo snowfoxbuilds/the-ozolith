@@ -30,6 +30,9 @@ KNOWN_CHANNEL_PATHS = {
     "/api/v1/nodes/register",
     "/api/v1/heartbeats",
     "/api/v1/secrets/pull",
+    # theozolith.error summaries (2026-07-21 grilling): references and
+    # size-capped text only, never secret values.
+    "/api/v1/events",
 }
 
 HEARTBEAT_REQUEST_KEYS = {

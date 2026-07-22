@@ -9,4 +9,6 @@
          aria-label="Nodes"><p class="muted">loading fleet…</p></section>
 <section id="activity" hx-get="/fragments/activity" hx-trigger="load, every {{ poll_seconds }}s"
          aria-label="Events"><p class="muted">loading events…</p></section>
+<section id="errors" hx-get="/fragments/errors" hx-trigger="load, every {{ poll_seconds }}s"
+         hx-include="#error-filters" aria-label="Errors"><p class="muted">loading errors…</p></section>
 {% endblock %}

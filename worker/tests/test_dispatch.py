@@ -83,3 +83,23 @@ def test_unreachable_control_node_pauses_cleanly():
     assert client.request_work("w", "n", "l") is None
     assert client.review_targets("w", "n", "l") is None
     assert any("unreachable" in line for line in logs)
+
+
+def test_dispatch_failures_fire_the_error_hook(control_node):
+    """2026-07-21 grilling: dispatch failures surface as theozolith.error
+    through the on_error hook the drivers wire to their event sink."""
+    url, answers, _ = control_node
+    answers.append((503, {"detail": "dispatch requires a control PAT"}))
+    answers.append((200, {"issue": {"number": "not-an-int"}}))
+    errors: list[tuple[str, str]] = []
+    client = DispatchClient(url, "node-token", on_error=lambda c, m: errors.append((c, m)))
+
+    assert client.request_work("w", "n", "l") is None
+    assert client.request_work("w", "n", "l") is None
+    unreachable = DispatchClient(
+        "http://127.0.0.1:1", "t", timeout=0.2, on_error=lambda c, m: errors.append((c, m))
+    )
+    assert unreachable.request_work("w", "n", "l") is None
+
+    classes = [error_class for error_class, _ in errors]
+    assert classes == ["dispatch-refused", "malformed-grant", "control-unreachable"]

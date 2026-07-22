@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS events (
     phase TEXT,
     pr INTEGER,
     round INTEGER,
-    verdict TEXT
+    verdict TEXT,
+    component TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
@@ -161,6 +162,7 @@ _DROPPED_TABLES = ("claim_intents", "audit_findings")
 EVENT_RUN = "theozolith.run"
 EVENT_REVIEW = "theozolith.review"
 EVENT_PROGRESS = "theozolith.run.progress"
+EVENT_ERROR = "theozolith.error"
 
 RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # Phases meaning "the driver still holds the claim" — what the zombie
@@ -213,6 +215,9 @@ class Store:
         ):
             if column not in present:
                 self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
+        event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
+        if "component" not in event_columns:  # theozolith.error filter column
+            self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
 
     def close(self) -> None:
         self._db.close()
@@ -337,8 +342,8 @@ class Store:
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO events (type, received_at, payload, node, worker, issue,"
-                " run_id, attempt, phase, pr, round, verdict)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " run_id, attempt, phase, pr, round, verdict, component)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_type,
                     self._clock(),
@@ -352,6 +357,7 @@ class Store:
                     _int("pr"),
                     _int("round"),
                     _str("verdict"),
+                    _str("component"),
                 ),
             )
             if event_type != EVENT_RUN:
@@ -425,6 +431,54 @@ class Store:
             for r in rows
         ]
 
+    def error_events(
+        self, *, node: str | None = None, component: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Newest-first theozolith.error feed, filterable by node/component."""
+        query = "SELECT id, received_at, node, component, payload FROM events WHERE type = ?"
+        params: list[Any] = [EVENT_ERROR]
+        if node:
+            query += " AND node = ?"
+            params.append(node)
+        if component:
+            query += " AND component = ?"
+            params.append(component)
+        with self._lock:
+            rows = self._db.execute(
+                query + " ORDER BY id DESC LIMIT ?", [*params, limit]
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "received_at": r["received_at"],
+                "node": r["node"] or "",
+                "component": r["component"] or "",
+                "payload": json.loads(r["payload"]),
+            }
+            for r in rows
+        ]
+
+    def error_filters(self) -> tuple[list[str], list[str]]:
+        """Distinct (nodes, components) seen on error events, for the panel."""
+        with self._lock:
+            nodes = [
+                r["node"]
+                for r in self._db.execute(
+                    "SELECT DISTINCT node FROM events WHERE type = ? AND node IS NOT NULL"
+                    " ORDER BY node",
+                    (EVENT_ERROR,),
+                )
+            ]
+            components = [
+                r["component"]
+                for r in self._db.execute(
+                    "SELECT DISTINCT component FROM events"
+                    " WHERE type = ? AND component IS NOT NULL ORDER BY component",
+                    (EVENT_ERROR,),
+                )
+            ]
+        return nodes, components
+
     def live_claims(self) -> list[LiveClaim]:
         """Issues whose LATEST Run event is non-terminal (claimed/gate)."""
         with self._lock:
@@ -492,21 +546,23 @@ class Store:
         return row["seen"] if row and row["seen"] is not None else None
 
     def evict_progress(self, budget_bytes: int) -> int:
-        """Cache, never archive (ADR-0016): drop the oldest progress events
-        until their payloads fit the byte budget. Terminal Run events are
-        never touched. Returns the number of rows evicted."""
+        """Cache, never archive (ADR-0016): drop the oldest progress and
+        error events until their payloads fit the byte budget. Terminal Run
+        events are never touched. Returns the number of rows evicted."""
+        evictable = (EVENT_PROGRESS, EVENT_ERROR)
         with self._lock, self._db:
             total = self._db.execute(
-                "SELECT COALESCE(SUM(LENGTH(payload)), 0) AS total FROM events WHERE type = ?",
-                (EVENT_PROGRESS,),
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) AS total FROM events"
+                " WHERE type IN (?, ?)",
+                evictable,
             ).fetchone()["total"]
             excess = total - budget_bytes
             if excess <= 0:
                 return 0
             doomed: list[int] = []
             for row in self._db.execute(
-                "SELECT id, LENGTH(payload) AS size FROM events WHERE type = ? ORDER BY id",
-                (EVENT_PROGRESS,),
+                "SELECT id, LENGTH(payload) AS size FROM events WHERE type IN (?, ?) ORDER BY id",
+                evictable,
             ):
                 doomed.append(row["id"])
                 excess -= row["size"]

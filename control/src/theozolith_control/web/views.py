@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from theozolith_control.configrepo import DeployConfig
-from theozolith_control.store import EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
+from theozolith_control.store import EVENT_ERROR, EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
 
 # A node is stale once it has missed ~2 heartbeats (60s cadence).
 STALE_AFTER_SECONDS = 150.0
@@ -141,7 +141,7 @@ def runs_view(store: Store, repo: str | None, *, now: float | None = None) -> li
     return rows
 
 
-KNOWN_EVENT_TYPES = (EVENT_RUN, EVENT_REVIEW, EVENT_PROGRESS)
+KNOWN_EVENT_TYPES = (EVENT_RUN, EVENT_REVIEW, EVENT_PROGRESS, EVENT_ERROR)
 
 
 def _summarize(event: dict[str, Any]) -> str:
@@ -161,6 +161,11 @@ def _summarize(event: dict[str, Any]) -> str:
             f"issue #{payload.get('issue')} · {payload.get('phase')}"
             f" · {payload.get('tool_calls', 0)} tool call(s)"
             f" · {payload.get('transcript_bytes', 0)} transcript bytes"
+        )
+    if event["type"] == EVENT_ERROR:
+        return (
+            f"{payload.get('component')}@{payload.get('node')}"
+            f" · {payload.get('error_class')}: {str(payload.get('message', ''))[:160]}"
         )
     return ""
 
@@ -186,6 +191,41 @@ def activity_view(
             }
         )
     return rows
+
+
+def errors_view(
+    store: Store,
+    *,
+    node: str = "",
+    component: str = "",
+    limit: int = 50,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """The theozolith.error panel (2026-07-21 grilling): newest-first
+    summaries with node/component filters. Message and context are
+    agent-adjacent text: rendered escaped, never trusted."""
+    now = time.time() if now is None else now
+    rows = []
+    for event in store.error_events(node=node or None, component=component or None, limit=limit):
+        payload = event["payload"]
+        rows.append(
+            {
+                "when": ago(now - event["received_at"]),
+                "node": event["node"],
+                "component": event["component"],
+                "error_class": str(payload.get("error_class", "")),
+                "message": str(payload.get("message", ""))[:2000],
+                "context": str(payload.get("context", ""))[:2000],
+            }
+        )
+    nodes, components = store.error_filters()
+    return {
+        "rows": rows,
+        "nodes": nodes,
+        "components": components,
+        "selected_node": node,
+        "selected_component": component,
+    }
 
 
 def flags_view(store: Store, *, now: float | None = None) -> dict[str, Any]:

@@ -33,6 +33,7 @@ from theozolith_worker.bootstrap.vocabulary import (
     PLAN_READY,
     PR_READY,
 )
+from theozolith_worker.containers import EngineError
 from theozolith_worker.gitops import GitError
 from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.runner import branch_for
@@ -876,6 +877,35 @@ def test_hostile_git_metadata_cannot_reach_the_driver(harness: Harness):
     assert not marker.exists(), "agent-written git hook executed in the driver"
     assert PR_READY in harness.fake.labels_of(harness.fake.open_pr_numbers()[0])
     assert harness.remote_file(branch_for(number), "change.txt") == "x"
+
+
+def test_container_start_failure_emits_an_error_event(harness: Harness):
+    """2026-07-21 grilling: an internal failure path (container start) emits
+    one theozolith.error per Run with component and error class, alongside
+    the normal failed-Run machinery."""
+    number = harness.file_issue("Doomed", CRITERIA_BODY)
+    real_factory = harness.session_factory
+
+    def broken_factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+
+        def broken_launch():
+            raise EngineError("docker run failed: no such image")
+
+        session.launch = broken_launch  # type: ignore[method-assign]
+        return session
+
+    harness.session_factory = broken_factory  # type: ignore[method-assign]
+    harness.worker_once()
+
+    errors = [e for e in harness.sink.events if e["type"] == "theozolith.error"]
+    assert len(errors) == 2  # the Run and its one local retry
+    for event in errors:
+        assert event["component"] == "implementer-driver"
+        assert event["error_class"] == "EngineError"
+        assert "docker run failed" in event["message"]
+    # The normal ADR-0016 escalation still happened.
+    assert FAILED in harness.fake.labels_of(number)
 
 
 # -- 9. headless sessions (ADR-0019) -------------------------------------------

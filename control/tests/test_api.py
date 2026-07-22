@@ -313,6 +313,44 @@ def test_oversized_event_payloads_are_refused(control: ControlRig):
     assert control.store.events(type="acme.blob") == []
 
 
+def test_error_event_context_is_truncated_at_ingestion_never_refused(control: ControlRig):
+    """2026-07-21 grilling: an oversized theozolith.error is truncated, not
+    dropped — an error summary must not vanish for being verbose."""
+    event = {
+        "type": "theozolith.error",
+        "node": "box1",
+        "component": "node-daemon",
+        "error_class": "RuntimeError",
+        "message": "m" * 10_000,
+        "context": "TAIL-MATTERS-" + "c" * 50_000,
+    }
+    assert control.node_post("/api/v1/events", event).status_code == 200
+    (stored,) = control.store.events(type="theozolith.error")
+    assert len(stored["context"]) == 8_192
+    assert stored["context"].endswith("c")  # tail kept (innermost frames)
+    assert len(stored["message"]) == 2_048
+
+
+def test_error_events_are_queryable_by_node_and_component(control: ControlRig):
+    for node, component in (("box1", "node-daemon"), ("box2", "implementer-driver")):
+        event = {
+            "type": "theozolith.error",
+            "node": node,
+            "component": component,
+            "error_class": "EngineError",
+            "message": f"boom on {node}",
+        }
+        assert control.node_post("/api/v1/events", event).status_code == 200
+    rows = control.store.error_events(node="box1")
+    assert [r["component"] for r in rows] == ["node-daemon"]
+    rows = control.store.error_events(component="implementer-driver")
+    assert [r["node"] for r in rows] == ["box2"]
+    assert control.store.error_filters() == (
+        ["box1", "box2"],
+        ["implementer-driver", "node-daemon"],
+    )
+
+
 def test_heartbeat_reports_command_deferrals(control: ControlRig):
     """Acceptance 12: the queue-behind deferral is visible in fleet state."""
     queued = control.admin("POST", "/api/v1/commands", {"node": "box1", "verb": "recycle"})

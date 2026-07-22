@@ -184,6 +184,14 @@ def mount_web(
     def activity_fragment(request: Request):
         return _fragment(request, "_activity.html", {"events": views.activity_view(store)})
 
+    @app.get("/fragments/errors", response_class=HTMLResponse)
+    def errors_fragment(request: Request, node: str = "", component: str = ""):
+        return _fragment(
+            request,
+            "_errors.html",
+            {"errors": views.errors_view(store, node=node, component=component)},
+        )
+
     # -- secret entry (writes through the same path as the CLI's API call) --
 
     @app.get("/secrets", response_class=HTMLResponse)

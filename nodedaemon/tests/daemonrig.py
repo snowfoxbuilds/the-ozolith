@@ -151,6 +151,10 @@ class ScriptedControl:
         self.denied_secrets = False
         self.transcript: list[tuple[str, str, Any, Any]] = []
 
+    @property
+    def events(self) -> list[dict]:
+        return [request for _, path, request, _ in self.transcript if path == "/events"]
+
     def __call__(
         self, method: str, url: str, headers: dict[str, str], body: bytes | None
     ) -> tuple[int, bytes]:
@@ -162,6 +166,8 @@ class ScriptedControl:
 
     def _answer(self, path: str, request: dict) -> tuple[int, Any]:
         if path == "/nodes/register":
+            return 200, {"ok": True}
+        if path == "/events":
             return 200, {"ok": True}
         if path == "/heartbeats":
             if not self.heartbeat_answers:

@@ -53,6 +53,14 @@ from theozolith_nodedaemon.stacks import (
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
 
+# theozolith.error events (2026-07-21 grilling): size-capped summaries
+# pointing at the failing node/component; diagnostic depth stays in the
+# systemd journal. Caps mirror the worker's events module (stdlib-only
+# component: no shared import).
+ERROR_EVENT = "theozolith.error"
+ERROR_MESSAGE_CHARS = 2_000
+ERROR_CONTEXT_CHARS = 8_000
+
 # Every process Stack gets its own jobs directory — <base>/<stack-name>,
 # injected as THEOZOLITH_JOBS_DIR unless the Stack's env overrides it — so
 # the queue-behind in-flight signal observes exactly one driver's Runs
@@ -156,6 +164,7 @@ class NodeDaemon:
                 self.once()
             except Exception as exc:  # a bad pass must never kill the daemon
                 self._log(f"pass failed: {exc}")
+                self._emit_error(type(exc).__name__, f"pass failed: {exc}")
             sleep(self._config.heartbeat_seconds)
 
     # -- heartbeat ------------------------------------------------------------------
@@ -257,6 +266,9 @@ class NodeDaemon:
             # No ack: the Control Node re-delivers next heartbeat (logged loop
             # beats a silently dropped command).
             self._log(f"command {command_id} failed: {exc}")
+            self._emit_error(
+                type(exc).__name__, f"command {command_id} ({verb} {target or ''}) failed: {exc}"
+            )
             return True
         self._ack(command_id)
         return True
@@ -265,6 +277,25 @@ class NodeDaemon:
         if isinstance(command_id, int):
             self._completed.append(command_id)
             _atomic_json(self._acks_path, self._completed)
+
+    def _emit_error(self, error_class: str, message: str, context: str = "") -> None:
+        """Best-effort theozolith.error summary; never raises, never loops
+        (an emission failure is itself only logged)."""
+        if self._client is None:
+            return
+        try:
+            self._client.emit_event(
+                {
+                    "type": ERROR_EVENT,
+                    "node": self._config.node,
+                    "component": "node-daemon",
+                    "error_class": error_class,
+                    "message": message[:ERROR_MESSAGE_CHARS],
+                    "context": context[-ERROR_CONTEXT_CHARS:],
+                }
+            )
+        except Exception as exc:
+            self._log(f"error event not delivered ({error_class}): {exc}")
 
     def _stack_by_name(self, name: str) -> WireStack | None:
         return next((s for s in self._stacks() if s.name == name), None)
@@ -356,6 +387,7 @@ class NodeDaemon:
                 self._rebuild_targets.discard(name)
             except Exception as exc:
                 self._log(f"image {name}: build failed: {exc}")
+                self._emit_error(type(exc).__name__, f"image {name}: build failed: {exc}")
         for stack in self._stacks():
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
@@ -364,7 +396,9 @@ class NodeDaemon:
                 else:
                     self._converge_container(stack, want_running)
             except Exception as exc:
+                # Config-apply and container-start failures both land here.
                 self._log(f"stack {stack.name}: reconcile failed: {exc}")
+                self._emit_error(type(exc).__name__, f"stack {stack.name}: reconcile failed: {exc}")
         self._reap_orphans()
 
     def _pull_stack_secrets(self, stack: WireStack) -> bool:
@@ -386,6 +420,9 @@ class NodeDaemon:
                 self._log(f"stack {stack.name}: secrets pull failed ({exc}); using tmpfs copies")
                 return True
             self._log(f"stack {stack.name}: cannot deploy, secrets unavailable ({exc})")
+            self._emit_error(
+                type(exc).__name__, f"stack {stack.name}: cannot deploy, secrets unavailable: {exc}"
+            )
             return False
 
     def _converge_process(

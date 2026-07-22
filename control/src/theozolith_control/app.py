@@ -32,13 +32,18 @@ from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_co
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
 from theozolith_control.settings import ControlSettings
-from theozolith_control.store import COMMAND_VERBS, EVENT_PROGRESS, Store
+from theozolith_control.store import COMMAND_VERBS, EVENT_ERROR, EVENT_PROGRESS, Store
 
 # Ingestion size caps (ADR-0016): the transcript tail inside a progress
 # event, and any single event payload. Oversized tails are truncated (the
 # tail end is the interesting part); anything still over the payload cap is
 # refused — the control database is a bounded cache, never an archive.
+# theozolith.error context/message are likewise truncated, never refused
+# (2026-07-21 grilling: an error summary must not itself be droppable for
+# being too verbose).
 PROGRESS_TAIL_LIMIT = 8_192
+ERROR_CONTEXT_LIMIT = 8_192
+ERROR_MESSAGE_LIMIT = 2_048
 EVENT_PAYLOAD_LIMIT = 32_768
 
 DISPATCH_ROLES = ("worker", "reviewer")
@@ -85,6 +90,14 @@ def _capped_event(body: dict[str, Any]) -> dict[str, Any]:
         tail = body.get("transcript_tail")
         if isinstance(tail, str) and len(tail) > PROGRESS_TAIL_LIMIT:
             body = {**body, "transcript_tail": tail[-PROGRESS_TAIL_LIMIT:]}
+    if body.get("type") == EVENT_ERROR:
+        context = body.get("context")
+        if isinstance(context, str) and len(context) > ERROR_CONTEXT_LIMIT:
+            # Keep the tail: with a traceback the innermost frames matter.
+            body = {**body, "context": context[-ERROR_CONTEXT_LIMIT:]}
+        message = body.get("message")
+        if isinstance(message, str) and len(message) > ERROR_MESSAGE_LIMIT:
+            body = {**body, "message": message[:ERROR_MESSAGE_LIMIT]}
     if len(json.dumps(body)) > EVENT_PAYLOAD_LIMIT:
         raise HTTPException(
             status_code=413,

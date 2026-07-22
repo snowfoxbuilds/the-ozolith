@@ -36,7 +36,14 @@ class WorkDispatch(Protocol):
 
 
 class DispatchClient:
-    """POSTs /api/v1/dispatch; every failure mode is a clean pause."""
+    """POSTs /api/v1/dispatch; every failure mode is a clean pause.
+
+    ``on_error(error_class, message)`` is the theozolith.error hook (2026-07-21
+    grilling): the drivers wire it to their event sink so dispatch failures
+    surface on the dashboard. Best-effort — when the Control Node itself is
+    unreachable the event goes nowhere, which is fine (the dashboard is on
+    the same box that is down).
+    """
 
     def __init__(
         self,
@@ -46,12 +53,20 @@ class DispatchClient:
         ca: str | None = None,
         timeout: float = 15.0,
         log=None,
+        on_error=None,
     ):
         self._url = url.rstrip("/") + "/api/v1/dispatch"
         self._token = token
         self._ca = ca
         self._timeout = timeout
         self._log = log
+        self._on_error = on_error
+
+    def _error(self, error_class: str, message: str) -> None:
+        if self._log:
+            self._log(message)
+        if self._on_error:
+            self._on_error(error_class, message)
 
     def _post(self, body: dict[str, Any]) -> dict[str, Any] | None:
         request = control_request(self._url, self._token, body)
@@ -61,12 +76,10 @@ class DispatchClient:
                 answer = json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:200]
-            if self._log:
-                self._log(f"dispatch refused (HTTP {exc.code}): {detail}")
+            self._error("dispatch-refused", f"dispatch refused (HTTP {exc.code}): {detail}")
             return None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-            if self._log:
-                self._log(f"control node unreachable; dispatch paused ({exc})")
+            self._error("control-unreachable", f"control node unreachable; dispatch paused ({exc})")
             return None
         return answer if isinstance(answer, dict) else None
 
@@ -82,8 +95,9 @@ class DispatchClient:
         if not isinstance(issue.get("number"), int):
             # A malformed grant must not crash the driver — the claim is
             # already on GitHub; the activation-window release unwinds it.
-            if self._log:
-                self._log(f"dispatch: malformed grant payload ignored: {issue!r:.200}")
+            self._error(
+                "malformed-grant", f"dispatch: malformed grant payload ignored: {issue!r:.200}"
+            )
             return None
         return issue
 

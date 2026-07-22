@@ -10,6 +10,7 @@ the deletion test's daemon half (boots with no config at all).
 from __future__ import annotations
 
 import json
+import subprocess
 
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
 
@@ -248,6 +249,67 @@ def test_failed_command_is_not_acked(rig: Rig, monkeypatch):
     rig.control.heartbeat_answers.append(heartbeat_response(stacks))
     rig.daemon.once()
     assert rig.control.transcript[-1][2]["completed_commands"] == []
+    # The failure also surfaced as a theozolith.error summary (2026-07-21).
+    (event,) = rig.control.events
+    assert event["type"] == "theozolith.error"
+    assert event["node"] == "box1" and event["component"] == "node-daemon"
+    assert event["error_class"] == "RuntimeError"
+    assert "docker is down" in event["message"]
+
+
+# -- error events (2026-07-21 grilling) -------------------------------------------------
+
+
+def test_container_start_failure_emits_a_size_capped_error_event(rig: Rig, monkeypatch):
+    def broken_start(*args, **kwargs):
+        raise RuntimeError("docker run failed: " + "x" * 50_000)
+
+    monkeypatch.setattr(rig.docker, "run_stack_container", broken_start)
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("web")]))
+    rig.daemon.once()
+
+    (event,) = rig.control.events
+    assert event["type"] == "theozolith.error"
+    assert event["component"] == "node-daemon"
+    assert event["error_class"] == "RuntimeError"
+    assert "stack web: reconcile failed" in event["message"]
+    assert len(event["message"]) <= 2_000  # capped at emission
+
+
+def test_update_install_failure_emits_an_error_event(rig: Rig, monkeypatch):
+    def failing_update(args, **_):
+        return subprocess.CompletedProcess(args, 1, "", "no matching distribution")
+
+    monkeypatch.setattr(rig.daemon, "_update_runner", failing_update)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([], commands=[{"id": 7, "verb": "update", "target": None}])
+    )
+    rig.daemon.once()
+
+    assert not rig.execv_calls  # the failed update never re-execs
+    (event,) = rig.control.events
+    assert event["error_class"] == "RuntimeError"
+    assert "pip install failed" in event["message"]
+
+
+def test_error_emission_failure_is_swallowed(rig: Rig, monkeypatch):
+    """A dead events endpoint must never break a daemon pass (no recursion)."""
+
+    def broken_start(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rig.docker, "run_stack_container", broken_start)
+    original = rig.control._answer
+
+    def refuse_events(path, request):
+        if path == "/events":
+            return 500, {"detail": "events store is down"}
+        return original(path, request)
+
+    monkeypatch.setattr(rig.control, "_answer", refuse_events)
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("web")]))
+    rig.daemon.once()  # must not raise
+    assert any("error event not delivered" in line for line in rig.logs)
 
 
 # -- degraded mode (ADR-0006) -----------------------------------------------------------

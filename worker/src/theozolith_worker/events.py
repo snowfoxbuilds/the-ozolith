@@ -30,6 +30,7 @@ from theozolith_worker.harness import adapters
 RUN_EVENT = "theozolith.run"
 REVIEW_EVENT = "theozolith.review"
 PROGRESS_EVENT = "theozolith.run.progress"
+ERROR_EVENT = "theozolith.error"
 
 # The Worker Run phases (ADR-0015/0016): claimed and gate are "in flight"
 # (what the janitor watches); pr-open, failed, and escalated are terminal.
@@ -43,6 +44,11 @@ PHASE_ESCALATED = "escalated"
 
 # Kept below the Control Node's ingestion cap (ADR-0016) with headroom.
 TRANSCRIPT_TAIL_CHARS = 4_000
+
+# theozolith.error size caps (2026-07-21 grilling: summaries pointing at the
+# failing node/component — depth stays in the journal and evidence bundles).
+ERROR_MESSAGE_CHARS = 2_000
+ERROR_CONTEXT_CHARS = 8_000
 
 
 class EventSink(Protocol):
@@ -148,6 +154,57 @@ def review_event(
         "round": round_number,
         "verdict": verdict,
     }
+
+
+# -- error events (2026-07-21 grilling; NODE-SUBSTRATE.md) ---------------------
+
+
+def driver_component(config: DriverConfig) -> str:
+    """The dashboard-facing component name (ADR-0020 terminology)."""
+    return "implementer-driver" if config.role == "worker" else f"{config.role}-driver"
+
+
+def error_event(
+    config: DriverConfig,
+    *,
+    error_class: str,
+    message: str,
+    context: str = "",
+    component: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": ERROR_EVENT,
+        "node": config.node_name,
+        "component": component or driver_component(config),
+        "stack": config.stack,
+        "error_class": error_class,
+        "message": str(message)[:ERROR_MESSAGE_CHARS],
+        # Keep the tail: with a traceback, the innermost frames matter most.
+        "context": str(context)[-ERROR_CONTEXT_CHARS:],
+    }
+
+
+def emit_error(
+    sink: EventSink,
+    config: DriverConfig,
+    *,
+    error_class: str,
+    message: str,
+    context: str = "",
+    component: str | None = None,
+) -> None:
+    """Best-effort error summary to the Control Node; never raises. (The
+    sink's own emission failures stay log-only — an error event about a
+    failed error event would recurse.)"""
+    sink.emit(
+        error_event(
+            config,
+            error_class=error_class,
+            message=message,
+            context=context,
+            component=component,
+        )
+    )
 
 
 # -- run-progress telemetry (ADR-0016) ------------------------------------------
