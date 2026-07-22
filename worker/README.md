@@ -26,12 +26,14 @@ container:
   verdict comment, and applies all post-PR state. 3 review rounds per issue; at the last
   budgeted round a revise verdict is rejected (approve or escalate only).
 - `theozolith-harness` — PID 1 of the run container: invokes the agent **headless**
-  (ADR-0019) — the adapter's one-shot command (Claude: `claude -p` with structured
-  output), prompt passed at invocation — captures the structured output stream as the
-  evidence-bundle transcript (it also supplies token usage), treats process exit as
-  completion with the hard agent timeout as backstop, serves driver-sequenced jobs,
-  writes outputs, and exits. Run containers are never attach targets; interactivity
-  lives only in the Flight Deck Stack.
+  (ADR-0019 as amended) — the adapter's one-shot command (Claude: `claude -p` with
+  structured output) carrying a constant-size **pointer prompt** at the mounted task
+  file (`input/prompt.md`, driver-rendered; the argv never carries task content, so
+  the invocation cannot outgrow ARG_MAX) — captures the structured output stream as
+  the evidence-bundle transcript (it also supplies token usage), treats process exit
+  as completion with the hard agent timeout as backstop, serves driver-sequenced
+  jobs, writes outputs, and exits. Run containers are never attach targets;
+  interactivity lives only in the Flight Deck Stack.
 
 Driver and harness communicate only through the job directory (`input/`, `output/`,
 `checkout|work/`), bind-mounted at `/job` — no network channel, no shared process tree.

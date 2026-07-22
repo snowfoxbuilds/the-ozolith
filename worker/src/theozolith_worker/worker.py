@@ -28,7 +28,7 @@ import traceback
 
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import DockerEngine, Engine
-from theozolith_worker.dispatch import DispatchClient, WorkDispatch
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
 from theozolith_worker.events import EventSink, emit_error, make_sink
 from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.runner import execute_claim
@@ -91,6 +91,7 @@ def run_worker(
     sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
 
     runs = 0
+    unreachable_streak = 0
     while True:
         granted: dict | None = None
         try:
@@ -122,11 +123,20 @@ def run_worker(
             return runs
         if granted is None:
             # An idle-pass sweep with nothing to push is one directory
-            # listing; only failed pushes arm the backoff.
+            # listing; only failed pushes arm the sweep backoff.
             if time.monotonic() >= sweep_retry_at:
                 _, kept = sweep_orphans(config, log=log)
                 sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
-            sleep(config.poll_seconds)
+            # Unreachable-Control backoff (ADR-0015 revision): double the
+            # poll delay per consecutive failed pass, capped; recover the
+            # moment the Control Node answers again.
+            if getattr(dispatch, "last_unreachable", False):
+                unreachable_streak += 1
+            else:
+                unreachable_streak = 0
+            sleep(backoff_delay(config.poll_seconds, unreachable_streak))
+        else:
+            unreachable_streak = 0
 
 
 def main(argv: list[str] | None = None) -> int:

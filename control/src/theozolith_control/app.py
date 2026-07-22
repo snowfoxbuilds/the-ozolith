@@ -22,8 +22,11 @@ ADR-0015/0018, and shared with stdlib-only clients that cannot see pydantic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
+import os
+import tempfile
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -192,6 +195,26 @@ def create_app(
                 config_doc["product_artifacts"] = sorted(
                     p.name for p in version_dir.iterdir() if p.name.endswith(".whl")
                 )
+        # Pin-convergence watch (ADR-0015 revision): keyed on the REPORTED
+        # version, never command acks. Persistent off-pin escalates: one
+        # restart command at the threshold, a theozolith.error after that —
+        # the node stays dispatch-ineligible until a human intervenes.
+        reported = str(body.get("version", ""))
+        action = store.observe_version(node, reported, pin, settings.offpin_beats)
+        if action == "escalated":
+            store.record_event(
+                {
+                    "type": EVENT_ERROR,
+                    "node": node,
+                    "component": "control-node",
+                    "error_class": "update-not-converging",
+                    "message": (
+                        f"node {node} still reports product version {reported} after a"
+                        f" restart; the pin is {pin} — the node stays ineligible for"
+                        " dispatch until a human intervenes"
+                    ),
+                }
+            )
         return {
             "commands": store.pending_commands(node),
             "config": config_doc,
@@ -228,12 +251,23 @@ def create_app(
         worker = _require(body, "worker", str)
         login = _require(body, "login", str)
         node = str(body.get("node", ""))
+        # The pin-eligibility gate (ADR-0015 revision) needs the recorded
+        # pin. Fail-open on a broken Config Repo: an unreadable repo must
+        # not silence dispatch — it is loudly visible everywhere else.
+        try:
+            pin = _config().product_version
+        except HTTPException:
+            pin = ""
         # Off the event loop: the grant path does real GitHub round-trips
         # (with rate-limit sleeps) that must never stall heartbeats or the
         # terminal websockets. The dispatcher's own lock still serializes.
         if role == "worker":
-            return await asyncio.to_thread(dispatcher.grant_work, worker, node, login)
-        return await asyncio.to_thread(dispatcher.review_targets, worker, node, login)
+            return await asyncio.to_thread(
+                lambda: dispatcher.grant_work(worker, node, login, pin=pin)
+            )
+        return await asyncio.to_thread(
+            lambda: dispatcher.review_targets(worker, node, login, pin=pin)
+        )
 
     @app.post("/api/v1/secrets/pull")
     async def secrets_pull(request: Request) -> dict[str, Any]:
@@ -314,10 +348,14 @@ def create_app(
         _authorize(request, settings.admin_token, "admin")
         body = await _json_body(request)
         version = _require(body, "version", str)
+        previous = product.read_pin(settings.config_repo)
         try:
             product.write_pin(settings.config_repo, version)
         except product.ProductError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Cache, not archive: at most the pinned + previous artifact sets
+        # survive a pin change (the previous set is the rollback path).
+        product.prune_artifacts(settings.artifacts_dir, {version, previous} - {""})
         control_hosts = {s.node for s in _config().stacks if s.name == "control"}
         nodes = sorted(
             (n["name"] for n in store.fleet_state()["nodes"]),
@@ -345,7 +383,16 @@ def create_app(
             raise HTTPException(status_code=400, detail="empty artifact body")
         target_dir = settings.artifacts_dir / version
         target_dir.mkdir(parents=True, exist_ok=True)
-        (target_dir / filename).write_bytes(data)
+        # Atomic: a node pulling mid-upload must never receive a torn wheel.
+        fd, tmp = tempfile.mkstemp(dir=str(target_dir), prefix=f".{filename}.")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp, target_dir / filename)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
         return {"ok": True, "bytes": len(data)}
 
     @app.get("/api/v1/product/artifacts/{version}/{filename}")

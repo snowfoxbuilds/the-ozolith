@@ -3,13 +3,16 @@
 ``theozolith update`` (user path) resolves the latest published release —
 or an explicit ``--version`` — and pins it. ``theozolith build`` (developer
 path) builds the distribution from the local source checkout, pins the
-checkout's git SHA (``-dirty``-marked as a ``.dirty`` local-version suffix
-when the tree has uncommitted changes), and uploads the built wheels for
-the Control Node to serve to node pulls. Both converge on
+checkout's git SHA, and uploads the built wheels for the Control Node to
+serve to node pulls. A dirty tree is REFUSED (revision ruling amending
+ADR-0015): every pin names a committed SHA — a dirty pin is a moving
+target where two different trees share one pin and re-uploads silently
+overwrite. Local iteration relies on ``theozolith test``, never on
+deploying uncommitted state. Both paths converge on
 ``POST /api/v1/product/update``: the pin bump is committed to product.toml
-in the Config Repo and update commands fan out over heartbeat responses
-(drain-aware queue-behind, ADR-0015), with the Control Node's own host
-queued last so it applies its own update only after the fan-out is queued.
+in the Config Repo, and nodes CONVERGE on the pin — every heartbeat
+compares the running version against it — with the fanned-out update
+command only an immediate nudge, never the mechanism of record.
 
 Nodes never pull source and never build the product. "Never deploy :latest"
 is restated as never deploy an unrecorded version: a fresh install with no
@@ -34,8 +37,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from theozolith_worker.config import env_value
-
 # The components one product version covers (ADR-0013 §8: one versioned
 # distribution). Order matters only cosmetically.
 COMPONENTS = ("knowledge", "worker", "control", "nodedaemon")
@@ -50,6 +51,19 @@ _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 class ProductError(RuntimeError):
     """An update-path step could not complete."""
+
+
+def _env_value(environ, name: str) -> str | None:
+    """A local VAR/VAR_FILE reader: this module imports nothing from
+    theozolith_worker at import time (component separability)."""
+    file_path = environ.get(f"{name}_FILE")
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    value = environ.get(name)
+    return value if value else None
 
 
 def safe_segment(value: str) -> bool:
@@ -67,7 +81,7 @@ def _log(message: str) -> None:
 def resolve_latest_release(http_get=None, environ=None) -> str:
     """The latest published release version, from the release index."""
     environ = os.environ if environ is None else environ
-    url = env_value(environ, "THEOZOLITH_RELEASE_INDEX_URL") or RELEASE_INDEX_URL
+    url = _env_value(environ, "THEOZOLITH_RELEASE_INDEX_URL") or RELEASE_INDEX_URL
 
     def _default_get(target: str) -> bytes:
         with urllib.request.urlopen(target, timeout=30) as resp:
@@ -163,9 +177,10 @@ _BUILD_IGNORES = shutil.ignore_patterns(
 
 
 def source_version(source: Path, *, runner=subprocess.run) -> str:
-    """The checkout's pin: ``<base>+g<sha12>`` with a ``.dirty`` suffix when
-    the tree has uncommitted changes (a PEP 440 local version, so wheels
-    carry it and nodes report it back in heartbeats)."""
+    """The checkout's pin: ``<base>+g<sha12>`` (a PEP 440 local version, so
+    wheels carry it and nodes report it back in heartbeats). A dirty tree is
+    refused outright — every pin names a committed SHA, or two different
+    trees could share one pin and re-uploads would silently overwrite."""
     try:
         rev = runner(
             ["git", "rev-parse", "--short=12", "HEAD"],
@@ -186,14 +201,19 @@ def source_version(source: Path, *, runner=subprocess.run) -> str:
         text=True,
         check=False,
     )
-    dirty = bool((status.stdout or "").strip())
+    if (status.stdout or "").strip():
+        raise ProductError(
+            "refusing to build from a dirty tree: the pin must name a committed"
+            " SHA (never deploy an unrecorded version). Commit or stash your"
+            " changes; for local iteration run `theozolith test` instead."
+        )
     try:
         base = tomllib.loads((source / "nodedaemon" / "pyproject.toml").read_text())["project"][
             "version"
         ]
     except (OSError, tomllib.TOMLDecodeError, KeyError) as exc:
         raise ProductError(f"cannot read the base version from {source}: {exc}") from exc
-    return f"{base}+g{sha}" + (".dirty" if dirty else "")
+    return f"{base}+g{sha}"
 
 
 def _stamp_version(component_dir: Path, version: str) -> None:
@@ -235,9 +255,9 @@ def _pip_wheel(component_dir: Path, out_dir: Path, runner) -> None:
 def build_distribution(
     source: Path, out_dir: Path, *, runner=subprocess.run, log=_log
 ) -> tuple[str, list[str]]:
-    """Build the whole distribution from the working tree (including any
-    uncommitted changes — that is what ``.dirty`` records) into ``out_dir``.
-    Returns (version, wheel filenames)."""
+    """Build the whole distribution from a CLEAN checkout into ``out_dir``
+    (``source_version`` refuses a dirty tree). Returns (version, wheel
+    filenames)."""
     version = source_version(source, runner=runner)
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="theozolith-build-") as sandbox:
@@ -251,6 +271,19 @@ def build_distribution(
         raise ProductError("the build produced no wheels")
     log(f"built {len(wheels)} wheel(s) at version {version}")
     return version, wheels
+
+
+def prune_artifacts(artifacts_dir: Path, keep: set[str]) -> list[str]:
+    """Cache, not archive: the artifact store holds at most the pinned and
+    the previous version sets. Returns the pruned version names."""
+    if not artifacts_dir.is_dir():
+        return []
+    pruned = []
+    for entry in artifacts_dir.iterdir():
+        if entry.is_dir() and entry.name not in keep:
+            shutil.rmtree(entry, ignore_errors=True)
+            pruned.append(entry.name)
+    return sorted(pruned)
 
 
 # -- the `theozolith` CLI ---------------------------------------------------------
@@ -301,6 +334,29 @@ def _cmd_update(args) -> int:
     return _update_via_api(args, version)
 
 
+def _cmd_test(args) -> int:
+    """The local-development signal (revision ruling amending ADR-0015):
+    iterate with `theozolith test` against the working tree — deploying
+    uncommitted state is not a testing path."""
+    source = Path(args.source).resolve()
+    checks = [
+        [sys.executable, "-m", "pytest"],
+        [sys.executable, "-m", "ruff", "check", "."],
+        [sys.executable, "-m", "ruff", "format", "--check", "."],
+    ]
+    for argv in checks:
+        _log(f"$ {' '.join(argv[2:] if argv[1] == '-m' else argv)}")
+        try:
+            proc = subprocess.run(argv, cwd=str(source), check=False)
+        except OSError as exc:
+            print(f"error: cannot run {argv[2]}: {exc}", file=sys.stderr)
+            return 1
+        if proc.returncode != 0:
+            return proc.returncode
+    _log("all checks passed")
+    return 0
+
+
 def _cmd_build(args) -> int:
     from theozolith_control.cli import _admin_env
 
@@ -338,12 +394,20 @@ def main(argv: list[str] | None = None) -> int:
     build = commands.add_parser(
         "build",
         help=(
-            "build the distribution from a source checkout, pin its git SHA"
-            " (-dirty when unclean), serve the wheels, and fan the update out"
+            "build the distribution from a CLEAN source checkout, pin its git"
+            " SHA, serve the wheels, and fan the update out (a dirty tree is"
+            " refused — iterate with `theozolith test`)"
         ),
     )
     build.add_argument("--source", default=".", help="source checkout (default: current directory)")
     build.set_defaults(handler=_cmd_build)
+
+    test = commands.add_parser(
+        "test",
+        help="the local-development signal: run the checkout's test and lint suite",
+    )
+    test.add_argument("--source", default=".", help="source checkout (default: current directory)")
+    test.set_defaults(handler=_cmd_test)
 
     args = parser.parse_args(argv)
     try:

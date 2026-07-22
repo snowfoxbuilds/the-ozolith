@@ -164,6 +164,14 @@ CREATE TABLE IF NOT EXISTS malformed_states (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL
 );
+-- Pin-convergence tracking (revision ruling amending ADR-0015): consecutive
+-- off-pin heartbeats per node; a row exists only while the node is off-pin.
+CREATE TABLE IF NOT EXISTS version_health (
+    node TEXT PRIMARY KEY,
+    offpin_beats INTEGER NOT NULL DEFAULT 0,
+    restart_queued INTEGER NOT NULL DEFAULT 0,
+    escalated INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Tables of earlier schema generations, dropped on open: the advisory
@@ -183,10 +191,11 @@ RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # a driver that dies between the failed Run and its retry stays visible.
 LIVE_RUN_PHASES = ("claimed", "gate", "failed")
 
-# The command verbs (ADR-0015), and the subset whose pending presence
-# closes the dispatch gate for a node (queue-behind, ADR-0018).
-COMMAND_VERBS = ("drain", "recycle", "update", "rebuild")
-LIFECYCLE_VERBS = ("drain", "recycle", "update")
+# The command verbs (ADR-0015; restart is the off-pin escalation step), and
+# the subset whose pending presence closes the dispatch gate for a node
+# (queue-behind, ADR-0018).
+COMMAND_VERBS = ("drain", "recycle", "update", "rebuild", "restart")
+LIFECYCLE_VERBS = ("drain", "recycle", "update", "restart")
 
 # Consecutive failed Runs on one node before the dispatch gate closes.
 QUARANTINE_AFTER_FAILURES = 2
@@ -250,6 +259,54 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT last_seen FROM nodes WHERE name = ?", (name,)).fetchone()
         return row["last_seen"] if row else None
+
+    def node_version(self, name: str) -> str:
+        """The last heartbeat-reported product version ('' when unknown)."""
+        with self._lock:
+            row = self._db.execute("SELECT version FROM nodes WHERE name = ?", (name,)).fetchone()
+        return row["version"] if row else ""
+
+    def observe_version(self, node: str, reported: str, pin: str, threshold: int) -> str | None:
+        """Track pin convergence per heartbeat (revision ruling amending
+        ADR-0015). On-pin (or no pin / no report): reset. Off-pin: count;
+        at ``threshold`` consecutive off-pin beats queue one restart
+        command; still off-pin ``threshold`` beats after that, mark the
+        node escalated (the caller emits the theozolith.error event).
+        Returns the action taken: None | "restart-queued" | "escalated"."""
+        with self._lock, self._db:
+            if not pin or not reported or reported == pin:
+                self._db.execute("DELETE FROM version_health WHERE node = ?", (node,))
+                return None
+            self._db.execute(
+                "INSERT INTO version_health (node, offpin_beats) VALUES (?, 0)"
+                " ON CONFLICT (node) DO NOTHING",
+                (node,),
+            )
+            self._db.execute(
+                "UPDATE version_health SET offpin_beats = offpin_beats + 1 WHERE node = ?",
+                (node,),
+            )
+            row = self._db.execute(
+                "SELECT * FROM version_health WHERE node = ?", (node,)
+            ).fetchone()
+            if not row["restart_queued"] and row["offpin_beats"] >= threshold:
+                self._db.execute(
+                    "INSERT INTO commands (node, verb, target, force, created_at)"
+                    " VALUES (?, 'restart', NULL, 0, ?)",
+                    (node, self._clock()),
+                )
+                self._db.execute(
+                    "UPDATE version_health SET restart_queued = 1 WHERE node = ?", (node,)
+                )
+                return "restart-queued"
+            if (
+                row["restart_queued"]
+                and not row["escalated"]
+                and row["offpin_beats"] >= 2 * threshold
+            ):
+                self._db.execute("UPDATE version_health SET escalated = 1 WHERE node = ?", (node,))
+                return "escalated"
+            return None
 
     def container_record(self, node: str, name: str) -> dict[str, Any] | None:
         """The live-container row a heartbeat last reported for (node, name):

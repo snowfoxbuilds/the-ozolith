@@ -16,10 +16,12 @@ state = "running"
 image = "ghcr.io/example/flightdeck:1"   # agent CLI + tmux; pin your build
 
 # Start the named tmux session with the agent CLI in it, pipe the session
-# transcript (which captures typed input) to the log volume, and keep the
-# container alive. The session name ("flightdeck") is the discoverable
-# attach point.
-command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tail -f /dev/null'"
+# transcript (which captures typed input) to the log volume, and tie the
+# container's lifetime to the tmux SERVER: `tmux wait-for` blocks while the
+# server lives and exits when it dies, so a dead session shows as a dead
+# container (and the restart policy brings up a fresh one). The session
+# name ("flightdeck") is the discoverable attach point.
+command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tmux wait-for flightdeck-forever'"
 
 # Web-terminal attach command, executed by the Control Node's PTY bridge as
 # a structured argv array ({host}/{container} only as complete arguments,

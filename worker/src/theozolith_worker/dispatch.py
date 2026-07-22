@@ -22,6 +22,18 @@ from typing import Any, Protocol
 
 from theozolith_worker.events import control_request, ssl_context_for
 
+# Unreachable-Control-Node backoff cap (ADR-0015 revision): driver polling
+# doubles its delay per consecutive failure up to this, then snaps back to
+# the configured poll interval the moment the Control Node answers.
+BACKOFF_CAP_SECONDS = 300.0
+
+
+def backoff_delay(base: float, streak: int, cap: float = BACKOFF_CAP_SECONDS) -> float:
+    """The poll delay after ``streak`` consecutive unreachable passes."""
+    if streak <= 1:
+        return base
+    return min(cap, base * 2 ** (streak - 1))
+
 
 class WorkDispatch(Protocol):
     """What the drivers need from dispatch. Tests provide fakes."""
@@ -61,6 +73,9 @@ class DispatchClient:
         self._timeout = timeout
         self._log = log
         self._on_error = on_error
+        # True after a pass that could not reach the Control Node at all —
+        # the drivers' backoff signal (a refusal is not unreachability).
+        self.last_unreachable = False
 
     def _error(self, error_class: str, message: str) -> None:
         if self._log:
@@ -75,12 +90,15 @@ class DispatchClient:
             with urllib.request.urlopen(request, timeout=self._timeout, context=context) as resp:
                 answer = json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
+            self.last_unreachable = False  # it answered; it refused
             detail = exc.read().decode(errors="replace")[:200]
             self._error("dispatch-refused", f"dispatch refused (HTTP {exc.code}): {detail}")
             return None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            self.last_unreachable = True
             self._error("control-unreachable", f"control node unreachable; dispatch paused ({exc})")
             return None
+        self.last_unreachable = False
         return answer if isinstance(answer, dict) else None
 
     def request_work(self, worker: str, node: str, login: str) -> dict[str, Any] | None:

@@ -417,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
     secret_list.set_defaults(func=_secret_list)
 
     command = sub.add_parser("command", help="Queue an infrastructure command for a node.")
-    command.add_argument("verb", choices=["drain", "recycle", "update", "rebuild"])
+    command.add_argument("verb", choices=["drain", "recycle", "update", "rebuild", "restart"])
     command.add_argument("--node", required=True)
     command.add_argument("--target", help="Stack (drain/recycle) or image (rebuild) name.")
     command.add_argument(

@@ -125,17 +125,27 @@ def _checkout(tmp_path: Path) -> Path:
     return source
 
 
-def test_source_version_stamps_the_sha_and_dirty_suffix(tmp_path):
+def test_source_version_stamps_the_committed_sha(tmp_path):
     source = _checkout(tmp_path)
     sha = _git(["rev-parse", "--short=12", "HEAD"], source)
 
     assert product.source_version(source) == f"0.3.0+g{sha}"
 
-    (source / "worker" / "uncommitted.txt").write_text("wip")
-    assert product.source_version(source) == f"0.3.0+g{sha}.dirty"
-
     with pytest.raises(product.ProductError, match="not a git checkout"):
         product.source_version(tmp_path / "not-a-repo-at-all")
+
+
+def test_a_dirty_tree_is_refused_outright(tmp_path):
+    """Revision ruling (amends ADR-0015): every pin names a committed SHA.
+    No .dirty version can be produced, so none can be uploaded or pinned."""
+    source = _checkout(tmp_path)
+    (source / "worker" / "uncommitted.txt").write_text("wip")
+
+    with pytest.raises(product.ProductError, match="dirty tree"):
+        product.source_version(source)
+    with pytest.raises(product.ProductError, match="theozolith test"):
+        product.build_distribution(source, tmp_path / "wheels", log=lambda *_: None)
+    assert not (tmp_path / "wheels").exists() or not list((tmp_path / "wheels").iterdir())
 
 
 def test_build_distribution_stamps_versions_and_collects_wheels(tmp_path):
@@ -171,7 +181,33 @@ def test_build_distribution_stamps_versions_and_collects_wheels(tmp_path):
 
 
 def test_safe_segment_rejects_traversal():
-    assert product.safe_segment("0.3.0+gabc.dirty")
+    assert product.safe_segment("0.3.0+gabc123def456")
     assert product.safe_segment("theozolith_worker-0.3.0-py3-none-any.whl")
     for hostile in ("", "..", "a/../b", "a/b", ".hidden", "-flag", "a\x00b"):
         assert not product.safe_segment(hostile), hostile
+
+
+def test_product_module_imports_nothing_from_the_worker_component():
+    """Component separability: theozolith_control.product must be importable
+    without theozolith_worker (function-scope imports of sibling control
+    modules are fine; module-level worker imports are not)."""
+    source = Path(product.__file__).read_text(encoding="utf-8")
+    offending = [
+        line
+        for line in source.splitlines()
+        if line.startswith(("import ", "from ")) and "theozolith_worker" in line
+    ]
+    assert offending == []
+
+
+def test_prune_artifacts_keeps_only_the_named_versions(tmp_path):
+    store = tmp_path / "artifacts"
+    for version in ("0.1.0", "0.2.0", "0.3.0"):
+        (store / version).mkdir(parents=True)
+        (store / version / "x.whl").write_bytes(b"w")
+
+    pruned = product.prune_artifacts(store, {"0.3.0", "0.2.0"})
+
+    assert pruned == ["0.1.0"]
+    assert sorted(p.name for p in store.iterdir()) == ["0.2.0", "0.3.0"]
+    assert product.prune_artifacts(tmp_path / "absent", {"x"}) == []  # no dir, no crash

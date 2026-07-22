@@ -215,10 +215,14 @@ def test_run_mode_full_cycle(tmp_path):
     assert code == 0
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_DONE and status.agent.completed
-    # Headless one-shot: the prompt rides the invocation (ADR-0019).
+    # Headless one-shot with the POINTER prompt (ADR-0019 as amended): the
+    # argv names the mounted task file and never carries the task content,
+    # so the invocation is constant-size regardless of task size.
     call = launcher.calls[0]
     argv = call["argv"]
-    assert argv[argv.index("-p") + 1] == "do the thing\n"
+    pointer = argv[argv.index("-p") + 1]
+    assert str(job / jobdir.PROMPT_FILE) in pointer
+    assert "do the thing" not in " ".join(argv)  # the task stays in the file
     assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
@@ -261,7 +265,7 @@ def test_harness_survives_agent_timeout_and_reports_it(tmp_path):
     assert status.agent.timed_out and not status.agent.completed
 
 
-def test_missing_prompt_is_a_harness_failure(tmp_path):
+def test_missing_task_file_is_a_harness_failure(tmp_path):
     job, _manifest = make_job(tmp_path)
     (job / jobdir.PROMPT_FILE).unlink()
     clock = ScriptedClock()
@@ -271,7 +275,7 @@ def test_missing_prompt_is_a_harness_failure(tmp_path):
 
     assert code == 1
     status = jobdir.read_status(job)
-    assert status.phase == jobdir.PHASE_FAILED and "prompt" in status.error
+    assert status.phase == jobdir.PHASE_FAILED and "task file" in status.error
     assert launcher.calls == []  # nothing was ever spawned
 
 
@@ -322,7 +326,9 @@ def test_real_headless_invocation_streams_and_completes(tmp_path, monkeypatch):
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_DONE and status.agent.completed
     transcript = (job / jobdir.TRANSCRIPT_FILE).read_text()
-    assert "PROMPT:do the thing" in transcript  # the prompt rode the argv
+    # The argv carried the pointer at the task file, never the task content.
+    assert f"PROMPT:Work on the task specified in {job / jobdir.PROMPT_FILE}" in transcript
+    assert "do the thing" not in transcript
     assert f"JOB:{job}" in transcript  # in-session tools can find the job dir
 
 

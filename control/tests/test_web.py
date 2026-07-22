@@ -146,11 +146,11 @@ def test_product_version_skew_is_surfaced(control: ControlRig):
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
     login(control)
     control.heartbeat(node="box1", version="0.4.0")
-    control.heartbeat(node="box2", version="0.3.0+gabc123def456.dirty")
+    control.heartbeat(node="box2", version="0.3.0+gabc123def456")
 
     page = control.client.get("/fragments/fleet").text
     assert "product version skew" in page and "box2" in page
-    assert "0.3.0+gabc123def456.dirty" in page  # the odd version is visible
+    assert "0.3.0+gabc123def456" in page  # the odd version is visible
 
     control.heartbeat(node="box2", version="0.4.0")  # converged
     assert "product version skew" not in control.client.get("/fragments/fleet").text

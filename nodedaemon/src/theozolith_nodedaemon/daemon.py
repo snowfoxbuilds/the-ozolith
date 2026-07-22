@@ -7,9 +7,12 @@ One pass every heartbeat interval (60s):
 2. The response carries infrastructure commands and this node's desired
    state (ADR-0006); the desired state is cached to disk so an unreachable
    Control Node degrades to reconciling the last-applied config, forever.
-3. Execute commands (drain / recycle / update / rebuild), then converge
-   Stacks: build missing derived images, start/stop process children and
-   container workloads, and reap orphaned run containers (owner gone).
+3. Execute commands (drain / recycle / update / rebuild / restart), converge
+   the product version to the pin (the pin is desired state — ADR-0015 as
+   revised: mismatch self-updates, failed installs retry next pass, the
+   update command is only a nudge), then converge Stacks: build missing
+   derived images, start/stop process children and container workloads, and
+   reap orphaned run containers (owner gone).
 
 Queue-behind (NODE-SUBSTRATE, grilling 2026-07-17): recycle and update
 received mid-Run defer behind the current Run — job-dir presence under a
@@ -61,6 +64,9 @@ UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-kno
 ERROR_EVENT = "theozolith.error"
 ERROR_MESSAGE_CHARS = 2_000
 ERROR_CONTEXT_CHARS = 8_000
+
+# Unreachable-Control-Node backoff cap (revision ruling amending ADR-0015).
+BACKOFF_CAP_SECONDS = 300.0
 
 # Every process Stack gets its own jobs directory — <base>/<stack-name>,
 # injected as THEOZOLITH_JOBS_DIR unless the Stack's env overrides it — so
@@ -130,6 +136,14 @@ class NodeDaemon:
         self._rebuild_targets: set[str] = set()
         # Queue-behind: command id -> deferral reason, reported in heartbeats.
         self._deferrals: dict[int, str] = {}
+        # Product convergence (revision ruling amending ADR-0015): the pin is
+        # desired state, checked every pass. True once an install succeeded
+        # and the re-exec is imminent — no second attempt is in flight.
+        self._update_done = False
+        self._update_blocker: str | None = None
+        self._product_attempted = False  # per-pass latch (nudge vs. pass check)
+        # Capped exponential backoff while the Control Node is unreachable.
+        self._unreachable_streak = 0
 
     @property
     def _acks_path(self) -> Path:
@@ -146,6 +160,7 @@ class NodeDaemon:
     # -- one pass -----------------------------------------------------------------
 
     def once(self) -> None:
+        self._product_attempted = False  # at most one install attempt per pass
         commands = self._exchange_heartbeat()
         for command in commands:
             if not self._execute(command):
@@ -153,7 +168,17 @@ class NodeDaemon:
                 # one wait too, or a later drain could land before the
                 # recycle it was issued after and be undone by it.
                 break
+        self._converge_product()
         self._reconcile()
+
+    def _next_delay(self) -> float:
+        """The inter-pass delay: the heartbeat interval normally; capped
+        exponential backoff while the Control Node is unreachable, resetting
+        the moment it answers again (revision ruling amending ADR-0015)."""
+        base = self._config.heartbeat_seconds
+        if self._unreachable_streak <= 1:
+            return base
+        return min(BACKOFF_CAP_SECONDS, base * 2 ** (self._unreachable_streak - 1))
 
     def run(self, *, sleep=time.sleep) -> None:
         self._log(
@@ -166,7 +191,7 @@ class NodeDaemon:
             except Exception as exc:  # a bad pass must never kill the daemon
                 self._log(f"pass failed: {exc}")
                 self._emit_error(type(exc).__name__, f"pass failed: {exc}")
-            sleep(self._config.heartbeat_seconds)
+            sleep(self._next_delay())
 
     # -- heartbeat ------------------------------------------------------------------
 
@@ -231,9 +256,14 @@ class NodeDaemon:
                 self._log(f"registration deferred: {exc}")
         try:
             answer = self._client.heartbeat(self._status_payload())
-        except (ControlUnreachable, ControlError) as exc:
+        except ControlUnreachable as exc:
+            self._unreachable_streak += 1
             self._log(f"control node unreachable ({exc}); reconciling from cached config")
             return []
+        except ControlError as exc:
+            self._log(f"control node refused the heartbeat ({exc}); using cached config")
+            return []
+        self._unreachable_streak = 0
         # Acks landed on the Control Node: stop re-sending them.
         self._completed = []
         _atomic_json(self._acks_path, self._completed)
@@ -252,7 +282,7 @@ class NodeDaemon:
         verb = command.get("verb", "")
         target = command.get("target") or None
         command_id = command.get("id")
-        if verb in ("recycle", "update") and not command.get("force"):
+        if verb in ("recycle", "update", "restart") and not command.get("force"):
             blocker = self._inflight_blocker([target] if verb == "recycle" and target else None)
             if blocker is not None and isinstance(command_id, int):
                 # Queue-behind: no ack, so the Control Node re-delivers the
@@ -274,8 +304,23 @@ class NodeDaemon:
             elif verb == "rebuild":
                 self._rebuild_targets.update([target] if target else self._images())
             elif verb == "update":
-                self._update(command_id)
-                return True  # unreachable when the update re-execs
+                # The nudge, never the mechanism of record (revision ruling
+                # amending ADR-0015): ack FIRST — convergence owns the retry,
+                # so a failed install must not leave the command consuming
+                # the queue — then attempt convergence immediately.
+                self._ack(command_id)
+                self._converge_product(force=bool(command.get("force")))
+                return True
+            elif verb == "restart":
+                # Escalation step for a node that will not converge: stop
+                # the tree and re-exec in place, no install.
+                self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
+                self._ack(command_id)
+                self._log("restart command: re-exec")
+                self._execv(
+                    sys.executable, [sys.executable, "-m", "theozolith_nodedaemon", *sys.argv[1:]]
+                )
+                return True
             else:
                 self._log(f"command {command_id}: unknown verb {verb!r}; acking as a no-op")
         except Exception as exc:
@@ -373,21 +418,46 @@ class NodeDaemon:
         _atomic_json(self._config.drained_path, sorted(self._drained))
         # The reconcile step of this same pass starts them again.
 
-    def _update(self, command_id: Any) -> None:
-        """Product update (ADR-0013 §8, ADR-0015 as amended 2026-07-22):
-        stop the tree, install the pinned version, re-exec this daemon in
-        place. Release pins install by name from the package index; a
-        served artifact set (the developer build path) is pulled from the
+    def _converge_product(self, *, force: bool = False) -> None:
+        """The pin is desired state (revision ruling amending ADR-0015):
+        every pass compares the running product version against the pinned
+        one and self-updates on mismatch — startup is just the first pass,
+        and a failed install retries on a later pass with no re-queued
+        command. Drain-aware queue-behind semantics are unchanged: an
+        in-flight Run defers the attempt (``force`` keeps kill-the-tree)."""
+        if self._update_done or self._product_attempted:
+            return  # already succeeded (re-exec imminent) or tried this pass
+        pin = str(self._desired.get("product_version", "") or "")
+        if not pin or pin == self._config.version:
+            self._update_blocker = None
+            return
+        if not force:
+            blocker = self._inflight_blocker(None)
+            if blocker is not None:
+                if self._update_blocker != blocker:
+                    self._log(f"product update to {pin} deferred ({blocker})")
+                self._update_blocker = blocker
+                return
+        self._update_blocker = None
+        self._product_attempted = True
+        try:
+            self._install_product(pin)
+        except Exception as exc:
+            self._log(f"product update to {pin} failed: {exc} (retrying next pass)")
+            self._emit_error(type(exc).__name__, f"product update to {pin} failed: {exc}")
+
+    def _install_product(self, pin: str) -> None:
+        """Stop the tree, install the pinned version, re-exec in place
+        (ADR-0013 §8). Release pins install by name from the package index;
+        a served artifact set (the developer build path) is pulled from the
         Control Node and installed from local wheel files — nodes never
-        pull source and never build. The ack is persisted first so the
-        re-exec'd daemon does not replay the command."""
+        pull source and never build."""
         self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
-        version = str(self._desired.get("product_version", "") or "")
         artifacts = self._desired.get("product_artifacts")
         if isinstance(artifacts, list) and artifacts and self._client is not None:
-            targets = self._pull_artifacts(version, [str(a) for a in artifacts])
+            targets = self._pull_artifacts(pin, [str(a) for a in artifacts])
         else:
-            targets = [f"{name}=={version}" if version else name for name in UPDATE_PACKAGES]
+            targets = [f"{name}=={pin}" for name in UPDATE_PACKAGES]
         proc = self._update_runner(
             [sys.executable, "-m", "pip", "install", "--upgrade", *targets],
             capture_output=True,
@@ -395,8 +465,8 @@ class NodeDaemon:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"pip install failed: {(proc.stderr or '').strip()[-300:]}")
-        self._ack(command_id)
-        self._log(f"updated to {version or 'latest'}; re-exec")
+        self._update_done = True
+        self._log(f"updated to {pin}; re-exec")
         self._execv(sys.executable, [sys.executable, "-m", "theozolith_nodedaemon", *sys.argv[1:]])
 
     def _pull_artifacts(self, version: str, names: list[str]) -> list[str]:

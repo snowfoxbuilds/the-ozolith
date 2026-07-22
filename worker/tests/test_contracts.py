@@ -250,13 +250,17 @@ def test_claude_adapter_headless_command():
         adapter="claude",
         model="claude-sonnet-5",
     )
-    argv = adapter.command(manifest, "do the thing\n")
-    # Headless one-shot (ADR-0019): the prompt rides the invocation and the
-    # structured output stream is the transcript.
-    assert argv[argv.index("-p") + 1] == "do the thing\n"
+    pointer = "Work on the task specified in /job/input/prompt.md. Read that file first."
+    argv = adapter.command(manifest, pointer)
+    # Headless one-shot (ADR-0019 as amended): the constant-size POINTER
+    # rides the invocation and the structured output stream is the
+    # transcript. --verbose is load-bearing: the claude CLI requires it for
+    # -p with --output-format stream-json.
+    assert argv[argv.index("-p") + 1] == pointer
     assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
 
 
 def test_claude_adapter_prepare_installs_no_hooks(tmp_path):

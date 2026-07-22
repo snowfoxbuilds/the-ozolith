@@ -1,10 +1,11 @@
 """Harness adapters: the vendor-specific slice of a run-container image.
 
 An adapter knows three things about its agent CLI: the headless one-shot
-argv to invoke (prompt passed at invocation, completion is process exit —
-ADR-0019), how to read counters and token usage out of the structured
-output stream, and which session outputs to copy into the job directory.
-One adapter ships per image; M2 ships Claude only.
+argv to invoke (a constant-size pointer prompt at invocation — the task
+content stays in the mounted job directory; completion is process exit,
+ADR-0019 as amended), how to read counters and token usage out of the
+structured output stream, and which session outputs to copy into the job
+directory. One adapter ships per image; M2 ships Claude only.
 """
 
 from __future__ import annotations
@@ -38,7 +39,8 @@ class HarnessAdapter(Protocol):
     name: str
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
-        """The headless one-shot argv; the prompt rides the invocation."""
+        """The headless one-shot argv; ``prompt`` is the harness's
+        constant-size pointer at the mounted task file, never the task."""
         ...
 
     def prepare(self, workdir: Path, job: Path) -> dict[str, str]:
@@ -57,8 +59,9 @@ class HarnessAdapter(Protocol):
 class ClaudeHarnessAdapter:
     """Drives the Claude Code CLI. All Claude-specific mechanics live here.
 
-    The session runs headless: ``claude -p`` with the prompt as the argument
-    and ``--output-format stream-json``, so stdout is a line-per-event JSON
+    The session runs headless: ``claude -p`` with the pointer prompt as the
+    argument and ``--output-format stream-json`` (which requires
+    ``--verbose`` in one-shot mode), so stdout is a line-per-event JSON
     stream. That stream is the transcript, and its usage records supply the
     token counts progress telemetry carries.
     """

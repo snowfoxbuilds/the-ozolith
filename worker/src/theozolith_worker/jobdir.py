@@ -13,7 +13,8 @@ Layout::
     jobs/<run-id>/
       input/
         manifest.json    what to run: mode, adapter, model, timeouts
-        prompt.md        the prompt passed to the agent at invocation
+        prompt.md        the driver-rendered task; the invocation argv
+                         carries only a constant-size pointer to this file
         jobs/            driver-sequenced job requests (gate steps, shutdown)
       output/
         status.json      harness phase + agent outcome (atomic writes)

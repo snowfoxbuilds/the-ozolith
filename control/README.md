@@ -39,11 +39,16 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   (ADR-0019). One admin credential fronts all of it, behind a randomized public origin
   with exact Host/Origin enforcement (derived from the origin URL alone — independent
   of the Uvicorn bind host/port).
-- **Product updates** (ADR-0015 as amended 2026-07-22) — `theozolith update` pins a
-  published release; `theozolith build` pins a source checkout's git SHA and uploads
-  wheels the Control Node serves for node pulls. Both commit the pin to product.toml
-  and fan the update out over heartbeat responses, control-hosting node last; the
-  dashboard surfaces version skew against the recorded pin.
+- **Product updates** (ADR-0015 as amended) — `theozolith update` pins a published
+  release; `theozolith build` pins a CLEAN source checkout's git SHA (a dirty tree is
+  refused) and uploads wheels the Control Node serves for node pulls; `theozolith
+  test` is the local-development signal. Both update paths commit the pin to
+  product.toml; the pin is desired state that nodes converge to on every heartbeat
+  (failed installs self-retry; the fanned-out command is only a nudge), with the
+  control-hosting node queued last. Dispatch grants only to on-pin nodes — an update
+  pauses new dispatch fleet-wide until versions converge; persistently off-pin nodes
+  get a restart command, then a theozolith.error. The dashboard surfaces version skew
+  against the recorded pin.
 
 Availability (ADR-0017): with this service down, in-flight Runs finish and publish;
 new claims and review rounds pause. Drivers hold their own PATs for all non-claim

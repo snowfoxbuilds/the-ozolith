@@ -48,6 +48,14 @@ from theozolith_worker.jobdir import (
 DEFAULT_POLL_SECONDS = 0.5
 KILL_GRACE_SECONDS = 10.0  # SIGTERM at the deadline, SIGKILL after this
 
+# The pointer prompt (ADR-0019 as amended): the argv carries a constant-size
+# pointer at the driver-materialized task file, never the task content — the
+# invocation cannot outgrow ARG_MAX however large the task is.
+POINTER_PROMPT = (
+    "Work on the task specified in {path}. Read that file first — it is your"
+    " complete assignment — then execute it exactly."
+)
+
 # (command, cwd, timeout) -> (ok, exit code, output). Runs agent-authored
 # code, so the default is a plain shell in this (credential-free) container.
 JobRunner = Callable[[str, Path, float], tuple[bool, int, str]]
@@ -190,10 +198,9 @@ def run_harness(
         write_status(job, Status(phase=PHASE_FAILED, error=f"missing workdir {manifest.workdir}"))
         return 1
 
-    try:
-        prompt = (job / PROMPT_FILE).read_text(encoding="utf-8")
-    except OSError as exc:
-        write_status(job, Status(phase=PHASE_FAILED, error=f"missing prompt: {exc}"))
+    task_file = job / PROMPT_FILE
+    if not task_file.is_file():
+        write_status(job, Status(phase=PHASE_FAILED, error=f"missing task file {PROMPT_FILE}"))
         return 1
 
     transcript = job / TRANSCRIPT_FILE
@@ -202,7 +209,7 @@ def run_harness(
     # THEOZOLITH_JOB lets in-session tools (theozolith-validate-verdict)
     # find the manifest and outputs from inside the workdir.
     env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
-    argv = adapter.command(manifest, prompt)
+    argv = adapter.command(manifest, POINTER_PROMPT.format(path=task_file))
     write_status(job, Status(phase=PHASE_AGENT))
     try:
         process = launcher(argv, workdir, env, transcript)

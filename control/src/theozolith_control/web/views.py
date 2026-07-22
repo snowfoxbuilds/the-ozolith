@@ -12,6 +12,7 @@ import json
 import time
 from typing import Any
 
+from theozolith_control.app import ERROR_CONTEXT_LIMIT, ERROR_MESSAGE_LIMIT
 from theozolith_control.configrepo import DeployConfig
 from theozolith_control.store import EVENT_ERROR, EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
 
@@ -228,8 +229,10 @@ def errors_view(
                 "node": event["node"],
                 "component": event["component"],
                 "error_class": str(payload.get("error_class", "")),
-                "message": str(payload.get("message", ""))[:2000],
-                "context": str(payload.get("context", ""))[:2000],
+                # Display caps == ingestion caps: the expander shows the FULL
+                # stored context — depth was already bounded at ingestion.
+                "message": str(payload.get("message", ""))[:ERROR_MESSAGE_LIMIT],
+                "context": str(payload.get("context", ""))[:ERROR_CONTEXT_LIMIT],
             }
         )
     nodes, components = store.error_filters()

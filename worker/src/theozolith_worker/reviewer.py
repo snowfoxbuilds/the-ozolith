@@ -60,7 +60,7 @@ from theozolith_worker.containers import (
     review_container_name,
 )
 from theozolith_worker.decisions import section_text
-from theozolith_worker.dispatch import DispatchClient, WorkDispatch
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
 from theozolith_worker.events import EventSink, emit_error, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
@@ -547,12 +547,16 @@ def run_reviewer(
     sweep_orphans(config, log=log)  # recover orphaned review workspaces (ADR-0016)
 
     verdicts = 0
+    unreachable_streak = 0
     while True:
         try:
             targets = dispatch.review_targets(config.worker_id, config.node_name, me)
             if targets is None:
                 log("control node unreachable; review rounds paused (ADR-0017)")
+                unreachable_streak += 1
                 targets = []
+            else:
+                unreachable_streak = 0
             for number in targets:
                 pr = client.get_pull(number)
                 if not reviewable(pr.labels):
@@ -572,7 +576,9 @@ def run_reviewer(
             )
         if once:
             return verdicts
-        sleep(config.poll_seconds)
+        # Unreachable-Control backoff (ADR-0015 revision): capped doubling,
+        # snapping back to the poll interval on recovery.
+        sleep(backoff_delay(config.poll_seconds, unreachable_streak))
 
 
 def main(argv: list[str] | None = None) -> int:

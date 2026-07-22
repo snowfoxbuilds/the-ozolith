@@ -9,6 +9,7 @@ the deletion test's daemon half (boots with no config at all).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from pathlib import Path
@@ -18,6 +19,15 @@ from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
 
 def heartbeat_response(stacks, images=None, commands=None) -> dict:
     return {"commands": commands or [], "config": desired(stacks, images)}
+
+
+def pinned_response(stacks, commands=None, version="0.4.0") -> dict:
+    """A heartbeat answer whose desired state pins a product version the
+    rig's running daemon (0.3.0) has not converged to."""
+    return {
+        "commands": commands or [],
+        "config": {**desired(stacks), "product_version": version},
+    }
 
 
 # -- convergence: both Stack kinds (acceptance 5) --------------------------------
@@ -236,14 +246,110 @@ def test_update_stops_stacks_installs_pinned_version_and_reexecs(rig: Rig):
     assert json.loads(rig.daemon._acks_path.read_text()) == [4]
 
 
+# -- product convergence (revision ruling amending ADR-0015) --------------------------
+
+
+def test_offpin_node_converges_without_any_command(rig: Rig):
+    """The pin is desired state: a version mismatch alone triggers the
+    self-update — the fanned-out command is only a nudge."""
+    rig.control.heartbeat_answers.append(pinned_response([]))
+    rig.daemon.once()
+
+    (call,) = rig.update_calls
+    assert any("theozolith-nodedaemon==0.4.0" in arg for arg in call)
+    assert rig.execv_calls
+    assert rig.daemon._completed == []  # no command existed, nothing acked
+
+
+def test_failed_update_retries_on_a_later_pass_without_a_command(rig: Rig, monkeypatch):
+    """Acceptance 1: a failed install is retried by convergence on the next
+    pass — no re-queued command, no stranded node."""
+    calls: list[list[str]] = []
+
+    def failing_update(args, **_):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 1, "", "no matching distribution")
+
+    monkeypatch.setattr(rig.daemon, "_update_runner", failing_update)
+    rig.control.heartbeat_answers.append(pinned_response([]))
+    rig.daemon.once()
+    assert len(calls) == 1 and not rig.execv_calls
+    (event,) = rig.control.events
+    assert "product update to 0.4.0 failed" in event["message"]
+
+    rig.control.heartbeat_answers.append(pinned_response([]))
+    rig.daemon.once()  # the next pass simply tries again
+    assert len(calls) == 2
+
+
+def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
+    """Drain-aware semantics unchanged: an in-flight Run defers the
+    convergence attempt; the Run's end releases it."""
+    import shutil
+
+    stack, jobs = _driver_stack(tmp_path)
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()  # the driver child is up
+    (jobs / "r1").mkdir(parents=True)
+
+    rig.control.heartbeat_answers.append(pinned_response([stack]))
+    rig.daemon.once()
+    assert rig.update_calls == [] and rig.execv_calls == []  # deferred
+
+    shutil.rmtree(jobs / "r1")
+    rig.control.heartbeat_answers.append(pinned_response([stack]))
+    rig.daemon.once()
+    assert rig.update_calls and rig.execv_calls  # applied after the Run
+
+
+def test_restart_command_reexecs_without_installing(rig: Rig):
+    """The off-pin escalation step: stop the tree and re-exec in place —
+    no install (convergence owns installs)."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker")]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    restart = {"id": 15, "verb": "restart", "target": None, "force": False}
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([process_stack("worker")], commands=[restart])
+    )
+    rig.daemon.once()
+
+    assert first.returncode is not None  # the tree was stopped first
+    assert rig.execv_calls and rig.update_calls == []
+    assert 15 in rig.daemon._completed
+
+
+def test_unreachable_control_backoff_caps_and_recovers(rig: Rig):
+    """Acceptance 4: polling backs off exponentially (capped) while the
+    Control Node is unreachable and snaps back on recovery."""
+    from theozolith_nodedaemon.controlclient import ControlUnreachable
+
+    rig.control.heartbeat_answers.extend([ControlUnreachable("down")] * 4)
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    delays: list[float] = []
+
+    class _Stop(Exception):
+        pass
+
+    def sleeper(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= 5:
+            raise _Stop
+
+    with contextlib.suppress(_Stop):
+        rig.daemon.run(sleep=sleeper)
+    assert delays == [60, 120, 240, 300, 60]
+
+
 def test_update_installs_served_artifacts_from_the_control_node(rig: Rig):
     """The developer build path (ADR-0015, 2026-07-22): a pinned version
     with a served artifact set installs the pulled wheel FILES — the node
     never touches an index, never pulls source, never builds."""
-    version = "0.3.0+gabc123def456.dirty"
+    version = "0.3.0+gabc123def456"
     wheels = {
-        "theozolith_nodedaemon-0.3.0+gabc123def456.dirty-py3-none-any.whl": b"nodedaemon-wheel",
-        "theozolith_worker-0.3.0+gabc123def456.dirty-py3-none-any.whl": b"worker-wheel",
+        "theozolith_nodedaemon-0.3.0+gabc123def456-py3-none-any.whl": b"nodedaemon-wheel",
+        "theozolith_worker-0.3.0+gabc123def456-py3-none-any.whl": b"worker-wheel",
     }
     for name, payload in wheels.items():
         rig.control.artifacts[(version, name)] = payload
@@ -343,7 +449,7 @@ def test_update_install_failure_emits_an_error_event(rig: Rig, monkeypatch):
 
     monkeypatch.setattr(rig.daemon, "_update_runner", failing_update)
     rig.control.heartbeat_answers.append(
-        heartbeat_response([], commands=[{"id": 7, "verb": "update", "target": None}])
+        pinned_response([], commands=[{"id": 7, "verb": "update", "target": None}])
     )
     rig.daemon.once()
 
@@ -351,6 +457,8 @@ def test_update_install_failure_emits_an_error_event(rig: Rig, monkeypatch):
     (event,) = rig.control.events
     assert event["error_class"] == "RuntimeError"
     assert "pip install failed" in event["message"]
+    # The nudge command is consumed regardless: convergence owns the retry.
+    assert rig.daemon._completed == [7]
 
 
 def test_error_emission_failure_is_swallowed(rig: Rig, monkeypatch):
@@ -633,7 +741,7 @@ def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     rig.daemon.once()
 
     update = {"id": 11, "verb": "update", "target": None, "force": False}
-    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([stack], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls == [] and rig.execv_calls == []  # deferred
     assert rig.daemon._deferrals[11].startswith("behind run r1")
@@ -641,7 +749,7 @@ def test_update_mid_run_queues_behind_node_wide(rig: Rig, tmp_path):
     import shutil
 
     shutil.rmtree(jobs / "r1")
-    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([stack], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls and rig.execv_calls  # applied after the Run
 
@@ -734,17 +842,17 @@ def test_node_wide_update_waits_for_every_live_stack_but_not_parked_dirs(rig: Ri
     import shutil
 
     update = {"id": 40, "verb": "update", "target": None, "force": False}
-    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([worker, reviewer], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls == []  # the worker's Run defers it
 
     shutil.rmtree(tmp_path / "jobs-worker" / "r1")
-    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([worker, reviewer], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls == []  # …then the reviewer's Run defers it
 
     shutil.rmtree(tmp_path / "jobs-reviewer" / "review-9-round-1")
-    rig.control.heartbeat_answers.append(heartbeat_response([worker, reviewer], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([worker, reviewer], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls and rig.execv_calls  # parked dirs never blocked
 
@@ -758,6 +866,6 @@ def test_dead_drivers_run_dir_never_blocks_node_wide_update(rig: Rig, tmp_path):
     rig.popen.spawned[0].returncode = 0  # the driver died on its own
 
     update = {"id": 41, "verb": "update", "target": None, "force": False}
-    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[update]))
+    rig.control.heartbeat_answers.append(pinned_response([stack], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls and rig.execv_calls  # orphaned dir never deferred

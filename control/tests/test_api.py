@@ -250,6 +250,72 @@ def test_pending_lifecycle_command_pauses_grants_to_that_node(control: ControlRi
     assert control.dispatch(node="box1").json()["issue"]["number"] == 7
 
 
+def test_pin_bump_pauses_dispatch_fleet_wide_until_nodes_converge(control: ControlRig):
+    """ADR-0015 revision acceptance 2: dispatch grants only to nodes whose
+    REPORTED version equals the pin — issuing an update pauses new dispatch
+    fleet-wide; capacity returns node by node as versions converge."""
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    for node in ("box1", "box2"):
+        control.heartbeat(node=node, version="0.3.0")
+
+    refused = control.dispatch(worker="worker-a", node="box1").json()
+    assert refused["issue"] is None and "pin is 0.4.0" in refused["reason"]
+    assert control.dispatch(worker="worker-b", node="box2").json()["issue"] is None
+    # Reviewer discovery pauses on the same gate.
+    review = control.node_post(
+        "/api/v1/dispatch",
+        {"role": "reviewer", "worker": "rev-1", "node": "box1", "login": "ozolith-rev"},
+    ).json()
+    assert review["prs"] == [] and "pin is 0.4.0" in review["reason"]
+
+    # box1 converges: capacity returns for it alone.
+    control.heartbeat(node="box1", version="0.4.0")
+    assert control.dispatch(worker="worker-a", node="box1").json()["issue"]["number"] == 7
+    assert control.dispatch(worker="worker-b", node="box2").json()["issue"] is None
+
+
+def test_unreported_node_versions_stay_dispatch_eligible(control: ControlRig):
+    """The daemon-less dev shape heartbeats no version at all: the gate is
+    keyed on the reported version, and no report means no block."""
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    control.github.add_issue(9, labels={"plan_ready"}, assignees=[])
+    assert control.dispatch(worker="worker-a", node="ghost").json()["issue"]["number"] == 9
+
+
+def test_persistently_offpin_node_gets_restart_then_error_and_stays_ineligible(
+    control: ControlRig,
+):
+    """ADR-0015 revision acceptance 3: threshold consecutive off-pin beats
+    queue one restart; as many again, one theozolith.error — and the node
+    stays ineligible until it actually converges."""
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+
+    for _ in range(2):
+        assert control.heartbeat(node="box1", version="0.3.0").json()["commands"] == []
+    beat = control.heartbeat(node="box1", version="0.3.0").json()  # third off-pin beat
+    assert [c["verb"] for c in beat["commands"]] == ["restart"]
+    restart_id = beat["commands"][0]["id"]
+
+    # The restart is applied but the node STAYS off-pin: after as many
+    # beats again, the escalation event lands — exactly once.
+    for _ in range(3):
+        control.heartbeat(node="box1", version="0.3.0", completed_commands=[restart_id])
+    errors = control.store.error_events(component="control-node")
+    assert len(errors) == 1
+    assert errors[0]["payload"]["error_class"] == "update-not-converging"
+    assert "box1" in errors[0]["payload"]["message"]
+    # No second restart is ever queued; the node stays ineligible.
+    state = control.admin("GET", "/api/v1/state").json()
+    assert [c["verb"] for c in state["commands"] if c["verb"] == "restart"] == ["restart"]
+    assert control.dispatch(node="box1").json()["issue"] is None
+
+    # Actual convergence clears the tracking and reopens dispatch.
+    control.heartbeat(node="box1", version="0.4.0")
+    assert control.dispatch(node="box1").json()["issue"]["number"] == 7
+
+
 def test_dispatch_reviewer_side_is_discovery_only(control: ControlRig):
     control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
     control.github.add_pr(12, head_ref="ozolith/issue-6", labels={"pr_ready", "needs_human"})
@@ -410,8 +476,8 @@ def test_product_update_requires_admin_and_a_version(control: ControlRig):
 
 
 def test_artifact_upload_serve_roundtrip_and_heartbeat_references(control: ControlRig):
-    version = "0.3.0+gabc123def456.dirty"
-    wheel = "theozolith_worker-0.3.0+gabc123def456.dirty-py3-none-any.whl"
+    version = "0.3.0+gabc123def456"
+    wheel = "theozolith_worker-0.3.0+gabc123def456-py3-none-any.whl"
     upload = control.client.put(
         f"/api/v1/product/artifacts/{version}/{wheel}",
         content=b"wheel-bytes",
@@ -432,6 +498,22 @@ def test_artifact_upload_serve_roundtrip_and_heartbeat_references(control: Contr
     beat = control.heartbeat(node="box1").json()
     assert beat["config"]["product_version"] == version
     assert beat["config"]["product_artifacts"] == [wheel]
+
+
+def test_pin_changes_prune_the_artifact_store_to_pinned_plus_previous(control: ControlRig):
+    """Cache, not archive: at most the pinned and the previous version's
+    artifact sets survive a pin change (the previous is the rollback path)."""
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    for version in ("0.3.0+gaaa111", "0.3.0+gbbb222", "0.3.0+gccc333"):
+        upload = control.client.put(
+            f"/api/v1/product/artifacts/{version}/x.whl", content=b"w", headers=headers
+        )
+        assert upload.status_code == 200
+        pinned = control.admin("POST", "/api/v1/product/update", {"version": version})
+        assert pinned.status_code == 200
+
+    kept = sorted(p.name for p in control.settings.artifacts_dir.iterdir())
+    assert kept == ["0.3.0+gbbb222", "0.3.0+gccc333"]  # the oldest set is gone
 
 
 def test_artifact_endpoints_refuse_unsafe_segments_and_unknown_files(control: ControlRig):

@@ -47,6 +47,9 @@ class ControlSettings:
     # ADR-0016 cache-not-archive: progress-telemetry byte budget (oldest-first
     # eviction; terminal events are never evicted).
     tail_budget_bytes: int
+    # ADR-0015 revision: consecutive off-pin heartbeats before the restart
+    # escalation (a theozolith.error follows after as many again).
+    offpin_beats: int = 3
     # True only when the server terminates TLS itself or an operator
     # explicitly opted into insecure dev mode: gates the secret endpoints.
     secrets_channel_ok: bool = False
@@ -127,6 +130,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         janitor_sweep_seconds=_float(environ, "THEOZOLITH_JANITOR_SWEEP_SECONDS", "60"),
         activation_window_seconds=_float(environ, "THEOZOLITH_ACTIVATION_WINDOW_SECONDS", "60"),
         tail_budget_bytes=int(_float(environ, "THEOZOLITH_TAIL_BUDGET_BYTES", str(10 * 1024**3))),
+        offpin_beats=int(_float(environ, "THEOZOLITH_OFFPIN_BEATS", "3")),
         # The env override is an expert escape hatch (it wins over the
         # artifact); the sanctioned source is the origin-init file in the
         # data dir. Format-checked at serve/app startup — but entropy cannot
