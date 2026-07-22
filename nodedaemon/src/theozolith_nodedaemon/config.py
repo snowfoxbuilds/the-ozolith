@@ -91,9 +91,9 @@ def load_daemon_config(environ: Mapping[str, str] | None = None) -> DaemonConfig
 
 def running_product_version() -> str:
     """The RUNNING product version, from the installed distribution's real
-    metadata (ADR-0015, 2026-07-22): a source build's ``+g<sha>[.dirty]``
-    local version survives into heartbeats, so the dashboard can compare
-    every node against the recorded pin."""
+    metadata (ADR-0015 as revised): a source build's ``+g<sha>`` local
+    version survives into heartbeats, so pin convergence and the dispatch
+    eligibility gate compare every node against the recorded pin."""
     import importlib.metadata
 
     try:
