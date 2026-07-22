@@ -33,6 +33,9 @@ KNOWN_CHANNEL_PATHS = {
     # theozolith.error summaries (2026-07-21 grilling): references and
     # size-capped text only, never secret values.
     "/api/v1/events",
+    # Built-artifact pulls (ADR-0015, 2026-07-22) use
+    # /api/v1/product/artifacts/<version>/<filename> — wheel bytes flow
+    # control->node only; the daemon sends nothing but the bearer header.
 }
 
 HEARTBEAT_REQUEST_KEYS = {
