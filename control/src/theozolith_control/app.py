@@ -170,6 +170,7 @@ def create_app(
             _list_of_dicts(body, "stacks"),
             _list_of_dicts(body, "run_containers"),
             _list_of_dicts(body, "images"),
+            stack_containers=_list_of_dicts(body, "stack_containers"),
         )
         completed = body.get("completed_commands", [])
         if isinstance(completed, list):

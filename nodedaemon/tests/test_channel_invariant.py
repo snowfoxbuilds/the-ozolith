@@ -40,6 +40,7 @@ HEARTBEAT_REQUEST_KEYS = {
     "version",
     "stacks",
     "run_containers",
+    "stack_containers",  # web-terminal target evidence (ADR-0019)
     "images",
     "config_commit",
     "completed_commands",

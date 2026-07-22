@@ -230,12 +230,25 @@ def mount_web(
 
     def _attach_target(node: str, container: str) -> tuple[list[str] | None, str, str]:
         """(attach argv, owning stack, error). The target is resolved from
-        the live container record and its Stack derived server-side from
-        ``owner`` (ADR-0019) — caller-supplied Stack identity is not an
-        authority. Refusals, in order: unknown/wrong-node container, stale
-        heartbeat, unknown owner, no attach configuration, and identifier
-        validation (forged heartbeat values die here, never in a shell)."""
-        record = store.container_record(node, container)
+        the live stack-container record and its Stack derived server-side
+        (ADR-0022) — caller-supplied Stack identity is not an authority.
+        Run containers are categorically refused (ADR-0019: Runs are
+        headless; the Flight Deck and other configured container Stacks own
+        interactivity). Remaining refusals, in order: unknown/wrong-node
+        container, stale heartbeat, unknown owning Stack, non-container
+        kind, no attach configuration, and identifier validation (forged
+        heartbeat values die here, never in a shell)."""
+        run_record = store.container_record(node, container)
+        if run_record is not None:
+            return (
+                None,
+                run_record["owner"],
+                (
+                    f"container {container!r} is a run container — run containers are"
+                    " headless and never attach targets (ADR-0019)"
+                ),
+            )
+        record = store.stack_container_record(node, container)
         if record is None:
             return None, "", f"container {container!r} is not live on {node!r} (per heartbeats)"
         if record["age_seconds"] > ATTACH_FRESH_SECONDS:
@@ -247,7 +260,7 @@ def mount_web(
                     f" ({record['age_seconds']:.0f}s old) — refusing to attach"
                 ),
             )
-        owner = record["owner"]
+        owner = record["stack"]
         stack_def = next((s for s in _config().stacks if s.name == owner and s.node == node), None)
         if stack_def is None:
             return (
@@ -255,8 +268,14 @@ def mount_web(
                 owner,
                 (
                     f"container {container!r} has no configured owning Stack on {node!r}"
-                    f" (owner {owner!r})"
+                    f" (stack {owner!r})"
                 ),
+            )
+        if stack_def.kind != "container":
+            return (
+                None,
+                owner,
+                f"stack {owner!r} on {node!r} is not a container-kind Stack (ADR-0019)",
             )
         if not stack_def.attach:
             return (

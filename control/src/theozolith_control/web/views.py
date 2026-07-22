@@ -56,7 +56,11 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
     state = store.fleet_state()
     quarantined = {q["node"]: q for q in store.quarantines()}
     skewed = image_skew(state["images"])
-    attach_by_stack = {stack.name: bool(stack.attach) for stack in config.stacks}
+    # Attach affordances exist only for container-kind Stacks (ADR-0019):
+    # run containers are headless and never attach targets.
+    attach_by_stack = {
+        stack.name: bool(stack.attach) for stack in config.stacks if stack.kind == "container"
+    }
 
     nodes = []
     for node in state["nodes"]:
@@ -80,12 +84,13 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
                     "converged": want == have,
                 }
             )
-        containers = [
+        containers = [c for c in state["run_containers"] if c["node"] == name]
+        stack_containers = [
             {
                 **c,
-                "attachable": attach_by_stack.get(c["owner"], False),
+                "attachable": attach_by_stack.get(c["stack"], False),
             }
-            for c in state["run_containers"]
+            for c in state["stack_containers"]
             if c["node"] == name
         ]
         images = [
@@ -100,6 +105,7 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
                 "quarantine": quarantined.get(name),
                 "stacks": stacks,
                 "containers": containers,
+                "stack_containers": stack_containers,
                 "images": images,
             }
         )

@@ -56,7 +56,8 @@ below.
 3. **Config Repo** (`~/.theozolith/configs` on the Control Node; ADR-0006): declare
    Stacks and derived images — `deploy/configs-example/` is a complete starter. Desired
    state distributes over the heartbeat channel; nodes cache it for degraded mode.
-   The Worker/Reviewer drivers are process-kind Stacks; `control` is a container Stack.
+   The Implementer/Reviewer drivers are process-kind Stacks; `control` and the Flight
+   Deck are container Stacks.
 
 4. **Secrets**: enter values once —
 
@@ -87,10 +88,13 @@ below.
    presence is the in-flight signal; the deferral shows in heartbeats and on the
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
    (same origin as the API, behind the admin credential) is the read-only fleet view
-   plus secret entry and the web terminal: to expose a Stack's live run containers to
-   the terminal, give it an `attach` argv array in the Config Repo (see
-   `deploy/configs-example/stacks/worker.toml`; free-form command strings are rejected,
-   ADR-0019).
+   plus secret entry, the errors panel (`theozolith.error` summaries with
+   node/component filters — depth stays in each node's journal and the evidence
+   bundles), and the web terminal. Terminal targets are container-kind Stacks with an
+   `attach` argv array in the Config Repo — the Flight Deck first among them (see
+   `deploy/configs-example/stacks/flightdeck.toml`; free-form command strings are
+   rejected, ADR-0022). Run containers are headless and never attach targets
+   (ADR-0019).
 
    The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence
@@ -141,20 +145,24 @@ the files owned by the driver user either by building the image with
 `--build-arg OZOLITH_UID=$(id -u)` (or matching uid in the image recipe) or by setting
 `THEOZOLITH_CONTAINER_USER=$(id -u):$(id -g)`.
 
-## Observing and attaching
+## Observing Runs, and the Flight Deck
 
-- Live containers: `docker ps --filter label=theozolith.owner` — names are
+- Live run containers: `docker ps --filter label=theozolith.owner` — names are
   `ozolith-run-<run-id>` and `ozolith-review-<pr>-round-<n>`; heartbeats report the same
-  set to the Control Node.
-- Attach to any live agent session (input is permitted and lands in the transcript):
-
-  ```sh
-  docker exec -it ozolith-run-<run-id> tmux attach
-  ```
-
-  Detach with `C-b d`. No live run container = nothing to attach to.
-- Evidence bundles (incl. full session transcripts): branch `theozolith/evidence`
-  in the target repo, `runs/issue-<N>/`.
+  set to the Control Node. Runs are **headless** (ADR-0019): there is no session to
+  attach to and no mid-Run steering — watch progress telemetry on the dashboard, read
+  the evidence bundle afterwards, or kill the Run (`recycle`).
+- Evidence bundles (incl. the structured-output session transcripts and token usage):
+  branch `theozolith/evidence` in the target repo, `runs/issue-<N>/`.
+- **The Flight Deck** is where interactive agent work happens: a container-kind Stack
+  running the agent CLI in a named tmux session (`deploy/configs-example/stacks/
+  flightdeck.toml`), attached from the web terminal (attach/detach audit-logged; the
+  session transcript captures typed input). Its GitHub credential is a **dedicated
+  machine identity** — a fine-grained PAT scoped to issues, PRs, and contents with
+  **no merge permission**, stored under the dedicated secret name
+  `flightdeck-github-token`. Never reuse a driver PAT and never use a personal token
+  here; the human merge gate stays human by construction. Do not leave Flight Deck
+  sessions running unattended.
 
 ## Cleanup / deletion test
 

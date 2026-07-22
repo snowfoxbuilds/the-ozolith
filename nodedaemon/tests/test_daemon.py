@@ -257,6 +257,32 @@ def test_failed_command_is_not_acked(rig: Rig, monkeypatch):
     assert "docker is down" in event["message"]
 
 
+def test_flightdeck_style_stack_runs_its_command_and_reports_its_container(rig: Rig):
+    """ADR-0019: a container Stack's optional command starts the named tmux
+    session, and the heartbeat reports the stack container as web-terminal
+    target evidence."""
+    stack = container_stack(
+        "flightdeck",
+        image="ghcr.io/example/flightdeck:1",
+        command="tmux new-session -d -s flightdeck claude",
+        ports=[],
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    row = rig.docker.stacks["ozolith-stack-flightdeck"]
+    assert row["command"] == ["tmux", "new-session", "-d", "-s", "flightdeck", "claude"]
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    payload = rig.control.transcript[-1][2]
+    (record,) = payload["stack_containers"]
+    assert record["name"] == "ozolith-stack-flightdeck"
+    assert record["stack"] == "flightdeck"
+    assert record["state"] == "running"
+    # Run containers stay in their own list: never attach targets.
+    assert payload["run_containers"] == []
+
+
 # -- error events (2026-07-21 grilling) -------------------------------------------------
 
 

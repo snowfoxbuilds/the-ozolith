@@ -107,6 +107,7 @@ class DockerCtl:
         env: dict[str, str],
         ports: list[str],
         volumes: list[str],
+        command: list[str] | None = None,
     ) -> None:
         """Single-image container Stack: one long-running container."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
@@ -133,6 +134,7 @@ class DockerCtl:
         for volume in volumes:
             args += ["--volume", volume]
         args.append(image)
+        args.extend(command or [])
         self._run(args)
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:

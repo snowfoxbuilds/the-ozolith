@@ -95,7 +95,9 @@ class FakeDocker:
 
     # -- container Stacks ----------------------------------------------------
 
-    def run_stack_container(self, stack, image, *, env_files, env, ports, volumes) -> None:
+    def run_stack_container(
+        self, stack, image, *, env_files, env, ports, volumes, command=None
+    ) -> None:
         self.stacks[f"ozolith-stack-{stack}"] = {
             "stack": stack,
             "image": image,
@@ -104,6 +106,7 @@ class FakeDocker:
             "env": dict(env),
             "ports": list(ports),
             "volumes": list(volumes),
+            "command": list(command or []),
         }
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:

@@ -14,13 +14,12 @@ from theozolith_control.web.auth import SESSION_COOKIE
 
 ADMIN_BEARER = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
-# The attach argv (ADR-0019): placeholders only as complete arguments. The
-# sh trampoline receives the validated container name as $1.
+# Process Stacks expose no terminal (ADR-0019: run containers are headless
+# and never attach targets).
 WORKER_STACK_TOML = """\
 kind = "process"
 node = "box1"
 command = "theozolith-worker"
-attach = ["sh", "-c", "printf 'hello-%s' \\"$1\\"; cat", "attach-sh", "{container}"]
 
 [secrets]
 WORKER_GITHUB_TOKEN = "github-worker"
@@ -30,6 +29,28 @@ MUTE_STACK_TOML = """\
 kind = "process"
 node = "box1"
 command = "acme-runner"
+"""
+
+# The Flight Deck (ADR-0019): the web terminal's primary target — a
+# container-kind Stack with its own machine identity and an attach argv
+# (placeholders only as complete arguments; the sh trampoline receives the
+# validated container name as $1).
+FLIGHTDECK_STACK_TOML = """\
+kind = "container"
+node = "box1"
+image = "ghcr.io/example/flightdeck:1"
+command = "tmux new-session -d -s flightdeck claude"
+attach = ["sh", "-c", "printf 'hello-%s' \\"$1\\"; cat", "attach-sh", "{container}"]
+
+[secrets]
+GITHUB_TOKEN = "flightdeck-github-token"
+"""
+
+# A container Stack with no attach command: exposes no terminal.
+MUTE_DECK_TOML = """\
+kind = "container"
+node = "box1"
+image = "ghcr.io/example/mutedeck:1"
 """
 
 # A syntactically conforming public origin (26 base32 chars of slug).
@@ -51,6 +72,24 @@ def heartbeat_worker_node(control: ControlRig, state: str = "running") -> None:
         stacks=[{"name": "worker", "kind": "process", "state": state, "detail": "pid 7"}],
         run_containers=[
             {"name": "ozolith-run-r1", "run_id": "r1", "owner": "worker", "status": "Up"}
+        ],
+    )
+
+
+FLIGHTDECK_CONTAINER = "ozolith-stack-flightdeck"
+
+
+def heartbeat_flightdeck_node(control: ControlRig) -> None:
+    control.heartbeat(
+        node="box1",
+        stacks=[{"name": "flightdeck", "kind": "container", "state": "running", "detail": "Up"}],
+        stack_containers=[
+            {
+                "name": FLIGHTDECK_CONTAINER,
+                "stack": "flightdeck",
+                "state": "running",
+                "status": "Up",
+            }
         ],
     )
 
@@ -277,47 +316,78 @@ def test_secret_form_refuses_without_the_tls_channel(tmp_path):
 
 
 def test_attach_affordance_requires_config_and_live_container(control: ControlRig):
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    control.write_config("stacks/mutedeck.toml", MUTE_DECK_TOML)
     control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    control.write_config("stacks/acme.toml", MUTE_STACK_TOML)
     login(control)
     control.heartbeat(
         node="box1",
         stacks=[
+            {"name": "flightdeck", "kind": "container", "state": "running", "detail": ""},
+            {"name": "mutedeck", "kind": "container", "state": "running", "detail": ""},
             {"name": "worker", "kind": "process", "state": "running", "detail": ""},
-            {"name": "acme", "kind": "process", "state": "running", "detail": ""},
         ],
         run_containers=[
             {"name": "ozolith-run-r1", "run_id": "r1", "owner": "worker", "status": "Up"},
-            {"name": "ozolith-run-r9", "run_id": "r9", "owner": "acme", "status": "Up"},
+        ],
+        stack_containers=[
+            {
+                "name": FLIGHTDECK_CONTAINER,
+                "stack": "flightdeck",
+                "state": "running",
+                "status": "Up",
+            },
+            {
+                "name": "ozolith-stack-mutedeck",
+                "stack": "mutedeck",
+                "state": "running",
+                "status": "Up",
+            },
         ],
     )
     page = control.client.get("/fragments/fleet").text
-    # The attach affordance exists exactly for the Stack with an attach command.
-    assert "/terminal?node=box1&amp;container=ozolith-run-r1" in page
-    assert "container=ozolith-run-r9" not in page
+    # The attach affordance exists exactly for the Stack with an attach
+    # command; run containers never get one (ADR-0019).
+    assert f"/terminal?node=box1&amp;container={FLIGHTDECK_CONTAINER}" in page
+    assert "container=ozolith-stack-mutedeck" not in page
+    assert "container=ozolith-run-r1" not in page
 
-    # The no-attach Stack (derived from the container's owner — the URL
+    # The no-attach Stack (derived from the container's stack — the URL
     # names no Stack at all) and a dead container both refuse the page.
     no_attach = control.client.get(
-        "/terminal", params={"node": "box1", "container": "ozolith-run-r9"}
+        "/terminal", params={"node": "box1", "container": "ozolith-stack-mutedeck"}
     )
     assert "exposes no terminal" in no_attach.text
-    dead = control.client.get("/terminal", params={"node": "box1", "container": "ozolith-run-gone"})
+    dead = control.client.get(
+        "/terminal", params={"node": "box1", "container": "ozolith-stack-gone"}
+    )
     assert "not live" in dead.text
 
 
-def test_terminal_bridge_relays_io_and_audit_logs_the_session(control: ControlRig):
-    """Acceptance 6: attach works, the audit log records actor, timestamp,
-    target (with the server-derived Stack), and the detach reason."""
+def test_run_containers_are_never_attach_targets(control: ControlRig):
+    """ADR-0019 acceptance: a live run container is refused categorically,
+    and a process Stack cannot even declare an attach command."""
     control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
+    login(control)
     heartbeat_worker_node(control)
+    page = control.client.get("/terminal", params={"node": "box1", "container": "ozolith-run-r1"})
+    assert "never attach targets (ADR-0019)" in page.text
+    assert _refused_ws(control, "/terminal/ws?node=box1&container=ozolith-run-r1") == 4404
+
+
+def test_terminal_bridge_relays_io_and_audit_logs_the_session(control: ControlRig):
+    """Acceptance 6: attach works (the Flight Deck is the target), the audit
+    log records actor, timestamp, target (with the server-derived Stack),
+    and the detach reason."""
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(control)
 
     with control.client.websocket_connect(
-        "/terminal/ws?node=box1&container=ozolith-run-r1",
+        f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}",
         headers=ADMIN_BEARER,
     ) as socket:
         received = b""
-        while b"hello-ozolith-run-r1" not in received:
+        while f"hello-{FLIGHTDECK_CONTAINER}".encode() not in received:
             received += socket.receive_bytes()
         socket.send_json({"resize": {"cols": 120, "rows": 40}})
         socket.send_bytes(b"echo-me\n")
@@ -329,21 +399,23 @@ def test_terminal_bridge_relays_io_and_audit_logs_the_session(control: ControlRi
     ]
     attach = next(line for line in lines if line["event"] == "attach")
     assert attach["actor"] == "admin" and attach["at"]
-    assert attach["node"] == "box1" and attach["container"] == "ozolith-run-r1"
-    assert attach["stack"] == "worker"  # derived from the live owner
+    assert attach["node"] == "box1" and attach["container"] == FLIGHTDECK_CONTAINER
+    assert attach["stack"] == "flightdeck"  # derived from the live record
     assert attach["command"][0] == "sh" and "{container}" not in attach["command"]
     detach = next(line for line in lines if line["event"] == "detach")
-    assert detach["container"] == "ozolith-run-r1"
+    assert detach["container"] == FLIGHTDECK_CONTAINER
     assert detach["reason"] == "client-closed"
 
 
 def test_terminal_websocket_rejects_unauthenticated_and_unconfigured(control: ControlRig):
-    control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    heartbeat_worker_node(control)
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(control)
     # No credential at all.
     with (
         pytest.raises(WebSocketDisconnect) as refused,
-        control.client.websocket_connect("/terminal/ws?node=box1&container=ozolith-run-r1"),
+        control.client.websocket_connect(
+            f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}"
+        ),
     ):
         pass
     assert refused.value.code == 4401
@@ -351,7 +423,7 @@ def test_terminal_websocket_rejects_unauthenticated_and_unconfigured(control: Co
     with (
         pytest.raises(WebSocketDisconnect) as refused,
         control.client.websocket_connect(
-            "/terminal/ws?node=box1&container=ozolith-run-gone",
+            "/terminal/ws?node=box1&container=ozolith-stack-gone",
             headers=ADMIN_BEARER,
         ),
     ):
@@ -375,57 +447,67 @@ def test_terminal_stack_is_derived_from_the_live_owner(control: ControlRig):
     """Acceptance 4: the URL carries no Stack authority — an attach-enabled
     Stack cannot be used to reach a container owned by a Stack without
     attach configuration."""
-    control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    control.write_config("stacks/acme.toml", MUTE_STACK_TOML)
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    control.write_config("stacks/mutedeck.toml", MUTE_DECK_TOML)
     control.heartbeat(
         node="box1",
-        run_containers=[
-            {"name": "ozolith-run-r9", "run_id": "r9", "owner": "acme", "status": "Up"}
+        stack_containers=[
+            {
+                "name": "ozolith-stack-mutedeck",
+                "stack": "mutedeck",
+                "state": "running",
+                "status": "",
+            },
         ],
     )
-    # A forged stack=worker query param changes nothing: the owner is acme.
-    code = _refused_ws(control, "/terminal/ws?node=box1&stack=worker&container=ozolith-run-r9")
+    # A forged stack=flightdeck query param changes nothing: the owner is
+    # mutedeck.
+    code = _refused_ws(
+        control, "/terminal/ws?node=box1&stack=flightdeck&container=ozolith-stack-mutedeck"
+    )
     assert code == 4404
 
 
 def test_terminal_refuses_stale_heartbeat_evidence(control: ControlRig):
     """Acceptance 5: attach demands fresh heartbeat evidence."""
-    control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    heartbeat_worker_node(control)
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(control)
     control.clock.advance(151)  # past the ~2.5-missed-beats bound
-    assert _refused_ws(control, "/terminal/ws?node=box1&container=ozolith-run-r1") == 4404
+    assert _refused_ws(control, f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}") == 4404
     page = control.client.get(
-        "/terminal", params={"node": "box1", "container": "ozolith-run-r1"}, headers=ADMIN_BEARER
+        "/terminal",
+        params={"node": "box1", "container": FLIGHTDECK_CONTAINER},
+        headers=ADMIN_BEARER,
     )
     assert "stale" in page.text
 
-    heartbeat_worker_node(control)  # fresh evidence again: attach works
+    heartbeat_flightdeck_node(control)  # fresh evidence again: attach works
     with control.client.websocket_connect(
-        "/terminal/ws?node=box1&container=ozolith-run-r1", headers=ADMIN_BEARER
+        f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}", headers=ADMIN_BEARER
     ) as socket:
         assert b"hello" in socket.receive_bytes()
 
 
 def test_terminal_refuses_wrong_node_and_unknown_owner(control: ControlRig):
-    control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    heartbeat_worker_node(control)
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(control)
     # The container is live on box1, not box2.
-    assert _refused_ws(control, "/terminal/ws?node=box2&container=ozolith-run-r1") == 4404
-    # A container whose owner is no configured Stack on the node.
+    assert _refused_ws(control, f"/terminal/ws?node=box2&container={FLIGHTDECK_CONTAINER}") == 4404
+    # A container whose stack is no configured Stack on the node.
     control.heartbeat(
         node="box1",
-        run_containers=[
-            {"name": "ozolith-run-r1", "run_id": "r1", "owner": "worker", "status": "Up"},
-            {"name": "ozolith-run-x1", "run_id": "x1", "owner": "ghost", "status": "Up"},
+        stack_containers=[
+            {"name": FLIGHTDECK_CONTAINER, "stack": "flightdeck", "state": "running", "status": ""},
+            {"name": "ozolith-stack-x1", "stack": "ghost", "state": "running", "status": ""},
         ],
     )
-    assert _refused_ws(control, "/terminal/ws?node=box1&container=ozolith-run-x1") == 4404
+    assert _refused_ws(control, "/terminal/ws?node=box1&container=ozolith-stack-x1") == 4404
 
 
 def test_forged_heartbeat_identifiers_never_reach_the_command(control: ControlRig):
     """Acceptance 2-3: hostile container names from a forged heartbeat die
     in validation, before any process launch."""
-    control.write_config("stacks/worker.toml", WORKER_STACK_TOML)
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
     hostile = [
         "run;rm -rf /",
         "run$(reboot)",
@@ -437,9 +519,9 @@ def test_forged_heartbeat_identifiers_never_reach_the_command(control: ControlRi
     ]
     control.heartbeat(
         node="box1",
-        run_containers=[
-            {"name": name, "run_id": f"r{i}", "owner": "worker", "status": "Up"}
-            for i, name in enumerate(hostile)
+        stack_containers=[
+            {"name": name, "stack": "flightdeck", "state": "running", "status": ""}
+            for name in hostile
         ],
     )
     for name in hostile:
@@ -544,30 +626,29 @@ def test_bearer_clients_work_without_origin(tmp_path):
 
 def test_cookie_websocket_requires_exact_origin(tmp_path):
     rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
-    rig.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    heartbeat_worker_node(rig)
+    rig.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(rig)
     cookie = rig.client.app.state.admin_sessions.login(ADMIN_TOKEN)
     with_cookie = {"Cookie": f"{SESSION_COOKIE}={cookie}"}
 
-    code = _refused_ws(rig, "/terminal/ws?node=box1&container=ozolith-run-r1", with_cookie)
+    target = f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}"
+    code = _refused_ws(rig, target, with_cookie)
     assert code == 4403  # no Origin at all
     code = _refused_ws(
         rig,
-        "/terminal/ws?node=box1&container=ozolith-run-r1",
+        target,
         {**with_cookie, "Host": CANONICAL_HOST, "Origin": "https://evil.example"},
     )
     assert code == 4403
 
     with rig.client.websocket_connect(
-        "/terminal/ws?node=box1&container=ozolith-run-r1",
+        target,
         headers={**with_cookie, **CANONICAL_HEADERS},
     ) as socket:
         assert b"hello" in socket.receive_bytes()
 
     # Bearer websockets never need an Origin (non-browser clients).
-    with rig.client.websocket_connect(
-        "/terminal/ws?node=box1&container=ozolith-run-r1", headers=ADMIN_BEARER
-    ) as socket:
+    with rig.client.websocket_connect(target, headers=ADMIN_BEARER) as socket:
         assert b"hello" in socket.receive_bytes()
 
 
@@ -576,13 +657,12 @@ def test_cookie_websocket_requires_exact_origin(tmp_path):
 
 def test_terminal_session_cap_refuses_excess_without_launching(tmp_path):
     rig = make_rig(tmp_path, terminal_session_cap=1)
-    rig.write_config("stacks/worker.toml", WORKER_STACK_TOML)
-    heartbeat_worker_node(rig)
-    with rig.client.websocket_connect(
-        "/terminal/ws?node=box1&container=ozolith-run-r1", headers=ADMIN_BEARER
-    ) as first:
+    rig.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    heartbeat_flightdeck_node(rig)
+    target = f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}"
+    with rig.client.websocket_connect(target, headers=ADMIN_BEARER) as first:
         assert b"hello" in first.receive_bytes()
-        code = _refused_ws(rig, "/terminal/ws?node=box1&container=ozolith-run-r1")
+        code = _refused_ws(rig, target)
         assert code == 4429
 
     lines = [json.loads(line) for line in rig.settings.terminal_audit_path.read_text().splitlines()]

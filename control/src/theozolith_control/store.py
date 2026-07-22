@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS containers (
     updated_at REAL NOT NULL,
     PRIMARY KEY (node, name)
 );
+-- Container-kind Stack containers reported by heartbeat (ADR-0019): the
+-- web terminal's attach targets (the Flight Deck lives here); run
+-- containers above are never attach targets.
+CREATE TABLE IF NOT EXISTS stack_containers (
+    node TEXT NOT NULL,
+    name TEXT NOT NULL,
+    stack TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (node, name)
+);
 CREATE TABLE IF NOT EXISTS images (
     node TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -255,17 +267,33 @@ class Store:
         record["age_seconds"] = self._clock() - record["updated_at"]
         return record
 
+    def stack_container_record(self, node: str, name: str) -> dict[str, Any] | None:
+        """The live stack-container row a heartbeat last reported for
+        (node, name): the terminal's target authority for container-kind
+        Stacks (ADR-0019 — the Flight Deck attaches through this record;
+        ``stack`` is where the owning Stack is derived from)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM stack_containers WHERE node = ? AND name = ?", (node, name)
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["age_seconds"] = self._clock() - record["updated_at"]
+        return record
+
     def record_status(
         self,
         node: str,
         stacks: list[dict[str, Any]],
         containers: list[dict[str, Any]],
         images: list[dict[str, Any]],
+        stack_containers: list[dict[str, Any]] | None = None,
     ) -> None:
         """Replace the node's reported status with this heartbeat's."""
         now = self._clock()
         with self._lock, self._db:
-            for table in ("stacks", "containers", "images"):
+            for table in ("stacks", "containers", "images", "stack_containers"):
                 self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
             self._db.executemany(
                 "INSERT INTO stacks (node, name, kind, state, detail, updated_at)"
@@ -315,6 +343,22 @@ class Store:
                     )
                     for i in images
                     if i.get("name")
+                ],
+            )
+            self._db.executemany(
+                "INSERT INTO stack_containers (node, name, stack, state, status, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        node,
+                        str(c.get("name", "")),
+                        str(c.get("stack", "")),
+                        str(c.get("state", "")),
+                        str(c.get("status", "")),
+                        now,
+                    )
+                    for c in (stack_containers or [])
+                    if c.get("name")
                 ],
             )
 
@@ -829,6 +873,9 @@ class Store:
             nodes = self._db.execute("SELECT * FROM nodes ORDER BY name").fetchall()
             stacks = self._db.execute("SELECT * FROM stacks ORDER BY node, name").fetchall()
             containers = self._db.execute("SELECT * FROM containers ORDER BY node, name").fetchall()
+            stack_containers = self._db.execute(
+                "SELECT * FROM stack_containers ORDER BY node, name"
+            ).fetchall()
             images = self._db.execute("SELECT * FROM images ORDER BY node, name").fetchall()
             commands = self._db.execute(
                 "SELECT id, node, verb, target, force, created_at, delivered_at, completed_at,"
@@ -839,6 +886,7 @@ class Store:
             "nodes": [dict(r) for r in nodes],
             "stacks": [dict(r) for r in stacks],
             "run_containers": [dict(r) for r in containers],
+            "stack_containers": [dict(r) for r in stack_containers],
             "images": [dict(r) for r in images],
             "commands": [dict(r) for r in commands],
             "node_health": [dict(r) for r in health],

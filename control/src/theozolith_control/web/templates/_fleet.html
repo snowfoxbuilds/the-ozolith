@@ -28,16 +28,27 @@
     </tbody>
   </table>
   {% endif %}
-  {% if node.containers %}
-  <p class="muted">run containers:</p>
+  {% if node.stack_containers %}
+  <p class="muted">stack containers:</p>
   <ul class="flags">
-    {% for c in node.containers %}
-    <li><code>{{ c.name }}</code> <span class="muted">run {{ c.run_id }} · owner {{ c.owner }}
-        · {{ c.status }}</span>
+    {% for c in node.stack_containers %}
+    <li><code>{{ c.name }}</code> <span class="muted">stack {{ c.stack }} · {{ c.state }}
+        {{ c.status }}</span>
       {% if c.attachable %}
       <a class="button" href="/terminal?node={{ node.name }}&amp;container={{ c.name }}">attach</a>
       {% endif %}
     </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if node.containers %}
+  {# Run containers are headless and never attach targets (ADR-0019):
+     informational only — watch progress, read evidence, no terminal. #}
+  <p class="muted">run containers:</p>
+  <ul class="flags">
+    {% for c in node.containers %}
+    <li><code>{{ c.name }}</code> <span class="muted">run {{ c.run_id }} · owner {{ c.owner }}
+        · {{ c.status }}</span></li>
     {% endfor %}
   </ul>
   {% endif %}

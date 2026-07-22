@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -171,6 +172,7 @@ class NodeDaemon:
 
     def _status_payload(self) -> dict[str, Any]:
         stacks = []
+        stack_containers = []
         for stack in self._stacks():
             if stack.kind == "process":
                 state, detail = self._supervisor.status(stack.name)
@@ -183,6 +185,19 @@ class NodeDaemon:
                 running = [r for r in rows if r.get("state") == "running"]
                 state = "running" if running else "stopped"
                 detail = "; ".join(r.get("status", "") for r in rows[:3])
+                # Live container evidence for the web terminal (ADR-0019):
+                # the Flight Deck and other container Stacks attach through
+                # these records; run containers are never attach targets.
+                stack_containers.extend(
+                    {
+                        "name": str(row.get("name", "")),
+                        "stack": stack.name,
+                        "state": str(row.get("state", "")),
+                        "status": str(row.get("status", "")),
+                    }
+                    for row in rows
+                    if row.get("name")
+                )
             if stack.name in self._drained:
                 detail = (detail + " (drained)").strip()
             stacks.append(
@@ -193,6 +208,7 @@ class NodeDaemon:
             "version": self._config.version,
             "stacks": stacks,
             "run_containers": self._docker.run_containers(),
+            "stack_containers": stack_containers,
             "images": [image_status(self._docker, img) for img in self._images().values()],
             "config_commit": self._desired.get("commit", ""),
             "completed_commands": list(self._completed),
@@ -492,6 +508,9 @@ class NodeDaemon:
             env=stack.env,
             ports=list(stack.ports),
             volumes=list(stack.volumes),
+            # Optional docker-run command for the single-image form — how
+            # the Flight Deck starts its named tmux session (ADR-0019).
+            command=shlex.split(stack.command) if stack.command else None,
         )
 
     def _reap_orphans(self) -> None:

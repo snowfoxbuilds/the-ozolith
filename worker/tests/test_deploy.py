@@ -148,12 +148,17 @@ def test_no_tailscale_anywhere_in_product_code_or_deploy():
 
 def test_configs_example_parses_and_places_the_builtin_stacks():
     """The starter Config Repo must stay valid: worker/reviewer as process
-    Stacks, control as a container Stack (ADR-0013)."""
+    Stacks, control and the Flight Deck as container Stacks (ADR-0013/0019)."""
     from theozolith_control.configrepo import load_config
 
     config = load_config(REPO_ROOT / "deploy" / "configs-example")
     kinds = {stack.name: stack.kind for stack in config.stacks}
-    assert kinds == {"worker": "process", "reviewer": "process", "control": "container"}
+    assert kinds == {
+        "worker": "process",
+        "reviewer": "process",
+        "control": "container",
+        "flightdeck": "container",
+    }
     assert config.product_version
     assert "claude-dev" in config.images
     # The worker Stack's node gets exactly its referenced secrets.
@@ -163,3 +168,17 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     for node in {stack.node for stack in config.stacks}:
         state = config.desired_state_for(node)
         assert state["commit"]
+    # ADR-0019: run containers are never attach targets — no process Stack
+    # carries an attach command (the parser enforces it; this pins the
+    # example). The Flight Deck is the attach target, under its own
+    # dedicated machine-identity secret, distinct from every driver PAT.
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+    assert flightdeck.attach and "tmux" in flightdeck.attach
+    driver_secrets = {
+        name
+        for stack in config.stacks
+        if stack.kind == "process"
+        for name in stack.secrets.values()
+    }
+    assert flightdeck.secrets["GITHUB_TOKEN"] == "flightdeck-github-token"
+    assert "flightdeck-github-token" not in driver_secrets

@@ -1,0 +1,36 @@
+# The Flight Deck (ADR-0019): the interactive, human-driven agent container
+# — a container-kind Stack running an agent CLI inside a discoverably named
+# tmux session, and the web terminal's primary attach target. It is NOT a
+# pipeline actor: it never claims issues and holds no transition authority.
+#
+# GitHub identity: its OWN machine account with a fine-grained PAT scoped to
+# issues, PRs, and contents — NO merge permission — entered once as the
+# dedicated secret below. Never a driver PAT, and never anyone's personal
+# token: a prompt-injected session must not be able to perform human-
+# authority transitions (above all the merge) as a human. Do not leave
+# Flight Deck sessions running unattended.
+
+kind = "container"
+node = "box1"
+state = "running"
+image = "ghcr.io/example/flightdeck:1"   # agent CLI + tmux; pin your build
+
+# Start the named tmux session with the agent CLI in it, pipe the session
+# transcript (which captures typed input) to the log volume, and keep the
+# container alive. The session name ("flightdeck") is the discoverable
+# attach point.
+command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tail -f /dev/null'"
+
+# Web-terminal attach command, executed by the Control Node's PTY bridge as
+# a structured argv array ({host}/{container} only as complete arguments,
+# validated before launch). Attach and detach are audit-logged.
+attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]
+
+volumes = ["flightdeck-logs:/var/log/flightdeck"]
+
+# Secret NAMES only — the value lives encrypted on the Control Node
+# (`theozolith-control secret set flightdeck-github-token`). The name is
+# deliberately distinct from every driver PAT.
+[secrets]
+GITHUB_TOKEN = "flightdeck-github-token"
+ANTHROPIC_API_KEY = "anthropic-api-key"
