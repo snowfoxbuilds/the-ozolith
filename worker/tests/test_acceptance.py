@@ -116,6 +116,55 @@ def test_happy_path(harness: Harness):
     assert harness.record.alive == set()
 
 
+def test_process_issues_render_everywhere_and_change_no_state(harness: Harness):
+    """2026-07-22 grilling: a populated process_issues[] renders as a
+    Process issues block in the PR body and the verdict comment, and
+    provably changes no verdict, label, or gate outcome — the label sets
+    are exactly the ones the plain happy path produces."""
+    number = harness.file_issue("Add change.txt", CRITERIA_BODY, risk="medium")
+    harness.worker_behaviors.append(
+        behavior_write(
+            {"change.txt": "run 1\n"},
+            decisions=[{"what": "made the change", "why": "the issue asked"}],
+            process_issues=[
+                {"friction": "the gate ran twice", "suggested_fix": "dedupe gate steps"}
+            ],
+        )
+    )
+    assert harness.worker_once() == 1
+
+    (pr_number,) = harness.fake.open_pr_numbers()
+    body = harness.fake.issues[pr_number]["body"]
+    assert "### Process issues" in body
+    assert "the gate ran twice — suggested fix: dedupe gate steps" in body
+    section = decisions.parse(body)
+    assert section.process_issues == [
+        decisions.ProcessIssue("the gate ran twice", "dedupe gate steps")
+    ]
+    # Identical PR/issue state to the plain happy path: advisory only.
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+
+    harness.reviewer_replies.append(
+        approve_reply(
+            process_issues=[{"friction": "diff lacked context", "suggested_fix": "use -U10"}]
+        )
+    )
+    assert harness.reviewer_once() == 1
+
+    comment = harness.fake.comments[pr_number][-1]["body"]
+    assert comment.startswith("### Reviewer verdict: approve")
+    assert "#### Process issues" in comment
+    assert "diff lacked context — suggested fix: use -U10" in comment
+    # The exact label set an approve without process_issues produces.
+    assert harness.fake.labels_of(pr_number) == {
+        PR_READY,
+        NEEDS_HUMAN,
+        "deviation:low",
+        "risk:low",
+    }
+
+
 # -- 2. claims (write-through dispatch, ADR-0017) ------------------------------
 
 

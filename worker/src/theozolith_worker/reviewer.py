@@ -118,7 +118,13 @@ other output counts) with this JSON shape:
   "revised_plan": "numbered, concrete steps for the next Run (revise only, else empty)",
   "resume_commit": "commit SHA the next Run resets the branch to (revise \
 only; empty means current head)",
-  "cherry_pick": []}}
+  "cherry_pick": [],
+  "process_issues": []}}
+
+process_issues is optional and advisory: observations about the PIPELINE \
+itself (friction you hit reviewing — missing inputs, confusing evidence), \
+each as {{"friction": "...", "suggested_fix": "..."}}. Never findings about \
+the change under review; it influences no verdict, label, or gate outcome.
 
 deviation grades divergence from the plan (files outside the plan's \
 footprint, unrequested behavior, new dependencies, size far beyond \

@@ -21,6 +21,12 @@ def sample_section() -> decisions.DecisionsSection:
         remaining_work=["wire the CLI"],
         dead_ends=["tried ORM X; version conflict"],
         gate_findings=[Finding(step="lint", severity="warning", summary="fixed", fixed=True)],
+        process_issues=[
+            decisions.ProcessIssue(
+                friction="gate step timed out on cold cache",
+                suggested_fix="warm the dependency volume in the image",
+            )
+        ],
     )
 
 
@@ -30,6 +36,9 @@ def test_decisions_render_upsert_parse_roundtrip():
 
     assert body.startswith("Closes #7.")
     assert "### Decisions made" in body
+    # process_issues renders as its own block (2026-07-22 grilling)…
+    assert "### Process issues" in body
+    assert "gate step timed out on cold cache — suggested fix: warm the dependency" in body
     parsed = decisions.parse(body)
     assert parsed == section
 
@@ -38,6 +47,26 @@ def test_decisions_render_upsert_parse_roundtrip():
     assert updated.count(decisions.BEGIN) == 1
     assert decisions.parse(updated) == decisions.DecisionsSection()
     assert updated.startswith("Closes #7.")
+    # …and an empty field renders nothing at all.
+    assert "Process issues" not in updated
+
+
+def test_process_issues_parse_is_lenient_and_advisory():
+    # Malformed entries are dropped, never errors — advisory content cannot
+    # invalidate a decisions file.
+    raw = {
+        "process_issues": [
+            {"friction": "prompt was ambiguous"},
+            {"suggested_fix": "no friction key"},  # dropped
+            "bare string friction",
+            42,  # dropped
+        ]
+    }
+    section = decisions.section_from_dict(raw)
+    assert section.process_issues == [
+        decisions.ProcessIssue(friction="prompt was ambiguous"),
+        decisions.ProcessIssue(friction="bare string friction"),
+    ]
 
 
 def test_decisions_section_text_strips_machine_block():
@@ -82,12 +111,23 @@ def test_verdict_comment_roundtrip_and_latest():
         resume_commit="abc123",
         cherry_pick=["def456"],
         bundle_url="https://example.com/bundle",
+        process_issues=[
+            decisions.ProcessIssue(
+                friction="diff arrived without context lines",
+                suggested_fix="materialize diffs with -U10",
+            )
+        ],
     )
     body = verdict.render_comment(revise)
     assert "Reviewer verdict: revise (round 2)" in body
     assert "Resume from commit `abc123`" in body
+    assert "#### Process issues" in body
+    assert "diff arrived without context lines — suggested fix" in body
     assert verdict.parse_comment(body) == revise
     assert verdict.parse_comment("just chatting about `abc123`") is None
+    # An empty field renders no block at all.
+    plain = verdict.render_comment(verdict.Verdict(verdict=verdict.ESCALATE, round=1))
+    assert "Process issues" not in plain
 
     comments = [
         Comment(id=1, author="reviewer", body=body, created_at="t1"),
@@ -316,7 +356,68 @@ VALIDATOR_FIXTURES = [
     ({"verdict": "escalate", "evidence": "human needed"}, 3, 3),
     ("this is not json {", 1, 3),
     (None, 2, 3),  # no file at all
+    # process_issues (advisory): populated and malformed alike stay valid.
+    (
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
+        },
+        1,
+        3,
+    ),
+    (
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": "not even a list",
+        },
+        1,
+        3,
+    ),
 ]
+
+
+def test_process_issues_never_invalidate_a_verdict(tmp_path):
+    """Advisory only (2026-07-22): a populated field is carried, a malformed
+    one is dropped — neither can fail validation and trigger an escalation."""
+    populated_dir = tmp_path / "populated"
+    populated_dir.mkdir()
+    populated = write_verdict(
+        populated_dir,
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
+        },
+    )
+    result, reason = validate(populated)
+    assert result is not None, reason
+    assert result.process_issues == [
+        decisions.ProcessIssue(friction="slow clone", suggested_fix="cache it")
+    ]
+
+    malformed_dir = tmp_path / "malformed"
+    malformed_dir.mkdir()
+    malformed = write_verdict(
+        malformed_dir,
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [42, {"no": "friction"}],
+        },
+    )
+    result, reason = validate(malformed)
+    assert result is not None, reason
+    assert result.process_issues == []
 
 
 def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path:

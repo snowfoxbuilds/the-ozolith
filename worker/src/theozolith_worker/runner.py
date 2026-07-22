@@ -114,11 +114,15 @@ decisions afterwards.
 - Record your run summary in `.theozolith/decisions.json` (create the file) \
 with exactly this JSON shape:
   {{"decisions": [{{"what": "...", "why": "..."}}], "open_questions": [], \
-"remaining_work": [], "dead_ends": []}}
+"remaining_work": [], "dead_ends": [], "process_issues": []}}
   Decisions are judgment calls with rationale; open_questions are calls only \
 a human can make; remaining_work is what a follow-up round still needs; \
 dead_ends are approaches you tried and abandoned (so the next Run does not \
 repeat them).
+- process_issues is optional and advisory: observations about the PIPELINE \
+itself (friction you hit — a confusing prompt, missing tooling, a flaky \
+gate), each as {{"friction": "...", "suggested_fix": "..."}}. Never findings \
+about the change; it influences no verdict, label, or gate outcome.
 - If you conclude that NO code change is needed, change nothing and record \
 why in the decisions file — the pipeline ships an empty PR carrying your \
 reasoning for review. A run with no changes and no recorded reasoning is \

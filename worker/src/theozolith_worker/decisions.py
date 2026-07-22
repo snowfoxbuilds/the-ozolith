@@ -35,6 +35,17 @@ class Decision:
     why: str
 
 
+@dataclass(frozen=True)
+class ProcessIssue:
+    """One observation about the pipeline itself (2026-07-22 grilling):
+    friction observed plus a suggested fix. Advisory only — process issues
+    are never findings about the change and influence no verdict, label, or
+    gate outcome; harvesting is manual in V1."""
+
+    friction: str
+    suggested_fix: str = ""
+
+
 @dataclass
 class DecisionsSection:
     decisions: list[Decision] = field(default_factory=list)
@@ -42,6 +53,7 @@ class DecisionsSection:
     remaining_work: list[str] = field(default_factory=list)
     dead_ends: list[str] = field(default_factory=list)
     gate_findings: list[Finding] = field(default_factory=list)
+    process_issues: list[ProcessIssue] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
@@ -65,6 +77,25 @@ def _decisions(raw: object) -> list[Decision]:
     return items
 
 
+def process_issues_from(raw: object) -> list[ProcessIssue]:
+    """Lenient by design: advisory content must never invalidate a file, so
+    malformed entries are dropped, never errors (shared with verdict.py)."""
+    items: list[ProcessIssue] = []
+    if not isinstance(raw, list):
+        return items
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get("friction"):
+            items.append(
+                ProcessIssue(
+                    friction=str(entry["friction"]),
+                    suggested_fix=str(entry.get("suggested_fix", "")),
+                )
+            )
+        elif isinstance(entry, str) and entry:
+            items.append(ProcessIssue(friction=entry))
+    return items
+
+
 def section_from_dict(data: dict) -> DecisionsSection:
     return DecisionsSection(
         decisions=_decisions(data.get("decisions")),
@@ -74,6 +105,7 @@ def section_from_dict(data: dict) -> DecisionsSection:
         gate_findings=[
             Finding(**entry) for entry in data.get("gate_findings", []) if isinstance(entry, dict)
         ],
+        process_issues=process_issues_from(data.get("process_issues")),
     )
 
 
@@ -116,6 +148,11 @@ def render(section: DecisionsSection) -> str:
         ]
     else:
         lines += ["- none"]
+    # Advisory pipeline observations (2026-07-22 grilling): rendered only
+    # when present — an absent or empty field renders nothing at all.
+    if section.process_issues:
+        lines += ["", "### Process issues"]
+        lines += [render_process_issue(issue) for issue in section.process_issues]
     lines += [
         "",
         "<!-- theozolith:decisions:data",
@@ -124,6 +161,13 @@ def render(section: DecisionsSection) -> str:
         END,
     ]
     return "\n".join(lines)
+
+
+def render_process_issue(issue: ProcessIssue) -> str:
+    """One bullet, shared by the PR body and the verdict comment."""
+    if issue.suggested_fix:
+        return f"- {issue.friction} — suggested fix: {issue.suggested_fix}"
+    return f"- {issue.friction}"
 
 
 def upsert(pr_body: str, section: DecisionsSection) -> str:
