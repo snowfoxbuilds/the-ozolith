@@ -7,18 +7,24 @@ An open-source agent-orchestration monorepo with three separable concerns:
   a one-way sync engine into local tool config dirs; and a bake CLI for installing a pinned
   Knowledge Source into a container image at build time.
 - **Agentic coding pipeline** (`worker/`) — staged autonomous development on GitHub issues
-  and PRs: Worker and Reviewer drivers, per-Run containers with the agent harness as PID 1,
-  the Claim Protocol, a first-party gate, best-effort PRs with Decisions Sections, and
-  verdict-file review rounds (M2; ADR-0013). Plus the repo bootstrap tool from M1.
+  and PRs: Implementer and Reviewer drivers, per-Run containers with the agent harness as
+  PID 1 running the agent **headless** (one-shot invocation, exit-is-completion, the
+  structured output stream as the evidence transcript — ADR-0019), the Claim Protocol
+  (Control Node write-through dispatch, ADR-0017), a first-party gate, best-effort PRs
+  with Decisions Sections (including advisory `process_issues`), and verdict-file review
+  rounds. Plus the repo bootstrap tool from M1.
 - **Cluster substrate** (`control/`, `nodedaemon/`, `deploy/`) — Control Node, Node Daemons,
-  and Stacks (M3; ADR-0015). The Control Node serves the heartbeat/command channel, typed
-  Run events, the advisory claim pre-filter, the zombie-claim janitor and retry auditor,
-  and the encrypted node-scoped secret store. The Node Daemon registers a box as a
-  Container-Host: declarative Stacks (container + supervised driver processes,
-  kill-the-tree), local derived-image builds, tmpfs secrets, orphan reaping. `deploy/`
-  carries the installer, the control compose file, and a starter Config Repo; the M2
-  daemon-less one-box deployment remains fully supported (the pipeline never needs the
-  Control Node; ADR-0002).
+  and Stacks (ADR-0015). The Control Node serves the heartbeat/command channel, claim
+  dispatch, typed events (Run progress and `theozolith.error` summaries), the zombie-claim
+  janitor, the encrypted node-scoped secret store, the dashboard + web terminal (the
+  Flight Deck is the terminal's primary target; run containers are never attachable), and
+  the two product-update paths (`theozolith update` / `theozolith build`, ADR-0015 as
+  amended). The Node Daemon registers a box as a Container-Host: declarative Stacks
+  (container + supervised driver processes, kill-the-tree), local derived-image builds,
+  tmpfs secrets, orphan reaping. `deploy/` carries the installer, the control compose
+  file, and a starter Config Repo (including a Flight Deck example); the daemon-less
+  one-box dev shape runs `theozolith-control serve` beside the drivers (claims dispatch
+  through the Control Node — ADR-0017).
 
 Every top-level component is independently installable. A laptop-only user of the knowledge
 machinery never installs the cluster manager.
