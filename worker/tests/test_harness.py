@@ -1,53 +1,23 @@
-"""The agent harness: completion detection, job serving, and the tmux session.
+"""The agent harness: headless one-shot invocation, exit-is-completion, jobs.
 
-Unit tests drive the harness single-threaded with a fake tmux and scripted
-clocks; the integration test at the bottom runs the real thing — real tmux,
-real pipe-pane transcript, a fake agent CLI — and exercises the interactivity
-contract (M2 acceptance 9): input injected into the live session mid-Run
-lands in the transcript and the Run completes normally.
+Unit tests drive the harness single-threaded with a fake agent process and
+scripted clocks; the integration tests at the bottom run the real thing — a
+real subprocess standing in for the agent CLI — and exercise the headless
+contract (ADR-0019): the prompt rides the invocation argv, stdout is the
+structured-output transcript, process exit completes the Run, and the hard
+timeout kills an overrunning session.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import stat
-import subprocess
-import threading
 import time
 from pathlib import Path
 
-import pytest
 from theozolith_worker import jobdir
-from theozolith_worker.harness.main import await_completion, run_harness, serve_jobs
-from theozolith_worker.harness.tmux import RealTmux
-
-
-class FakeTmux:
-    def __init__(self):
-        self.sessions: dict[str, dict] = {}
-        self.transcripts: dict[str, Path] = {}
-        self.killed: list[str] = []
-
-    def new_session(self, session, command, cwd, env):
-        self.sessions[session] = {"command": command, "cwd": cwd, "env": env, "alive": True}
-
-    def pipe_pane(self, session, capture_file):
-        self.transcripts[session] = Path(capture_file)
-
-    def paste(self, session, text):
-        target = self.transcripts.get(session)
-        if target is not None:
-            with target.open("a") as handle:
-                handle.write(text)
-
-    def has_session(self, session):
-        return self.sessions.get(session, {}).get("alive", False)
-
-    def kill(self, session):
-        if session in self.sessions:
-            self.sessions[session]["alive"] = False
-        self.killed.append(session)
+from theozolith_worker.harness.main import await_exit, launch_agent, run_harness, serve_jobs
 
 
 class ScriptedClock:
@@ -66,13 +36,64 @@ class ScriptedClock:
             hook(self.now)
 
 
+class FakeAgent:
+    """A scripted headless agent process driven by the test clock."""
+
+    def __init__(
+        self,
+        clock,
+        *,
+        exit_code: int = 0,
+        exits_at: float | None = None,
+        term_reaps: bool = True,
+    ):
+        self._clock = clock
+        self._exit_code = exit_code
+        self._exits_at = exits_at
+        self._term_reaps = term_reaps
+        self.terminated_at: float | None = None
+        self.killed_at: float | None = None
+
+    def poll(self) -> int | None:
+        if self.killed_at is not None:
+            return -9
+        if self.terminated_at is not None and self._term_reaps:
+            return -15
+        if self._exits_at is not None and self._clock() >= self._exits_at:
+            return self._exit_code
+        return None
+
+    def terminate(self) -> None:
+        if self.terminated_at is None:
+            self.terminated_at = self._clock()
+
+    def kill(self) -> None:
+        if self.killed_at is None:
+            self.killed_at = self._clock()
+
+
+class FakeLauncher:
+    """Records the invocation and returns the prepared FakeAgent, writing a
+    scripted structured-output stream into the transcript first."""
+
+    def __init__(self, agent: FakeAgent, stream: str = ""):
+        self._agent = agent
+        self._stream = stream
+        self.calls: list[dict] = []
+
+    def __call__(self, argv, cwd, env, transcript) -> FakeAgent:
+        self.calls.append({"argv": argv, "cwd": cwd, "env": env, "transcript": transcript})
+        if self._stream:
+            with Path(transcript).open("a") as handle:
+                handle.write(self._stream)
+        return self._agent
+
+
 def make_job(
     tmp_path: Path,
     *,
     mode: str = jobdir.MODE_RUN,
-    settle: float = 5.0,
     timeout: float = 100.0,
-    events: str | None = None,
 ) -> tuple[Path, jobdir.Manifest]:
     job = jobdir.create_job_dir(tmp_path, "r1")
     workdir = jobdir.CHECKOUT_DIR if mode == jobdir.MODE_RUN else jobdir.WORK_DIR
@@ -80,93 +101,66 @@ def make_job(
     manifest = jobdir.Manifest(
         run_id="r1",
         mode=mode,
-        session=f"{'run' if mode == jobdir.MODE_RUN else 'review'}-r1",
         adapter="claude",
         model="claude-sonnet-5",
         workdir=workdir,
         agent_timeout_seconds=timeout,
-        settle_seconds=settle,
-        startup_seconds=0.0,
         jobs_idle_timeout_seconds=30.0,
     )
     jobdir.write_manifest(job, manifest)
     (job / jobdir.PROMPT_FILE).parent.mkdir(parents=True, exist_ok=True)
     (job / jobdir.PROMPT_FILE).write_text("do the thing\n")
-    if events is not None:
-        log = job / jobdir.HOOK_EVENTS_FILE
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text(events)
     return job, manifest
 
 
-def append_event(job: Path, event: str) -> None:
-    log = job / jobdir.HOOK_EVENTS_FILE
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a") as handle:
-        handle.write(f"{event}\n")
+# -- completion detection (process exit, ADR-0019) ---------------------------
 
 
-# -- completion detection -------------------------------------------------
-
-
-def test_completion_settles_after_stop(tmp_path):
-    job, manifest = make_job(tmp_path, settle=5.0, events="stop\n")
-    tmux = FakeTmux()
-    tmux.new_session(manifest.session, "agent", tmp_path, {})
+def test_process_exit_zero_is_completion(tmp_path):
+    _job, manifest = make_job(tmp_path)
     clock = ScriptedClock()
+    agent = FakeAgent(clock, exit_code=0, exits_at=3.0)
 
-    outcome = await_completion(job, tmux, manifest, clock=clock, sleep=clock.sleep)
+    outcome = await_exit(agent, manifest, clock=clock, sleep=clock.sleep)
 
-    assert outcome.completed and not outcome.timed_out
-    assert clock.now >= 5.0  # the settle window was honored
+    assert outcome.completed and not outcome.timed_out and not outcome.session_died
+    assert outcome.exit_code == 0
 
 
-def test_queued_human_input_rearms_the_wait(tmp_path):
-    """A prompt event after stop (an attached human) must re-arm completion."""
-    job, manifest = make_job(tmp_path, settle=5.0, events="stop\n")
-    tmux = FakeTmux()
-    tmux.new_session(manifest.session, "agent", tmp_path, {})
+def test_nonzero_exit_is_a_died_session(tmp_path):
+    _job, manifest = make_job(tmp_path)
     clock = ScriptedClock()
-    fired: list[float] = []
+    agent = FakeAgent(clock, exit_code=2, exits_at=3.0)
 
-    def interject(now: float) -> None:
-        if now >= 2.0 and not fired:
-            fired.append(now)
-            append_event(job, "prompt")  # human submits mid-settle
-
-        if now >= 10.0 and len(fired) == 1:
-            fired.append(now)
-            append_event(job, "stop")  # the agent answers and stops again
-
-    clock.on_tick.append(interject)
-    outcome = await_completion(job, tmux, manifest, clock=clock, sleep=clock.sleep)
-
-    assert outcome.completed
-    assert clock.now >= 15.0  # second stop + a fresh settle window
-
-
-def test_hard_timeout_backstop(tmp_path):
-    job, manifest = make_job(tmp_path, settle=5.0, timeout=30.0)  # no events ever
-    tmux = FakeTmux()
-    tmux.new_session(manifest.session, "agent", tmp_path, {})
-    clock = ScriptedClock()
-
-    outcome = await_completion(job, tmux, manifest, clock=clock, sleep=clock.sleep)
-
-    assert outcome.timed_out and not outcome.completed
-    assert clock.now >= 30.0
-
-
-def test_session_death_ends_the_wait(tmp_path):
-    job, manifest = make_job(tmp_path, settle=5.0)
-    tmux = FakeTmux()
-    tmux.new_session(manifest.session, "agent", tmp_path, {})
-    clock = ScriptedClock()
-    clock.on_tick.append(lambda now: tmux.kill(manifest.session) if now >= 3.0 else None)
-
-    outcome = await_completion(job, tmux, manifest, clock=clock, sleep=clock.sleep)
+    outcome = await_exit(agent, manifest, clock=clock, sleep=clock.sleep)
 
     assert outcome.session_died and not outcome.completed
+    assert outcome.exit_code == 2
+    assert "exit 2" in outcome.describe()
+
+
+def test_hard_timeout_terminates_then_kills(tmp_path):
+    _job, manifest = make_job(tmp_path, timeout=30.0)
+    clock = ScriptedClock()
+    agent = FakeAgent(clock, term_reaps=False)  # ignores SIGTERM
+
+    outcome = await_exit(agent, manifest, clock=clock, sleep=clock.sleep)
+
+    assert outcome.timed_out and not outcome.completed
+    assert agent.terminated_at is not None and agent.terminated_at >= 30.0
+    assert agent.killed_at is not None and agent.killed_at >= agent.terminated_at + 10.0
+
+
+def test_hard_timeout_needs_no_sigkill_when_sigterm_reaps(tmp_path):
+    _job, manifest = make_job(tmp_path, timeout=30.0)
+    clock = ScriptedClock()
+    agent = FakeAgent(clock, term_reaps=True)
+
+    outcome = await_exit(agent, manifest, clock=clock, sleep=clock.sleep)
+
+    assert outcome.timed_out
+    assert agent.terminated_at is not None
+    assert agent.killed_at is None
 
 
 # -- job serving ------------------------------------------------------------
@@ -204,46 +198,53 @@ def test_serve_jobs_idle_timeout_protects_against_dead_driver(tmp_path):
     assert "idle timeout" in error
 
 
-# -- the full harness cycle (fake tmux) --------------------------------------
+# -- the full harness cycle (fake agent process) ------------------------------
 
 
 def test_run_mode_full_cycle(tmp_path):
-    job, manifest = make_job(tmp_path, settle=0.0, events="stop\n")
+    job, manifest = make_job(tmp_path)
     workdir = job / manifest.workdir
     jobdir.write_job_request(job, jobdir.JobRequest("001-gate", "printf ok > gate.txt", 10.0))
     jobdir.write_job_request(job, jobdir.JobRequest("002-shutdown", ""))
-    tmux = FakeTmux()
     clock = ScriptedClock()
+    stream = '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}\n'
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0), stream=stream)
 
-    code = run_harness(job, tmux, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
 
     assert code == 0
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_DONE and status.agent.completed
-    # The interactive session: correct command, prompt pasted, then killed.
-    session = tmux.sessions[manifest.session]
-    assert "--model claude-sonnet-5" in session["command"]
-    assert "--dangerously-skip-permissions" in session["command"]
-    assert " -p " not in f" {session['command']} "  # headless one-shot is banned
-    assert "do the thing" in (job / jobdir.TRANSCRIPT_FILE).read_text()
-    assert manifest.session in tmux.killed
-    # The completion hook was installed in the workdir.
-    settings = json.loads((workdir / ".claude" / "settings.local.json").read_text())
-    assert "Stop" in settings["hooks"] and "UserPromptSubmit" in settings["hooks"]
-    assert session["env"]["THEOZOLITH_HOOK_LOG"] == str(job / jobdir.HOOK_EVENTS_FILE)
-    assert session["env"]["THEOZOLITH_JOB"] == str(job)  # in-session tools find the job dir
-    # The gate job ran inside the workdir.
+    # Headless one-shot with the POINTER prompt (ADR-0019 as amended): the
+    # argv names the mounted task file and never carries the task content,
+    # so the invocation is constant-size regardless of task size.
+    call = launcher.calls[0]
+    argv = call["argv"]
+    pointer = argv[argv.index("-p") + 1]
+    assert str(job / jobdir.PROMPT_FILE) in pointer
+    assert "do the thing" not in " ".join(argv)  # the task stays in the file
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert call["cwd"] == workdir
+    assert call["env"]["THEOZOLITH_JOB"] == str(job)  # in-session tools find the job dir
+    # The structured output stream is the transcript.
+    assert call["transcript"] == job / jobdir.TRANSCRIPT_FILE
+    assert "done" in (job / jobdir.TRANSCRIPT_FILE).read_text()
+    # No hook machinery: nothing writes agent settings into the workdir.
+    assert not (workdir / ".claude").exists()
+    # The gate job ran inside the workdir, after the agent process exited.
     assert (workdir / "gate.txt").read_text() == "ok"
 
 
 def test_review_mode_copies_verdict_and_serves_no_jobs(tmp_path):
-    job, manifest = make_job(tmp_path, mode=jobdir.MODE_REVIEW, settle=0.0, events="stop\n")
+    job, manifest = make_job(tmp_path, mode=jobdir.MODE_REVIEW)
     verdict = {"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}
     (job / manifest.workdir / "verdict.json").write_text(json.dumps(verdict))
-    tmux = FakeTmux()
     clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0))
 
-    code = run_harness(job, tmux, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
 
     assert code == 0
     assert json.loads((job / jobdir.VERDICT_FILE).read_text()) == verdict
@@ -251,12 +252,12 @@ def test_review_mode_copies_verdict_and_serves_no_jobs(tmp_path):
 
 
 def test_harness_survives_agent_timeout_and_reports_it(tmp_path):
-    job, _manifest = make_job(tmp_path, settle=1.0, timeout=5.0)  # hook never fires
+    job, _manifest = make_job(tmp_path, timeout=5.0)  # the agent never exits
     jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
-    tmux = FakeTmux()
     clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock))
 
-    code = run_harness(job, tmux, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
 
     assert code == 0  # a timed-out agent is an outcome, not a harness failure
     status = jobdir.read_status(job)
@@ -264,72 +265,85 @@ def test_harness_survives_agent_timeout_and_reports_it(tmp_path):
     assert status.agent.timed_out and not status.agent.completed
 
 
-# -- the real thing: tmux + pipe-pane + mid-run injection (acceptance 9) -----
+def test_missing_task_file_is_a_harness_failure(tmp_path):
+    job, _manifest = make_job(tmp_path)
+    (job / jobdir.PROMPT_FILE).unlink()
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exits_at=1.0))
+
+    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED and "task file" in status.error
+    assert launcher.calls == []  # nothing was ever spawned
 
 
-def _tmux_available() -> bool:
-    return shutil.which("tmux") is not None
+def test_agent_launch_failure_is_a_harness_failure(tmp_path):
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+
+    def broken_launcher(argv, cwd, env, transcript):
+        raise OSError("no such binary: claude")
+
+    code = run_harness(job, broken_launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED and "agent launch failed" in status.error
 
 
-@pytest.mark.skipif(not _tmux_available(), reason="tmux unavailable")
-def test_real_tmux_session_with_midrun_injection(tmp_path, monkeypatch):
-    # Isolate from any developer tmux server on the box.
-    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
-    # A fake `claude` CLI: echoes whatever it receives (so pasted prompts and
-    # injected instructions land in the pane, which pipe-pane captures).
+# -- the real thing: a real headless subprocess (ADR-0019) --------------------
+
+
+def _fake_claude(tmp_path: Path, script: str) -> Path:
     bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake_claude = bindir / "claude"
-    fake_claude.write_text("#!/bin/sh\nexec cat\n")
-    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "claude"
+    fake.write_text(script)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    return fake
 
-    job, manifest = make_job(tmp_path, settle=0.5, timeout=30.0)
-    manifest = jobdir.Manifest(
-        **{**manifest.__dict__, "startup_seconds": 0.3, "session": "run-test-inject"}
+
+def test_real_headless_invocation_streams_and_completes(tmp_path, monkeypatch):
+    # A fake `claude` CLI: streams its prompt argument and its environment
+    # to stdout, then exits 0 — completion is that exit.
+    _fake_claude(
+        tmp_path,
+        "#!/bin/sh\n"
+        'printf \'{"type":"system","subtype":"init"}\\n\'\n'
+        "printf 'PROMPT:%s\\n' \"$2\"\n"
+        "printf 'JOB:%s\\n' \"$THEOZOLITH_JOB\"\n",
     )
-    jobdir.write_manifest(job, manifest)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+    job, _manifest = make_job(tmp_path, timeout=30.0)
     jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
 
-    result: list[int] = []
-    thread = threading.Thread(
-        target=lambda: result.append(run_harness(job, RealTmux(), poll_seconds=0.05))
-    )
-    thread.start()
-    try:
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            status = jobdir.read_status(job)
-            if status is not None and status.phase == jobdir.PHASE_AGENT:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("harness never reached the agent phase")
+    code = run_harness(job, launch_agent, runner=_real_runner, poll_seconds=0.05)
 
-        # A human attaches and injects an instruction mid-Run.
-        subprocess.run(
-            ["tmux", "send-keys", "-t", manifest.session, "human: also update the docs", "Enter"],
-            check=True,
-            capture_output=True,
-        )
-        time.sleep(0.5)
-        append_event(job, "stop")  # the CLI's Stop hook fires
-        thread.join(timeout=25)
-        assert not thread.is_alive(), "harness did not finish"
-    finally:
-        subprocess.run(["tmux", "kill-server"], capture_output=True, check=False)  # isolated server
-        thread.join(timeout=5)
-
-    assert result == [0]
+    assert code == 0
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_DONE and status.agent.completed
     transcript = (job / jobdir.TRANSCRIPT_FILE).read_text()
-    assert "do the thing" in transcript  # the pasted prompt
-    assert "human: also update the docs" in transcript  # the injected exchange
-    # The Run completed normally after the injection; the session is gone.
-    assert (
-        subprocess.run(
-            ["tmux", "has-session", "-t", manifest.session], capture_output=True, check=False
-        ).returncode
-        != 0
-    )
+    # The argv carried the pointer at the task file, never the task content.
+    assert f"PROMPT:Work on the task specified in {job / jobdir.PROMPT_FILE}" in transcript
+    assert "do the thing" not in transcript
+    assert f"JOB:{job}" in transcript  # in-session tools can find the job dir
+
+
+def test_real_hard_timeout_kills_the_overrunning_agent(tmp_path, monkeypatch):
+    _fake_claude(tmp_path, "#!/bin/sh\nsleep 300\n")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+    job, _manifest = make_job(tmp_path, timeout=0.5)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+
+    started = time.monotonic()
+    code = run_harness(job, launch_agent, runner=_real_runner, poll_seconds=0.05)
+
+    assert code == 0
+    assert time.monotonic() - started < 30  # killed, not waited out
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_DONE
+    assert status.agent.timed_out and not status.agent.completed

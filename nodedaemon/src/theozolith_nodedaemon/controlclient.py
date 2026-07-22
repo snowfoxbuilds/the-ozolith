@@ -94,6 +94,23 @@ class ControlClient:
     def emit_event(self, event: dict[str, Any]) -> None:
         self._post("/api/v1/events", event)
 
+    def fetch_artifact(self, version: str, filename: str) -> bytes:
+        """One built wheel from the Control Node's artifact store (ADR-0015
+        amendment 2026-07-22): nodes never pull source and never build."""
+        status, payload = self._transport(
+            "GET",
+            f"{self._url}/api/v1/product/artifacts/{version}/{filename}",
+            {
+                "Authorization": f"Bearer {self._token}",
+                "User-Agent": "theozolith-nodedaemon",
+            },
+            None,
+        )
+        if status >= 400:
+            detail = payload.decode(errors="replace")[:200]
+            raise ControlError(f"artifact {filename} for {version}: HTTP {status} {detail}")
+        return payload
+
     def pull_secrets(self, node: str, names: list[str]) -> dict[str, str]:
         """Node-scoped secret pull — values transit TLS only (ADR-0006)."""
         if not names:

@@ -20,7 +20,7 @@ def orphan_job(harness: Harness, run_id: str, issue: int | None = 5) -> Path:
     """A job dir the way a dead driver leaves one."""
     job = jobdir.create_job_dir(Path(harness.worker_config.jobs_dir), run_id)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, "the prompt\n")
-    jobdir.atomic_write(job / jobdir.TRANSCRIPT_FILE, "[tmux] half a session\n")
+    jobdir.atomic_write(job / jobdir.TRANSCRIPT_FILE, '{"type":"system"} half a stream\n')
     if issue is not None:
         jobdir.atomic_write(
             job / "input" / "issue.json", json.dumps({"number": issue, "title": "t"})
@@ -42,7 +42,8 @@ def test_orphans_are_pushed_under_the_original_run_id_and_deleted(harness: Harne
     assert marker["swept"] is True and marker["swept_at"]  # distinguishable
     assert marker["run_id"] == RUN_ID
     assert f"{prefix}/swept-transcript.txt" in paths
-    assert harness.evidence_file(f"{prefix}/swept-transcript.txt") == "[tmux] half a session"
+    swept = harness.evidence_file(f"{prefix}/swept-transcript.txt")
+    assert swept == '{"type":"system"} half a stream'
 
 
 def test_push_failure_parks_the_job_dir_for_retry(harness: Harness, monkeypatch):

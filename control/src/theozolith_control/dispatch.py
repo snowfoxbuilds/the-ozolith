@@ -8,11 +8,18 @@ lock, so claim races are structurally impossible; assign-and-verify is
 gone. The Reviewer side of the same path is discovery-only (no claim label
 exists on PRs).
 
-Gates applied before any grant (ADR-0016 + the queue-behind rule):
+Gates applied before any grant (ADR-0016 + the queue-behind rule + the
+pin-eligibility rule of the ADR-0015 revision):
 
 - a quarantined node gets nothing until a human releases it;
-- a node with a pending drain/recycle/update gets nothing, which bounds a
-  queued-behind command by the current Run;
+- a node whose last heartbeat-reported product version differs from the
+  recorded pin gets nothing until it converges — keyed on the REPORTED
+  version, never on command acks (a node can ack, fail the install, and
+  never converge). Issuing an update therefore pauses dispatch fleet-wide;
+  capacity returns node by node as versions converge. Nodes with no
+  reported version (the daemon-less dev shape) stay eligible;
+- a node with a pending drain/recycle/update/restart gets nothing, which
+  bounds a queued-behind command by the current Run;
 - an issue carrying ``failed`` is refused even with plan_ready present and
   surfaced on the dashboard as a malformed state — a visibly stalled grant
   beats a laundered failure loop;
@@ -53,7 +60,22 @@ class Dispatcher:
         self._log = log
         self._lock = threading.Lock()
 
-    def grant_work(self, worker: str, node: str, login: str) -> dict[str, Any]:
+    def _version_block(self, node: str, pin: str) -> str | None:
+        """The pin-eligibility gate: a node reporting a version other than
+        the recorded pin gets no work until it converges. Unreported
+        versions stay eligible (the daemon-less dev shape heartbeats
+        nothing)."""
+        if not pin:
+            return None
+        reported = self._store.node_version(node)
+        if not reported or reported == pin:
+            return None
+        return (
+            f"node {node!r} runs product version {reported}, the pin is {pin};"
+            " no new work until it converges"
+        )
+
+    def grant_work(self, worker: str, node: str, login: str, *, pin: str = "") -> dict[str, Any]:
         """Grant one issue to ``worker`` (write-through), or explain why not.
 
         Returns ``{"issue": {...}}`` on a grant and ``{"issue": None}``
@@ -64,6 +86,9 @@ class Dispatcher:
             quarantine = self._store.node_quarantine(node)
             if quarantine is not None:
                 return {"issue": None, "reason": f"node {node!r} quarantined: {quarantine}"}
+            version_block = self._version_block(node, pin)
+            if version_block is not None:
+                return {"issue": None, "reason": version_block}
             pending = self._store.pending_lifecycle_commands(node)
             if pending:
                 return {
@@ -106,9 +131,16 @@ class Dispatcher:
                 }
             return {"issue": None}
 
-    def review_targets(self, worker: str, node: str, login: str) -> dict[str, Any]:
-        """Discovery for the Reviewer: reviewable pr_ready PRs, no writes."""
+    def review_targets(
+        self, worker: str, node: str, login: str, *, pin: str = ""
+    ) -> dict[str, Any]:
+        """Discovery for the Reviewer: reviewable pr_ready PRs, no writes.
+        The pin-eligibility gate applies here too — an off-pin node burns
+        review rounds on the wrong product version."""
         self._store.upsert_driver(worker, node, login, "reviewer")
+        version_block = self._version_block(node, pin)
+        if version_block is not None:
+            return {"prs": [], "reason": version_block}
         numbers = [
             candidate.number
             for candidate in self._client.list_open_prs_by_label(PR_READY)

@@ -25,10 +25,12 @@ from typing import Any, Protocol
 
 from theozolith_worker import jobdir
 from theozolith_worker.config import DriverConfig
+from theozolith_worker.harness import adapters
 
 RUN_EVENT = "theozolith.run"
 REVIEW_EVENT = "theozolith.review"
 PROGRESS_EVENT = "theozolith.run.progress"
+ERROR_EVENT = "theozolith.error"
 
 # The Worker Run phases (ADR-0015/0016): claimed and gate are "in flight"
 # (what the janitor watches); pr-open, failed, and escalated are terminal.
@@ -42,6 +44,11 @@ PHASE_ESCALATED = "escalated"
 
 # Kept below the Control Node's ingestion cap (ADR-0016) with headroom.
 TRANSCRIPT_TAIL_CHARS = 4_000
+
+# theozolith.error size caps (2026-07-21 grilling: summaries pointing at the
+# failing node/component — depth stays in the journal and evidence bundles).
+ERROR_MESSAGE_CHARS = 2_000
+ERROR_CONTEXT_CHARS = 8_000
 
 
 class EventSink(Protocol):
@@ -149,18 +156,66 @@ def review_event(
     }
 
 
+# -- error events (2026-07-21 grilling; NODE-SUBSTRATE.md) ---------------------
+
+
+def driver_component(config: DriverConfig) -> str:
+    """The dashboard-facing component name (ADR-0020 terminology)."""
+    return "implementer-driver" if config.role == "worker" else f"{config.role}-driver"
+
+
+def error_event(
+    config: DriverConfig,
+    *,
+    error_class: str,
+    message: str,
+    context: str = "",
+    component: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": ERROR_EVENT,
+        "node": config.node_name,
+        "component": component or driver_component(config),
+        "stack": config.stack,
+        "error_class": error_class,
+        "message": str(message)[:ERROR_MESSAGE_CHARS],
+        # Keep the tail: with a traceback, the innermost frames matter most.
+        "context": str(context)[-ERROR_CONTEXT_CHARS:],
+    }
+
+
+def emit_error(
+    sink: EventSink,
+    config: DriverConfig,
+    *,
+    error_class: str,
+    message: str,
+    context: str = "",
+    component: str | None = None,
+) -> None:
+    """Best-effort error summary to the Control Node; never raises. (The
+    sink's own emission failures stay log-only — an error event about a
+    failed error event would recurse.)"""
+    sink.emit(
+        error_event(
+            config,
+            error_class=error_class,
+            message=message,
+            context=context,
+            component=component,
+        )
+    )
+
+
 # -- run-progress telemetry (ADR-0016) ------------------------------------------
 
 
-def _count_hook_events(job: Path) -> dict[str, int]:
+def _stream_stats(config: DriverConfig, transcript: Path) -> adapters.StreamStats:
     try:
-        lines = (job / jobdir.HOOK_EVENTS_FILE).read_text(encoding="utf-8").split()
-    except OSError:
-        lines = []
-    counts: dict[str, int] = {}
-    for line in lines:
-        counts[line] = counts.get(line, 0) + 1
-    return counts
+        adapter = adapters.make_harness_adapter(config.adapter)
+    except adapters.HarnessAdapterError:
+        return adapters.StreamStats()
+    return adapter.stream_stats(transcript)
 
 
 def _transcript_snapshot(path: Path) -> tuple[int, str]:
@@ -191,7 +246,7 @@ def progress_event(
     here and again at ingestion."""
     status = jobdir.read_status(job)
     transcript_bytes, tail = _transcript_snapshot(job / jobdir.TRANSCRIPT_FILE)
-    counts = _count_hook_events(job)
+    stats = _stream_stats(config, job / jobdir.TRANSCRIPT_FILE)
     return {
         "type": PROGRESS_EVENT,
         "worker": config.worker_id,
@@ -202,12 +257,11 @@ def progress_event(
         "attempt": attempt,
         "phase": status.phase if status else "starting",
         "elapsed_seconds": round(elapsed_seconds, 1),
-        # Counters: tool calls and operator prompts from the adapter's hook
-        # log; token counts need adapter support the claude adapter does not
-        # have yet (recorded as remaining work in the M4 ADR).
-        "tool_calls": counts.get("tool", 0),
-        "prompts": counts.get("prompt", 0),
-        "tokens": None,
+        # Counters from the headless session's structured output stream
+        # (ADR-0019); tokens stay None only for adapters whose stream
+        # carries no usage (the claude stream does — ADR-0018's gap closed).
+        "tool_calls": stats.tool_calls,
+        "tokens": stats.tokens,
         "transcript_bytes": transcript_bytes,
         "transcript_tail": tail,
     }

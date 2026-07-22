@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS containers (
     updated_at REAL NOT NULL,
     PRIMARY KEY (node, name)
 );
+-- Container-kind Stack containers reported by heartbeat (ADR-0019): the
+-- web terminal's attach targets (the Flight Deck lives here); run
+-- containers above are never attach targets.
+CREATE TABLE IF NOT EXISTS stack_containers (
+    node TEXT NOT NULL,
+    name TEXT NOT NULL,
+    stack TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (node, name)
+);
 CREATE TABLE IF NOT EXISTS images (
     node TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -75,7 +87,8 @@ CREATE TABLE IF NOT EXISTS events (
     phase TEXT,
     pr INTEGER,
     round INTEGER,
-    verdict TEXT
+    verdict TEXT,
+    component TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
@@ -151,6 +164,14 @@ CREATE TABLE IF NOT EXISTS malformed_states (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL
 );
+-- Pin-convergence tracking (revision ruling amending ADR-0015): consecutive
+-- off-pin heartbeats per node; a row exists only while the node is off-pin.
+CREATE TABLE IF NOT EXISTS version_health (
+    node TEXT PRIMARY KEY,
+    offpin_beats INTEGER NOT NULL DEFAULT 0,
+    restart_queued INTEGER NOT NULL DEFAULT 0,
+    escalated INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Tables of earlier schema generations, dropped on open: the advisory
@@ -161,6 +182,7 @@ _DROPPED_TABLES = ("claim_intents", "audit_findings")
 EVENT_RUN = "theozolith.run"
 EVENT_REVIEW = "theozolith.review"
 EVENT_PROGRESS = "theozolith.run.progress"
+EVENT_ERROR = "theozolith.error"
 
 RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # Phases meaning "the driver still holds the claim" — what the zombie
@@ -169,10 +191,11 @@ RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # a driver that dies between the failed Run and its retry stays visible.
 LIVE_RUN_PHASES = ("claimed", "gate", "failed")
 
-# The command verbs (ADR-0015), and the subset whose pending presence
-# closes the dispatch gate for a node (queue-behind, ADR-0018).
-COMMAND_VERBS = ("drain", "recycle", "update", "rebuild")
-LIFECYCLE_VERBS = ("drain", "recycle", "update")
+# The command verbs (ADR-0015; restart is the off-pin escalation step), and
+# the subset whose pending presence closes the dispatch gate for a node
+# (queue-behind, ADR-0018).
+COMMAND_VERBS = ("drain", "recycle", "update", "rebuild", "restart")
+LIFECYCLE_VERBS = ("drain", "recycle", "update", "restart")
 
 # Consecutive failed Runs on one node before the dispatch gate closes.
 QUARANTINE_AFTER_FAILURES = 2
@@ -213,6 +236,9 @@ class Store:
         ):
             if column not in present:
                 self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
+        event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
+        if "component" not in event_columns:  # theozolith.error filter column
+            self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
 
     def close(self) -> None:
         self._db.close()
@@ -234,6 +260,54 @@ class Store:
             row = self._db.execute("SELECT last_seen FROM nodes WHERE name = ?", (name,)).fetchone()
         return row["last_seen"] if row else None
 
+    def node_version(self, name: str) -> str:
+        """The last heartbeat-reported product version ('' when unknown)."""
+        with self._lock:
+            row = self._db.execute("SELECT version FROM nodes WHERE name = ?", (name,)).fetchone()
+        return row["version"] if row else ""
+
+    def observe_version(self, node: str, reported: str, pin: str, threshold: int) -> str | None:
+        """Track pin convergence per heartbeat (revision ruling amending
+        ADR-0015). On-pin (or no pin / no report): reset. Off-pin: count;
+        at ``threshold`` consecutive off-pin beats queue one restart
+        command; still off-pin ``threshold`` beats after that, mark the
+        node escalated (the caller emits the theozolith.error event).
+        Returns the action taken: None | "restart-queued" | "escalated"."""
+        with self._lock, self._db:
+            if not pin or not reported or reported == pin:
+                self._db.execute("DELETE FROM version_health WHERE node = ?", (node,))
+                return None
+            self._db.execute(
+                "INSERT INTO version_health (node, offpin_beats) VALUES (?, 0)"
+                " ON CONFLICT (node) DO NOTHING",
+                (node,),
+            )
+            self._db.execute(
+                "UPDATE version_health SET offpin_beats = offpin_beats + 1 WHERE node = ?",
+                (node,),
+            )
+            row = self._db.execute(
+                "SELECT * FROM version_health WHERE node = ?", (node,)
+            ).fetchone()
+            if not row["restart_queued"] and row["offpin_beats"] >= threshold:
+                self._db.execute(
+                    "INSERT INTO commands (node, verb, target, force, created_at)"
+                    " VALUES (?, 'restart', NULL, 0, ?)",
+                    (node, self._clock()),
+                )
+                self._db.execute(
+                    "UPDATE version_health SET restart_queued = 1 WHERE node = ?", (node,)
+                )
+                return "restart-queued"
+            if (
+                row["restart_queued"]
+                and not row["escalated"]
+                and row["offpin_beats"] >= 2 * threshold
+            ):
+                self._db.execute("UPDATE version_health SET escalated = 1 WHERE node = ?", (node,))
+                return "escalated"
+            return None
+
     def container_record(self, node: str, name: str) -> dict[str, Any] | None:
         """The live-container row a heartbeat last reported for (node, name):
         the terminal's authority for target resolution (ADR-0019 — the
@@ -250,17 +324,33 @@ class Store:
         record["age_seconds"] = self._clock() - record["updated_at"]
         return record
 
+    def stack_container_record(self, node: str, name: str) -> dict[str, Any] | None:
+        """The live stack-container row a heartbeat last reported for
+        (node, name): the terminal's target authority for container-kind
+        Stacks (ADR-0019 — the Flight Deck attaches through this record;
+        ``stack`` is where the owning Stack is derived from)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM stack_containers WHERE node = ? AND name = ?", (node, name)
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["age_seconds"] = self._clock() - record["updated_at"]
+        return record
+
     def record_status(
         self,
         node: str,
         stacks: list[dict[str, Any]],
         containers: list[dict[str, Any]],
         images: list[dict[str, Any]],
+        stack_containers: list[dict[str, Any]] | None = None,
     ) -> None:
         """Replace the node's reported status with this heartbeat's."""
         now = self._clock()
         with self._lock, self._db:
-            for table in ("stacks", "containers", "images"):
+            for table in ("stacks", "containers", "images", "stack_containers"):
                 self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
             self._db.executemany(
                 "INSERT INTO stacks (node, name, kind, state, detail, updated_at)"
@@ -312,6 +402,22 @@ class Store:
                     if i.get("name")
                 ],
             )
+            self._db.executemany(
+                "INSERT INTO stack_containers (node, name, stack, state, status, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        node,
+                        str(c.get("name", "")),
+                        str(c.get("stack", "")),
+                        str(c.get("state", "")),
+                        str(c.get("status", "")),
+                        now,
+                    )
+                    for c in (stack_containers or [])
+                    if c.get("name")
+                ],
+            )
 
     # -- typed events --------------------------------------------------------
 
@@ -337,8 +443,8 @@ class Store:
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO events (type, received_at, payload, node, worker, issue,"
-                " run_id, attempt, phase, pr, round, verdict)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " run_id, attempt, phase, pr, round, verdict, component)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_type,
                     self._clock(),
@@ -352,6 +458,7 @@ class Store:
                     _int("pr"),
                     _int("round"),
                     _str("verdict"),
+                    _str("component"),
                 ),
             )
             if event_type != EVENT_RUN:
@@ -425,6 +532,54 @@ class Store:
             for r in rows
         ]
 
+    def error_events(
+        self, *, node: str | None = None, component: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Newest-first theozolith.error feed, filterable by node/component."""
+        query = "SELECT id, received_at, node, component, payload FROM events WHERE type = ?"
+        params: list[Any] = [EVENT_ERROR]
+        if node:
+            query += " AND node = ?"
+            params.append(node)
+        if component:
+            query += " AND component = ?"
+            params.append(component)
+        with self._lock:
+            rows = self._db.execute(
+                query + " ORDER BY id DESC LIMIT ?", [*params, limit]
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "received_at": r["received_at"],
+                "node": r["node"] or "",
+                "component": r["component"] or "",
+                "payload": json.loads(r["payload"]),
+            }
+            for r in rows
+        ]
+
+    def error_filters(self) -> tuple[list[str], list[str]]:
+        """Distinct (nodes, components) seen on error events, for the panel."""
+        with self._lock:
+            nodes = [
+                r["node"]
+                for r in self._db.execute(
+                    "SELECT DISTINCT node FROM events WHERE type = ? AND node IS NOT NULL"
+                    " ORDER BY node",
+                    (EVENT_ERROR,),
+                )
+            ]
+            components = [
+                r["component"]
+                for r in self._db.execute(
+                    "SELECT DISTINCT component FROM events"
+                    " WHERE type = ? AND component IS NOT NULL ORDER BY component",
+                    (EVENT_ERROR,),
+                )
+            ]
+        return nodes, components
+
     def live_claims(self) -> list[LiveClaim]:
         """Issues whose LATEST Run event is non-terminal (claimed/gate)."""
         with self._lock:
@@ -492,21 +647,23 @@ class Store:
         return row["seen"] if row and row["seen"] is not None else None
 
     def evict_progress(self, budget_bytes: int) -> int:
-        """Cache, never archive (ADR-0016): drop the oldest progress events
-        until their payloads fit the byte budget. Terminal Run events are
-        never touched. Returns the number of rows evicted."""
+        """Cache, never archive (ADR-0016): drop the oldest progress and
+        error events until their payloads fit the byte budget. Terminal Run
+        events are never touched. Returns the number of rows evicted."""
+        evictable = (EVENT_PROGRESS, EVENT_ERROR)
         with self._lock, self._db:
             total = self._db.execute(
-                "SELECT COALESCE(SUM(LENGTH(payload)), 0) AS total FROM events WHERE type = ?",
-                (EVENT_PROGRESS,),
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) AS total FROM events"
+                " WHERE type IN (?, ?)",
+                evictable,
             ).fetchone()["total"]
             excess = total - budget_bytes
             if excess <= 0:
                 return 0
             doomed: list[int] = []
             for row in self._db.execute(
-                "SELECT id, LENGTH(payload) AS size FROM events WHERE type = ? ORDER BY id",
-                (EVENT_PROGRESS,),
+                "SELECT id, LENGTH(payload) AS size FROM events WHERE type IN (?, ?) ORDER BY id",
+                evictable,
             ):
                 doomed.append(row["id"])
                 excess -= row["size"]
@@ -773,6 +930,9 @@ class Store:
             nodes = self._db.execute("SELECT * FROM nodes ORDER BY name").fetchall()
             stacks = self._db.execute("SELECT * FROM stacks ORDER BY node, name").fetchall()
             containers = self._db.execute("SELECT * FROM containers ORDER BY node, name").fetchall()
+            stack_containers = self._db.execute(
+                "SELECT * FROM stack_containers ORDER BY node, name"
+            ).fetchall()
             images = self._db.execute("SELECT * FROM images ORDER BY node, name").fetchall()
             commands = self._db.execute(
                 "SELECT id, node, verb, target, force, created_at, delivered_at, completed_at,"
@@ -783,6 +943,7 @@ class Store:
             "nodes": [dict(r) for r in nodes],
             "stacks": [dict(r) for r in stacks],
             "run_containers": [dict(r) for r in containers],
+            "stack_containers": [dict(r) for r in stack_containers],
             "images": [dict(r) for r in images],
             "commands": [dict(r) for r in commands],
             "node_health": [dict(r) for r in health],

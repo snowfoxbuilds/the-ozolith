@@ -21,6 +21,12 @@ def sample_section() -> decisions.DecisionsSection:
         remaining_work=["wire the CLI"],
         dead_ends=["tried ORM X; version conflict"],
         gate_findings=[Finding(step="lint", severity="warning", summary="fixed", fixed=True)],
+        process_issues=[
+            decisions.ProcessIssue(
+                friction="gate step timed out on cold cache",
+                suggested_fix="warm the dependency volume in the image",
+            )
+        ],
     )
 
 
@@ -30,6 +36,9 @@ def test_decisions_render_upsert_parse_roundtrip():
 
     assert body.startswith("Closes #7.")
     assert "### Decisions made" in body
+    # process_issues renders as its own block (2026-07-22 grilling)…
+    assert "### Process issues" in body
+    assert "gate step timed out on cold cache — suggested fix: warm the dependency" in body
     parsed = decisions.parse(body)
     assert parsed == section
 
@@ -38,6 +47,26 @@ def test_decisions_render_upsert_parse_roundtrip():
     assert updated.count(decisions.BEGIN) == 1
     assert decisions.parse(updated) == decisions.DecisionsSection()
     assert updated.startswith("Closes #7.")
+    # …and an empty field renders nothing at all.
+    assert "Process issues" not in updated
+
+
+def test_process_issues_parse_is_lenient_and_advisory():
+    # Malformed entries are dropped, never errors — advisory content cannot
+    # invalidate a decisions file.
+    raw = {
+        "process_issues": [
+            {"friction": "prompt was ambiguous"},
+            {"suggested_fix": "no friction key"},  # dropped
+            "bare string friction",
+            42,  # dropped
+        ]
+    }
+    section = decisions.section_from_dict(raw)
+    assert section.process_issues == [
+        decisions.ProcessIssue(friction="prompt was ambiguous"),
+        decisions.ProcessIssue(friction="bare string friction"),
+    ]
 
 
 def test_decisions_section_text_strips_machine_block():
@@ -82,12 +111,23 @@ def test_verdict_comment_roundtrip_and_latest():
         resume_commit="abc123",
         cherry_pick=["def456"],
         bundle_url="https://example.com/bundle",
+        process_issues=[
+            decisions.ProcessIssue(
+                friction="diff arrived without context lines",
+                suggested_fix="materialize diffs with -U10",
+            )
+        ],
     )
     body = verdict.render_comment(revise)
     assert "Reviewer verdict: revise (round 2)" in body
     assert "Resume from commit `abc123`" in body
+    assert "#### Process issues" in body
+    assert "diff arrived without context lines — suggested fix" in body
     assert verdict.parse_comment(body) == revise
     assert verdict.parse_comment("just chatting about `abc123`") is None
+    # An empty field renders no block at all.
+    plain = verdict.render_comment(verdict.Verdict(verdict=verdict.ESCALATE, round=1))
+    assert "Process issues" not in plain
 
     comments = [
         Comment(id=1, author="reviewer", body=body, created_at="t1"),
@@ -202,35 +242,97 @@ def test_final_round_rule_rejects_revise(tmp_path):
 # -- the Claude harness adapter ----------------------------------------------
 
 
-def test_claude_adapter_interactive_command():
+def test_claude_adapter_headless_command():
     adapter = ClaudeHarnessAdapter()
     manifest = jobdir.Manifest(
         run_id="r1",
         mode=jobdir.MODE_RUN,
-        session="run-r1",
         adapter="claude",
         model="claude-sonnet-5",
     )
-    command = adapter.command(manifest)
-    assert "--model claude-sonnet-5" in command
-    assert "--dangerously-skip-permissions" in command
-    assert " -p " not in f" {command} "  # headless one-shot is banned
-    assert "--output-format" not in command  # no machine mode: it's a session
+    pointer = "Work on the task specified in /job/input/prompt.md. Read that file first."
+    argv = adapter.command(manifest, pointer)
+    # Headless one-shot (ADR-0019 as amended): the constant-size POINTER
+    # rides the invocation and the structured output stream is the
+    # transcript. --verbose is load-bearing: the claude CLI requires it for
+    # -p with --output-format stream-json.
+    assert argv[argv.index("-p") + 1] == pointer
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
 
 
-def test_claude_adapter_installs_stop_hook(tmp_path):
+def test_claude_adapter_prepare_installs_no_hooks(tmp_path):
     adapter = ClaudeHarnessAdapter()
     workdir = tmp_path / "checkout"
     workdir.mkdir()
     env = adapter.prepare(workdir, tmp_path)
 
-    hook_log = Path(env["THEOZOLITH_HOOK_LOG"])
-    assert hook_log == tmp_path / jobdir.HOOK_EVENTS_FILE
-    assert hook_log.exists()
-    settings = json.loads((workdir / ".claude" / "settings.local.json").read_text())
-    stop_command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert "stop" in stop_command and "THEOZOLITH_HOOK_LOG" in stop_command
-    assert settings["hooks"]["UserPromptSubmit"]  # human input re-arms the wait
+    assert env == {}  # no completion hooks: process exit is completion
+    assert not (workdir / ".claude").exists()
+
+
+def test_claude_adapter_stream_stats_reads_usage_and_tool_calls(tmp_path):
+    adapter = ClaudeHarnessAdapter()
+    stream = tmp_path / "transcript.txt"
+    stream.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "working"},
+                                {"type": "tool_use", "name": "Edit", "input": {}},
+                                {"type": "tool_use", "name": "Bash", "input": {}},
+                            ],
+                            "usage": {"input_tokens": 90, "output_tokens": 10},
+                        },
+                    }
+                ),
+                "not json at all {",
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "usage": {"input_tokens": 120, "output_tokens": 60},
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    stats = adapter.stream_stats(stream)
+    assert stats.tool_calls == 2
+    assert stats.tokens == 180  # the final result's cumulative usage wins
+
+
+def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
+    adapter = ClaudeHarnessAdapter()
+    # No result event (session killed): per-call assistant usage is summed.
+    stream = tmp_path / "transcript.txt"
+    stream.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [], "usage": {"input_tokens": 50, "output_tokens": 5}},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [], "usage": {"input_tokens": 60, "output_tokens": 15}},
+            }
+        )
+        + "\n"
+    )
+    assert adapter.stream_stats(stream).tokens == 130
+    # An empty or missing stream reports no usage, never a crash.
+    assert adapter.stream_stats(tmp_path / "absent.txt").tokens is None
 
 
 def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
@@ -258,7 +360,68 @@ VALIDATOR_FIXTURES = [
     ({"verdict": "escalate", "evidence": "human needed"}, 3, 3),
     ("this is not json {", 1, 3),
     (None, 2, 3),  # no file at all
+    # process_issues (advisory): populated and malformed alike stay valid.
+    (
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
+        },
+        1,
+        3,
+    ),
+    (
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": "not even a list",
+        },
+        1,
+        3,
+    ),
 ]
+
+
+def test_process_issues_never_invalidate_a_verdict(tmp_path):
+    """Advisory only (2026-07-22): a populated field is carried, a malformed
+    one is dropped — neither can fail validation and trigger an escalation."""
+    populated_dir = tmp_path / "populated"
+    populated_dir.mkdir()
+    populated = write_verdict(
+        populated_dir,
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
+        },
+    )
+    result, reason = validate(populated)
+    assert result is not None, reason
+    assert result.process_issues == [
+        decisions.ProcessIssue(friction="slow clone", suggested_fix="cache it")
+    ]
+
+    malformed_dir = tmp_path / "malformed"
+    malformed_dir.mkdir()
+    malformed = write_verdict(
+        malformed_dir,
+        {
+            "verdict": "approve",
+            "deviation": "low",
+            "risk": "low",
+            "evidence": "fine",
+            "process_issues": [42, {"no": "friction"}],
+        },
+    )
+    result, reason = validate(malformed)
+    assert result is not None, reason
+    assert result.process_issues == []
 
 
 def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path:
@@ -272,7 +435,6 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
         jobdir.Manifest(
             run_id=f"review-r{round_number}",
             mode=jobdir.MODE_REVIEW,
-            session=f"review-1-round-{round_number}",
             adapter="claude",
             model="m",
             workdir=jobdir.WORK_DIR,

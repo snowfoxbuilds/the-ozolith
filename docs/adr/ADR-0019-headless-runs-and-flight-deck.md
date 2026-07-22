@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-07-22 (pointer prompt; see Amendments)
 
 Date: 2026-07-21
 
@@ -28,3 +28,6 @@ The always-interactive contract (2026-07-15) ran every Run's agent in an attacha
 ## Amends
 
 - ADR-0013 (harness tmux mechanics and the attach-target consequence) and ADR-0014 (hook-based completion, settle window, tmux transcript capture) in part. Supersedes the 2026-07-15 always-interactive decisions in [AGENTIC-CODING-PIPELINE.md](http://agentic-coding-pipeline.md/) and [NODE-SUBSTRATE.md](http://node-substrate.md/) (prior design archived in Historical Context). ADR-0018's terminal machinery stands; its attach targets become the Flight Deck and other configured Stacks.
+## Amendments (2026-07-22, PR #7 review)
+
+- **Pointer prompt**: the harness passes a constant pointer prompt at invocation ("work on the task specified in the mounted task file") instead of embedding the task content in the argv. The driver remains responsible for fetching the task and writing it into the per-Run job directory the container mounts; the argv stays constant-size regardless of task size, and the full task rides the existing file interface. Applies symmetrically to Implementer and Review Runs.

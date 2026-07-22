@@ -6,9 +6,9 @@ through the Control Node's dispatch endpoint (ADR-0017, discovery-only) and
 runs each review round as an
 ephemeral container (ADR-0013): the driver materializes the review inputs as
 files (issue intent, diff, Decisions Section, mechanical signals), the
-judging agent runs in an interactive tmux session and writes its verdict as
-a file, and the driver validates the file, renders the evidence-citing
-comment, and applies exactly one verdict:
+judging agent runs headless (ADR-0019) and writes its verdict as a file,
+and the driver validates the file, renders the evidence-citing comment, and
+applies exactly one verdict:
 
 - approve: needs_human (keeping pr_ready) + deviation:* + risk:* + an
   evidence-citing comment; the human stamps and merges. Approve means no
@@ -35,6 +35,7 @@ import json
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from theozolith_worker import evidence, gitops, jobdir, runner, verdict
@@ -57,11 +58,10 @@ from theozolith_worker.containers import (
     DockerEngine,
     container_labels,
     review_container_name,
-    review_session_name,
 )
 from theozolith_worker.decisions import section_text
-from theozolith_worker.dispatch import DispatchClient, WorkDispatch
-from theozolith_worker.events import EventSink, make_sink, review_event
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
+from theozolith_worker.events import EventSink, emit_error, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
 from theozolith_worker.signals import compute_signals
@@ -119,7 +119,13 @@ other output counts) with this JSON shape:
   "revised_plan": "numbered, concrete steps for the next Run (revise only, else empty)",
   "resume_commit": "commit SHA the next Run resets the branch to (revise \
 only; empty means current head)",
-  "cherry_pick": []}}
+  "cherry_pick": [],
+  "process_issues": []}}
+
+process_issues is optional and advisory: observations about the PIPELINE \
+itself (friction you hit reviewing — missing inputs, confusing evidence), \
+each as {{"friction": "...", "suggested_fix": "..."}}. Never findings about \
+the change under review; it influences no verdict, label, or gate outcome.
 
 deviation grades divergence from the plan (files outside the plan's \
 footprint, unrequested behavior, new dependencies, size far beyond \
@@ -212,7 +218,7 @@ def review_pr(
             ),
             bundle_url=bundle_url,
         )
-        _apply(config, client, pr, issue_number, result, log, container="")
+        _apply(config, client, pr, issue_number, result, log, container="", sink=sink)
         sink.emit(
             review_event(
                 config,
@@ -244,12 +250,10 @@ def review_pr(
         manifest = jobdir.Manifest(
             run_id=review_id,
             mode=jobdir.MODE_REVIEW,
-            session=review_session_name(pr.number, round_number),
             adapter=config.adapter,
             model=config.model,  # the Reviewer's stronger model (ADR-0008)
             workdir=jobdir.WORK_DIR,
             agent_timeout_seconds=config.agent_timeout_seconds,
-            settle_seconds=config.settle_seconds,
             round=round_number,
             round_budget=ROUND_BUDGET,
         )
@@ -294,6 +298,7 @@ def review_pr(
                 transcript,
                 container,
                 log,
+                sink=sink,
             )
             sink.emit(
                 review_event(
@@ -315,6 +320,7 @@ def review_pr(
             log,
             transcript=transcript,
             container=container,
+            sink=sink,
         )
         sink.emit(
             review_event(
@@ -342,6 +348,7 @@ def _escalate_invalid_verdict(
     transcript: str,
     container: str,
     log,
+    sink: EventSink | None = None,
 ) -> verdict.Verdict:
     """Apply the one-strike rule: evidence first (so the cited path
     resolves), then blocked + needs_human with the raw validation error."""
@@ -373,6 +380,7 @@ def _escalate_invalid_verdict(
         message=f"Evidence: invalid verdict, review round {round_number} (issue #{issue_number})",
         log=log,
         context=f"PR #{pr.number}",
+        sink=sink,
     )
 
     location = (
@@ -403,9 +411,10 @@ def _apply(
     *,
     transcript: str = "",
     container: str = "",
+    sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
-    _push_review_evidence(config, pr, issue_number, result, transcript, container, log)
+    _push_review_evidence(config, pr, issue_number, result, transcript, container, log, sink=sink)
 
 
 def _publish(
@@ -442,6 +451,7 @@ def _push_evidence_files(
     message: str,
     log,
     context: str,
+    sink: EventSink | None = None,
 ) -> None:
     """Push evidence, logging failures — never silently, never fatally."""
     try:
@@ -455,6 +465,13 @@ def _push_evidence_files(
         )
     except Exception as exc:
         log(f"evidence push failed for {context}: {exc}")
+        if sink is not None:
+            emit_error(
+                sink,
+                config,
+                error_class=type(exc).__name__,
+                message=f"evidence push failed for {context}: {exc}",
+            )
 
 
 def _push_review_evidence(
@@ -465,6 +482,7 @@ def _push_review_evidence(
     transcript: str,
     container: str,
     log,
+    sink: EventSink | None = None,
 ) -> None:
     record = {
         "pr": pr.number,
@@ -490,6 +508,7 @@ def _push_review_evidence(
         message=f"Evidence: review round {result.round} (issue #{issue_number})",
         log=log,
         context=f"PR #{pr.number}",
+        sink=sink,
     )
 
 
@@ -513,21 +532,31 @@ def run_reviewer(
     """
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
-    dispatch = dispatch or DispatchClient(
-        config.control_node_url, config.control_token, ca=config.control_ca, log=log
-    )
     sink = sink or make_sink(config, log)
+    dispatch = dispatch or DispatchClient(
+        config.control_node_url,
+        config.control_token,
+        ca=config.control_ca,
+        log=log,
+        on_error=lambda error_class, message: emit_error(
+            sink, config, error_class=error_class, message=message
+        ),
+    )
     me = client.viewer_login()
     log(f"reviewer driver ({me}) requesting {PR_READY} PRs for {config.repo} via dispatch")
     sweep_orphans(config, log=log)  # recover orphaned review workspaces (ADR-0016)
 
     verdicts = 0
+    unreachable_streak = 0
     while True:
         try:
             targets = dispatch.review_targets(config.worker_id, config.node_name, me)
             if targets is None:
                 log("control node unreachable; review rounds paused (ADR-0017)")
+                unreachable_streak += 1
                 targets = []
+            else:
+                unreachable_streak = 0
             for number in targets:
                 pr = client.get_pull(number)
                 if not reviewable(pr.labels):
@@ -536,9 +565,20 @@ def run_reviewer(
                     verdicts += 1
         except Exception as exc:
             log(f"review pass failed: {exc}")
+            # The pass-level summary (2026-07-21): review-container start
+            # failures and GitHub write failures in _publish surface here.
+            emit_error(
+                sink,
+                config,
+                error_class=type(exc).__name__,
+                message=f"review pass failed: {exc}",
+                context=traceback.format_exc(),
+            )
         if once:
             return verdicts
-        sleep(config.poll_seconds)
+        # Unreachable-Control backoff (ADR-0015 revision): capped doubling,
+        # snapping back to the poll interval on recovery.
+        sleep(backoff_delay(config.poll_seconds, unreachable_streak))
 
 
 def main(argv: list[str] | None = None) -> int:

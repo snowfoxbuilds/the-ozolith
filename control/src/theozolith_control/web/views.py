@@ -12,8 +12,9 @@ import json
 import time
 from typing import Any
 
+from theozolith_control.app import ERROR_CONTEXT_LIMIT, ERROR_MESSAGE_LIMIT
 from theozolith_control.configrepo import DeployConfig
-from theozolith_control.store import EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
+from theozolith_control.store import EVENT_ERROR, EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
 
 # A node is stale once it has missed ~2 heartbeats (60s cadence).
 STALE_AFTER_SECONDS = 150.0
@@ -56,7 +57,11 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
     state = store.fleet_state()
     quarantined = {q["node"]: q for q in store.quarantines()}
     skewed = image_skew(state["images"])
-    attach_by_stack = {stack.name: bool(stack.attach) for stack in config.stacks}
+    # Attach affordances exist only for container-kind Stacks (ADR-0019):
+    # run containers are headless and never attach targets.
+    attach_by_stack = {
+        stack.name: bool(stack.attach) for stack in config.stacks if stack.kind == "container"
+    }
 
     nodes = []
     for node in state["nodes"]:
@@ -80,12 +85,13 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
                     "converged": want == have,
                 }
             )
-        containers = [
+        containers = [c for c in state["run_containers"] if c["node"] == name]
+        stack_containers = [
             {
                 **c,
-                "attachable": attach_by_stack.get(c["owner"], False),
+                "attachable": attach_by_stack.get(c["stack"], False),
             }
-            for c in state["run_containers"]
+            for c in state["stack_containers"]
             if c["node"] == name
         ]
         images = [
@@ -95,11 +101,18 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
             {
                 "name": name,
                 "version": node["version"],
+                # Version skew (ADR-0015, 2026-07-22): every heartbeat
+                # reports the running product version; a node off the
+                # recorded pin is surfaced, never silently tolerated.
+                "version_skew": bool(config.product_version)
+                and bool(node["version"])
+                and node["version"] != config.product_version,
                 "last_seen": ago(now - node["last_seen"]),
                 "stale": now - node["last_seen"] > STALE_AFTER_SECONDS,
                 "quarantine": quarantined.get(name),
                 "stacks": stacks,
                 "containers": containers,
+                "stack_containers": stack_containers,
                 "images": images,
             }
         )
@@ -112,6 +125,8 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
     return {
         "nodes": nodes,
         "skewed_images": sorted(skewed),
+        "product_version": config.product_version,
+        "version_skew": sorted(n["name"] for n in nodes if n["version_skew"]),
         "pending_commands": pending,
         "drivers": drivers,
     }
@@ -141,7 +156,7 @@ def runs_view(store: Store, repo: str | None, *, now: float | None = None) -> li
     return rows
 
 
-KNOWN_EVENT_TYPES = (EVENT_RUN, EVENT_REVIEW, EVENT_PROGRESS)
+KNOWN_EVENT_TYPES = (EVENT_RUN, EVENT_REVIEW, EVENT_PROGRESS, EVENT_ERROR)
 
 
 def _summarize(event: dict[str, Any]) -> str:
@@ -161,6 +176,11 @@ def _summarize(event: dict[str, Any]) -> str:
             f"issue #{payload.get('issue')} · {payload.get('phase')}"
             f" · {payload.get('tool_calls', 0)} tool call(s)"
             f" · {payload.get('transcript_bytes', 0)} transcript bytes"
+        )
+    if event["type"] == EVENT_ERROR:
+        return (
+            f"{payload.get('component')}@{payload.get('node')}"
+            f" · {payload.get('error_class')}: {str(payload.get('message', ''))[:160]}"
         )
     return ""
 
@@ -186,6 +206,43 @@ def activity_view(
             }
         )
     return rows
+
+
+def errors_view(
+    store: Store,
+    *,
+    node: str = "",
+    component: str = "",
+    limit: int = 50,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """The theozolith.error panel (2026-07-21 grilling): newest-first
+    summaries with node/component filters. Message and context are
+    agent-adjacent text: rendered escaped, never trusted."""
+    now = time.time() if now is None else now
+    rows = []
+    for event in store.error_events(node=node or None, component=component or None, limit=limit):
+        payload = event["payload"]
+        rows.append(
+            {
+                "when": ago(now - event["received_at"]),
+                "node": event["node"],
+                "component": event["component"],
+                "error_class": str(payload.get("error_class", "")),
+                # Display caps == ingestion caps: the expander shows the FULL
+                # stored context — depth was already bounded at ingestion.
+                "message": str(payload.get("message", ""))[:ERROR_MESSAGE_LIMIT],
+                "context": str(payload.get("context", ""))[:ERROR_CONTEXT_LIMIT],
+            }
+        )
+    nodes, components = store.error_filters()
+    return {
+        "rows": rows,
+        "nodes": nodes,
+        "components": components,
+        "selected_node": node,
+        "selected_component": component,
+    }
 
 
 def flags_view(store: Store, *, now: float | None = None) -> dict[str, Any]:

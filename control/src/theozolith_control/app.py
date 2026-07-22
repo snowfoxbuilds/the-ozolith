@@ -22,23 +22,33 @@ ADR-0015/0018, and shared with stdlib-only clients that cannot see pydantic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
+import os
+import tempfile
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 
+from theozolith_control import product
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
 from theozolith_control.settings import ControlSettings
-from theozolith_control.store import COMMAND_VERBS, EVENT_PROGRESS, Store
+from theozolith_control.store import COMMAND_VERBS, EVENT_ERROR, EVENT_PROGRESS, Store
 
 # Ingestion size caps (ADR-0016): the transcript tail inside a progress
 # event, and any single event payload. Oversized tails are truncated (the
 # tail end is the interesting part); anything still over the payload cap is
 # refused — the control database is a bounded cache, never an archive.
+# theozolith.error context/message are likewise truncated, never refused
+# (2026-07-21 grilling: an error summary must not itself be droppable for
+# being too verbose).
 PROGRESS_TAIL_LIMIT = 8_192
+ERROR_CONTEXT_LIMIT = 8_192
+ERROR_MESSAGE_LIMIT = 2_048
 EVENT_PAYLOAD_LIMIT = 32_768
 
 DISPATCH_ROLES = ("worker", "reviewer")
@@ -85,6 +95,14 @@ def _capped_event(body: dict[str, Any]) -> dict[str, Any]:
         tail = body.get("transcript_tail")
         if isinstance(tail, str) and len(tail) > PROGRESS_TAIL_LIMIT:
             body = {**body, "transcript_tail": tail[-PROGRESS_TAIL_LIMIT:]}
+    if body.get("type") == EVENT_ERROR:
+        context = body.get("context")
+        if isinstance(context, str) and len(context) > ERROR_CONTEXT_LIMIT:
+            # Keep the tail: with a traceback the innermost frames matter.
+            body = {**body, "context": context[-ERROR_CONTEXT_LIMIT:]}
+        message = body.get("message")
+        if isinstance(message, str) and len(message) > ERROR_MESSAGE_LIMIT:
+            body = {**body, "message": message[:ERROR_MESSAGE_LIMIT]}
     if len(json.dumps(body)) > EVENT_PAYLOAD_LIMIT:
         raise HTTPException(
             status_code=413,
@@ -157,6 +175,7 @@ def create_app(
             _list_of_dicts(body, "stacks"),
             _list_of_dicts(body, "run_containers"),
             _list_of_dicts(body, "images"),
+            stack_containers=_list_of_dicts(body, "stack_containers"),
         )
         completed = body.get("completed_commands", [])
         if isinstance(completed, list):
@@ -164,9 +183,41 @@ def create_app(
         # Queue-behind visibility: commands the daemon is holding behind an
         # in-flight Run ride the heartbeat as deferrals (NODE-SUBSTRATE).
         store.record_deferrals(node, _list_of_dicts(body, "deferred_commands"))
+        config_doc = _config().desired_state_for(node)
+        pin = config_doc.get("product_version") or ""
+        if pin:
+            # Developer-path builds (ADR-0015 amendment 2026-07-22): when the
+            # pinned version has a served artifact set, the update installs
+            # those wheels instead of pulling a published release — the
+            # heartbeat carries filename REFERENCES only (channel invariant).
+            version_dir = settings.artifacts_dir / pin
+            if version_dir.is_dir():
+                config_doc["product_artifacts"] = sorted(
+                    p.name for p in version_dir.iterdir() if p.name.endswith(".whl")
+                )
+        # Pin-convergence watch (ADR-0015 revision): keyed on the REPORTED
+        # version, never command acks. Persistent off-pin escalates: one
+        # restart command at the threshold, a theozolith.error after that —
+        # the node stays dispatch-ineligible until a human intervenes.
+        reported = str(body.get("version", ""))
+        action = store.observe_version(node, reported, pin, settings.offpin_beats)
+        if action == "escalated":
+            store.record_event(
+                {
+                    "type": EVENT_ERROR,
+                    "node": node,
+                    "component": "control-node",
+                    "error_class": "update-not-converging",
+                    "message": (
+                        f"node {node} still reports product version {reported} after a"
+                        f" restart; the pin is {pin} — the node stays ineligible for"
+                        " dispatch until a human intervenes"
+                    ),
+                }
+            )
         return {
             "commands": store.pending_commands(node),
-            "config": _config().desired_state_for(node),
+            "config": config_doc,
         }
 
     @app.post("/api/v1/events")
@@ -200,12 +251,23 @@ def create_app(
         worker = _require(body, "worker", str)
         login = _require(body, "login", str)
         node = str(body.get("node", ""))
+        # The pin-eligibility gate (ADR-0015 revision) needs the recorded
+        # pin. Fail-open on a broken Config Repo: an unreadable repo must
+        # not silence dispatch — it is loudly visible everywhere else.
+        try:
+            pin = _config().product_version
+        except HTTPException:
+            pin = ""
         # Off the event loop: the grant path does real GitHub round-trips
         # (with rate-limit sleeps) that must never stall heartbeats or the
         # terminal websockets. The dispatcher's own lock still serializes.
         if role == "worker":
-            return await asyncio.to_thread(dispatcher.grant_work, worker, node, login)
-        return await asyncio.to_thread(dispatcher.review_targets, worker, node, login)
+            return await asyncio.to_thread(
+                lambda: dispatcher.grant_work(worker, node, login, pin=pin)
+            )
+        return await asyncio.to_thread(
+            lambda: dispatcher.review_targets(worker, node, login, pin=pin)
+        )
 
     @app.post("/api/v1/secrets/pull")
     async def secrets_pull(request: Request) -> dict[str, Any]:
@@ -273,6 +335,75 @@ def create_app(
                 0, "", "", f"node {node}: quarantine released by {verb} command"
             )
         return {"id": command_id}
+
+    # -- the two update paths, one machinery (ADR-0015, 2026-07-22) ----------
+
+    @app.post("/api/v1/product/update")
+    async def product_update(request: Request) -> dict[str, Any]:
+        """Pin ``version`` in the Config Repo (committed) and fan the update
+        out to every known node. Nodes hosting the ``control`` Stack are
+        queued LAST: the Control Node applies its own update only after the
+        fan-out is queued (its daemon's existing os.execv path performs it).
+        Re-running with a previous version re-pins and redeploys (rollback)."""
+        _authorize(request, settings.admin_token, "admin")
+        body = await _json_body(request)
+        version = _require(body, "version", str)
+        previous = product.read_pin(settings.config_repo)
+        try:
+            product.write_pin(settings.config_repo, version)
+        except product.ProductError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Cache, not archive: at most the pinned + previous artifact sets
+        # survive a pin change (the previous set is the rollback path).
+        product.prune_artifacts(settings.artifacts_dir, {version, previous} - {""})
+        control_hosts = {s.node for s in _config().stacks if s.name == "control"}
+        nodes = sorted(
+            (n["name"] for n in store.fleet_state()["nodes"]),
+            key=lambda name: (name in control_hosts, name),
+        )
+        for node in nodes:
+            store.queue_command(node, "update", None, False)
+            if store.release_quarantine(node):
+                store.record_janitor_action(
+                    0, "", "", f"node {node}: quarantine released by update fan-out"
+                )
+        return {"version": version, "queued": nodes}
+
+    @app.put("/api/v1/product/artifacts/{version}/{filename}")
+    async def upload_artifact(version: str, filename: str, request: Request) -> dict[str, Any]:
+        """`theozolith build` uploads its wheels here; nodes pull them back
+        via the GET twin — nodes never pull source and never build."""
+        _authorize(request, settings.admin_token, "admin")
+        if not product.safe_segment(version) or not product.safe_segment(filename):
+            raise HTTPException(status_code=400, detail="unsafe artifact path segment")
+        if not filename.endswith(".whl"):
+            raise HTTPException(status_code=400, detail="artifacts are wheels (*.whl)")
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty artifact body")
+        target_dir = settings.artifacts_dir / version
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic: a node pulling mid-upload must never receive a torn wheel.
+        fd, tmp = tempfile.mkstemp(dir=str(target_dir), prefix=f".{filename}.")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp, target_dir / filename)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        return {"ok": True, "bytes": len(data)}
+
+    @app.get("/api/v1/product/artifacts/{version}/{filename}")
+    async def pull_artifact(version: str, filename: str, request: Request):
+        _authorize(request, settings.node_token, "node")
+        if not product.safe_segment(version) or not product.safe_segment(filename):
+            raise HTTPException(status_code=400, detail="unsafe artifact path segment")
+        path = settings.artifacts_dir / version / filename
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"no artifact {filename} for {version}")
+        return FileResponse(path, media_type="application/octet-stream")
 
     @app.post("/api/v1/nodes/{node}/quarantine/release")
     async def unquarantine(node: str, request: Request) -> dict[str, Any]:

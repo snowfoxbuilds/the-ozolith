@@ -1,16 +1,16 @@
 # theozolith-worker
 
-The coding-pipeline component: the Worker and Reviewer **drivers**, the **agent
+The coding-pipeline component: the Implementer and Reviewer **drivers**, the **agent
 harness** + run-container image, the first-party quality gate, and the repo bootstrap
-tool. See `docs/specs/AGENTIC-CODING-PIPELINE.md` and ADR-0013/0016/0017.
+tool. See `docs/specs/AGENTIC-CODING-PIPELINE.md` and ADR-0013/0016/0017/0019.
 
-## Topology (M2)
+## Topology
 
 Each actor is a trusted, credentialed **driver** — a node-resident host process — paired
 with a credential-free **agent harness** running as PID 1 of an ephemeral per-Run
 container:
 
-- `theozolith-worker` — the Worker driver: requests work from the Control Node's
+- `theozolith-worker` — the Implementer driver: requests work from the Control Node's
   dispatch endpoint (ADR-0017 — the Control Node writes the claim on GitHub before the
   driver ever sees the issue), prepares a per-Run job directory with a **token-free
   checkout**, launches `ozolith-run-<run-id>`, sequences gate steps as harness jobs,
@@ -25,12 +25,15 @@ container:
   `ozolith-review-<pr>-round-<n>`, validates the agent's `verdict.json`, renders the
   verdict comment, and applies all post-PR state. 3 review rounds per issue; at the last
   budgeted round a revise verdict is rejected (approve or escalate only).
-- `theozolith-harness` — PID 1 of the run container: starts the interactive agent
-  session in tmux (`run-<run-id>` / `review-<pr>-round-<n>`), injects the prompt by
-  buffer paste, captures a `pipe-pane` transcript into the evidence bundle, detects
-  completion via the per-adapter hook (Claude Stop hook) plus a hard timeout, serves
-  driver-sequenced jobs, writes outputs, and exits. Headless `-p` invocation is banned
-  (always-interactive contract).
+- `theozolith-harness` — PID 1 of the run container: invokes the agent **headless**
+  (ADR-0019 as amended) — the adapter's one-shot command (Claude: `claude -p` with
+  structured output) carrying a constant-size **pointer prompt** at the mounted task
+  file (`input/prompt.md`, driver-rendered; the argv never carries task content, so
+  the invocation cannot outgrow ARG_MAX) — captures the structured output stream as
+  the evidence-bundle transcript (it also supplies token usage), treats process exit
+  as completion with the hard agent timeout as backstop, serves driver-sequenced
+  jobs, writes outputs, and exits. Run containers are never attach targets;
+  interactivity lives only in the Flight Deck Stack.
 
 Driver and harness communicate only through the job directory (`input/`, `output/`,
 `checkout|work/`), bind-mounted at `/job` — no network channel, no shared process tree.

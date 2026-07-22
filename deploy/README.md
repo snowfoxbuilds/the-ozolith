@@ -56,7 +56,8 @@ below.
 3. **Config Repo** (`~/.theozolith/configs` on the Control Node; ADR-0006): declare
    Stacks and derived images — `deploy/configs-example/` is a complete starter. Desired
    state distributes over the heartbeat channel; nodes cache it for degraded mode.
-   The Worker/Reviewer drivers are process-kind Stacks; `control` is a container Stack.
+   The Implementer/Reviewer drivers are process-kind Stacks; `control` and the Flight
+   Deck are container Stacks.
 
 4. **Secrets**: enter values once —
 
@@ -78,19 +79,59 @@ below.
    theozolith-control command recycle --node box1 --target worker   # kills the whole
        # driver tree, run containers included, and restarts it
    theozolith-control command rebuild --node box1 --target claude-dev
-   theozolith-control command update  --node box1             # Config-Repo-pinned version
+   theozolith-control command update  --node box1             # nudge convergence now
+   theozolith-control command restart --node box1             # re-exec the daemon in place
    theozolith-control flags                                   # zombie/malformed/quarantine flags
    theozolith-control unquarantine --node box1                # human-only release (ADR-0016)
    ```
+
+6. **Update the product** (ADR-0015 as amended — two paths, one machinery;
+   both need `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN`):
+
+   ```sh
+   theozolith update                  # user path: pin the latest published release
+   theozolith update --version 0.4.0  # …or an explicit one; rollback = re-pin
+   theozolith build                   # developer path, from a CLEAN source checkout:
+       # builds the distribution, pins the checkout's git SHA, and uploads the
+       # wheels — the Control Node serves them, so nodes never pull source and
+       # never build. A dirty tree is refused: every pin names a committed SHA.
+   theozolith test                    # the local-development signal: run the
+       # checkout's test and lint suite (iterate here, never by deploying
+       # uncommitted state)
+   ```
+
+   Both paths commit the pin bump to `product.toml` in the Config Repo. **The
+   pin is desired state**: every Node Daemon compares its running product
+   version against the pin on each heartbeat and self-updates on mismatch
+   (drain-aware queue-behind as above; startup is just the first pass), so a
+   failed install retries automatically — the fanned-out update command is an
+   immediate nudge, never the mechanism of record. The node hosting the
+   `control` Stack is queued last: the Control Node applies its own update only
+   after the fan-out is queued.
+
+   Dispatch follows convergence: the Control Node grants work only to nodes
+   whose heartbeat-reported version equals the pin, so issuing an update pauses
+   new dispatch fleet-wide and capacity returns node by node. A node still
+   off-pin after 3 consecutive heartbeats (`THEOZOLITH_OFFPIN_BEATS`) gets a
+   queued `restart`; still off-pin after that, a `theozolith.error` lands on
+   the dashboard and the node stays ineligible until you intervene. The
+   dashboard surfaces version skew against the recorded pin; polling backs off
+   exponentially (capped at 5 minutes) while the Control Node is unreachable.
+   A fresh install with no `product.toml` pin resolves the latest release and
+   writes the pin at Control Node startup — a running fleet always has a
+   recorded version.
 
    `recycle` and `update` received mid-Run queue behind the current Run (job-dir
    presence is the in-flight signal; the deferral shows in heartbeats and on the
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
    (same origin as the API, behind the admin credential) is the read-only fleet view
-   plus secret entry and the web terminal: to expose a Stack's live run containers to
-   the terminal, give it an `attach` argv array in the Config Repo (see
-   `deploy/configs-example/stacks/worker.toml`; free-form command strings are rejected,
-   ADR-0019).
+   plus secret entry, the errors panel (`theozolith.error` summaries with
+   node/component filters — depth stays in each node's journal and the evidence
+   bundles), and the web terminal. Terminal targets are container-kind Stacks with an
+   `attach` argv array in the Config Repo — the Flight Deck first among them (see
+   `deploy/configs-example/stacks/flightdeck.toml`; free-form command strings are
+   rejected, ADR-0022). Run containers are headless and never attach targets
+   (ADR-0019).
 
    The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence
@@ -141,20 +182,24 @@ the files owned by the driver user either by building the image with
 `--build-arg OZOLITH_UID=$(id -u)` (or matching uid in the image recipe) or by setting
 `THEOZOLITH_CONTAINER_USER=$(id -u):$(id -g)`.
 
-## Observing and attaching
+## Observing Runs, and the Flight Deck
 
-- Live containers: `docker ps --filter label=theozolith.owner` — names are
+- Live run containers: `docker ps --filter label=theozolith.owner` — names are
   `ozolith-run-<run-id>` and `ozolith-review-<pr>-round-<n>`; heartbeats report the same
-  set to the Control Node.
-- Attach to any live agent session (input is permitted and lands in the transcript):
-
-  ```sh
-  docker exec -it ozolith-run-<run-id> tmux attach
-  ```
-
-  Detach with `C-b d`. No live run container = nothing to attach to.
-- Evidence bundles (incl. full session transcripts): branch `theozolith/evidence`
-  in the target repo, `runs/issue-<N>/`.
+  set to the Control Node. Runs are **headless** (ADR-0019): there is no session to
+  attach to and no mid-Run steering — watch progress telemetry on the dashboard, read
+  the evidence bundle afterwards, or kill the Run (`recycle`).
+- Evidence bundles (incl. the structured-output session transcripts and token usage):
+  branch `theozolith/evidence` in the target repo, `runs/issue-<N>/`.
+- **The Flight Deck** is where interactive agent work happens: a container-kind Stack
+  running the agent CLI in a named tmux session (`deploy/configs-example/stacks/
+  flightdeck.toml`), attached from the web terminal (attach/detach audit-logged; the
+  session transcript captures typed input). Its GitHub credential is a **dedicated
+  machine identity** — a fine-grained PAT scoped to issues, PRs, and contents with
+  **no merge permission**, stored under the dedicated secret name
+  `flightdeck-github-token`. Never reuse a driver PAT and never use a personal token
+  here; the human merge gate stays human by construction. Do not leave Flight Deck
+  sessions running unattended.
 
 ## Cleanup / deletion test
 

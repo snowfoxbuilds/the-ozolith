@@ -8,6 +8,8 @@ where the M2 end-to-end harness already is.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -242,6 +244,88 @@ def test_full_review_cycle_emits_run_and_review_events(harness: Harness, tmp_pat
         progress = live.store.events(type="theozolith.run.progress", issue=issue)
         assert progress and progress[0]["run_id"]
         assert "transcript_tail" in progress[0]
+
+
+def test_progress_telemetry_reads_counters_from_the_stream(harness: Harness, tmp_path: Path):
+    """ADR-0019 acceptance 2: for adapters whose structured output stream
+    reports usage (claude does), progress telemetry carries a non-null
+    token count — ADR-0018's null-token gap is closed."""
+    from theozolith_worker import events, jobdir
+
+    job = jobdir.create_job_dir(tmp_path / "jobs", "r9")
+    stream = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": "Edit", "input": {}},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                    ],
+                    "usage": {"input_tokens": 90, "output_tokens": 10},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "usage": {"input_tokens": 120, "output_tokens": 60},
+            }
+        ),
+    ]
+    (job / jobdir.TRANSCRIPT_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (job / jobdir.TRANSCRIPT_FILE).write_text("\n".join(stream) + "\n")
+
+    event = events.progress_event(
+        harness.worker_config, job, issue=1, run_id="r9", attempt=1, elapsed_seconds=5.0
+    )
+    assert event["tokens"] == 180  # non-null: extracted from the stream
+    assert event["tool_calls"] == 2
+    assert "prompts" not in event  # the operator-prompt counter died with attach
+
+
+def test_driver_polling_backs_off_while_control_is_unreachable(harness: Harness):
+    """Acceptance 4 (ADR-0015 revision): the driver loop doubles its poll
+    delay (capped) across consecutive unreachable passes and snaps back the
+    moment the Control Node answers."""
+    import dataclasses
+
+    class ScriptedDispatch:
+        def __init__(self):
+            self.last_unreachable = True
+
+        def request_work(self, worker, node, login):
+            return None
+
+        def review_targets(self, worker, node, login):
+            return None
+
+    class _Stop(Exception):
+        pass
+
+    dispatch = ScriptedDispatch()
+    delays: list[float] = []
+
+    def sleeper(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) == 4:
+            dispatch.last_unreachable = False  # the Control Node returns
+        if len(delays) >= 6:
+            raise _Stop
+
+    config = dataclasses.replace(harness.worker_config, poll_seconds=60.0)
+    with contextlib.suppress(_Stop):
+        run_worker(
+            config,
+            harness.worker_client,
+            harness.session_factory,
+            dispatch,
+            sleep=sleeper,
+            log=harness.logs.append,
+            sink=RecordingSink(),
+        )
+    assert delays == [60, 120, 240, 300, 60, 60]
 
 
 def test_failed_runs_emit_failed_then_escalated(harness: Harness):

@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import traceback
 
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import DockerEngine, Engine
-from theozolith_worker.dispatch import DispatchClient, WorkDispatch
-from theozolith_worker.events import EventSink, make_sink
+from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
+from theozolith_worker.events import EventSink, emit_error, make_sink
 from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.runner import execute_claim
 from theozolith_worker.sessions import ContainerSession, SessionFactory
@@ -72,10 +73,16 @@ def run_worker(
     """The dispatch-run loop; returns the number of Runs executed."""
     client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
     session_factory = session_factory or container_session_factory(DockerEngine())
-    dispatch = dispatch or DispatchClient(
-        config.control_node_url, config.control_token, ca=config.control_ca, log=log
-    )
     sink = sink or make_sink(config, log)
+    dispatch = dispatch or DispatchClient(
+        config.control_node_url,
+        config.control_token,
+        ca=config.control_ca,
+        log=log,
+        on_error=lambda error_class, message: emit_error(
+            sink, config, error_class=error_class, message=message
+        ),
+    )
     me = client.viewer_login()
     log(f"worker driver {config.worker_id} ({me}) requesting work for {config.repo} via dispatch")
     _, kept = sweep_orphans(config, log=log)  # boot-time evidence sweep (ADR-0016)
@@ -84,6 +91,7 @@ def run_worker(
     sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
 
     runs = 0
+    unreachable_streak = 0
     while True:
         granted: dict | None = None
         try:
@@ -101,15 +109,34 @@ def run_worker(
                     )
         except Exception as exc:
             log(f"dispatch pass failed: {exc}")
+            # The pass-level summary (2026-07-21): GitHub write failures in
+            # escalation paths and anything else that escaped the Run's own
+            # failure handling surfaces here.
+            emit_error(
+                sink,
+                config,
+                error_class=type(exc).__name__,
+                message=f"dispatch pass failed: {exc}",
+                context=traceback.format_exc(),
+            )
         if once:
             return runs
         if granted is None:
             # An idle-pass sweep with nothing to push is one directory
-            # listing; only failed pushes arm the backoff.
+            # listing; only failed pushes arm the sweep backoff.
             if time.monotonic() >= sweep_retry_at:
                 _, kept = sweep_orphans(config, log=log)
                 sweep_retry_at = time.monotonic() + SWEEP_RETRY_SECONDS if kept else 0.0
-            sleep(config.poll_seconds)
+            # Unreachable-Control backoff (ADR-0015 revision): double the
+            # poll delay per consecutive failed pass, capped; recover the
+            # moment the Control Node answers again.
+            if getattr(dispatch, "last_unreachable", False):
+                unreachable_streak += 1
+            else:
+                unreachable_streak = 0
+            sleep(backoff_delay(config.poll_seconds, unreachable_streak))
+        else:
+            unreachable_streak = 0
 
 
 def main(argv: list[str] | None = None) -> int:

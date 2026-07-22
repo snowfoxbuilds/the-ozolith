@@ -118,7 +118,6 @@ SWEPT_ARTIFACTS = (
     "input/issue.json",
     jobdir.STATUS_FILE,
     jobdir.TRANSCRIPT_FILE,
-    jobdir.HOOK_EVENTS_FILE,
     jobdir.VERDICT_FILE,
     f"{jobdir.CHECKOUT_DIR}/.theozolith/decisions.json",
 )

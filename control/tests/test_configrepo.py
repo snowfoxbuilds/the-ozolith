@@ -144,8 +144,8 @@ def test_attach_must_be_an_argv_array(tmp_path):
 def test_attach_placeholders_only_as_complete_arguments(tmp_path):
     write(
         tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        "stacks/flightdeck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "ghcr.io/x/deck:1"\n'
         'attach = ["ssh", "user@{host}", "tmux", "attach"]\n',
     )
     with pytest.raises(ConfigRepoError, match="complete arguments"):
@@ -153,8 +153,8 @@ def test_attach_placeholders_only_as_complete_arguments(tmp_path):
 
     write(
         tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        "stacks/flightdeck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "ghcr.io/x/deck:1"\n'
         'attach = ["docker", "exec", "-it", "c-{container}", "sh"]\n',
     )
     with pytest.raises(ConfigRepoError, match="complete arguments"):
@@ -162,12 +162,47 @@ def test_attach_placeholders_only_as_complete_arguments(tmp_path):
 
     write(
         tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "w"\nattach = ["ssh", "{host}", "-t",'
-        ' "docker", "exec", "-it", "{container}", "tmux", "attach"]\n',
+        "stacks/flightdeck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "ghcr.io/x/deck:1"\n'
+        'attach = ["ssh", "{host}", "-t",'
+        ' "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]\n',
     )
     stack = load_config(tmp_path).stacks[0]
     assert stack.attach[1] == "{host}" and stack.attach[6] == "{container}"
+
+
+def test_attach_is_container_kind_only(tmp_path):
+    """ADR-0019: run containers are headless — a process Stack declaring an
+    attach command is a Config Repo error, so no configuration can ever
+    expose a run container to the terminal."""
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        'attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "sh"]\n',
+    )
+    with pytest.raises(ConfigRepoError, match="ADR-0019"):
+        load_config(tmp_path)
+
+
+def test_container_command_is_single_image_form_only(tmp_path):
+    write(
+        tmp_path,
+        "stacks/flightdeck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "ghcr.io/x/deck:1"\n'
+        'command = "tmux new-session -d -s flightdeck claude"\n',
+    )
+    stack = load_config(tmp_path).stacks[0]
+    assert stack.command == "tmux new-session -d -s flightdeck claude"
+
+    write(tmp_path, "compose/deck.yml", "services: {}\n")
+    write(
+        tmp_path,
+        "stacks/composedeck.toml",
+        'kind = "container"\nnode = "box1"\ncompose = "compose/deck.yml"\ncommand = "tmux"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="single-image container form"):
+        load_config(tmp_path)
 
 
 def test_duplicate_resolved_jobs_dirs_are_rejected_per_node(tmp_path):

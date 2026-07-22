@@ -33,6 +33,7 @@ from theozolith_worker.bootstrap.vocabulary import (
     PLAN_READY,
     PR_READY,
 )
+from theozolith_worker.containers import EngineError
 from theozolith_worker.gitops import GitError
 from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.runner import branch_for
@@ -96,13 +97,17 @@ def test_happy_path(harness: Harness):
     assert f"tree/theozolith/evidence/runs/issue-{number}" in comment
 
     # The bundle link resolves to a real git ref holding this Run's evidence —
-    # including the full session transcript (M2 brief).
+    # the transcript is the headless session's structured output stream
+    # (ADR-0019), and run.json carries the usage the stream reported.
     paths = harness.evidence_paths()
     run_dirs = [p for p in paths if p.startswith(f"runs/issue-{number}/") and "/reviews/" not in p]
-    assert any(p.endswith("/run.json") for p in run_dirs)
+    (run_json_path,) = [p for p in run_dirs if p.endswith("/run.json")]
+    run_json = json.loads(harness.evidence_file(run_json_path))
+    assert run_json["tokens"] == 180  # extracted from the stream's usage
     (transcript_path,) = [p for p in run_dirs if p.endswith("/transcript.txt")]
     transcript = harness.evidence_file(transcript_path)
-    assert "[tmux session run-" in transcript  # the pipe-pane capture
+    first_event = json.loads(transcript.splitlines()[0])
+    assert first_event["type"] == "system"  # line-per-event JSON stream
     assert any(f"runs/issue-{number}/reviews/round-1" in p for p in paths)
 
     # Containers: run + review round, correctly named, none left behind.
@@ -110,6 +115,55 @@ def test_happy_path(harness: Harness):
     assert any(name.startswith("ozolith-run-") for name in names)
     assert f"ozolith-review-{pr_number}-round-1" in names
     assert harness.record.alive == set()
+
+
+def test_process_issues_render_everywhere_and_change_no_state(harness: Harness):
+    """2026-07-22 grilling: a populated process_issues[] renders as a
+    Process issues block in the PR body and the verdict comment, and
+    provably changes no verdict, label, or gate outcome — the label sets
+    are exactly the ones the plain happy path produces."""
+    number = harness.file_issue("Add change.txt", CRITERIA_BODY, risk="medium")
+    harness.worker_behaviors.append(
+        behavior_write(
+            {"change.txt": "run 1\n"},
+            decisions=[{"what": "made the change", "why": "the issue asked"}],
+            process_issues=[
+                {"friction": "the gate ran twice", "suggested_fix": "dedupe gate steps"}
+            ],
+        )
+    )
+    assert harness.worker_once() == 1
+
+    (pr_number,) = harness.fake.open_pr_numbers()
+    body = harness.fake.issues[pr_number]["body"]
+    assert "### Process issues" in body
+    assert "the gate ran twice — suggested fix: dedupe gate steps" in body
+    section = decisions.parse(body)
+    assert section.process_issues == [
+        decisions.ProcessIssue("the gate ran twice", "dedupe gate steps")
+    ]
+    # Identical PR/issue state to the plain happy path: advisory only.
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+
+    harness.reviewer_replies.append(
+        approve_reply(
+            process_issues=[{"friction": "diff lacked context", "suggested_fix": "use -U10"}]
+        )
+    )
+    assert harness.reviewer_once() == 1
+
+    comment = harness.fake.comments[pr_number][-1]["body"]
+    assert comment.startswith("### Reviewer verdict: approve")
+    assert "#### Process issues" in comment
+    assert "diff lacked context — suggested fix: use -U10" in comment
+    # The exact label set an approve without process_issues produces.
+    assert harness.fake.labels_of(pr_number) == {
+        PR_READY,
+        NEEDS_HUMAN,
+        "deviation:low",
+        "risk:low",
+    }
 
 
 # -- 2. claims (write-through dispatch, ADR-0017) ------------------------------
@@ -825,11 +879,41 @@ def test_hostile_git_metadata_cannot_reach_the_driver(harness: Harness):
     assert harness.remote_file(branch_for(number), "change.txt") == "x"
 
 
-# -- 9. interactivity ---------------------------------------------------------
-# The live-session half (attach, inject, transcript capture) is exercised
-# against real tmux in test_harness.py; here we pin the driver-side plumbing:
-# whatever the session transcript contains ends up in the evidence bundle
-# (test_happy_path asserts the pipe-pane capture reaches the git ref).
+def test_container_start_failure_emits_an_error_event(harness: Harness):
+    """2026-07-21 grilling: an internal failure path (container start) emits
+    one theozolith.error per Run with component and error class, alongside
+    the normal failed-Run machinery."""
+    number = harness.file_issue("Doomed", CRITERIA_BODY)
+    real_factory = harness.session_factory
+
+    def broken_factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+
+        def broken_launch():
+            raise EngineError("docker run failed: no such image")
+
+        session.launch = broken_launch  # type: ignore[method-assign]
+        return session
+
+    harness.session_factory = broken_factory  # type: ignore[method-assign]
+    harness.worker_once()
+
+    errors = [e for e in harness.sink.events if e["type"] == "theozolith.error"]
+    assert len(errors) == 2  # the Run and its one local retry
+    for event in errors:
+        assert event["component"] == "implementer-driver"
+        assert event["error_class"] == "EngineError"
+        assert "docker run failed" in event["message"]
+    # The normal ADR-0016 escalation still happened.
+    assert FAILED in harness.fake.labels_of(number)
+
+
+# -- 9. headless sessions (ADR-0019) -------------------------------------------
+# The process half (one-shot invocation, exit-is-completion, timeout kill) is
+# exercised against real subprocesses in test_harness.py; here we pin the
+# driver-side plumbing: whatever the structured output stream contains ends
+# up in the evidence bundle (test_happy_path asserts the stream reaches the
+# git ref and that run.json carries its token usage).
 
 
 # -- 10. verdict robustness ---------------------------------------------------

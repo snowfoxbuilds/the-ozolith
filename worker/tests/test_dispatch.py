@@ -83,3 +83,57 @@ def test_unreachable_control_node_pauses_cleanly():
     assert client.request_work("w", "n", "l") is None
     assert client.review_targets("w", "n", "l") is None
     assert any("unreachable" in line for line in logs)
+
+
+def test_backoff_delay_doubles_to_the_cap_and_recovers():
+    """ADR-0015 revision: capped exponential backoff while the Control Node
+    is unreachable; streak 0 (recovered) is the plain poll interval."""
+    from theozolith_worker.dispatch import backoff_delay
+
+    assert [backoff_delay(60, streak) for streak in range(7)] == [
+        60,
+        60,
+        120,
+        240,
+        300,
+        300,
+        300,
+    ]
+    assert backoff_delay(15, 3) == 60
+    assert backoff_delay(0, 5) == 0  # a zero poll interval stays zero (tests)
+
+
+def test_unreachability_flag_tracks_the_last_pass(control_node):
+    url, answers, _ = control_node
+    client = DispatchClient(url, "node-token")
+    answers.append((200, {"issue": None}))
+    client.request_work("w", "n", "l")
+    assert client.last_unreachable is False
+
+    dead = DispatchClient("http://127.0.0.1:1", "t", timeout=0.2)
+    dead.request_work("w", "n", "l")
+    assert dead.last_unreachable is True
+
+    answers.append((503, {"detail": "no PAT"}))
+    client.request_work("w", "n", "l")
+    assert client.last_unreachable is False  # a refusal is not unreachability
+
+
+def test_dispatch_failures_fire_the_error_hook(control_node):
+    """2026-07-21 grilling: dispatch failures surface as theozolith.error
+    through the on_error hook the drivers wire to their event sink."""
+    url, answers, _ = control_node
+    answers.append((503, {"detail": "dispatch requires a control PAT"}))
+    answers.append((200, {"issue": {"number": "not-an-int"}}))
+    errors: list[tuple[str, str]] = []
+    client = DispatchClient(url, "node-token", on_error=lambda c, m: errors.append((c, m)))
+
+    assert client.request_work("w", "n", "l") is None
+    assert client.request_work("w", "n", "l") is None
+    unreachable = DispatchClient(
+        "http://127.0.0.1:1", "t", timeout=0.2, on_error=lambda c, m: errors.append((c, m))
+    )
+    assert unreachable.request_work("w", "n", "l") is None
+
+    classes = [error_class for error_class, _ in errors]
+    assert classes == ["dispatch-refused", "malformed-grant", "control-unreachable"]

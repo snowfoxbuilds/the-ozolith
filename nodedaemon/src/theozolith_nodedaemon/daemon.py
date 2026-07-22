@@ -7,9 +7,12 @@ One pass every heartbeat interval (60s):
 2. The response carries infrastructure commands and this node's desired
    state (ADR-0006); the desired state is cached to disk so an unreachable
    Control Node degrades to reconciling the last-applied config, forever.
-3. Execute commands (drain / recycle / update / rebuild), then converge
-   Stacks: build missing derived images, start/stop process children and
-   container workloads, and reap orphaned run containers (owner gone).
+3. Execute commands (drain / recycle / update / rebuild / restart), converge
+   the product version to the pin (the pin is desired state — ADR-0015 as
+   revised: mismatch self-updates, failed installs retry next pass, the
+   update command is only a nudge), then converge Stacks: build missing
+   derived images, start/stop process children and container workloads, and
+   reap orphaned run containers (owner gone).
 
 Queue-behind (NODE-SUBSTRATE, grilling 2026-07-17): recycle and update
 received mid-Run defer behind the current Run — job-dir presence under a
@@ -30,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -52,6 +56,17 @@ from theozolith_nodedaemon.stacks import (
 )
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
+
+# theozolith.error events (2026-07-21 grilling): size-capped summaries
+# pointing at the failing node/component; diagnostic depth stays in the
+# systemd journal. Caps mirror the worker's events module (stdlib-only
+# component: no shared import).
+ERROR_EVENT = "theozolith.error"
+ERROR_MESSAGE_CHARS = 2_000
+ERROR_CONTEXT_CHARS = 8_000
+
+# Unreachable-Control-Node backoff cap (revision ruling amending ADR-0015).
+BACKOFF_CAP_SECONDS = 300.0
 
 # Every process Stack gets its own jobs directory — <base>/<stack-name>,
 # injected as THEOZOLITH_JOBS_DIR unless the Stack's env overrides it — so
@@ -121,6 +136,14 @@ class NodeDaemon:
         self._rebuild_targets: set[str] = set()
         # Queue-behind: command id -> deferral reason, reported in heartbeats.
         self._deferrals: dict[int, str] = {}
+        # Product convergence (revision ruling amending ADR-0015): the pin is
+        # desired state, checked every pass. True once an install succeeded
+        # and the re-exec is imminent — no second attempt is in flight.
+        self._update_done = False
+        self._update_blocker: str | None = None
+        self._product_attempted = False  # per-pass latch (nudge vs. pass check)
+        # Capped exponential backoff while the Control Node is unreachable.
+        self._unreachable_streak = 0
 
     @property
     def _acks_path(self) -> Path:
@@ -137,6 +160,7 @@ class NodeDaemon:
     # -- one pass -----------------------------------------------------------------
 
     def once(self) -> None:
+        self._product_attempted = False  # at most one install attempt per pass
         commands = self._exchange_heartbeat()
         for command in commands:
             if not self._execute(command):
@@ -144,7 +168,17 @@ class NodeDaemon:
                 # one wait too, or a later drain could land before the
                 # recycle it was issued after and be undone by it.
                 break
+        self._converge_product()
         self._reconcile()
+
+    def _next_delay(self) -> float:
+        """The inter-pass delay: the heartbeat interval normally; capped
+        exponential backoff while the Control Node is unreachable, resetting
+        the moment it answers again (revision ruling amending ADR-0015)."""
+        base = self._config.heartbeat_seconds
+        if self._unreachable_streak <= 1:
+            return base
+        return min(BACKOFF_CAP_SECONDS, base * 2 ** (self._unreachable_streak - 1))
 
     def run(self, *, sleep=time.sleep) -> None:
         self._log(
@@ -156,12 +190,14 @@ class NodeDaemon:
                 self.once()
             except Exception as exc:  # a bad pass must never kill the daemon
                 self._log(f"pass failed: {exc}")
-            sleep(self._config.heartbeat_seconds)
+                self._emit_error(type(exc).__name__, f"pass failed: {exc}")
+            sleep(self._next_delay())
 
     # -- heartbeat ------------------------------------------------------------------
 
     def _status_payload(self) -> dict[str, Any]:
         stacks = []
+        stack_containers = []
         for stack in self._stacks():
             if stack.kind == "process":
                 state, detail = self._supervisor.status(stack.name)
@@ -174,6 +210,19 @@ class NodeDaemon:
                 running = [r for r in rows if r.get("state") == "running"]
                 state = "running" if running else "stopped"
                 detail = "; ".join(r.get("status", "") for r in rows[:3])
+                # Live container evidence for the web terminal (ADR-0019):
+                # the Flight Deck and other container Stacks attach through
+                # these records; run containers are never attach targets.
+                stack_containers.extend(
+                    {
+                        "name": str(row.get("name", "")),
+                        "stack": stack.name,
+                        "state": str(row.get("state", "")),
+                        "status": str(row.get("status", "")),
+                    }
+                    for row in rows
+                    if row.get("name")
+                )
             if stack.name in self._drained:
                 detail = (detail + " (drained)").strip()
             stacks.append(
@@ -184,6 +233,7 @@ class NodeDaemon:
             "version": self._config.version,
             "stacks": stacks,
             "run_containers": self._docker.run_containers(),
+            "stack_containers": stack_containers,
             "images": [image_status(self._docker, img) for img in self._images().values()],
             "config_commit": self._desired.get("commit", ""),
             "completed_commands": list(self._completed),
@@ -206,9 +256,14 @@ class NodeDaemon:
                 self._log(f"registration deferred: {exc}")
         try:
             answer = self._client.heartbeat(self._status_payload())
-        except (ControlUnreachable, ControlError) as exc:
+        except ControlUnreachable as exc:
+            self._unreachable_streak += 1
             self._log(f"control node unreachable ({exc}); reconciling from cached config")
             return []
+        except ControlError as exc:
+            self._log(f"control node refused the heartbeat ({exc}); using cached config")
+            return []
+        self._unreachable_streak = 0
         # Acks landed on the Control Node: stop re-sending them.
         self._completed = []
         _atomic_json(self._acks_path, self._completed)
@@ -227,7 +282,7 @@ class NodeDaemon:
         verb = command.get("verb", "")
         target = command.get("target") or None
         command_id = command.get("id")
-        if verb in ("recycle", "update") and not command.get("force"):
+        if verb in ("recycle", "update", "restart") and not command.get("force"):
             blocker = self._inflight_blocker([target] if verb == "recycle" and target else None)
             if blocker is not None and isinstance(command_id, int):
                 # Queue-behind: no ack, so the Control Node re-delivers the
@@ -249,14 +304,32 @@ class NodeDaemon:
             elif verb == "rebuild":
                 self._rebuild_targets.update([target] if target else self._images())
             elif verb == "update":
-                self._update(command_id)
-                return True  # unreachable when the update re-execs
+                # The nudge, never the mechanism of record (revision ruling
+                # amending ADR-0015): ack FIRST — convergence owns the retry,
+                # so a failed install must not leave the command consuming
+                # the queue — then attempt convergence immediately.
+                self._ack(command_id)
+                self._converge_product(force=bool(command.get("force")))
+                return True
+            elif verb == "restart":
+                # Escalation step for a node that will not converge: stop
+                # the tree and re-exec in place, no install.
+                self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
+                self._ack(command_id)
+                self._log("restart command: re-exec")
+                self._execv(
+                    sys.executable, [sys.executable, "-m", "theozolith_nodedaemon", *sys.argv[1:]]
+                )
+                return True
             else:
                 self._log(f"command {command_id}: unknown verb {verb!r}; acking as a no-op")
         except Exception as exc:
             # No ack: the Control Node re-delivers next heartbeat (logged loop
             # beats a silently dropped command).
             self._log(f"command {command_id} failed: {exc}")
+            self._emit_error(
+                type(exc).__name__, f"command {command_id} ({verb} {target or ''}) failed: {exc}"
+            )
             return True
         self._ack(command_id)
         return True
@@ -265,6 +338,25 @@ class NodeDaemon:
         if isinstance(command_id, int):
             self._completed.append(command_id)
             _atomic_json(self._acks_path, self._completed)
+
+    def _emit_error(self, error_class: str, message: str, context: str = "") -> None:
+        """Best-effort theozolith.error summary; never raises, never loops
+        (an emission failure is itself only logged)."""
+        if self._client is None:
+            return
+        try:
+            self._client.emit_event(
+                {
+                    "type": ERROR_EVENT,
+                    "node": self._config.node,
+                    "component": "node-daemon",
+                    "error_class": error_class,
+                    "message": message[:ERROR_MESSAGE_CHARS],
+                    "context": context[-ERROR_CONTEXT_CHARS:],
+                }
+            )
+        except Exception as exc:
+            self._log(f"error event not delivered ({error_class}): {exc}")
 
     def _stack_by_name(self, name: str) -> WireStack | None:
         return next((s for s in self._stacks() if s.name == name), None)
@@ -326,23 +418,72 @@ class NodeDaemon:
         _atomic_json(self._config.drained_path, sorted(self._drained))
         # The reconcile step of this same pass starts them again.
 
-    def _update(self, command_id: Any) -> None:
-        """Product update (ADR-0013 §8): stop the tree, install the pinned
-        version, re-exec this daemon in place. The ack is persisted first so
-        the re-exec'd daemon does not replay the command."""
+    def _converge_product(self, *, force: bool = False) -> None:
+        """The pin is desired state (revision ruling amending ADR-0015):
+        every pass compares the running product version against the pinned
+        one and self-updates on mismatch — startup is just the first pass,
+        and a failed install retries on a later pass with no re-queued
+        command. Drain-aware queue-behind semantics are unchanged: an
+        in-flight Run defers the attempt (``force`` keeps kill-the-tree)."""
+        if self._update_done or self._product_attempted:
+            return  # already succeeded (re-exec imminent) or tried this pass
+        pin = str(self._desired.get("product_version", "") or "")
+        if not pin or pin == self._config.version:
+            self._update_blocker = None
+            return
+        if not force:
+            blocker = self._inflight_blocker(None)
+            if blocker is not None:
+                if self._update_blocker != blocker:
+                    self._log(f"product update to {pin} deferred ({blocker})")
+                self._update_blocker = blocker
+                return
+        self._update_blocker = None
+        self._product_attempted = True
+        try:
+            self._install_product(pin)
+        except Exception as exc:
+            self._log(f"product update to {pin} failed: {exc} (retrying next pass)")
+            self._emit_error(type(exc).__name__, f"product update to {pin} failed: {exc}")
+
+    def _install_product(self, pin: str) -> None:
+        """Stop the tree, install the pinned version, re-exec in place
+        (ADR-0013 §8). Release pins install by name from the package index;
+        a served artifact set (the developer build path) is pulled from the
+        Control Node and installed from local wheel files — nodes never
+        pull source and never build."""
         self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
-        version = str(self._desired.get("product_version", "") or "")
-        packages = [f"{name}=={version}" if version else name for name in UPDATE_PACKAGES]
+        artifacts = self._desired.get("product_artifacts")
+        if isinstance(artifacts, list) and artifacts and self._client is not None:
+            targets = self._pull_artifacts(pin, [str(a) for a in artifacts])
+        else:
+            targets = [f"{name}=={pin}" for name in UPDATE_PACKAGES]
         proc = self._update_runner(
-            [sys.executable, "-m", "pip", "install", "--upgrade", *packages],
+            [sys.executable, "-m", "pip", "install", "--upgrade", *targets],
             capture_output=True,
             text=True,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"pip install failed: {(proc.stderr or '').strip()[-300:]}")
-        self._ack(command_id)
-        self._log(f"updated to {version or 'latest'}; re-exec")
+        self._update_done = True
+        self._log(f"updated to {pin}; re-exec")
         self._execv(sys.executable, [sys.executable, "-m", "theozolith_nodedaemon", *sys.argv[1:]])
+
+    def _pull_artifacts(self, version: str, names: list[str]) -> list[str]:
+        """Download the served wheels into the state dir; local file paths
+        become the pip install targets."""
+        wheel_dir = self._config.state_dir / "update-wheels"
+        if wheel_dir.is_dir():
+            for stale in wheel_dir.iterdir():
+                stale.unlink()
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for name in names:
+            base = Path(name).name  # a served filename is never a path
+            target = wheel_dir / base
+            target.write_bytes(self._client.fetch_artifact(version, base))
+            paths.append(str(target))
+        return paths
 
     # -- reconciliation ---------------------------------------------------------------
 
@@ -356,6 +497,7 @@ class NodeDaemon:
                 self._rebuild_targets.discard(name)
             except Exception as exc:
                 self._log(f"image {name}: build failed: {exc}")
+                self._emit_error(type(exc).__name__, f"image {name}: build failed: {exc}")
         for stack in self._stacks():
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
@@ -364,7 +506,9 @@ class NodeDaemon:
                 else:
                     self._converge_container(stack, want_running)
             except Exception as exc:
+                # Config-apply and container-start failures both land here.
                 self._log(f"stack {stack.name}: reconcile failed: {exc}")
+                self._emit_error(type(exc).__name__, f"stack {stack.name}: reconcile failed: {exc}")
         self._reap_orphans()
 
     def _pull_stack_secrets(self, stack: WireStack) -> bool:
@@ -386,6 +530,9 @@ class NodeDaemon:
                 self._log(f"stack {stack.name}: secrets pull failed ({exc}); using tmpfs copies")
                 return True
             self._log(f"stack {stack.name}: cannot deploy, secrets unavailable ({exc})")
+            self._emit_error(
+                type(exc).__name__, f"stack {stack.name}: cannot deploy, secrets unavailable: {exc}"
+            )
             return False
 
     def _converge_process(
@@ -455,6 +602,9 @@ class NodeDaemon:
             env=stack.env,
             ports=list(stack.ports),
             volumes=list(stack.volumes),
+            # Optional docker-run command for the single-image form — how
+            # the Flight Deck starts its named tmux session (ADR-0019).
+            command=shlex.split(stack.command) if stack.command else None,
         )
 
     def _reap_orphans(self) -> None:

@@ -13,6 +13,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 
+from theozolith_worker.decisions import ProcessIssue, process_issues_from, render_process_issue
 from theozolith_worker.githubapi import Comment
 
 APPROVE = "approve"
@@ -33,6 +34,9 @@ class Verdict:
     resume_commit: str = ""  # revise: branch state the next Run starts from
     cherry_pick: list[str] = field(default_factory=list)  # revise, optional
     bundle_url: str = ""  # evidence bundle link (escalate: mandatory)
+    # Advisory pipeline observations (2026-07-22 grilling): rendered in the
+    # comment, never consulted by any verdict, label, or gate decision.
+    process_issues: list[ProcessIssue] = field(default_factory=list)
 
 
 def render_comment(v: Verdict) -> str:
@@ -51,6 +55,10 @@ def render_comment(v: Verdict) -> str:
         lines += [""]
     if v.bundle_url:
         lines += [f"Evidence bundle: {v.bundle_url}", ""]
+    if v.process_issues:  # absent or empty renders nothing
+        lines += ["#### Process issues", ""]
+        lines += [render_process_issue(issue) for issue in v.process_issues]
+        lines += [""]
     lines += [
         "<!-- theozolith:verdict",
         json.dumps(asdict(v), indent=2, sort_keys=True),
@@ -79,6 +87,7 @@ def parse_comment(body: str) -> Verdict | None:
         resume_commit=str(data.get("resume_commit", "")),
         cherry_pick=[str(sha) for sha in data.get("cherry_pick", [])],
         bundle_url=str(data.get("bundle_url", "")),
+        process_issues=process_issues_from(data.get("process_issues")),
     )
 
 
@@ -172,6 +181,10 @@ def validate_verdict_file(
             resume_commit=resume_commit or default_resume,
             cherry_pick=[sha for sha in cherry_pick if sha],
             bundle_url=bundle_url,
+            # Advisory: parsed leniently — a malformed process_issues entry
+            # is dropped, never a validation failure (it must not be able to
+            # invalidate a verdict and trigger an escalation).
+            process_issues=process_issues_from(data.get("process_issues")),
         ),
         "",
     )

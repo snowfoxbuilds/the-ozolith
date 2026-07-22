@@ -96,12 +96,7 @@ class ContainerSession:
 
     def wait_for_agent(self) -> AgentOutcome:
         manifest = self._manifest
-        budget = (
-            manifest.agent_timeout_seconds
-            + manifest.settle_seconds
-            + manifest.startup_seconds
-            + WAIT_GRACE_SECONDS
-        )
+        budget = manifest.agent_timeout_seconds + WAIT_GRACE_SECONDS
         deadline = self._clock() + budget
         while True:
             outcome = self._agent_phase_over()

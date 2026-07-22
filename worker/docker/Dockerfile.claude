@@ -1,8 +1,9 @@
-# The Claude run-container image: what a Worker or Reviewer driver launches
-# for every Run and review round (ADR-0013). PID 1 is the agent harness —
-# credential-free plumbing that runs the interactive Claude session in tmux,
-# serves driver-sequenced gate jobs, and exits; container lifetime = Run
-# lifetime. The driver bind-mounts the per-Run job directory at /job.
+# The Claude run-container image: what an Implementer or Reviewer driver
+# launches for every Run and review round (ADR-0013). PID 1 is the agent
+# harness — credential-free plumbing that invokes the Claude session headless
+# (`claude -p`, ADR-0019), serves driver-sequenced gate jobs, and exits;
+# container lifetime = Run lifetime. The driver bind-mounts the per-Run job
+# directory at /job. Run containers are never attach targets.
 #
 # Build from the repo root:
 #   docker build -f worker/docker/Dockerfile.claude \
@@ -21,11 +22,11 @@
 FROM python:3.13-slim
 
 # git: the agent inspects the checkout (the driver does all pushes).
-# tmux: every agent session is interactive and attachable
-#   (docker exec -it <container> tmux attach).
-# nodejs/npm: the Claude Code CLI.
+# nodejs/npm: the Claude Code CLI. No terminal multiplexer: sessions are
+# headless one-shot processes (ADR-0019) — interactivity lives only in the
+# Flight Deck.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git tmux ca-certificates nodejs npm \
+    && apt-get install -y --no-install-recommends git ca-certificates nodejs npm \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code
 

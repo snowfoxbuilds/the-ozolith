@@ -1,6 +1,15 @@
-# The product version the `update` infrastructure command installs on nodes
-# (ADR-0013 §8). Bump this, commit, and issue `theozolith-control command
-# update --node <name>`. Absent or empty = latest.
+# The recorded product version (ADR-0015 as amended): desired state that
+# every node CONVERGES to — the Node Daemon compares its running version
+# against this pin on each heartbeat and self-updates on mismatch. Never
+# deploy an unrecorded version. Normally written FOR you:
+#
+#   theozolith update              # pin the latest published release
+#   theozolith update --version X  # pin an explicit release (rollback too)
+#   theozolith build               # pin a CLEAN checkout's git SHA and
+#                                  # serve wheels (a dirty tree is refused)
+#
+# A fresh install with no pin resolves the latest release and writes one at
+# Control Node startup, so a running fleet always has a recorded version.
 
 [product]
 version = "0.3.0"

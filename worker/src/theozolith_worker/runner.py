@@ -39,6 +39,7 @@ import json
 import secrets
 import shutil
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,10 +57,10 @@ from theozolith_worker.containers import (
     ContainerSpec,
     container_labels,
     run_container_name,
-    run_session_name,
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.harness.adapters import HarnessAdapterError, make_harness_adapter
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -96,11 +97,10 @@ def issue_for_branch(head_ref: str) -> int | None:
 
 
 PROMPT_TEMPLATE = """\
-You are a Worker in TheOzolith agentic coding pipeline, executing one \
-stateless Run against the checked-out repository (your working directory). \
-You run in an interactive session; a human operator may attach at any time \
-and add instructions — treat those as authoritative input and record how \
-they shaped your work.
+You are an Implementer in TheOzolith agentic coding pipeline, executing one \
+stateless, headless Run against the checked-out repository (your working \
+directory). No human watches or steers this session; everything the pipeline \
+needs from you must land in the working tree and the decisions file.
 
 ## Issue #{number}: {title}
 
@@ -115,11 +115,15 @@ decisions afterwards.
 - Record your run summary in `.theozolith/decisions.json` (create the file) \
 with exactly this JSON shape:
   {{"decisions": [{{"what": "...", "why": "..."}}], "open_questions": [], \
-"remaining_work": [], "dead_ends": []}}
+"remaining_work": [], "dead_ends": [], "process_issues": []}}
   Decisions are judgment calls with rationale; open_questions are calls only \
 a human can make; remaining_work is what a follow-up round still needs; \
 dead_ends are approaches you tried and abandoned (so the next Run does not \
 repeat them).
+- process_issues is optional and advisory: observations about the PIPELINE \
+itself (friction you hit — a confusing prompt, missing tooling, a flaky \
+gate), each as {{"friction": "...", "suggested_fix": "..."}}. Never findings \
+about the change; it influences no verdict, label, or gate outcome.
 - If you conclude that NO code change is needed, change nothing and record \
 why in the decisions file — the pipeline ships an empty PR carrying your \
 reasoning for review. A run with no changes and no recorded reasoning is \
@@ -128,8 +132,8 @@ treated as a failure.
 control.
 - Do not edit `.theozolith/gate.toml` or CI workflows unless the issue \
 explicitly asks for it.
-- When you are done, simply finish your reply; the pipeline detects \
-completion and runs the quality gate.
+- When you are done, simply finish your reply and exit; the pipeline treats \
+your process exit as completion and runs the quality gate.
 """
 
 REVISED_PLAN_CONTEXT = """\
@@ -241,6 +245,16 @@ def _read_output(job: Path, relpath: str) -> str:
         return ""
 
 
+def _run_tokens(config: DriverConfig, job: Path) -> int | None:
+    """Token usage from the structured output stream (ADR-0019); None when
+    the adapter's stream carries no usage."""
+    try:
+        adapter = make_harness_adapter(config.adapter)
+    except HarnessAdapterError:
+        return None
+    return adapter.stream_stats(job / jobdir.TRANSCRIPT_FILE).tokens
+
+
 def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:
     jobdir.atomic_write(
         job / "input" / "issue.json",
@@ -308,6 +322,16 @@ def execute_run(
     except _RunFailed as failed:
         _fail_run(config, issue, report, job, context, failed, log, sink)
     except Exception as exc:  # pre/post-session driver-side breakage
+        # An internal failure, not a Run outcome: container-start and GitHub
+        # write failures land here — summarize for the dashboard errors
+        # panel (2026-07-21 grilling) before the failed-Run machinery runs.
+        events.emit_error(
+            sink,
+            config,
+            error_class=type(exc).__name__,
+            message=f"run {run_id}: driver-side failure: {exc}",
+            context=traceback.format_exc(),
+        )
         _fail_run(
             config,
             issue,
@@ -476,12 +500,10 @@ def _run_to_pr(
     manifest = jobdir.Manifest(
         run_id=report.run_id,
         mode=jobdir.MODE_RUN,
-        session=run_session_name(report.run_id),
         adapter=config.adapter,
         model=config.model,
         workdir=jobdir.CHECKOUT_DIR,
         agent_timeout_seconds=config.agent_timeout_seconds,
-        settle_seconds=config.settle_seconds,
     )
     jobdir.write_manifest(job, manifest)
     spec = ContainerSpec(
@@ -614,7 +636,7 @@ def _run_to_pr(
         )
     )
 
-    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log, sink)
 
 
 def _fail_run(
@@ -635,7 +657,7 @@ def _fail_run(
     report.failure_class = failed.failure_class
     if context.section is None:
         context.section = decisions.fallback_section(failed.reason)
-    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log)
+    report.evidence_pushed = _push_run_evidence(config, report, issue, job, context, log, sink)
     sink.emit(
         events.run_event(
             config,
@@ -655,6 +677,7 @@ def _push_run_evidence(
     job: Path,
     context: _RunContext,
     log,
+    sink: events.EventSink | None = None,
 ) -> bool:
     """Every Run pushes its bundle (ADR-0014) — normal, empty-PR, and failed
     Runs alike. True only when the push confirmed (ADR-0016: the job dir
@@ -687,6 +710,7 @@ def _push_run_evidence(
                 "head": report.head,
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
+                "tokens": _run_tokens(config, job),
                 "reason": report.reason,
                 "failure_class": report.failure_class,
                 "notes": report.notes,
@@ -700,8 +724,8 @@ def _push_run_evidence(
         )
         + "\n",
         f"{prefix}/decisions.json": section.to_json() + "\n",
-        # The full tmux session transcript: the audit trail for any human
-        # interaction mid-Run (M2 brief; captured via pipe-pane).
+        # The headless session's structured output stream: the Run's full
+        # audit trail (ADR-0019).
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }
@@ -716,7 +740,7 @@ def _push_run_evidence(
         )
     except Exception as exc:
         # Never fail the Run on evidence, but never swallow it silently: a
-        # structured record (ADR-0019) so operators and log scrapers see
+        # structured record (ADR-0022) so operators and log scrapers see
         # exactly which bundle is missing and why.
         report.notes.append(f"evidence push failed: {exc}")
         log(
@@ -733,6 +757,14 @@ def _push_run_evidence(
                 sort_keys=True,
             )
         )
+        if sink is not None:
+            events.emit_error(
+                sink,
+                config,
+                error_class=type(exc).__name__,
+                message=f"evidence push failed for run {report.run_id}: {exc}",
+                context=f"bundle {prefix}, {evidence.PUSH_ATTEMPTS} attempts",
+            )
         return False
     return True
 

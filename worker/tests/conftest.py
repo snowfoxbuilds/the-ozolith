@@ -172,9 +172,33 @@ class FakeSession:
         self.harness.record.launched.append(self.spec.name)
 
     def _write_transcript(self, prompt: str) -> None:
+        # The structured output stream of a headless session (ADR-0019):
+        # line-per-event JSON, with the usage records real adapters emit.
         transcript = self.job / jobdir.TRANSCRIPT_FILE
         transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text(f"[tmux session {self.manifest.session}]\n{prompt}\n")
+        lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": self.manifest.run_id}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "tool_use", "name": "Edit", "input": {}},
+                        ],
+                        "usage": {"input_tokens": 100, "output_tokens": 40},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "usage": {"input_tokens": 120, "output_tokens": 60},
+                }
+            ),
+        ]
+        transcript.write_text("\n".join(lines) + "\n")
 
     def wait_for_agent(self) -> AgentOutcome:
         prompt = (self.job / jobdir.PROMPT_FILE).read_text()

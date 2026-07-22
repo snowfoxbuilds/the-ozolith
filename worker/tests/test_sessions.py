@@ -1,8 +1,8 @@
 """ContainerSession ↔ harness: both ends of the job-dir protocol, live.
 
-The harness runs in a thread (in place of a container) with a fake tmux; the
-driver-side ContainerSession talks to it purely through job-dir files —
-exactly the production seam, minus docker.
+The harness runs in a thread (in place of a container) with a fake agent
+launcher; the driver-side ContainerSession talks to it purely through
+job-dir files — exactly the production seam, minus docker.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from test_harness import FakeTmux
 from theozolith_worker import jobdir
 from theozolith_worker.containers import ContainerSpec
 from theozolith_worker.harness.main import run_harness
@@ -20,6 +19,23 @@ from theozolith_worker.shell import run_shell
 
 def _runner(command: str, cwd: Path, timeout: float):
     return run_shell(command, cwd, timeout)
+
+
+class _InstantAgent:
+    """A headless agent that has already exited 0."""
+
+    def poll(self):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def _instant_launcher(argv, cwd, env, transcript):
+    return _InstantAgent()
 
 
 class ThreadEngine:
@@ -33,7 +49,7 @@ class ThreadEngine:
     def launch(self, spec: ContainerSpec) -> None:
         thread = threading.Thread(
             target=run_harness,
-            args=(self.job, FakeTmux()),
+            args=(self.job, _instant_launcher),
             kwargs={"runner": _runner, "poll_seconds": 0.01},
             daemon=True,
         )
@@ -62,18 +78,11 @@ def make_run_job(tmp_path: Path) -> tuple[Path, jobdir.Manifest, ContainerSpec]:
     manifest = jobdir.Manifest(
         run_id="r1",
         mode=jobdir.MODE_RUN,
-        session="run-r1",
         adapter="claude",
         model="m",
         agent_timeout_seconds=20.0,
-        settle_seconds=0.0,
-        startup_seconds=0.0,
     )
     jobdir.write_manifest(job, manifest)
-    # The completion hook "fires" immediately (pre-written stop event).
-    log = job / jobdir.HOOK_EVENTS_FILE
-    log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text("stop\n")
     spec = ContainerSpec(name="ozolith-run-r1", image="img")
     return job, manifest, spec
 

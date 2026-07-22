@@ -75,8 +75,6 @@ def load_daemon_config(environ: Mapping[str, str] | None = None) -> DaemonConfig
     if control_url and not node_token:
         raise DaemonConfigError("set THEOZOLITH_NODE_TOKEN (or its _FILE form)")
 
-    from theozolith_nodedaemon import __version__
-
     return DaemonConfig(
         node=env_value(environ, "THEOZOLITH_NODE_NAME") or socket.gethostname(),
         control_url=control_url,
@@ -87,5 +85,20 @@ def load_daemon_config(environ: Mapping[str, str] | None = None) -> DaemonConfig
         heartbeat_seconds=_float(environ, "THEOZOLITH_HEARTBEAT_SECONDS", "60"),
         stop_grace_seconds=_float(environ, "THEOZOLITH_STOP_GRACE_SECONDS", "30"),
         insecure_dev=(env_value(environ, "THEOZOLITH_INSECURE_DEV") or "") == "1",
-        version=__version__,
+        version=running_product_version(),
     )
+
+
+def running_product_version() -> str:
+    """The RUNNING product version, from the installed distribution's real
+    metadata (ADR-0015 as revised): a source build's ``+g<sha>`` local
+    version survives into heartbeats, so pin convergence and the dispatch
+    eligibility gate compare every node against the recorded pin."""
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("theozolith-nodedaemon")
+    except importlib.metadata.PackageNotFoundError:
+        from theozolith_nodedaemon import __version__
+
+        return __version__

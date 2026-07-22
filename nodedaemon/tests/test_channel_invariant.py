@@ -30,6 +30,12 @@ KNOWN_CHANNEL_PATHS = {
     "/api/v1/nodes/register",
     "/api/v1/heartbeats",
     "/api/v1/secrets/pull",
+    # theozolith.error summaries (2026-07-21 grilling): references and
+    # size-capped text only, never secret values.
+    "/api/v1/events",
+    # Built-artifact pulls (ADR-0015, 2026-07-22) use
+    # /api/v1/product/artifacts/<version>/<filename> — wheel bytes flow
+    # control->node only; the daemon sends nothing but the bearer header.
 }
 
 HEARTBEAT_REQUEST_KEYS = {
@@ -37,6 +43,7 @@ HEARTBEAT_REQUEST_KEYS = {
     "version",
     "stacks",
     "run_containers",
+    "stack_containers",  # web-terminal target evidence (ADR-0019)
     "images",
     "config_commit",
     "completed_commands",

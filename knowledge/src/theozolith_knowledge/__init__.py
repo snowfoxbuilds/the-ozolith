@@ -9,7 +9,7 @@ from theozolith_knowledge.claude import GENERATED_MARKER, FileEntry, compile_cla
 from theozolith_knowledge.model import KnowledgeError, KnowledgeRoot, load_knowledge_root
 from theozolith_knowledge.sync import MANIFEST_NAME, SyncReport, apply_fileset, sync
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "GENERATED_MARKER",

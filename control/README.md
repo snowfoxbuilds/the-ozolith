@@ -15,11 +15,13 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   quarantine (2 consecutive failed Runs, human-only release), pending lifecycle
   commands, and the `failed` label (refused and surfaced as a malformed state, never
   laundered). Requires the control PAT; without it the pipeline pauses.
-- **Typed event API** — namespaced events; `theozolith.run`, `theozolith.review`, and
-  `theozolith.run.progress` are the known pipeline types; unknown types are accepted,
-  stored, and rendered generically on the dashboard (extension point). Telemetry
-  payloads are size-capped at ingestion; progress events evict oldest-first under a
-  ~10GB budget (the database is a cache, never the archive — ADR-0016).
+- **Typed event API** — namespaced events; `theozolith.run`, `theozolith.review`,
+  `theozolith.run.progress`, and `theozolith.error` are the known pipeline types;
+  unknown types are accepted, stored, and rendered generically on the dashboard
+  (extension point). Telemetry payloads are size-capped at ingestion (error context is
+  truncated, never refused); progress and error events evict oldest-first under a
+  ~10GB budget (the database is a cache, never the archive — ADR-0016). The dashboard's
+  errors panel filters `theozolith.error` summaries by node and component.
 - **Zombie-claim janitor** (ADR-0016) — two-phase, evidence-first: silence past the
   grace period flags the dashboard only; once the Run's evidence bundle lands the claim
   is released and escalated `failed` + `needs_human` with the evidence link. Also
@@ -28,13 +30,25 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
 - **Secret store** — values entered once via `theozolith-control secret set` or the
   dashboard's web form (both write through the same store), encrypted at rest (Fernet,
   file-held master key), pull-only and node-scoped, TLS mandatory, never displayed.
-- **Dashboard + web terminal** (M4, ADR-0018; hardened by ADR-0019) — read-only fleet
-  view (Jinja + HTMX polling, no build step) and a PTY-bridge terminal running each
-  Stack's config-supplied `attach` argv against live run containers (target and owner
-  derived server-side from fresh heartbeats; identifiers validated; output bounded),
-  audit-logged to `<data>/terminal-audit.log`. One admin credential fronts all of it,
-  behind a randomized public origin with exact Host/Origin enforcement (derived from
-  the origin URL alone — independent of the Uvicorn bind host/port).
+- **Dashboard + web terminal** (M4, ADR-0018; hardened by ADR-0022) — read-only fleet
+  view (Jinja + HTMX polling, no build step) and a PTY-bridge terminal running a
+  container Stack's config-supplied `attach` argv against its live stack container
+  (target and owning Stack derived server-side from fresh heartbeats; identifiers
+  validated; output bounded), audit-logged to `<data>/terminal-audit.log`. The Flight
+  Deck is the primary target; run containers are headless and never attach targets
+  (ADR-0019). One admin credential fronts all of it, behind a randomized public origin
+  with exact Host/Origin enforcement (derived from the origin URL alone — independent
+  of the Uvicorn bind host/port).
+- **Product updates** (ADR-0015 as amended) — `theozolith update` pins a published
+  release; `theozolith build` pins a CLEAN source checkout's git SHA (a dirty tree is
+  refused) and uploads wheels the Control Node serves for node pulls; `theozolith
+  test` is the local-development signal. Both update paths commit the pin to
+  product.toml; the pin is desired state that nodes converge to on every heartbeat
+  (failed installs self-retry; the fanned-out command is only a nudge), with the
+  control-hosting node queued last. Dispatch grants only to on-pin nodes — an update
+  pauses new dispatch fleet-wide until versions converge; persistently off-pin nodes
+  get a restart command, then a theozolith.error. The dashboard surfaces version skew
+  against the recorded pin.
 
 Availability (ADR-0017): with this service down, in-flight Runs finish and publish;
 new claims and review rounds pause. Drivers hold their own PATs for all non-claim

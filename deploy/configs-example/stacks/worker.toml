@@ -1,19 +1,15 @@
-# The Worker driver as a process-kind Stack (ADR-0013: node-resident driver,
-# supervised Node Daemon child). Copy this tree into your Config Repo
-# (default ~/.theozolith/configs on the Control Node) and adjust.
+# The Implementer driver as a process-kind Stack (ADR-0013: node-resident
+# driver, supervised Node Daemon child). Copy this tree into your Config
+# Repo (default ~/.theozolith/configs on the Control Node) and adjust.
+#
+# No `attach` key: run containers are headless and never attach targets
+# (ADR-0019) — a process Stack declaring one is a Config Repo error.
+# Interactive work happens in the Flight Deck (stacks/flightdeck.toml).
 
 kind = "process"
 node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
 state = "running"
 command = "theozolith-worker"
-
-# Web-terminal attach command for this Stack's live run containers, executed
-# by the Control Node's PTY bridge as a structured argv array (ADR-0019 —
-# free-form command strings are rejected). {host} = node name and
-# {container} = the target run container are permitted only as complete
-# arguments and are validated before launch. Omit the key entirely to
-# expose no terminal for this Stack.
-attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach"]
 
 # The derived run-container image this driver launches per Run: an
 # images/<name>.toml recipe, built locally by the node that hosts this

@@ -113,7 +113,10 @@ class StackDef:
     state: str = "running"  # desired: "running" | "stopped"
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
-    command: str = ""  # process kind
+    # process kind: the supervised argv string. Container kind (single-image
+    # form only): an optional docker-run command — how the Flight Deck
+    # starts its named tmux session (ADR-0019).
+    command: str = ""
     run_image: str = ""  # process kind: images/<name> the driver launches
     image: str = ""  # container kind, single-image form
     ports: tuple[str, ...] = ()
@@ -124,8 +127,11 @@ class StackDef:
     # ``{container}`` are permitted only as complete elements, substituted
     # (after validation) by the Control Node's PTY bridge. Empty = no
     # terminal exposed for this Stack (NODE-SUBSTRATE: dashboard and
-    # operator access). Consumed control-side only; it never travels to
-    # nodes. Free-form command strings are rejected (M5 hardening).
+    # operator access). Container-kind Stacks only (ADR-0019: run containers
+    # are headless and never attach targets — the Flight Deck and other
+    # configured container Stacks are the terminal's world). Consumed
+    # control-side only; it never travels to nodes. Free-form command
+    # strings are rejected (M5 hardening).
     attach: tuple[str, ...] = ()
 
     def as_wire(self, compose_files: list[dict[str, str]]) -> dict[str, Any]:
@@ -297,6 +303,17 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")
     if stack.kind == "container" and bool(stack.image) == bool(stack.compose):
         raise ConfigRepoError(f"{context}: container Stacks declare exactly one of image/compose")
+    if stack.attach and stack.kind != "container":
+        raise ConfigRepoError(
+            f"{context}: 'attach' is only valid on container-kind Stacks — run"
+            " containers are headless and never attach targets (ADR-0019); the"
+            " web terminal reaches the Flight Deck and other container Stacks"
+        )
+    if stack.kind == "container" and stack.command and stack.compose:
+        raise ConfigRepoError(
+            f"{context}: 'command' applies to the single-image container form"
+            " only (compose services declare their own commands)"
+        )
     return stack
 
 

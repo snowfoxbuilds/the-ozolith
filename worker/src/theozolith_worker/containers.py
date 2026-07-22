@@ -4,9 +4,9 @@ Every Run and review round executes in one ephemeral container created by a
 driver (ADR-0013): deterministic names (``ozolith-run-<run-id>``,
 ``ozolith-review-<pr>-round-<n>``), identifying labels (``theozolith.run-id``,
 ``theozolith.owner=<stack>``), container lifetime = Run lifetime, and warm
-dependency caches as named volumes. A human on the box attaches with::
-
-    docker exec -it ozolith-run-<run-id> tmux attach
+dependency caches as named volumes. Run containers are headless and never
+attach targets (ADR-0019) — diagnostics are progress telemetry and the
+evidence bundle, never a shell inside the container.
 
 The ``Engine`` protocol is the seam tests fake; ``DockerEngine`` shells out
 to the docker CLI. Secret env values are passed to ``docker run`` as bare
@@ -39,15 +39,6 @@ def run_container_name(run_id: str) -> str:
 
 def review_container_name(pr_number: int, round_number: int) -> str:
     return f"{REVIEW_NAME_PREFIX}{pr_number}-round-{round_number}"
-
-
-def run_session_name(run_id: str) -> str:
-    """tmux session inside a run container (agent session contract)."""
-    return f"run-{run_id}"
-
-
-def review_session_name(pr_number: int, round_number: int) -> str:
-    return f"review-{pr_number}-round-{round_number}"
 
 
 @dataclass(frozen=True)

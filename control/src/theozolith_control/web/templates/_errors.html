@@ -1,0 +1,42 @@
+<h2>Errors</h2>
+{# theozolith.error summaries (2026-07-21 grilling): node/component filters;
+   depth stays in the node's journal and the evidence bundles. Message and
+   context are untrusted text — autoescape renders them inert. #}
+<form id="error-filters" class="filters">
+  <label>node
+    <select name="node" hx-get="/fragments/errors" hx-target="#errors"
+            hx-include="#error-filters">
+      <option value="">all</option>
+      {% for node in errors.nodes %}
+      <option value="{{ node }}"{% if node == errors.selected_node %} selected{% endif %}>
+        {{ node }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>component
+    <select name="component" hx-get="/fragments/errors" hx-target="#errors"
+            hx-include="#error-filters">
+      <option value="">all</option>
+      {% for component in errors.components %}
+      <option value="{{ component }}"{% if component == errors.selected_component %} selected{% endif %}>
+        {{ component }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+{% if errors.rows %}
+<ul class="events errors">
+  {% for row in errors.rows %}
+  <li>
+    <span class="muted">{{ row.when }}</span>
+    <code class="etype">{{ row.component }}@{{ row.node }}</code>
+    <strong>{{ row.error_class }}</strong>: {{ row.message }}
+    {% if row.context %}
+    <details><summary class="muted">context</summary><pre>{{ row.context }}</pre></details>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No errors{% if errors.selected_node or errors.selected_component %} match this filter{% endif %}.</p>
+{% endif %}

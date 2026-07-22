@@ -95,7 +95,9 @@ class FakeDocker:
 
     # -- container Stacks ----------------------------------------------------
 
-    def run_stack_container(self, stack, image, *, env_files, env, ports, volumes) -> None:
+    def run_stack_container(
+        self, stack, image, *, env_files, env, ports, volumes, command=None
+    ) -> None:
         self.stacks[f"ozolith-stack-{stack}"] = {
             "stack": stack,
             "image": image,
@@ -104,6 +106,7 @@ class FakeDocker:
             "env": dict(env),
             "ports": list(ports),
             "volumes": list(volumes),
+            "command": list(command or []),
         }
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:
@@ -149,7 +152,13 @@ class ScriptedControl:
         self.heartbeat_answers: list[Any] = []
         self.secrets: dict[str, str] = {}
         self.denied_secrets = False
+        # (version, filename) -> wheel bytes served to artifact pulls.
+        self.artifacts: dict[tuple[str, str], bytes] = {}
         self.transcript: list[tuple[str, str, Any, Any]] = []
+
+    @property
+    def events(self) -> list[dict]:
+        return [request for _, path, request, _ in self.transcript if path == "/events"]
 
     def __call__(
         self, method: str, url: str, headers: dict[str, str], body: bytes | None
@@ -158,11 +167,22 @@ class ScriptedControl:
         request = json.loads(body or b"{}")
         status, answer = self._answer(path, request)
         self.transcript.append((method, path, request, answer))
+        if isinstance(answer, bytes):  # artifact pulls are raw, not JSON
+            return status, answer
         return status, json.dumps(answer).encode()
 
     def _answer(self, path: str, request: dict) -> tuple[int, Any]:
         if path == "/nodes/register":
             return 200, {"ok": True}
+        if path == "/events":
+            return 200, {"ok": True}
+        if path.startswith("/product/artifacts/"):
+            _, _, rest = path.partition("/product/artifacts/")
+            version, _, filename = rest.partition("/")
+            wheel = self.artifacts.get((version, filename))
+            if wheel is None:
+                return 404, {"detail": f"no artifact {filename} for {version}"}
+            return 200, wheel
         if path == "/heartbeats":
             if not self.heartbeat_answers:
                 raise ControlUnreachable("no scripted answer")

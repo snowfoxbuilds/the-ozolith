@@ -12,13 +12,13 @@ Layout::
 
     jobs/<run-id>/
       input/
-        manifest.json    what to run: mode, session, adapter, model, timeouts
-        prompt.md        the prompt the harness pastes into the session
+        manifest.json    what to run: mode, adapter, model, timeouts
+        prompt.md        the driver-rendered task; the invocation argv
+                         carries only a constant-size pointer to this file
         jobs/            driver-sequenced job requests (gate steps, shutdown)
       output/
         status.json      harness phase + agent outcome (atomic writes)
-        transcript.txt   tmux pipe-pane capture of the whole session
-        hook-events.log  completion-hook events (adapter-specific)
+        transcript.txt   the headless session's structured output stream
         verdict.json     review mode: the agent's verdict, copied out
         jobs/            job results, one file per answered request
       checkout/          run mode: the token-free repo checkout (driver-made)
@@ -56,7 +56,6 @@ MANIFEST_FILE = "input/manifest.json"
 PROMPT_FILE = "input/prompt.md"
 STATUS_FILE = "output/status.json"
 TRANSCRIPT_FILE = "output/transcript.txt"
-HOOK_EVENTS_FILE = "output/hook-events.log"
 VERDICT_FILE = "output/verdict.json"
 JOBS_IN_DIR = "input/jobs"
 JOBS_OUT_DIR = "output/jobs"
@@ -64,8 +63,6 @@ CHECKOUT_DIR = "checkout"
 WORK_DIR = "work"
 
 DEFAULT_AGENT_TIMEOUT = 3600.0
-DEFAULT_SETTLE_SECONDS = 20.0
-DEFAULT_STARTUP_SECONDS = 5.0
 DEFAULT_JOBS_IDLE_TIMEOUT = 600.0
 
 
@@ -100,13 +97,10 @@ class Manifest:
 
     run_id: str
     mode: str  # "run" | "review"
-    session: str  # tmux session name (run-<run-id> | review-<pr>-round-<n>)
     adapter: str  # harness adapter name (M2: "claude")
     model: str
     workdir: str = CHECKOUT_DIR  # job-dir-relative agent working directory
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT
-    settle_seconds: float = DEFAULT_SETTLE_SECONDS
-    startup_seconds: float = DEFAULT_STARTUP_SECONDS
     jobs_idle_timeout_seconds: float = DEFAULT_JOBS_IDLE_TIMEOUT
     # Review mode: the round this session judges, so the in-session
     # validate-verdict job applies the final-round rule exactly as the
@@ -139,11 +133,17 @@ def read_manifest(job: Path) -> Manifest:
 
 @dataclass(frozen=True)
 class AgentOutcome:
-    """How the agent session ended, as the harness observed it."""
+    """How the headless agent process ended, as the harness observed it.
 
-    completed: bool = False  # the completion hook fired and settled
-    timed_out: bool = False  # the hard timeout cut the session short
-    session_died: bool = False  # the agent process exited on its own
+    Completion is process exit (ADR-0019): exit 0 is a completed session,
+    a non-zero exit is a died session, and the hard timeout kills an
+    overrunning process.
+    """
+
+    completed: bool = False  # the agent process exited 0
+    timed_out: bool = False  # the hard timeout killed the process
+    session_died: bool = False  # the agent process exited non-zero
+    exit_code: int | None = None
 
     def describe(self) -> str:
         if self.completed:
@@ -151,7 +151,8 @@ class AgentOutcome:
         if self.timed_out:
             return "timed out"
         if self.session_died:
-            return "session died"
+            code = f" (exit {self.exit_code})" if self.exit_code is not None else ""
+            return f"session died{code}"
         return "unknown"
 
 
@@ -178,10 +179,12 @@ def read_status(job: Path) -> Status | None:
     agent = None
     raw_agent = data.get("agent")
     if isinstance(raw_agent, dict):
+        raw_code = raw_agent.get("exit_code")
         agent = AgentOutcome(
             completed=bool(raw_agent.get("completed")),
             timed_out=bool(raw_agent.get("timed_out")),
             session_died=bool(raw_agent.get("session_died")),
+            exit_code=int(raw_code) if isinstance(raw_code, int) else None,
         )
     return Status(phase=data["phase"], agent=agent, error=str(data.get("error", "")))
 
