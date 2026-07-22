@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
 
@@ -233,6 +234,40 @@ def test_update_stops_stacks_installs_pinned_version_and_reexecs(rig: Rig):
     # never returns; here the pass continues and reconverges — which is also
     # exactly what the re-exec'd daemon does on its first pass).
     assert json.loads(rig.daemon._acks_path.read_text()) == [4]
+
+
+def test_update_installs_served_artifacts_from_the_control_node(rig: Rig):
+    """The developer build path (ADR-0015, 2026-07-22): a pinned version
+    with a served artifact set installs the pulled wheel FILES — the node
+    never touches an index, never pulls source, never builds."""
+    version = "0.3.0+gabc123def456.dirty"
+    wheels = {
+        "theozolith_nodedaemon-0.3.0+gabc123def456.dirty-py3-none-any.whl": b"nodedaemon-wheel",
+        "theozolith_worker-0.3.0+gabc123def456.dirty-py3-none-any.whl": b"worker-wheel",
+    }
+    for name, payload in wheels.items():
+        rig.control.artifacts[(version, name)] = payload
+    rig.control.heartbeat_answers.append(
+        {
+            "commands": [{"id": 11, "verb": "update", "target": None}],
+            "config": {
+                **desired([]),
+                "product_version": version,
+                "product_artifacts": sorted(wheels),
+            },
+        }
+    )
+    rig.daemon.once()
+
+    (call,) = rig.update_calls
+    installed = [arg for arg in call if arg.endswith(".whl")]
+    assert len(installed) == len(wheels)
+    for path in installed:
+        assert path.startswith(str(rig.config.state_dir / "update-wheels"))
+        assert Path(path).read_bytes() == wheels[Path(path).name]
+    assert all("==" not in arg for arg in call)  # no index pins on this path
+    assert rig.execv_calls, "the daemon must re-exec itself after an update"
+    assert json.loads(rig.daemon._acks_path.read_text()) == [11]
 
 
 def test_failed_command_is_not_acked(rig: Rig, monkeypatch):

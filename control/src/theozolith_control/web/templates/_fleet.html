@@ -1,4 +1,12 @@
 <h2>Nodes</h2>
+{% if fleet.product_version %}<p class="muted">recorded product version:
+  <code>{{ fleet.product_version }}</code></p>{% endif %}
+{% if fleet.version_skew %}
+<p class="flash flash-warning">⚠ product version skew:
+  {% for name in fleet.version_skew %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+  {% if fleet.version_skew|length == 1 %}runs{% else %}run{% endif %} a version other than the
+  recorded pin <code>{{ fleet.product_version }}</code> (queue an update to converge).</p>
+{% endif %}
 {% if fleet.skewed_images %}
 <p class="flash flash-warning">⚠ build skew across the fleet:
   {% for name in fleet.skewed_images %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
@@ -8,6 +16,7 @@
 <article class="node">
   <h3>{{ node.name }}
     <span class="muted">{{ node.version }}</span>
+    {% if node.version_skew %}<span class="badge b-warning">● version skew</span>{% endif %}
     {% if node.stale %}<span class="badge b-warning">● stale ({{ node.last_seen }})</span>
     {% else %}<span class="badge b-good">● seen {{ node.last_seen }}</span>{% endif %}
     {% if node.quarantine %}<span class="badge b-critical">● quarantined: {{ node.quarantine.reason }}</span>{% endif %}

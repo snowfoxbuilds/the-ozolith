@@ -1,0 +1,357 @@
+"""Two update paths, one machinery (ADR-0015 amendment 2026-07-22).
+
+``theozolith update`` (user path) resolves the latest published release —
+or an explicit ``--version`` — and pins it. ``theozolith build`` (developer
+path) builds the distribution from the local source checkout, pins the
+checkout's git SHA (``-dirty``-marked as a ``.dirty`` local-version suffix
+when the tree has uncommitted changes), and uploads the built wheels for
+the Control Node to serve to node pulls. Both converge on
+``POST /api/v1/product/update``: the pin bump is committed to product.toml
+in the Config Repo and update commands fan out over heartbeat responses
+(drain-aware queue-behind, ADR-0015), with the Control Node's own host
+queued last so it applies its own update only after the fan-out is queued.
+
+Nodes never pull source and never build the product. "Never deploy :latest"
+is restated as never deploy an unrecorded version: a fresh install with no
+product.toml pin resolves the latest release and writes the pin
+(``ensure_pin``, run at serve startup), so a running fleet always has a
+recorded version.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from theozolith_worker.config import env_value
+
+# The components one product version covers (ADR-0013 §8: one versioned
+# distribution). Order matters only cosmetically.
+COMPONENTS = ("knowledge", "worker", "control", "nodedaemon")
+
+# Where the user path resolves "the latest published release". The anchor
+# package is the one every node installs; THEOZOLITH_RELEASE_INDEX_URL
+# points air-gapped deployments at their own index.
+RELEASE_INDEX_URL = "https://pypi.org/pypi/theozolith-nodedaemon/json"
+
+_SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+
+
+class ProductError(RuntimeError):
+    """An update-path step could not complete."""
+
+
+def safe_segment(value: str) -> bool:
+    """True for version/filename path segments that cannot traverse."""
+    return bool(_SAFE_SEGMENT.match(value)) and ".." not in value
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
+# -- release resolution (user path) --------------------------------------------
+
+
+def resolve_latest_release(http_get=None, environ=None) -> str:
+    """The latest published release version, from the release index."""
+    environ = os.environ if environ is None else environ
+    url = env_value(environ, "THEOZOLITH_RELEASE_INDEX_URL") or RELEASE_INDEX_URL
+
+    def _default_get(target: str) -> bytes:
+        with urllib.request.urlopen(target, timeout=30) as resp:
+            return resp.read()
+
+    get = http_get or _default_get
+    try:
+        payload = json.loads(get(url))
+    except Exception as exc:
+        raise ProductError(f"cannot resolve the latest release from {url}: {exc}") from exc
+    version = payload.get("info", {}).get("version") if isinstance(payload, dict) else None
+    if not isinstance(version, str) or not version:
+        raise ProductError(f"release index {url} answered no version")
+    return version
+
+
+# -- the pin (product.toml in the Config Repo) ----------------------------------
+
+
+def read_pin(config_repo: Path) -> str:
+    try:
+        data = tomllib.loads((config_repo / "product.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    version = data.get("product", {}).get("version", "")
+    return version if isinstance(version, str) else ""
+
+
+def write_pin(config_repo: Path, version: str, *, runner=subprocess.run, log=_log) -> None:
+    """Write the pin and commit it when the Config Repo is git-backed —
+    the recorded version IS the deployment decision (ADR-0006/0015)."""
+    if not version:
+        raise ProductError("refusing to pin an empty version (never deploy an unrecorded version)")
+    config_repo.mkdir(parents=True, exist_ok=True)
+    target = config_repo / "product.toml"
+    target.write_text(
+        "# The deployed product version (ADR-0015, amended 2026-07-22):\n"
+        "# written by `theozolith update` / `theozolith build`. Rollback is\n"
+        "# re-pinning a previous version with the same command.\n"
+        f'[product]\nversion = "{version}"\n',
+        encoding="utf-8",
+    )
+    if not (config_repo / ".git").exists():
+        return  # folder mode: the file itself is the record
+    status = runner(
+        ["git", "status", "--porcelain", "product.toml"],
+        cwd=str(config_repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode == 0 and not (status.stdout or "").strip():
+        return  # re-pinning the already-recorded version: nothing to commit
+    for args in (
+        ["git", "add", "product.toml"],
+        [
+            "git",
+            "-c",
+            "user.name=theozolith",
+            "-c",
+            "user.email=theozolith@invalid",
+            "commit",
+            "-m",
+            f"theozolith: pin product version {version}",
+        ],
+    ):
+        proc = runner(args, cwd=str(config_repo), capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise ProductError(
+                f"could not commit the pin bump: {' '.join(args[:2])} failed:"
+                f" {(proc.stderr or proc.stdout or '').strip()[:300]}"
+            )
+    log(f"pinned product version {version} (committed to the Config Repo)")
+
+
+def ensure_pin(config_repo: Path, *, http_get=None, runner=subprocess.run, log=_log) -> str:
+    """A running fleet always has a recorded version (2026-07-22): when
+    product.toml lacks a pin, resolve the latest release and write it."""
+    version = read_pin(config_repo)
+    if version:
+        return version
+    version = resolve_latest_release(http_get)
+    write_pin(config_repo, version, runner=runner, log=log)
+    return version
+
+
+# -- the source build (developer path) -------------------------------------------
+
+# Working-tree noise never worth copying into the build sandbox.
+_BUILD_IGNORES = shutil.ignore_patterns(
+    "__pycache__", "*.egg-info", ".pytest_cache", ".ruff_cache", "dist", "build", "node_modules"
+)
+
+
+def source_version(source: Path, *, runner=subprocess.run) -> str:
+    """The checkout's pin: ``<base>+g<sha12>`` with a ``.dirty`` suffix when
+    the tree has uncommitted changes (a PEP 440 local version, so wheels
+    carry it and nodes report it back in heartbeats)."""
+    try:
+        rev = runner(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(source),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ProductError(f"{source} is not a git checkout: {exc}") from exc
+    if rev.returncode != 0:
+        raise ProductError(f"{source} is not a git checkout: {(rev.stderr or '').strip()[:200]}")
+    sha = (rev.stdout or "").strip()
+    status = runner(
+        ["git", "status", "--porcelain"],
+        cwd=str(source),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    dirty = bool((status.stdout or "").strip())
+    try:
+        base = tomllib.loads((source / "nodedaemon" / "pyproject.toml").read_text())["project"][
+            "version"
+        ]
+    except (OSError, tomllib.TOMLDecodeError, KeyError) as exc:
+        raise ProductError(f"cannot read the base version from {source}: {exc}") from exc
+    return f"{base}+g{sha}" + (".dirty" if dirty else "")
+
+
+def _stamp_version(component_dir: Path, version: str) -> None:
+    pyproject = component_dir / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    stamped = re.sub(r'(?m)^version = ".*"$', f'version = "{version}"', text, count=1)
+    pyproject.write_text(stamped, encoding="utf-8")
+    for init in (component_dir / "src").glob("*/__init__.py"):
+        text = init.read_text(encoding="utf-8")
+        init.write_text(
+            re.sub(r'(?m)^__version__ = ".*"$', f'__version__ = "{version}"', text, count=1),
+            encoding="utf-8",
+        )
+
+
+def _pip_wheel(component_dir: Path, out_dir: Path, runner) -> None:
+    proc = runner(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--wheel-dir",
+            str(out_dir),
+            str(component_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ProductError(
+            f"pip wheel failed for {component_dir.name}:"
+            f" {(proc.stderr or proc.stdout or '').strip()[-400:]}"
+        )
+
+
+def build_distribution(
+    source: Path, out_dir: Path, *, runner=subprocess.run, log=_log
+) -> tuple[str, list[str]]:
+    """Build the whole distribution from the working tree (including any
+    uncommitted changes — that is what ``.dirty`` records) into ``out_dir``.
+    Returns (version, wheel filenames)."""
+    version = source_version(source, runner=runner)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="theozolith-build-") as sandbox:
+        for component in COMPONENTS:
+            staged = Path(sandbox) / component
+            shutil.copytree(source / component, staged, ignore=_BUILD_IGNORES)
+            _stamp_version(staged, version)
+            _pip_wheel(staged, out_dir, runner)
+    wheels = sorted(p.name for p in out_dir.iterdir() if p.name.endswith(".whl"))
+    if not wheels:
+        raise ProductError("the build produced no wheels")
+    log(f"built {len(wheels)} wheel(s) at version {version}")
+    return version, wheels
+
+
+# -- the `theozolith` CLI ---------------------------------------------------------
+
+
+def _update_via_api(args, version: str) -> int:
+    from theozolith_control.cli import _admin_env, _call
+
+    url, token, ca = _admin_env(args)
+    answer = _call(
+        url, "/api/v1/product/update", token=token, method="POST", body={"version": version}, ca=ca
+    )
+    queued = answer.get("queued", [])
+    _log(f"pinned {answer.get('version', version)}; update queued for: {', '.join(queued) or '-'}")
+    _log("nodes apply on their next heartbeat (drain-aware queue-behind); the")
+    _log("Control Node's own host was queued last")
+    return 0
+
+
+def _upload_artifact(url: str, token: str, ca: str | None, version: str, path: Path) -> None:
+    request = urllib.request.Request(
+        f"{url.rstrip('/')}/api/v1/product/artifacts/{version}/{path.name}",
+        data=path.read_bytes(),
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "theozolith-cli",
+        },
+    )
+    context = None
+    if url.startswith("https"):
+        context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(request, timeout=120, context=context) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:300]
+        raise SystemExit(
+            f"error: upload of {path.name} refused (HTTP {exc.code}): {detail}"
+        ) from exc
+
+
+def _cmd_update(args) -> int:
+    version = args.version or resolve_latest_release()
+    if not args.version:
+        _log(f"latest published release: {version}")
+    return _update_via_api(args, version)
+
+
+def _cmd_build(args) -> int:
+    from theozolith_control.cli import _admin_env
+
+    source = Path(args.source).resolve()
+    url, token, ca = _admin_env(args)
+    with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
+        out_dir = Path(staging)
+        version, wheels = build_distribution(source, out_dir)
+        for name in wheels:
+            _upload_artifact(url, token, ca, version, out_dir / name)
+        _log(f"uploaded {len(wheels)} wheel(s); the Control Node serves them for node pulls")
+    return _update_via_api(args, version)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="theozolith",
+        description=(
+            "Operate a TheOzolith deployment from the Control Node. Two update"
+            " paths, one machinery (ADR-0015): `update` pins a published"
+            " release; `build` pins and serves the local source checkout."
+        ),
+    )
+    parser.add_argument("--url", help="Control Node URL (default: CONTROL_NODE_URL)")
+    parser.add_argument("--ca", help="CA bundle (default: THEOZOLITH_TLS_CA)")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    update = commands.add_parser(
+        "update",
+        help="pin the latest published release (or --version) and fan the update out",
+    )
+    update.add_argument("--version", help="an explicit release to pin (rollback = re-pin)")
+    update.set_defaults(handler=_cmd_update)
+
+    build = commands.add_parser(
+        "build",
+        help=(
+            "build the distribution from a source checkout, pin its git SHA"
+            " (-dirty when unclean), serve the wheels, and fan the update out"
+        ),
+    )
+    build.add_argument("--source", default=".", help="source checkout (default: current directory)")
+    build.set_defaults(handler=_cmd_build)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.handler(args)
+    except ProductError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -84,6 +84,27 @@ below.
    theozolith-control unquarantine --node box1                # human-only release (ADR-0016)
    ```
 
+6. **Update the product** (ADR-0015 as amended 2026-07-22 — two paths, one
+   machinery; both need `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN`):
+
+   ```sh
+   theozolith update                  # user path: pin the latest published release
+   theozolith update --version 0.4.0  # …or an explicit one; rollback = re-pin
+   theozolith build                   # developer path, from a source checkout:
+       # builds the distribution, pins the checkout's git SHA (-dirty when the
+       # tree has uncommitted changes), and uploads the wheels — the Control
+       # Node serves them, so nodes never pull source and never build
+   ```
+
+   Both commit the pin bump to `product.toml` in the Config Repo and queue the
+   update for every node over heartbeat responses (drain-aware queue-behind, as
+   above). The node hosting the `control` Stack is queued last: the Control Node
+   applies its own update only after the fan-out is queued. Every heartbeat
+   reports the node's running product version and the dashboard surfaces version
+   skew against the recorded pin. A fresh install with no `product.toml` pin
+   resolves the latest release and writes the pin at Control Node startup — a
+   running fleet always has a recorded version.
+
    `recycle` and `update` received mid-Run queue behind the current Run (job-dir
    presence is the in-flight signal; the deferral shows in heartbeats and on the
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard

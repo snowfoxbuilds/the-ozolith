@@ -100,6 +100,12 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
             {
                 "name": name,
                 "version": node["version"],
+                # Version skew (ADR-0015, 2026-07-22): every heartbeat
+                # reports the running product version; a node off the
+                # recorded pin is surfaced, never silently tolerated.
+                "version_skew": bool(config.product_version)
+                and bool(node["version"])
+                and node["version"] != config.product_version,
                 "last_seen": ago(now - node["last_seen"]),
                 "stale": now - node["last_seen"] > STALE_AFTER_SECONDS,
                 "quarantine": quarantined.get(name),
@@ -118,6 +124,8 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
     return {
         "nodes": nodes,
         "skewed_images": sorted(skewed),
+        "product_version": config.product_version,
+        "version_skew": sorted(n["name"] for n in nodes if n["version_skew"]),
         "pending_commands": pending,
         "drivers": drivers,
     }

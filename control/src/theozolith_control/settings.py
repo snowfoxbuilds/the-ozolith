@@ -82,6 +82,12 @@ class ControlSettings:
         return self.data_dir / "terminal-audit.log"
 
     @property
+    def artifacts_dir(self) -> Path:
+        """Built distributions the developer path serves for node pulls
+        (ADR-0015 amendment 2026-07-22): one directory per pinned version."""
+        return self.data_dir / "artifacts"
+
+    @property
     def coordination_jobs_enabled(self) -> bool:
         """Dispatch + janitor need a GitHub identity and a target repo."""
         return bool(self.repo and self.github_token)

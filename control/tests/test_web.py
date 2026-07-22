@@ -140,6 +140,22 @@ def test_node_state_change_is_reflected_on_the_next_poll(control: ControlRig):
     assert "stopped" in page  # desired running vs actual stopped is visible
 
 
+def test_product_version_skew_is_surfaced(control: ControlRig):
+    """ADR-0015 (2026-07-22): every heartbeat reports the running product
+    version; the dashboard surfaces nodes off the recorded pin."""
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    login(control)
+    control.heartbeat(node="box1", version="0.4.0")
+    control.heartbeat(node="box2", version="0.3.0+gabc123def456.dirty")
+
+    page = control.client.get("/fragments/fleet").text
+    assert "product version skew" in page and "box2" in page
+    assert "0.3.0+gabc123def456.dirty" in page  # the odd version is visible
+
+    control.heartbeat(node="box2", version="0.4.0")  # converged
+    assert "product version skew" not in control.client.get("/fragments/fleet").text
+
+
 def test_build_skew_between_nodes_is_flagged(control: ControlRig):
     """Acceptance 4: same image name on two nodes, different build metadata."""
     login(control)

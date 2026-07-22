@@ -374,14 +374,22 @@ class NodeDaemon:
         # The reconcile step of this same pass starts them again.
 
     def _update(self, command_id: Any) -> None:
-        """Product update (ADR-0013 §8): stop the tree, install the pinned
-        version, re-exec this daemon in place. The ack is persisted first so
-        the re-exec'd daemon does not replay the command."""
+        """Product update (ADR-0013 §8, ADR-0015 as amended 2026-07-22):
+        stop the tree, install the pinned version, re-exec this daemon in
+        place. Release pins install by name from the package index; a
+        served artifact set (the developer build path) is pulled from the
+        Control Node and installed from local wheel files — nodes never
+        pull source and never build. The ack is persisted first so the
+        re-exec'd daemon does not replay the command."""
         self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
         version = str(self._desired.get("product_version", "") or "")
-        packages = [f"{name}=={version}" if version else name for name in UPDATE_PACKAGES]
+        artifacts = self._desired.get("product_artifacts")
+        if isinstance(artifacts, list) and artifacts and self._client is not None:
+            targets = self._pull_artifacts(version, [str(a) for a in artifacts])
+        else:
+            targets = [f"{name}=={version}" if version else name for name in UPDATE_PACKAGES]
         proc = self._update_runner(
-            [sys.executable, "-m", "pip", "install", "--upgrade", *packages],
+            [sys.executable, "-m", "pip", "install", "--upgrade", *targets],
             capture_output=True,
             text=True,
         )
@@ -390,6 +398,22 @@ class NodeDaemon:
         self._ack(command_id)
         self._log(f"updated to {version or 'latest'}; re-exec")
         self._execv(sys.executable, [sys.executable, "-m", "theozolith_nodedaemon", *sys.argv[1:]])
+
+    def _pull_artifacts(self, version: str, names: list[str]) -> list[str]:
+        """Download the served wheels into the state dir; local file paths
+        become the pip install targets."""
+        wheel_dir = self._config.state_dir / "update-wheels"
+        if wheel_dir.is_dir():
+            for stale in wheel_dir.iterdir():
+                stale.unlink()
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for name in names:
+            base = Path(name).name  # a served filename is never a path
+            target = wheel_dir / base
+            target.write_bytes(self._client.fetch_artifact(version, base))
+            paths.append(str(target))
+        return paths
 
     # -- reconciliation ---------------------------------------------------------------
 

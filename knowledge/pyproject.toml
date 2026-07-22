@@ -1,6 +1,6 @@
 [project]
 name = "theozolith-knowledge"
-version = "0.1.0"
+version = "0.3.0"
 description = "Agent-knowledge machinery: knowledge config format, per-tool compilers, one-way sync engine, and bake CLI."
 readme = "README.md"
 license = { text = "MIT" }

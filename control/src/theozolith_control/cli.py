@@ -22,7 +22,7 @@ from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import janitor, origin
+from theozolith_control import janitor, origin, product
 from theozolith_control.crypto import SecretBox, ensure_key_file, generate_key
 from theozolith_control.origin import OriginError
 from theozolith_control.settings import ControlSettings, load_settings
@@ -152,6 +152,15 @@ def _serve(args) -> int:
                 " THEOZOLITH_PUBLIC_ORIGIN; --insecure-dev for local dev only)"
             ) from exc
     settings = dataclasses.replace(settings, secrets_channel_ok=True, serve_tls=tls)
+    # A running fleet always has a recorded version (ADR-0015, 2026-07-22):
+    # a fresh install with no product.toml pin resolves the latest release
+    # and writes the pin. Best-effort at startup — an unreachable release
+    # index must never keep the Control Node down.
+    try:
+        pinned = product.ensure_pin(settings.config_repo, log=_log)
+        _log(f"product version pin: {pinned}")
+    except Exception as exc:
+        _log(f"product pin not resolved yet ({exc}); run 'theozolith update' to pin")
     store = Store(settings.db_path)
     box = SecretBox(
         env_value(os.environ, "THEOZOLITH_MASTER_KEY") or ensure_key_file(settings.key_path)

@@ -22,6 +22,10 @@ dependencies = [
 
 [project.scripts]
 theozolith-control = "theozolith_control.cli:main"
+# The operator command (ADR-0015 amendment 2026-07-22): `theozolith update`
+# pins a published release; `theozolith build` pins and serves the local
+# source checkout. Both fan out over heartbeat responses.
+theozolith = "theozolith_control.product:main"
 
 [build-system]
 requires = ["hatchling"]

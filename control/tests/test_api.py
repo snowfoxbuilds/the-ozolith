@@ -7,7 +7,7 @@ the telemetry ingestion caps.
 
 from __future__ import annotations
 
-from controlrig import ControlRig, make_rig, run_event
+from controlrig import ADMIN_TOKEN, NODE_TOKEN, ControlRig, make_rig, run_event
 
 STACK_TOML = """\
 kind = "process"
@@ -364,6 +364,91 @@ def test_heartbeat_reports_command_deferrals(control: ControlRig):
     control.heartbeat(completed_commands=[command_id])
     commands = control.admin("GET", "/api/v1/state").json()["commands"]
     assert commands[0]["deferred_reason"] is None
+
+
+# -- the two update paths, one machinery (ADR-0015, 2026-07-22) -----------------------
+
+
+CONTROL_STACK_TOML = 'kind = "container"\nnode = "boxctl"\nimage = "theozolith-control:pinned"\n'
+
+
+def test_product_update_pins_and_fans_out_control_host_last(control: ControlRig):
+    control.write_config("stacks/control.toml", CONTROL_STACK_TOML)
+    # Three registered nodes; boxctl hosts the control Stack.
+    for node in ("boxctl", "box1", "box2"):
+        control.heartbeat(node=node)
+
+    answer = control.admin("POST", "/api/v1/product/update", {"version": "0.4.0"})
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["version"] == "0.4.0"
+    # Fan-out to every node; the control host is queued LAST (it applies
+    # its own update only after the fan-out is queued).
+    assert body["queued"] == ["box1", "box2", "boxctl"]
+
+    # The pin landed in the Config Repo…
+    pin = (control.settings.config_repo / "product.toml").read_text()
+    assert 'version = "0.4.0"' in pin
+    # …and every node's next heartbeat delivers both the command and the pin.
+    for node in ("box1", "box2", "boxctl"):
+        beat = control.heartbeat(node=node).json()
+        assert [c["verb"] for c in beat["commands"]] == ["update"]
+        assert beat["config"]["product_version"] == "0.4.0"
+        # A release pin with no served artifacts carries no artifact refs.
+        assert "product_artifacts" not in beat["config"]
+
+    # Rollback: re-running with a previous version re-pins and redeploys.
+    assert control.admin("POST", "/api/v1/product/update", {"version": "0.3.0"}).status_code == 200
+    assert 'version = "0.3.0"' in (control.settings.config_repo / "product.toml").read_text()
+
+
+def test_product_update_requires_admin_and_a_version(control: ControlRig):
+    refused = control.node_post("/api/v1/product/update", {"version": "0.4.0"})
+    assert refused.status_code == 401
+    empty = control.admin("POST", "/api/v1/product/update", {"version": ""})
+    assert empty.status_code == 400
+
+
+def test_artifact_upload_serve_roundtrip_and_heartbeat_references(control: ControlRig):
+    version = "0.3.0+gabc123def456.dirty"
+    wheel = "theozolith_worker-0.3.0+gabc123def456.dirty-py3-none-any.whl"
+    upload = control.client.put(
+        f"/api/v1/product/artifacts/{version}/{wheel}",
+        content=b"wheel-bytes",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    assert upload.status_code == 200 and upload.json()["bytes"] == 11
+
+    # Nodes pull with the node token; the payload is byte-exact.
+    pulled = control.client.get(
+        f"/api/v1/product/artifacts/{version}/{wheel}",
+        headers={"Authorization": f"Bearer {NODE_TOKEN}"},
+    )
+    assert pulled.status_code == 200 and pulled.content == b"wheel-bytes"
+
+    # Pinning that version makes heartbeats carry the artifact REFERENCES
+    # (filenames only — the channel invariant holds).
+    assert control.admin("POST", "/api/v1/product/update", {"version": version}).status_code == 200
+    beat = control.heartbeat(node="box1").json()
+    assert beat["config"]["product_version"] == version
+    assert beat["config"]["product_artifacts"] == [wheel]
+
+
+def test_artifact_endpoints_refuse_unsafe_segments_and_unknown_files(control: ControlRig):
+    headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+    # A `..` segment dies in URL normalization (route miss) or in the
+    # handler's segment check — refused either way, never written.
+    for version, name in (("..", "a.whl"), ("0.3.0", "..whl"), ("0.3.0", "not-a-wheel.txt")):
+        refused = control.client.put(
+            f"/api/v1/product/artifacts/{version}/{name}", content=b"x", headers=headers
+        )
+        assert refused.status_code in (400, 404), (version, name)
+    assert not control.settings.artifacts_dir.exists()  # nothing landed anywhere
+    missing = control.client.get(
+        "/api/v1/product/artifacts/0.9.9/ghost.whl",
+        headers={"Authorization": f"Bearer {NODE_TOKEN}"},
+    )
+    assert missing.status_code == 404
 
 
 # -- deletion test (acceptance 8, control half) ---------------------------------------------

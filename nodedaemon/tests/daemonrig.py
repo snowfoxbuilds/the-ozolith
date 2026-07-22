@@ -152,6 +152,8 @@ class ScriptedControl:
         self.heartbeat_answers: list[Any] = []
         self.secrets: dict[str, str] = {}
         self.denied_secrets = False
+        # (version, filename) -> wheel bytes served to artifact pulls.
+        self.artifacts: dict[tuple[str, str], bytes] = {}
         self.transcript: list[tuple[str, str, Any, Any]] = []
 
     @property
@@ -165,6 +167,8 @@ class ScriptedControl:
         request = json.loads(body or b"{}")
         status, answer = self._answer(path, request)
         self.transcript.append((method, path, request, answer))
+        if isinstance(answer, bytes):  # artifact pulls are raw, not JSON
+            return status, answer
         return status, json.dumps(answer).encode()
 
     def _answer(self, path: str, request: dict) -> tuple[int, Any]:
@@ -172,6 +176,13 @@ class ScriptedControl:
             return 200, {"ok": True}
         if path == "/events":
             return 200, {"ok": True}
+        if path.startswith("/product/artifacts/"):
+            _, _, rest = path.partition("/product/artifacts/")
+            version, _, filename = rest.partition("/")
+            wheel = self.artifacts.get((version, filename))
+            if wheel is None:
+                return 404, {"detail": f"no artifact {filename} for {version}"}
+            return 200, wheel
         if path == "/heartbeats":
             if not self.heartbeat_answers:
                 raise ControlUnreachable("no scripted answer")
