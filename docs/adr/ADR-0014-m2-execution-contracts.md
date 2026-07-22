@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended in part by ADR-0016 (2026-07-17): the failed-Run marker/re-queue path is replaced by local retry with failed + needs_human escalation; zombie re-queue by evidence-first escalation.
+Status: ACCEPTED — amended in part by ADR-0016 (2026-07-17): the failed-Run marker/re-queue path is replaced by local retry with failed + needs_human escalation; zombie re-queue by evidence-first escalation. Amended in part by ADR-0019 (2026-07-21): hook-based completion detection, the settle window, and tmux session mechanics are retired — Runs invoke the adapter headless and completion is process exit.
 
 Date: 2026-07-16
 

@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-07-17 by ADR-0016 and ADR-0017 (see Amendments)
+Status: ACCEPTED — amended 2026-07-17 by ADR-0016 and ADR-0017; amended 2026-07-22 (two update paths) (see Amendments)
 
 Date: 2026-07-16
 
@@ -81,3 +81,6 @@ Built-in Stacks (worker, reviewer, control) are ordinary files in this same form
 - **Telemetry on the channel (ADR-0016)**: `theozolith.run.progress` joins the known event types (size caps enforced at ingestion); the control database is a cache, never the archive — ~10GB transcript-tail budget, oldest-first eviction, terminal events kept indefinitely.
 - **Queue-behind recycle/update (recorded in **[**NODE-SUBSTRATE.md**](http://node-substrate.md/)** Decisions, 2026-07-17)**: commands received mid-Run queue behind the current Run as a drain→apply→undrain composition instead of killing it; job-dir presence is the in-flight signal; `--force` keeps kill-the-tree.
 - **M4 control-only dependencies**: `jinja2` and `python-multipart` join the `control/` runtime-dependency exception for the approved server-rendered dashboard and HTML forms. The stdlib-only rule remains unchanged for `worker/`, `nodedaemon/`, and `knowledge/`.
+## Amendments (2026-07-22, grilling session)
+
+- **Two update paths (recorded in **[**NODE-SUBSTRATE.md**](http://node-substrate.md/)** Decisions, 2026-07-22)**: `theozolith update` (user path) resolves the latest published release — or an explicit `--version` — and pins it; `theozolith build` (developer path) builds the distribution from the source checkout on the Control Node, pins the checkout's git SHA (`-dirty` marked when uncommitted changes exist), and serves the built artifact for node pulls. Both paths converge on the same machinery: pin bump committed to product.toml, update command fanned out over heartbeat responses (drain-aware queue-behind), Control Node self-update last via the existing `os.execv` path. product.toml's "absent = latest" default is softened: absent means the installer resolves the latest release and **writes the pin** — a running fleet always has a recorded version. Nodes never pull source and never build the product distribution.

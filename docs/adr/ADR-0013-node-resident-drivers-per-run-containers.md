@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended in part by ADR-0019 (2026-07-21): interactive tmux harness mechanics retired; Runs execute headless and are not attach targets (interactivity moves to the Pilot).
 
 Date: 2026-07-15
 
