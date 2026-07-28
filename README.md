@@ -51,9 +51,10 @@ theozolith-knowledge bake --source https://example.com/knowledge.git --pin <comm
 ## Setup (full substrate)
 
 One Control Node plus a Node Daemon on every physical box that should run Stacks.
-The deployment footprint per box is docker + the TheOzolith package + a `.env`
-(the deletion test, NODE-SUBSTRATE.md). Operations, product updates, the daemon-less
-one-box dev shape, and cleanup are covered in [deploy/README.md](deploy/README.md).
+The deployment footprint per box is docker + the TheOzolith package +
+`theozolith-control init` output (the deletion test as restated by ADR-0023 — there
+is no `.env`). Operations, product updates, backup/recovery, the daemon-less one-box
+dev shape, and cleanup are covered in [deploy/README.md](deploy/README.md).
 
 Prerequisites:
 
@@ -64,54 +65,42 @@ Prerequisites:
   Worker, the Reviewer, and the Control Node — three distinct GitHub identities, so
   no self-grading by construction (ADR-0008, ADR-0017).
 
-### 1. Set up and provision the Control Node
+### 1. Initialize the Control Node
 
 From the repo checkout on the Control Node box:
 
 ```sh
-cp deploy/.env.example .env    # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN;
-                               # for the pipeline also THEOZOLITH_REPO + CONTROL_GITHUB_TOKEN
-
 docker compose -f deploy/compose/control.yml build
-
-# One-time provisioning, BEFORE the service is healthy (until both one-shots
-# have run, `serve` exits and the container restarts — that is expected):
-docker compose -f deploy/compose/control.yml run --rm control origin-init
-docker compose -f deploy/compose/control.yml run --rm control tls-init
-
-docker compose --env-file .env -f deploy/compose/control.yml up -d
-docker compose -f deploy/compose/control.yml cp control:/data/tls/ca.pem .
+docker compose -f deploy/compose/control.yml run --rm control init
+docker compose -f deploy/compose/control.yml up -d
 ```
 
-- `origin-init` mints the deployment's one public origin —
-  `https://<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to
-  change). Give its hostname a **trusted-network-only** DNS record (or hosts entries)
-  pointing at the Control Node, which must have no public ingress path; browsers and
-  nodes must use exactly this origin.
-- `tls-init` mints the self-signed CA and a certificate covering the origin's hostname
-  (`--host` adds extra names). TLS is mandatory: secrets transit this channel.
-- Keep the copied `ca.pem` at hand — every node and driver pins it (step 2).
-- Back up and guard the `control-data` volume: it holds the SQLite DB, the TLS
-  material, and the master key protecting every secret.
+`init` (ADR-0023) composes the whole first run: master key → the deployment's one
+public origin (`https://<128-bit-random-slug>.theozolith.internal`; `--base-domain`
+to change) → per-deployment CA + server certificate with the box's IP in the SAN →
+admin password prompt (only its scrypt hash is stored) → the **operator handoff**:
+the dashboard URL, the exact DNS/hosts line, the CA download URL, and per-OS trust
+one-liners. The two irreducibly manual actions — the trusted-network-only DNS record
+and CA trust per operator device — are copy-paste from that printout. All state
+lands under `~/.theozolith/` on the host, partitioned by durability class
+(ADR-0024); backup is a copy of that folder minus `cache/`.
 
-### 2. Provision the physical nodes
-
-On every box that should run Stacks, with the `ca.pem` from step 1:
+### 2. Provision the physical nodes — one paste each
 
 ```sh
-sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
-  --control-url https://<slug>.theozolith.internal --ca ca.pem
+theozolith join-token create     # on the Control Node (or the dashboard)
 ```
 
-The installer creates the `ozolith` service user, installs the product distribution
-into a venv at `/opt/theozolith` (daemon + drivers + knowledge machinery — one
-versioned distribution, ADR-0013), pins the CA at `/etc/theozolith/ca.pem`, installs
-the systemd unit (`KillMode=control-group`: every TheOzolith process on the node dies
-with the daemon), and starts heartbeating. The node registers within one heartbeat
-interval (60 s default). `--node <name>` overrides the node name (default: the
-hostname); `--source <checkout>` installs from a local checkout instead of the
-published release. If `THEOZOLITH_NODE_TOKEN` is not in the environment the installer
-prompts for it — it is never passed as an argument.
+Paste the printed line on the box. For a fresh box it fetches the installer over
+GitHub release HTTPS and hands off to `theozolith-nodedaemon provision` — which
+verifies the CA against the join string's pinned fingerprint **before transmitting
+anything**, exchanges the short-lived single-use join token for the node's own
+non-expiring per-node token, persists everything under `/var/lib/theozolith`, and
+enables the systemd unit (`KillMode=control-group`: every TheOzolith process on the
+node dies with the daemon). Provisioning **is** registration (ADR-0023): the node
+exists the moment the exchange succeeds and heartbeats within the interval (60 s
+default). Join tokens default to 1 hour / single use; `--ttl`/`--uses` widen them
+for batches, `theozolith join-token revoke` is the backstop.
 
 ### 3. Declare desired state (Config Repo)
 
@@ -127,8 +116,7 @@ state distributes over the heartbeat channel; nodes cache it for degraded mode.
 Stacks reference secrets by name (e.g. `github-worker`); enter each value once:
 
 ```sh
-CONTROL_NODE_URL=https://<slug>.theozolith.internal THEOZOLITH_ADMIN_TOKEN=... \
-  theozolith-control secret set github-worker --ca ca.pem
+theozolith-control secret set github-worker    # on the Control Node; or the dashboard
 ```
 
 Secrets are encrypted at rest on the Control Node, pulled node-scoped over TLS (only
@@ -142,8 +130,10 @@ GITHUB_TOKEN=... theozolith-bootstrap --repo owner/name   # labels + issue forms
 theozolith-control status                                 # fleet state
 ```
 
-The dashboard (at the minted origin, behind the admin token) shows the fleet, Run
-progress, `theozolith.error` summaries, secret entry, and the web terminal.
+The dashboard (at the minted origin, behind the admin password) shows the fleet —
+including unregistered nodes awaiting a join-string paste — Run progress,
+`theozolith.error` summaries, secret entry, tier-2 settings (committed to
+`control.toml` in the Config Repo), join tokens, and the web terminal.
 
 ## Development
 

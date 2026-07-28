@@ -36,9 +36,15 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   (target and owning Stack derived server-side from fresh heartbeats; identifiers
   validated; output bounded), audit-logged to `<data>/terminal-audit.log`. The Flight
   Deck is the primary target; run containers are headless and never attach targets
-  (ADR-0019). One admin credential fronts all of it, behind a randomized public origin
-  with exact Host/Origin enforcement (derived from the origin URL alone — independent
-  of the Uvicorn bind host/port).
+  (ADR-0019), audit log under `~/.theozolith/logs/`. The admin password (scrypt hash,
+  stateful revocable sessions in cache.db, rate-limited login — ADR-0023) fronts the
+  browser surface; the admin bearer token stays the machine credential. Everything
+  sits behind a randomized public origin with exact Host/Origin enforcement (derived
+  from the origin URL alone — independent of the Uvicorn bind host/port). Tier-2
+  settings edit `control.toml` in the Config Repo via fixed-schema commits; join
+  tokens mint the one paste that provisions a node (per-node bearer tokens; rejected
+  heartbeats surface as the unregistered-nodes view). A plaintext bootstrap listener
+  (port 6965) serves exactly the CA cert, origin, and control URL.
 - **Product updates** (ADR-0015 as amended) — `theozolith update` pins a published
   release; `theozolith build` pins a CLEAN source checkout's git SHA (a dirty tree is
   refused) and uploads wheels the Control Node serves for node pulls; `theozolith
@@ -55,9 +61,11 @@ new claims and review rounds pause. Drivers hold their own PATs for all non-clai
 GitHub writes.
 
 ```sh
-theozolith-control origin-init                       # once: mint the public origin (ADR-0019)
-theozolith-control tls-init                          # once: TLS covering the origin's hostname
-theozolith-control serve                             # the service (+ dashboard)
+theozolith-control init                              # the unified first run (ADR-0023):
+                                                     # key, origin, CA/TLS, password, handoff
+theozolith-control serve                             # the service (+ dashboard + bootstrap listener)
+theozolith-control recover                           # after restoring ~/.theozolith minus cache/
+theozolith join-token create                         # print the one paste that provisions a node
 theozolith-control secret set github-worker          # operator entry
 theozolith-control command recycle --node box1 --target worker   # queues behind a Run
 theozolith-control command recycle --node box1 --target worker --force
