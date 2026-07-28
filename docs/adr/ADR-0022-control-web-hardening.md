@@ -2,7 +2,7 @@ Status: ACCEPTED
 
 Date: 2026-07-18
 
-Amended: 2026-07-21 — PR #6 review rounds
+Amended: 2026-07-21 — PR #6 review rounds; 2026-07-27 — ADR-0024 relocates the persisted public origin (see Amendments)
 
 Provenance: authored in-repo under the M5 delegated-decisions mandate as ADR-0019 in PR #6; uplifted to Notion on 2026-07-22 as ADR-0022 because ADR-0019 had already been allocated to Headless Runs and the Flight Deck. This page is canonical and supersedes the conflicting repo number on the next sync.
 
@@ -72,3 +72,6 @@ The post-merge review of PR #5 found security and stability gaps in terminal com
 - **Unbounded server queue with client flow control**: rejected because the client cannot be trusted to drain; kernel PTY backpressure is the natural bound.
 - **Persistent evidence retry queue**: rejected; the boot sweep is already the durable retry and evidence does not become coordination state.
 - **Pipeline-specific parsing for queue ownership**: rejected; one directory per Stack encodes ownership structurally and supports custom Stacks.
+## Amendments (2026-07-27, grilling session)
+
+- **Public-origin storage relocated by ADR-0024**: the persisted origin moves from the `<data-dir>/public-origin` flat file into `control.toml` in the Config Repo as a tier-1 field — written by `origin-init`/`init`, rendered read-only in the dashboard settings form, `THEOZOLITH_PUBLIC_ORIGIN` override unchanged. Origin semantics, fail-closed parsing, and exact-Host/Origin enforcement are untouched; only the storage location changes. The origin is deployment customization, not machine state, and restoring the Config Repo must restore it (ADR-0024 recovery).

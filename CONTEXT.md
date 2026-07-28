@@ -30,7 +30,7 @@ A single `.md` subagent file used by Claude. One component inside the Claude age
 
 **Config Repo**
 
-The single source of truth for one deployment's customizations: Stack definitions, worker types (base image + setup instructions + optional Knowledge Source), compose overlays, and secret names. A git-backed folder (default ~/.theozolith/configs) whose working home is the Control Node; the web UI is an editor that commits to it. Never contains secret values.
+The single source of truth for one deployment's customizations: Stack definitions, worker types (base image + setup instructions + optional Knowledge Source), compose overlays, secret names, and control-plane settings (`control.toml`; ADR-0023). A git-backed folder (default ~/.theozolith/configs) whose working home is the Control Node; the web UI is an editor that commits to it. Never contains secret values.
 
 *Avoid*: treating the web UI as a separate authority; per-node config dirs.
 
@@ -81,6 +81,12 @@ The Run kind that attempts one GitHub issue (renamed from "Worker Run" 2026-07-2
 The draft-stage worker type (ADR-0021; specified 2026-07-21, deferred past the current testing scope): discovers draft issues lacking the initialized label through Control Node dispatch (discovery-only — no claim write), reads the issue and the repo to understand intent, and publishes one structured analysis comment — intent restatement, feasibility, challenges, recommended path, and grilling-style questions with recommendations — updated in place on re-runs, then applies the initialized label. The issue body stays human-owned; removing initialized is the human re-queue. Exists to make human planning fast; plan_ready authority stays human.
 
 *Avoid*: "Planner" (reserved for a future autonomous planning actor); editing the issue body (forbidden); confusing with the Flight Deck (human-driven, interactive).
+
+**Join String**
+
+The single paste that provisions a physical node: a versioned, checksummed blob (`ozjoin1:` prefix) carrying the Control Node address, the CA certificate fingerprint, and a short-lived single-use join token. The provision CLI verifies the fetched CA against the fingerprint before transmitting anything, then exchanges the join token over verified TLS for a non-expiring per-node token. Disposable by design.
+
+*Avoid*: treating it as a password (it expires and is consumed); confusing the join token with the per-node token (which persists) or the admin token.
 
 **Knowledge Source**
 

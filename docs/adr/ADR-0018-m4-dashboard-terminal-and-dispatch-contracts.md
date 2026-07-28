@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-07-27 by ADR-0023 (admin credential and session superseded; see Amendments)
 
 Date: 2026-07-17
 
@@ -56,3 +56,7 @@ The M4 brief delegated four decisions to the implementing PR: dashboard informat
 - **Terminal audit in SQLite**: rejected; the control database is deletable cache state.
 - **Implicit terminal template for every Stack**: rejected; no configured attach command means no terminal exposure.
 - **Reject oversized progress events without truncation**: rejected; retaining the tail preserves useful advisory telemetry.
+## Amendments (2026-07-27, grilling session)
+
+- **Admin credential and session superseded by ADR-0023**: a scrypt-hashed admin password (entered at `theozolith-control init`) becomes the browser login credential; sessions move to a server-side table in the control database — random 128-bit session ID in the ADR-0022 cookie, 30-day absolute expiry, revocable (logout deletes the row; password change truncates the table); sessions survive Control Node restarts, which the stateless per-process-key design did not — operationally hostile once `os.execv` self-updates make restarts routine. The admin bearer token remains the machine credential for CLI and API, unchanged.
+- **"Separate dashboard password: rejected" is reversed** by ADR-0023: the original rejection weighed authority (unchanged — the password protects the same single-operator trust domain as the admin token), not ergonomics. Init-time password entry changed the ground: humans do not memorize 128-bit bearer tokens.

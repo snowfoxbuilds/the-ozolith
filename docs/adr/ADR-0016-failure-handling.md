@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-07-27 by ADR-0024 (cache/store split; see Amendments)
 
 Date: 2026-07-17
 
@@ -29,3 +29,6 @@ ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the re
 - **Escalate zombies before evidence, link the expected path**: rejected by the operator — faster issue turnaround is not worth escalations without complete forensics.
 - **Driver-side circuit breaker for sick nodes**: rejected — the Control Node holds the grant gate (ADR-0017) and the fleet view, so it can distinguish a failing node from a failing issue; a driver cannot.
 - **Auto-strip failed at dispatch when plan_ready is present**: rejected — launders a forgotten label into silence; a visibly stalled grant is preferable to an unnoticed failure loop.
+## Amendments (2026-07-27, grilling session)
+
+- **Cache, never archive — made true by construction by ADR-0024.** The single control database silently mixed durability classes: the encrypted secret store (ADR-0015) and per-node tokens (ADR-0023) lived in the same "deletable" file as heartbeat state and the event cache, so deleting the cache destroyed secrets and fleet enrollment. ADR-0024 splits it into `cache.db` (node/stack state, events, janitor findings, sessions, join tokens — always safe to delete) and `store.db` (encrypted secrets, per-node tokens — the backup set). This ADR's rule stands; its storage now obeys it.
