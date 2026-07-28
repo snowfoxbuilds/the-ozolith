@@ -48,6 +48,103 @@ theozolith-knowledge sync --source . --scope project --target .
 theozolith-knowledge bake --source https://example.com/knowledge.git --pin <commit> --target /root/.claude
 ```
 
+## Setup (full substrate)
+
+One Control Node plus a Node Daemon on every physical box that should run Stacks.
+The deployment footprint per box is docker + the TheOzolith package + a `.env`
+(the deletion test, NODE-SUBSTRATE.md). Operations, product updates, the daemon-less
+one-box dev shape, and cleanup are covered in [deploy/README.md](deploy/README.md).
+
+Prerequisites:
+
+- **Control Node**: any box with docker + the compose plugin (the Pi in the reference
+  deployment) and a checkout of this repo.
+- **Every physical node**: systemd Linux, docker with the compose plugin, python3 ≥ 3.11.
+- **For the coding pipeline**: a target GitHub repo and machine-user PATs for the
+  Worker, the Reviewer, and the Control Node — three distinct GitHub identities, so
+  no self-grading by construction (ADR-0008, ADR-0017).
+
+### 1. Set up and provision the Control Node
+
+From the repo checkout on the Control Node box:
+
+```sh
+cp deploy/.env.example .env    # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN;
+                               # for the pipeline also THEOZOLITH_REPO + CONTROL_GITHUB_TOKEN
+
+docker compose -f deploy/compose/control.yml build
+
+# One-time provisioning, BEFORE the service is healthy (until both one-shots
+# have run, `serve` exits and the container restarts — that is expected):
+docker compose -f deploy/compose/control.yml run --rm control origin-init
+docker compose -f deploy/compose/control.yml run --rm control tls-init
+
+docker compose --env-file .env -f deploy/compose/control.yml up -d
+docker compose -f deploy/compose/control.yml cp control:/data/tls/ca.pem .
+```
+
+- `origin-init` mints the deployment's one public origin —
+  `https://<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to
+  change). Give its hostname a **trusted-network-only** DNS record (or hosts entries)
+  pointing at the Control Node, which must have no public ingress path; browsers and
+  nodes must use exactly this origin.
+- `tls-init` mints the self-signed CA and a certificate covering the origin's hostname
+  (`--host` adds extra names). TLS is mandatory: secrets transit this channel.
+- Keep the copied `ca.pem` at hand — every node and driver pins it (step 2).
+- Back up and guard the `control-data` volume: it holds the SQLite DB, the TLS
+  material, and the master key protecting every secret.
+
+### 2. Provision the physical nodes
+
+On every box that should run Stacks, with the `ca.pem` from step 1:
+
+```sh
+sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
+  --control-url https://<slug>.theozolith.internal --ca ca.pem
+```
+
+The installer creates the `ozolith` service user, installs the product distribution
+into a venv at `/opt/theozolith` (daemon + drivers + knowledge machinery — one
+versioned distribution, ADR-0013), pins the CA at `/etc/theozolith/ca.pem`, installs
+the systemd unit (`KillMode=control-group`: every TheOzolith process on the node dies
+with the daemon), and starts heartbeating. The node registers within one heartbeat
+interval (60 s default). `--node <name>` overrides the node name (default: the
+hostname); `--source <checkout>` installs from a local checkout instead of the
+published release. If `THEOZOLITH_NODE_TOKEN` is not in the environment the installer
+prompts for it — it is never passed as an argument.
+
+### 3. Declare desired state (Config Repo)
+
+The git-backed Config Repo at `~/.theozolith/configs` on the Control Node (ADR-0006)
+is the deployment's source of truth: Stacks, derived images, and the product version
+pin. `deploy/configs-example/` is a complete starter — copy it in and adjust the
+`node = "..."` placements to your node names. The Implementer/Reviewer drivers are
+process-kind Stacks; `control` and the Flight Deck are container Stacks. Desired
+state distributes over the heartbeat channel; nodes cache it for degraded mode.
+
+### 4. Enter secrets
+
+Stacks reference secrets by name (e.g. `github-worker`); enter each value once:
+
+```sh
+CONTROL_NODE_URL=https://<slug>.theozolith.internal THEOZOLITH_ADMIN_TOKEN=... \
+  theozolith-control secret set github-worker --ca ca.pem
+```
+
+Secrets are encrypted at rest on the Control Node, pulled node-scoped over TLS (only
+nodes whose Stacks reference a name may pull it), and materialized to tmpfs — never
+on node disk.
+
+### 5. Bootstrap the target repo and verify
+
+```sh
+GITHUB_TOKEN=... theozolith-bootstrap --repo owner/name   # labels + issue forms, one-time
+theozolith-control status                                 # fleet state
+```
+
+The dashboard (at the minted origin, behind the admin token) shows the fleet, Run
+progress, `theozolith.error` summaries, secret entry, and the web terminal.
+
 ## Development
 
 ```sh
