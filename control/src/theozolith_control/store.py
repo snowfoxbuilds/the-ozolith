@@ -1,14 +1,16 @@
-"""Control Node persistence: one SQLite database, one writer process.
+"""cache.db: Control Node cache persistence — deletable by construction.
 
-The database is a cache, never an archive (ADR-0016): the evidence bundle is
-the sole durable audit trail, nothing here may ever be the only copy of
-anything, and everything is deletable by policy. What it caches: node/stack/
-container/image status from heartbeats, namespaced events from drivers
-(terminal Run events kept indefinitely — they are tiny and are the metrics
-substrate; progress telemetry evicted oldest-first under a byte budget),
-queued infrastructure commands, dispatch grants awaiting activation
-(ADR-0017), node health for the quarantine gate, dashboard flags, and the
-encrypted secret values.
+The database is a cache, never an archive, with no exceptions left
+(ADR-0016 as made true by ADR-0024's split: secrets and per-node tokens
+live in store.db, see secretstore.py). Deleting this file mid-operation
+costs the operator a re-login and one heartbeat round of state re-warm,
+nothing else. What it caches: node/stack/container/image status from
+heartbeats, namespaced events from drivers (terminal Run events kept
+indefinitely — they are tiny and are the metrics substrate; progress
+telemetry evicted oldest-first under a byte budget), queued infrastructure
+commands, dispatch grants awaiting activation (ADR-0017), node health for
+the quarantine gate, dashboard flags, browser sessions (ADR-0023),
+outstanding join tokens, and unregistered-node sightings.
 
 The connection is shared across FastAPI handlers and the sweep threads, so
 every access serializes on one lock; at control-plane cadence (a heartbeat
@@ -17,7 +19,9 @@ per node per minute) contention is irrelevant.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets as _secrets
 import sqlite3
 import threading
 import time
@@ -103,10 +107,37 @@ CREATE TABLE IF NOT EXISTS commands (
     completed_at REAL,
     deferred_reason TEXT
 );
-CREATE TABLE IF NOT EXISTS secrets (
-    name TEXT PRIMARY KEY,
-    token TEXT NOT NULL,
-    updated_at REAL NOT NULL
+-- Browser sessions (ADR-0023: stateful, revocable). The cookie carries a
+-- random 128-bit id; only its SHA-256 lands here — reading the cache never
+-- yields a usable cookie. Absolute expiry; logout deletes the row; a
+-- password change truncates the table.
+CREATE TABLE IF NOT EXISTS sessions (
+    id_hash TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+-- Outstanding join tokens (ADR-0023): short-lived, use-counted, consumed on
+-- successful exchange. Hash-stored like sessions. Losing this table only
+-- invalidates unredeemed join strings — re-mint and re-paste.
+CREATE TABLE IF NOT EXISTS join_tokens (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    uses_left INTEGER NOT NULL
+);
+-- Unregistered-node sightings (ADR-0023): heartbeats bearing unknown or
+-- revoked tokens are rejected 401 and recorded here — advisory display
+-- built from unauthenticated input, deduplicated and size-capped, never a
+-- node record, never dispatch-eligible. After a stale-backup recovery this
+-- is exactly the re-provision worklist.
+CREATE TABLE IF NOT EXISTS unregistered_nodes (
+    name TEXT NOT NULL,
+    source TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    beats INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (name, source)
 );
 CREATE TABLE IF NOT EXISTS janitor_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,7 +208,17 @@ CREATE TABLE IF NOT EXISTS version_health (
 # Tables of earlier schema generations, dropped on open: the advisory
 # claim-intent pre-filter (replaced by dispatch grants, ADR-0017) and the
 # retry auditor's findings (died with the marker machinery, ADR-0016).
+# The pre-split secrets table (moved to store.db, ADR-0024) is deliberately
+# NOT dropped: pointing this class at a pre-split control.db must never
+# destroy the one copy of the ciphertext — migration is manual.
 _DROPPED_TABLES = ("claim_intents", "audit_findings")
+
+# Unregistered-node sightings kept at most (dedup key: name + source).
+UNREGISTERED_CAP = 64
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 EVENT_RUN = "theozolith.run"
 EVENT_REVIEW = "theozolith.review"
@@ -871,33 +912,143 @@ class Store:
             ).fetchall()
         return [r["verb"] for r in rows]
 
-    # -- secrets (encrypted values only; crypto lives in crypto.py) ----------
+    # -- browser sessions (ADR-0023) -------------------------------------------
 
-    def put_secret(self, name: str, token: str) -> None:
+    def create_session(self, ttl_seconds: float) -> str:
+        """A fresh session: returns the random 128-bit id the cookie will
+        carry; only its digest is stored."""
+        raw = _secrets.token_hex(16)
+        now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO secrets (name, token, updated_at) VALUES (?, ?, ?)"
-                " ON CONFLICT (name) DO UPDATE SET token = ?, updated_at = ?",
-                (name, token, self._clock(), token, self._clock()),
+                "INSERT INTO sessions (id_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                (_digest(raw), now, now + ttl_seconds),
             )
+        return raw
 
-    def get_secret_token(self, name: str) -> str | None:
-        with self._lock:
-            row = self._db.execute("SELECT token FROM secrets WHERE name = ?", (name,)).fetchone()
-        return row["token"] if row else None
-
-    def secret_names(self) -> list[str]:
-        with self._lock:
-            rows = self._db.execute("SELECT name FROM secrets ORDER BY name").fetchall()
-        return [r["name"] for r in rows]
-
-    def replace_secret_tokens(self, tokens: dict[str, str]) -> None:
-        """Key rotation: swap every stored token in one transaction."""
+    def session_active(self, raw: str) -> bool:
+        """True for a live, unexpired session id. Expired rows are reaped
+        on sight (absolute expiry, ADR-0023 — no sliding renewal)."""
+        if not raw:
+            return False
         with self._lock, self._db:
-            self._db.executemany(
-                "UPDATE secrets SET token = ? WHERE name = ?",
-                [(token, name) for name, token in tokens.items()],
+            row = self._db.execute(
+                "SELECT expires_at FROM sessions WHERE id_hash = ?", (_digest(raw),)
+            ).fetchone()
+            if row is None:
+                return False
+            if self._clock() >= row["expires_at"]:
+                self._db.execute("DELETE FROM sessions WHERE id_hash = ?", (_digest(raw),))
+                return False
+        return True
+
+    def delete_session(self, raw: str) -> None:
+        """Logout: immediate server-side invalidation."""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM sessions WHERE id_hash = ?", (_digest(raw),))
+
+    def truncate_sessions(self) -> None:
+        """A password change invalidates every session (ADR-0023)."""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM sessions")
+
+    # -- join tokens (ADR-0023) -------------------------------------------------
+
+    def create_join_token(self, *, ttl_seconds: float, uses: int) -> tuple[str, bytes, float]:
+        """Mint one join token: (short id for revocation, 16 raw bytes for
+        the join-string payload, expiry). Default policy — 1h TTL, single
+        use — belongs to the callers; this stores what it is told."""
+        raw = _secrets.token_bytes(16)
+        token_id = _secrets.token_hex(4)
+        now = self._clock()
+        expires_at = now + ttl_seconds
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO join_tokens (id, token_hash, created_at, expires_at, uses_left)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token_id, hashlib.sha256(raw).hexdigest(), now, expires_at, max(1, uses)),
             )
+        return token_id, raw, expires_at
+
+    def redeem_join_token(self, raw: bytes) -> bool:
+        """Consume one use; False for unknown, expired, revoked, or spent
+        tokens (one answer — the node-side error text stays generic by
+        design: expired/consumed/revoked are indistinguishable off-box)."""
+        token_hash = hashlib.sha256(raw).hexdigest()
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT id, expires_at, uses_left FROM join_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return False
+            if self._clock() >= row["expires_at"] or row["uses_left"] <= 0:
+                self._db.execute("DELETE FROM join_tokens WHERE id = ?", (row["id"],))
+                return False
+            if row["uses_left"] == 1:
+                self._db.execute("DELETE FROM join_tokens WHERE id = ?", (row["id"],))
+            else:
+                self._db.execute(
+                    "UPDATE join_tokens SET uses_left = uses_left - 1 WHERE id = ?", (row["id"],)
+                )
+        return True
+
+    def revoke_join_token(self, token_id: str) -> bool:
+        """The oops backstop; True when an outstanding token was revoked."""
+        with self._lock, self._db:
+            cursor = self._db.execute("DELETE FROM join_tokens WHERE id = ?", (token_id,))
+        return cursor.rowcount > 0
+
+    def join_tokens(self) -> list[dict[str, Any]]:
+        """Outstanding (unexpired) tokens for the dashboard/CLI — ids and
+        windows only, never token material."""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM join_tokens WHERE expires_at <= ?", (self._clock(),))
+            rows = self._db.execute(
+                "SELECT id, created_at, expires_at, uses_left FROM join_tokens ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- unregistered-node sightings (ADR-0023) ---------------------------------
+
+    def record_unregistered(self, name: str, source: str) -> None:
+        """One rejected-heartbeat sighting: deduplicated on (self-declared
+        name, source address) and size-capped — unauthenticated input must
+        never grow the cache unboundedly. Past the cap, the oldest sighting
+        is evicted (advisory display; losing one row costs nothing)."""
+        name = (name or "(unnamed)")[:64]
+        source = (source or "?")[:64]
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO unregistered_nodes (name, source, first_seen, last_seen, beats)"
+                " VALUES (?, ?, ?, ?, 1)"
+                " ON CONFLICT (name, source) DO UPDATE SET last_seen = ?, beats = beats + 1",
+                (name, source, now, now, now),
+            )
+            for row in self._db.execute(
+                "SELECT name, source FROM unregistered_nodes ORDER BY last_seen DESC"
+                " LIMIT -1 OFFSET ?",
+                (UNREGISTERED_CAP,),
+            ).fetchall():
+                self._db.execute(
+                    "DELETE FROM unregistered_nodes WHERE name = ? AND source = ?",
+                    (row["name"], row["source"]),
+                )
+
+    def clear_unregistered(self, name: str) -> None:
+        """A successful provisioning settles every sighting of that name —
+        the re-provision worklist shrinks by itself."""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM unregistered_nodes WHERE name = ?", (name,))
+
+    def unregistered_nodes(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name, source, first_seen, last_seen, beats FROM unregistered_nodes"
+                " ORDER BY last_seen DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- janitor records --------------------------------------------------------
 

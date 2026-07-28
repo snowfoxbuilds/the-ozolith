@@ -371,6 +371,41 @@ def _cmd_build(args) -> int:
     return _update_via_api(args, version)
 
 
+def _cmd_join_token(args) -> int:
+    """Node provisioning tokens (ADR-0023): `create` prints the bare join
+    string AND the complete ready-to-paste command — the operator never
+    composes the line; `revoke` is the oops backstop."""
+    from theozolith_control.cli import _admin_env, _call
+
+    url, token, ca = _admin_env(args)
+    if args.join_cmd == "create":
+        body: dict = {"ttl_seconds": args.ttl, "uses": args.uses}
+        if args.addr:
+            body["addr"] = args.addr
+        answer = _call(url, "/api/v1/join-tokens", token=token, method="POST", body=body, ca=ca)
+        _log(f"join token {answer.get('id')} minted ({args.uses} use(s), {args.ttl:.0f}s TTL)")
+        _log("")
+        _log(f"join string:      {answer.get('join_string')}")
+        _log("")
+        _log("node already installed — paste on the box:")
+        _log(f"  {answer.get('provision_command')}")
+        _log("fresh box — installer over GitHub HTTPS, then provision:")
+        _log(f"  {answer.get('install_command')}")
+        return 0
+    if args.join_cmd == "revoke":
+        answer = _call(
+            url, f"/api/v1/join-tokens/{args.id}", token=token, method="DELETE", ca=ca
+        )
+        _log("revoked" if answer.get("revoked") else "no such outstanding token")
+        return 0
+    for entry in _call(url, "/api/v1/join-tokens", token=token, ca=ca).get("tokens", []):
+        _log(
+            f"{entry['id']}  uses_left={entry['uses_left']}"
+            f"  expires_at={entry['expires_at']:.0f}"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="theozolith",
@@ -378,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             "Operate a TheOzolith deployment from the Control Node. Two update"
             " paths, one machinery (ADR-0015): `update` pins a published"
             " release; `build` pins and serves the local source checkout."
+            " `join-token` mints the one paste that provisions a node (ADR-0023)."
         ),
     )
     parser.add_argument("--url", help="Control Node URL (default: CONTROL_NODE_URL)")
@@ -408,6 +444,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     test.add_argument("--source", default=".", help="source checkout (default: current directory)")
     test.set_defaults(handler=_cmd_test)
+
+    join = commands.add_parser(
+        "join-token",
+        help="mint or revoke node-provisioning join tokens (create prints the paste)",
+    )
+    join_sub = join.add_subparsers(dest="join_cmd", required=True)
+    join_create = join_sub.add_parser(
+        "create", help="mint one (default: 1h TTL, single use) and print the paste"
+    )
+    join_create.add_argument(
+        "--ttl", type=float, default=3600.0, help="seconds until expiry (default 3600)"
+    )
+    join_create.add_argument(
+        "--uses", type=int, default=1, help="redemptions allowed (default 1; batches widen it)"
+    )
+    join_create.add_argument(
+        "--addr",
+        help="bootstrap address nodes dial, host[:port] (default: this box's IP + the"
+        " bootstrap port)",
+    )
+    join_create.set_defaults(handler=_cmd_join_token)
+    join_revoke = join_sub.add_parser("revoke", help="revoke an outstanding token by id")
+    join_revoke.add_argument("id")
+    join_revoke.set_defaults(handler=_cmd_join_token)
+    join_sub.add_parser("list", help="outstanding tokens (ids and windows only)").set_defaults(
+        handler=_cmd_join_token
+    )
 
     args = parser.parse_args(argv)
     try:

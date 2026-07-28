@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
+from controlrig import ADMIN_PASSWORD, ADMIN_TOKEN, ControlRig, make_rig, run_event
 from starlette.websockets import WebSocketDisconnect
 from theozolith_control.web.auth import SESSION_COOKIE
 
@@ -62,7 +62,7 @@ CANONICAL_HEADERS = {"Host": CANONICAL_HOST, "Origin": CANONICAL_ORIGIN}
 
 
 def login(control: ControlRig) -> None:
-    response = control.client.post("/login", data={"token": ADMIN_TOKEN}, follow_redirects=False)
+    response = control.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
     assert response.status_code == 303
 
 
@@ -107,11 +107,11 @@ def test_every_web_route_rejects_unauthenticated_access(control: ControlRig):
         "/secrets", data={"name": "x", "value": "y"}, follow_redirects=False
     )
     assert submit.status_code == 303 and submit.headers["location"] == "/login"
-    assert control.store.secret_names() == []  # nothing was stored
+    assert control.secret_store.secret_names() == []  # nothing was stored
 
 
 def test_login_flow_and_wrong_credential(control: ControlRig):
-    assert control.client.post("/login", data={"token": "wrong"}).status_code == 401
+    assert control.client.post("/login", data={"password": "wrong"}).status_code == 401
     login(control)
     assert control.client.get("/", follow_redirects=False).status_code == 200
     # The admin bearer token works too (same single credential).
@@ -271,7 +271,9 @@ def test_errors_panel_lists_and_filters_by_node_and_component(control: ControlRi
     login(control)
     control.node_post("/api/v1/events", _error_event("box1", "node-daemon", "image build failed"))
     control.node_post(
-        "/api/v1/events", _error_event("box2", "implementer-driver", "evidence push failed")
+        "/api/v1/events",
+        _error_event("box2", "implementer-driver", "evidence push failed"),
+        node="box2",
     )
 
     page = control.client.get("/fragments/errors").text
@@ -322,10 +324,10 @@ def test_web_secret_reaches_a_referencing_node_like_the_cli(control: ControlRig)
 
 def test_secret_form_refuses_without_the_tls_channel(tmp_path):
     rig = make_rig(tmp_path, secrets_channel_ok=False)
-    rig.client.post("/login", data={"token": ADMIN_TOKEN})
+    rig.client.post("/login", data={"password": ADMIN_PASSWORD})
     response = rig.client.post("/secrets", data={"name": "n", "value": "v"})
     assert response.status_code == 403
-    assert rig.store.secret_names() == []
+    assert rig.secret_store.secret_names() == []
 
 
 # -- the web terminal (acceptance 6) ---------------------------------------------
@@ -552,7 +554,7 @@ def test_forged_heartbeat_identifiers_never_reach_the_command(control: ControlRi
 
 
 def test_session_cookie_is_host_locked(control: ControlRig):
-    response = control.client.post("/login", data={"token": ADMIN_TOKEN}, follow_redirects=False)
+    response = control.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
     header = response.headers["set-cookie"]
     assert header.startswith(f"{SESSION_COOKIE}=")
     assert SESSION_COOKIE == "__Host-ozolith_session"
@@ -567,7 +569,7 @@ def test_insecure_dev_login_works_over_plain_http(tmp_path):
     non-Secure cookie so a browser actually stores it and the dashboard
     authenticates — a __Host-/Secure cookie would be dropped and loop."""
     rig = make_rig(tmp_path, base_url="http://control.dev:8443", serve_tls=False)
-    response = rig.client.post("/login", data={"token": ADMIN_TOKEN}, follow_redirects=False)
+    response = rig.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
     assert response.status_code == 303
     header = response.headers["set-cookie"].lower()
     assert header.startswith("ozolith_session=") and "secure" not in header
@@ -583,9 +585,9 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     assert guard.expected_host == CANONICAL_HOST  # no :8443
     assert guard.expected_origin == CANONICAL_ORIGIN
     # The login form is browser-only: enforced from the first POST.
-    assert rig.client.post("/login", data={"token": ADMIN_TOKEN}).status_code == 403
+    assert rig.client.post("/login", data={"password": ADMIN_PASSWORD}).status_code == 403
     ok = rig.client.post(
-        "/login", data={"token": ADMIN_TOKEN}, headers=CANONICAL_HEADERS, follow_redirects=False
+        "/login", data={"password": ADMIN_PASSWORD}, headers=CANONICAL_HEADERS, follow_redirects=False
     )
     assert ok.status_code == 303
 
@@ -598,7 +600,7 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     ):
         refused = rig.client.post("/secrets", data={"name": "n", "value": "v"}, headers=headers)
         assert refused.status_code == 403
-    assert rig.store.secret_names() == []
+    assert rig.secret_store.secret_names() == []
 
     stored = rig.client.post(
         "/secrets",
@@ -607,7 +609,7 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
         follow_redirects=False,
     )
     assert stored.status_code == 303
-    assert rig.store.secret_names() == ["n"]
+    assert rig.secret_store.secret_names() == ["n"]
 
 
 def test_nonstandard_public_port_is_enforced_exactly(tmp_path):
@@ -622,11 +624,11 @@ def test_nonstandard_public_port_is_enforced_exactly(tmp_path):
         "Origin": f"https://{CANONICAL_HOST}:9443",
     }
     ok = rig.client.post(
-        "/login", data={"token": ADMIN_TOKEN}, headers=with_port, follow_redirects=False
+        "/login", data={"password": ADMIN_PASSWORD}, headers=with_port, follow_redirects=False
     )
     assert ok.status_code == 303
     for headers in (CANONICAL_HEADERS, {**with_port, "Host": CANONICAL_HOST}):
-        refused = rig.client.post("/login", data={"token": ADMIN_TOKEN}, headers=headers)
+        refused = rig.client.post("/login", data={"password": ADMIN_PASSWORD}, headers=headers)
         assert refused.status_code == 403
 
 
@@ -644,7 +646,7 @@ def test_cookie_websocket_requires_exact_origin(tmp_path):
     rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
     rig.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
     heartbeat_flightdeck_node(rig)
-    cookie = rig.client.app.state.admin_sessions.login(ADMIN_TOKEN)
+    cookie = rig.client.app.state.admin_sessions.login(ADMIN_PASSWORD)
     with_cookie = {"Cookie": f"{SESSION_COOKIE}={cookie}"}
 
     target = f"/terminal/ws?node=box1&container={FLIGHTDECK_CONTAINER}"

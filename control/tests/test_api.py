@@ -7,7 +7,7 @@ the telemetry ingestion caps.
 
 from __future__ import annotations
 
-from controlrig import ADMIN_TOKEN, NODE_TOKEN, ControlRig, make_rig, run_event
+from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
 
 STACK_TOML = """\
 kind = "process"
@@ -35,8 +35,20 @@ def test_node_endpoints_reject_bad_tokens(control: ControlRig):
     assert control.heartbeat().status_code == 200
     assert control.node_post("/api/v1/heartbeats", {"node": "x"}, token="wrong").status_code == 401
     assert control.client.post("/api/v1/heartbeats", json={"node": "x"}).status_code == 401
-    # The node token is not the admin token.
-    assert control.admin("GET", "/api/v1/state", token="node-token").status_code == 401
+    # A per-node token is not the admin token.
+    assert control.admin("GET", "/api/v1/state", token=control.node_token()).status_code == 401
+
+
+def test_per_node_tokens_bind_identity(control: ControlRig):
+    """ADR-0023: no node can speak as another — a declared node name that is
+    not the token's node is refused on every node-channel shape."""
+    control.provision_node("box2")
+    imposter = control.heartbeat(node="box2", token=control.node_token("box1"))
+    assert imposter.status_code == 403
+    event = control.node_post(
+        "/api/v1/events", run_event(5, "claimed", node="box2"), token=control.node_token("box1")
+    )
+    assert event.status_code == 403
 
 
 # -- heartbeats: status in, commands + desired state out -----------------------------
@@ -66,14 +78,17 @@ def test_heartbeat_records_status_and_registers_the_node(control: ControlRig):
     assert state["images"][0]["instruction_hash"] == "h"
 
 
-def test_register_endpoint_is_idempotent(control: ControlRig):
-    for _ in range(2):
-        assert (
-            control.node_post(
-                "/api/v1/nodes/register", {"node": "box1", "version": "0.3.0"}
-            ).status_code
-            == 200
-        )
+def test_provisioning_is_registration_no_register_endpoint(control: ControlRig):
+    """ADR-0023 supersedes register-on-first-heartbeat: the endpoint is gone,
+    and an unknown token never creates a node record — it surfaces as an
+    unregistered sighting instead."""
+    gone = control.node_post("/api/v1/nodes/register", {"node": "box9", "version": "0.3.0"})
+    assert gone.status_code == 404
+    rejected = control.heartbeat(node="ghost", token="not-a-token")
+    assert rejected.status_code == 401
+    state = control.admin("GET", "/api/v1/state").json()
+    assert "ghost" not in [n["name"] for n in state["nodes"]]
+    assert [u["name"] for u in state["unregistered_nodes"]] == ["ghost"]
 
 
 def test_heartbeat_distributes_only_this_nodes_desired_state(control: ControlRig):
@@ -406,7 +421,7 @@ def test_error_events_are_queryable_by_node_and_component(control: ControlRig):
             "error_class": "EngineError",
             "message": f"boom on {node}",
         }
-        assert control.node_post("/api/v1/events", event).status_code == 200
+        assert control.node_post("/api/v1/events", event, node=node).status_code == 200
     rows = control.store.error_events(node="box1")
     assert [r["component"] for r in rows] == ["node-daemon"]
     rows = control.store.error_events(component="implementer-driver")
@@ -488,7 +503,7 @@ def test_artifact_upload_serve_roundtrip_and_heartbeat_references(control: Contr
     # Nodes pull with the node token; the payload is byte-exact.
     pulled = control.client.get(
         f"/api/v1/product/artifacts/{version}/{wheel}",
-        headers={"Authorization": f"Bearer {NODE_TOKEN}"},
+        headers={"Authorization": f"Bearer {control.node_token()}"},
     )
     assert pulled.status_code == 200 and pulled.content == b"wheel-bytes"
 
@@ -528,7 +543,7 @@ def test_artifact_endpoints_refuse_unsafe_segments_and_unknown_files(control: Co
     assert not control.settings.artifacts_dir.exists()  # nothing landed anywhere
     missing = control.client.get(
         "/api/v1/product/artifacts/0.9.9/ghost.whl",
-        headers={"Authorization": f"Bearer {NODE_TOKEN}"},
+        headers={"Authorization": f"Bearer {control.node_token()}"},
     )
     assert missing.status_code == 404
 
@@ -538,6 +553,16 @@ def test_artifact_endpoints_refuse_unsafe_segments_and_unknown_files(control: Co
 
 def test_boots_and_serves_with_no_config_repo_at_all(control: ControlRig):
     """No private Config Repo: every node's desired state is empty, nothing
-    errors — the product boots from package + .env (ADR-0004)."""
+    errors — the product boots from docker + package + init output with
+    every tier-2 tunable at its shipped default (ADR-0004 as restated by
+    ADR-0023; `.env` is no longer a surface). The shipped cadence defaults
+    ride desired state."""
     answer = control.heartbeat().json()
-    assert answer["config"] == {"commit": "", "product_version": "", "stacks": [], "images": []}
+    assert answer["config"] == {
+        "commit": "",
+        "product_version": "",
+        "stacks": [],
+        "images": [],
+        "heartbeat_seconds": 60.0,
+        "stop_grace_seconds": 30.0,
+    }

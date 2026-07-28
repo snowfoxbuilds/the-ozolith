@@ -29,8 +29,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from theozolith_control import bootstrap, controltoml, joinstring, tls
 from theozolith_control.crypto import SecretBox
 from theozolith_control.origin import parse_public_origin
+from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_control.web import views
@@ -63,6 +65,7 @@ def mount_web(
     app: FastAPI,
     settings: ControlSettings,
     store: Store,
+    secret_store: SecretStore,
     box: SecretBox,
     config_loader,
 ) -> None:
@@ -70,7 +73,22 @@ def mount_web(
     # string (transcript tails, event payloads) renders escaped.
     templates = Jinja2Templates(directory=str(_HERE / "templates"))
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
-    sessions = AdminSessions(settings.admin_token, secure_cookies=settings.serve_tls)
+
+    def _password_record() -> str:
+        # Read per login attempt: `theozolith-control set-password` takes
+        # effect without a restart (it truncates the session table itself).
+        try:
+            return settings.admin_password_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    sessions = AdminSessions(
+        store,
+        password_reader=_password_record,
+        admin_token=settings.admin_token,
+        session_days=settings.session_days,
+        secure_cookies=settings.serve_tls,
+    )
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
     # The exact Host/Origin contract derives from the parsed public origin
     # alone (never the bind host/port); a configured-but-invalid origin
@@ -120,10 +138,30 @@ def mount_web(
     async def login(request: Request):
         if not _origin_ok(request):
             return _wrong_origin()
+        # Rate limit BEFORE the scrypt check: a throttled attempt must cost
+        # the caller nothing but time (ADR-0023 login hardening).
+        retry_after = sessions.throttled_for()
+        if retry_after > 0:
+            response = _page(
+                request,
+                "login.html",
+                {"error": f"too many failed attempts — retry in {retry_after:.0f}s"},
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(int(retry_after) + 1)
+            return response
+        if not sessions.configured:
+            response = _page(
+                request,
+                "login.html",
+                {"error": "no admin password is set — run 'theozolith-control init'"},
+            )
+            response.status_code = 503
+            return response
         form = await request.form()
-        cookie = sessions.login(str(form.get("token", "")))
+        cookie = sessions.login(str(form.get("password", "")))
         if cookie is None:
-            response = _page(request, "login.html", {"error": "wrong admin credential"})
+            response = _page(request, "login.html", {"error": "wrong password"})
             response.status_code = 401
             return response
         response = RedirectResponse("/", status_code=303)
@@ -146,6 +184,9 @@ def mount_web(
     async def logout(request: Request):
         if not _origin_ok(request):
             return _wrong_origin()
+        # Server-side first: the row dies, so the cookie value is inert
+        # everywhere immediately (stateful sessions, ADR-0023).
+        sessions.logout(sessions.cookie_value(request))
         response = _login_redirect()
         # Clear whichever session cookie this scheme uses.
         response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True)
@@ -202,7 +243,7 @@ def mount_web(
             request,
             "secrets.html",
             {
-                "names": store.secret_names(),
+                "names": secret_store.secret_names(),
                 "stored": request.query_params.get("stored", ""),
                 "channel_ok": settings.secrets_channel_ok,
             },
@@ -223,8 +264,125 @@ def mount_web(
             return HTMLResponse("both a name and a value are required", status_code=400)
         # The same write as PUT /api/v1/secrets/{name}: encrypted before it
         # touches the store; nothing ever reads it back out to a browser.
-        store.put_secret(name, box.encrypt(value))
+        secret_store.put_secret(name, box.encrypt(value))
         return RedirectResponse(f"/secrets?stored={name}", status_code=303)
+
+    # -- settings (tier-2 tunables; ADR-0023) --------------------------------
+
+    def _settings_context(saved: str = "", error: str = "") -> dict:
+        current = controltoml.read_values(settings.config_repo)
+        return {
+            "origin": controltoml.read_public_origin(settings.config_repo)
+            or settings.public_origin,
+            "rows": [
+                {
+                    "key": s.key,
+                    "label": s.label,
+                    "value": current[s.key],
+                    "default": s.default,
+                    "is_default": current[s.key] == s.default,
+                }
+                for s in controltoml.SETTINGS
+            ],
+            "saved": saved,
+            "error": error,
+        }
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_form(request: Request):
+        if not sessions.authorized(request):
+            return _login_redirect()
+        return _page(request, "settings.html", _settings_context())
+
+    @app.post("/settings")
+    async def settings_submit(request: Request):
+        """The fixed-schema write path (ADR-0023): one known tier-2 key at a
+        time, committed to control.toml in the Config Repo — the
+        product.toml pin-bump precedent, never a free-form editor. The
+        public origin is not a settings key: writes to it are refused."""
+        if not sessions.authorized(request):
+            return _login_redirect()
+        if not _origin_ok(request):
+            return _wrong_origin()
+        form = await request.form()
+        key = str(form.get("key", "")).strip()
+        value = str(form.get("value", "")).strip()
+        if key == "public_origin":
+            return HTMLResponse(
+                "the public origin is read-only — re-pointing a deployment is"
+                " 'theozolith-control origin-init --force', not a settings edit",
+                status_code=403,
+            )
+        try:
+            controltoml.set_value(settings.config_repo, key, value)
+        except controltoml.ControlTomlError as exc:
+            page = _page(request, "settings.html", _settings_context(error=str(exc)))
+            page.status_code = 400
+            return page
+        return RedirectResponse(f"/settings?saved={key}", status_code=303)
+
+    # -- join tokens (node provisioning; ADR-0023) ----------------------------
+
+    def _join_context(minted: dict | None = None, notice: str = "") -> dict:
+        return {
+            "tokens": [
+                {**t, "expires_in": views.elapsed(t["expires_at"] - time.time())}
+                for t in store.join_tokens()
+            ],
+            "minted": minted,
+            "notice": notice,
+        }
+
+    @app.get("/join", response_class=HTMLResponse)
+    def join_page(request: Request):
+        if not sessions.authorized(request):
+            return _login_redirect()
+        return _page(request, "join.html", _join_context())
+
+    @app.post("/join")
+    async def join_create(request: Request):
+        """Mint a join token and show the ready-to-paste line — the same
+        machinery as `theozolith join-token create` (the API twin)."""
+        if not sessions.authorized(request):
+            return _login_redirect()
+        if not _origin_ok(request):
+            return _wrong_origin()
+        form = await request.form()
+        try:
+            ttl = float(str(form.get("ttl_seconds") or "3600"))
+            uses = int(str(form.get("uses") or "1"))
+            if ttl <= 0 or uses < 1:
+                raise ValueError("ttl and uses must be positive")
+            fingerprint = tls.ca_fingerprint_sha256(
+                (settings.tls_dir / tls.CA_FILE).read_bytes()
+            )
+        except (ValueError, OSError) as exc:
+            page = _page(request, "join.html", _join_context(notice=f"cannot mint: {exc}"))
+            page.status_code = 400
+            return page
+        addr = f"{bootstrap.detect_host_ip()}:{settings.bootstrap_port}"
+        token_id, raw, expires_at = store.create_join_token(ttl_seconds=ttl, uses=uses)
+        join = joinstring.compose(
+            addr=addr, ca_sha256=fingerprint, token=raw, expires_at=expires_at
+        )
+        minted = {
+            "id": token_id,
+            "join_string": join,
+            "provision_command": f"sudo theozolith-nodedaemon provision '{join}'",
+            "install_command": f"curl -fsSL {settings.installer_url} | sudo bash -s -- '{join}'",
+        }
+        return _page(request, "join.html", _join_context(minted=minted))
+
+    @app.post("/join/revoke")
+    async def join_revoke(request: Request):
+        if not sessions.authorized(request):
+            return _login_redirect()
+        if not _origin_ok(request):
+            return _wrong_origin()
+        form = await request.form()
+        revoked = store.revoke_join_token(str(form.get("id", "")))
+        notice = "join token revoked" if revoked else "no such outstanding token"
+        return _page(request, "join.html", _join_context(notice=notice))
 
     # -- the web terminal ---------------------------------------------------
 

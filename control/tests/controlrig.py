@@ -1,6 +1,10 @@
 """Control Node test rig: the real app over TestClient, a fake clock, an
 in-memory GitHub for the janitor/auditor, and Config Repo scaffolding.
 
+Node-channel calls authenticate with a PER-NODE token (ADR-0023): the rig
+provisions ``box1`` at construction and node_post/heartbeat present its
+token by default; ``provision_node`` mints more.
+
 (Named controlrig, not conftest: a module literally named `conftest` is
 order-dependent across the multi-directory pytest run — worker/tests owns
 that name.)
@@ -16,12 +20,14 @@ import pytest
 from fastapi.testclient import TestClient
 from theozolith_control.app import create_app
 from theozolith_control.crypto import SecretBox, generate_key
+from theozolith_control.passwords import hash_password
+from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_worker.githubapi import Issue, PullRequest
 
-NODE_TOKEN = "node-token"
 ADMIN_TOKEN = "admin-token"
+ADMIN_PASSWORD = "rig-password"
 
 
 class FakeClock:
@@ -39,15 +45,10 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
     values: dict[str, Any] = dict(
         data_dir=tmp_path / "data",
         config_repo=tmp_path / "configs",
-        node_token=NODE_TOKEN,
         admin_token=ADMIN_TOKEN,
         repo="acme/sandbox",
         github_token="gh-token",
         api_url="https://api.github.invalid",
-        zombie_grace_seconds=600,
-        janitor_sweep_seconds=60,
-        activation_window_seconds=60,
-        tail_budget_bytes=10 * 1024**3,
         secrets_channel_ok=True,
         serve_tls=True,  # production-like default; the dev-cookie test overrides
     )
@@ -59,12 +60,28 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
 class ControlRig:
     settings: ControlSettings
     store: Store
+    secret_store: SecretStore
     box: SecretBox
     client: TestClient
     clock: FakeClock
     github: FakeGitHubLite
+    node_tokens: dict[str, str]
 
-    def node_post(self, path: str, body: dict, token: str = NODE_TOKEN):
+    def provision_node(self, node: str) -> str:
+        """Mint (or rotate) a per-node token the way the join exchange does."""
+        token = self.secret_store.mint_node_token(node)
+        self.node_tokens[node] = token
+        self.store.touch_node(node)
+        return token
+
+    def node_token(self, node: str = "box1") -> str:
+        return self.node_tokens[node]
+
+    def node_post(self, path: str, body: dict, token: str | None = None, node: str = "box1"):
+        if token is None:
+            # Lazy provisioning: any node a test speaks as gets its own
+            # token, exactly as the join exchange would mint it.
+            token = self.node_tokens.get(node) or self.provision_node(node)
         return self.client.post(path, json=body, headers={"Authorization": f"Bearer {token}"})
 
     def admin(self, method: str, path: str, body: dict | None = None, token: str = ADMIN_TOKEN):
@@ -72,7 +89,7 @@ class ControlRig:
             method, path, json=body, headers={"Authorization": f"Bearer {token}"}
         )
 
-    def heartbeat(self, node: str = "box1", **overrides):
+    def heartbeat(self, node: str = "box1", token: str | None = None, **overrides):
         payload: dict[str, Any] = {
             "node": node,
             "version": "0.3.0",
@@ -83,7 +100,7 @@ class ControlRig:
             "completed_commands": [],
         }
         payload.update(overrides)
-        return self.node_post("/api/v1/heartbeats", payload)
+        return self.node_post("/api/v1/heartbeats", payload, token=token, node=node)
 
     def write_config(self, relpath: str, text: str) -> None:
         target = self.settings.config_repo / relpath
@@ -94,6 +111,7 @@ class ControlRig:
         return self.node_post(
             "/api/v1/dispatch",
             {"role": role, "worker": worker, "node": node, "login": f"ozolith-{worker}"},
+            node=node,
         )
 
 
@@ -103,12 +121,17 @@ def make_rig(
     settings = make_settings(tmp_path, **settings_overrides)
     clock = FakeClock()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    store = Store(settings.db_path, clock=clock)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    # The browser credential (ADR-0023): tests log in with ADMIN_PASSWORD.
+    settings.admin_password_path.write_text(hash_password(ADMIN_PASSWORD) + "\n")
+    store = Store(settings.cache_db_path, clock=clock)
+    secret_store = SecretStore(settings.store_db_path, clock=clock)
     box = SecretBox(generate_key())
     github = FakeGitHubLite()
     app = create_app(
         settings,
         store,
+        secret_store,
         box,
         github_client=github if settings.coordination_jobs_enabled else None,
     )
@@ -117,7 +140,9 @@ def make_rig(
     # over TLS. Pass base_url="http://..." to exercise the --insecure-dev
     # cookie path.
     client = TestClient(app, base_url=base_url)
-    return ControlRig(settings, store, box, client, clock, github)
+    rig = ControlRig(settings, store, secret_store, box, client, clock, github, {})
+    rig.provision_node("box1")
+    return rig
 
 
 @pytest.fixture

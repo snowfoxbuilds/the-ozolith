@@ -80,7 +80,7 @@
   {% endif %}
 </article>
 {% else %}
-<p class="muted">No nodes have registered yet.</p>
+<p class="muted">No nodes provisioned yet — mint a join token and paste it on a box.</p>
 {% endfor %}
 {% if fleet.drivers %}
 <h3>Registered drivers</h3>
@@ -101,6 +101,18 @@
       <span class="muted">{{ c.deferred_reason }} (queue-behind; --force overrides)</span>
     {% else %}<span class="badge b-info">● pending</span>{% endif %}
   </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if fleet.unregistered %}
+<h3>Unregistered nodes</h3>
+<p class="muted">Heartbeats rejected 401 (unknown or revoked token) — advisory only, never
+dispatch-eligible. Each needs one join-string paste to (re-)provision.</p>
+<ul class="flags">
+  {% for u in fleet.unregistered %}
+  <li><code>{{ u.name }}</code> <span class="muted">from {{ u.source }} · last seen
+      {{ u.last_seen }} · {{ u.beats }} rejected heartbeat(s)</span>
+      <span class="badge b-serious">● unregistered</span></li>
   {% endfor %}
 </ul>
 {% endif %}

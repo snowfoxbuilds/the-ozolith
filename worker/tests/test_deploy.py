@@ -7,13 +7,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
-ENV_EXAMPLE = DEPLOY / ".env.example"
 DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.claude"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-
-
-def documented_env_names() -> set[str]:
-    return set(re.findall(r"^#?([A-Z_]+)=", ENV_EXAMPLE.read_text(), re.MULTILINE))
 
 
 def test_compose_no_longer_runs_the_actors():
@@ -21,27 +16,17 @@ def test_compose_no_longer_runs_the_actors():
     assert not (DEPLOY / "docker-compose.yml").exists()
 
 
-def test_env_example_covers_the_driver_config_surface():
-    documented = documented_env_names()
-    required = {
-        "THEOZOLITH_REPO",
-        "WORKER_GITHUB_TOKEN",
-        "REVIEWER_GITHUB_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "THEOZOLITH_RUN_IMAGE",
-        "WORKER_MODEL",
-        "REVIEWER_MODEL",
-        "THEOZOLITH_JOBS_DIR",
-        "THEOZOLITH_CACHE_VOLUMES",
-        "CONTROL_NODE_URL",
-        "POLL_SECONDS",
-    }
-    missing = required - documented
-    assert not missing, f".env.example is missing: {sorted(missing)}"
-    # Distinct identities are the no-self-grading precondition (ADR-0008).
-    text = ENV_EXAMPLE.read_text()
-    assert "DIFFERENT GitHub identities" in text
-    assert "VAR_FILE" in text  # the secrets convention is documented
+def test_dot_env_is_no_longer_a_user_facing_surface():
+    """ADR-0023 deletion test: `.env`-driven setup is gone — no example
+    file ships, the installer writes none, and the compose stub needs none.
+    (Env vars survive only as validated expert overrides.)"""
+    assert not (DEPLOY / ".env.example").exists()
+    assert "/etc/theozolith/.env" not in (DEPLOY / "install-nodedaemon.sh").read_text()
+    assert "env_file" not in (DEPLOY / "compose" / "control.yml").read_text()
+    # The dev-shape documentation kept its non-negotiables.
+    readme = (DEPLOY / "README.md").read_text()
+    assert "different GitHub identities" in readme  # no self-grading (ADR-0008)
+    assert "VAR_FILE" in readme  # the secrets convention is documented
 
 
 def test_systemd_units_exist_for_both_drivers():
@@ -78,57 +63,42 @@ def test_ci_builds_the_run_container_image():
 # -- M3 substrate artifacts -------------------------------------------------------
 
 
-def test_env_example_covers_the_substrate_config_surface():
-    documented = documented_env_names()
-    required = {
-        "CONTROL_NODE_URL",
-        "THEOZOLITH_NODE_TOKEN",
-        "THEOZOLITH_ADMIN_TOKEN",
-        "THEOZOLITH_TLS_CA",
-        "THEOZOLITH_NODE_NAME",
-        "CONTROL_GITHUB_TOKEN",
-        "THEOZOLITH_CONTROL_DATA",
-        "THEOZOLITH_CONFIG_REPO",
-        "THEOZOLITH_HEARTBEAT_SECONDS",
-        "THEOZOLITH_ZOMBIE_GRACE_SECONDS",
-        "THEOZOLITH_JANITOR_SWEEP_SECONDS",
-        "THEOZOLITH_ACTIVATION_WINDOW_SECONDS",
-        "THEOZOLITH_TAIL_BUDGET_BYTES",
-        "THEOZOLITH_PROGRESS_SECONDS",
-        "THEOZOLITH_STOP_GRACE_SECONDS",
-        "THEOZOLITH_STATE_DIR",
-        "THEOZOLITH_RUNTIME_DIR",
-    }
-    missing = required - documented
-    assert not missing, f".env.example is missing: {sorted(missing)}"
-
-
 def test_nodedaemon_unit_enforces_kill_the_tree():
-    unit = (DEPLOY / "systemd" / "theozolith-nodedaemon.service").read_text()
-    assert "KillMode=control-group" in unit  # ADR-0013: no zombie processes
-    assert "RuntimeDirectory=theozolith" in unit  # secrets tmpfs under /run
-    assert "StateDirectory=theozolith" in unit
-    assert "EnvironmentFile=" in unit
-    assert "Restart=always" in unit
-    assert "User=ozolith" in unit  # never root
-
-
-def test_installer_provisions_tls_and_the_unit():
+    """The unit is embedded in the installer (curl|bash needs no sidecar
+    files); its cgroup and directory contract is unchanged — but there is
+    no EnvironmentFile: configuration is the provisioned state dir."""
     installer = (DEPLOY / "install-nodedaemon.sh").read_text()
-    assert "--ca" in installer and "ca.pem" in installer  # TLS provisioning
-    assert "systemctl enable --now theozolith-nodedaemon" in installer
-    assert "THEOZOLITH_NODE_TOKEN" in installer
+    assert "KillMode=control-group" in installer  # ADR-0013: no zombie processes
+    assert "RuntimeDirectory=theozolith" in installer  # secrets tmpfs under /run
+    assert "StateDirectory=theozolith" in installer
+    assert "EnvironmentFile" not in installer
+    assert "Restart=always" in installer
+    assert "User=ozolith" in installer  # never root
+    assert not (DEPLOY / "systemd" / "theozolith-nodedaemon.service").exists()
+
+
+def test_installer_hands_off_to_provision_as_its_final_step():
+    """ADR-0023 installer consolidation: the manual-configuration half is
+    gone — the installer installs the distribution and unit, then runs
+    `theozolith-nodedaemon provision <join-string>`; a run without a join
+    string is refused (no fingerprint-less manual path)."""
+    installer = (DEPLOY / "install-nodedaemon.sh").read_text()
+    assert "theozolith-nodedaemon provision" in installer
+    assert 'ozjoin' in installer  # the join string is the one input
     assert "usermod -aG docker ozolith" in installer
-    # Tokens never travel through argv.
-    assert "read -r -s" in installer
+    assert "read -r -s" not in installer  # no token prompting remains
+    assert "theozolith join-token create" in installer  # the refusal says where to go
+    # Steps after the last comment: pip install precedes provision.
+    assert installer.index("pip install") < installer.index("provision \"$JOIN\"")
 
 
-def test_control_compose_mounts_data_and_the_config_repo():
+def test_control_compose_mounts_the_partitioned_home():
     compose = (DEPLOY / "compose" / "control.yml").read_text()
-    assert "control-data:/data" in compose
-    assert ":/configs:ro" in compose
-    assert "tls-init" in compose  # the mandatory-TLS bootstrap is documented
+    assert "~/.theozolith}:/data" in compose  # ADR-0024: the one home
+    assert "THEOZOLITH_DATA_DIR: /data" in compose
+    assert "run --rm control init" in compose  # the unified first run (ADR-0023)
     assert "8443" in compose
+    assert "6965:6965" in compose  # the bootstrap listener rides its own port
 
 
 def test_ci_builds_the_control_image():
@@ -142,7 +112,7 @@ def test_no_tailscale_anywhere_in_product_code_or_deploy():
     for component in ("worker", "control", "nodedaemon", "knowledge"):
         for path in (REPO_ROOT / component / "src").rglob("*.py"):
             assert "tailscale" not in path.read_text().lower(), path
-    for name in ("install-nodedaemon.sh", "compose/control.yml", ".env.example"):
+    for name in ("install-nodedaemon.sh", "compose/control.yml", "README.md"):
         assert "tailscale" not in (DEPLOY / name).read_text().lower(), name
 
 

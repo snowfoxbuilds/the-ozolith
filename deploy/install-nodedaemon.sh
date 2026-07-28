@@ -1,53 +1,50 @@
 #!/usr/bin/env bash
 # TheOzolith Node Daemon installer: turn a fresh Linux box into a
-# Container-Host (NODE-SUBSTRATE.md). Bootstrap = install the daemon;
-# everything else flows from config.
+# Container-Host with ONE paste (ADR-0023). `theozolith join-token create`
+# on the Control Node prints the exact line:
 #
-#   sudo ./install-nodedaemon.sh \
-#     --control-url https://<slug>.theozolith.internal \
-#     --ca /path/to/ca.pem \
-#     [--node <name>] [--source /path/to/theozolith-checkout]
+#   curl -fsSL <github-release-url>/install-nodedaemon.sh | sudo bash -s -- 'ozjoin1:...'
 #
-# The --control-url host must be the hostname of the Control Node's public
-# origin (ADR-0019: minted by `origin-init` and carried in its TLS cert),
-# reachable via trusted-network DNS — cert verification pins that name.
-# Include a port only when the Control Node is reachable on a nonstandard
-# external port (the reference compose publishes 443).
+# or, from a checkout / scp copy:
 #
-# The node token is read from THEOZOLITH_NODE_TOKEN in the environment or
-# prompted for (never passed as an argument: argv is world-readable).
-# TLS provisioning: --ca installs the Control Node's self-signed CA bundle
-# (minted by `theozolith-control tls-init`) at /etc/theozolith/ca.pem and
-# pins it via THEOZOLITH_TLS_CA.
+#   sudo ./install-nodedaemon.sh 'ozjoin1:...' [--node <name>] [--source <checkout>]
+#
+# The installer and the distribution ride only pre-trusted channels (GitHub
+# release HTTPS, or scp) — never the plaintext bootstrap listener: code over
+# an unverified channel would be remote code execution for a LAN MITM. The
+# join string itself is verified machine-side by `provision` (CA fingerprint
+# before any transmission; the token is disposable). No .env, no manual
+# configuration: `provision` persists everything under /var/lib/theozolith.
 #
 # Host baseline (ADR-0015): systemd Linux, docker (with the compose plugin),
 # python3 >= 3.11.
 
 set -euo pipefail
 
-CONTROL_URL=""
-CA_FILE=""
+JOIN=""
 NODE_NAME="$(hostname)"
 SOURCE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --control-url) CONTROL_URL="$2"; shift 2 ;;
-        --ca) CA_FILE="$2"; shift 2 ;;
         --node) NODE_NAME="$2"; shift 2 ;;
         --source) SOURCE="$2"; shift 2 ;;
+        ozjoin*) JOIN="$1"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+if [ -z "$JOIN" ]; then
+    echo "usage: install-nodedaemon.sh 'ozjoin1:...' [--node <name>] [--source <checkout>]" >&2
+    echo "mint the join string with 'theozolith join-token create' on the Control Node" >&2
+    echo "(provisioning requires a join string — there is no manual path; ADR-0023)" >&2
+    exit 2
+fi
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 (>= 3.11) is required" >&2; exit 2; }
 command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 2; }
-
-if [ -n "$CONTROL_URL" ] && [ -z "${THEOZOLITH_NODE_TOKEN:-}" ]; then
-    read -r -s -p "node token (THEOZOLITH_NODE_TOKEN): " THEOZOLITH_NODE_TOKEN; echo
-fi
 
 # The service user: unprivileged + docker group (run containers, builds).
 id ozolith >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin ozolith
@@ -64,29 +61,49 @@ else
         theozolith-knowledge theozolith-worker theozolith-nodedaemon
 fi
 
-install -d -m 0750 -o root -g ozolith /etc/theozolith
-if [ -n "$CA_FILE" ]; then
-    install -m 0640 -o root -g ozolith "$CA_FILE" /etc/theozolith/ca.pem
-fi
+# The daemon state dir, owned by the service user before provision writes
+# into it (provision chowns its files to the dir owner).
+install -d -m 0750 -o ozolith -g ozolith /var/lib/theozolith
 
-if [ ! -f /etc/theozolith/.env ]; then
-    umask 027
-    {
-        echo "# TheOzolith Node Daemon — see deploy/.env.example for every knob."
-        echo "THEOZOLITH_NODE_NAME=${NODE_NAME}"
-        [ -n "$CONTROL_URL" ] && echo "CONTROL_NODE_URL=${CONTROL_URL}"
-        [ -n "${THEOZOLITH_NODE_TOKEN:-}" ] && echo "THEOZOLITH_NODE_TOKEN=${THEOZOLITH_NODE_TOKEN}"
-        [ -n "$CA_FILE" ] && echo "THEOZOLITH_TLS_CA=/etc/theozolith/ca.pem"
-    } > /etc/theozolith/.env
-    chgrp ozolith /etc/theozolith/.env
-else
-    echo "keeping existing /etc/theozolith/.env"
-fi
+# The unit, embedded so `curl | bash` needs no sidecar files. Every
+# TheOzolith process on this node (the daemon, the driver processes it
+# supervises) lives in this unit's cgroup: KillMode=control-group means
+# they are live descendants or do not exist. Configuration comes from the
+# provisioned state dir — no environment file exists.
+cat > /etc/systemd/system/theozolith-nodedaemon.service <<'UNIT'
+[Unit]
+Description=TheOzolith Node Daemon (Container-Host: Stacks, drivers, builds, heartbeats)
+After=network-online.target docker.service
+Wants=network-online.target
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-install -m 0644 "$SCRIPT_DIR/systemd/theozolith-nodedaemon.service" /etc/systemd/system/
+[Service]
+Type=simple
+# Not root: the daemon only needs docker access and its own state dirs.
+User=ozolith
+Group=ozolith
+SupplementaryGroups=docker
+ExecStart=/opt/theozolith/bin/theozolith-nodedaemon
+KillMode=control-group
+Restart=always
+RestartSec=10
+# /var/lib/theozolith: provisioned identity (control-url, node-token,
+# ca.pem, node-name), config cache, materialized compose files (disk).
+StateDirectory=theozolith
+Environment=THEOZOLITH_STATE_DIR=/var/lib/theozolith
+# /run/theozolith: secrets tmpfs — values never touch node disk and vanish
+# with the daemon (NODE-SUBSTRATE.md).
+RuntimeDirectory=theozolith
+RuntimeDirectoryMode=0700
+Environment=THEOZOLITH_RUNTIME_DIR=/run/theozolith
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 systemctl daemon-reload
-systemctl enable --now theozolith-nodedaemon
 
-echo "node daemon installed and running; it registers as '${NODE_NAME}'"
-echo "watch:  journalctl -fu theozolith-nodedaemon"
+# The final step IS provisioning (ADR-0023): verify the pinned CA
+# fingerprint, exchange the join token for this node's own token, persist,
+# enable the unit, first heartbeat. Fails closed and loud.
+/opt/theozolith/bin/theozolith-nodedaemon provision "$JOIN" --node "$NODE_NAME"
+
+echo "node daemon installed; watch:  journalctl -fu theozolith-nodedaemon"

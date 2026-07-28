@@ -1,8 +1,10 @@
 """The public origin: one randomized browser origin per deployment (ADR-0019).
 
-``origin-init`` generates ``https://<slug>.<base-domain>`` where the slug
-encodes 128 bits from the OS CSPRNG as 26 lowercase base32 characters, and
-persists the complete origin at ``<data-dir>/public-origin``. The name is
+``origin-init`` (and unified ``init``, ADR-0023) generates
+``https://<slug>.<base-domain>`` where the slug encodes 128 bits from the
+OS CSPRNG as 26 lowercase base32 characters, persisted as the read-only
+``[control] public_origin`` field of control.toml in the Config Repo
+(ADR-0024 — storage only; semantics unchanged). The name is
 defense in depth for the browser surface — an attacker who cannot name the
 host cannot aim a browser at it — and never a substitute for the admin
 credential, the private network, or exact-origin enforcement (all still
@@ -38,10 +40,8 @@ import base64
 import re
 import secrets
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlsplit
 
-PUBLIC_ORIGIN_FILE = "public-origin"
 DEFAULT_BASE_DOMAIN = "theozolith.internal"
 
 SLUG_BYTES = 16  # 128 bits
@@ -144,22 +144,3 @@ def parse_public_origin(text: str) -> PublicOrigin:
     port = port or 443
     origin = f"https://{hostname}" if port == 443 else f"https://{hostname}:{port}"
     return PublicOrigin(origin=origin, hostname=hostname, port=port)
-
-
-def origin_path(data_dir: Path) -> Path:
-    return data_dir / PUBLIC_ORIGIN_FILE
-
-
-def read_public_origin(data_dir: Path) -> str:
-    try:
-        return origin_path(data_dir).read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-
-
-def write_public_origin(data_dir: Path, text: str) -> Path:
-    canonical = parse_public_origin(text).origin
-    path = origin_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(canonical + "\n", encoding="utf-8")
-    return path

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Settings · TheOzolith{% endblock %}
+{% block content %}
+<h2>Settings</h2>
+<p class="muted">Tier-2 tunables live in <code>control.toml</code> in the Config Repo; every save
+is a fixed-schema commit touching only that file. Every setting has a shipped default —
+the file is optional. <code>THEOZOLITH_*</code> environment variables override these
+(expert escape hatch).</p>
+{% if saved %}<p class="flash flash-good">✓ <code>{{ saved }}</code> committed to control.toml</p>{% endif %}
+{% if error %}<p class="flash flash-error">✕ {{ error }}</p>{% endif %}
+<table class="settings">
+  <tr><th>Setting</th><th>Value</th><th></th></tr>
+  <tr>
+    <td><code>public_origin</code><div class="muted">The one origin browsers dial — written by init,
+      read-only here (re-pointing is <code>origin-init --force</code>).</div></td>
+    <td><input value="{{ origin }}" readonly disabled></td>
+    <td><span class="muted">read-only</span></td>
+  </tr>
+  {% for row in rows %}
+  <tr>
+    <td><code>{{ row.key }}</code><div class="muted">{{ row.label }}</div></td>
+    <td>
+      <form method="post" action="/settings" class="inline">
+        <input type="hidden" name="key" value="{{ row.key }}">
+        <input name="value" value="{{ row.value }}">
+        <button type="submit">Save</button>
+      </form>
+    </td>
+    <td>{% if row.is_default %}<span class="muted">default</span>
+        {% else %}<span class="muted">default: {{ row.default }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

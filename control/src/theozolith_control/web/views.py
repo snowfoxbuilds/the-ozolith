@@ -129,6 +129,14 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
         "version_skew": sorted(n["name"] for n in nodes if n["version_skew"]),
         "pending_commands": pending,
         "drivers": drivers,
+        # Advisory display from unauthenticated input (ADR-0023): heartbeats
+        # whose tokens were rejected — never node records, never
+        # dispatch-eligible; the re-provision worklist after a stale-backup
+        # recovery. Self-declared names render escaped like all agent text.
+        "unregistered": [
+            {**row, "last_seen": ago(now - row["last_seen"])}
+            for row in store.unregistered_nodes()
+        ],
     }
 
 
