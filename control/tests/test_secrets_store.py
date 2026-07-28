@@ -103,7 +103,9 @@ def test_key_rotation_reencrypts_everything(control):
     new_box = SecretBox(generate_key())
     control.secret_store.replace_secret_tokens(
         {
-            name: new_box.encrypt(control.box.decrypt(control.secret_store.get_secret_token(name) or ""))
+            name: new_box.encrypt(
+                control.box.decrypt(control.secret_store.get_secret_token(name) or "")
+            )
             for name in control.secret_store.secret_names()
         }
     )

@@ -220,6 +220,7 @@ UNREGISTERED_CAP = 64
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+
 EVENT_RUN = "theozolith.run"
 EVENT_REVIEW = "theozolith.review"
 EVENT_PROGRESS = "theozolith.run.progress"

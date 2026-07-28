@@ -353,9 +353,7 @@ def mount_web(
             uses = int(str(form.get("uses") or "1"))
             if ttl <= 0 or uses < 1:
                 raise ValueError("ttl and uses must be positive")
-            fingerprint = tls.ca_fingerprint_sha256(
-                (settings.tls_dir / tls.CA_FILE).read_bytes()
-            )
+            fingerprint = tls.ca_fingerprint_sha256((settings.tls_dir / tls.CA_FILE).read_bytes())
         except (ValueError, OSError) as exc:
             page = _page(request, "join.html", _join_context(notice=f"cannot mint: {exc}"))
             page.status_code = 400

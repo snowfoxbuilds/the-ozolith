@@ -338,8 +338,14 @@ def _print_handoff(settings: ControlSettings, origin_text: str, ip: str) -> None
     _log("")
     _log("2) Trust the CA on operator devices (nodes pin it automatically when")
     _log(f"   provisioned). Download: {ca_url}")
-    _log("     macOS:   sudo security add-trusted-cert -d -k /Library/Keychains/System.keychain ca.pem")
-    _log("     Linux:   sudo cp ca.pem /usr/local/share/ca-certificates/theozolith.crt && sudo update-ca-certificates")
+    _log(
+        "     macOS:   sudo security add-trusted-cert -d"
+        " -k /Library/Keychains/System.keychain ca.pem"
+    )
+    _log(
+        "     Linux:   sudo cp ca.pem /usr/local/share/ca-certificates/theozolith.crt"
+        " && sudo update-ca-certificates"
+    )
     _log("     Firefox: uses its own store — Settings > Privacy & Security > Certificates > Import")
     _log("     iOS:     send ca.pem to the device, install the profile, then enable it under")
     _log("              Settings > General > About > Certificate Trust Settings")
@@ -537,7 +543,10 @@ def _rotate_key(args) -> int:
     secret_store = SecretStore(settings.store_db_path)
     names = secret_store.secret_names()
     secret_store.replace_secret_tokens(
-        {name: new.encrypt(old.decrypt(secret_store.get_secret_token(name) or "")) for name in names}
+        {
+            name: new.encrypt(old.decrypt(secret_store.get_secret_token(name) or ""))
+            for name in names
+        }
     )
     settings.key_path.write_text(new_key + "\n", encoding="utf-8")
     settings.key_path.chmod(0o600)

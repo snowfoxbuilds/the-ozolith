@@ -427,9 +427,7 @@ def create_app(
             # off to provision as its final step — never the bootstrap
             # listener (ADR-0023: code never rides plaintext).
             "provision_command": f"sudo theozolith-nodedaemon provision '{join}'",
-            "install_command": (
-                f"curl -fsSL {settings.installer_url} | sudo bash -s -- '{join}'"
-            ),
+            "install_command": (f"curl -fsSL {settings.installer_url} | sudo bash -s -- '{join}'"),
             "expires_at": expires_at,
             "uses": uses,
         }

@@ -227,7 +227,9 @@ def render(origin: str, overrides: dict[str, Any]) -> str:
         f"public_origin = {_toml_literal(origin)}",
     ]
     set_keys = [
-        setting for setting in SETTINGS if overrides.get(setting.key, setting.default) != setting.default
+        setting
+        for setting in SETTINGS
+        if overrides.get(setting.key, setting.default) != setting.default
     ]
     if set_keys:
         lines += ["", "[settings]"]
@@ -290,9 +292,7 @@ def write_public_origin(
     return path
 
 
-def set_value(
-    config_repo: Path, key: str, raw: str, *, runner=subprocess.run, log=print
-) -> Any:
+def set_value(config_repo: Path, key: str, raw: str, *, runner=subprocess.run, log=print) -> Any:
     """The settings-form write path: validate one known tier-2 key, rewrite
     control.toml from the fixed schema (touching nothing else), and commit
     ``theozolith: settings: <key> = <value>``. The public origin is not a
@@ -306,9 +306,10 @@ def set_value(
     values = read_values(config_repo)
     values[key] = value
     _write(config_repo, read_public_origin(config_repo), values)
+    # The message carries the exact TOML literal that was written.
     _commit(
         config_repo,
-        f"theozolith: settings: {key} = {value}",
+        f"theozolith: settings: {key} = {_toml_literal(value)}",
         runner=runner,
         log=log,
     )

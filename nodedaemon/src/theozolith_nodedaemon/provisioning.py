@@ -237,7 +237,9 @@ def provision(
             try:
                 exchange_port = int(hostpart.rsplit(":", 1)[1])
             except ValueError as exc:
-                raise ProvisionError(f"bad control URL from the bootstrap listener: {exc}") from None
+                raise ProvisionError(
+                    f"bad control URL from the bootstrap listener: {exc}"
+                ) from None
 
     # The exchange dials the join-string host (DNS for the canonical name
     # may not exist yet); the server cert's IP SAN makes verification pass.
@@ -325,7 +327,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--inspect", action="store_true", help="pretty-print the payload without acting"
     )
-    parser.add_argument("--node", default=socket.gethostname(), help="node name (default: hostname)")
+    parser.add_argument(
+        "--node", default=socket.gethostname(), help="node name (default: hostname)"
+    )
     parser.add_argument(
         "--state-dir",
         default=os.environ.get("THEOZOLITH_STATE_DIR") or DEFAULT_STATE_DIR,

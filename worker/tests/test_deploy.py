@@ -84,12 +84,12 @@ def test_installer_hands_off_to_provision_as_its_final_step():
     string is refused (no fingerprint-less manual path)."""
     installer = (DEPLOY / "install-nodedaemon.sh").read_text()
     assert "theozolith-nodedaemon provision" in installer
-    assert 'ozjoin' in installer  # the join string is the one input
+    assert "ozjoin" in installer  # the join string is the one input
     assert "usermod -aG docker ozolith" in installer
     assert "read -r -s" not in installer  # no token prompting remains
     assert "theozolith join-token create" in installer  # the refusal says where to go
     # Steps after the last comment: pip install precedes provision.
-    assert installer.index("pip install") < installer.index("provision \"$JOIN\"")
+    assert installer.index("pip install") < installer.index('provision "$JOIN"')
 
 
 def test_control_compose_mounts_the_partitioned_home():

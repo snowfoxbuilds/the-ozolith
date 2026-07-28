@@ -62,7 +62,9 @@ CANONICAL_HEADERS = {"Host": CANONICAL_HOST, "Origin": CANONICAL_ORIGIN}
 
 
 def login(control: ControlRig) -> None:
-    response = control.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
+    response = control.client.post(
+        "/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False
+    )
     assert response.status_code == 303
 
 
@@ -554,7 +556,9 @@ def test_forged_heartbeat_identifiers_never_reach_the_command(control: ControlRi
 
 
 def test_session_cookie_is_host_locked(control: ControlRig):
-    response = control.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
+    response = control.client.post(
+        "/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False
+    )
     header = response.headers["set-cookie"]
     assert header.startswith(f"{SESSION_COOKIE}=")
     assert SESSION_COOKIE == "__Host-ozolith_session"
@@ -587,7 +591,10 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
     # The login form is browser-only: enforced from the first POST.
     assert rig.client.post("/login", data={"password": ADMIN_PASSWORD}).status_code == 403
     ok = rig.client.post(
-        "/login", data={"password": ADMIN_PASSWORD}, headers=CANONICAL_HEADERS, follow_redirects=False
+        "/login",
+        data={"password": ADMIN_PASSWORD},
+        headers=CANONICAL_HEADERS,
+        follow_redirects=False,
     )
     assert ok.status_code == 303
 

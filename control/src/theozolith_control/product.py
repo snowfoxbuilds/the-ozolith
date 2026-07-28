@@ -393,16 +393,11 @@ def _cmd_join_token(args) -> int:
         _log(f"  {answer.get('install_command')}")
         return 0
     if args.join_cmd == "revoke":
-        answer = _call(
-            url, f"/api/v1/join-tokens/{args.id}", token=token, method="DELETE", ca=ca
-        )
+        answer = _call(url, f"/api/v1/join-tokens/{args.id}", token=token, method="DELETE", ca=ca)
         _log("revoked" if answer.get("revoked") else "no such outstanding token")
         return 0
     for entry in _call(url, "/api/v1/join-tokens", token=token, ca=ca).get("tokens", []):
-        _log(
-            f"{entry['id']}  uses_left={entry['uses_left']}"
-            f"  expires_at={entry['expires_at']:.0f}"
-        )
+        _log(f"{entry['id']}  uses_left={entry['uses_left']}  expires_at={entry['expires_at']:.0f}")
     return 0
 
 

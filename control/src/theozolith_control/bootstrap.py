@@ -76,10 +76,10 @@ class BootstrapServer:
                 if send_body:
                     self.wfile.write(body)
 
-            def do_GET(self):  # noqa: N802 (http.server naming)
+            def do_GET(self):
                 self._answer(send_body=True)
 
-            def do_HEAD(self):  # noqa: N802
+            def do_HEAD(self):
                 self._answer(send_body=False)
 
             def send_error(self, code, message=None, explain=None):
@@ -94,7 +94,7 @@ class BootstrapServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, format, *args):  # noqa: A002
+            def log_message(self, format, *args):
                 pass  # three public values need no access log
 
         self._server = ThreadingHTTPServer((host, port), Handler)
