@@ -4,7 +4,10 @@ rejected heartbeats surface as capped, deduplicated sightings (ADR-0028)."""
 
 from __future__ import annotations
 
-from controlrig import ControlRig
+import re
+
+import pytest
+from controlrig import ADMIN_PASSWORD, ControlRig, make_rig
 from theozolith_control.store import UNREGISTERED_CAP
 from theozolith_control.tls import provision
 
@@ -25,14 +28,22 @@ def _exchange(control: ControlRig, token_hex: str, node: str):
     return control.client.post("/api/v1/join/exchange", json={"node": node, "token": token_hex})
 
 
-def _token_hex_from(join_string: str) -> str:
-    """Lift the raw token out of a composed join string (the node-side
-    parser proper is exercised in nodedaemon/tests)."""
+def _payload_of(join_string: str) -> bytes:
     import base64
 
     encoded = join_string.partition(":")[2]
     blob = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    return blob[4 + 32 : 4 + 32 + 16].hex()
+    return blob[:-4]  # strip the checksum
+
+
+def _token_hex_from(join_string: str) -> str:
+    """Lift the raw token out of a composed join string (the node-side
+    parser proper is exercised in nodedaemon/tests)."""
+    return _payload_of(join_string)[4 + 32 : 4 + 32 + 16].hex()
+
+
+def _addr_of(join_string: str) -> str:
+    return _payload_of(join_string)[4 + 32 + 16 :].decode()
 
 
 def test_join_token_create_answers_the_complete_paste(control: ControlRig):
@@ -48,6 +59,49 @@ def test_join_token_create_answers_the_complete_paste(control: ControlRig):
 def test_join_token_create_requires_a_ca(control: ControlRig):
     refused = control.admin("POST", "/api/v1/join-tokens", {})
     assert refused.status_code == 409 and "init" in refused.json()["detail"]
+
+
+def test_every_mint_surface_embeds_the_persisted_ip_never_detection(
+    control: ControlRig, monkeypatch
+):
+    """Acceptance 3 (ADR-0031): the API and the dashboard join page (the
+    CLI rides the API) default to the init-persisted control IP; no mint
+    path calls detect_host_ip() — proven by making detection explode."""
+    _with_ca(control)
+
+    def _boom() -> str:
+        raise AssertionError("detect_host_ip() must never run at mint time (ADR-0031)")
+
+    monkeypatch.setattr("theozolith_control.bootstrap.detect_host_ip", _boom)
+
+    # API mint, no addr: the persisted IP + bootstrap port.
+    minted = control.admin("POST", "/api/v1/join-tokens", {}).json()
+    assert _addr_of(minted["join_string"]) == "203.0.113.5:6965"
+
+    # Dashboard mint: same address, same non-detection.
+    login = control.client.post("/login", data={"password": ADMIN_PASSWORD}, follow_redirects=False)
+    assert login.status_code == 303
+    page = control.client.post("/join", data={"ttl_seconds": "3600", "uses": "1"}).text
+    match = re.search(r"ozjoin1:[A-Za-z0-9_-]+", page)
+    assert match is not None
+    assert _addr_of(match.group(0)) == "203.0.113.5:6965"
+
+
+def test_mints_refuse_without_a_persisted_ip(tmp_path, monkeypatch):
+    """A pre-init deployment cannot mint a guessed address: 409 with
+    instructions, never a silent detect_host_ip() fallback."""
+    rig = make_rig(tmp_path, control_ip="")
+    provision(rig.settings.tls_dir, ["127.0.0.1"])
+    monkeypatch.setattr(
+        "theozolith_control.bootstrap.detect_host_ip",
+        lambda: pytest.fail("detection at mint time"),
+    )
+    refused = rig.admin("POST", "/api/v1/join-tokens", {})
+    assert refused.status_code == 409
+    assert "no persisted control IP" in refused.json()["detail"]
+    # An explicit addr override still works (the expert path).
+    explicit = rig.admin("POST", "/api/v1/join-tokens", {"addr": "192.0.2.1:6965"})
+    assert explicit.status_code == 200
 
 
 def test_exchange_mints_distinct_per_node_tokens_and_consumes_the_token(control: ControlRig):

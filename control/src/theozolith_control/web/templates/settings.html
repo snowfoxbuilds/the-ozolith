@@ -16,6 +16,13 @@ the file is optional. <code>THEOZOLITH_*</code> environment variables override t
     <td><input value="{{ origin }}" readonly disabled></td>
     <td><span class="muted">read-only</span></td>
   </tr>
+  <tr>
+    <td><code>control_ip</code><div class="muted">The LAN address nodes dial (the node channel is
+      IP-only) — written by init, read-only here (an IP change is <code>recover --ip</code> plus one
+      join-string re-paste per node).</div></td>
+    <td><input value="{{ control_ip }}" readonly disabled></td>
+    <td><span class="muted">read-only</span></td>
+  </tr>
   {% for row in rows %}
   <tr>
     <td><code>{{ row.key }}</code><div class="muted">{{ row.label }}</div></td>

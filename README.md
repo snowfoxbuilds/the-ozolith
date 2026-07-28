@@ -71,7 +71,7 @@ From the repo checkout on the Control Node box:
 
 ```sh
 docker compose -f deploy/compose/control.yml build
-docker compose -f deploy/compose/control.yml run --rm control init
+docker compose -f deploy/compose/control.yml run --rm control init --ip <this-box-LAN-IP>
 docker compose -f deploy/compose/control.yml up -d
 ```
 
@@ -81,9 +81,12 @@ to change) → per-deployment CA + server certificate with the box's IP in the S
 admin password prompt (only its scrypt hash is stored) → the **operator handoff**:
 the dashboard URL, the exact DNS/hosts line, the CA download URL, and per-OS trust
 one-liners. The two irreducibly manual actions — the trusted-network-only DNS record
-and CA trust per operator device — are copy-paste from that printout. All state
-lands under `~/.theozolith/` on the host, partitioned by durability class
-(ADR-0024); backup is a copy of that folder minus `cache/`.
+and CA trust per operator device — are copy-paste from that printout. `--ip` names
+the LAN address nodes will dial (required in the compose flow — a container cannot
+auto-detect it; give the box a static IP or DHCP reservation): the node channel is
+IP-only, the DNS record is for browsers alone. All state lands under
+`~/.theozolith/` on the host, partitioned by durability class (ADR-0024); backup is
+a copy of that folder minus `cache/`.
 
 ### 2. Provision the physical nodes — one paste each
 

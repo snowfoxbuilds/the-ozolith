@@ -176,12 +176,25 @@ def _load(config_repo: Path) -> dict[str, Any]:
     return data
 
 
+def _read_control_field(config_repo: Path, key: str) -> str:
+    control = _load(config_repo).get("control", {})
+    value = control.get(key, "") if isinstance(control, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
 def read_public_origin(config_repo: Path) -> str:
     """The persisted public origin — a read-only [control] field written by
     init (ADR-0024 moved it here from the flat public-origin file)."""
-    control = _load(config_repo).get("control", {})
-    origin = control.get("public_origin", "") if isinstance(control, dict) else ""
-    return origin if isinstance(origin, str) else ""
+    return _read_control_field(config_repo, "public_origin")
+
+
+def read_control_ip(config_repo: Path) -> str:
+    """The persisted control IP (ADR-0031): the LAN address nodes dial —
+    the node channel is IP-only (ADR-0023 as amended 2026-07-28), so this
+    read-only field feeds every join-string mint surface, the bootstrap
+    listener's /control-url, and the certificate SAN. Confirmed once at
+    init; it survives backup/recovery with the Config Repo."""
+    return _read_control_field(config_repo, "control_ip")
 
 
 def read_values(config_repo: Path) -> dict[str, Any]:
@@ -210,7 +223,7 @@ def _toml_literal(value: Any) -> str:
     return str(value)
 
 
-def render(origin: str, overrides: dict[str, Any]) -> str:
+def render(origin: str, control_ip: str, overrides: dict[str, Any]) -> str:
     """The whole file, regenerated from the fixed schema: the read-only
     [control] table, then only the [settings] keys that differ from their
     shipped defaults (every setting has one — the file stays minimal and
@@ -222,10 +235,13 @@ def render(origin: str, overrides: dict[str, Any]) -> str:
         "# variables override these (expert escape hatch).",
         "",
         "[control]",
-        "# Read-only: written by 'theozolith-control init' / origin-init; the",
-        "# settings form refuses to change it.",
+        "# Read-only: written by 'theozolith-control init' (origin-init /",
+        "# recover --ip); the settings form refuses to change them. The origin",
+        "# is what browsers dial; the IP is what nodes dial (ADR-0023/0031).",
         f"public_origin = {_toml_literal(origin)}",
     ]
+    if control_ip:
+        lines.append(f"control_ip = {_toml_literal(control_ip)}")
     set_keys = [
         setting
         for setting in SETTINGS
@@ -272,23 +288,39 @@ def _commit(config_repo: Path, message: str, *, runner=subprocess.run, log=print
     log(f"committed {CONTROL_TOML}: {message}")
 
 
-def _write(config_repo: Path, origin: str, overrides: dict[str, Any]) -> Path:
+def _write(config_repo: Path, origin: str, control_ip: str, overrides: dict[str, Any]) -> Path:
     config_repo.mkdir(parents=True, exist_ok=True)
     path = control_toml_path(config_repo)
-    path.write_text(render(origin, overrides), encoding="utf-8")
+    path.write_text(render(origin, control_ip, overrides), encoding="utf-8")
     return path
 
 
 def write_public_origin(
     config_repo: Path, origin: str, *, runner=subprocess.run, log=print
 ) -> Path:
-    """Persist the public origin (init/origin-init only), keeping every
-    committed setting; committed with the fixed author identity."""
+    """Persist the public origin (init/origin-init only), keeping the
+    persisted control IP and every committed setting; committed with the
+    fixed author identity."""
     from theozolith_control.origin import parse_public_origin
 
     canonical = parse_public_origin(origin).origin
-    path = _write(config_repo, canonical, read_values(config_repo))
+    path = _write(config_repo, canonical, read_control_ip(config_repo), read_values(config_repo))
     _commit(config_repo, f"theozolith: public origin {canonical}", runner=runner, log=log)
+    return path
+
+
+def write_control_ip(config_repo: Path, ip: str, *, runner=subprocess.run, log=print) -> Path:
+    """Persist the control IP (init / recover --ip only; ADR-0031), keeping
+    the origin and every committed setting. Validated as an IP literal —
+    the node channel never carries a hostname."""
+    import ipaddress
+
+    try:
+        canonical = str(ipaddress.ip_address(ip))
+    except ValueError as exc:
+        raise ControlTomlError(f"control IP {ip!r} is not an IP address: {exc}") from exc
+    path = _write(config_repo, read_public_origin(config_repo), canonical, read_values(config_repo))
+    _commit(config_repo, f"theozolith: control ip {canonical}", runner=runner, log=log)
     return path
 
 
@@ -305,7 +337,7 @@ def set_value(config_repo: Path, key: str, raw: str, *, runner=subprocess.run, l
     value = setting.coerce(raw, source="settings form")
     values = read_values(config_repo)
     values[key] = value
-    _write(config_repo, read_public_origin(config_repo), values)
+    _write(config_repo, read_public_origin(config_repo), read_control_ip(config_repo), values)
     # The message carries the exact TOML literal that was written.
     _commit(
         config_repo,

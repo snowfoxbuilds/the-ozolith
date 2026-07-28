@@ -5,8 +5,10 @@ A closed route table by decision, not convention — GET/HEAD only, no auth,
 no state, no cookies, and exactly three paths:
 
     /ca.pem        the CA certificate (PEM)
-    /origin        the public origin
-    /control-url   the canonical control URL
+    /origin        the public origin (browser-only: the slug hostname)
+    /control-url   the IP-based control URL nodes dial (the node channel is
+                   IP-only — ADR-0023 as amended 2026-07-28; it must agree
+                   with the join exchange's answer)
 
 Everything else answers 404; non-GET methods answer 405. It runs on its own
 port (default in control.toml, ``bootstrap_port``), never mounted on the

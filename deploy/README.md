@@ -15,24 +15,36 @@ Stacks and worker types on top, never below.
 
 ## Full substrate
 
-1. **Control Node** (any box with docker; the Pi in the reference deployment):
+1. **Control Node** (any box with docker; the Pi in the reference deployment).
+   **Prerequisite: give this box a static IP or DHCP reservation** — the node
+   channel is IP-only (ADR-0023 as amended 2026-07-28): nodes dial the control IP
+   directly, with zero DNS dependency; the slug hostname is browser-only.
 
    ```sh
    docker compose -f deploy/compose/control.yml build
-   docker compose -f deploy/compose/control.yml run --rm control init
+   docker compose -f deploy/compose/control.yml run --rm control init --ip <this-box-LAN-IP>
    docker compose -f deploy/compose/control.yml up -d
    ```
 
+   `--ip` is required in the compose flow: inside a container the auto-detected
+   address would be the Docker bridge IP, unreachable from your LAN, so `init`
+   refuses to guess there (ADR-0031). The confirmed IP is persisted as a read-only
+   `control.toml` field beside the origin and is the one address every join string,
+   the bootstrap listener's `/control-url`, and the certificate SAN carry — mint
+   surfaces never re-detect it.
+
    `init` (ADR-0023) composes the whole first run: master key → public origin
    (`https://<128-bit-random-slug>.theozolith.internal`; `--base-domain`/`--port` to
-   vary) → per-deployment CA + server cert with the box's IP in the SAN → admin
+   vary) → per-deployment CA + server cert with the persisted IP in the SAN → admin
    password prompt (only its scrypt hash is stored) → the **operator handoff**: the
-   dashboard URL, the exact `/etc/hosts`/DNS line, the CA download URL (served by the
-   plaintext bootstrap listener, port 6965), and per-OS trust one-liners. The two
-   irreducibly manual actions — the DNS record and CA trust per operator device — are
-   copy-paste from that printout. Re-running `init` requires `--force` (a new origin
-   and CA invalidate DNS, device trust, and every outstanding join string; the master
-   key and stored secrets are never touched).
+   dashboard URL, the exact `/etc/hosts`/DNS line (browsers only — nodes never
+   resolve it), the CA download URL (served by the bootstrap listener, port 6965,
+   once `serve` runs), and per-OS trust one-liners. The two irreducibly manual
+   actions — the DNS record and CA trust per operator device — are copy-paste from
+   that printout. Re-running `init` requires `--force`: **a new CA invalidates the
+   pinned `ca.pem` on every provisioned node — the whole fleet fails TLS until each
+   box gets one join-string re-paste** (outstanding join strings, DNS entries, and
+   device trust die too; the master key and stored secrets are never touched).
 
    Everything lands under `~/.theozolith/` on the host, partitioned by durability
    class (ADR-0024): `configs/` (the git-backed Config Repo — `control.toml`,
@@ -63,8 +75,13 @@ Stacks and worker types on top, never below.
    anything** (mismatch = possible MITM or a stale join string after CA rotation —
    abort), exchanges the short-lived single-use join token over verified TLS for this
    node's own **non-expiring per-node token**, persists everything under
-   `/var/lib/theozolith`, enables the unit, and heartbeats. Provisioning **is**
-   registration: unknown/revoked tokens are rejected 401 and surface on the dashboard
+   `/var/lib/theozolith`, enables the unit, and heartbeats. The persisted control URL
+   is the **IP-based address the node just verified** — nodes never resolve the slug
+   hostname and never need DNS. Re-pasting a fresh join string on an
+   already-provisioned node rotates its token and replaces its persisted state in
+   place: that one paste per node is the whole recovery path when the Control Node's
+   IP changes. Provisioning **is** registration:
+   unknown/revoked tokens are rejected 401 and surface on the dashboard
    as *unregistered nodes* (advisory, never dispatch-eligible). Remove a node with
    `POST /api/v1/nodes/<node>/revoke`; `theozolith join-token revoke <id>` kills an
    outstanding join string. `theozolith-nodedaemon provision --inspect 'ozjoin1:…'`
@@ -79,7 +96,7 @@ Stacks and worker types on top, never below.
    interval, grace periods, sweep cadences, terminal cap, event budget, session
    length, bootstrap port) live in `control.toml` and are edited on the dashboard's
    Settings page — each save is a fixed-schema commit touching only that file. The
-   public origin renders read-only there.
+   public origin and the control IP render read-only there.
 
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
@@ -182,23 +199,34 @@ Config Repo clone looks like a deployment but cannot resurrect one (`secrets/` i
 sibling of `configs/` by decision, never a git-ignored child: `git clean -x` must not
 be able to delete the master key, and a clone must not look complete while missing it).
 
-Recovery, zero node touches:
+Recovery:
 
 1. Install the TheOzolith package on the replacement box; restore the copy to
    `~/.theozolith/`.
 2. `theozolith-control recover` — validates the restore **loudly and completely**
    (every missing or corrupt artifact enumerated in one pass, nonzero exit), then
-   re-mints the server certificate from the restored CA with the new box's IP in the
-   SAN.
-3. Update the private-side DNS/hosts record to the new address; start `serve`.
+   re-mints the server certificate from the restored CA. It uses the restored
+   `control_ip` by default; pass `--ip` if the replacement box's address differs
+   (it is then persisted for every future mint).
+3. Update the **browser-side** DNS/hosts record; start `serve`.
 
-Nodes pin the CA (not the server cert) and hold non-expiring tokens restored with
-`store.db`: they reconnect on their capped backoff, untouched. Sessions and cached
-state died with `cache/` — a re-login and one heartbeat round recover them. Nodes
-enrolled *after* the backup show up in the dashboard's unregistered-nodes view: that
-list is exactly the re-provision worklist (one join-string paste each). Deleting
-`cache/cache.db` on a live system is always safe and is the documented recovery move
-for cache corruption.
+**Same IP** (give the Control Node a static IP or DHCP reservation so this is the
+normal case): zero node touches — nodes dial the persisted IP directly, pin the CA
+(not the server cert), and hold non-expiring tokens restored with `store.db`, so
+they reconnect on their capped backoff, untouched.
+
+**Changed IP**: every provisioned node still dials the old address — the recovery
+path is **one join-string re-paste per node** (`theozolith join-token create`; the
+paste rotates that node's token in place). Note the asymmetry `recover` also prints:
+these nodes will **NOT** appear in the unregistered-nodes view, because their
+heartbeats go to the dead address and never arrive — work from your node inventory,
+not the dashboard.
+
+Sessions and cached state died with `cache/` — a re-login and one heartbeat round
+recover them. Nodes enrolled *after* the backup DO show up in the unregistered-nodes
+view (their heartbeats arrive with unknown tokens): that list is the re-provision
+worklist for the stale-backup case. Deleting `cache/cache.db` on a live system is
+always safe and is the documented recovery move for cache corruption.
 
 ## Daemon-less dev (the M2 shape)
 

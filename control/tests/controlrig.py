@@ -49,6 +49,9 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         repo="acme/sandbox",
         github_token="gh-token",
         api_url="https://api.github.invalid",
+        # The init-persisted control IP (ADR-0031): what every mint surface
+        # embeds — detect_host_ip() is never called at mint time.
+        control_ip="203.0.113.5",
         secrets_channel_ok=True,
         serve_tls=True,  # production-like default; the dev-cookie test overrides
     )

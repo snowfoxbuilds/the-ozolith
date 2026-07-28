@@ -109,16 +109,19 @@ def test_settings_form_commits_one_key_to_control_toml(control: ControlRig):
     assert 'value="30.0"' in page or 'value="30"' in page
 
 
-def test_settings_form_renders_the_origin_read_only_and_rejects_writes(control: ControlRig):
+def test_settings_form_renders_control_fields_read_only_and_rejects_writes(control: ControlRig):
     _git_config_repo(control)
     _login(control)
     page = control.client.get("/settings").text
     assert "readonly" in page and control.settings.public_origin in page
-    refused = control.client.post(
-        "/settings", data={"key": "public_origin", "value": "https://evil.example"}
-    )
-    assert refused.status_code == 403
+    # The control IP renders read-only beside the origin (ADR-0031): the
+    # node channel's address is a recover --ip act, never a form field.
+    assert control.settings.control_ip in page
+    for key, value in (("public_origin", "https://evil.example"), ("control_ip", "10.6.6.6")):
+        refused = control.client.post("/settings", data={"key": key, "value": value})
+        assert refused.status_code == 403, key
     assert controltoml.read_public_origin(control.settings.config_repo) != "https://evil.example"
+    assert controltoml.read_control_ip(control.settings.config_repo) != "10.6.6.6"
     bad = control.client.post("/settings", data={"key": "made_up", "value": "1"})
     assert bad.status_code == 400
 

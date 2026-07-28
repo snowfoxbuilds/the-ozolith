@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from theozolith_control import bootstrap, controltoml, joinstring, tls
+from theozolith_control import controltoml, joinstring, tls
 from theozolith_control.crypto import SecretBox
 from theozolith_control.origin import parse_public_origin
 from theozolith_control.secretstore import SecretStore
@@ -274,6 +274,7 @@ def mount_web(
         return {
             "origin": controltoml.read_public_origin(settings.config_repo)
             or settings.public_origin,
+            "control_ip": controltoml.read_control_ip(settings.config_repo) or settings.control_ip,
             "rows": [
                 {
                     "key": s.key,
@@ -307,10 +308,11 @@ def mount_web(
         form = await request.form()
         key = str(form.get("key", "")).strip()
         value = str(form.get("value", "")).strip()
-        if key == "public_origin":
+        if key in ("public_origin", "control_ip"):
             return HTMLResponse(
-                "the public origin is read-only — re-pointing a deployment is"
-                " 'theozolith-control origin-init --force', not a settings edit",
+                "the [control] fields are read-only — re-pointing a deployment is"
+                " 'theozolith-control origin-init --force' / 'recover --ip', not a"
+                " settings edit",
                 status_code=403,
             )
         try:
@@ -353,12 +355,17 @@ def mount_web(
             uses = int(str(form.get("uses") or "1"))
             if ttl <= 0 or uses < 1:
                 raise ValueError("ttl and uses must be positive")
+            if not settings.control_ip:
+                raise ValueError(
+                    "no persisted control IP — run 'theozolith-control init' (ADR-0031)"
+                )
             fingerprint = tls.ca_fingerprint_sha256((settings.tls_dir / tls.CA_FILE).read_bytes())
         except (ValueError, OSError) as exc:
             page = _page(request, "join.html", _join_context(notice=f"cannot mint: {exc}"))
             page.status_code = 400
             return page
-        addr = f"{bootstrap.detect_host_ip()}:{settings.bootstrap_port}"
+        # The persisted control IP (ADR-0031) — never detected at mint time.
+        addr = f"{settings.control_ip}:{settings.bootstrap_port}"
         token_id, raw, expires_at = store.create_join_token(ttl_seconds=ttl, uses=uses)
         join = joinstring.compose(
             addr=addr, ca_sha256=fingerprint, token=raw, expires_at=expires_at

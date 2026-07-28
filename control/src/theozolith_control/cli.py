@@ -7,7 +7,8 @@ it runs on (ADR-0023) — ``init``, ``origin-init``, ``tls-init``, ``serve``,
 (with the box's IP in the SAN) → admin password → operator handoff. All
 state lands under the ``~/.theozolith/`` partition (ADR-0024); ``recover``
 validates a restored copy loudly and re-mints the server certificate from
-the restored CA so nodes reconnect untouched.
+the restored CA — a same-IP restore reconnects the fleet untouched (nodes
+dial the persisted control IP directly; ADR-0023 as amended 2026-07-28).
 
 Secret entry happens here and through the dashboard's web form — both write
 through the same PUT /api/v1/secrets/{name} API to the same encrypted store
@@ -90,7 +91,15 @@ def _admin_env(args) -> tuple[str, str, str | None]:
     back to init's artifacts on this box — on the Control Node itself the
     commands work with no environment at all (`.env` is gone)."""
     settings = load_settings()
-    url = args.url or env_value(os.environ, "CONTROL_NODE_URL") or settings.public_origin
+    # Prefer the IP-based URL (zero DNS dependency — the server cert
+    # carries the IP SAN, so verification passes); the slug origin is the
+    # browser's address, kept as a last resort for pre-ADR-0031 setups.
+    url = (
+        args.url
+        or env_value(os.environ, "CONTROL_NODE_URL")
+        or _node_control_url(settings)
+        or settings.public_origin
+    )
     if not url:
         raise SystemExit(
             "error: no Control Node URL — set CONTROL_NODE_URL, pass --url, or run"
@@ -198,16 +207,19 @@ def _serve(args) -> int:
     )
     app = create_app(settings, store, secret_store, box)
 
-    # The plaintext bootstrap listener (ADR-0023): CA cert, public origin,
-    # canonical control URL, on its own port — never on the HTTPS app. It
-    # exists to serve provisioning, so it runs exactly when a CA does.
+    # The plaintext bootstrap listener (ADR-0023): CA cert, browser origin,
+    # and the IP-based control URL, on its own port — never on the HTTPS
+    # app. It exists to serve provisioning, so it runs exactly when a CA
+    # does. /control-url must agree with the join exchange's answer: the
+    # node channel is IP-only (2026-07-28 amendment) — nodes never resolve
+    # the slug hostname, which stays browser-only on /origin.
     bootstrap_server = None
     ca_path = settings.tls_dir / CA_FILE
     if ca_path.is_file():
         bootstrap_server = bootstrap.BootstrapServer(
             ca_pem=ca_path.read_bytes(),
             origin=settings.public_origin,
-            control_url=settings.public_origin,
+            control_url=_node_control_url(settings) or settings.public_origin,
             port=settings.bootstrap_port,
         )
         bootstrap_server.start()
@@ -245,6 +257,28 @@ def _serve(args) -> int:
 
 
 # -- local maintenance ----------------------------------------------------------
+
+
+def _node_control_url(settings: ControlSettings) -> str:
+    """The IP-based URL nodes dial (ADR-0023 § node channel addressing):
+    the persisted control IP + the origin's external https port. Empty
+    until init has persisted the IP."""
+    if not settings.control_ip:
+        return ""
+    port = 443
+    if settings.public_origin:
+        try:
+            port = origin.parse_public_origin(settings.public_origin).port
+        except OriginError:
+            port = 443
+    host = settings.control_ip
+    return f"https://{host}" if port == 443 else f"https://{host}:{port}"
+
+
+def _running_in_container() -> bool:
+    """True inside docker/podman — where auto-detected addresses are the
+    container bridge IP, unreachable from the LAN (ADR-0031)."""
+    return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
 
 
 def _mint_origin(settings: ControlSettings, base_domain: str, port: int | None) -> str:
@@ -324,19 +358,27 @@ def _print_handoff(settings: ControlSettings, origin_text: str, ip: str) -> None
     two irreducibly manual actions — DNS record, CA trust per device — get
     exact copy-pasteable instructions, not prose."""
     try:
-        hostname = origin.parse_public_origin(origin_text).hostname
+        parsed = origin.parse_public_origin(origin_text)
+        hostname, external_port = parsed.hostname, parsed.port
     except OriginError:
-        hostname = ""
+        hostname, external_port = "", 443
+    node_url = f"https://{ip}" if external_port == 443 else f"https://{ip}:{external_port}"
     ca_url = f"http://{ip}:{settings.bootstrap_port}/ca.pem"
     _log("")
     _log("== Control Node initialized ==")
     _log(f"dashboard: {origin_text}")
+    _log(f"node channel: {node_url} (nodes dial the IP only — no DNS dependency;")
+    _log("give this box a static IP or DHCP reservation)")
     _log("")
-    _log("1) DNS (trusted network only) — hosts entry on every operator device,")
-    _log("   or one router/private-DNS record:")
+    _log("1) DNS for BROWSERS (trusted network only; nodes never resolve it) —")
+    _log("   hosts entry on every operator device, or one router/private-DNS record:")
     _log(f"     {ip} {hostname}")
     _log("")
-    _log("2) Trust the CA on operator devices (nodes pin it automatically when")
+    _log("2) start serving:      theozolith-control serve")
+    _log("   (the CA download URL in step 3 is served by it — the bootstrap")
+    _log("   listener only exists while serving)")
+    _log("")
+    _log("3) Trust the CA on operator devices (nodes pin it automatically when")
     _log(f"   provisioned). Download: {ca_url}")
     _log(
         "     macOS:   sudo security add-trusted-cert -d"
@@ -350,7 +392,6 @@ def _print_handoff(settings: ControlSettings, origin_text: str, ip: str) -> None
     _log("     iOS:     send ca.pem to the device, install the profile, then enable it under")
     _log("              Settings > General > About > Certificate Trust Settings")
     _log("")
-    _log("3) start serving:      theozolith-control serve")
     _log("4) provision nodes:    theozolith join-token create   (one paste per box)")
     _log("")
     _log(f"backup: copy {settings.data_dir}/ minus cache/ to another device after")
@@ -369,10 +410,29 @@ def _init(args) -> int:
     if initialized and not args.force:
         raise SystemExit(
             f"error: {settings.data_dir} is already initialized"
-            f" ({existing_origin or 'master key present'}) — pass --force to re-run"
-            " (a new origin and CA invalidate DNS entries, device trust, and every"
-            " outstanding join string)"
+            f" ({existing_origin or 'master key present'}) — pass --force to re-run."
+            " A new CA invalidates the pinned ca.pem on EVERY provisioned node:"
+            " the whole fleet fails TLS until each box gets one join-string"
+            " re-paste. DNS entries, device trust, and every outstanding join"
+            " string are invalidated too."
         )
+
+    # The control IP (ADR-0031): confirmed once, persisted, and the ONLY
+    # address any mint surface will ever embed. Inside a container the
+    # auto-detected address is the bridge IP — wrong for the LAN by
+    # construction — so detection is refused there, never silently used.
+    ip = args.ip
+    if not ip:
+        if _running_in_container():
+            raise SystemExit(
+                "error: running inside a container — an auto-detected address would"
+                " be the container bridge IP, unreachable from your LAN. Pass this"
+                " box's LAN address explicitly:\n"
+                "  docker compose -f deploy/compose/control.yml run --rm control"
+                " init --ip <LAN-IP>"
+            )
+        ip = bootstrap.detect_host_ip()
+        _log(f"control IP: {ip} (auto-detected; wrong for your LAN? re-run with --ip)")
 
     # The partition (ADR-0024): durability class legible from the path.
     settings.config_repo.mkdir(parents=True, exist_ok=True)
@@ -389,12 +449,16 @@ def _init(args) -> int:
     if not settings.admin_token_path.is_file():
         _write_private(settings.admin_token_path, _secrets.token_urlsafe(32))
 
-    # 2. The public origin, a read-only control.toml field.
+    # 2. The public origin (browsers) and the control IP (nodes), both
+    # read-only control.toml fields (ADR-0024/0031).
     origin_text = _mint_origin(settings, args.base_domain, args.port)
+    try:
+        controltoml.write_control_ip(settings.config_repo, ip, log=_log)
+    except controltoml.ControlTomlError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
-    # 3. Per-deployment CA + server cert; the box's IP rides the SAN so
-    # nodes and browsers reaching it by IP verify cleanly (ADR-0023).
-    ip = args.ip or bootstrap.detect_host_ip()
+    # 3. Per-deployment CA + server cert; the persisted IP rides the SAN so
+    # the join exchange and every node dial verify cleanly (ADR-0023).
     hostname = origin.parse_public_origin(origin_text).hostname
     hosts = [hostname, ip] + [h for h in (args.host or []) if h not in (hostname, ip)]
     try:
@@ -427,11 +491,21 @@ def _recover(args) -> int:
     """Recovery from a restored ~/.theozolith/ copy (ADR-0024): validate
     loudly and COMPLETELY — every missing or invalid artifact enumerated in
     one pass, exit nonzero — then re-mint the server certificate from the
-    restored CA with this box's IP in the SAN. Nodes pin the CA and hold
-    non-expiring tokens restored with store.db: they reconnect untouched
-    once DNS points here."""
+    restored CA with this box's IP in the SAN. Nodes dial the persisted
+    control IP directly (ADR-0023 as amended): a same-IP restore reconnects
+    the fleet untouched; a NEW IP means one join-string re-paste per node —
+    and those nodes will NOT appear in the unregistered view, because their
+    heartbeats go to the dead address and never arrive here."""
     settings = load_settings()
     problems: list[str] = []
+
+    persisted_ip = controltoml.read_control_ip(settings.config_repo)
+    ip = args.ip or persisted_ip
+    if not ip:
+        problems.append(
+            f"{settings.config_repo / controltoml.CONTROL_TOML}: no persisted control IP"
+            " — pass --ip <this box's LAN IP> (pre-ADR-0031 backup)"
+        )
 
     origin_text = controltoml.read_public_origin(settings.config_repo)
     if not settings.config_repo.is_dir():
@@ -489,17 +563,29 @@ def _recover(args) -> int:
         _log("restore a complete copy of the data dir (minus cache/) and re-run")
         return 1
 
-    ip = args.ip or bootstrap.detect_host_ip()
     hostname = origin.parse_public_origin(origin_text).hostname
     try:
         cert, key = tls.remint_server_cert(settings.tls_dir, [hostname, ip])
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
     _log(f"re-minted {cert} and {key} from the restored CA (SAN: {hostname}, {ip})")
+    if args.ip and args.ip != persisted_ip:
+        controltoml.write_control_ip(settings.config_repo, args.ip, log=_log)
     _log("recovery validated. next:")
-    _log(f"  1) update the private-side DNS/hosts record: {ip} {hostname}")
+    _log(f"  1) update the BROWSER-side DNS/hosts record: {ip} {hostname}")
     _log("  2) start serving: theozolith-control serve")
-    _log("nodes pin the CA and reconnect on their own backoff — no node-side action.")
+    if args.ip and persisted_ip and args.ip != persisted_ip:
+        _log("")
+        _log(f"control IP CHANGED ({persisted_ip} -> {args.ip}): every provisioned node")
+        _log("still dials the old address — each needs ONE join-string re-paste")
+        _log("('theozolith join-token create'). Those nodes will NOT appear in the")
+        _log("unregistered view: their heartbeats go to the dead address and never")
+        _log("arrive here. Re-provisioning rotates each node's token in place.")
+    else:
+        _log(f"nodes dial {ip} directly and reconnect on their own backoff — no")
+        _log("node-side action. (If this box's IP is actually different, re-run")
+        _log("'recover --ip <new-ip>': a changed IP costs one re-paste per node,")
+        _log("and affected nodes will NOT show up as unregistered.)")
     _log("sessions and cached state died with cache/ (by design): re-log-in; one")
     _log("heartbeat round re-warms the fleet. nodes provisioned after the backup")
     _log("surface as unregistered — the re-provision worklist.")
@@ -686,9 +772,11 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument(
         "--force",
         action="store_true",
-        help="Re-initialize: mints a NEW origin and CA (outstanding join strings become"
-        " invalid by construction; DNS and device trust must be redone). The master"
-        " key and stored secrets are never touched.",
+        help="Re-initialize: mints a NEW origin and CA. A new CA invalidates the"
+        " pinned ca.pem on EVERY provisioned node — the entire fleet fails TLS"
+        " until each box gets one join-string re-paste. Outstanding join strings,"
+        " DNS entries, and device trust are invalidated too. The master key and"
+        " stored secrets are never touched.",
     )
     init.set_defaults(func=_init)
 
@@ -698,7 +786,12 @@ def main(argv: list[str] | None = None) -> int:
         " the server certificate from the restored CA — nodes reconnect untouched"
         " (ADR-0024).",
     )
-    recover.add_argument("--ip", help="This box's IP for the new SAN (default: auto-detected).")
+    recover.add_argument(
+        "--ip",
+        help="This box's IP for the new SAN, persisted for future mints (default: the"
+        " restored control_ip). A CHANGED IP costs one join-string re-paste per node;"
+        " affected nodes will not appear in the unregistered view.",
+    )
     recover.set_defaults(func=_recover)
 
     set_password = sub.add_parser(

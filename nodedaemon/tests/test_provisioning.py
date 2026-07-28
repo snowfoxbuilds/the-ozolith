@@ -50,8 +50,9 @@ def test_cross_component_roundtrip():
     assert payload.ca_sha256 == FINGERPRINT
     assert payload.token == b"t" * 16
     assert payload.expires_at == 4000
-    # Portless addr: the bootstrap default rides implicitly.
-    assert parse_join_string(_compose(addr="10.0.0.9")).bootstrap_port == 80
+    # Portless addr: the fixed bootstrap default rides implicitly
+    # (ADR-0026 — never http-80; the join string dials the listener).
+    assert parse_join_string(_compose(addr="10.0.0.9")).bootstrap_port == 6965
 
 
 def test_the_paste_stays_terminal_sized():
@@ -93,6 +94,8 @@ class LiveControl:
     """The real control app on a real TLS socket + the real bootstrap
     listener, exactly as `serve` arranges them."""
 
+    SLUG_ORIGIN = f"https://{'a' * 26}.theozolith.internal"
+
     def __init__(self, tmp_path: Path):
         self.tls_dir = tmp_path / "data" / "secrets" / "tls"
         self.ca_path, cert, key = tls.provision(self.tls_dir, ["127.0.0.1"])
@@ -103,6 +106,10 @@ class LiveControl:
             repo=None,
             github_token=None,
             api_url="",
+            # The browser origin is SET and must never leak onto the node
+            # channel (ADR-0023 as amended 2026-07-28: IP-only).
+            public_origin=self.SLUG_ORIGIN,
+            control_ip="127.0.0.1",
             secrets_channel_ok=True,
         )
         self.store = Store(settings.cache_db_path)
@@ -206,8 +213,13 @@ def test_provision_happy_path_end_to_end(tmp_path):
         )
 
         # Persisted under the daemon state dir: CA, control URL, name, token.
+        # The control URL is the IP-based address the node just verified —
+        # an IP-literal host, never the browser-only slug origin, even with
+        # public_origin configured (acceptance 1 of the 2026-07-28 ruling).
         assert (state / "ca.pem").read_bytes() == live.ca_path.read_bytes()
-        assert (state / "control-url").read_text().strip() == f"https://127.0.0.1:{live.https_port}"
+        persisted_url = (state / "control-url").read_text().strip()
+        assert persisted_url == f"https://127.0.0.1:{live.https_port}"
+        assert "theozolith.internal" not in persisted_url
         assert (state / "node-name").read_text().strip() == "fresh-box"
         assert (state / "node-token").stat().st_mode & 0o777 == 0o600
         node_token = (state / "node-token").read_text().strip()
@@ -239,6 +251,38 @@ def test_provision_happy_path_end_to_end(tmp_path):
             )
         assert not (second_state / "node-token").exists()
         assert "copycat" not in [n["node"] for n in live.secret_store.provisioned_nodes()]
+
+
+def test_reprovisioning_rotates_the_token_and_replaces_state(tmp_path):
+    """One re-paste per node is the IP-change recovery path (ADR-0023 §
+    node channel addressing): a second provision of the SAME node rotates
+    its per-node token, replaces the persisted state in place, and the
+    node resumes heartbeating — while the old token goes dead."""
+    state = tmp_path / "state"
+    with LiveControl(tmp_path) as live:
+        provisioning.provision(
+            live.join_string(), state_dir=state, node_name="box1", enable_systemd=False
+        )
+        first_token = (state / "node-token").read_text().strip()
+
+        provisioning.provision(
+            live.join_string(), state_dir=state, node_name="box1", enable_systemd=False
+        )
+        second_token = (state / "node-token").read_text().strip()
+
+        assert second_token != first_token  # rotated, not appended
+        assert live.secret_store.node_for_token(first_token) is None  # old one is dead
+        assert live.secret_store.node_for_token(second_token) == "box1"
+        assert [n["node"] for n in live.secret_store.provisioned_nodes()] == ["box1"]
+
+        # The daemon boots from the replaced state and heartbeats.
+        config = load_daemon_config({"THEOZOLITH_STATE_DIR": str(state)})
+        assert config.node_token == second_token
+        client = ControlClient(config.control_url, config.node_token, ca=config.tls_ca)
+        answer = client.heartbeat(
+            {"node": "box1", "stacks": [], "run_containers": [], "images": []}
+        )
+        assert "config" in answer
 
 
 # -- acceptance 10: failure modes fail closed and loud ---------------------------

@@ -32,7 +32,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from theozolith_control import bootstrap, joinstring, product, tls
+from theozolith_control import joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
@@ -354,13 +354,21 @@ def create_app(
             # One deliberate answer for expired, consumed, revoked, and
             # never-existed: nothing is persisted, node-side text stays put.
             raise HTTPException(status_code=401, detail=JOIN_TOKEN_REJECTED)
+        # Re-provisioning an already-known node ROTATES its token (mint
+        # replaces) — the IP-change recovery path is one re-paste per node
+        # (ADR-0023 § node channel addressing).
         node_token = secret_store.mint_node_token(node)
         store.touch_node(node)
         store.clear_unregistered(node)
+        # The node channel is IP-only (ADR-0023 as amended 2026-07-28): the
+        # answer echoes the IP-based URL the node just verified — scheme +
+        # the address it dialed (its Host header) — never the browser-only
+        # slug origin. Nodes have zero DNS dependency.
+        dialed = request.headers.get("host", "")
         return {
             "node": node,
             "node_token": node_token,
-            "control_url": settings.public_origin,
+            "control_url": f"https://{dialed}" if dialed else "",
             "heartbeat_seconds": settings.heartbeat_seconds,
         }
 
@@ -386,7 +394,10 @@ def create_app(
 
     def _join_material(explicit_addr: str) -> tuple[str, str]:
         """(addr, ca fingerprint) for a join string. The CA must exist —
-        a join string pins its fingerprint or it does not exist."""
+        a join string pins its fingerprint or it does not exist — and the
+        default address is the init-persisted control IP (ADR-0031): never
+        detected at mint time, so a containerized Control Node can never
+        leak its bridge address into a paste."""
         try:
             fingerprint = tls.ca_fingerprint_sha256((settings.tls_dir / tls.CA_FILE).read_bytes())
         except (OSError, ValueError) as exc:
@@ -395,7 +406,15 @@ def create_app(
                 detail=f"no usable CA at {settings.tls_dir} — run 'theozolith-control init'"
                 f" first ({exc})",
             ) from exc
-        addr = explicit_addr or f"{bootstrap.detect_host_ip()}:{settings.bootstrap_port}"
+        addr = explicit_addr
+        if not addr:
+            if not settings.control_ip:
+                raise HTTPException(
+                    status_code=409,
+                    detail="no persisted control IP — run 'theozolith-control init'"
+                    " (ADR-0031), or pass an explicit 'addr'",
+                )
+            addr = f"{settings.control_ip}:{settings.bootstrap_port}"
         return addr, fingerprint
 
     @app.post("/api/v1/join-tokens")

@@ -62,11 +62,20 @@ def test_init_produces_the_partition_and_the_handoff(home, capsys):
     origin = controltoml.read_public_origin(home / "configs")
     assert origin.startswith("https://") and origin.endswith(".theozolith.internal")
     hostname = origin.removeprefix("https://")
+    # The control IP persists beside the origin (ADR-0031): the one address
+    # every mint surface will embed.
+    assert controltoml.read_control_ip(home / "configs") == "127.0.0.1"
 
     handoff = capsys.readouterr().out
     assert f"dashboard: {origin}" in handoff
     assert f"127.0.0.1 {hostname}" in handoff  # the exact hosts line
-    assert f"http://127.0.0.1:{settings.bootstrap_port}/ca.pem" in handoff  # CA download URL
+    ca_url = f"http://127.0.0.1:{settings.bootstrap_port}/ca.pem"
+    assert ca_url in handoff  # CA download URL
+    # Steps are executable in printed order (acceptance 7 of the revision):
+    # `serve` — which owns the bootstrap listener — comes before the CA
+    # download it serves.
+    assert handoff.index("theozolith-control serve") < handoff.index(ca_url)
+    assert "static IP or DHCP reservation" in handoff  # the IP-only channel prerequisite
     assert "security add-trusted-cert" in handoff  # macOS one-liner
     assert "update-ca-certificates" in handoff  # Linux one-liner
     assert "Firefox" in handoff and "iOS" in handoff
@@ -85,7 +94,9 @@ def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
     assert _init(home) == 0
     first = controltoml.read_public_origin(home / "configs")
     first_key = (home / "secrets" / "master.key").read_bytes()
-    with pytest.raises(SystemExit, match="--force"):
+    # The refusal names the most expensive consequence: fleet-wide CA
+    # invalidation, one re-paste per node (review finding 4).
+    with pytest.raises(SystemExit, match="EVERY provisioned node"):
         _init(home)
     monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     assert _init(home, "--force") == 0
@@ -93,6 +104,18 @@ def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
     assert controltoml.read_public_origin(home / "configs") != first
     # …but the master key — and with it every stored secret — is untouched.
     assert (home / "secrets" / "master.key").read_bytes() == first_key
+
+
+def test_init_refuses_to_autodetect_inside_a_container(home, monkeypatch, capsys):
+    """ADR-0031: a containerized init must never silently ship the bridge
+    IP — no --ip means refusal with the exact compose line to run."""
+    monkeypatch.setattr("theozolith_control.cli._running_in_container", lambda: True)
+    with pytest.raises(SystemExit, match="container"):
+        cli_main(["init"])
+    assert not (home / "secrets").exists()  # refused before any state landed
+    # An explicit --ip provisions normally, container or not.
+    assert _init(home) == 0
+    assert controltoml.read_control_ip(home / "configs") == "127.0.0.1"
 
 
 def test_filesystem_audit_no_secret_bytes_outside_secrets(home):
@@ -195,6 +218,13 @@ def test_recovery_drill_restores_and_reminst_the_server_cert(home, tmp_path, cap
     assert cli_main(["recover", "--ip", "10.9.9.9"]) == 0
     out = capsys.readouterr().out
     assert "re-minted" in out and "10.9.9.9" in out
+    # The IP changed (init used 127.0.0.1): the new address persists for
+    # every future mint, and the output names the asymmetry — one re-paste
+    # per node, and those nodes will NOT surface as unregistered (their
+    # heartbeats go to the dead address and never arrive).
+    assert controltoml.read_control_ip(home / "configs") == "10.9.9.9"
+    assert "one join-string re-paste" in out.lower() or "join-string re-paste" in out
+    assert "NOT appear in the" in out
 
     from cryptography import x509
 

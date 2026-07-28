@@ -28,6 +28,13 @@ Flow, failing closed and loud at every step:
    state dir; enable the systemd unit; the daemon's first heartbeat
    completes enrollment (provisioning IS registration).
 
+The node channel is IP-only (ADR-0023 as amended 2026-07-28): the persisted
+control URL is the IP-based address this flow just verified — nodes never
+resolve the deployment's slug hostname (browser-only) and carry zero DNS
+dependency. A Control Node IP change is recovered by re-pasting one fresh
+join string here, which rotates this node's token and replaces the
+persisted state in place.
+
 There is no fingerprint-less manual path: verification is the machine's
 job, and trust flows from where the join string came from (an authenticated
 dashboard session or SSH on the Control Node).
@@ -56,6 +63,9 @@ from theozolith_nodedaemon.config import DEFAULT_STATE_DIR
 
 PREFIX = "ozjoin1"
 TOKEN_BYTES = 16
+# The bootstrap listener's fixed default port (ADR-0026); a portless addr
+# means "the default", never http-80 — mirrored constant, no shared import.
+DEFAULT_BOOTSTRAP_PORT = 6965
 _FIXED = 4 + 32 + TOKEN_BYTES  # exp + fingerprint + token, before addr
 
 MALFORMED = "malformed join string"
@@ -99,7 +109,7 @@ class JoinPayload:
     def bootstrap_port(self) -> int:
         if ":" in self.addr:
             return int(self.addr.rsplit(":", 1)[1])
-        return 80
+        return DEFAULT_BOOTSTRAP_PORT
 
 
 def parse_join_string(text: str) -> JoinPayload:
@@ -276,7 +286,7 @@ def provision(
         },
     )
     log(f"provisioned node {node_name!r}: per-node token persisted under {state_dir}")
-    log(f"control URL: {canonical} (CA pinned; DNS for its hostname must resolve here)")
+    log(f"control URL: {canonical} (CA pinned; IP-based — this node needs no DNS)")
 
     if enable_systemd and shutil.which("systemctl"):
         for argv in (

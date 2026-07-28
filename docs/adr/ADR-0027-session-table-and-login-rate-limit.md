@@ -34,6 +34,8 @@ CREATE TABLE sessions (
 
 **At most 5 failed attempts per rolling 60-second window, globally**; while exceeded, the form answers 429 with `Retry-After`. The check runs before the scrypt work, so a throttled flood costs the server nothing. One global bucket, not per-IP: there is exactly one credential to defend and one legitimate operator (ADR-0022 trust model), and per-source buckets would only let an attacker spread the same guess budget across addresses. The lockout-as-DoS cost is bounded at 60 s on a trusted network and is accepted; the 128-bit origin slug remains defense in depth in front of the form.
 
+The failure window is **per-process memory** (2026-07-28 note, PR #9 review): a `serve` restart clears it, and the design assumes the single-process `serve` the product ships — a multi-worker deployment would multiply the budget by the worker count. Accepted: restarting the Control Node to reset the limiter is operator action, sessions themselves are durable in `cache.db`, and the scrypt cost plus the 60-second window still bound online guessing to a rate that never threatens the password space.
+
 ## Alternatives rejected
 
 - **Storing raw session ids**: a cache.db copy (backups explicitly exclude it, but still) would be a cookie jar.

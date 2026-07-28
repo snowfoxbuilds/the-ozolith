@@ -6,15 +6,20 @@
 # operator handoff (DNS line, CA download URL, per-OS trust one-liners):
 #
 #   docker compose -f deploy/compose/control.yml build
-#   docker compose -f deploy/compose/control.yml run --rm control init
+#   docker compose -f deploy/compose/control.yml run --rm control init --ip <LAN-IP>
 #   docker compose -f deploy/compose/control.yml up -d
+#
+# --ip is REQUIRED here: inside the container an auto-detected address would
+# be the Docker bridge IP, so init refuses to guess (ADR-0031). Nodes dial
+# that IP directly (the node channel is IP-only; the slug hostname is
+# browser-only) — give this box a static IP or DHCP reservation.
 #
 # All state lands under ~/.theozolith/ on the host (ADR-0024), partitioned:
 # configs/ (the git-backed Config Repo incl. control.toml), secrets/ (never
 # in any git tree), cache/ (deletable), logs/. Backup = copy ~/.theozolith/
 # minus cache/ to another device; recovery = restore + `run --rm control
-# recover` + DNS update (nodes reconnect untouched). GitHub is never a full
-# backup. There is no .env: tier-2 settings live in control.toml (edited in
+# recover` + browser DNS update (same IP: nodes reconnect untouched; new
+# IP: one join-string re-paste per node). GitHub is never a full backup. There is no .env: tier-2 settings live in control.toml (edited in
 # the dashboard), secrets in the encrypted store, and THEOZOLITH_* env vars
 # remain expert overrides only.
 #
