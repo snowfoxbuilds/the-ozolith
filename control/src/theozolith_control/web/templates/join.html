@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Join tokens · TheOzolith{% endblock %}
+{% block content %}
+<h2>Join tokens</h2>
+<p class="muted">Provisioning a node is one paste: the join string carries the Control Node's
+address, the CA fingerprint, and a short-lived token exchanged over verified TLS for that
+node's own non-expiring bearer token. Default: 1 hour, single use.</p>
+{% if notice %}<p class="flash">{{ notice }}</p>{% endif %}
+{% if minted %}
+<div class="flash flash-good">
+  <p>✓ join token <code>{{ minted.id }}</code> minted. On a box with the daemon installed:</p>
+  <pre>{{ minted.provision_command }}</pre>
+  <p>On a fresh box (installer over GitHub HTTPS, never the bootstrap listener):</p>
+  <pre>{{ minted.install_command }}</pre>
+</div>
+{% endif %}
+<form method="post" action="/join" class="secret-form">
+  <label for="ttl_seconds">TTL (seconds)</label>
+  <input id="ttl_seconds" name="ttl_seconds" value="3600">
+  <label for="uses">Uses</label>
+  <input id="uses" name="uses" value="1">
+  <button type="submit">Mint join token</button>
+</form>
+<h3>Outstanding</h3>
+{% if tokens %}
+<ul class="flags">{% for t in tokens %}
+  <li><code>{{ t.id }}</code> <span class="muted">expires in {{ t.expires_in }} ·
+    {{ t.uses_left }} use(s) left</span>
+    <form method="post" action="/join/revoke" class="inline">
+      <input type="hidden" name="id" value="{{ t.id }}">
+      <button class="linklike">revoke</button>
+    </form>
+  </li>
+{% endfor %}</ul>
+{% else %}<p class="muted">No outstanding join tokens (consumed and expired ones vanish).</p>{% endif %}
+{% endblock %}

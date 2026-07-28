@@ -1,4 +1,4 @@
-"""The Node Daemon: register, heartbeat, reconcile, supervise, build, reap.
+"""The Node Daemon: heartbeat, reconcile, supervise, build, reap.
 
 One pass every heartbeat interval (60s):
 
@@ -41,7 +41,13 @@ from pathlib import Path
 from typing import Any
 
 from theozolith_nodedaemon.builds import ensure_image, image_status
-from theozolith_nodedaemon.config import DaemonConfig, DaemonConfigError, load_daemon_config
+from theozolith_nodedaemon.config import (
+    DEFAULT_HEARTBEAT_SECONDS,
+    DEFAULT_STOP_GRACE_SECONDS,
+    DaemonConfig,
+    DaemonConfigError,
+    load_daemon_config,
+)
 from theozolith_nodedaemon.controlclient import (
     ControlClient,
     ControlError,
@@ -128,7 +134,6 @@ class NodeDaemon:
             )
         else:
             self._client = None  # permanent degraded mode: cache only
-        self._registered = False
         self._desired: dict[str, Any] = _read_json(config.cache_path, {})
         self._drained: set[str] = set(_read_json(config.drained_path, []))
         self._completed: list[int] = _read_json(self._acks_path, [])
@@ -171,11 +176,33 @@ class NodeDaemon:
         self._converge_product()
         self._reconcile()
 
+    def _wire_setting(self, key: str, config_value: float, shipped_default: float) -> float:
+        """A tier-2 cadence riding desired state (ADR-0023: control.toml
+        replaces per-node env). An explicit local environment override —
+        i.e. a config value off the shipped default — wins; otherwise the
+        Control Node's value applies."""
+        if config_value != shipped_default:
+            return config_value
+        wire = self._desired.get(key)
+        if isinstance(wire, (int, float)) and not isinstance(wire, bool) and wire > 0:
+            return float(wire)
+        return config_value
+
+    def _heartbeat_seconds(self) -> float:
+        return self._wire_setting(
+            "heartbeat_seconds", self._config.heartbeat_seconds, DEFAULT_HEARTBEAT_SECONDS
+        )
+
+    def _stop_grace_seconds(self) -> float:
+        return self._wire_setting(
+            "stop_grace_seconds", self._config.stop_grace_seconds, DEFAULT_STOP_GRACE_SECONDS
+        )
+
     def _next_delay(self) -> float:
         """The inter-pass delay: the heartbeat interval normally; capped
         exponential backoff while the Control Node is unreachable, resetting
         the moment it answers again (revision ruling amending ADR-0015)."""
-        base = self._config.heartbeat_seconds
+        base = self._heartbeat_seconds()
         if self._unreachable_streak <= 1:
             return base
         return min(BACKOFF_CAP_SECONDS, base * 2 ** (self._unreachable_streak - 1))
@@ -245,15 +272,11 @@ class NodeDaemon:
         }
 
     def _exchange_heartbeat(self) -> list[dict[str, Any]]:
+        # Provisioning is registration (ADR-0023): the daemon never
+        # registers — it heartbeats with its per-node token, and a 401
+        # (revoked/unknown) surfaces as an unregistered sighting control-side.
         if self._client is None:
             return []
-        if not self._registered:
-            try:
-                self._client.register(self._config.node, self._config.version)
-                self._registered = True
-                self._log(f"registered node {self._config.node}")
-            except (ControlUnreachable, ControlError) as exc:
-                self._log(f"registration deferred: {exc}")
         try:
             answer = self._client.heartbeat(self._status_payload())
         except ControlUnreachable as exc:
@@ -314,7 +337,7 @@ class NodeDaemon:
             elif verb == "restart":
                 # Escalation step for a node that will not converge: stop
                 # the tree and re-exec in place, no install.
-                self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
+                self._supervisor.stop_all(grace_seconds=self._stop_grace_seconds())
                 self._ack(command_id)
                 self._log("restart command: re-exec")
                 self._execv(
@@ -388,7 +411,7 @@ class NodeDaemon:
     def _stop_stack(self, stack: WireStack) -> None:
         """Stop a Stack AND its labeled run containers (kill-the-tree)."""
         if stack.kind == "process":
-            self._supervisor.stop(stack.name, grace_seconds=self._config.stop_grace_seconds)
+            self._supervisor.stop(stack.name, grace_seconds=self._stop_grace_seconds())
         elif stack.compose_files:
             self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
             self._applied_compose.pop(stack.name, None)
@@ -452,7 +475,7 @@ class NodeDaemon:
         a served artifact set (the developer build path) is pulled from the
         Control Node and installed from local wheel files — nodes never
         pull source and never build."""
-        self._supervisor.stop_all(grace_seconds=self._config.stop_grace_seconds)
+        self._supervisor.stop_all(grace_seconds=self._stop_grace_seconds())
         artifacts = self._desired.get("product_artifacts")
         if isinstance(artifacts, list) and artifacts and self._client is not None:
             targets = self._pull_artifacts(pin, [str(a) for a in artifacts])
@@ -551,6 +574,15 @@ class NodeDaemon:
             "THEOZOLITH_JOBS_DIR": str(stack_jobs_dir(stack)),
             **stack.env,
         }
+        # The control channel for node-resident drivers (ADR-0023): they
+        # authenticate as the node that supervises them — the daemon hands
+        # its own per-node token down instead of a hand-configured shared
+        # token. Stack env wins (daemon-less dev keeps its own settings).
+        if self._config.control_url:
+            env.setdefault("CONTROL_NODE_URL", self._config.control_url)
+            env.setdefault("THEOZOLITH_NODE_TOKEN", self._config.node_token)
+            if self._config.tls_ca:
+                env.setdefault("THEOZOLITH_TLS_CA", self._config.tls_ca)
         if stack.run_image and stack.run_image in images:
             # The derived image this driver launches per Run (ADR-0013).
             env.setdefault("THEOZOLITH_RUN_IMAGE", images[stack.run_image]["tag"])
@@ -619,11 +651,20 @@ class NodeDaemon:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["provision"]:
+        # The one node-side human interaction (ADR-0023): paste the join
+        # string `theozolith join-token create` printed. Everything else on
+        # a node is this daemon.
+        from theozolith_nodedaemon.provisioning import main as provision_main
+
+        return provision_main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="theozolith-nodedaemon",
         description=(
-            "TheOzolith Node Daemon: register this box as a Container-Host, heartbeat to the"
-            " Control Node, reconcile declarative Stacks, build derived images, reap orphans."
+            "TheOzolith Node Daemon: heartbeat to the Control Node with this node's"
+            " provisioned token, reconcile declarative Stacks, build derived images,"
+            " reap orphans. 'provision <join-string>' joins a fresh box (ADR-0023)."
         ),
     )
     parser.add_argument(

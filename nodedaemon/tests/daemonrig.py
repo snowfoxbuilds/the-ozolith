@@ -172,8 +172,6 @@ class ScriptedControl:
         return status, json.dumps(answer).encode()
 
     def _answer(self, path: str, request: dict) -> tuple[int, Any]:
-        if path == "/nodes/register":
-            return 200, {"ok": True}
         if path == "/events":
             return 200, {"ok": True}
         if path.startswith("/product/artifacts/"):

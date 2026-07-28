@@ -2,26 +2,30 @@
 # Run it directly for bootstrap (the Control Node must exist before any node
 # can reconcile Stacks), or declare it in the Config Repo like any Stack.
 #
-# One-time provisioning (BEFORE the long-running service is healthy — until
-# it is done, `serve` exits and the container restarts; that is expected):
+# First run (ADR-0023) — one command generates everything, then prints the
+# operator handoff (DNS line, CA download URL, per-OS trust one-liners):
 #
-#   docker compose -f deploy/compose/control.yml run --rm control origin-init
-#     # mints the mandatory public origin (ADR-0019): one randomized
-#     # https://<slug>.theozolith.internal origin (--base-domain to change;
-#     # --port only for a nonstandard EXTERNAL port). Give its hostname a
-#     # trusted-network-only DNS record; production serve requires the origin.
-#   docker compose -f deploy/compose/control.yml run --rm control tls-init
-#     # TLS is mandatory (secrets transit this channel); tls-init covers the
-#     # public origin's hostname automatically. `--host <LAN name or IP>` adds
-#     # extras.
+#   docker compose -f deploy/compose/control.yml build
+#   docker compose -f deploy/compose/control.yml run --rm control init --ip <LAN-IP>
+#   docker compose -f deploy/compose/control.yml up -d
 #
-# then start it and distribute the minted CA:
+# --ip is REQUIRED here: inside the container an auto-detected address would
+# be the Docker bridge IP, so init refuses to guess (ADR-0031). Nodes dial
+# that IP directly (the node channel is IP-only; the slug hostname is
+# browser-only) — give this box a static IP or DHCP reservation.
 #
-#   docker compose --env-file .env -f deploy/compose/control.yml up -d
-#   docker compose -f deploy/compose/control.yml cp control:/data/tls/ca.pem .
-# (install-nodedaemon.sh --ca ca.pem pins it on every node).
+# All state lands under ~/.theozolith/ on the host (ADR-0024), partitioned:
+# configs/ (the git-backed Config Repo incl. control.toml), secrets/ (never
+# in any git tree), cache/ (deletable), logs/. Backup = copy ~/.theozolith/
+# minus cache/ to another device; recovery = restore + `run --rm control
+# recover` + browser DNS update (same IP: nodes reconnect untouched; new
+# IP: one join-string re-paste per node). GitHub is never a full backup. There is no .env: tier-2 settings live in control.toml (edited in
+# the dashboard), secrets in the encrypted store, and THEOZOLITH_* env vars
+# remain expert overrides only.
 #
-# Configuration comes from the environment (see deploy/.env.example).
+# Provision nodes afterwards: `theozolith join-token create` prints the one
+# paste per box (the join string rides the plaintext bootstrap listener's
+# port below; the installer rides GitHub HTTPS).
 
 services:
   control:
@@ -36,24 +40,17 @@ services:
       # The two are independent: remapping the bind side never changes the
       # accepted browser Host/Origin — only the origin artifact does.
       - "443:8443"
+      # The plaintext bootstrap listener (ADR-0023): exactly three public
+      # values — CA cert, public origin, canonical control URL. Nonstandard
+      # remappings must ride the join string (control.toml bootstrap_port).
+      - "6965:6965"
     environment:
-      THEOZOLITH_NODE_TOKEN: ${THEOZOLITH_NODE_TOKEN:?set in .env}
-      THEOZOLITH_ADMIN_TOKEN: ${THEOZOLITH_ADMIN_TOKEN:?set in .env}
-      # The control PAT: required for the pipeline — the Control Node writes
-      # every claim (ADR-0017) and runs the janitor. Unset = pure substrate
-      # observer; claim dispatch answers 503 and the pipeline pauses.
+      # The partitioned data dir inside the container; the volume below
+      # makes ~/.theozolith on the host the real home.
+      THEOZOLITH_DATA_DIR: /data
+      # Optional pipeline identity (ADR-0017); without it the Control Node
+      # is a pure substrate observer and dispatch answers 503.
       THEOZOLITH_REPO: ${THEOZOLITH_REPO:-}
       CONTROL_GITHUB_TOKEN: ${CONTROL_GITHUB_TOKEN:-}
-      THEOZOLITH_ZOMBIE_GRACE_SECONDS: ${THEOZOLITH_ZOMBIE_GRACE_SECONDS:-600}
-      THEOZOLITH_JANITOR_SWEEP_SECONDS: ${THEOZOLITH_JANITOR_SWEEP_SECONDS:-60}
-      THEOZOLITH_ACTIVATION_WINDOW_SECONDS: ${THEOZOLITH_ACTIVATION_WINDOW_SECONDS:-60}
-      THEOZOLITH_TAIL_BUDGET_BYTES: ${THEOZOLITH_TAIL_BUDGET_BYTES:-10737418240}
     volumes:
-      # SQLite DB, master key, TLS material. The master key protects every
-      # secret: this volume is the thing to back up and to guard.
-      - control-data:/data
-      # The Config Repo working home (ADR-0006), read-only in the container.
-      - ${THEOZOLITH_CONFIG_REPO:-~/.theozolith/configs}:/configs:ro
-
-volumes:
-  control-data:
+      - ${THEOZOLITH_HOME:-~/.theozolith}:/data

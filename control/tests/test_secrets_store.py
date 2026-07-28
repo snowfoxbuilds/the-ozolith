@@ -30,10 +30,19 @@ def test_non_referencing_node_is_denied(control):
     control.write_config("stacks/worker.toml", WORKER_STACK)
     enter_secret(control)
 
-    denied = control.node_post("/api/v1/secrets/pull", {"node": "box2", "names": ["github-worker"]})
+    denied = control.node_post(
+        "/api/v1/secrets/pull", {"node": "box2", "names": ["github-worker"]}, node="box2"
+    )
     assert denied.status_code == 403
     # A node with no Stacks at all may pull nothing (the brief's exact case).
     assert "no Stack referencing" in denied.json()["detail"]
+    # And box2's token cannot pull AS box1 (per-node identity, ADR-0023).
+    imposter = control.node_post(
+        "/api/v1/secrets/pull",
+        {"node": "box1", "names": ["github-worker"]},
+        token=control.node_token("box2"),
+    )
+    assert imposter.status_code == 403
 
 
 def test_secret_entry_requires_the_admin_token(control):
@@ -58,11 +67,11 @@ def test_at_rest_storage_is_encrypted(control):
     control.write_config("stacks/worker.toml", WORKER_STACK)
     enter_secret(control)
 
-    raw = control.settings.db_path.read_bytes()
+    raw = control.settings.store_db_path.read_bytes()
     assert SENTINEL.encode() not in raw
     # The name is metadata, the value is not: re-reading through the store
     # without the box also yields only ciphertext.
-    token = control.store.get_secret_token("github-worker")
+    token = control.secret_store.get_secret_token("github-worker")
     assert token is not None and SENTINEL not in token
 
 
@@ -89,15 +98,17 @@ def test_secret_endpoints_refuse_a_non_tls_channel(tmp_path):
 def test_key_rotation_reencrypts_everything(control):
     control.write_config("stacks/worker.toml", WORKER_STACK)
     enter_secret(control)
-    old_token = control.store.get_secret_token("github-worker")
+    old_token = control.secret_store.get_secret_token("github-worker")
 
     new_box = SecretBox(generate_key())
-    control.store.replace_secret_tokens(
+    control.secret_store.replace_secret_tokens(
         {
-            name: new_box.encrypt(control.box.decrypt(control.store.get_secret_token(name) or ""))
-            for name in control.store.secret_names()
+            name: new_box.encrypt(
+                control.box.decrypt(control.secret_store.get_secret_token(name) or "")
+            )
+            for name in control.secret_store.secret_names()
         }
     )
-    new_token = control.store.get_secret_token("github-worker")
+    new_token = control.secret_store.get_secret_token("github-worker")
     assert new_token != old_token
     assert new_box.decrypt(new_token or "") == SENTINEL

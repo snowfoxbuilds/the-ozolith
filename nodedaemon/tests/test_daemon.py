@@ -869,3 +869,35 @@ def test_dead_drivers_run_dir_never_blocks_node_wide_update(rig: Rig, tmp_path):
     rig.control.heartbeat_answers.append(pinned_response([stack], commands=[update]))
     rig.daemon.once()
     assert rig.update_calls and rig.execv_calls  # orphaned dir never deferred
+
+
+# -- ADR-0023: the daemon owns its drivers' control channel -----------------------
+
+
+def test_channel_env_is_injected_into_process_stacks(rig: Rig):
+    """Node-resident drivers authenticate as their node: the daemon hands
+    its control URL, per-node token, and pinned CA down — Stack env wins
+    (the daemon-less dev override)."""
+    pinned = process_stack("reviewer", env={"CONTROL_NODE_URL": "http://elsewhere.test"})
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker"), pinned]))
+    rig.daemon.once()
+
+    by_name = {p.args[0]: p.env for p in rig.popen.spawned}
+    assert by_name["worker-driver"]["CONTROL_NODE_URL"] == "http://control.test"
+    assert by_name["worker-driver"]["THEOZOLITH_NODE_TOKEN"] == "node-token"
+    assert by_name["reviewer-driver"]["CONTROL_NODE_URL"] == "http://elsewhere.test"
+
+
+def test_wire_cadences_apply_unless_locally_overridden(rig: Rig):
+    """control.toml cadences ride desired state (ADR-0023): the wire value
+    drives the heartbeat delay when the local config sits on its shipped
+    default; an explicit local override wins."""
+    answer = heartbeat_response([])
+    answer["config"]["heartbeat_seconds"] = 5
+    answer["config"]["stop_grace_seconds"] = 2
+    rig.control.heartbeat_answers.append(answer)
+    rig.daemon.once()
+    # heartbeat_seconds sits on the shipped default (60): the wire wins.
+    assert rig.daemon._next_delay() == 5.0
+    # stop_grace_seconds is locally overridden (0.5 in the rig): local wins.
+    assert rig.daemon._stop_grace_seconds() == 0.5

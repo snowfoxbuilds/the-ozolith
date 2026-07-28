@@ -18,6 +18,7 @@ import uvicorn
 from conftest import Harness, RecordingSink
 from theozolith_control.app import create_app
 from theozolith_control.crypto import SecretBox, generate_key
+from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_worker.dispatch import DispatchClient
@@ -27,8 +28,8 @@ from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.reviewer import run_reviewer
 from theozolith_worker.worker import run_worker
 
-NODE_TOKEN = "node-token"
 CONTROL_LOGIN = "ozolith-control"
+NODE_NAME = "box1"  # matches THEOZOLITH_NODE_NAME in the harness env
 DEAD_URL = "http://127.0.0.1:9"  # the discard port: nothing ever answers
 
 
@@ -43,22 +44,30 @@ class LiveControl:
         settings = ControlSettings(
             data_dir=data_dir,
             config_repo=data_dir / "configs",
-            node_token=NODE_TOKEN,
             admin_token="admin-token",
             repo=harness.fake.repo,
             github_token="tok-control",
             api_url="",
-            zombie_grace_seconds=600,
-            janitor_sweep_seconds=60,
-            activation_window_seconds=60,
-            tail_budget_bytes=10 * 1024**3,
         )
         harness.fake.register("tok-control", CONTROL_LOGIN)
-        self.store = Store(settings.db_path)
+        self.store = Store(settings.cache_db_path)
+        # Provisioning is registration (ADR-0023): a "restarted" instance
+        # reopens the same store.db, so the minted token hash survives with
+        # it — and this side keeps the plaintext exactly as a real node
+        # keeps its provisioned copy across Control Node restarts.
+        secret_store = SecretStore(settings.store_db_path)
+        token_copy = data_dir / "provisioned-node-token"
+        if token_copy.exists():
+            self.node_token = token_copy.read_text().strip()
+        else:
+            self.node_token = secret_store.mint_node_token(NODE_NAME)
+            token_copy.write_text(self.node_token)
         github = GitHubClient(
             harness.fake.repo, "tok-control", transport=harness.fake, sleep=lambda s: None
         )
-        app = create_app(settings, self.store, SecretBox(generate_key()), github_client=github)
+        app = create_app(
+            settings, self.store, secret_store, SecretBox(generate_key()), github_client=github
+        )
         self._server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
         )
@@ -83,10 +92,10 @@ class LiveControl:
         self.stop()
 
     def sink(self) -> ControlNodeSink:
-        return ControlNodeSink(self.url, token=NODE_TOKEN, timeout=2.0)
+        return ControlNodeSink(self.url, token=self.node_token, timeout=2.0)
 
     def dispatch(self, timeout: float = 5.0) -> DispatchClient:
-        return DispatchClient(self.url, NODE_TOKEN, timeout=timeout)
+        return DispatchClient(self.url, self.node_token, timeout=timeout)
 
     def run_phases(self, issue: int) -> list[str]:
         return [e["phase"] for e in self.store.events(type="theozolith.run", issue=issue)]
@@ -182,8 +191,8 @@ def test_dead_control_node_pauses_new_claims(harness: Harness):
     """ADR-0017: no second claim path — a dead Control Node means no new
     claims, and the issue is left exactly as it was."""
     issue = harness.file_issue("waiting", "nobody claims me")
-    dispatch = DispatchClient(DEAD_URL, NODE_TOKEN, timeout=0.3)
-    sink = ControlNodeSink(DEAD_URL, token=NODE_TOKEN, timeout=0.3)
+    dispatch = DispatchClient(DEAD_URL, "any-token", timeout=0.3)
+    sink = ControlNodeSink(DEAD_URL, token="any-token", timeout=0.3)
 
     assert worker_once(harness, sink=sink, dispatch=dispatch) == 0
     assert harness.fake.assignees_of(issue) == []

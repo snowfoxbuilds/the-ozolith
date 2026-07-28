@@ -32,10 +32,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from theozolith_control import product
+from theozolith_control import joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
+from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import COMMAND_VERBS, EVENT_ERROR, EVENT_PROGRESS, Store
 
@@ -53,6 +54,13 @@ EVENT_PAYLOAD_LIMIT = 32_768
 
 DISPATCH_ROLES = ("worker", "reviewer")
 
+# Join-token defaults (ADR-0023): short-lived and single-use unless the
+# operator widens them for a batch provisioning session.
+JOIN_TOKEN_TTL_SECONDS = 3600.0
+JOIN_TOKEN_USES = 1
+
+JOIN_TOKEN_REJECTED = "join token rejected (expired, consumed, or revoked)"
+
 
 def _bearer(request: Request) -> str:
     header = request.headers.get("authorization", "")
@@ -61,7 +69,7 @@ def _bearer(request: Request) -> str:
 
 
 def _authorize(request: Request, expected: str, who: str) -> None:
-    if not hmac.compare_digest(_bearer(request), expected):
+    if not expected or not hmac.compare_digest(_bearer(request), expected):
         raise HTTPException(status_code=401, detail=f"{who} token required")
 
 
@@ -114,6 +122,7 @@ def _capped_event(body: dict[str, Any]) -> dict[str, Any]:
 def create_app(
     settings: ControlSettings,
     store: Store,
+    secret_store: SecretStore,
     box: SecretBox,
     *,
     config_loader=None,
@@ -125,6 +134,7 @@ def create_app(
     # is still a separate process; these are for the in-process loops).
     app.state.settings = settings
     app.state.store = store
+    app.state.secret_store = secret_store
 
     if github_client is None and settings.coordination_jobs_enabled:
         from theozolith_worker.githubapi import GitHubClient
@@ -154,21 +164,39 @@ def create_app(
     async def healthz() -> dict[str, Any]:
         return {"ok": True}
 
-    # -- node channel (node token) -----------------------------------------
+    # -- node channel (per-node tokens, ADR-0023) ---------------------------
 
-    @app.post("/api/v1/nodes/register")
-    async def register(request: Request) -> dict[str, Any]:
-        _authorize(request, settings.node_token, "node")
-        body = await _json_body(request)
-        node = _require(body, "node", str)
-        store.touch_node(node, str(body.get("version", "")))
-        return {"ok": True}
+    def _node_auth(request: Request, declared: str | None = None) -> str:
+        """Resolve the per-node bearer token to its node. Provisioning is
+        registration: an unknown or revoked token never creates anything —
+        401. A declared node name that is not the token's node is refused:
+        per-node tokens exist exactly so no node can speak as another."""
+        node = secret_store.node_for_token(_bearer(request))
+        if node is None:
+            raise HTTPException(status_code=401, detail="per-node token required (provision first)")
+        if declared and declared != node:
+            raise HTTPException(
+                status_code=403,
+                detail=f"token belongs to node {node!r}, request claims {declared!r}",
+            )
+        return node
 
     @app.post("/api/v1/heartbeats")
     async def heartbeat(request: Request) -> dict[str, Any]:
-        _authorize(request, settings.node_token, "node")
         body = await _json_body(request)
         node = _require(body, "node", str)
+        if secret_store.node_for_token(_bearer(request)) is None:
+            # Rejected, and never a node record — but surfaced: the sighting
+            # (self-declared name, source address, last seen) is the
+            # unregistered-nodes view, the re-provision worklist after a
+            # stale-backup recovery (ADR-0023/0024). Advisory only.
+            client = request.client
+            store.record_unregistered(node, client.host if client else "")
+            raise HTTPException(status_code=401, detail="per-node token required (provision first)")
+        _node_auth(request, node)
+        # A valid heartbeat settles any stale sightings under this name
+        # (e.g. the window between provisioning and the first heartbeat).
+        store.clear_unregistered(node)
         store.touch_node(node, str(body.get("version", "")))
         store.record_status(
             node,
@@ -184,6 +212,10 @@ def create_app(
         # in-flight Run ride the heartbeat as deferrals (NODE-SUBSTRATE).
         store.record_deferrals(node, _list_of_dicts(body, "deferred_commands"))
         config_doc = _config().desired_state_for(node)
+        # Tier-2 cadence settings ride desired state (ADR-0023: control.toml
+        # replaces per-node env files) — declarations, never values.
+        config_doc["heartbeat_seconds"] = settings.heartbeat_seconds
+        config_doc["stop_grace_seconds"] = settings.stop_grace_seconds
         pin = config_doc.get("product_version") or ""
         if pin:
             # Developer-path builds (ADR-0015 amendment 2026-07-22): when the
@@ -222,8 +254,10 @@ def create_app(
 
     @app.post("/api/v1/events")
     async def ingest_event(request: Request) -> dict[str, Any]:
-        _authorize(request, settings.node_token, "node")
         body = await _json_body(request)
+        # An event declaring a node must come from that node's token —
+        # events are facts about the past, and the past has an author.
+        _node_auth(request, str(body.get("node", "")) or None)
         _require(body, "type", str)
         store.record_event(_capped_event(body))
         return {"ok": True}
@@ -233,7 +267,6 @@ def create_app(
         """The one claim path (ADR-0017): grant for Workers, discovery for
         the Reviewer. Requires the control PAT — without it the pipeline
         pauses (no second claim path exists)."""
-        _authorize(request, settings.node_token, "node")
         if dispatcher is None:
             raise HTTPException(
                 status_code=503,
@@ -243,6 +276,9 @@ def create_app(
                 ),
             )
         body = await _json_body(request)
+        # Drivers are node-resident (ADR-0013): they present the token of
+        # the node that supervises them, injected by its daemon.
+        node = _node_auth(request, str(body.get("node", "")) or None)
         role = _require(body, "role", str)
         if role not in DISPATCH_ROLES:
             raise HTTPException(
@@ -250,7 +286,6 @@ def create_app(
             )
         worker = _require(body, "worker", str)
         login = _require(body, "login", str)
-        node = str(body.get("node", ""))
         # The pin-eligibility gate (ADR-0015 revision) needs the recorded
         # pin. Fail-open on a broken Config Repo: an unreadable repo must
         # not silence dispatch — it is loudly visible everywhere else.
@@ -271,10 +306,13 @@ def create_app(
 
     @app.post("/api/v1/secrets/pull")
     async def secrets_pull(request: Request) -> dict[str, Any]:
-        _authorize(request, settings.node_token, "node")
         _secrets_channel_guard()
         body = await _json_body(request)
         node = _require(body, "node", str)
+        # The node-scoping seam was self-declared identity (ADR-0015's
+        # accepted risk); per-node tokens close it — the pull filter now
+        # keys on a cryptographically attributed node name.
+        _node_auth(request, node)
         names = body.get("names")
         if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
             raise HTTPException(status_code=400, detail="'names' must be a list of strings")
@@ -289,11 +327,50 @@ def create_app(
             )
         values: dict[str, str] = {}
         for name in names:
-            token = store.get_secret_token(name)
+            token = secret_store.get_secret_token(name)
             if token is None:
                 raise HTTPException(status_code=404, detail=f"secret {name!r} has no stored value")
             values[name] = box.decrypt(token)
         return {"secrets": values}
+
+    # -- provisioning: the join-token exchange (ADR-0023) --------------------
+
+    @app.post("/api/v1/join/exchange")
+    async def join_exchange(request: Request) -> dict[str, Any]:
+        """The sole way a node comes to exist. The join token IS the
+        credential (no bearer header); it is consumed here, over verified
+        TLS only — the response carries the freshly minted per-node token."""
+        _secrets_channel_guard()
+        body = await _json_body(request)
+        node = _require(body, "node", str)
+        if not product.safe_segment(node) or len(node) > 64:
+            raise HTTPException(status_code=400, detail=f"node name {node!r} is not usable")
+        token_hex = _require(body, "token", str)
+        try:
+            raw = bytes.fromhex(token_hex)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="'token' must be hex") from None
+        if not store.redeem_join_token(raw):
+            # One deliberate answer for expired, consumed, revoked, and
+            # never-existed: nothing is persisted, node-side text stays put.
+            raise HTTPException(status_code=401, detail=JOIN_TOKEN_REJECTED)
+        # Re-provisioning an already-known node ROTATES its token (mint
+        # replaces) — the IP-change recovery path is one re-paste per node
+        # (ADR-0023 § node channel addressing).
+        node_token = secret_store.mint_node_token(node)
+        store.touch_node(node)
+        store.clear_unregistered(node)
+        # The node channel is IP-only (ADR-0023 as amended 2026-07-28): the
+        # answer echoes the IP-based URL the node just verified — scheme +
+        # the address it dialed (its Host header) — never the browser-only
+        # slug origin. Nodes have zero DNS dependency.
+        dialed = request.headers.get("host", "")
+        return {
+            "node": node,
+            "node_token": node_token,
+            "control_url": f"https://{dialed}" if dialed else "",
+            "heartbeat_seconds": settings.heartbeat_seconds,
+        }
 
     # -- operator surface (admin token) --------------------------------------
 
@@ -305,13 +382,92 @@ def create_app(
         value = _require(body, "value", str)
         # Encrypted before it touches the store; write-only entry — no API
         # returns a stored value to an admin (values are pull-only, to nodes).
-        store.put_secret(name, box.encrypt(value))
+        secret_store.put_secret(name, box.encrypt(value))
         return {"ok": True}
 
     @app.get("/api/v1/secrets")
     async def secret_names(request: Request) -> dict[str, Any]:
         _authorize(request, settings.admin_token, "admin")
-        return {"names": store.secret_names()}
+        return {"names": secret_store.secret_names()}
+
+    # -- join tokens + node revocation (admin; ADR-0023) ----------------------
+
+    def _join_material(explicit_addr: str) -> tuple[str, str]:
+        """(addr, ca fingerprint) for a join string. The CA must exist —
+        a join string pins its fingerprint or it does not exist — and the
+        default address is the init-persisted control IP (ADR-0031): never
+        detected at mint time, so a containerized Control Node can never
+        leak its bridge address into a paste."""
+        try:
+            fingerprint = tls.ca_fingerprint_sha256((settings.tls_dir / tls.CA_FILE).read_bytes())
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"no usable CA at {settings.tls_dir} — run 'theozolith-control init'"
+                f" first ({exc})",
+            ) from exc
+        addr = explicit_addr
+        if not addr:
+            if not settings.control_ip:
+                raise HTTPException(
+                    status_code=409,
+                    detail="no persisted control IP — run 'theozolith-control init'"
+                    " (ADR-0031), or pass an explicit 'addr'",
+                )
+            addr = f"{settings.control_ip}:{settings.bootstrap_port}"
+        return addr, fingerprint
+
+    @app.post("/api/v1/join-tokens")
+    async def join_token_create(request: Request) -> dict[str, Any]:
+        """Mint a join token and answer the complete paste (ADR-0023: the
+        operator never composes the line). Default 1h TTL, single use;
+        ttl_seconds/uses widen it for batch provisioning sessions."""
+        _authorize(request, settings.admin_token, "admin")
+        body = await _json_body(request)
+        ttl = body.get("ttl_seconds", JOIN_TOKEN_TTL_SECONDS)
+        uses = body.get("uses", JOIN_TOKEN_USES)
+        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
+            raise HTTPException(status_code=400, detail="'ttl_seconds' must be a positive number")
+        if not isinstance(uses, int) or isinstance(uses, bool) or uses < 1:
+            raise HTTPException(status_code=400, detail="'uses' must be a positive integer")
+        explicit_addr = body.get("addr", "")
+        if not isinstance(explicit_addr, str):
+            raise HTTPException(status_code=400, detail="'addr' must be a string or absent")
+        addr, fingerprint = _join_material(explicit_addr)
+        token_id, raw, expires_at = store.create_join_token(ttl_seconds=float(ttl), uses=uses)
+        join = joinstring.compose(
+            addr=addr, ca_sha256=fingerprint, token=raw, expires_at=expires_at
+        )
+        return {
+            "id": token_id,
+            "join_string": join,
+            # Node already installed: one paste. Fresh box: the installer
+            # rides a pre-trusted channel (GitHub release HTTPS) and hands
+            # off to provision as its final step — never the bootstrap
+            # listener (ADR-0023: code never rides plaintext).
+            "provision_command": f"sudo theozolith-nodedaemon provision '{join}'",
+            "install_command": (f"curl -fsSL {settings.installer_url} | sudo bash -s -- '{join}'"),
+            "expires_at": expires_at,
+            "uses": uses,
+        }
+
+    @app.get("/api/v1/join-tokens")
+    async def join_token_list(request: Request) -> dict[str, Any]:
+        _authorize(request, settings.admin_token, "admin")
+        return {"tokens": store.join_tokens()}
+
+    @app.delete("/api/v1/join-tokens/{token_id}")
+    async def join_token_revoke(token_id: str, request: Request) -> dict[str, Any]:
+        _authorize(request, settings.admin_token, "admin")
+        return {"revoked": store.revoke_join_token(token_id)}
+
+    @app.post("/api/v1/nodes/{node}/revoke")
+    async def node_revoke(node: str, request: Request) -> dict[str, Any]:
+        """Remove a node from the fleet: per-node tokens never expire, so
+        leaving the fleet is explicit revocation (ADR-0023). Its heartbeats
+        401 from now on and surface as unregistered sightings."""
+        _authorize(request, settings.admin_token, "admin")
+        return {"revoked": secret_store.revoke_node_token(node)}
 
     @app.post("/api/v1/commands")
     async def queue_command(request: Request) -> dict[str, Any]:
@@ -397,7 +553,7 @@ def create_app(
 
     @app.get("/api/v1/product/artifacts/{version}/{filename}")
     async def pull_artifact(version: str, filename: str, request: Request):
-        _authorize(request, settings.node_token, "node")
+        _node_auth(request)
         if not product.safe_segment(version) or not product.safe_segment(filename):
             raise HTTPException(status_code=400, detail="unsafe artifact path segment")
         path = settings.artifacts_dir / version / filename
@@ -416,7 +572,11 @@ def create_app(
     @app.get("/api/v1/state")
     async def state(request: Request) -> dict[str, Any]:
         _authorize(request, settings.admin_token, "admin")
-        return store.fleet_state()
+        return {
+            **store.fleet_state(),
+            "provisioned_nodes": secret_store.provisioned_nodes(),
+            "unregistered_nodes": store.unregistered_nodes(),
+        }
 
     @app.get("/api/v1/flags")
     async def flags(request: Request) -> dict[str, Any]:
@@ -432,6 +592,6 @@ def create_app(
 
     from theozolith_control.web import mount_web
 
-    mount_web(app, settings, store, box, _config)
+    mount_web(app, settings, store, secret_store, box, _config)
 
     return app

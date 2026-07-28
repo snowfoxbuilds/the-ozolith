@@ -8,11 +8,12 @@ services:
       # External https default (443) onto the Uvicorn bind (8443): the
       # public origin stays portless; the bind port is invisible to browsers.
       - "443:8443"
+      # The plaintext bootstrap listener (ADR-0023): CA cert, origin,
+      # control URL — what `theozolith-nodedaemon provision` dials first.
+      - "6965:6965"
     environment:
-      THEOZOLITH_NODE_TOKEN_FILE: /run/secrets/node-token
-      THEOZOLITH_ADMIN_TOKEN_FILE: /run/secrets/admin-token
+      THEOZOLITH_DATA_DIR: /data
     volumes:
-      - control-data:/data
-      - /home/ozolith/.theozolith/configs:/configs:ro
-volumes:
-  control-data:
+      # The partitioned ~/.theozolith home (ADR-0024): configs/, secrets/,
+      # cache/, logs/ — init-generated, backed up minus cache/.
+      - /home/ozolith/.theozolith:/data

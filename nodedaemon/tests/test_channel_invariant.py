@@ -3,7 +3,7 @@ crosses the heartbeat/command channel contains desired state and references
 only — the sole value payload is the node-scoped secrets-pull response.
 
 The REAL Node Daemon reconciles against the REAL control-plane app for
-several passes (registration, heartbeats with status, a queued command and
+several passes (per-node-token heartbeats with status, a queued command and
 its ack, a secret-referencing Stack that triggers a pull); every exchange is
 captured at the transport seam and then scanned.
 """
@@ -17,6 +17,7 @@ from daemonrig import FakeDocker, FakePopen
 from fastapi.testclient import TestClient
 from theozolith_control.app import create_app
 from theozolith_control.crypto import SecretBox, generate_key
+from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_nodedaemon.config import DaemonConfig
@@ -27,7 +28,6 @@ from theozolith_nodedaemon.stacks import ProcessSupervisor
 SECRET_VALUE = "ghp_THEACTUALSECRETVALUE999"
 
 KNOWN_CHANNEL_PATHS = {
-    "/api/v1/nodes/register",
     "/api/v1/heartbeats",
     "/api/v1/secrets/pull",
     # theozolith.error summaries (2026-07-21 grilling): references and
@@ -56,15 +56,10 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     settings = ControlSettings(
         data_dir=tmp_path / "data",
         config_repo=tmp_path / "configs",
-        node_token="node-token",
         admin_token="admin-token",
         repo=None,
         github_token=None,
         api_url="",
-        zombie_grace_seconds=600,
-        janitor_sweep_seconds=60,
-        activation_window_seconds=60,
-        tail_budget_bytes=10 * 1024**3,
         secrets_channel_ok=True,  # TLS-mandatory is proven in test_tls.py
     )
     stack_toml = tmp_path / "configs" / "stacks" / "worker.toml"
@@ -74,11 +69,15 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
         '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n',
         encoding="utf-8",
     )
-    store = Store(settings.db_path)
+    store = Store(settings.cache_db_path)
+    secret_store = SecretStore(settings.store_db_path)
     box = SecretBox(generate_key())
-    store.put_secret("github-worker", box.encrypt(SECRET_VALUE))
+    secret_store.put_secret("github-worker", box.encrypt(SECRET_VALUE))
+    # Provisioning is registration (ADR-0023): the daemon presents the
+    # per-node token the join exchange minted.
+    node_token = secret_store.mint_node_token("box1")
     store.queue_command("box1", "recycle", "worker")
-    web = TestClient(create_app(settings, store, box))
+    web = TestClient(create_app(settings, store, secret_store, box))
 
     # -- the real daemon, its transport tapped --------------------------------
     transcript: list[tuple[str, str, bytes, bytes]] = []
@@ -97,7 +96,7 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     config = DaemonConfig(
         node="box1",
         control_url="http://control.test",
-        node_token="node-token",
+        node_token=node_token,
         tls_ca=None,
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "run",
@@ -110,12 +109,12 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
         config,
         docker=FakeDocker(),  # type: ignore[arg-type]
         client=ControlClient(
-            "http://control.test", "node-token", insecure_dev=True, transport=tapped_transport
+            "http://control.test", node_token, insecure_dev=True, transport=tapped_transport
         ),
         supervisor=ProcessSupervisor(popen=popen, log=lambda *_: None),
         log=lambda *_: None,
     )
-    daemon.once()  # register + heartbeat + recycle command + pull + start
+    daemon.once()  # heartbeat + recycle command + pull + start
     daemon.once()  # ack rides this heartbeat
 
     # -- the invariant ------------------------------------------------------------

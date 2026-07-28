@@ -10,6 +10,7 @@ binary needed — the ``cryptography`` package is already a control/ dependency.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import ipaddress
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 CA_FILE = "ca.pem"
+CA_KEY_FILE = "ca.key"
 CERT_FILE = "server.pem"
 KEY_FILE = "server.key"
 
@@ -87,6 +89,28 @@ def provision(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
         .sign(ca_key, hashes.SHA256())
     )
 
+    server_key, server_cert = _issue_server_cert(ca_name, ca_key, hosts, not_before, not_after)
+
+    ca_path = tls_dir / CA_FILE
+    cert_path = tls_dir / CERT_FILE
+    key_path = tls_dir / KEY_FILE
+    _write(ca_path, ca_cert.public_bytes(serialization.Encoding.PEM))
+    _write(cert_path, server_cert.public_bytes(serialization.Encoding.PEM))
+    _write(key_path, _pem_key(server_key), private=True)
+    # The CA key stays for server-cert re-mints — recovery on a new box
+    # re-issues the server certificate with the new IP in its SAN while
+    # nodes keep trusting the pinned CA (ADR-0024) — locked down.
+    _write(tls_dir / CA_KEY_FILE, _pem_key(ca_key), private=True)
+    return ca_path, cert_path, key_path
+
+
+def _issue_server_cert(
+    ca_name: x509.Name,
+    ca_key: ec.EllipticCurvePrivateKey,
+    hosts: list[str],
+    not_before: datetime.datetime,
+    not_after: datetime.datetime,
+) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
     names: list[x509.GeneralName] = []
     for host in hosts:
         try:
@@ -113,14 +137,44 @@ def provision(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
         )
         .sign(ca_key, hashes.SHA256())
     )
+    return server_key, server_cert
 
-    ca_path = tls_dir / CA_FILE
-    cert_path = tls_dir / CERT_FILE
-    key_path = tls_dir / KEY_FILE
-    _write(ca_path, ca_cert.public_bytes(serialization.Encoding.PEM))
+
+def remint_server_cert(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path]:
+    """Re-issue the server certificate from the EXISTING CA — the recovery
+    move (ADR-0024): a restored Control Node lands on a new IP, the new SAN
+    goes in the cert, and nodes reconnect untouched because they pin the CA,
+    not the server certificate. Returns (cert, key) paths."""
+    if not hosts:
+        raise ValueError("at least one host (DNS name or IP) is required")
+    for host in hosts:
+        if "*" in host:
+            raise ValueError(f"wildcard host {host!r} refused — one TLS identity per deployment")
+    try:
+        ca_cert = x509.load_pem_x509_certificate((tls_dir / CA_FILE).read_bytes())
+        ca_key = serialization.load_pem_private_key((tls_dir / CA_KEY_FILE).read_bytes(), None)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot load the CA keypair from {tls_dir}: {exc}") from exc
+    if not isinstance(ca_key, ec.EllipticCurvePrivateKey):
+        raise ValueError(f"{tls_dir / CA_KEY_FILE} is not the expected EC private key")
+    now = datetime.datetime.now(datetime.UTC)
+    server_key, server_cert = _issue_server_cert(
+        ca_cert.subject,
+        ca_key,
+        hosts,
+        now - datetime.timedelta(minutes=5),
+        min(now + datetime.timedelta(days=_VALID_DAYS), ca_cert.not_valid_after_utc),
+    )
+    cert_path, key_path = tls_dir / CERT_FILE, tls_dir / KEY_FILE
     _write(cert_path, server_cert.public_bytes(serialization.Encoding.PEM))
     _write(key_path, _pem_key(server_key), private=True)
-    # The CA key signs exactly two certs and is never needed again unless
-    # the operator re-provisions; keep it for that, locked down.
-    _write(tls_dir / "ca.key", _pem_key(ca_key), private=True)
-    return ca_path, cert_path, key_path
+    return cert_path, key_path
+
+
+def ca_fingerprint_sha256(ca_pem: bytes) -> str:
+    """The CA certificate's SHA-256 fingerprint (over the DER encoding —
+    the standard certificate fingerprint), hex. This is what the join
+    string pins and what `provision` verifies before transmitting anything
+    (ADR-0023); the node side computes the same digest stdlib-only."""
+    cert = x509.load_pem_x509_certificate(ca_pem)
+    return hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()

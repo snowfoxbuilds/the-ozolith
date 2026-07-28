@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 import uvicorn
-from controlrig import ADMIN_TOKEN, NODE_TOKEN, make_rig
+from controlrig import ADMIN_TOKEN, make_rig
 from theozolith_control.tls import provision
 from theozolith_nodedaemon.controlclient import ControlClient
 
@@ -85,7 +85,7 @@ def test_secrets_transit_tls_end_to_end(tmp_path: Path):
             assert resp.status == 200
 
         # The REAL node-side client, pinned to the CA (THEOZOLITH_TLS_CA).
-        client = ControlClient(live.url, NODE_TOKEN, ca=str(ca))
+        client = ControlClient(live.url, rig.node_token(), ca=str(ca))
         assert client.pull_secrets("box1", ["github-worker"]) == {"github-worker": SENTINEL}
 
         # Without the CA the handshake itself fails: nothing transits.
@@ -110,7 +110,7 @@ def test_plain_http_server_refuses_secret_traffic(tmp_path: Path):
             urllib.request.urlopen(request)
         assert denied.value.code == 403
 
-        client = ControlClient(live.url, NODE_TOKEN, insecure_dev=True)  # client would try…
+        client = ControlClient(live.url, rig.node_token(), insecure_dev=True)  # client would try…
         with pytest.raises(Exception, match="403"):
             client.pull_secrets("box1", ["github-worker"])  # …the server still refuses
 

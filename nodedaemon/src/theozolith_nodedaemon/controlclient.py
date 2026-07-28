@@ -84,9 +84,6 @@ class ControlClient:
             raise ControlError(f"POST {path}: non-JSON answer") from exc
         return answer if isinstance(answer, dict) else {}
 
-    def register(self, node: str, version: str) -> None:
-        self._post("/api/v1/nodes/register", {"node": node, "version": version})
-
     def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One heartbeat; the answer carries commands + desired state."""
         return self._post("/api/v1/heartbeats", payload)

@@ -3,7 +3,7 @@
 Every variable honors the VAR_FILE convention (NODE-SUBSTRATE.md): if
 ``<NAME>_FILE`` is set, the value is read from that file. This is how secrets
 arrive when the Control Node materializes them to /run/secrets in M3+; with a
-plain ``.env`` (M2 deploys) the direct variables work unchanged.
+plain exported variables (daemon-less dev) they work unchanged.
 
 The clone URL defaults to the tokenless HTTPS remote: the PAT never lands in
 a checkout's ``.git/config`` — the driver authenticates via environment-level
@@ -39,7 +39,7 @@ def env_value(environ: Mapping[str, str], name: str, default: str | None = None)
 def _first(environ: Mapping[str, str], *names: str, default: str | None = None) -> str | None:
     """The first of ``names`` present in the environment (VAR_FILE honored).
 
-    Lookup chains let one shared .env configure both drivers: role-prefixed
+    Lookup chains let one shared environment configure both drivers: role-prefixed
     variables (WORKER_GITHUB_TOKEN, REVIEWER_MODEL, …) win over the generic
     THEOZOLITH_* names.
     """

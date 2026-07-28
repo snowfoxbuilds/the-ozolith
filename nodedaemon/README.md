@@ -2,9 +2,14 @@
 
 Node Daemon (renamed from "Node Agent" — Agent is reserved for LLM tool configs;
 ADR-0013): the uncontainerized TheOzolith daemon installed on every physical node,
-registering it as a Container-Host. Stdlib-only; installed by
-`deploy/install-nodedaemon.sh` as a systemd unit with `KillMode=control-group` — every
-TheOzolith process on the node is a live descendant of this daemon or does not exist.
+making it a Container-Host. Stdlib-only; installed by `deploy/install-nodedaemon.sh`
+as a systemd unit with `KillMode=control-group` — every TheOzolith process on the
+node is a live descendant of this daemon or does not exist. A box joins the fleet
+with one pasted join string: `theozolith-nodedaemon provision` verifies the pinned
+CA fingerprint before transmitting anything, exchanges the short-lived join token
+for this node's own non-expiring bearer token, and persists everything under the
+state dir — no environment configuration remains (ADR-0023; provisioning IS
+registration).
 
 Each pass (60s):
 

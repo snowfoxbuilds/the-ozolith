@@ -1,4 +1,10 @@
-"""Node Daemon configuration from the environment.
+"""Node Daemon configuration: provisioned state first, environment override.
+
+Provisioning (ADR-0023) persists everything the daemon needs to speak to
+its Control Node under the state dir — ``control-url``, ``node-token``
+(the per-node bearer), ``node-name``, ``ca.pem`` — so a provisioned box
+needs NO environment configuration (`.env` is deleted). Environment
+variables remain as expert overrides and the daemon-less dev path.
 
 Stdlib-only (ADR-0010: the daemon must install trivially on any host) and
 VAR_FILE-honoring like every TheOzolith service. A daemon without a
@@ -16,6 +22,8 @@ from pathlib import Path
 
 DEFAULT_STATE_DIR = "/var/lib/theozolith"
 DEFAULT_RUNTIME_DIR = "/run/theozolith"
+DEFAULT_HEARTBEAT_SECONDS = 60.0
+DEFAULT_STOP_GRACE_SECONDS = 30.0
 
 
 class DaemonConfigError(RuntimeError):
@@ -68,22 +76,47 @@ class DaemonConfig:
         return self.runtime_dir / "secrets"
 
 
+def _provisioned(state_dir: Path, name: str) -> str | None:
+    """One file persisted by `provision` (ADR-0023), or None."""
+    try:
+        return (state_dir / name).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def load_daemon_config(environ: Mapping[str, str] | None = None) -> DaemonConfig:
     environ = os.environ if environ is None else environ
-    control_url = env_value(environ, "CONTROL_NODE_URL")
-    node_token = env_value(environ, "THEOZOLITH_NODE_TOKEN") or ""
+    state_dir = Path(env_value(environ, "THEOZOLITH_STATE_DIR", DEFAULT_STATE_DIR) or "")
+    # Provisioned state is the sanctioned source; the environment overrides
+    # it (expert hatch / daemon-less dev). File names match provisioning.py.
+    control_url = env_value(environ, "CONTROL_NODE_URL") or _provisioned(state_dir, "control-url")
+    node_token = (
+        env_value(environ, "THEOZOLITH_NODE_TOKEN") or _provisioned(state_dir, "node-token") or ""
+    )
     if control_url and not node_token:
-        raise DaemonConfigError("set THEOZOLITH_NODE_TOKEN (or its _FILE form)")
+        raise DaemonConfigError(
+            "no node token: run 'theozolith-nodedaemon provision <join-string>'"
+            " (or set THEOZOLITH_NODE_TOKEN / its _FILE form for dev)"
+        )
+    tls_ca = env_value(environ, "THEOZOLITH_TLS_CA")
+    if not tls_ca and (state_dir / "ca.pem").is_file():
+        tls_ca = str(state_dir / "ca.pem")
 
     return DaemonConfig(
-        node=env_value(environ, "THEOZOLITH_NODE_NAME") or socket.gethostname(),
+        node=env_value(environ, "THEOZOLITH_NODE_NAME")
+        or _provisioned(state_dir, "node-name")
+        or socket.gethostname(),
         control_url=control_url,
         node_token=node_token,
-        tls_ca=env_value(environ, "THEOZOLITH_TLS_CA"),
-        state_dir=Path(env_value(environ, "THEOZOLITH_STATE_DIR", DEFAULT_STATE_DIR) or ""),
+        tls_ca=tls_ca,
+        state_dir=state_dir,
         runtime_dir=Path(env_value(environ, "THEOZOLITH_RUNTIME_DIR", DEFAULT_RUNTIME_DIR) or ""),
-        heartbeat_seconds=_float(environ, "THEOZOLITH_HEARTBEAT_SECONDS", "60"),
-        stop_grace_seconds=_float(environ, "THEOZOLITH_STOP_GRACE_SECONDS", "30"),
+        heartbeat_seconds=_float(
+            environ, "THEOZOLITH_HEARTBEAT_SECONDS", str(DEFAULT_HEARTBEAT_SECONDS)
+        ),
+        stop_grace_seconds=_float(
+            environ, "THEOZOLITH_STOP_GRACE_SECONDS", str(DEFAULT_STOP_GRACE_SECONDS)
+        ),
         insecure_dev=(env_value(environ, "THEOZOLITH_INSECURE_DEV") or "") == "1",
         version=running_product_version(),
     )

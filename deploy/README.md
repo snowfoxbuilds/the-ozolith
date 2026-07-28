@@ -1,73 +1,111 @@
 # deploy
 
-The node substrate: Control Node + Node Daemon + secrets + the M4 dashboard/terminal.
+The node substrate: Control Node + Node Daemon + secrets + the dashboard/terminal.
 Since ADR-0017 the Control Node is load-bearing for the pipeline — it writes every
 claim (no second claim path exists), so the daemon-less dev shape is `theozolith-control
 serve` on the same box as the drivers, not "no Control Node". With it down, in-flight
 Runs finish and publish; new claims and review rounds pause.
 
-Deployment footprint (the deletion test, NODE-SUBSTRATE.md): **docker + the TheOzolith
-package + a `.env`** — a private Config Repo adds Stacks and worker types on top, never
-below.
+Deployment footprint (the deletion test, restated 2026-07-27; ADR-0023): **docker + the
+TheOzolith package + `theozolith-control init` output** — every tier-2 tunable at its
+shipped default, environment variables as the expert override only. There is no `.env`:
+settings live in `control.toml` in the Config Repo (dashboard-edited), secrets in the
+encrypted store, node identity in the join-string exchange. A private Config Repo adds
+Stacks and worker types on top, never below.
 
 ## Full substrate
 
-1. **Control Node** (any box with docker; the Pi in the reference deployment):
+1. **Control Node** (any box with docker; the Pi in the reference deployment).
+   **Prerequisite: give this box a static IP or DHCP reservation** — the node
+   channel is IP-only (ADR-0023 as amended 2026-07-28): nodes dial the control IP
+   directly, with zero DNS dependency; the slug hostname is browser-only.
 
    ```sh
-   cp deploy/.env.example .env         # set THEOZOLITH_NODE_TOKEN + THEOZOLITH_ADMIN_TOKEN
-   # Provision BEFORE the service is healthy (build the image, then two one-shots):
    docker compose -f deploy/compose/control.yml build
-   docker compose -f deploy/compose/control.yml run --rm control \
-     origin-init                       # one-time public origin (mandatory, ADR-0019)
-   docker compose -f deploy/compose/control.yml run --rm control \
-     tls-init                          # one-time TLS provisioning (mandatory); covers
-                                       # the origin's hostname; --host adds extras
-   docker compose --env-file .env -f deploy/compose/control.yml up -d
+   docker compose -f deploy/compose/control.yml run --rm control init --ip <this-box-LAN-IP>
+   docker compose -f deploy/compose/control.yml up -d
    ```
 
-   `origin-init` mints the deployment's one public origin —
-   `https://<128-bit-random-slug>.theozolith.internal` by default (`--base-domain` to
-   change; `--port` only when browsers dial a nonstandard *external* port) — which
-   production `serve` requires: until both one-shots have run, `serve` exits and the
-   container restarts (expected during provisioning). The origin is independent of the
-   Uvicorn bind (`serve --host/--port`): the reference compose publishes external 443
-   onto the container's 8443 bind, so the origin carries no port, and remapping the bind
-   never changes the accepted browser `Host`/`Origin`. Give the origin's hostname a
-   **trusted-network-only** DNS record (or hosts entries); the Control Node must have no
-   public ingress path, and browsers must use exactly this origin (cookie-authenticated
-   requests from any other Host/Origin are rejected). Experts may instead supply
-   `THEOZOLITH_PUBLIC_ORIGIN` (format-checked only — the operator owns slug entropy;
-   see `.env.example`). Copy `/data/tls/ca.pem` out of the volume — every node pins it,
-   and every `CONTROL_NODE_URL` uses the origin's hostname.
+   `--ip` is required in the compose flow: inside a container the auto-detected
+   address would be the Docker bridge IP, unreachable from your LAN, so `init`
+   refuses to guess there (ADR-0031). The confirmed IP is persisted as a read-only
+   `control.toml` field beside the origin and is the one address every join string,
+   the bootstrap listener's `/control-url`, and the certificate SAN carry — mint
+   surfaces never re-detect it.
 
-2. **Nodes** (every physical box that should run Stacks):
+   `init` (ADR-0023) composes the whole first run: master key → public origin
+   (`https://<128-bit-random-slug>.theozolith.internal`; `--base-domain`/`--port` to
+   vary) → per-deployment CA + server cert with the persisted IP in the SAN → admin
+   password prompt (only its scrypt hash is stored) → the **operator handoff**: the
+   dashboard URL, the exact `/etc/hosts`/DNS line (browsers only — nodes never
+   resolve it), the CA download URL (served by the bootstrap listener, port 6965,
+   once `serve` runs), and per-OS trust one-liners. The two irreducibly manual
+   actions — the DNS record and CA trust per operator device — are copy-paste from
+   that printout. Re-running `init` requires `--force`: **a new CA invalidates the
+   pinned `ca.pem` on every provisioned node — the whole fleet fails TLS until each
+   box gets one join-string re-paste** (outstanding join strings, DNS entries, and
+   device trust die too; the master key and stored secrets are never touched).
+
+   Everything lands under `~/.theozolith/` on the host, partitioned by durability
+   class (ADR-0024): `configs/` (the git-backed Config Repo — `control.toml`,
+   `stacks/`, `images/`, `product.toml`), `secrets/` (master key, CA keypair, TLS
+   material, admin password hash, `store.db` — a **sibling** of configs/, never inside
+   any git tree), `cache/` (`cache.db`, deletable at any time: costs a re-login and
+   one heartbeat round), `logs/` (terminal audit log).
+
+   Experts may override any setting with `THEOZOLITH_*` environment variables
+   (validated; e.g. `THEOZOLITH_PUBLIC_ORIGIN` — the operator then owns slug entropy).
+
+2. **Nodes** (every physical box that should run Stacks) — one paste each:
 
    ```sh
-   sudo THEOZOLITH_NODE_TOKEN=... deploy/install-nodedaemon.sh \
-     --control-url https://<slug>.theozolith.internal --ca ca.pem
+   theozolith join-token create        # on the Control Node (or the dashboard's
+                                       # Join tokens page): prints the exact line
    ```
 
-   The installer creates the `ozolith` user, a venv at `/opt/theozolith` (daemon +
-   drivers + knowledge machinery — one versioned distribution, ADR-0013), the systemd
-   unit (`KillMode=control-group`: every TheOzolith process on the node dies with the
-   daemon), and starts heartbeating. The node registers within one heartbeat interval.
+   Paste its output on the box. Fresh box: the printed `curl … | sudo bash -s --
+   'ozjoin1:…'` line fetches the installer over GitHub release HTTPS (code never rides
+   the plaintext listener) — it creates the `ozolith` user, the venv at
+   `/opt/theozolith`, the systemd unit (`KillMode=control-group`), and hands off to
+   `theozolith-nodedaemon provision` as its final step. Already-installed box: the
+   printed `sudo theozolith-nodedaemon provision 'ozjoin1:…'` line alone.
+
+   `provision` parses and checksums the join string, fetches the CA from the bootstrap
+   listener, verifies it against the pinned fingerprint **before transmitting
+   anything** (mismatch = possible MITM or a stale join string after CA rotation —
+   abort), exchanges the short-lived single-use join token over verified TLS for this
+   node's own **non-expiring per-node token**, persists everything under
+   `/var/lib/theozolith`, enables the unit, and heartbeats. The persisted control URL
+   is the **IP-based address the node just verified** — nodes never resolve the slug
+   hostname and never need DNS. Re-pasting a fresh join string on an
+   already-provisioned node rotates its token and replaces its persisted state in
+   place: that one paste per node is the whole recovery path when the Control Node's
+   IP changes. Provisioning **is** registration:
+   unknown/revoked tokens are rejected 401 and surface on the dashboard
+   as *unregistered nodes* (advisory, never dispatch-eligible). Remove a node with
+   `POST /api/v1/nodes/<node>/revoke`; `theozolith join-token revoke <id>` kills an
+   outstanding join string. `theozolith-nodedaemon provision --inspect 'ozjoin1:…'`
+   pretty-prints a payload without acting.
 
 3. **Config Repo** (`~/.theozolith/configs` on the Control Node; ADR-0006): declare
    Stacks and derived images — `deploy/configs-example/` is a complete starter. Desired
    state distributes over the heartbeat channel; nodes cache it for degraded mode.
-   The Implementer/Reviewer drivers are process-kind Stacks; `control` and the Flight
-   Deck are container Stacks.
+   The Implementer/Reviewer drivers are process-kind Stacks (the daemon injects the
+   control channel — URL, per-node token, CA — into them; Stack env overrides win);
+   `control` and the Flight Deck are container Stacks. Tier-2 tunables (heartbeat
+   interval, grace periods, sweep cadences, terminal cap, event budget, session
+   length, bootstrap port) live in `control.toml` and are edited on the dashboard's
+   Settings page — each save is a fixed-schema commit touching only that file. The
+   public origin and the control IP render read-only there.
 
-4. **Secrets**: enter values once —
+4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
    ```sh
-   CONTROL_NODE_URL=https://<slug>.theozolith.internal THEOZOLITH_ADMIN_TOKEN=... \
-     theozolith-control secret set github-worker --ca ca.pem
+   theozolith-control secret set github-worker    # on the Control Node; no env needed
    ```
 
-   Encrypted at rest on the Control Node; pulled node-scoped (only nodes whose Stacks
-   reference a name may pull it) over TLS; materialized to tmpfs
+   Encrypted at rest in `secrets/store.db`; pulled node-scoped (only nodes whose
+   Stacks reference a name may pull it) over TLS; materialized to tmpfs
    (`/run/theozolith/secrets`, `/run/secrets/<name>` inside containers) and wired via
    `<ENV>_FILE`. Never on node disk.
 
@@ -85,8 +123,12 @@ below.
    theozolith-control unquarantine --node box1                # human-only release (ADR-0016)
    ```
 
-6. **Update the product** (ADR-0015 as amended — two paths, one machinery;
-   both need `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN`):
+   On the Control Node these need no environment: the URL comes from the persisted
+   public origin, the admin token from `secrets/admin-token`, the CA from
+   `secrets/tls/ca.pem` (all init-written). Elsewhere, set `CONTROL_NODE_URL` +
+   `THEOZOLITH_ADMIN_TOKEN` + `THEOZOLITH_TLS_CA`.
+
+6. **Update the product** (ADR-0015 as amended — two paths, one machinery):
 
    ```sh
    theozolith update                  # user path: pin the latest published release
@@ -98,6 +140,9 @@ below.
    theozolith test                    # the local-development signal: run the
        # checkout's test and lint suite (iterate here, never by deploying
        # uncommitted state)
+   python3 build.py                   # bootstrap ONLY: a bare checkout with nothing
+       # installed — same build implementation as `theozolith build`, finishing by
+       # installing the theozolith/theozolith-control entry points (ADR-0023)
    ```
 
    Both paths commit the pin bump to `product.toml` in the Config Repo. **The
@@ -112,7 +157,7 @@ below.
    Dispatch follows convergence: the Control Node grants work only to nodes
    whose heartbeat-reported version equals the pin, so issuing an update pauses
    new dispatch fleet-wide and capacity returns node by node. A node still
-   off-pin after 3 consecutive heartbeats (`THEOZOLITH_OFFPIN_BEATS`) gets a
+   off-pin after 3 consecutive heartbeats (`offpin_beats` in control.toml) gets a
    queued `restart`; still off-pin after that, a `theozolith.error` lands on
    the dashboard and the node stays ineligible until you intervene. The
    dashboard surfaces version skew against the recorded pin; polling backs off
@@ -124,20 +169,64 @@ below.
    `recycle` and `update` received mid-Run queue behind the current Run (job-dir
    presence is the in-flight signal; the deferral shows in heartbeats and on the
    dashboard); `--force` keeps the immediate kill-the-tree semantics. The dashboard
-   (same origin as the API, behind the admin credential) is the read-only fleet view
-   plus secret entry, the errors panel (`theozolith.error` summaries with
-   node/component filters — depth stays in each node's journal and the evidence
-   bundles), and the web terminal. Terminal targets are container-kind Stacks with an
-   `attach` argv array in the Config Repo — the Flight Deck first among them (see
-   `deploy/configs-example/stacks/flightdeck.toml`; free-form command strings are
-   rejected, ADR-0022). Run containers are headless and never attach targets
-   (ADR-0019).
+   (same origin as the API, behind the admin password; ADR-0023) is the read-only fleet
+   view plus secret entry, settings, join tokens, the errors panel
+   (`theozolith.error` summaries with node/component filters — depth stays in each
+   node's journal and the evidence bundles), and the web terminal. Terminal targets are
+   container-kind Stacks with an `attach` argv array in the Config Repo — the Flight
+   Deck first among them (see `deploy/configs-example/stacks/flightdeck.toml`;
+   free-form command strings are rejected, ADR-0022). Run containers are headless and
+   never attach targets (ADR-0019).
 
    The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence
    bundle, the claim is released and the issue escalated `failed` + `needs_human` with
    the evidence link — never auto-re-queued. An optional slow GitHub-Action backstop
    lives in `deploy/github/zombie-janitor.yml` (copy into the target repo).
+
+## Backup and recovery (ADR-0024)
+
+Backup is **one folder, one copy command**: `~/.theozolith/` minus `cache/`
+(optionally minus `logs/`) to another trusted device —
+
+```sh
+rsync -a --exclude cache/ ~/.theozolith/ backup-host:theozolith-backup/
+```
+
+Re-copy after enrolling nodes or adding secrets; that is the whole cadence rule.
+Secret material never leaves trusted devices: **GitHub is never a full backup** — a
+Config Repo clone looks like a deployment but cannot resurrect one (`secrets/` is a
+sibling of `configs/` by decision, never a git-ignored child: `git clean -x` must not
+be able to delete the master key, and a clone must not look complete while missing it).
+
+Recovery:
+
+1. Install the TheOzolith package on the replacement box; restore the copy to
+   `~/.theozolith/`.
+2. `theozolith-control recover` — validates the restore **loudly and completely**
+   (every missing or corrupt artifact enumerated in one pass, nonzero exit), then
+   re-mints the server certificate from the restored CA. It uses the restored
+   `control_ip` by default; pass `--ip` if the replacement box's address differs
+   (it is then persisted for every future mint).
+3. Update the **browser-side** DNS/hosts record; start `serve`.
+
+**Same IP** (give the Control Node a static IP or DHCP reservation so this is the
+normal case): zero node touches — nodes dial the persisted IP directly, pin the CA
+(not the server cert), and hold non-expiring tokens restored with `store.db`, so
+they reconnect on their capped backoff, untouched.
+
+**Changed IP**: every provisioned node still dials the old address — the recovery
+path is **one join-string re-paste per node** (`theozolith join-token create`; the
+paste rotates that node's token in place). Note the asymmetry `recover` also prints:
+these nodes will **NOT** appear in the unregistered-nodes view, because their
+heartbeats go to the dead address and never arrive — work from your node inventory,
+not the dashboard.
+
+Sessions and cached state died with `cache/` — a re-login and one heartbeat round
+recover them. Nodes enrolled *after* the backup DO show up in the unregistered-nodes
+view (their heartbeats arrive with unknown tokens): that list is the re-provision
+worklist for the stale-backup case. Deleting `cache/cache.db` on a live system is
+always safe and is the documented recovery move for cache corruption.
 
 ## Daemon-less dev (the M2 shape)
 
@@ -155,18 +244,24 @@ below.
    # optional: --build-arg OZOLITH_UID=$(id -u)   # match the driver user
    ```
 
-3. Install and configure (every variable honors the VAR_FILE convention; one `.env`
-   serves both drivers via the role-prefixed names):
+3. Install and export the driver configuration (every variable honors the VAR_FILE
+   convention; the daemonful path injects these from the Config Repo + secret store —
+   exporting them by hand is the dev-only surface):
 
    ```sh
    pip install ./knowledge ./worker
-   cp deploy/.env.example .env    # fill in both PATs and the model API key
+   export THEOZOLITH_REPO=owner/name WORKER_GITHUB_TOKEN=... REVIEWER_GITHUB_TOKEN=... \
+          ANTHROPIC_API_KEY=... CONTROL_NODE_URL=... THEOZOLITH_NODE_TOKEN=... \
+          THEOZOLITH_RUN_IMAGE=theozolith-run-claude:local
    ```
+
+   The Worker and the Reviewer must be **different GitHub identities** (ADR-0008: no
+   self-grading by construction). PATs live in the drivers only; no run container ever
+   sees them (ADR-0013).
 
 4. Run the drivers (don't run them as root):
 
    ```sh
-   set -a; . ./.env; set +a
    theozolith-worker --once       # single poll-claim-run pass; or no flag for the loop
    theozolith-reviewer --once
    ```
@@ -206,9 +301,9 @@ the files owned by the driver user either by building the image with
 ```sh
 sudo systemctl disable --now theozolith-nodedaemon    # drivers die with it (cgroup)
 docker ps -aq --filter label=theozolith.owner | xargs -r docker rm -f
-docker compose -f deploy/compose/control.yml down -v
+docker compose -f deploy/compose/control.yml down
 docker volume rm theozolith-cache
-sudo rm -rf /opt/theozolith /etc/theozolith /var/lib/theozolith
+sudo rm -rf /opt/theozolith /var/lib/theozolith ~/.theozolith
 ```
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node

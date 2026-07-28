@@ -373,6 +373,9 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         # FakeDispatch and a RecordingSink, so nothing dials this URL.
         "CONTROL_NODE_URL": "https://control.invalid:8443",
         "THEOZOLITH_NODE_TOKEN": "node-token",
+        # The node identity events declare; must match the per-node token's
+        # node when a live Control Node is in play (ADR-0023).
+        "THEOZOLITH_NODE_NAME": "box1",
         # The model API key is ALLOWED in run containers (a rotatable spend
         # credential); the GitHub PATs are not (ADR-0013).
         "ANTHROPIC_API_KEY": "model-key",
