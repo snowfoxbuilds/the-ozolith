@@ -2,7 +2,7 @@ Status: ACCEPTED
 
 Date: 2026-07-30
 
-Provenance: operator ruling (2026-07-30) amending ADR-0023's CLI-surface decision and the NODE-SUBSTRATE.md grilling entry of 2026-07-27. Folding `theozolith-knowledge sync` was considered in the same session and explicitly deferred — knowledge separability (ADR-0007) is untouched.
+Provenance: operator ruling (2026-07-30). Amends ADR-0023's CLI-surface decision in place (repo-authored ADRs per ADR-0033); the matching NODE-SUBSTRATE.md CLI-surface entry (grilling 2026-07-27) is a spec and stays Notion-owned — its amendment lands through the normal spec sync. Folding `theozolith-knowledge sync` was considered in the same session and explicitly deferred — knowledge separability (ADR-0007) is untouched.
 
 # ADR-0032: One human CLI — `theozolith-control` folds into `theozolith`
 

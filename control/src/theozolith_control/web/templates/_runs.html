@@ -49,7 +49,7 @@
   {% for q in flags.quarantines %}
   <li><span class="badge b-critical">● quarantined</span>
       node {{ q.node }}: {{ q.reason }} <span class="muted">(since {{ q.since }};
-      release: recycle/update or <code>theozolith-control unquarantine</code>)</span></li>
+      release: recycle/update or <code>theozolith unquarantine</code>)</span></li>
   {% endfor %}
 </ul>
 {% endif %}

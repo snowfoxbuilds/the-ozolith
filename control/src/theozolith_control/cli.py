@@ -6,8 +6,8 @@ state (ADR-0023) — ``init``, ``origin-init``, ``tls-init``, ``serve``,
 ``janitor --once``) and HTTP-driven operator subcommands. The fleet-operator
 half (``update``, ``build``, ``test``, ``join-token``) is registered from
 ``product`` — that module stays stdlib-only at import for the build.py
-bootstrap (ADR-0030), so the merged parser lives here. ``theozolith-control``
-is a deprecated alias for the same entry point.
+bootstrap (ADR-0030), so the merged parser lives here.
+``theozolith-control`` is a deprecated alias for the same entry point.
 
 ``init`` is the unified first-run command: master key → origin → CA/TLS
 (with the box's IP in the SAN) → admin password → operator handoff. All
@@ -726,8 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="theozolith",
         description="TheOzolith Control Node: serve the control plane, administer this"
-        " box, and operate the fleet (ADR-0032 — one human CLI; `theozolith-control`"
-        " is a deprecated alias).",
+        " box, and operate the fleet (ADR-0032 — one human CLI;"
+        " `theozolith-control` is a deprecated alias).",
     )
     parser.add_argument("--url", help="Control Node URL (default: CONTROL_NODE_URL)")
     parser.add_argument("--ca", help="CA bundle for TLS verification (default: THEOZOLITH_TLS_CA)")
