@@ -4,8 +4,10 @@ the wheel build sandbox."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -211,3 +213,39 @@ def test_prune_artifacts_keeps_only_the_named_versions(tmp_path):
     assert pruned == ["0.1.0"]
     assert sorted(p.name for p in store.iterdir()) == ["0.2.0", "0.3.0"]
     assert product.prune_artifacts(tmp_path / "absent", {"x"}) == []  # no dir, no crash
+
+
+# -- an unreachable Control Node is an error, not a traceback --------------------
+
+
+def test_upload_reports_an_unreachable_control_node_cleanly(tmp_path, monkeypatch):
+    wheel = tmp_path / "theozolith_worker-0.3.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+
+    def refuse(*a, **kw):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(product.urllib.request, "urlopen", refuse)
+
+    with pytest.raises(SystemExit, match=r"cannot reach https://10\.0\.0\.2:8443"):
+        product._upload_artifact("https://10.0.0.2:8443", "t", None, "0.3.0", wheel)
+
+
+def test_build_pre_flights_the_control_node_before_building(monkeypatch):
+    """Four wheels take minutes; none of them are worth building if the
+    Control Node that would serve them is down."""
+    from theozolith_control import cli
+
+    monkeypatch.setattr(cli, "_admin_env", lambda args: ("https://10.0.0.2:8443", "t", None))
+
+    def unreachable(url, path, **kw):
+        assert path == "/api/v1/healthz"
+        raise SystemExit(f"error: cannot reach {url}: [Errno 111] Connection refused")
+
+    monkeypatch.setattr(cli, "_call", unreachable)
+    monkeypatch.setattr(
+        product, "build_distribution", lambda *a, **kw: pytest.fail("built before pre-flight")
+    )
+
+    with pytest.raises(SystemExit, match="cannot reach"):
+        product._cmd_build(argparse.Namespace(source="."))
