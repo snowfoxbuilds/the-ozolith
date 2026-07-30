@@ -324,6 +324,8 @@ def _upload_artifact(url: str, token: str, ca: str | None, version: str, path: P
         raise SystemExit(
             f"error: upload of {path.name} refused (HTTP {exc.code}): {detail}"
         ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"error: cannot reach {url}: {exc.reason}") from exc
 
 
 def _cmd_update(args) -> int:
@@ -357,10 +359,13 @@ def _cmd_test(args) -> int:
 
 
 def _cmd_build(args) -> int:
-    from theozolith_control.cli import _admin_env
+    from theozolith_control.cli import _admin_env, _call
 
     source = Path(args.source).resolve()
     url, token, ca = _admin_env(args)
+    # Pre-flight: building four wheels takes minutes, and every one of them
+    # is wasted if the Control Node is not up. Fail here, before the work.
+    _call(url, "/api/v1/healthz", token=token, ca=ca)
     with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
         out_dir = Path(staging)
         version, wheels = build_distribution(source, out_dir)
