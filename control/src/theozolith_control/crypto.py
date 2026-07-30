@@ -4,7 +4,7 @@ Values are encrypted per-secret before they touch SQLite; the database alone
 reveals nothing. The master key lives in one 0600 file beside the database
 (or arrives via THEOZOLITH_MASTER_KEY(_FILE)) and never transits the channel.
 Rotation re-encrypts every stored value under a fresh key in one transaction
-(``theozolith-control rotate-key``).
+(``theozolith rotate-key``).
 """
 
 from __future__ import annotations

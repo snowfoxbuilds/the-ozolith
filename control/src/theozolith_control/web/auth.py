@@ -74,7 +74,7 @@ class AdminSessions:
         secure_cookies: bool = True,
     ):
         self._store = store
-        # Read per attempt, not cached: `theozolith-control set-password`
+        # Read per attempt, not cached: `theozolith set-password`
         # (server running or not) takes effect on the next login.
         self._password_reader = password_reader
         self._admin_token = admin_token

@@ -31,7 +31,7 @@ attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux",
 volumes = ["flightdeck-logs:/var/log/flightdeck"]
 
 # Secret NAMES only — the value lives encrypted on the Control Node
-# (`theozolith-control secret set flightdeck-github-token`). The name is
+# (`theozolith secret set flightdeck-github-token`). The name is
 # deliberately distinct from every driver PAT.
 [secrets]
 GITHUB_TOKEN = "flightdeck-github-token"

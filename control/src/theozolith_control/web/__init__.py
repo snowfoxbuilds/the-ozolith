@@ -75,7 +75,7 @@ def mount_web(
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
 
     def _password_record() -> str:
-        # Read per login attempt: `theozolith-control set-password` takes
+        # Read per login attempt: `theozolith set-password` takes
         # effect without a restart (it truncates the session table itself).
         try:
             return settings.admin_password_path.read_text(encoding="utf-8").strip()
@@ -154,7 +154,7 @@ def mount_web(
             response = _page(
                 request,
                 "login.html",
-                {"error": "no admin password is set — run 'theozolith-control init'"},
+                {"error": "no admin password is set — run 'theozolith init'"},
             )
             response.status_code = 503
             return response
@@ -311,7 +311,7 @@ def mount_web(
         if key in ("public_origin", "control_ip"):
             return HTMLResponse(
                 "the [control] fields are read-only — re-pointing a deployment is"
-                " 'theozolith-control origin-init --force' / 'recover --ip', not a"
+                " 'theozolith origin-init --force' / 'recover --ip', not a"
                 " settings edit",
                 status_code=403,
             )
@@ -356,9 +356,7 @@ def mount_web(
             if ttl <= 0 or uses < 1:
                 raise ValueError("ttl and uses must be positive")
             if not settings.control_ip:
-                raise ValueError(
-                    "no persisted control IP — run 'theozolith-control init' (ADR-0031)"
-                )
+                raise ValueError("no persisted control IP — run 'theozolith init' (ADR-0031)")
             fingerprint = tls.ca_fingerprint_sha256((settings.tls_dir / tls.CA_FILE).read_bytes())
         except (ValueError, OSError) as exc:
             page = _page(request, "join.html", _join_context(notice=f"cannot mint: {exc}"))

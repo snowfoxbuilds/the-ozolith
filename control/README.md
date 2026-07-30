@@ -27,7 +27,7 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   is released and escalated `failed` + `needs_human` with the evidence link. Also
   releases never-activated dispatch grants (no claimed event within the activation
   window).
-- **Secret store** — values entered once via `theozolith-control secret set` or the
+- **Secret store** — values entered once via `theozolith secret set` or the
   dashboard's web form (both write through the same store), encrypted at rest (Fernet,
   file-held master key), pull-only and node-scoped, TLS mandatory, never displayed.
 - **Dashboard + web terminal** (M4, ADR-0018; hardened by ADR-0022) — read-only fleet
@@ -61,15 +61,15 @@ new claims and review rounds pause. Drivers hold their own PATs for all non-clai
 GitHub writes.
 
 ```sh
-theozolith-control init                              # the unified first run (ADR-0023):
+theozolith init                              # the unified first run (ADR-0023):
                                                      # key, origin, CA/TLS, password, handoff
-theozolith-control serve                             # the service (+ dashboard + bootstrap listener)
-theozolith-control recover                           # after restoring ~/.theozolith minus cache/
+theozolith serve                             # the service (+ dashboard + bootstrap listener)
+theozolith recover                           # after restoring ~/.theozolith minus cache/
 theozolith join-token create                         # print the one paste that provisions a node
-theozolith-control secret set github-worker          # operator entry
-theozolith-control command recycle --node box1 --target worker   # queues behind a Run
-theozolith-control command recycle --node box1 --target worker --force
-theozolith-control unquarantine --node box1          # human-only release
-theozolith-control status                            # fleet state JSON
-theozolith-control flags                             # zombie/malformed/quarantine flags
+theozolith secret set github-worker          # operator entry
+theozolith command recycle --node box1 --target worker   # queues behind a Run
+theozolith command recycle --node box1 --target worker --force
+theozolith unquarantine --node box1          # human-only release
+theozolith status                            # fleet state JSON
+theozolith flags                             # zombie/malformed/quarantine flags
 ```
