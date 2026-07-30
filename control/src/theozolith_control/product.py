@@ -23,7 +23,6 @@ recorded version.
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -401,26 +400,17 @@ def _cmd_join_token(args) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="theozolith",
-        description=(
-            "Operate a TheOzolith deployment from the Control Node. Two update"
-            " paths, one machinery (ADR-0015): `update` pins a published"
-            " release; `build` pins and serves the local source checkout."
-            " `join-token` mints the one paste that provisions a node (ADR-0023)."
-        ),
-    )
-    parser.add_argument("--url", help="Control Node URL (default: CONTROL_NODE_URL)")
-    parser.add_argument("--ca", help="CA bundle (default: THEOZOLITH_TLS_CA)")
-    commands = parser.add_subparsers(dest="command", required=True)
-
+def register(commands) -> None:
+    """Register the fleet-operator subcommands on the single ``theozolith``
+    parser (ADR-0032). This module stays stdlib-only at import (ADR-0030),
+    so the merged parser lives in ``cli`` — which already imports it — and
+    calls back in here."""
     update = commands.add_parser(
         "update",
         help="pin the latest published release (or --version) and fan the update out",
     )
     update.add_argument("--version", help="an explicit release to pin (rollback = re-pin)")
-    update.set_defaults(handler=_cmd_update)
+    update.set_defaults(func=_cmd_update)
 
     build = commands.add_parser(
         "build",
@@ -431,14 +421,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     build.add_argument("--source", default=".", help="source checkout (default: current directory)")
-    build.set_defaults(handler=_cmd_build)
+    build.set_defaults(func=_cmd_build)
 
     test = commands.add_parser(
         "test",
         help="the local-development signal: run the checkout's test and lint suite",
     )
     test.add_argument("--source", default=".", help="source checkout (default: current directory)")
-    test.set_defaults(handler=_cmd_test)
+    test.set_defaults(func=_cmd_test)
 
     join = commands.add_parser(
         "join-token",
@@ -459,20 +449,21 @@ def main(argv: list[str] | None = None) -> int:
         help="bootstrap address nodes dial, host[:port] (default: this box's IP + the"
         " bootstrap port)",
     )
-    join_create.set_defaults(handler=_cmd_join_token)
+    join_create.set_defaults(func=_cmd_join_token)
     join_revoke = join_sub.add_parser("revoke", help="revoke an outstanding token by id")
     join_revoke.add_argument("id")
-    join_revoke.set_defaults(handler=_cmd_join_token)
+    join_revoke.set_defaults(func=_cmd_join_token)
     join_sub.add_parser("list", help="outstanding tokens (ids and windows only)").set_defaults(
-        handler=_cmd_join_token
+        func=_cmd_join_token
     )
 
-    args = parser.parse_args(argv)
-    try:
-        return args.handler(args)
-    except ProductError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+
+def main(argv: list[str] | None = None) -> int:
+    # Lazy: this module must import stdlib-only for the build.py bootstrap
+    # (ADR-0030); the merged parser and its dependencies load only when run.
+    from theozolith_control.cli import main as merged_main
+
+    return merged_main(argv)
 
 
 if __name__ == "__main__":

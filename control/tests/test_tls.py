@@ -73,7 +73,7 @@ def test_secrets_transit_tls_end_to_end(tmp_path: Path):
     rig.write_config("stacks/worker.toml", WORKER_STACK)
 
     with LiveServer(rig.client.app, certfile=str(cert), keyfile=str(key)) as live:
-        # Admin entry over TLS (what `theozolith-control secret set` does).
+        # Admin entry over TLS (what `theozolith secret set` does).
         request = urllib.request.Request(
             f"{live.url}/api/v1/secrets/github-worker",
             data=json.dumps({"value": SENTINEL}).encode(),

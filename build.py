@@ -8,7 +8,7 @@ SAME build implementation ``theozolith build`` wraps
 (``theozolith_control.product.build_distribution`` — one implementation,
 two entry paths; they cannot drift), builds every component wheel from the
 CLEAN checkout into ``dist/``, and finishes by installing them, which
-yields the ``theozolith`` and ``theozolith-control`` entry points. From
+yields the ``theozolith`` entry point (one human CLI, ADR-0032). From
 then on, source-based updates are ``theozolith build``.
 """
 
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: pip install of the built wheels failed", file=sys.stderr)
         return proc.returncode
     print(f"built and installed {len(wheels)} wheel(s) at version {version}")
-    print("next: 'theozolith-control init' on the Control Node box, then 'theozolith build'")
+    print("next: 'theozolith init' on the Control Node box, then 'theozolith build'")
     print("for future source updates (this shim was only the bootstrap).")
     return 0
 

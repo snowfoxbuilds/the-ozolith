@@ -1,7 +1,13 @@
-"""The ``theozolith-control`` CLI: the service-admin surface for the machine
-it runs on (ADR-0023) — ``init``, ``origin-init``, ``tls-init``, ``serve``,
+"""The ``theozolith`` CLI: every human command on the Control Node (ADR-0032).
+
+One surface, two halves. The service-admin half operates on this box's local
+state (ADR-0023) — ``init``, ``origin-init``, ``tls-init``, ``serve``,
 ``recover`` — plus local maintenance (``set-password``, ``rotate-key``,
-``janitor --once``) and HTTP-driven operator subcommands.
+``janitor --once``) and HTTP-driven operator subcommands. The fleet-operator
+half (``update``, ``build``, ``test``, ``join-token``) is registered from
+``product`` — that module stays stdlib-only at import for the build.py
+bootstrap (ADR-0030), so the merged parser lives here.
+``theozolith-control`` is a deprecated alias for the same entry point.
 
 ``init`` is the unified first-run command: master key → origin → CA/TLS
 (with the box's IP in the SAN) → admin password → operator handoff. All
@@ -72,7 +78,7 @@ def _call(
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "theozolith-control-cli",
+            "User-Agent": "theozolith-cli",
         },
     )
     context = _ssl_context(ca) if url.startswith("https") else None
@@ -103,12 +109,12 @@ def _admin_env(args) -> tuple[str, str, str | None]:
     if not url:
         raise SystemExit(
             "error: no Control Node URL — set CONTROL_NODE_URL, pass --url, or run"
-            " 'theozolith-control init' on this box first"
+            " 'theozolith init' on this box first"
         )
     token = settings.admin_token
     if not token:
         raise SystemExit(
-            "error: no admin token — run 'theozolith-control init' or set"
+            "error: no admin token — run 'theozolith init' or set"
             " THEOZOLITH_ADMIN_TOKEN (or its _FILE form)"
         )
     ca = args.ca or env_value(os.environ, "THEOZOLITH_TLS_CA")
@@ -167,7 +173,7 @@ def _serve(args) -> int:
     tls = cert.is_file() and key.is_file()
     if not tls and not args.insecure_dev:
         raise SystemExit(
-            f"error: no TLS material at {settings.tls_dir} — run 'theozolith-control tls-init"
+            f"error: no TLS material at {settings.tls_dir} — run 'theozolith tls-init"
             " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
         )
     if not args.insecure_dev or settings.public_origin:
@@ -182,12 +188,12 @@ def _serve(args) -> int:
         except OriginError as exc:
             raise SystemExit(
                 f"error: {exc} — production startup requires the generated public"
-                " origin (run 'theozolith-control origin-init' or set"
+                " origin (run 'theozolith origin-init' or set"
                 " THEOZOLITH_PUBLIC_ORIGIN; --insecure-dev for local dev only)"
             ) from exc
     if not args.insecure_dev and not settings.admin_password_path.is_file():
         raise SystemExit(
-            "error: no admin password is set — run 'theozolith-control init' first"
+            "error: no admin password is set — run 'theozolith init' first"
             " (--insecure-dev for local dev only)"
         )
     settings = dataclasses.replace(settings, secrets_channel_ok=True, serve_tls=tls)
@@ -310,7 +316,7 @@ def _origin_init(args) -> int:
     _log(f"public origin: {text}")
     _log(
         "next: create a trusted-network-only DNS record (or hosts entries) for its hostname"
-        " and run 'theozolith-control tls-init' — the Control Node must have no public"
+        " and run 'theozolith tls-init' — the Control Node must have no public"
         " ingress path"
     )
     return 0
@@ -374,7 +380,7 @@ def _print_handoff(settings: ControlSettings, origin_text: str, ip: str) -> None
     _log("   hosts entry on every operator device, or one router/private-DNS record:")
     _log(f"     {ip} {hostname}")
     _log("")
-    _log("2) start serving:      theozolith-control serve")
+    _log("2) start serving:      theozolith serve")
     _log("   (the CA download URL in step 3 is served by it — the bootstrap")
     _log("   listener only exists while serving)")
     _log("")
@@ -480,7 +486,7 @@ def _set_password(args) -> int:
     table — every browser session dies now (ADR-0023)."""
     settings = load_settings()
     if not settings.secrets_dir.is_dir():
-        raise SystemExit("error: not initialized — run 'theozolith-control init' first")
+        raise SystemExit("error: not initialized — run 'theozolith init' first")
     _write_private(settings.admin_password_path, passwords.hash_password(_prompt_password(args)))
     Store(settings.cache_db_path).truncate_sessions()
     _log("admin password updated; every browser session was invalidated")
@@ -573,7 +579,7 @@ def _recover(args) -> int:
         controltoml.write_control_ip(settings.config_repo, args.ip, log=_log)
     _log("recovery validated. next:")
     _log(f"  1) update the BROWSER-side DNS/hosts record: {ip} {hostname}")
-    _log("  2) start serving: theozolith-control serve")
+    _log("  2) start serving: theozolith serve")
     if args.ip and persisted_ip and args.ip != persisted_ip:
         _log("")
         _log(f"control IP CHANGED ({persisted_ip} -> {args.ip}): every provisioned node")
@@ -607,8 +613,7 @@ def _tls_init(args) -> int:
             hosts.insert(0, hostname)
     if not hosts:
         raise SystemExit(
-            "error: pass --host, or provision the public origin first"
-            " ('theozolith-control origin-init')"
+            "error: pass --host, or provision the public origin first ('theozolith origin-init')"
         )
     try:
         ca, cert, key = provision(settings.tls_dir, hosts)
@@ -719,8 +724,10 @@ def _flags(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="theozolith-control",
-        description="TheOzolith Control Node: serve the control plane and operate it.",
+        prog="theozolith",
+        description="TheOzolith Control Node: serve the control plane, administer this"
+        " box, and operate the fleet (ADR-0032 — one human CLI;"
+        " `theozolith-control` is a deprecated alias).",
     )
     parser.add_argument("--url", help="Control Node URL (default: CONTROL_NODE_URL)")
     parser.add_argument("--ca", help="CA bundle for TLS verification (default: THEOZOLITH_TLS_CA)")
@@ -873,9 +880,15 @@ def main(argv: list[str] | None = None) -> int:
         "rotate-key", help="Re-encrypt all secrets under a fresh master key (server stopped)."
     ).set_defaults(func=_rotate_key)
 
+    # The fleet-operator half (update/build/test/join-token) — ADR-0032.
+    product.register(sub)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except product.ProductError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

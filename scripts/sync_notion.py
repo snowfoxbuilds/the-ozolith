@@ -7,7 +7,9 @@ Project tooling, not product (ARCHITECTURE.md). Exports:
   - AGENTS.md      -> <output_dir>/AGENTS.md
   - CONTEXT.md     -> <output_dir>/CONTEXT.md
   - Specs/*        -> <output_dir>/docs/specs/<page_title>
-  - ADRs/*         -> <output_dir>/docs/adr/<page_title>
+
+ADRs are repo-authored and never synced (ADR-0033 amending ADR-0001):
+docs/adr/ is owned by the repo; Notion's ADR pages are historical only.
 
 Usage:
   python3 scripts/sync_notion.py
@@ -298,20 +300,9 @@ def sync(project_root_id: str, output_dir: str):
     else:
         print("  ! No 'CONTEXT.md' page found under project root")
 
-    # 4. Export ADRs/* -> <output_dir>/docs/adr/<title>
-    adrs_page = next((c for c in children if c["title"] == "ADRs"), None)
-    if adrs_page:
-        adrs_children = get_child_pages(adrs_page["id"])
-        if not adrs_children:
-            print("  ! ADRs page has no children")
-        for adr in adrs_children:
-            filename = adr["title"]
-            if not filename.endswith(".md"):
-                filename += ".md"
-            filepath = os.path.join(output_dir, "docs", "adr", filename)
-            export_page(adr["id"], filepath)
-    else:
-        print("  ! No 'ADRs' page found under project root")
+    # ADRs are NOT exported: docs/adr/ is repo-authored as of ADR-0033
+    # (2026-07-30). Notion's ADR pages are a frozen historical mirror; an
+    # export here would clobber repo-side rulings and amendments.
 
 
 # --- CLI ---

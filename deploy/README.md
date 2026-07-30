@@ -2,12 +2,12 @@
 
 The node substrate: Control Node + Node Daemon + secrets + the dashboard/terminal.
 Since ADR-0017 the Control Node is load-bearing for the pipeline — it writes every
-claim (no second claim path exists), so the daemon-less dev shape is `theozolith-control
+claim (no second claim path exists), so the daemon-less dev shape is `theozolith
 serve` on the same box as the drivers, not "no Control Node". With it down, in-flight
 Runs finish and publish; new claims and review rounds pause.
 
 Deployment footprint (the deletion test, restated 2026-07-27; ADR-0023): **docker + the
-TheOzolith package + `theozolith-control init` output** — every tier-2 tunable at its
+TheOzolith package + `theozolith init` output** — every tier-2 tunable at its
 shipped default, environment variables as the expert override only. There is no `.env`:
 settings live in `control.toml` in the Config Repo (dashboard-edited), secrets in the
 encrypted store, node identity in the join-string exchange. A private Config Repo adds
@@ -101,7 +101,7 @@ Stacks and worker types on top, never below.
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
    ```sh
-   theozolith-control secret set github-worker    # on the Control Node; no env needed
+   theozolith secret set github-worker    # on the Control Node; no env needed
    ```
 
    Encrypted at rest in `secrets/store.db`; pulled node-scoped (only nodes whose
@@ -112,15 +112,15 @@ Stacks and worker types on top, never below.
 5. **Operate**:
 
    ```sh
-   theozolith-control status                                  # fleet state
-   theozolith-control command drain   --node box1 --target worker
-   theozolith-control command recycle --node box1 --target worker   # kills the whole
+   theozolith status                                  # fleet state
+   theozolith command drain   --node box1 --target worker
+   theozolith command recycle --node box1 --target worker   # kills the whole
        # driver tree, run containers included, and restarts it
-   theozolith-control command rebuild --node box1 --target claude-dev
-   theozolith-control command update  --node box1             # nudge convergence now
-   theozolith-control command restart --node box1             # re-exec the daemon in place
-   theozolith-control flags                                   # zombie/malformed/quarantine flags
-   theozolith-control unquarantine --node box1                # human-only release (ADR-0016)
+   theozolith command rebuild --node box1 --target claude-dev
+   theozolith command update  --node box1             # nudge convergence now
+   theozolith command restart --node box1             # re-exec the daemon in place
+   theozolith flags                                   # zombie/malformed/quarantine flags
+   theozolith unquarantine --node box1                # human-only release (ADR-0016)
    ```
 
    On the Control Node these need no environment: the URL comes from the persisted
@@ -142,7 +142,8 @@ Stacks and worker types on top, never below.
        # uncommitted state)
    python3 build.py                   # bootstrap ONLY: a bare checkout with nothing
        # installed — same build implementation as `theozolith build`, finishing by
-       # installing the theozolith/theozolith-control entry points (ADR-0023)
+       # installing the `theozolith` entry point (ADR-0023/0032; the deprecated
+       # `theozolith-control` alias comes along for one release)
    ```
 
    Both paths commit the pin bump to `product.toml` in the Config Repo. **The
@@ -203,7 +204,7 @@ Recovery:
 
 1. Install the TheOzolith package on the replacement box; restore the copy to
    `~/.theozolith/`.
-2. `theozolith-control recover` — validates the restore **loudly and completely**
+2. `theozolith recover` — validates the restore **loudly and completely**
    (every missing or corrupt artifact enumerated in one pass, nonzero exit), then
    re-mints the server certificate from the restored CA. It uses the restored
    `control_ip` by default; pass `--ip` if the replacement box's address differs

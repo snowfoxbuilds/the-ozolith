@@ -23,7 +23,7 @@ An open-source agent-orchestration monorepo with three separable concerns:
   (container + supervised driver processes, kill-the-tree), local derived-image builds,
   tmpfs secrets, orphan reaping. `deploy/` carries the installer, the control compose
   file, and a starter Config Repo (including a Flight Deck example); the daemon-less
-  one-box dev shape runs `theozolith-control serve` beside the drivers (claims dispatch
+  one-box dev shape runs `theozolith serve` beside the drivers (claims dispatch
   through the Control Node — ADR-0017).
 
 Every top-level component is independently installable. A laptop-only user of the knowledge
@@ -52,7 +52,7 @@ theozolith-knowledge bake --source https://example.com/knowledge.git --pin <comm
 
 One Control Node plus a Node Daemon on every physical box that should run Stacks.
 The deployment footprint per box is docker + the TheOzolith package +
-`theozolith-control init` output (the deletion test as restated by ADR-0023 — there
+`theozolith init` output (the deletion test as restated by ADR-0023 — there
 is no `.env`). Operations, product updates, backup/recovery, the daemon-less one-box
 dev shape, and cleanup are covered in [deploy/README.md](deploy/README.md).
 
@@ -119,7 +119,7 @@ state distributes over the heartbeat channel; nodes cache it for degraded mode.
 Stacks reference secrets by name (e.g. `github-worker`); enter each value once:
 
 ```sh
-theozolith-control secret set github-worker    # on the Control Node; or the dashboard
+theozolith secret set github-worker    # on the Control Node; or the dashboard
 ```
 
 Secrets are encrypted at rest on the Control Node, pulled node-scoped over TLS (only
@@ -130,7 +130,7 @@ on node disk.
 
 ```sh
 GITHUB_TOKEN=... theozolith-bootstrap --repo owner/name   # labels + issue forms, one-time
-theozolith-control status                                 # fleet state
+theozolith status                                 # fleet state
 ```
 
 The dashboard (at the minted origin, behind the admin password) shows the fleet —

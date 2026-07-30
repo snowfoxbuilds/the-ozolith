@@ -403,15 +403,14 @@ def create_app(
         except (OSError, ValueError) as exc:
             raise HTTPException(
                 status_code=409,
-                detail=f"no usable CA at {settings.tls_dir} — run 'theozolith-control init'"
-                f" first ({exc})",
+                detail=f"no usable CA at {settings.tls_dir} — run 'theozolith init' first ({exc})",
             ) from exc
         addr = explicit_addr
         if not addr:
             if not settings.control_ip:
                 raise HTTPException(
                     status_code=409,
-                    detail="no persisted control IP — run 'theozolith-control init'"
+                    detail="no persisted control IP — run 'theozolith init'"
                     " (ADR-0031), or pass an explicit 'addr'",
                 )
             addr = f"{settings.control_ip}:{settings.bootstrap_port}"

@@ -134,12 +134,12 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
     )
     # ADR-0017: claims dispatch through the Control Node — there is no
     # second claim path, so a driver without one cannot run. The daemon-less
-    # dev shape is `theozolith-control serve` on the same box.
+    # dev shape is `theozolith serve` on the same box.
     control_node_url = env_value(environ, "CONTROL_NODE_URL")
     if not control_node_url:
         raise ConfigError(
             "set CONTROL_NODE_URL — drivers request work from the Control Node (ADR-0017);"
-            " for local dev run 'theozolith-control serve' and point at it"
+            " for local dev run 'theozolith serve' and point at it"
         )
     stack = _first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role
     # Per-Stack default matching the Node Daemon's injection and control's

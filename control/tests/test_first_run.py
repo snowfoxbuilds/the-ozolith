@@ -74,7 +74,7 @@ def test_init_produces_the_partition_and_the_handoff(home, capsys):
     # Steps are executable in printed order (acceptance 7 of the revision):
     # `serve` — which owns the bootstrap listener — comes before the CA
     # download it serves.
-    assert handoff.index("theozolith-control serve") < handoff.index(ca_url)
+    assert handoff.index("theozolith serve") < handoff.index(ca_url)
     assert "static IP or DHCP reservation" in handoff  # the IP-only channel prerequisite
     assert "security add-trusted-cert" in handoff  # macOS one-liner
     assert "update-ca-certificates" in handoff  # Linux one-liner

@@ -235,7 +235,7 @@ def render(origin: str, control_ip: str, overrides: dict[str, Any]) -> str:
         "# variables override these (expert escape hatch).",
         "",
         "[control]",
-        "# Read-only: written by 'theozolith-control init' (origin-init /",
+        "# Read-only: written by 'theozolith init' (origin-init /",
         "# recover --ip); the settings form refuses to change them. The origin",
         "# is what browsers dial; the IP is what nodes dial (ADR-0023/0031).",
         f"public_origin = {_toml_literal(origin)}",

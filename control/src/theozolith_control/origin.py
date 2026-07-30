@@ -95,7 +95,7 @@ def validate_host(host: str) -> None:
         raise OriginError(
             f"public-origin host {host!r} lacks a conforming slug — the first label must be"
             f" >= {_SLUG_CHARS} base32 characters carrying at least 128 bits of entropy"
-            " (run 'theozolith-control origin-init')"
+            " (run 'theozolith origin-init')"
         )
     for label in base.split("."):
         if not _LABEL_RE.match(label):
@@ -111,7 +111,7 @@ def parse_public_origin(text: str) -> PublicOrigin:
     raw = text.strip()
     if not raw:
         raise OriginError(
-            "no public origin configured — run 'theozolith-control origin-init'"
+            "no public origin configured — run 'theozolith origin-init'"
             " or set THEOZOLITH_PUBLIC_ORIGIN"
         )
     try:

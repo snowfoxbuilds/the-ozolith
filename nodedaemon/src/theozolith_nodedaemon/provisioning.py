@@ -71,7 +71,7 @@ _FIXED = 4 + 32 + TOKEN_BYTES  # exp + fingerprint + token, before addr
 MALFORMED = "malformed join string"
 MISMATCH = (
     "CA fingerprint mismatch: possible MITM, or a stale join string after a CA"
-    " rotation (a re-run of 'theozolith-control init --force' invalidates every"
+    " rotation (a re-run of 'theozolith init --force' invalidates every"
     " outstanding join string by construction — mint a fresh one). Nothing was"
     " transmitted to the control channel."
 )

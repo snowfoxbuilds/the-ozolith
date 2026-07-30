@@ -30,5 +30,5 @@ USER ozolith
 ENV THEOZOLITH_DATA_DIR=/data
 
 EXPOSE 8443 6965
-ENTRYPOINT ["theozolith-control"]
+ENTRYPOINT ["theozolith"]
 CMD ["serve", "--host", "0.0.0.0", "--port", "8443"]

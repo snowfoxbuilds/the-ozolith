@@ -59,7 +59,7 @@ def test_absolute_expiry_ends_the_session(control: ControlRig):
 
 
 def test_password_change_invalidates_every_session(control: ControlRig, monkeypatch):
-    """`theozolith-control set-password` rewrites the hash and truncates the
+    """`theozolith set-password` rewrites the hash and truncates the
     session table; the new password takes effect with no server restart."""
     _login(control)
     assert control.client.get("/", follow_redirects=False).status_code == 200
