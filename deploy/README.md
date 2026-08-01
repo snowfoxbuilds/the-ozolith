@@ -211,10 +211,15 @@ Stacks and worker types on top, never below.
 Backup is **one folder, one copy command**: the data partition minus `cache/`
 (optionally minus `logs/`) to another trusted device. Root-mediated bare metal —
 the primary shape — keeps it at `/var/lib/theozolith-control/`, owned by the
-service user, so the copy runs under sudo:
+service user, so only the local *read* is privileged: root creates a tar stream
+and the network leg runs as you, with your own SSH identity (root has no keys
+for `backup-host`, and preserving the service user's ownership on a remote
+account would fail anyway — `recover` repairs ownership on restore, so none
+needs preserving):
 
 ```sh
-sudo rsync -a --exclude cache/ /var/lib/theozolith-control/ backup-host:theozolith-backup/
+sudo tar -C /var/lib/theozolith-control --exclude='./cache' -cf - . \
+  | ssh backup-host 'cat > theozolith-backup.tar'
 ```
 
 Unprivileged and compose homes keep `~/.theozolith/`:
@@ -236,7 +241,13 @@ Recovery:
 
 1. Install the TheOzolith package on the replacement box; restore the copy to
    the data dir (`/var/lib/theozolith-control/` root-mediated, `~/.theozolith/`
-   otherwise).
+   otherwise). Root-mediated, mirroring the backup command — the network leg as
+   you, only the local extract as root (ownership comes back in step 2):
+
+   ```sh
+   sudo mkdir -p /var/lib/theozolith-control
+   ssh backup-host 'cat theozolith-backup.tar' | sudo tar -C /var/lib/theozolith-control -xf -
+   ```
 2. `theozolith recover` (under `sudo` on bare metal) — validates the restore
    **loudly and completely** (every missing or corrupt artifact enumerated in one
    pass, nonzero exit), re-mints the server certificate from the restored CA
