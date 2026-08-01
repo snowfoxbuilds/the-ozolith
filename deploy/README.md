@@ -208,14 +208,25 @@ Stacks and worker types on top, never below.
 
 ## Backup and recovery (ADR-0024)
 
-Backup is **one folder, one copy command**: `~/.theozolith/` minus `cache/`
-(optionally minus `logs/`) to another trusted device —
+Backup is **one folder, one copy command**: the data partition minus `cache/`
+(optionally minus `logs/`) to another trusted device. Root-mediated bare metal —
+the primary shape — keeps it at `/var/lib/theozolith-control/`, owned by the
+service user, so the copy runs under sudo:
+
+```sh
+sudo rsync -a --exclude cache/ /var/lib/theozolith-control/ backup-host:theozolith-backup/
+```
+
+Unprivileged and compose homes keep `~/.theozolith/`:
 
 ```sh
 rsync -a --exclude cache/ ~/.theozolith/ backup-host:theozolith-backup/
 ```
 
-Re-copy after enrolling nodes or adding secrets; that is the whole cadence rule.
+Back up the partition your deployment actually uses — after `sudo theozolith
+init`, an `~/.theozolith/` copy is empty or stale and omits the CA, master key,
+tokens, and secret store. Re-copy after enrolling nodes or adding secrets; that
+is the whole cadence rule.
 Secret material never leaves trusted devices: **GitHub is never a full backup** — a
 Config Repo clone looks like a deployment but cannot resurrect one (`secrets/` is a
 sibling of `configs/` by decision, never a git-ignored child: `git clean -x` must not
@@ -253,6 +264,28 @@ recover them. Nodes enrolled *after* the backup DO show up in the unregistered-n
 view (their heartbeats arrive with unknown tokens): that list is the re-provision
 worklist for the stale-backup case. Deleting `cache/cache.db` on a live system is
 always safe and is the documented recovery move for cache corruption.
+
+### Migrating a pre-ADR-0034 home-directory install
+
+The same recover machinery relocates an existing `~/.theozolith/` deployment onto
+the root-mediated shape — no re-init, no CA rotation, zero node touches (same IP):
+
+```sh
+# prerequisite: theozolith installed at a system path the service user can
+# reach (e.g. a venv under /opt/theozolith) — the installer refuses a home venv
+# 1. stop the old hand-run serve (Ctrl-C / kill), then:
+sudo mkdir -p /var/lib/theozolith-control
+sudo rsync -a ~/.theozolith/ /var/lib/theozolith-control/   # cache/ optional
+sudo theozolith recover      # validates, re-mints the server cert from the SAME
+                             # CA, creates the service user, repairs ownership,
+                             # installs and enables the unit
+sudo systemctl start theozolith-control.service
+rm -rf ~/.theozolith         # once the dashboard answers
+```
+
+A deployment with no provisioned nodes and no stored secrets can skip all of
+this and simply re-run `sudo theozolith init` (recover validates the full
+partition, including `store.db`, which only exists once a node or secret does).
 
 ## Daemon-less dev (the M2 shape)
 
@@ -326,12 +359,19 @@ the files owned by the driver user either by building the image with
 
 ```sh
 sudo systemctl disable --now theozolith-nodedaemon    # drivers die with it (cgroup)
+# The root-mediated Control Node (ADR-0034; the guards make this safe on
+# boxes that never had one):
+sudo systemctl disable --now theozolith-control.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/theozolith-control.service
+sudo systemctl daemon-reload
+sudo userdel ozolith-control 2>/dev/null || true    # drops its group with it
 docker ps -aq --filter label=theozolith.owner | xargs -r docker rm -f
 docker compose -f deploy/compose/control.yml down
 docker volume rm theozolith-cache
-sudo rm -rf /opt/theozolith /var/lib/theozolith ~/.theozolith
+sudo rm -rf /opt/theozolith /var/lib/theozolith /var/lib/theozolith-control ~/.theozolith
 ```
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node
-store, both now gone. Orphaned run containers from a mid-Run kill are reaped by the
-daemon on its next start; the zombie-claim janitor restores the GitHub claim state.
+store, both now gone (including the root-mediated partition, its unit, and its service
+user). Orphaned run containers from a mid-Run kill are reaped by the daemon on its next
+start; the zombie-claim janitor restores the GitHub claim state.
