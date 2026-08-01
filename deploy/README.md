@@ -218,9 +218,16 @@ account would fail anyway — `recover` repairs ownership on restore, so none
 needs preserving):
 
 ```sh
+set -o pipefail   # a tar failure must fail the pipeline, not ship a truncated archive
 sudo tar -C /var/lib/theozolith-control --exclude='./cache' -cf - . \
-  | ssh backup-host 'cat > theozolith-backup.tar'
+  | ssh backup-host 'umask 077; cat > theozolith-backup.tar.tmp' \
+  && ssh backup-host 'mv theozolith-backup.tar.tmp theozolith-backup.tar'
 ```
+
+The remote `umask 077` matters: the archive carries the master key, CA private
+key, admin token, and secret store, and the remote account's default umask
+would land it world-readable. The temp-file-then-promote keeps the last good
+archive intact until the new one has fully arrived.
 
 Unprivileged and compose homes keep `~/.theozolith/`:
 
@@ -246,8 +253,14 @@ Recovery:
 
    ```sh
    sudo mkdir -p /var/lib/theozolith-control
-   ssh backup-host 'cat theozolith-backup.tar' | sudo tar -C /var/lib/theozolith-control -xf -
+   ssh backup-host 'cat theozolith-backup.tar' \
+     | sudo tar -C /var/lib/theozolith-control --no-same-owner -xf -
    ```
+
+   `--no-same-owner` is deliberate: root tar would otherwise restore the
+   archived numeric UID/GID, which on a replacement box may belong to an
+   unrelated account — files stay root-owned until step 2's controlled
+   ownership repair.
 2. `theozolith recover` (under `sudo` on bare metal) — validates the restore
    **loudly and completely** (every missing or corrupt artifact enumerated in one
    pass, nonzero exit), re-mints the server certificate from the restored CA
