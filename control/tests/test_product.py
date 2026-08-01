@@ -168,12 +168,20 @@ def test_build_distribution_stamps_versions_and_collects_wheels(tmp_path):
             return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.run(args, **kwargs)  # the git subcommands are real
 
+    # A stale wheel from an earlier version in a reused out_dir (build.py's
+    # ./dist) must not survive into the result: pip would face two versions
+    # of the same package and refuse the whole install.
+    out.mkdir(parents=True)
+    (out / "theozolith_worker-0.3.0+gdeadbeef0000-py3-none-any.whl").write_bytes(b"stale")
+
     version, wheels = product.build_distribution(
         source, out, runner=fake_runner, log=lambda *_: None
     )
 
     assert version == expected
     assert len(wheels) == len(product.COMPONENTS)
+    assert not any("deadbeef" in name for name in wheels)
+    assert not (out / "theozolith_worker-0.3.0+gdeadbeef0000-py3-none-any.whl").exists()
     # Every component's sandbox pyproject carried the stamped version, so
     # the installed distributions report it back in heartbeats.
     for component in product.COMPONENTS:

@@ -259,6 +259,15 @@ def build_distribution(
     filenames)."""
     version = source_version(source, runner=runner)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # A reused out_dir (build.py's ./dist — the CLI path passes a fresh
+    # tempdir) may hold wheels from an earlier version; the collection glob
+    # below would sweep them into the result and pip would face two
+    # versions of every package (ResolutionImpossible on the Pi, 2026-08-01).
+    stale = [p for p in out_dir.iterdir() if p.name.endswith(".whl")]
+    for wheel in stale:
+        wheel.unlink()
+    if stale:
+        log(f"removed {len(stale)} stale wheel(s) from {out_dir}")
     with tempfile.TemporaryDirectory(prefix="theozolith-build-") as sandbox:
         for component in COMPONENTS:
             staged = Path(sandbox) / component
