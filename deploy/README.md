@@ -6,7 +6,8 @@ claim (no second claim path exists), so the daemon-less dev shape is `theozolith
 serve` on the same box as the drivers, not "no Control Node". With it down, in-flight
 Runs finish and publish; new claims and review rounds pause.
 
-Deployment footprint (the deletion test, restated 2026-07-27; ADR-0023): **docker + the
+Deployment footprint (the deletion test, restated 2026-07-27; ADR-0023, amended by
+ADR-0034): **docker — or the systemd unit init installs on bare metal — + the
 TheOzolith package + `theozolith init` output** — every tier-2 tunable at its
 shipped default, environment variables as the expert override only. There is no `.env`:
 settings live in `control.toml` in the Config Repo (dashboard-edited), secrets in the
@@ -20,7 +21,8 @@ Stacks and worker types on top, never below.
    (ADR-0023 as amended; ADR-0034): nodes AND browsers dial the control IP
    directly, with zero DNS dependency anywhere.
 
-   Bare metal (root-mediated, ADR-0034):
+   Bare metal (root-mediated, ADR-0034; the `theozolith` CLI must already be
+   installed at a system path — see *Build / rebuild from the repo* below):
 
    ```sh
    sudo theozolith init
@@ -79,7 +81,8 @@ Stacks and worker types on top, never below.
 2. **Nodes** (every physical box that should run Stacks) — one paste each:
 
    ```sh
-   theozolith join-token create        # on the Control Node (or the dashboard's
+   theozolith join-token create        # on the Control Node, under sudo on a
+                                       # root-mediated install (or the dashboard's
                                        # Join tokens page): prints the exact line
    ```
 
@@ -107,7 +110,9 @@ Stacks and worker types on top, never below.
    outstanding join string. `theozolith-nodedaemon provision --inspect 'ozjoin1:…'`
    pretty-prints a payload without acting.
 
-3. **Config Repo** (`~/.theozolith/configs` on the Control Node; ADR-0006): declare
+3. **Config Repo** (`configs/` in the Control Node's data partition —
+   `/var/lib/theozolith-control/configs` root-mediated, `~/.theozolith/configs`
+   otherwise; ADR-0006): declare
    Stacks and derived images — `deploy/configs-example/` is a complete starter. Desired
    state distributes over the heartbeat channel; nodes cache it for degraded mode.
    The Implementer/Reviewer drivers are process-kind Stacks (the daemon injects the
@@ -122,6 +127,7 @@ Stacks and worker types on top, never below.
 
    ```sh
    theozolith secret set github-worker    # on the Control Node; no env needed
+                                          # (under sudo on a root-mediated install)
    ```
 
    Encrypted at rest in `secrets/store.db`; pulled node-scoped (only nodes whose
@@ -164,7 +170,8 @@ Stacks and worker types on top, never below.
    python3 build.py                   # bootstrap ONLY: a bare checkout with nothing
        # installed — same build implementation as `theozolith build`, finishing by
        # installing the `theozolith` entry point (ADR-0023/0032; the deprecated
-       # `theozolith-control` alias comes along for one release)
+       # `theozolith-control` alias comes along for one release). The full
+       # bare-metal sequence: "Build / rebuild from the repo" below.
    ```
 
    Both paths commit the pin bump to `product.toml` in the Config Repo. **The
@@ -205,6 +212,57 @@ Stacks and worker types on top, never below.
    bundle, the claim is released and the issue escalated `failed` + `needs_human` with
    the evidence link — never auto-re-queued. An optional slow GitHub-Action backstop
    lives in `deploy/github/zombie-janitor.yml` (copy into the target repo).
+
+## Build / rebuild from the repo (bare metal)
+
+The complete from-checkout sequence for a root-mediated Control Node — first
+install and every source update after it.
+
+**First install.** The executable must live at a system path the service user
+can reach (the installer refuses a home venv — `/home/<you>` is not
+world-traversable; ADR-0034), so the bootstrap venv goes under `/opt`:
+
+```sh
+git clone https://github.com/snowfoxbuilds/the-ozolith && cd the-ozolith
+sudo python3 -m venv /opt/theozolith
+sudo /opt/theozolith/bin/python build.py     # builds the wheels, installs them there
+sudo ln -sf /opt/theozolith/bin/theozolith /usr/local/bin/theozolith
+```
+
+Then the first run, exactly as in step 1 of Full substrate:
+
+```sh
+sudo theozolith init            # check the auto-detected IP; --ip to correct it
+sudo systemctl start theozolith-control.service
+```
+
+Browse to `https://<control-ip>`, click through the certificate interstitial,
+log in — then pin the product so the fleet has a recorded version:
+
+```sh
+cd the-ozolith && sudo theozolith build      # uploads the wheels, commits the pin
+```
+
+If a shell had a previous checkout venv active, `deactivate` and confirm
+`which theozolith` answers `/usr/local/bin/theozolith` — the old entry point
+shadows the system one until it does.
+
+**Rebuild after source changes.** `build.py` was bootstrap only; from here the
+loop is:
+
+```sh
+cd the-ozolith
+git pull                        # a dirty tree is refused — every pin names a committed SHA
+theozolith test                 # iterate here (checkout venv), never by deploying
+sudo theozolith build           # build, upload, pin; nodes converge on their heartbeats
+```
+
+`theozolith build` serves the wheels from the Control Node and bumps the pin,
+so every node — the Control Node's own host queued last — self-updates; no
+node ever pulls source or builds. The `/opt/theozolith` venv itself only needs
+touching when you want the *CLI on this box* updated too (it is just another
+node-shaped install): re-run `sudo /opt/theozolith/bin/python build.py` from
+the updated checkout.
 
 ## Backup and recovery (ADR-0024)
 
@@ -350,7 +408,9 @@ partition, including `store.db`, which only exists once a node or secret does).
    ```
 
    With `CONTROL_NODE_URL` unset, the claim pre-filter and event emission are skipped
-   cleanly. The M2 systemd units in `deploy/systemd/` remain as conveniences; from M3 on
+   cleanly. The M2 driver units (`theozolith-worker.service`,
+   `theozolith-reviewer.service` in `deploy/systemd/`) remain as conveniences — unlike
+   `theozolith-control.service` there, which is the ADR-0034 production unit; from M3 on
    the deployment contract is the Node Daemon supervising the drivers as process Stacks.
 
 ## Job-dir ownership
