@@ -111,6 +111,19 @@ def test_production_serve_requires_the_control_address(cli_env):
         cli_main(["serve"])
 
 
+def test_production_serve_fails_closed_on_a_malformed_persisted_port(cli_env, capsys):
+    """A present-but-invalid control_port is a configuration error at
+    startup — never a silent redirect of browsers and nodes to 443."""
+    provision(cli_env / "secrets" / "tls", [CONTROL_IP])
+    configs = cli_env / "configs"
+    configs.mkdir(parents=True, exist_ok=True)
+    (configs / "control.toml").write_text(
+        f'[control]\ncontrol_ip = "{CONTROL_IP}"\ncontrol_port = "443"\n'
+    )
+    assert cli_main(["serve"]) == 2
+    assert "control_port" in capsys.readouterr().err
+
+
 def _capture_serve(monkeypatch) -> dict:
     """Run `serve` up to (a fake) uvicorn.run and capture the built app."""
     import uvicorn

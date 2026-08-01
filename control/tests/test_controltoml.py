@@ -110,6 +110,36 @@ def test_set_value_refuses_unknown_keys_and_the_control_address(tmp_path):
     assert controltoml.read_control_ip(repo) == CONTROL_IP
 
 
+def test_control_port_absent_defaults_and_malformed_fails_closed(tmp_path):
+    """ADR-0034: no control.toml or no control_port line means 443; a
+    PRESENT malformed value is a configuration error, never a silent 443
+    (silently redirecting the fleet is the hand-edit failure the fixed
+    schema exists to surface)."""
+    assert controltoml.read_control_port(tmp_path) == 443  # no file at all
+    controltoml.write_control_address(tmp_path, CONTROL_IP, port=9443)
+    assert controltoml.read_control_port(tmp_path) == 9443
+    controltoml.write_control_address(tmp_path, CONTROL_IP, port=443)
+    assert controltoml.read_control_port(tmp_path) == 443  # absent line again
+    for bad in ('"9443"', "9443.5", "true", "false", "0", "-1", "70000"):
+        (tmp_path / "control.toml").write_text(
+            f'[control]\ncontrol_ip = "{CONTROL_IP}"\ncontrol_port = {bad}\n'
+        )
+        with pytest.raises(controltoml.ControlTomlError, match="control_port"):
+            controltoml.read_control_port(tmp_path)
+
+
+def test_load_settings_fails_closed_on_a_malformed_control_port(tmp_path):
+    repo = tmp_path / "configs"
+    repo.mkdir()
+    (repo / "control.toml").write_text(
+        f'[control]\ncontrol_ip = "{CONTROL_IP}"\ncontrol_port = true\n'
+    )
+    with pytest.raises(ConfigError, match="control_port"):
+        load_settings(
+            {"THEOZOLITH_DATA_DIR": str(tmp_path / "home"), "THEOZOLITH_CONFIG_REPO": str(repo)}
+        )
+
+
 def test_address_writes_preserve_committed_settings(tmp_path):
     repo = _git_repo(tmp_path)
     controltoml.write_control_address(repo, CONTROL_IP, port=9443)

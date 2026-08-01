@@ -113,11 +113,12 @@ def test_settings_form_renders_control_fields_read_only_and_rejects_writes(contr
     _git_config_repo(control)
     _login(control)
     page = control.client.get("/settings").text
-    # The derived browser origin and the control IP render read-only
+    # The derived browser origin and the control address render read-only
     # (ADR-0031/0034): re-pointing a deployment is a recover --ip / init
     # --force act, never a form field.
     assert "readonly" in page and f"https://{control.settings.control_ip}" in page
     assert control.settings.control_ip in page
+    assert "<code>control_port</code>" in page and 'value="443"' in page
     for key in ("public_origin", "control_ip", "control_port"):
         refused = control.client.post("/settings", data={"key": key, "value": "10.6.6.6"})
         assert refused.status_code == 403, key

@@ -178,12 +178,15 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     ).expanduser()
 
     # Tier-2: shipped defaults <- control.toml <- validated env overrides.
+    # The persisted control_port rides the same fail-closed path: a
+    # malformed value is a configuration error, never a silent 443.
     try:
         tunables: dict[str, Any] = controltoml.read_values(config_repo)
         for setting in controltoml.SETTINGS:
             raw = env_value(environ, setting.env)
             if raw:
                 tunables[setting.key] = setting.coerce(raw, source=setting.env)
+        control_port = controltoml.read_control_port(config_repo)
     except controltoml.ControlTomlError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -199,6 +202,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         or env_value(environ, "GITHUB_TOKEN"),
         api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",
         control_ip=controltoml.read_control_ip(config_repo),
-        control_port=controltoml.read_control_port(config_repo),
+        control_port=control_port,
         **{key: value for key, value in tunables.items() if key in _SETTING_FIELDS},
     )

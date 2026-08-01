@@ -365,21 +365,62 @@ WantedBy=multi-user.target
 """
 
 
+def _systemd_present() -> bool:
+    return Path("/run/systemd/system").is_dir()
+
+
+def _exec_unreachable_reason(path: Path) -> str | None:
+    """Why the service user could not run ``path``, or None if it can.
+
+    The unit runs as the unprivileged ``ozolith-control`` user (its own
+    group), so reachability reduces to the world bits: the file needs
+    others-read+execute and every ancestor directory others-execute. A sudo
+    invocation happily resolves an executable inside /root or a 0700 home
+    venv — persisting that into the unit would fail only at first boot,
+    which is exactly the deferred failure this check moves to setup time."""
+    if not path.is_file():
+        return "no such file"
+    if path.stat().st_mode & 0o005 != 0o005:
+        return "the file is not readable+executable by others"
+    for parent in path.parents:
+        if parent.stat().st_mode & 0o001 == 0:
+            return f"directory {parent} is not traversable by others"
+    return None
+
+
+def _service_executable() -> str:
+    """The ExecStart path for the unit, validated as reachable by the
+    service user — setup fails with remediation rather than generating a
+    unit that dies at first start (ADR-0034)."""
+    import shutil
+
+    path = Path(shutil.which("theozolith") or Path(sys.argv[0])).resolve()
+    reason = _exec_unreachable_reason(path)
+    if reason:
+        raise SystemExit(
+            f"error: theozolith at {path} is not reachable by the"
+            f" {CONTROL_SERVICE_USER} service user ({reason}) — install TheOzolith"
+            " at a system path (e.g. a venv under /opt/theozolith with its bin on"
+            " PATH, or pipx --global) and re-run, or use the docker compose flow"
+        )
+    return str(path)
+
+
 def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
-    """Root-mediated bare-metal setup (ADR-0034): create the dedicated
-    service user, hand the partition to it, install and enable the unit.
-    Skipped (False) when not root, inside a container, or without systemd —
-    the compose flow and hand-run dev serve are unchanged."""
+    """Root-mediated bare-metal setup (ADR-0034), idempotent — shared by
+    init and recover: ensure the dedicated service user, hand the partition
+    to it, (re)write the unit, daemon-reload, enable. Skipped (False) when
+    not root, inside a container, or without systemd — the compose flow and
+    hand-run dev serve are unchanged."""
     if os.geteuid() != 0 or _running_in_container():
         return False
-    if not Path("/run/systemd/system").is_dir():
+    if not _systemd_present():
         _log(f"systemd not detected — start serving yourself: theozolith serve --port {port}")
         return False
     import pwd
-    import shutil
     import subprocess
 
-    exec_path = shutil.which("theozolith") or str(Path(sys.argv[0]).resolve())
+    exec_path = _service_executable()
     try:
         pwd.getpwnam(CONTROL_SERVICE_USER)
     except KeyError:
@@ -398,6 +439,7 @@ def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
             check=True,
         )
     # The service user owns the partition; root (sudo) reads through it.
+    # Re-running repairs ownership after a restore (recover's case).
     subprocess.run(
         ["chown", "-R", f"{CONTROL_SERVICE_USER}:{CONTROL_SERVICE_USER}", str(settings.data_dir)],
         check=True,
@@ -574,7 +616,7 @@ def _recover(args) -> int:
     elif ip:
         try:
             origin.derive_origin(ip, controltoml.read_control_port(settings.config_repo))
-        except OriginError as exc:
+        except (OriginError, controltoml.ControlTomlError) as exc:
             problems.append(f"control address invalid: {exc}")
     try:
         controltoml.read_values(settings.config_repo)
@@ -629,8 +671,18 @@ def _recover(args) -> int:
     _log(f"re-minted {cert} and {key} from the restored CA (SAN: {ip})")
     if args.ip and args.ip != persisted_ip:
         controltoml.write_control_address(settings.config_repo, args.ip, log=_log)
+    # Root-mediated recovery repairs the service too (ADR-0034): same
+    # idempotent installer as init — service user, partition ownership,
+    # unit, enable — never a new CA. The printed instruction is truthful:
+    # the unit exists and is enabled before it is suggested.
+    unit_installed = _install_systemd_unit(
+        settings, controltoml.read_control_port(settings.config_repo)
+    )
     _log("recovery validated. next:")
-    _log("  start serving: sudo systemctl start theozolith-control.service (or theozolith serve)")
+    if unit_installed:
+        _log(f"  start serving: sudo systemctl start {CONTROL_SERVICE_NAME}")
+    else:
+        _log("  start serving: theozolith serve (or the compose flow)")
     if args.ip and persisted_ip and args.ip != persisted_ip:
         _log("")
         _log(f"control IP CHANGED ({persisted_ip} -> {args.ip}): every provisioned node")
@@ -830,9 +882,10 @@ def main(argv: list[str] | None = None) -> int:
 
     recover = sub.add_parser(
         "recover",
-        help="Validate a restored data-dir copy (loudly, completely) and re-mint"
-        " the server certificate from the restored CA — nodes reconnect untouched"
-        " (ADR-0024).",
+        help="Validate a restored data-dir copy (loudly, completely), re-mint the"
+        " server certificate from the restored CA — nodes reconnect untouched"
+        " (ADR-0024) — and, run as root on bare metal, repair the systemd service"
+        " (ADR-0034; never a new CA).",
     )
     recover.add_argument(
         "--ip",

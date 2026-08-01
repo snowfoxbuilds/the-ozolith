@@ -190,12 +190,19 @@ DEFAULT_CONTROL_PORT = 443
 
 def read_control_port(config_repo: Path) -> int:
     """The persisted external https port (ADR-0034) — a read-only [control]
-    field beside the IP. Default 443, so a portless deployment writes
-    nothing and the browser origin carries no port."""
+    field beside the IP. ABSENT defaults to 443 (a portless deployment
+    writes nothing and the browser origin carries no port); a PRESENT but
+    malformed value fails closed with ControlTomlError — silently
+    redirecting every browser and node to 443 would be exactly the
+    hand-edit-a-typo failure the fixed schema exists to surface."""
     control = _load(config_repo).get("control", {})
     value = control.get("control_port") if isinstance(control, dict) else None
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+    if value is None:
         return DEFAULT_CONTROL_PORT
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ControlTomlError(
+            f"{CONTROL_TOML}: 'control_port' must be an integer in 1-65535, got {value!r}"
+        )
     return value
 
 

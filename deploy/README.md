@@ -223,9 +223,11 @@ Recovery:
 1. Install the TheOzolith package on the replacement box; restore the copy to
    the data dir (`/var/lib/theozolith-control/` root-mediated, `~/.theozolith/`
    otherwise).
-2. `theozolith recover` — validates the restore **loudly and completely**
-   (every missing or corrupt artifact enumerated in one pass, nonzero exit), then
-   re-mints the server certificate from the restored CA. It uses the restored
+2. `theozolith recover` (under `sudo` on bare metal) — validates the restore
+   **loudly and completely** (every missing or corrupt artifact enumerated in one
+   pass, nonzero exit), re-mints the server certificate from the restored CA
+   (never a new CA), and — run as root on a systemd host — repairs the service
+   too: service user, partition ownership, unit, enable. It uses the restored
    `control_ip` by default; pass `--ip` if the replacement box's address differs
    (it is then persisted for every future mint).
 3. Start serving (`sudo systemctl start theozolith-control.service`, or the

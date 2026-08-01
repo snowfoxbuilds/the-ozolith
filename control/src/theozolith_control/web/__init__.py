@@ -283,6 +283,7 @@ def mount_web(
         return {
             "origin": origin_text,
             "control_ip": control_ip,
+            "control_port": control_port,
             "rows": [
                 {
                     "key": s.key,

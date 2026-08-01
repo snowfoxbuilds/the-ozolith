@@ -23,6 +23,12 @@ the file is optional. <code>THEOZOLITH_*</code> environment variables override t
     <td><input value="{{ control_ip }}" readonly disabled></td>
     <td><span class="muted">read-only</span></td>
   </tr>
+  <tr>
+    <td><code>control_port</code><div class="muted">The EXTERNAL https port browsers and nodes
+      dial — written by init (443 when absent), read-only here.</div></td>
+    <td><input value="{{ control_port }}" readonly disabled></td>
+    <td><span class="muted">read-only</span></td>
+  </tr>
   {% for row in rows %}
   <tr>
     <td><code>{{ row.key }}</code><div class="muted">{{ row.label }}</div></td>
