@@ -206,6 +206,57 @@ Stacks and worker types on top, never below.
    the evidence link — never auto-re-queued. An optional slow GitHub-Action backstop
    lives in `deploy/github/zombie-janitor.yml` (copy into the target repo).
 
+## Build / rebuild from the repo (bare metal)
+
+The complete from-checkout sequence for a root-mediated Control Node — first
+install and every source update after it.
+
+**First install.** The executable must live at a system path the service user
+can reach (the installer refuses a home venv — `/home/<you>` is not
+world-traversable; ADR-0034), so the bootstrap venv goes under `/opt`:
+
+```sh
+git clone https://github.com/snowfoxbuilds/the-ozolith && cd the-ozolith
+sudo python3 -m venv /opt/theozolith
+sudo /opt/theozolith/bin/python build.py     # builds the wheels, installs them there
+sudo ln -sf /opt/theozolith/bin/theozolith /usr/local/bin/theozolith
+```
+
+Then the first run, exactly as in step 1 of Full substrate:
+
+```sh
+sudo theozolith init            # check the auto-detected IP; --ip to correct it
+sudo systemctl start theozolith-control.service
+```
+
+Browse to `https://<control-ip>`, click through the certificate interstitial,
+log in — then pin the product so the fleet has a recorded version:
+
+```sh
+cd the-ozolith && sudo theozolith build      # uploads the wheels, commits the pin
+```
+
+If a shell had a previous checkout venv active, `deactivate` and confirm
+`which theozolith` answers `/usr/local/bin/theozolith` — the old entry point
+shadows the system one until it does.
+
+**Rebuild after source changes.** `build.py` was bootstrap only; from here the
+loop is:
+
+```sh
+cd the-ozolith
+git pull                        # a dirty tree is refused — every pin names a committed SHA
+theozolith test                 # iterate here (checkout venv), never by deploying
+sudo theozolith build           # build, upload, pin; nodes converge on their heartbeats
+```
+
+`theozolith build` serves the wheels from the Control Node and bumps the pin,
+so every node — the Control Node's own host queued last — self-updates; no
+node ever pulls source or builds. The `/opt/theozolith` venv itself only needs
+touching when you want the *CLI on this box* updated too (it is just another
+node-shaped install): re-run `sudo /opt/theozolith/bin/python build.py` from
+the updated checkout.
+
 ## Backup and recovery (ADR-0024)
 
 Backup is **one folder, one copy command**: the data partition minus `cache/`
