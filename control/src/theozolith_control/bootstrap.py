@@ -5,7 +5,9 @@ A closed route table by decision, not convention — GET/HEAD only, no auth,
 no state, no cookies, and exactly three paths:
 
     /ca.pem        the CA certificate (PEM)
-    /origin        the public origin (browser-only: the slug hostname)
+    /origin        the browser origin — since ADR-0034 the same IP-based
+                   URL as /control-url (browsers and nodes dial one
+                   address; the route stays for compatibility)
     /control-url   the IP-based control URL nodes dial (the node channel is
                    IP-only — ADR-0023 as amended 2026-07-28; it must agree
                    with the join exchange's answer)

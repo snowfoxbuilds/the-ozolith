@@ -1,7 +1,7 @@
-"""The public origin (ADR-0019, amended by M5): slug generation, origin
-parsing/validation, the origin-init CLI verb, the production serve
-requirement (artifact or THEOZOLITH_PUBLIC_ORIGIN), bind-port
-independence, and TLS SAN derivation."""
+"""The browser origin (ADR-0034): derivation from the persisted control
+address, fail-closed validation, the production serve requirement,
+bind-port independence (plus the loud mismatch warning), and TLS SAN
+derivation from the control IP."""
 
 from __future__ import annotations
 
@@ -14,75 +14,74 @@ from theozolith_control.origin import OriginError
 from theozolith_control.passwords import hash_password
 from theozolith_control.tls import provision
 
-BASE32_ALPHABET = set("abcdefghijklmnopqrstuvwxyz234567")
-GOOD_HOST = f"{'a' * 26}.theozolith.com"
+CONTROL_IP = "192.0.2.20"
 
 
-def test_generated_slugs_carry_128_bits_as_26_base32_chars():
-    slugs = {origin.generate_slug() for _ in range(32)}
-    assert len(slugs) == 32  # cheap non-collision sanity
-    for slug in slugs:
-        assert len(slug) == 26 and set(slug) <= BASE32_ALPHABET
+def test_derive_yields_portless_origin_for_default_https():
+    """https://<ip> => Host <ip> and the same Origin — no :8443 or any
+    other port anywhere."""
+    derived = origin.derive_origin(CONTROL_IP)
+    assert derived.origin == f"https://{CONTROL_IP}"
+    assert derived.host_header == CONTROL_IP
+    assert derived.port == 443
 
 
-def test_compose_write_read_roundtrip(tmp_path):
-    """The origin persists as the read-only [control] field of control.toml
-    in the Config Repo (ADR-0024)."""
-    text = origin.compose_origin(origin.generate_slug(), "theozolith.com")
-    assert text.startswith("https://") and ":" not in text.removeprefix("https://")
-    path = controltoml.write_public_origin(tmp_path, text)
-    assert path.name == "control.toml" and text in path.read_text()
-    assert controltoml.read_public_origin(tmp_path) == text
+def test_derive_keeps_an_explicit_nonstandard_port():
+    derived = origin.derive_origin(CONTROL_IP, 9443)
+    assert derived.origin == f"https://{CONTROL_IP}:9443"
+    assert derived.host_header == f"{CONTROL_IP}:9443"
 
 
-def test_parse_yields_portless_host_and_origin_for_default_https():
-    """https://<slug>.theozolith.com => Host <slug>.theozolith.com and the
-    same Origin — no :8443 or any other port anywhere."""
-    parsed = origin.parse_public_origin(f"https://{GOOD_HOST}")
-    assert parsed.origin == f"https://{GOOD_HOST}"
-    assert parsed.host_header == GOOD_HOST
-    assert parsed.hostname == GOOD_HOST
-    assert parsed.port == 443
+def test_derive_brackets_ipv6_literals():
+    derived = origin.derive_origin("2001:db8::7")
+    assert derived.origin == "https://[2001:db8::7]"
+    assert origin.derive_origin("2001:db8::7", 9443).host_header == "[2001:db8::7]:9443"
 
 
-def test_parse_normalizes_case_default_port_and_bare_slash():
-    parsed = origin.parse_public_origin(f"HTTPS://{'A' * 26}.TheOzolith.COM:443/")
-    assert parsed.origin == f"https://{'a' * 26}.theozolith.com"
-    assert parsed.host_header == f"{'a' * 26}.theozolith.com"
-
-
-def test_parse_keeps_an_explicit_nonstandard_port():
-    parsed = origin.parse_public_origin(f"https://{GOOD_HOST}:9443")
-    assert parsed.origin == f"https://{GOOD_HOST}:9443"
-    assert parsed.host_header == f"{GOOD_HOST}:9443"
-    assert parsed.hostname == GOOD_HOST  # the SAN input never carries a port
-
-
-def test_parse_rejects_nonconforming_origins():
-    """Invalid public-origin URL forms fail closed (OriginError)."""
-    for bad in (
-        "",
-        GOOD_HOST,  # bare host: the artifact is a complete origin now
-        f"http://{GOOD_HOST}",  # production origins require https
-        f"ftp://{GOOD_HOST}",
-        f"https://user@{GOOD_HOST}",  # credentials
-        f"https://user:pw@{GOOD_HOST}",
-        f"https://{GOOD_HOST}/dashboard",  # path
-        f"https://{GOOD_HOST}?q=1",  # query
-        f"https://{GOOD_HOST}#frag",  # fragment
-        "https://*.theozolith.com",  # wildcard host
-        f"https://{GOOD_HOST}:0",  # malformed ports
-        f"https://{GOOD_HOST}:99999",
-        f"https://{GOOD_HOST}:8a",
-        "https://control.local",  # a guessable name is exactly what this forbids
-        f"https://{'a' * 25}.theozolith.com",  # one char short of the entropy floor
-        f"https://{'a' * 26}",  # no base domain
-        f"https://{'a' * 26}.bad_domain",
-        f"https://{'a' * 26}.-x.com",
-        "https://10.0.0.5",  # an IP literal is not a randomized hostname
+def test_derive_fails_closed_on_garbage():
+    """Non-IP addresses and out-of-range ports raise OriginError — the
+    BrowserGuard is never armed with garbage expectations."""
+    for ip, port in (
+        ("", 443),
+        ("control.local", 443),  # hostnames are retired with the slug origin
+        ("10.0.0.999", 443),
+        (CONTROL_IP, 0),
+        (CONTROL_IP, 65536),
+        (CONTROL_IP, True),
     ):
         with pytest.raises(OriginError):
-            origin.parse_public_origin(bad)
+            origin.derive_origin(ip, port)
+
+
+def test_control_address_write_read_roundtrip(tmp_path):
+    """The address persists as the read-only [control] fields of
+    control.toml in the Config Repo (ADR-0024/0034)."""
+    path = controltoml.write_control_address(tmp_path, CONTROL_IP, port=9443)
+    assert path.name == "control.toml"
+    assert controltoml.read_control_ip(tmp_path) == CONTROL_IP
+    assert controltoml.read_control_port(tmp_path) == 9443
+    # The default port writes no line and reads back as 443.
+    controltoml.write_control_address(tmp_path, CONTROL_IP, port=443)
+    assert "control_port" not in controltoml.control_toml_path(tmp_path).read_text()
+    assert controltoml.read_control_port(tmp_path) == 443
+    # recover --ip keeps the persisted port (port=None).
+    controltoml.write_control_address(tmp_path, CONTROL_IP, port=9443)
+    controltoml.write_control_address(tmp_path, "192.0.2.21")
+    assert controltoml.read_control_ip(tmp_path) == "192.0.2.21"
+    assert controltoml.read_control_port(tmp_path) == 9443
+
+
+def test_leftover_public_origin_is_ignored_and_dropped(tmp_path):
+    """A pre-ADR-0034 control.toml still parses: the retired field is
+    ignored on read and dropped on the next regeneration."""
+    controltoml.control_toml_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    controltoml.control_toml_path(tmp_path).write_text(
+        f'[control]\npublic_origin = "https://x.theozolith.internal"\ncontrol_ip = "{CONTROL_IP}"\n'
+    )
+    assert controltoml.read_control_ip(tmp_path) == CONTROL_IP
+    assert controltoml.read_control_port(tmp_path) == 443
+    controltoml.set_value(tmp_path, "heartbeat_seconds", "30")
+    assert "public_origin" not in controltoml.control_toml_path(tmp_path).read_text()
 
 
 def _free_port() -> int:
@@ -99,46 +98,16 @@ def cli_env(tmp_path, monkeypatch):
     # Production serve requires the init-written password hash; the
     # bootstrap listener gets a per-test free port.
     monkeypatch.setenv("THEOZOLITH_BOOTSTRAP_PORT", str(_free_port()))
-    monkeypatch.delenv("THEOZOLITH_PUBLIC_ORIGIN", raising=False)
     (data / "secrets").mkdir(parents=True)
     (data / "secrets" / "admin-password").write_text(hash_password("pw") + "\n")
     return data
 
 
-def _stored_origin(data):
-    return controltoml.read_public_origin(data / "configs")
-
-
-def test_origin_init_is_persistent_until_forced(cli_env):
-    assert cli_main(["origin-init"]) == 0
-    first = _stored_origin(cli_env)
-    origin.parse_public_origin(first)
-    assert first.endswith(".theozolith.internal")  # the self-contained default, no port
-
-    with pytest.raises(SystemExit, match="persistent"):
-        cli_main(["origin-init"])
-    assert _stored_origin(cli_env) == first
-
-    assert cli_main(["origin-init", "--force", "--base-domain", "theozolith.com"]) == 0
-    second = _stored_origin(cli_env)
-    assert second != first and second.endswith(".theozolith.com")
-
-
-def test_origin_init_can_pin_a_nonstandard_external_port(cli_env):
-    assert cli_main(["origin-init", "--port", "9443"]) == 0
-    text = _stored_origin(cli_env)
-    assert text.endswith(".theozolith.internal:9443")
-    assert origin.parse_public_origin(text).host_header.endswith(":9443")
-    # :443 is the https default and is normalized away.
-    assert cli_main(["origin-init", "--force", "--port", "443"]) == 0
-    assert ":" not in _stored_origin(cli_env).removeprefix("https://")
-
-
-def test_production_serve_requires_the_public_origin(cli_env):
-    """Acceptance 6: with TLS material present but no provisioned origin
-    (and no env override), production startup refuses with instructions."""
-    provision(cli_env / "secrets" / "tls", ["control.lan"])
-    with pytest.raises(SystemExit, match="origin-init"):
+def test_production_serve_requires_the_control_address(cli_env):
+    """With TLS material present but no persisted control address,
+    production startup refuses with instructions."""
+    provision(cli_env / "secrets" / "tls", [CONTROL_IP])
+    with pytest.raises(SystemExit, match="theozolith init"):
         cli_main(["serve"])
 
 
@@ -156,51 +125,44 @@ def _capture_serve(monkeypatch) -> dict:
     return captured
 
 
-def test_serve_accepts_the_persisted_artifact_and_ignores_the_bind_port(cli_env, monkeypatch):
-    """Production boots from the origin-init artifact; a different internal
-    serve --port changes only the bind, never the accepted Host/Origin."""
-    assert cli_main(["origin-init"]) == 0
+def test_serve_derives_the_guard_and_ignores_the_bind_port(cli_env, monkeypatch, capsys):
+    """Production boots from the persisted address; a different internal
+    serve --port changes only the bind, never the accepted Host/Origin —
+    but the mismatch is called out loudly (ADR-0034)."""
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
     assert cli_main(["tls-init"]) == 0
-    text = _stored_origin(cli_env)
     captured = _capture_serve(monkeypatch)
+    # The warning is bare-metal-only (a container bind is never the
+    # external truth) — and this test suite itself runs in a container.
+    monkeypatch.setattr("theozolith_control.cli._running_in_container", lambda: False)
     assert cli_main(["serve", "--port", "9090"]) == 0
     guard = captured["app"].state.browser_guard
-    assert guard.expected_origin == text
-    assert guard.expected_host == text.removeprefix("https://")
-    assert ":" not in guard.expected_host  # the bind port leaked nowhere
+    assert guard.expected_origin == f"https://{CONTROL_IP}"
+    assert guard.expected_host == CONTROL_IP  # the bind port leaked nowhere
     assert captured["kwargs"]["port"] == 9090  # …but uvicorn does bind it
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "persisted external port is 443" in out
 
 
-def test_serve_accepts_the_env_override_in_production(cli_env, monkeypatch):
-    """THEOZOLITH_PUBLIC_ORIGIN alone (no artifact) satisfies production —
-    the expert escape hatch; format-checked, entropy is the operator's job."""
-    provision(cli_env / "secrets" / "tls", ["control.lan"])
-    monkeypatch.setenv("THEOZOLITH_PUBLIC_ORIGIN", f"https://{GOOD_HOST}")
+def test_serve_matching_bind_warns_nothing(cli_env, monkeypatch, capsys):
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=9443)
+    assert cli_main(["tls-init"]) == 0
     captured = _capture_serve(monkeypatch)
-    assert cli_main(["serve"]) == 0
-    guard = captured["app"].state.browser_guard
-    assert guard.expected_host == GOOD_HOST
-    assert guard.expected_origin == f"https://{GOOD_HOST}"
+    monkeypatch.setattr("theozolith_control.cli._running_in_container", lambda: False)
+    assert cli_main(["serve", "--port", "9443"]) == 0
+    assert captured["app"].state.browser_guard.expected_host == f"{CONTROL_IP}:9443"
+    assert "WARNING" not in capsys.readouterr().out
 
 
-def test_serve_fails_closed_on_an_invalid_env_override(cli_env, monkeypatch):
-    provision(cli_env / "secrets" / "tls", ["control.lan"])
-    for bad in (f"http://{GOOD_HOST}", "https://control.local", f"https://{GOOD_HOST}:8a"):
-        monkeypatch.setenv("THEOZOLITH_PUBLIC_ORIGIN", bad)
-        with pytest.raises(SystemExit, match="error"):
-            cli_main(["serve"])
+def test_tls_init_puts_the_control_ip_in_the_san(cli_env):
+    """The TLS SAN derives from the persisted control IP alone — nodes and
+    CA-trusting browsers both verify against it (ADR-0031/0034)."""
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=9443)
+    assert cli_main(["tls-init"]) == 0  # no --host needed once persisted
+    import ipaddress
 
-
-def test_tls_init_includes_the_hostname_but_never_a_port(cli_env):
-    """TLS SAN derives from the public origin's hostname alone, even when
-    the origin pins an explicit external port."""
-    assert cli_main(["origin-init", "--port", "9443"]) == 0
-    assert cli_main(["tls-init"]) == 0  # no --host needed once provisioned
     from cryptography import x509
 
-    hostname = origin.parse_public_origin(_stored_origin(cli_env)).hostname
     cert = x509.load_pem_x509_certificate((cli_env / "secrets" / "tls" / "server.pem").read_bytes())
     san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    dns_names = san.get_values_for_type(x509.DNSName)
-    assert hostname in dns_names
-    assert all(":" not in name for name in dns_names)
+    assert ipaddress.ip_address(CONTROL_IP) in san.get_values_for_type(x509.IPAddress)

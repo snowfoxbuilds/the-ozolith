@@ -1,5 +1,5 @@
 """control.toml (ADR-0023/0029): defaults, env overrides, the fixed-schema
-settings write path, and the read-only public origin."""
+settings write path, and the read-only control address (ADR-0031/0034)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from theozolith_control import controltoml
 from theozolith_control.settings import load_settings
 from theozolith_worker.config import ConfigError
 
-ORIGIN = f"https://{'a' * 26}.theozolith.internal"
+CONTROL_IP = "192.0.2.30"
 
 
 def _git(config_repo, *args) -> str:
@@ -80,7 +80,7 @@ def test_set_value_commits_only_control_toml_with_the_convention(tmp_path):
     touching only control.toml, fixed author identity, and the value takes
     effect on the next settings load."""
     repo = _git_repo(tmp_path)
-    controltoml.write_public_origin(repo, ORIGIN)
+    controltoml.write_control_address(repo, CONTROL_IP)
     controltoml.set_value(repo, "heartbeat_seconds", "30")
 
     assert controltoml.read_values(repo)["heartbeat_seconds"] == 30.0
@@ -101,21 +101,20 @@ def test_set_value_commits_only_control_toml_with_the_convention(tmp_path):
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
-def test_set_value_refuses_unknown_keys_and_the_public_origin(tmp_path):
+def test_set_value_refuses_unknown_keys_and_the_control_address(tmp_path):
     repo = _git_repo(tmp_path)
-    controltoml.write_public_origin(repo, ORIGIN)
-    with pytest.raises(controltoml.ControlTomlError, match="unknown or read-only"):
-        controltoml.set_value(repo, "public_origin", "https://evil.example")
-    with pytest.raises(controltoml.ControlTomlError, match="unknown or read-only"):
-        controltoml.set_value(repo, "made_up", "1")
-    assert controltoml.read_public_origin(repo) == ORIGIN
+    controltoml.write_control_address(repo, CONTROL_IP)
+    for key in ("control_ip", "control_port", "public_origin", "made_up"):
+        with pytest.raises(controltoml.ControlTomlError, match="unknown or read-only"):
+            controltoml.set_value(repo, key, "10.6.6.6")
+    assert controltoml.read_control_ip(repo) == CONTROL_IP
 
 
-def test_origin_writes_preserve_committed_settings(tmp_path):
+def test_address_writes_preserve_committed_settings(tmp_path):
     repo = _git_repo(tmp_path)
-    controltoml.write_public_origin(repo, ORIGIN)
+    controltoml.write_control_address(repo, CONTROL_IP, port=9443)
     controltoml.set_value(repo, "session_days", "7")
-    fresh = f"https://{'b' * 26}.theozolith.internal"
-    controltoml.write_public_origin(repo, fresh)
-    assert controltoml.read_public_origin(repo) == fresh
+    controltoml.write_control_address(repo, "192.0.2.31")
+    assert controltoml.read_control_ip(repo) == "192.0.2.31"
+    assert controltoml.read_control_port(repo) == 9443  # recover keeps the port
     assert controltoml.read_values(repo)["session_days"] == 7.0

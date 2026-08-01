@@ -28,6 +28,12 @@ from theozolith_worker.githubapi import Issue, PullRequest
 
 ADMIN_TOKEN = "admin-token"
 ADMIN_PASSWORD = "rig-password"
+# The init-persisted control IP (ADR-0031) — since ADR-0034 also the
+# browser origin, so the rig's TestClient dials it as the base URL and
+# sends the matching Origin by default (the armed BrowserGuard is the
+# production posture).
+CONTROL_IP = "203.0.113.5"
+CONTROL_ORIGIN = f"https://{CONTROL_IP}"
 
 
 class FakeClock:
@@ -51,7 +57,7 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         api_url="https://api.github.invalid",
         # The init-persisted control IP (ADR-0031): what every mint surface
         # embeds — detect_host_ip() is never called at mint time.
-        control_ip="203.0.113.5",
+        control_ip=CONTROL_IP,
         secrets_channel_ok=True,
         serve_tls=True,  # production-like default; the dev-cookie test overrides
     )
@@ -119,7 +125,7 @@ class ControlRig:
 
 
 def make_rig(
-    tmp_path: Path, *, base_url: str = "https://testserver", **settings_overrides: Any
+    tmp_path: Path, *, base_url: str = CONTROL_ORIGIN, **settings_overrides: Any
 ) -> ControlRig:
     settings = make_settings(tmp_path, **settings_overrides)
     clock = FakeClock()
@@ -138,11 +144,15 @@ def make_rig(
         box,
         github_client=github if settings.coordination_jobs_enabled else None,
     )
-    # https base URL by default: the __Host- session cookie is Secure
-    # (ADR-0019), and the client's cookie jar only returns Secure cookies
-    # over TLS. Pass base_url="http://..." to exercise the --insecure-dev
-    # cookie path.
+    # The base URL is the derived browser origin by default: the __Host-
+    # session cookie is Secure (ADR-0019) and the armed BrowserGuard
+    # (ADR-0034) expects exactly this Host — so browser-shaped requests
+    # look like production ones. The default Origin header matches; a test
+    # supplying its own headers overrides both. Pass base_url="http://..."
+    # (+ serve_tls=False) to exercise the --insecure-dev cookie path.
     client = TestClient(app, base_url=base_url)
+    if base_url == CONTROL_ORIGIN:
+        client.headers["Origin"] = CONTROL_ORIGIN
     rig = ControlRig(settings, store, secret_store, box, client, clock, github, {})
     rig.provision_node("box1")
     return rig

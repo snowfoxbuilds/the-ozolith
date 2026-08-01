@@ -31,7 +31,7 @@ from fastapi.templating import Jinja2Templates
 
 from theozolith_control import controltoml, joinstring, tls
 from theozolith_control.crypto import SecretBox
-from theozolith_control.origin import parse_public_origin
+from theozolith_control.origin import derive_origin
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
@@ -90,12 +90,16 @@ def mount_web(
         secure_cookies=settings.serve_tls,
     )
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
-    # The exact Host/Origin contract derives from the parsed public origin
-    # alone (never the bind host/port); a configured-but-invalid origin
-    # raises OriginError here, so the app fails closed instead of arming a
-    # guard with garbage expectations.
+    # The exact Host/Origin contract derives from the persisted control
+    # address alone (ADR-0034 — never the bind host/port); an invalid
+    # persisted address raises OriginError here, so the app fails closed
+    # instead of arming a guard with garbage expectations. Armed only over
+    # TLS: the derived origin is https by construction, so plain-HTTP
+    # --insecure-dev (the only TLS-less mode) could never match it.
     guard = BrowserGuard(
-        parse_public_origin(settings.public_origin) if settings.public_origin else None
+        derive_origin(settings.control_ip, settings.control_port)
+        if settings.control_ip and settings.serve_tls
+        else None
     )
     app.state.browser_guard = guard  # tests assert the derived expectations
 
@@ -271,10 +275,14 @@ def mount_web(
 
     def _settings_context(saved: str = "", error: str = "") -> dict:
         current = controltoml.read_values(settings.config_repo)
+        control_ip = controltoml.read_control_ip(settings.config_repo) or settings.control_ip
+        control_port = controltoml.read_control_port(settings.config_repo)
+        origin_text = ""
+        if control_ip:
+            origin_text = derive_origin(control_ip, control_port).origin
         return {
-            "origin": controltoml.read_public_origin(settings.config_repo)
-            or settings.public_origin,
-            "control_ip": controltoml.read_control_ip(settings.config_repo) or settings.control_ip,
+            "origin": origin_text,
+            "control_ip": control_ip,
             "rows": [
                 {
                     "key": s.key,
@@ -308,11 +316,11 @@ def mount_web(
         form = await request.form()
         key = str(form.get("key", "")).strip()
         value = str(form.get("value", "")).strip()
-        if key in ("public_origin", "control_ip"):
+        if key in ("public_origin", "control_ip", "control_port"):
             return HTMLResponse(
-                "the [control] fields are read-only — re-pointing a deployment is"
-                " 'theozolith origin-init --force' / 'recover --ip', not a"
-                " settings edit",
+                "the [control] address fields are read-only — re-pointing a"
+                " deployment is 'theozolith recover --ip' (or init --force),"
+                " not a settings edit",
                 status_code=403,
             )
         try:

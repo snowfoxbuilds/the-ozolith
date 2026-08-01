@@ -8,7 +8,15 @@ from __future__ import annotations
 import json
 
 import pytest
-from controlrig import ADMIN_PASSWORD, ADMIN_TOKEN, ControlRig, make_rig, run_event
+from controlrig import (
+    ADMIN_PASSWORD,
+    ADMIN_TOKEN,
+    CONTROL_IP,
+    CONTROL_ORIGIN,
+    ControlRig,
+    make_rig,
+    run_event,
+)
 from starlette.websockets import WebSocketDisconnect
 from theozolith_control.web.auth import SESSION_COOKIE
 
@@ -53,12 +61,15 @@ node = "box1"
 image = "ghcr.io/example/mutedeck:1"
 """
 
-# A syntactically conforming public origin (26 base32 chars of slug).
-# Default HTTPS: no port in the origin, the Host header, or anywhere else —
-# the Uvicorn bind port is invisible to browsers (M5).
-CANONICAL_HOST = "abcdefghijklmnopqrstuvwxyz.theozolith.internal"
-CANONICAL_ORIGIN = f"https://{CANONICAL_HOST}"
+# The canonical browser origin is the rig's control IP (ADR-0034). Default
+# HTTPS: no port in the origin, the Host header, or anywhere else — the
+# Uvicorn bind port is invisible to browsers (M5). NEUTRAL_BASE builds a
+# rig whose client sends neither the canonical Host nor any Origin, so
+# each request opts in explicitly.
+CANONICAL_HOST = CONTROL_IP
+CANONICAL_ORIGIN = CONTROL_ORIGIN
 CANONICAL_HEADERS = {"Host": CANONICAL_HOST, "Origin": CANONICAL_ORIGIN}
+NEUTRAL_BASE = "https://testserver"
 
 
 def login(control: ControlRig) -> None:
@@ -582,9 +593,9 @@ def test_insecure_dev_login_works_over_plain_http(tmp_path):
 
 
 def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
-    """A default-HTTPS public origin yields Host ``<slug>.<base>`` and the
-    same Origin — no port anywhere, whatever port Uvicorn binds."""
-    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
+    """The default-HTTPS control address yields Host ``<ip>`` and the same
+    Origin — no port anywhere, whatever port Uvicorn binds (ADR-0034)."""
+    rig = make_rig(tmp_path, base_url=NEUTRAL_BASE)
     guard = rig.client.app.state.browser_guard
     assert guard.expected_host == CANONICAL_HOST  # no :8443
     assert guard.expected_origin == CANONICAL_ORIGIN
@@ -620,9 +631,9 @@ def test_cookie_state_changes_require_exact_host_and_origin(tmp_path):
 
 
 def test_nonstandard_public_port_is_enforced_exactly(tmp_path):
-    """An explicit external port in the public origin appears in exactly
-    one accepted Host and Origin spelling."""
-    rig = make_rig(tmp_path, public_origin=f"https://{CANONICAL_HOST}:9443")
+    """An explicit external control_port appears in exactly one accepted
+    Host and Origin spelling."""
+    rig = make_rig(tmp_path, base_url=NEUTRAL_BASE, control_port=9443)
     guard = rig.client.app.state.browser_guard
     assert guard.expected_host == f"{CANONICAL_HOST}:9443"
     assert guard.expected_origin == f"https://{CANONICAL_HOST}:9443"
@@ -641,7 +652,7 @@ def test_nonstandard_public_port_is_enforced_exactly(tmp_path):
 
 def test_bearer_clients_work_without_origin(tmp_path):
     """Acceptance 7: non-browser callers keep working with no Origin."""
-    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
+    rig = make_rig(tmp_path, base_url=NEUTRAL_BASE)
     assert rig.admin("PUT", "/api/v1/secrets/gh", body={"value": "v"}).status_code == 200
     form = rig.client.post(
         "/secrets", data={"name": "a", "value": "b"}, headers=ADMIN_BEARER, follow_redirects=False
@@ -650,7 +661,7 @@ def test_bearer_clients_work_without_origin(tmp_path):
 
 
 def test_cookie_websocket_requires_exact_origin(tmp_path):
-    rig = make_rig(tmp_path, public_origin=CANONICAL_ORIGIN)
+    rig = make_rig(tmp_path, base_url=NEUTRAL_BASE)
     rig.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
     heartbeat_flightdeck_node(rig)
     cookie = rig.client.app.state.admin_sessions.login(ADMIN_PASSWORD)

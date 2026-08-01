@@ -59,16 +59,13 @@ def test_init_produces_the_partition_and_the_handoff(home, capsys):
     assert PASSWORD not in record
     parse_record(record)
 
-    origin = controltoml.read_public_origin(home / "configs")
-    assert origin.startswith("https://") and origin.endswith(".theozolith.internal")
-    hostname = origin.removeprefix("https://")
-    # The control IP persists beside the origin (ADR-0031): the one address
-    # every mint surface will embed.
+    # The control address persists as the read-only fields (ADR-0031/0034):
+    # the one address every mint surface — and every browser — will use.
     assert controltoml.read_control_ip(home / "configs") == "127.0.0.1"
+    assert controltoml.read_control_port(home / "configs") == 443
 
     handoff = capsys.readouterr().out
-    assert f"dashboard: {origin}" in handoff
-    assert f"127.0.0.1 {hostname}" in handoff  # the exact hosts line
+    assert "dashboard: https://127.0.0.1" in handoff
     ca_url = f"http://127.0.0.1:{settings.bootstrap_port}/ca.pem"
     assert ca_url in handoff  # CA download URL
     # Steps are executable in printed order (acceptance 7 of the revision):
@@ -76,23 +73,28 @@ def test_init_produces_the_partition_and_the_handoff(home, capsys):
     # download it serves.
     assert handoff.index("theozolith serve") < handoff.index(ca_url)
     assert "static IP or DHCP reservation" in handoff  # the IP-only channel prerequisite
+    # No DNS step exists (ADR-0034); the first visit clicks through the
+    # interstitial, and CA trust is the optional green-lock upgrade.
+    assert "DNS" not in handoff or "no DNS anywhere" in handoff
+    assert "click through" in handoff
+    assert "OPTIONAL" in handoff
     assert "security add-trusted-cert" in handoff  # macOS one-liner
     assert "update-ca-certificates" in handoff  # Linux one-liner
     assert "Firefox" in handoff and "iOS" in handoff
     assert "minus cache/" in handoff  # the backup doctrine, one line
 
-    # The server cert covers both the hostname and the IP (SAN, ADR-0023).
+    # The server cert carries the IP in the SAN (ADR-0023/0031) — what
+    # nodes and CA-trusting browsers both verify against.
     from cryptography import x509
 
     cert = x509.load_pem_x509_certificate((home / "secrets" / "tls" / "server.pem").read_bytes())
     san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert hostname in san.get_values_for_type(x509.DNSName)
     assert [str(ip) for ip in san.get_values_for_type(x509.IPAddress)] == ["127.0.0.1"]
 
 
 def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
     assert _init(home) == 0
-    first = controltoml.read_public_origin(home / "configs")
+    first_ca = (home / "secrets" / "tls" / "ca.pem").read_bytes()
     first_key = (home / "secrets" / "master.key").read_bytes()
     # The refusal names the most expensive consequence: fleet-wide CA
     # invalidation, one re-paste per node (review finding 4).
@@ -100,8 +102,8 @@ def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
         _init(home)
     monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     assert _init(home, "--force") == 0
-    # New origin and CA (outstanding join strings die by construction)…
-    assert controltoml.read_public_origin(home / "configs") != first
+    # A new CA (outstanding join strings die by construction)…
+    assert (home / "secrets" / "tls" / "ca.pem").read_bytes() != first_ca
     # …but the master key — and with it every stored secret — is untouched.
     assert (home / "secrets" / "master.key").read_bytes() == first_key
 
