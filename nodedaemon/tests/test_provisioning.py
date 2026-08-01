@@ -94,8 +94,6 @@ class LiveControl:
     """The real control app on a real TLS socket + the real bootstrap
     listener, exactly as `serve` arranges them."""
 
-    SLUG_ORIGIN = f"https://{'a' * 26}.theozolith.internal"
-
     def __init__(self, tmp_path: Path):
         self.tls_dir = tmp_path / "data" / "secrets" / "tls"
         self.ca_path, cert, key = tls.provision(self.tls_dir, ["127.0.0.1"])
@@ -106,9 +104,8 @@ class LiveControl:
             repo=None,
             github_token=None,
             api_url="",
-            # The browser origin is SET and must never leak onto the node
-            # channel (ADR-0023 as amended 2026-07-28: IP-only).
-            public_origin=self.SLUG_ORIGIN,
+            # The persisted control address (ADR-0031/0034): the join
+            # exchange echoes the address the node dialed, never this.
             control_ip="127.0.0.1",
             secrets_channel_ok=True,
         )
@@ -213,9 +210,8 @@ def test_provision_happy_path_end_to_end(tmp_path):
         )
 
         # Persisted under the daemon state dir: CA, control URL, name, token.
-        # The control URL is the IP-based address the node just verified —
-        # an IP-literal host, never the browser-only slug origin, even with
-        # public_origin configured (acceptance 1 of the 2026-07-28 ruling).
+        # The control URL is the IP-based address the node just verified
+        # (acceptance 1 of the 2026-07-28 ruling).
         assert (state / "ca.pem").read_bytes() == live.ca_path.read_bytes()
         persisted_url = (state / "control-url").read_text().strip()
         assert persisted_url == f"https://127.0.0.1:{live.https_port}"

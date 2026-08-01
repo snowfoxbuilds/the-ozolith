@@ -24,15 +24,15 @@ not per-request.
 Login hardening (ADR-0023): the hash comparison is constant-time
 (passwords.verify_password) and the form is rate-limited — a small global
 failure budget per window; within the single-operator trust model a lockout
-window is a tolerable cost for a hard brute-force bound. The 128-bit origin
-slug is defense in depth; the password check stands alone.
+window is a tolerable cost for a hard brute-force bound. The dashboard is
+LAN-discoverable by construction (ADR-0034: the origin is the control IP);
+the password check and this rate limit are the front line, not a layer.
 
-``BrowserGuard`` enforces the origin contract: with a public origin
-configured (mandatory in production, see origin.py), cookie-authenticated
-state-changing requests and websockets must carry exactly the ``Host`` and
-``Origin`` derived from the parsed public-origin URL — a browser on any
-other origin (DNS rebinding, a lured click) fails closed before any
-handler runs.
+``BrowserGuard`` enforces the origin contract: with a control address
+persisted (production always has one), cookie-authenticated state-changing
+requests and websockets must carry exactly the ``Host`` and ``Origin``
+derived from it (origin.py) — a browser on any other origin (DNS
+rebinding, a lured click) fails closed before any handler runs.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from collections.abc import Callable
 
 from fastapi import Request, WebSocket
 
-from theozolith_control.origin import PublicOrigin
+from theozolith_control.origin import BrowserOrigin
 from theozolith_control.passwords import verify_password
 from theozolith_control.store import Store
 
@@ -157,18 +157,18 @@ class AdminSessions:
 class BrowserGuard:
     """Exact-match Host and Origin enforcement for browser-shaped requests.
 
-    Armed only when a public origin is configured (production always is;
-    ``--insecure-dev`` may run bare). The expected values derive from the
-    parsed public-origin URL alone — never from the Uvicorn bind host or
-    port, so changing ``serve --port`` cannot silently change what is
-    accepted. Browsers omit the default https port (443) and include any
-    other, so exactly one Host and one Origin spelling is correct for a
-    given deployment."""
+    Armed only when a control address is persisted (production always has
+    one; ``--insecure-dev`` may run bare). The expected values derive from
+    the persisted control IP + external port alone (ADR-0034) — never from
+    the Uvicorn bind host or port, so changing ``serve --port`` cannot
+    silently change what is accepted. Browsers omit the default https port
+    (443) and include any other, so exactly one Host and one Origin
+    spelling is correct for a given deployment."""
 
-    def __init__(self, public_origin: PublicOrigin | None):
-        self._armed = public_origin is not None
-        self._host = public_origin.host_header if public_origin else ""
-        self._origin = public_origin.origin if public_origin else ""
+    def __init__(self, browser_origin: BrowserOrigin | None):
+        self._armed = browser_origin is not None
+        self._host = browser_origin.host_header if browser_origin else ""
+        self._origin = browser_origin.origin if browser_origin else ""
 
     @property
     def expected_host(self) -> str:

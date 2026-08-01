@@ -15,12 +15,16 @@ from theozolith_control.cli import main as cli_main
 # Where `theozolith-control` may still legitimately appear on a line
 # (PR #10 review round 1): the component's distribution and docker-image
 # names, the deprecated-alias console script, and deprecation notes that
-# say "alias" in the same breath. Everything else is a missed sweep.
+# say "alias" in the same breath — plus, since ADR-0034, the systemd unit
+# and the system data dir, which carry the component name, not the command.
+# Everything else is a missed sweep.
 _ALLOWED_LINE = re.compile(
     r"theozolith-control:"  # docker image tags — the component, not the command
     r"|name = \"theozolith-control\""  # the pip distribution name
     r"|^theozolith-control = \"theozolith_control\.cli:main\"$"  # the alias script
     r"|^# theozolith-control$"  # the component README heading
+    r"|theozolith-control\.service"  # the systemd unit (ADR-0034)
+    r"|/var/lib/theozolith-control"  # the root-mediated data dir (ADR-0034)
     r"|alias"  # deprecation notes
 )
 _SKIP_PARTS = {

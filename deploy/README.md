@@ -15,10 +15,19 @@ Stacks and worker types on top, never below.
 
 ## Full substrate
 
-1. **Control Node** (any box with docker; the Pi in the reference deployment).
-   **Prerequisite: give this box a static IP or DHCP reservation** — the node
-   channel is IP-only (ADR-0023 as amended 2026-07-28): nodes dial the control IP
-   directly, with zero DNS dependency; the slug hostname is browser-only.
+1. **Control Node** (the Pi in the reference deployment). **Prerequisite: give
+   this box a static IP or DHCP reservation** — the channel is IP-only
+   (ADR-0023 as amended; ADR-0034): nodes AND browsers dial the control IP
+   directly, with zero DNS dependency anywhere.
+
+   Bare metal (root-mediated, ADR-0034):
+
+   ```sh
+   sudo theozolith init
+   sudo systemctl start theozolith-control.service
+   ```
+
+   Or with docker:
 
    ```sh
    docker compose -f deploy/compose/control.yml build
@@ -28,33 +37,44 @@ Stacks and worker types on top, never below.
 
    `--ip` is required in the compose flow: inside a container the auto-detected
    address would be the Docker bridge IP, unreachable from your LAN, so `init`
-   refuses to guess there (ADR-0031). The confirmed IP is persisted as a read-only
-   `control.toml` field beside the origin and is the one address every join string,
-   the bootstrap listener's `/control-url`, and the certificate SAN carry — mint
-   surfaces never re-detect it.
+   refuses to guess there (ADR-0031); bare metal auto-detects. The confirmed IP is
+   persisted as a read-only `control.toml` field (with `control_port`, default
+   443, beside it) and is the one address every join string, the bootstrap
+   listener's `/control-url`, the certificate SAN, and the browser origin carry —
+   mint surfaces never re-detect it.
 
-   `init` (ADR-0023) composes the whole first run: master key → public origin
-   (`https://<128-bit-random-slug>.theozolith.internal`; `--base-domain`/`--port` to
-   vary) → per-deployment CA + server cert with the persisted IP in the SAN → admin
-   password prompt (only its scrypt hash is stored) → the **operator handoff**: the
-   dashboard URL, the exact `/etc/hosts`/DNS line (browsers only — nodes never
-   resolve it), the CA download URL (served by the bootstrap listener, port 6965,
-   once `serve` runs), and per-OS trust one-liners. The two irreducibly manual
-   actions — the DNS record and CA trust per operator device — are copy-paste from
-   that printout. Re-running `init` requires `--force`: **a new CA invalidates the
-   pinned `ca.pem` on every provisioned node — the whole fleet fails TLS until each
-   box gets one join-string re-paste** (outstanding join strings, DNS entries, and
-   device trust die too; the master key and stored secrets are never touched).
+   `init` (ADR-0023/0034) composes the whole first run: master key → control
+   address (`https://<control-ip>`; `--port` to vary) → per-deployment CA +
+   server cert with the persisted IP in the SAN → admin password prompt (only
+   its scrypt hash is stored) → on root bare metal, the systemd unit
+   (`theozolith-control.service`: a dedicated service user binding 443 via
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` — never a root serve) → the
+   **operator handoff**. There is no DNS step and no required certificate
+   install: the first browser visit clicks through the self-signed-certificate
+   interstitial and logs in (the TrueNAS model). Trusting the per-deployment CA
+   (download URL and per-OS one-liners in the handoff) is the optional
+   green-lock upgrade; operators with a public domain can substitute a publicly
+   valid certificate instead. Re-running `init` requires `--force`: **a new CA
+   invalidates the pinned `ca.pem` on every provisioned node — the whole fleet
+   fails TLS until each box gets one join-string re-paste** (outstanding join
+   strings and device trust die too; the master key and stored secrets are never
+   touched).
 
-   Everything lands under `~/.theozolith/` on the host, partitioned by durability
-   class (ADR-0024): `configs/` (the git-backed Config Repo — `control.toml`,
-   `stacks/`, `images/`, `product.toml`), `secrets/` (master key, CA keypair, TLS
-   material, admin password hash, `store.db` — a **sibling** of configs/, never inside
-   any git tree), `cache/` (`cache.db`, deletable at any time: costs a re-login and
-   one heartbeat round), `logs/` (terminal audit log).
+   Everything lands under `/var/lib/theozolith-control/` on a root-mediated
+   bare-metal install — that exact path is the only one the root installer
+   will manage or `chown` (a `THEOZOLITH_DATA_DIR` override is refused there;
+   it stays honored for unprivileged and compose runs, which use
+   `~/.theozolith/`) —
+   partitioned by durability class (ADR-0024): `configs/` (the git-backed
+   Config Repo — `control.toml`, `stacks/`, `images/`, `product.toml`),
+   `secrets/` (master key, CA keypair, TLS material, admin password hash,
+   `store.db` — a **sibling** of configs/, never inside any git tree), `cache/`
+   (`cache.db`, deletable at any time: costs a re-login and one heartbeat
+   round), `logs/` (terminal audit log). On the root-mediated install, admin
+   subcommands read their credentials from there — run them under `sudo`.
 
    Experts may override any setting with `THEOZOLITH_*` environment variables
-   (validated; e.g. `THEOZOLITH_PUBLIC_ORIGIN` — the operator then owns slug entropy).
+   (validated).
 
 2. **Nodes** (every physical box that should run Stacks) — one paste each:
 
@@ -76,8 +96,8 @@ Stacks and worker types on top, never below.
    abort), exchanges the short-lived single-use join token over verified TLS for this
    node's own **non-expiring per-node token**, persists everything under
    `/var/lib/theozolith`, enables the unit, and heartbeats. The persisted control URL
-   is the **IP-based address the node just verified** — nodes never resolve the slug
-   hostname and never need DNS. Re-pasting a fresh join string on an
+   is the **IP-based address the node just verified** — nothing in the deployment
+   resolves a hostname or needs DNS (ADR-0034). Re-pasting a fresh join string on an
    already-provisioned node rotates its token and replaces its persisted state in
    place: that one paste per node is the whole recovery path when the Control Node's
    IP changes. Provisioning **is** registration:
@@ -96,7 +116,7 @@ Stacks and worker types on top, never below.
    interval, grace periods, sweep cadences, terminal cap, event budget, session
    length, bootstrap port) live in `control.toml` and are edited on the dashboard's
    Settings page — each save is a fixed-schema commit touching only that file. The
-   public origin and the control IP render read-only there.
+   control address (and the browser origin derived from it) renders read-only there.
 
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
@@ -123,10 +143,11 @@ Stacks and worker types on top, never below.
    theozolith unquarantine --node box1                # human-only release (ADR-0016)
    ```
 
-   On the Control Node these need no environment: the URL comes from the persisted
-   public origin, the admin token from `secrets/admin-token`, the CA from
-   `secrets/tls/ca.pem` (all init-written). Elsewhere, set `CONTROL_NODE_URL` +
-   `THEOZOLITH_ADMIN_TOKEN` + `THEOZOLITH_TLS_CA`.
+   On the Control Node these need no environment (run them under `sudo` on a
+   root-mediated install): the URL comes from the persisted control address, the
+   admin token from `secrets/admin-token`, the CA from `secrets/tls/ca.pem` (all
+   init-written). Elsewhere, set `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN` +
+   `THEOZOLITH_TLS_CA`.
 
 6. **Update the product** (ADR-0015 as amended — two paths, one machinery):
 
@@ -187,14 +208,37 @@ Stacks and worker types on top, never below.
 
 ## Backup and recovery (ADR-0024)
 
-Backup is **one folder, one copy command**: `~/.theozolith/` minus `cache/`
-(optionally minus `logs/`) to another trusted device —
+Backup is **one folder, one copy command**: the data partition minus `cache/`
+(optionally minus `logs/`) to another trusted device. Root-mediated bare metal —
+the primary shape — keeps it at `/var/lib/theozolith-control/`, owned by the
+service user, so only the local *read* is privileged: root creates a tar stream
+and the network leg runs as you, with your own SSH identity (root has no keys
+for `backup-host`, and preserving the service user's ownership on a remote
+account would fail anyway — `recover` repairs ownership on restore, so none
+needs preserving):
+
+```sh
+set -o pipefail   # a tar failure must fail the pipeline, not ship a truncated archive
+sudo tar -C /var/lib/theozolith-control --exclude='./cache' -cf - . \
+  | ssh backup-host 'umask 077; cat > theozolith-backup.tar.tmp' \
+  && ssh backup-host 'mv theozolith-backup.tar.tmp theozolith-backup.tar'
+```
+
+The remote `umask 077` matters: the archive carries the master key, CA private
+key, admin token, and secret store, and the remote account's default umask
+would land it world-readable. The temp-file-then-promote keeps the last good
+archive intact until the new one has fully arrived.
+
+Unprivileged and compose homes keep `~/.theozolith/`:
 
 ```sh
 rsync -a --exclude cache/ ~/.theozolith/ backup-host:theozolith-backup/
 ```
 
-Re-copy after enrolling nodes or adding secrets; that is the whole cadence rule.
+Back up the partition your deployment actually uses — after `sudo theozolith
+init`, an `~/.theozolith/` copy is empty or stale and omits the CA, master key,
+tokens, and secret store. Re-copy after enrolling nodes or adding secrets; that
+is the whole cadence rule.
 Secret material never leaves trusted devices: **GitHub is never a full backup** — a
 Config Repo clone looks like a deployment but cannot resurrect one (`secrets/` is a
 sibling of `configs/` by decision, never a git-ignored child: `git clean -x` must not
@@ -203,13 +247,29 @@ be able to delete the master key, and a clone must not look complete while missi
 Recovery:
 
 1. Install the TheOzolith package on the replacement box; restore the copy to
-   `~/.theozolith/`.
-2. `theozolith recover` — validates the restore **loudly and completely**
-   (every missing or corrupt artifact enumerated in one pass, nonzero exit), then
-   re-mints the server certificate from the restored CA. It uses the restored
+   the data dir (`/var/lib/theozolith-control/` root-mediated, `~/.theozolith/`
+   otherwise). Root-mediated, mirroring the backup command — the network leg as
+   you, only the local extract as root (ownership comes back in step 2):
+
+   ```sh
+   sudo mkdir -p /var/lib/theozolith-control
+   ssh backup-host 'cat theozolith-backup.tar' \
+     | sudo tar -C /var/lib/theozolith-control --no-same-owner -xf -
+   ```
+
+   `--no-same-owner` is deliberate: root tar would otherwise restore the
+   archived numeric UID/GID, which on a replacement box may belong to an
+   unrelated account — files stay root-owned until step 2's controlled
+   ownership repair.
+2. `theozolith recover` (under `sudo` on bare metal) — validates the restore
+   **loudly and completely** (every missing or corrupt artifact enumerated in one
+   pass, nonzero exit), re-mints the server certificate from the restored CA
+   (never a new CA), and — run as root on a systemd host — repairs the service
+   too: service user, partition ownership, unit, enable. It uses the restored
    `control_ip` by default; pass `--ip` if the replacement box's address differs
    (it is then persisted for every future mint).
-3. Update the **browser-side** DNS/hosts record; start `serve`.
+3. Start serving (`sudo systemctl start theozolith-control.service`, or the
+   compose flow). Browsers dial the control IP directly — no DNS to update.
 
 **Same IP** (give the Control Node a static IP or DHCP reservation so this is the
 normal case): zero node touches — nodes dial the persisted IP directly, pin the CA
@@ -228,6 +288,28 @@ recover them. Nodes enrolled *after* the backup DO show up in the unregistered-n
 view (their heartbeats arrive with unknown tokens): that list is the re-provision
 worklist for the stale-backup case. Deleting `cache/cache.db` on a live system is
 always safe and is the documented recovery move for cache corruption.
+
+### Migrating a pre-ADR-0034 home-directory install
+
+The same recover machinery relocates an existing `~/.theozolith/` deployment onto
+the root-mediated shape — no re-init, no CA rotation, zero node touches (same IP):
+
+```sh
+# prerequisite: theozolith installed at a system path the service user can
+# reach (e.g. a venv under /opt/theozolith) — the installer refuses a home venv
+# 1. stop the old hand-run serve (Ctrl-C / kill), then:
+sudo mkdir -p /var/lib/theozolith-control
+sudo rsync -a ~/.theozolith/ /var/lib/theozolith-control/   # cache/ optional
+sudo theozolith recover      # validates, re-mints the server cert from the SAME
+                             # CA, creates the service user, repairs ownership,
+                             # installs and enables the unit
+sudo systemctl start theozolith-control.service
+rm -rf ~/.theozolith         # once the dashboard answers
+```
+
+A deployment with no provisioned nodes and no stored secrets can skip all of
+this and simply re-run `sudo theozolith init` (recover validates the full
+partition, including `store.db`, which only exists once a node or secret does).
 
 ## Daemon-less dev (the M2 shape)
 
@@ -301,12 +383,19 @@ the files owned by the driver user either by building the image with
 
 ```sh
 sudo systemctl disable --now theozolith-nodedaemon    # drivers die with it (cgroup)
+# The root-mediated Control Node (ADR-0034; the guards make this safe on
+# boxes that never had one):
+sudo systemctl disable --now theozolith-control.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/theozolith-control.service
+sudo systemctl daemon-reload
+sudo userdel ozolith-control 2>/dev/null || true    # drops its group with it
 docker ps -aq --filter label=theozolith.owner | xargs -r docker rm -f
 docker compose -f deploy/compose/control.yml down
 docker volume rm theozolith-cache
-sudo rm -rf /opt/theozolith /var/lib/theozolith ~/.theozolith
+sudo rm -rf /opt/theozolith /var/lib/theozolith /var/lib/theozolith-control ~/.theozolith
 ```
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node
-store, both now gone. Orphaned run containers from a mid-Run kill are reaped by the
-daemon on its next start; the zombie-claim janitor restores the GitHub claim state.
+store, both now gone (including the root-mediated partition, its unit, and its service
+user). Orphaned run containers from a mid-Run kill are reaped by the daemon on its next
+start; the zombie-claim janitor restores the GitHub claim state.

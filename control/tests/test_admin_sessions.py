@@ -113,14 +113,15 @@ def test_settings_form_renders_control_fields_read_only_and_rejects_writes(contr
     _git_config_repo(control)
     _login(control)
     page = control.client.get("/settings").text
-    assert "readonly" in page and control.settings.public_origin in page
-    # The control IP renders read-only beside the origin (ADR-0031): the
-    # node channel's address is a recover --ip act, never a form field.
+    # The derived browser origin and the control address render read-only
+    # (ADR-0031/0034): re-pointing a deployment is a recover --ip / init
+    # --force act, never a form field.
+    assert "readonly" in page and f"https://{control.settings.control_ip}" in page
     assert control.settings.control_ip in page
-    for key, value in (("public_origin", "https://evil.example"), ("control_ip", "10.6.6.6")):
-        refused = control.client.post("/settings", data={"key": key, "value": value})
+    assert "<code>control_port</code>" in page and 'value="443"' in page
+    for key in ("public_origin", "control_ip", "control_port"):
+        refused = control.client.post("/settings", data={"key": key, "value": "10.6.6.6"})
         assert refused.status_code == 403, key
-    assert controltoml.read_public_origin(control.settings.config_repo) != "https://evil.example"
     assert controltoml.read_control_ip(control.settings.config_repo) != "10.6.6.6"
     bad = control.client.post("/settings", data={"key": "made_up", "value": "1"})
     assert bad.status_code == 400

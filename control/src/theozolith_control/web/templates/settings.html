@@ -11,16 +11,22 @@ the file is optional. <code>THEOZOLITH_*</code> environment variables override t
 <table class="settings">
   <tr><th>Setting</th><th>Value</th><th></th></tr>
   <tr>
-    <td><code>public_origin</code><div class="muted">The one origin browsers dial — written by init,
-      read-only here (re-pointing is <code>origin-init --force</code>).</div></td>
+    <td><code>browser origin</code><div class="muted">Derived from the control address below —
+      browsers and nodes dial the same IP (no DNS anywhere).</div></td>
     <td><input value="{{ origin }}" readonly disabled></td>
+    <td><span class="muted">derived</span></td>
+  </tr>
+  <tr>
+    <td><code>control_ip</code><div class="muted">The LAN address nodes and browsers dial —
+      written by init, read-only here (an IP change is <code>recover --ip</code> plus one
+      join-string re-paste per node).</div></td>
+    <td><input value="{{ control_ip }}" readonly disabled></td>
     <td><span class="muted">read-only</span></td>
   </tr>
   <tr>
-    <td><code>control_ip</code><div class="muted">The LAN address nodes dial (the node channel is
-      IP-only) — written by init, read-only here (an IP change is <code>recover --ip</code> plus one
-      join-string re-paste per node).</div></td>
-    <td><input value="{{ control_ip }}" readonly disabled></td>
+    <td><code>control_port</code><div class="muted">The EXTERNAL https port browsers and nodes
+      dial — written by init (443 when absent), read-only here.</div></td>
+    <td><input value="{{ control_port }}" readonly disabled></td>
     <td><span class="muted">read-only</span></td>
   </tr>
   {% for row in rows %}

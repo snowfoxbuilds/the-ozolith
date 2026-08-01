@@ -32,6 +32,11 @@ from theozolith_worker.config import ConfigError, env_value
 from theozolith_control import controltoml
 
 DEFAULT_DATA_DIR = "~/.theozolith"
+# Root-mediated bare-metal setup (ADR-0034): `sudo theozolith init` and the
+# systemd unit's service user share one fixed system path (mirroring the
+# nodes' /var/lib/theozolith), so `sudo theozolith build` finds the admin
+# token with no environment. THEOZOLITH_DATA_DIR still overrides.
+DEFAULT_ROOT_DATA_DIR = "/var/lib/theozolith-control"
 
 ADMIN_TOKEN_FILE = "admin-token"
 ADMIN_PASSWORD_FILE = "admin-password"
@@ -74,17 +79,17 @@ class ControlSettings:
     # True only when the server terminates TLS itself or an operator
     # explicitly opted into insecure dev mode: gates the secret endpoints.
     secrets_channel_ok: bool = False
-    # The one public origin browsers reach this deployment by (ADR-0019),
-    # persisted as the read-only [control] field of control.toml (ADR-0024).
-    # Parsed, it defines the exact Host and Origin every cookie-authenticated
-    # state change must carry. Independent of the Uvicorn bind host/port.
-    public_origin: str = ""
-    # The LAN address nodes dial (ADR-0031): the node channel is IP-only
-    # (ADR-0023 as amended 2026-07-28) — this operator-confirmed, init-
-    # persisted address feeds every join-string mint, the bootstrap
-    # listener's /control-url, and the certificate SAN. Never detected at
-    # mint time.
+    # The LAN address nodes AND browsers dial (ADR-0031/0034; the slug
+    # origin is retired) — this operator-confirmed, init-persisted address
+    # feeds every join-string mint, the bootstrap listener's /control-url,
+    # the certificate SAN, and the exact browser Host/Origin. Never
+    # detected at mint time.
     control_ip: str = ""
+    # The EXTERNAL https port browsers and nodes dial (ADR-0034) — a
+    # read-only [control] field beside the IP; independent of the Uvicorn
+    # bind port (docker maps external onto the bind; the bare-metal systemd
+    # unit binds it directly).
+    control_port: int = 443
     # True when serve terminates TLS: decides the session cookie's name and
     # Secure flag (__Host- + Secure over TLS; a plain dev cookie otherwise).
     serve_tls: bool = False
@@ -164,20 +169,24 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     if repo and "/" not in repo:
         raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
 
+    default_dir = DEFAULT_ROOT_DATA_DIR if os.geteuid() == 0 else DEFAULT_DATA_DIR
     data_dir = Path(
-        env_value(environ, "THEOZOLITH_DATA_DIR", DEFAULT_DATA_DIR) or DEFAULT_DATA_DIR
+        env_value(environ, "THEOZOLITH_DATA_DIR", default_dir) or default_dir
     ).expanduser()
     config_repo = Path(
         env_value(environ, "THEOZOLITH_CONFIG_REPO") or (data_dir / "configs")
     ).expanduser()
 
     # Tier-2: shipped defaults <- control.toml <- validated env overrides.
+    # The persisted control_port rides the same fail-closed path: a
+    # malformed value is a configuration error, never a silent 443.
     try:
         tunables: dict[str, Any] = controltoml.read_values(config_repo)
         for setting in controltoml.SETTINGS:
             raw = env_value(environ, setting.env)
             if raw:
                 tunables[setting.key] = setting.coerce(raw, source=setting.env)
+        control_port = controltoml.read_control_port(config_repo)
     except controltoml.ControlTomlError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -192,13 +201,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         github_token=env_value(environ, "CONTROL_GITHUB_TOKEN")
         or env_value(environ, "GITHUB_TOKEN"),
         api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",
-        # The env override is the expert escape hatch (it wins over the
-        # persisted field); the sanctioned source is init/origin-init writing
-        # control.toml. Format-checked at serve/app startup — but entropy
-        # cannot be inferred from text, so an operator overriding is
-        # responsible for a CSPRNG-generated slug (origin.py).
-        public_origin=env_value(environ, "THEOZOLITH_PUBLIC_ORIGIN")
-        or controltoml.read_public_origin(config_repo),
         control_ip=controltoml.read_control_ip(config_repo),
+        control_port=control_port,
         **{key: value for key, value in tunables.items() if key in _SETTING_FIELDS},
     )
