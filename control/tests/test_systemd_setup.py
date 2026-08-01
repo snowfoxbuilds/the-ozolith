@@ -13,6 +13,7 @@ import types
 
 import pytest
 from theozolith_control import cli, controltoml
+from theozolith_control import settings as settings_module
 from theozolith_control.cli import main as cli_main
 from theozolith_control.crypto import SecretBox
 from theozolith_control.secretstore import SecretStore
@@ -70,6 +71,9 @@ def rootmode(tmp_path, monkeypatch) -> _RootMode:
     monkeypatch.setattr(cli, "_systemd_present", lambda: True)
     monkeypatch.setattr(cli, "CONTROL_UNIT_PATH", unit_path)
     monkeypatch.setattr(cli, "_service_executable", lambda: EXEC)
+    # The chown gate compares against the dedicated system leaf; the fake
+    # host's leaf is this test's data dir (the `home` fixture's path).
+    monkeypatch.setattr(settings_module, "DEFAULT_ROOT_DATA_DIR", str(tmp_path / "home"))
     monkeypatch.setattr(subprocess_module, "run", recorder)
     monkeypatch.setattr(pwd_module, "getpwnam", fake_getpwnam)
     return _RootMode(recorder, unit_path, user_state)
@@ -187,6 +191,41 @@ def test_unprivileged_init_handoff_never_references_the_unit(home, capsys):
     assert "theozolith serve" in handoff
 
 
+# -- the chown gate (ADR-0034 round 2): root only mutates its own leaf ----------
+
+
+def test_root_install_refuses_an_overridden_data_dir(home, rootmode, monkeypatch, tmp_path):
+    """THEOZOLITH_DATA_DIR pointing anywhere but the dedicated leaf must
+    stop a root install before ANY mutation — a root `chown -R /var` is how
+    a typo hands the host to the service user."""
+    elsewhere = tmp_path / "var"  # stands in for /, /var, /var/lib…
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(elsewhere))
+    with pytest.raises(SystemExit, match="only manages"):
+        cli._install_systemd_unit(load_settings(), 443)
+    assert rootmode.recorder.calls == []  # no useradd, no chown, no systemctl
+    assert not rootmode.unit_path.exists()
+
+
+def test_root_init_refuses_an_overridden_data_dir_before_writing_state(
+    home, rootmode, monkeypatch, tmp_path
+):
+    elsewhere = tmp_path / "var"
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(elsewhere))
+    with pytest.raises(SystemExit, match="only manages"):
+        cli_main(["init", "--ip", "127.0.0.1"])
+    assert not elsewhere.exists()  # refused before the partition was laid
+    assert rootmode.recorder.calls == []
+
+
+def test_root_install_refuses_a_symlinked_data_dir(home, rootmode, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    home.symlink_to(real)  # the leaf name points into the host
+    with pytest.raises(SystemExit, match="symlink"):
+        cli._install_systemd_unit(load_settings(), 443)
+    assert rootmode.recorder.calls == []
+
+
 # -- executable reachability (ADR-0034) ------------------------------------------
 
 
@@ -223,6 +262,18 @@ def test_exec_reachability_rejects_private_paths(tmp_path):
     hidden.write_text("#!/bin/sh\n")
     hidden.chmod(0o755)
     assert "not traversable by others" in cli._exec_unreachable_reason(hidden)
+
+
+def test_service_executable_rejects_unit_unsafe_characters(tmp_path, monkeypatch):
+    """Paths that would break the unquoted ExecStart directive — spaces,
+    systemd '%' specifiers — are refused at setup, not escaped."""
+    for name in ("the ozolith", "theo%zolith"):
+        exe = tmp_path / name
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        monkeypatch.setattr("shutil.which", lambda n, path=exe: str(path))
+        with pytest.raises(SystemExit, match="unsafe for an unquoted systemd"):
+            cli._service_executable()
 
 
 def test_service_executable_fails_setup_with_remediation(tmp_path, monkeypatch):

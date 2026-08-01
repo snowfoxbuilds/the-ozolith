@@ -33,6 +33,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import secrets as _secrets
 import ssl
 import sys
@@ -369,15 +370,25 @@ def _systemd_present() -> bool:
     return Path("/run/systemd/system").is_dir()
 
 
-def _exec_unreachable_reason(path: Path) -> str | None:
-    """Why the service user could not run ``path``, or None if it can.
+# The charset an ExecStart path may use without any systemd quoting or
+# specifier escaping: unit directives here are deliberately unquoted, so
+# spaces, quotes, backslashes, '%' (specifiers), and control characters are
+# refused at setup instead of being escaped (rejection is simpler to get
+# right than systemd's quoting rules, and real install paths are plain).
+_UNIT_SAFE_EXEC = re.compile(r"^[A-Za-z0-9/._+-]+$")
 
-    The unit runs as the unprivileged ``ozolith-control`` user (its own
-    group), so reachability reduces to the world bits: the file needs
-    others-read+execute and every ancestor directory others-execute. A sudo
+
+def _exec_unreachable_reason(path: Path) -> str | None:
+    """Why the INSTALLATION POLICY refuses ``path``, or None if accepted.
+
+    This is a conservative policy, not a precise access computation as the
+    service user: the file must be world-readable+executable and every
+    ancestor world-traversable. Group-accessible or execute-only layouts
+    that would in fact work are rejected by policy — a plain world-readable
+    system install is the supported shape. The point is timing: a sudo
     invocation happily resolves an executable inside /root or a 0700 home
-    venv — persisting that into the unit would fail only at first boot,
-    which is exactly the deferred failure this check moves to setup time."""
+    venv, and persisting that into the unit would fail only at first boot;
+    this check moves the failure to setup time."""
     if not path.is_file():
         return "no such file"
     if path.stat().st_mode & 0o005 != 0o005:
@@ -389,12 +400,21 @@ def _exec_unreachable_reason(path: Path) -> str | None:
 
 
 def _service_executable() -> str:
-    """The ExecStart path for the unit, validated as reachable by the
-    service user — setup fails with remediation rather than generating a
-    unit that dies at first start (ADR-0034)."""
+    """The ExecStart path for the unit, checked against the installation
+    policy (unit-syntax-safe characters, world-reachable) — setup fails
+    with remediation rather than generating a unit that is malformed or
+    dies at first start (ADR-0034)."""
     import shutil
 
     path = Path(shutil.which("theozolith") or Path(sys.argv[0])).resolve()
+    if not _UNIT_SAFE_EXEC.match(str(path)):
+        raise SystemExit(
+            f"error: theozolith at {path} contains characters unsafe for an"
+            " unquoted systemd ExecStart (spaces, quotes, '%', '\\', or control"
+            " characters) — install TheOzolith at a plain system path (e.g. a"
+            " venv under /opt/theozolith) and re-run, or use the docker compose"
+            " flow"
+        )
     reason = _exec_unreachable_reason(path)
     if reason:
         raise SystemExit(
@@ -406,12 +426,35 @@ def _service_executable() -> str:
     return str(path)
 
 
+def _validated_root_data_dir(data_dir: Path) -> Path:
+    """The ONE directory a root-mediated install may ``chown -R``: exactly
+    the dedicated system leaf, symlink-free. THEOZOLITH_DATA_DIR is honored
+    everywhere else, but feeding an environment-controlled path to a root
+    recursive chown is how a typo ('/', '/var', a symlink into the host)
+    transfers the machine to the service user — so the root installer
+    refuses everything but its own constant, and the constant doubles as a
+    unit-syntax-safe Environment= value by construction."""
+    from theozolith_control.settings import DEFAULT_ROOT_DATA_DIR
+
+    expected = Path(DEFAULT_ROOT_DATA_DIR)
+    if data_dir != expected or data_dir.is_symlink() or data_dir.resolve() != expected.resolve():
+        raise SystemExit(
+            f"error: root-mediated setup only manages {expected} — the data dir"
+            f" resolved to {data_dir}"
+            f"{' (a symlink)' if data_dir.is_symlink() else ''}. Unset"
+            " THEOZOLITH_DATA_DIR (or point it at the default), or run"
+            " unprivileged / via docker compose instead."
+        )
+    return data_dir
+
+
 def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
     """Root-mediated bare-metal setup (ADR-0034), idempotent — shared by
     init and recover: ensure the dedicated service user, hand the partition
     to it, (re)write the unit, daemon-reload, enable. Skipped (False) when
     not root, inside a container, or without systemd — the compose flow and
-    hand-run dev serve are unchanged."""
+    hand-run dev serve are unchanged. Everything mutating is gated behind
+    the data-dir and executable validations."""
     if os.geteuid() != 0 or _running_in_container():
         return False
     if not _systemd_present():
@@ -420,6 +463,7 @@ def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
     import pwd
     import subprocess
 
+    _validated_root_data_dir(settings.data_dir)
     exec_path = _service_executable()
     try:
         pwd.getpwnam(CONTROL_SERVICE_USER)
@@ -516,6 +560,13 @@ def _init(args) -> int:
             " re-paste. Device trust and every outstanding join string are"
             " invalidated too."
         )
+
+    # Root-mediated init fails BEFORE any state is written: a bad
+    # THEOZOLITH_DATA_DIR (or an unreachable executable) must not leave a
+    # half-laid partition behind the eventual installer refusal.
+    if os.geteuid() == 0 and not _running_in_container() and _systemd_present():
+        _validated_root_data_dir(settings.data_dir)
+        _service_executable()
 
     # The control IP (ADR-0031): confirmed once, persisted, and the ONLY
     # address any mint surface will ever embed. Inside a container the

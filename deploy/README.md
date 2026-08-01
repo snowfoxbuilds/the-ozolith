@@ -61,7 +61,10 @@ Stacks and worker types on top, never below.
    touched).
 
    Everything lands under `/var/lib/theozolith-control/` on a root-mediated
-   bare-metal install (`~/.theozolith/` for unprivileged/compose homes),
+   bare-metal install — that exact path is the only one the root installer
+   will manage or `chown` (a `THEOZOLITH_DATA_DIR` override is refused there;
+   it stays honored for unprivileged and compose runs, which use
+   `~/.theozolith/`) —
    partitioned by durability class (ADR-0024): `configs/` (the git-backed
    Config Repo — `control.toml`, `stacks/`, `images/`, `product.toml`),
    `secrets/` (master key, CA keypair, TLS material, admin password hash,
