@@ -100,6 +100,12 @@ The uncontainerized TheOzolith daemon installed on every physical node, register
 
 *Avoid*: "Node Agent" (retired 2026-07-15 — Agent is reserved for tool configs; ADR-0013); the legacy Home Server node agent (replaced by this); running the daemon itself in a container.
 
+**Operator TUI**
+
+The terminal-based fleet surface (`theozolith top`, plus the one-shot `theozolith status`): run on the Control Node over SSH, it is the primary routine-operations surface while the web dashboard is frozen. A pure API consumer over loopback — same bearer auth and endpoints as any client, no direct database or secret-store reads, and no embedded terminal: attach assistance prints a pastable command resolved from live heartbeat state.
+
+*Avoid*: "dashboard" (the frozen web surface); "web terminal" (the browser PTY bridge); nesting a PTY inside the TUI.
+
 **Orchestrator**
 
 The whole agentic coding pipeline system: planning, execution, review, and monitoring together. TheOzolith as a running system, not a single component.
@@ -129,6 +135,12 @@ One ephemeral container lifecycle executing one agent session: exactly one headl
 A reusable instruction module: a folder containing `SKILL.md` plus optional scripts and reference files.
 
 *Avoid*: "claude agent", "prompt".
+
+**Single-Node Deployment**
+
+A deployment shape where the Control Node and one Container-Host share a physical machine, bootstrapped by `theozolith-control init --with-local-node` (standard init plus an internally executed join flow). Uses the same provisioning, Stack, and update mechanisms as any fleet — nothing downstream knows it is single-node.
+
+*Avoid*: "single-node mode" (implies a separate code path or product mode); skipping the join mechanism (it runs, machine-consumed).
 
 **Stack**
 
