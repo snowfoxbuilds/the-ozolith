@@ -1,7 +1,7 @@
-"""The browser origin (ADR-0034): derivation from the persisted control
-address, fail-closed validation, the production serve requirement,
-bind-port independence (plus the loud mismatch warning), and TLS SAN
-derivation from the control IP."""
+"""The browser origin (ADR-0034, lazy since ADR-0036): derivation from the
+persisted control address, the parsed origin-init origin, fail-closed
+validation, the production serve requirement, bind-port independence (plus
+the loud mismatch warning), and TLS SAN derivation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import pytest
 from theozolith_control import controltoml, origin
 from theozolith_control.cli import main as cli_main
 from theozolith_control.origin import OriginError
-from theozolith_control.passwords import hash_password
 from theozolith_control.tls import provision
 
 CONTROL_IP = "192.0.2.20"
@@ -51,6 +50,44 @@ def test_derive_fails_closed_on_garbage():
     ):
         with pytest.raises(OriginError):
             origin.derive_origin(ip, port)
+
+
+def test_parse_browser_origin_accepts_ip_and_hostname_shapes():
+    """origin-init's parser (ADR-0036): the IP origin round-trips to the
+    derive_origin spelling; a hostname origin is the one hostname re-entry
+    point; ports and IPv6 brackets canonicalize."""
+    assert origin.parse_browser_origin(f"https://{CONTROL_IP}").origin == f"https://{CONTROL_IP}"
+    assert (
+        origin.parse_browser_origin(f"https://{CONTROL_IP}:9443/").origin
+        == f"https://{CONTROL_IP}:9443"
+    )
+    parsed = origin.parse_browser_origin("https://Ozolith.LAN:8443")
+    assert parsed.origin == "https://ozolith.lan:8443"
+    assert parsed.host_header == "ozolith.lan:8443"
+    assert origin.san_host(parsed) == "ozolith.lan"
+    v6 = origin.parse_browser_origin("https://[2001:db8::7]")
+    assert v6.origin == "https://[2001:db8::7]"
+    assert origin.san_host(v6) == "2001:db8::7"
+
+
+def test_parse_browser_origin_fails_closed():
+    """Every URL shape ADR-0022 refused stays refused: schemes,
+    credentials, paths, queries, fragments, wildcards, bad ports."""
+    for text in (
+        "",
+        "http://192.0.2.20",
+        "https://user:pw@192.0.2.20",
+        "https://192.0.2.20/dashboard",
+        "https://192.0.2.20?x=1",
+        "https://192.0.2.20#f",
+        "https://*.ozolith.lan",
+        "https://ozolith.lan:99999",
+        "https://ozolith.lan:abc",
+        "https://-bad-.lan",
+        "https://",
+    ):
+        with pytest.raises(OriginError):
+            origin.parse_browser_origin(text)
 
 
 def test_control_address_write_read_roundtrip(tmp_path):
@@ -95,11 +132,11 @@ def cli_env(tmp_path, monkeypatch):
     data = tmp_path / "data"
     monkeypatch.setenv("THEOZOLITH_ADMIN_TOKEN", "admin-token")
     monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(data))
-    # Production serve requires the init-written password hash; the
-    # bootstrap listener gets a per-test free port.
+    # No admin password: production serve no longer requires one (ADR-0036
+    # — the browser surface is lazy). The bootstrap listener gets a
+    # per-test free port.
     monkeypatch.setenv("THEOZOLITH_BOOTSTRAP_PORT", str(_free_port()))
     (data / "secrets").mkdir(parents=True)
-    (data / "secrets" / "admin-password").write_text(hash_password("pw") + "\n")
     return data
 
 
@@ -139,10 +176,12 @@ def _capture_serve(monkeypatch) -> dict:
 
 
 def test_serve_derives_the_guard_and_ignores_the_bind_port(cli_env, monkeypatch, capsys):
-    """Production boots from the persisted address; a different internal
-    serve --port changes only the bind, never the accepted Host/Origin —
-    but the mismatch is called out loudly (ADR-0034)."""
+    """Production boots from the persisted address; the guard arms from the
+    persisted browser origin (ADR-0036); a different internal serve --port
+    changes only the bind, never the accepted Host/Origin — but the
+    mismatch is called out loudly (ADR-0034)."""
     controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
+    controltoml.write_browser_origin(cli_env / "configs", f"https://{CONTROL_IP}")
     assert cli_main(["tls-init"]) == 0
     captured = _capture_serve(monkeypatch)
     # The warning is bare-metal-only (a container bind is never the
@@ -159,12 +198,35 @@ def test_serve_derives_the_guard_and_ignores_the_bind_port(cli_env, monkeypatch,
 
 def test_serve_matching_bind_warns_nothing(cli_env, monkeypatch, capsys):
     controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=9443)
+    controltoml.write_browser_origin(cli_env / "configs", f"https://{CONTROL_IP}:9443")
     assert cli_main(["tls-init"]) == 0
     captured = _capture_serve(monkeypatch)
     monkeypatch.setattr("theozolith_control.cli._running_in_container", lambda: False)
     assert cli_main(["serve", "--port", "9443"]) == 0
     assert captured["app"].state.browser_guard.expected_host == f"{CONTROL_IP}:9443"
     assert "WARNING" not in capsys.readouterr().out
+
+
+def test_serve_without_browser_origin_refuses_the_web_surface(cli_env, monkeypatch):
+    """ADR-0036 fail-closed, moved into the request path: with no persisted
+    browser origin the HTML/cookie surface answers 503 with a pointer at
+    origin-init and the terminal websocket refuses — while the bearer API
+    keeps working."""
+    from fastapi.testclient import TestClient
+
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
+    assert cli_main(["tls-init"]) == 0
+    captured = _capture_serve(monkeypatch)
+    assert cli_main(["serve"]) == 0
+    client = TestClient(captured["app"], base_url=f"https://{CONTROL_IP}")
+    for path in ("/login", "/", "/secrets", "/settings", "/join", "/terminal"):
+        response = client.get(path)
+        assert response.status_code == 503, path
+        assert "origin-init" in response.text
+    assert client.post("/login", data={"password": "x"}).status_code == 503
+    # The machine surface is untouched (the bearer API works; ADR-0036).
+    healthz = client.get("/api/v1/healthz")
+    assert healthz.status_code == 200
 
 
 def test_tls_init_puts_the_control_ip_in_the_san(cli_env):

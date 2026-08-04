@@ -1,6 +1,7 @@
-"""The unified first run and recovery (ADR-0023/0024): init composes
-everything and prints the handoff; the partition keeps every secret byte
-under secrets/; cache.db is deletable; a restored folder recovers with one
+"""The unified first run and recovery (ADR-0023/0024, split by ADR-0036):
+init composes the machine surface only and prints the handoff; origin-init
+is the opt-in browser step; the partition keeps every secret byte under
+secrets/; cache.db is deletable; a restored folder recovers with one
 command and zero node touches."""
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(data))
     monkeypatch.delenv("THEOZOLITH_CONFIG_REPO", raising=False)
     monkeypatch.delenv("THEOZOLITH_PUBLIC_ORIGIN", raising=False)
-    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     return data
 
 
@@ -36,9 +36,29 @@ def _init(home, *args) -> int:
     return cli_main(["init", "--ip", "127.0.0.1", *args])
 
 
+def _origin_init(monkeypatch, *args, origin_line: str = "") -> int:
+    """Run origin-init with a piped stdin: the origin line (blank keeps the
+    IP-origin default), then the password."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{origin_line}\n{PASSWORD}\n"))
+    return cli_main(["origin-init", *args])
+
+
+def _server_san(home) -> tuple[set[str], set[str]]:
+    """(IP SANs, DNS SANs) of the current server certificate."""
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate((home / "secrets" / "tls" / "server.pem").read_bytes())
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    return (
+        {str(ip) for ip in san.get_values_for_type(x509.IPAddress)},
+        set(san.get_values_for_type(x509.DNSName)),
+    )
+
+
 def test_init_produces_the_partition_and_the_handoff(home, capsys):
     """Acceptance 2: the full partition layout plus the operator handoff —
-    exact hosts line, CA URL, per-OS trust instructions."""
+    machine surface only (ADR-0036): no password prompt, no browser steps,
+    a pointer at origin-init."""
     assert _init(home) == 0
     settings = load_settings()
 
@@ -54,45 +74,43 @@ def test_init_produces_the_partition_and_the_handoff(home, capsys):
     assert (home / "secrets").stat().st_mode & 0o777 == 0o700
     assert (home / "secrets" / "admin-token").stat().st_mode & 0o777 == 0o600
 
-    # Only the scrypt hash of the password is stored.
-    record = settings.admin_password_path.read_text()
-    assert PASSWORD not in record
-    parse_record(record)
+    # No browser credential exists until origin-init (ADR-0036).
+    assert not settings.admin_password_path.exists()
+    assert controltoml.read_browser_origin(home / "configs") == ""
 
     # The control address persists as the read-only fields (ADR-0031/0034):
-    # the one address every mint surface — and every browser — will use.
+    # the one address every mint surface will use.
     assert controltoml.read_control_ip(home / "configs") == "127.0.0.1"
     assert controltoml.read_control_port(home / "configs") == 443
 
     handoff = capsys.readouterr().out
-    assert "dashboard: https://127.0.0.1" in handoff
-    ca_url = f"http://127.0.0.1:{settings.bootstrap_port}/ca.pem"
-    assert ca_url in handoff  # CA download URL
-    # Steps are executable in printed order (acceptance 7 of the revision):
-    # `serve` — which owns the bootstrap listener — comes before the CA
-    # download it serves.
-    assert handoff.index("theozolith serve") < handoff.index(ca_url)
+    assert "control address: https://127.0.0.1" in handoff
     assert "static IP or DHCP reservation" in handoff  # the IP-only channel prerequisite
-    # No DNS step exists (ADR-0034); the first visit clicks through the
-    # interstitial, and CA trust is the optional green-lock upgrade.
-    assert "DNS" not in handoff or "no DNS anywhere" in handoff
-    assert "click through" in handoff
-    assert "OPTIONAL" in handoff
-    assert "security add-trusted-cert" in handoff  # macOS one-liner
-    assert "update-ca-certificates" in handoff  # Linux one-liner
-    assert "Firefox" in handoff and "iOS" in handoff
+    assert "join-token create" in handoff
+    assert "theozolith status" in handoff
+    # The browser is one optional command away, and nothing more: no login
+    # step, no CA-trust prose (that moved to origin-init).
+    assert "origin-init" in handoff
+    assert "log in" not in handoff
+    assert "security add-trusted-cert" not in handoff
     assert "minus cache/" in handoff  # the backup doctrine, one line
 
-    # The server cert carries the IP in the SAN (ADR-0023/0031) — what
-    # nodes and CA-trusting browsers both verify against.
-    from cryptography import x509
-
-    cert = x509.load_pem_x509_certificate((home / "secrets" / "tls" / "server.pem").read_bytes())
-    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert [str(ip) for ip in san.get_values_for_type(x509.IPAddress)] == ["127.0.0.1"]
+    # The server cert carries the IP SANs (ADR-0023/0031/0037) — the box's
+    # IP and loopback are the same here, deduplicated.
+    ips, dns = _server_san(home)
+    assert ips == {"127.0.0.1"}
+    assert dns == set()
 
 
-def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
+def test_init_san_includes_loopback_beside_the_lan_ip(home):
+    """ADR-0037: loopback rides the SAN unconditionally — the local node
+    and the Operator TUI dial 127.0.0.1 against this cert."""
+    assert cli_main(["init", "--ip", "192.0.2.20"]) == 0
+    ips, _ = _server_san(home)
+    assert ips == {"192.0.2.20", "127.0.0.1"}
+
+
+def test_init_rerun_requires_force_and_force_remints(home):
     assert _init(home) == 0
     first_ca = (home / "secrets" / "tls" / "ca.pem").read_bytes()
     first_key = (home / "secrets" / "master.key").read_bytes()
@@ -100,12 +118,70 @@ def test_init_rerun_requires_force_and_force_remints(home, monkeypatch):
     # invalidation, one re-paste per node (review finding 4).
     with pytest.raises(SystemExit, match="EVERY provisioned node"):
         _init(home)
-    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     assert _init(home, "--force") == 0
     # A new CA (outstanding join strings die by construction)…
     assert (home / "secrets" / "tls" / "ca.pem").read_bytes() != first_ca
     # …but the master key — and with it every stored secret — is untouched.
     assert (home / "secrets" / "master.key").read_bytes() == first_key
+
+
+def test_origin_init_enables_the_browser_surface(home, monkeypatch, capsys):
+    """Acceptance 4 (M8): origin-init takes the origin (default: the IP
+    origin) and the password together, persists the origin, re-mints the
+    server cert from the SAME CA, and stores only the scrypt hash."""
+    assert _init(home) == 0
+    ca_before = (home / "secrets" / "tls" / "ca.pem").read_bytes()
+    settings = load_settings()
+
+    assert _origin_init(monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert "browser surface enabled: https://127.0.0.1" in out
+    assert "re-minted" in out
+    # CA-trust instructions live here now (moved out of init; ADR-0036).
+    assert "OPTIONAL" in out and "security add-trusted-cert" in out
+
+    assert controltoml.read_browser_origin(home / "configs") == "https://127.0.0.1"
+    record = settings.admin_password_path.read_text()
+    assert PASSWORD not in record
+    parse_record(record)
+    # Same CA — nodes pin it; only the server cert was re-minted.
+    assert (home / "secrets" / "tls" / "ca.pem").read_bytes() == ca_before
+
+    # Re-run requires --force.
+    with pytest.raises(SystemExit, match="--force"):
+        _origin_init(monkeypatch)
+    assert _origin_init(monkeypatch, "--force") == 0
+
+
+def test_origin_init_hostname_origin_lands_in_the_san(home, monkeypatch):
+    """The one hostname re-entry point (ADR-0036): an operator-entered
+    hostname origin persists and its host joins the SAN as a DNS name,
+    beside the IP SANs nodes rely on."""
+    assert cli_main(["init", "--ip", "192.0.2.20"]) == 0
+    assert _origin_init(monkeypatch, origin_line="https://ozolith.lan:8443") == 0
+    assert controltoml.read_browser_origin(load_settings().config_repo) == (
+        "https://ozolith.lan:8443"
+    )
+    ips, dns = _server_san(home)
+    assert ips == {"192.0.2.20", "127.0.0.1"}
+    assert dns == {"ozolith.lan"}
+
+
+def test_init_force_preserves_an_enabled_browser_surface(home, monkeypatch):
+    """A re-init after origin-init keeps the origin hostname in the new
+    SAN set — the enabled surface outlives the re-init (ADR-0036)."""
+    assert cli_main(["init", "--ip", "192.0.2.20"]) == 0
+    assert _origin_init(monkeypatch, origin_line="https://ozolith.lan") == 0
+    assert cli_main(["init", "--ip", "192.0.2.20", "--force"]) == 0
+    assert controltoml.read_browser_origin(load_settings().config_repo) == "https://ozolith.lan"
+    ips, dns = _server_san(home)
+    assert ips == {"192.0.2.20", "127.0.0.1"}
+    assert dns == {"ozolith.lan"}
+
+
+def test_origin_init_before_init_refuses(home):
+    with pytest.raises(SystemExit, match="theozolith init"):
+        cli_main(["origin-init"])
 
 
 def test_init_refuses_to_autodetect_inside_a_container(home, monkeypatch, capsys):
@@ -120,12 +196,13 @@ def test_init_refuses_to_autodetect_inside_a_container(home, monkeypatch, capsys
     assert controltoml.read_control_ip(home / "configs") == "127.0.0.1"
 
 
-def test_filesystem_audit_no_secret_bytes_outside_secrets(home):
-    """Acceptance 4: after init + one secret + one provisioned node, the
-    configs/ tree is committable without leaking a byte, secrets/ is a
-    sibling (absent, not git-ignored), and no secret material exists
-    outside it."""
+def test_filesystem_audit_no_secret_bytes_outside_secrets(home, monkeypatch):
+    """Acceptance 4: after init + origin-init + one secret + one
+    provisioned node, the configs/ tree is committable without leaking a
+    byte, secrets/ is a sibling (absent, not git-ignored), and no secret
+    material exists outside it."""
     assert _init(home) == 0
+    assert _origin_init(monkeypatch) == 0
     settings = load_settings()
     box = SecretBox(settings.key_path.read_text().strip())
     secret_store = SecretStore(settings.store_db_path)
@@ -228,13 +305,10 @@ def test_recovery_drill_restores_and_reminst_the_server_cert(home, tmp_path, cap
     assert "one join-string re-paste" in out.lower() or "join-string re-paste" in out
     assert "NOT appear in the" in out
 
-    from cryptography import x509
-
     cert_bytes = (home / "secrets" / "tls" / "server.pem").read_bytes()
     assert cert_bytes != old_cert
-    cert = x509.load_pem_x509_certificate(cert_bytes)
-    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert [str(ip) for ip in san.get_values_for_type(x509.IPAddress)] == ["10.9.9.9"]
+    ips, _ = _server_san(home)
+    assert ips == {"10.9.9.9", "127.0.0.1"}  # loopback rides every mint (ADR-0037)
     # The CA is byte-identical: nodes pinning it reconnect with no action.
     restored = SecretStore(settings.store_db_path)
     assert restored.node_for_token(early_token) == "box1"
@@ -242,10 +316,12 @@ def test_recovery_drill_restores_and_reminst_the_server_cert(home, tmp_path, cap
     assert box.decrypt(restored.get_secret_token("k")) == SECRET_VALUE
 
 
-def test_recover_enumerates_every_problem_in_one_pass(home, tmp_path, capsys):
+def test_recover_enumerates_every_problem_in_one_pass(home, tmp_path, monkeypatch, capsys):
     """Acceptance 13: a tampered/incomplete restore names EVERY missing or
-    invalid artifact at once and exits nonzero."""
+    invalid artifact at once and exits nonzero. The password record is
+    validated because this deployment enabled the browser (ADR-0036)."""
     assert _init(home) == 0
+    assert _origin_init(monkeypatch) == 0
     settings = load_settings()
     box = SecretBox(settings.key_path.read_text().strip())
     SecretStore(settings.store_db_path).put_secret("k", box.encrypt(SECRET_VALUE))
@@ -260,3 +336,15 @@ def test_recover_enumerates_every_problem_in_one_pass(home, tmp_path, capsys):
     assert str(settings.key_path) in out
     assert "CA private key" in out
     assert "scrypt" in out  # the malformed password record, named
+
+
+def test_recover_without_browser_enablement_owes_no_password(home, capsys):
+    """Browser credentials are optional-but-consistent (ADR-0036): a
+    browserless deployment recovers with no password hash on disk; an
+    enabled one missing its hash is named as a problem."""
+    assert _init(home) == 0
+    SecretStore(load_settings().store_db_path)  # store.db exists in any real backup
+    assert cli_main(["recover"]) == 0  # no password hash exists, no problem
+    controltoml.write_browser_origin(home / "configs", "https://127.0.0.1")
+    assert cli_main(["recover"]) == 1  # enabled but hash missing -> named
+    assert "origin-init --force" in capsys.readouterr().out

@@ -25,13 +25,13 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from theozolith_control import controltoml, joinstring, tls
 from theozolith_control.crypto import SecretBox
-from theozolith_control.origin import derive_origin
+from theozolith_control.origin import derive_origin, parse_browser_origin
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
@@ -60,6 +60,43 @@ WS_WRONG_ORIGIN = 4403
 WS_NO_TARGET = 4404
 WS_OVER_CAPACITY = 4429
 
+# The pre-origin-init refusal (ADR-0036): the whole HTML surface — cookie
+# routes and websockets — answers this until the browser surface is enabled.
+BROWSER_DISABLED_TEXT = (
+    "browser surface not enabled — run 'theozolith origin-init' to set the"
+    " browser origin and admin password (ADR-0036)"
+)
+
+_WEB_PATHS = (
+    "/login",
+    "/logout",
+    "/",
+    "/fragments/{rest:path}",
+    "/secrets",
+    "/settings",
+    "/join",
+    "/join/revoke",
+    "/terminal",
+)
+
+
+def _mount_disabled_web(app: FastAPI) -> None:
+    """The browser-disabled surface (ADR-0036): every HTML/cookie route
+    refuses per-request with a pointer at origin-init — fail closed in the
+    request path, not at serve startup — while the bearer /api/v1 surface
+    stays fully alive. Bearer callers are refused here too: the HTML
+    surface IS browser enablement; machine clients have the JSON API."""
+
+    async def refuse(request):
+        return PlainTextResponse(BROWSER_DISABLED_TEXT, status_code=503)
+
+    async def refuse_ws(websocket):
+        await websocket.close(code=WS_WRONG_ORIGIN, reason="browser surface not enabled")
+
+    for path in _WEB_PATHS:
+        app.router.add_route(path, refuse, methods=["GET", "POST"])
+    app.router.add_websocket_route("/terminal/ws", refuse_ws)
+
 
 def mount_web(
     app: FastAPI,
@@ -69,6 +106,12 @@ def mount_web(
     box: SecretBox,
     config_loader,
 ) -> None:
+    # Lazy browser enablement (ADR-0036): in production (TLS) the surface
+    # exists only once origin-init has persisted a browser origin.
+    # --insecure-dev (the only TLS-less mode) keeps the unarmed dev surface.
+    if settings.serve_tls and not settings.browser_origin:
+        _mount_disabled_web(app)
+        return
     # The default environment autoescapes *.html — every agent-authored
     # string (transcript tails, event payloads) renders escaped.
     templates = Jinja2Templates(directory=str(_HERE / "templates"))
@@ -90,15 +133,15 @@ def mount_web(
         secure_cookies=settings.serve_tls,
     )
     app.state.admin_sessions = sessions  # tests reach in to mint sessions
-    # The exact Host/Origin contract derives from the persisted control
-    # address alone (ADR-0034 — never the bind host/port); an invalid
-    # persisted address raises OriginError here, so the app fails closed
-    # instead of arming a guard with garbage expectations. Armed only over
-    # TLS: the derived origin is https by construction, so plain-HTTP
-    # --insecure-dev (the only TLS-less mode) could never match it.
+    # The exact Host/Origin contract is the persisted browser origin alone
+    # (ADR-0036 — never the bind host/port); a persisted-but-malformed
+    # origin raises OriginError here, so the app fails closed instead of
+    # arming a guard with garbage expectations. Armed only over TLS: the
+    # origin is https by construction, so plain-HTTP --insecure-dev (the
+    # only TLS-less mode) could never match it.
     guard = BrowserGuard(
-        derive_origin(settings.control_ip, settings.control_port)
-        if settings.control_ip and settings.serve_tls
+        parse_browser_origin(settings.browser_origin)
+        if settings.browser_origin and settings.serve_tls
         else None
     )
     app.state.browser_guard = guard  # tests assert the derived expectations
@@ -158,7 +201,7 @@ def mount_web(
             response = _page(
                 request,
                 "login.html",
-                {"error": "no admin password is set — run 'theozolith init'"},
+                {"error": "no admin password is set — run 'theozolith origin-init'"},
             )
             response.status_code = 503
             return response
@@ -277,8 +320,10 @@ def mount_web(
         current = controltoml.read_values(settings.config_repo)
         control_ip = controltoml.read_control_ip(settings.config_repo) or settings.control_ip
         control_port = controltoml.read_control_port(settings.config_repo)
-        origin_text = ""
-        if control_ip:
+        # The browser origin is what this page is being served on (ADR-0036);
+        # the IP-derived spelling is the dev-mode display fallback.
+        origin_text = controltoml.read_browser_origin(settings.config_repo)
+        if not origin_text and control_ip:
             origin_text = derive_origin(control_ip, control_port).origin
         return {
             "origin": origin_text,
@@ -317,11 +362,12 @@ def mount_web(
         form = await request.form()
         key = str(form.get("key", "")).strip()
         value = str(form.get("value", "")).strip()
-        if key in ("public_origin", "control_ip", "control_port"):
+        if key in ("public_origin", "control_ip", "control_port", "browser_origin"):
             return HTMLResponse(
-                "the [control] address fields are read-only — re-pointing a"
-                " deployment is 'theozolith recover --ip' (or init --force),"
-                " not a settings edit",
+                "the [control] fields are read-only — re-pointing a deployment"
+                " is 'theozolith recover --ip' (or init --force) and the browser"
+                " origin is 'theozolith origin-init --force', never a settings"
+                " edit",
                 status_code=403,
             )
         try:
