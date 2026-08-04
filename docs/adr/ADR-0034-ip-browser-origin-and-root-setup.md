@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-04 by ADR-0036 (browser enablement becomes lazy; `origin-init` returns in changed form — see Amendments)
 
 Date: 2026-08-01
 
@@ -47,3 +47,7 @@ ADR-0022/0023 rejected an IP-literal origin on three grounds. Two have aged out:
 - **`setcap` on the interpreter**: a venv's `python` symlinks the system binary — the capability would bless every Python script on the box, or require a copied-interpreter venv that breaks on upgrades.
 - **HSTS for the dashboard**: hard-blocks the click-through path that is now the default UX.
 - **A public-domain certificate as the default**: an external dependency (domain, ACME, egress) in a product whose deletion test is "docker + package + init output"; it stays the documented opt-in.
+
+## Amendments (2026-08-04, ADR-0036)
+
+- **Browser enablement becomes lazy**: `init` no longer prompts for the admin password and mints the server certificate with IP SANs only; the browser surface stays off until the reinstated `origin-init` persists a browser origin and takes the password. This ADR's IP origin remains the offered default there, and an operator-supplied hostname origin becomes the one hostname re-entry point (no slug, no DNS machinery returns). The TrueNAS-model TLS posture, the root-mediated installer, and the node channel are untouched. See ADR-0036.

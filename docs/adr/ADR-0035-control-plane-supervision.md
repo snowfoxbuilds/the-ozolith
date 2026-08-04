@@ -2,6 +2,10 @@ Status: ACCEPTED
 
 Date: 2026-08-04
 
+Provenance: "Grilling 2026-08-04 (late)" ruling in NODE-SUBSTRATE.md, forced into the open by the Single-Node Deployment design; authored in-repo (ADR-0033).
+
+# ADR-0035: Control-plane supervision — the substrate never supervises its own control plane
+
 # Context
 
 - The node substrate spec listed control as a built-in Stack kind alongside worker and reviewer, implying the Node Daemon could supervise the control workload like any other declarative Stack — including containerized control placed on some node.

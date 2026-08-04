@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-01 by ADR-0034 (IP browser origin, root-mediated setup); amended 2026-08-04 by ADR-0036 (lazy browser enablement — see Amendments)
 
 Date: 2026-07-27
 
@@ -97,3 +97,7 @@ Provisioning mints a unique bearer token per node, recorded as `{node, token}` i
 - **Fingerprint-less manual provision fallback** (operator types an address by hand, visually confirms the CA hash): rejected, 2026-07-27 grilling — its only safety mechanism is the visual comparison already rejected as theater; `join-token create` is available from the dashboard or any Control Node SSH session, so no scenario exists where a node shell is reachable but a join string is not (the exchange needs the Control Node live regardless); and it reintroduces exactly the TOFU window an attacker would steer a user toward.
 - **Signed stateless session cookies**: no benefit at single-operator scale and revocation becomes impossible; a SQLite session table is boring and sufficient.
 - **Web config editor for Stack/image topology**: reverses ADR-0006 and the M3/M4 scope decisions; dashboard-writes-git needs its own brief (git identity, conflict handling, validation UX) — deferred, not rejected on the merits.
+
+## Amendments (2026-08-04, ADR-0036)
+
+- **The unified-init scope shrinks to the machine surface**: the admin password prompt (step 4 above) and every browser-facing handoff step leave `init`, which now composes master key → admin bearer token → control address → CA + server certificate with IP SANs only → systemd unit → handoff. The reinstated `origin-init` is the opt-in browser step, prompting for the browser origin **and** the admin password together — both browser-only credentials of this ADR's two-credentials split. The fail-closed posture moves from serve startup into the request path: while no origin is persisted, the web surface refuses per-request. See ADR-0036.
