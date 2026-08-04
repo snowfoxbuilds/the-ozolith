@@ -1,9 +1,13 @@
 """TLS on the channel (acceptance 7): minted CA + server cert, a real
-uvicorn server, and the real node-side client verifying against the CA."""
+uvicorn server, the real node-side client verifying against the CA — and
+the renewal lifecycle (PR #15): Apple-compliant leaves, the expiry-warning
+policy, and interruption-safe re-minting."""
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import ssl
 import threading
 import time
@@ -14,7 +18,14 @@ from pathlib import Path
 import pytest
 import uvicorn
 from controlrig import ADMIN_TOKEN, make_rig
-from theozolith_control.tls import provision
+from theozolith_control import tls as tls_module
+from theozolith_control.tls import (
+    ca_fingerprint_sha256,
+    leaf_expiry_warning,
+    pair_matches,
+    provision,
+    remint_server_cert,
+)
 from theozolith_nodedaemon.controlclient import ControlClient
 
 SENTINEL = "tls-transported-secret-value"
@@ -147,3 +158,128 @@ def test_wildcard_hosts_are_refused(tmp_path):
     will never mint a shareable wildcard key."""
     with pytest.raises(ValueError, match="wildcard"):
         provision(tmp_path / "tls", ["*.theozolith.com"])
+
+
+# -- the renewal lifecycle (PR #15) ----------------------------------------------
+
+
+def _load_cert(path: Path):
+    from cryptography import x509
+
+    return x509.load_pem_x509_certificate(path.read_bytes())
+
+
+def test_leaf_lifetime_is_exactly_the_policy(tmp_path: Path):
+    """Initial and re-minted leaves both live the policy lifetime — the
+    explicit tolerance is the 5-minute clock-skew backdate."""
+    policy = datetime.timedelta(days=tls_module._SERVER_VALID_DAYS, minutes=5)
+    _, cert_path, _ = provision(tmp_path / "tls", ["127.0.0.1"])
+    initial = _load_cert(cert_path)
+    assert initial.not_valid_after_utc - initial.not_valid_before_utc == policy
+    new_cert, _ = remint_server_cert(tmp_path / "tls", ["127.0.0.1"])
+    reminted = _load_cert(new_cert)
+    assert reminted.not_valid_after_utc - reminted.not_valid_before_utc == policy
+
+
+def test_remint_chains_to_the_original_ca_and_changes_no_trust_material(tmp_path: Path):
+    """Routine renewal: the new leaf is signed by the ORIGINAL CA, matches
+    its new key, and carries the requested SAN — while the CA certificate
+    and its fingerprint (what every join string pins and every node and
+    device trusts) are byte-identical. Zero node-side changes."""
+    ca_path, cert_path, key_path = provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_before = ca_path.read_bytes()
+    fingerprint_before = ca_fingerprint_sha256(ca_before)
+    original_ca = _load_cert(ca_path)
+
+    remint_server_cert(tmp_path / "tls", ["10.0.0.9"])  # recovery's new-IP case
+
+    reminted = _load_cert(cert_path)
+    reminted.verify_directly_issued_by(original_ca)  # raises on a chain break
+    assert pair_matches(cert_path, key_path)
+    from cryptography import x509
+
+    san = reminted.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(ip) for ip in san.get_values_for_type(x509.IPAddress)] == ["10.0.0.9"]
+    assert ca_path.read_bytes() == ca_before
+    assert ca_fingerprint_sha256(ca_path.read_bytes()) == fingerprint_before
+
+
+def test_expiry_warning_fires_at_and_inside_the_threshold_only(tmp_path: Path):
+    _, cert_path, _ = provision(tmp_path / "tls", ["127.0.0.1"])
+    expiry = _load_cert(cert_path).not_valid_after_utc
+    threshold = datetime.timedelta(days=tls_module.LEAF_EXPIRY_WARNING_DAYS)
+
+    assert (
+        leaf_expiry_warning(cert_path, now=expiry - threshold - datetime.timedelta(days=1)) is None
+    )
+    at = leaf_expiry_warning(cert_path, now=expiry - threshold)
+    inside = leaf_expiry_warning(cert_path, now=expiry - datetime.timedelta(days=5))
+    expired = leaf_expiry_warning(cert_path, now=expiry + datetime.timedelta(days=1))
+    assert at and inside and expired
+    assert "EXPIRED" in expired
+
+    # Self-contained operator guidance: date, remaining time, both renewal
+    # commands, the restart, and the nodes-need-nothing guarantee.
+    assert expiry.strftime("%Y-%m-%d") in inside
+    assert "day(s) left" in inside
+    assert "theozolith recover" in inside
+    assert "docker compose" in inside
+    assert "restart" in inside
+    assert "CA is unchanged" in inside and "NO action" in inside
+
+
+def test_staged_write_failures_preserve_the_live_pair(tmp_path: Path, monkeypatch):
+    """A failure while staging either artifact leaves the previous pair
+    byte-identical and no staged debris behind."""
+    _, cert_path, key_path = provision(tmp_path / "tls", ["127.0.0.1"])
+    before = (cert_path.read_bytes(), key_path.read_bytes())
+    real_stage = tls_module._stage
+
+    for victim in ("server.pem.staged", "server.key.staged"):
+
+        def failing_stage(path, data, *, private=False, _victim=victim):
+            if path.name == _victim:
+                raise OSError("disk full")
+            return real_stage(path, data, private=private)
+
+        monkeypatch.setattr(tls_module, "_stage", failing_stage)
+        with pytest.raises(ValueError, match="before taking effect"):
+            remint_server_cert(tmp_path / "tls", ["127.0.0.1"])
+        assert (cert_path.read_bytes(), key_path.read_bytes()) == before
+        assert not list((tmp_path / "tls").glob("*.staged"))
+        assert pair_matches(cert_path, key_path)
+
+
+def test_promotion_failure_restores_the_live_pair(tmp_path: Path, monkeypatch):
+    """A failure between the two promotions (the mixed-pair window) is
+    rolled back: the previous pair comes back whole."""
+    _, cert_path, key_path = provision(tmp_path / "tls", ["127.0.0.1"])
+    before = (cert_path.read_bytes(), key_path.read_bytes())
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def failing_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the key already promoted; the cert fails
+            raise OSError("interrupted")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(ValueError, match="before taking effect"):
+        remint_server_cert(tmp_path / "tls", ["127.0.0.1"])
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert (cert_path.read_bytes(), key_path.read_bytes()) == before
+    assert pair_matches(cert_path, key_path)
+    assert not list((tmp_path / "tls").glob("*.staged"))
+
+
+def test_renewed_pair_serves_real_tls(tmp_path: Path):
+    """The whole point: after a renewal, the real TLS server loads the new
+    pair and a client verifying against the UNCHANGED CA connects."""
+    ca, _, _ = provision(tmp_path / "tls", ["127.0.0.1"])
+    new_cert, new_key = remint_server_cert(tmp_path / "tls", ["127.0.0.1"])
+    rig = make_rig(tmp_path)
+    with LiveServer(rig.client.app, certfile=str(new_cert), keyfile=str(new_key)) as live:
+        context = ssl.create_default_context(cafile=str(ca))
+        with urllib.request.urlopen(f"{live.url}/api/v1/healthz", context=context) as resp:
+            assert resp.status == 200

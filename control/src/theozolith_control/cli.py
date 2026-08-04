@@ -50,8 +50,16 @@ from theozolith_control.crypto import CryptoError, SecretBox, ensure_key_file, g
 from theozolith_control.origin import OriginError
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings, load_settings
-from theozolith_control.store import Store
-from theozolith_control.tls import CA_FILE, CA_KEY_FILE, CERT_FILE, KEY_FILE, provision
+from theozolith_control.store import EVENT_ERROR, Store
+from theozolith_control.tls import (
+    CA_FILE,
+    CA_KEY_FILE,
+    CERT_FILE,
+    KEY_FILE,
+    leaf_expiry_warning,
+    pair_matches,
+    provision,
+)
 
 
 def _log(message: str) -> None:
@@ -144,6 +152,45 @@ def _sweep_pass(settings: ControlSettings, store: Store, client, *, evict: bool 
             _log(f"evicted {evicted} progress event(s) past the tail budget (cache, not archive)")
 
 
+# The renewal watch (PR #15 review): a leaf that now genuinely expires
+# within a deployment's lifetime needs an operator-visible warning that
+# works for a service running continuously for years — one daily in-process
+# pass, not a startup-only log line.
+CERT_EXPIRY_CHECK_SECONDS = 86_400.0
+
+
+def _cert_expiry_pass(settings: ControlSettings, store: Store, *, now=None) -> str | None:
+    """One renewal-watch pass: inside the policy window, log the warning
+    and land it on the dashboard errors panel (the existing operator
+    surface — persistent, filterable, already watched)."""
+    message = leaf_expiry_warning(settings.tls_dir / CERT_FILE, now=now)
+    if message is None:
+        return None
+    _log(message)
+    store.record_event(
+        {
+            "type": EVENT_ERROR,
+            "node": "",
+            "component": "control-node",
+            "error_class": "server-certificate-expiring",
+            "message": message,
+        }
+    )
+    return message
+
+
+def _cert_expiry_loop(settings: ControlSettings, store: Store, stop: threading.Event) -> None:
+    """The daily renewal watch: an immediate pass at startup, then one per
+    day for as long as serve runs."""
+    while True:
+        try:
+            _cert_expiry_pass(settings, store)
+        except Exception as exc:
+            _log(f"certificate expiry check failed: {exc}")
+        if stop.wait(CERT_EXPIRY_CHECK_SECONDS):
+            return
+
+
 def _sweep_loop(settings: ControlSettings, store: Store, stop: threading.Event) -> None:
     """The janitor on its cadence, in one thread (ADR-0015)."""
     import time as _time
@@ -177,6 +224,15 @@ def _serve(args) -> int:
         raise SystemExit(
             f"error: no TLS material at {settings.tls_dir} — run 'theozolith tls-init"
             " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
+        )
+    # A renewal interrupted mid-promotion can leave a certificate and key
+    # that do not belong together; refusing here (with the fix named) is
+    # what guarantees startup never serves a mixed pair (tls.py protocol).
+    if tls and not pair_matches(cert, key):
+        raise SystemExit(
+            "error: server.pem and server.key do not match — an interrupted"
+            " renewal leaves a mixed pair; run 'theozolith recover' to re-mint"
+            " a consistent pair (the CA is unaffected)"
         )
     browser_origin = None
     if not args.insecure_dev or settings.control_ip:
@@ -233,6 +289,12 @@ def _serve(args) -> int:
         _log(f"bootstrap listener on port {bootstrap_server.port} (CA cert, origin, control URL)")
 
     stop = threading.Event()
+    if tls:
+        # The daily renewal watch (unconditional in production — unlike the
+        # sweeps it needs no GitHub identity).
+        threading.Thread(
+            target=_cert_expiry_loop, args=(settings, store, stop), daemon=True, name="cert-expiry"
+        ).start()
     if settings.coordination_jobs_enabled:
         threading.Thread(
             target=_sweep_loop, args=(settings, store, stop), daemon=True, name="sweeps"
@@ -643,7 +705,10 @@ def _set_password(args) -> int:
 
 
 def _recover(args) -> int:
-    """Recovery from a restored data-dir copy (ADR-0024): validate
+    """Two jobs, one command: recovery from a restored data-dir copy
+    (ADR-0024) AND routine server-certificate renewal (PR #15 — the leaf
+    now lives ~27 months, so re-minting it in place, same CA, is a normal
+    maintenance act, not only a disaster move). Validate
     loudly and COMPLETELY — every missing or invalid artifact enumerated in
     one pass, exit nonzero — then re-mint the server certificate from the
     restored CA with this box's IP in the SAN. Nodes dial the persisted
@@ -933,10 +998,11 @@ def main(argv: list[str] | None = None) -> int:
 
     recover = sub.add_parser(
         "recover",
-        help="Validate a restored data-dir copy (loudly, completely), re-mint the"
-        " server certificate from the restored CA — nodes reconnect untouched"
-        " (ADR-0024) — and, run as root on bare metal, repair the systemd service"
-        " (ADR-0034; never a new CA).",
+        help="Validate the data dir (loudly, completely) and re-mint the server"
+        " certificate from the existing CA — BOTH the restore-from-backup move"
+        " (ADR-0024) and the routine certificate renewal (never a new CA; nodes"
+        " untouched). Run as root on bare metal it also repairs the systemd"
+        " service (ADR-0034).",
     )
     recover.add_argument(
         "--ip",

@@ -32,6 +32,60 @@ _CA_VALID_DAYS = 3650  # home-lab CA: rotation story is re-running init
 # 2026-08-04). The margin below 825 absorbs clock skew. Renewal is the
 # recover re-mint (same CA, nodes untouched).
 _SERVER_VALID_DAYS = 820
+# The renewal-warning policy: once the live leaf is inside this window the
+# Control Node warns on every daily check (log line + a theozolith.error on
+# the dashboard errors panel). 90 days is enough lead time for a hobbyist
+# cadence, and the leaf's ~27-month life means the first warning arrives
+# with the deployment still healthy, not expired.
+LEAF_EXPIRY_WARNING_DAYS = 90
+
+RENEWAL_COMMANDS = (
+    "renew with 'sudo theozolith recover' (bare metal; compose:"
+    " 'docker compose -f deploy/compose/control.yml run --rm control recover'),"
+    " then restart the service ('sudo systemctl restart"
+    " theozolith-control.service' / 'docker compose restart control')"
+)
+
+
+def leaf_expiry_warning(cert_path: Path, *, now: datetime.datetime | None = None) -> str | None:
+    """The renewal warning when the live leaf is inside the policy window
+    (or past it), else None. The message is self-contained operator
+    guidance: what expires when, that the CA is untouched, the exact
+    renewal commands per deployment shape, and that nodes need nothing."""
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError):
+        return None  # no leaf to warn about; serve's own checks own that case
+    now = datetime.datetime.now(datetime.UTC) if now is None else now
+    remaining = cert.not_valid_after_utc - now
+    if remaining > datetime.timedelta(days=LEAF_EXPIRY_WARNING_DAYS):
+        return None
+    expires = cert.not_valid_after_utc.strftime("%Y-%m-%d")
+    state = (
+        f"expires {expires} ({remaining.days} day(s) left)"
+        if remaining > datetime.timedelta(0)
+        else f"EXPIRED {expires}"
+    )
+    return (
+        f"server certificate {state} — {RENEWAL_COMMANDS}. The CA is unchanged"
+        " by renewal, so nodes and trusted devices need NO action while the CA"
+        " and control IP stay the same."
+    )
+
+
+def pair_matches(cert_path: Path, key_path: Path) -> bool:
+    """True when the live certificate and private key belong together —
+    the startup guard against an interrupted renewal's mixed pair."""
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        key = serialization.load_pem_private_key(key_path.read_bytes(), None)
+    except (OSError, ValueError):
+        return False
+    return cert.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ) == key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
 
 
 def _write(path: Path, data: bytes, *, private: bool = False) -> None:
@@ -152,11 +206,63 @@ def _issue_server_cert(
     return server_key, server_cert
 
 
+def _verify_leaf(
+    cert: x509.Certificate,
+    key: ec.EllipticCurvePrivateKey,
+    ca_cert: x509.Certificate,
+    hosts: list[str],
+) -> None:
+    """The pre-promotion gate: nothing touches the live pair until the
+    freshly minted leaf provably chains to the existing CA, carries every
+    requested SAN and the serverAuth EKU, respects the lifetime policy, and
+    belongs to the freshly minted key."""
+    cert.verify_directly_issued_by(ca_cert)  # raises on a chain break
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    covered = {str(v) for v in san.get_values_for_type(x509.IPAddress)} | set(
+        san.get_values_for_type(x509.DNSName)
+    )
+    missing = [host for host in hosts if host not in covered]
+    if missing:
+        raise ValueError(f"minted leaf lacks SAN entries for: {', '.join(missing)}")
+    eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    if ExtendedKeyUsageOID.SERVER_AUTH not in eku:
+        raise ValueError("minted leaf lacks the serverAuth EKU")
+    lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+    if lifetime > datetime.timedelta(days=_SERVER_VALID_DAYS, minutes=10):
+        raise ValueError(
+            f"minted leaf lifetime {lifetime} exceeds the {_SERVER_VALID_DAYS}d policy"
+        )
+    spki = serialization.PublicFormat.SubjectPublicKeyInfo
+    if cert.public_key().public_bytes(
+        serialization.Encoding.PEM, spki
+    ) != key.public_key().public_bytes(serialization.Encoding.PEM, spki):
+        raise ValueError("minted leaf does not match the minted private key")
+
+
+def _stage(path: Path, data: bytes, *, private: bool = False) -> None:
+    """A staged artifact: full bytes on disk (fsynced) with final
+    permissions BEFORE any promotion touches the live pair."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def remint_server_cert(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path]:
-    """Re-issue the server certificate from the EXISTING CA — the recovery
-    move (ADR-0024): a restored Control Node lands on a new IP, the new SAN
-    goes in the cert, and nodes reconnect untouched because they pin the CA,
-    not the server certificate. Returns (cert, key) paths."""
+    """Re-issue the server certificate from the EXISTING CA — recovery's
+    re-mint and the routine renewal move (same machinery): nodes reconnect
+    untouched because they pin the CA, not the server certificate.
+
+    Interruption-safe by protocol: the pair is minted and verified in
+    memory, staged beside the live files with final permissions, and only
+    then promoted; any failure before or during promotion restores the
+    previous pair from the captured bytes. Two files cannot be replaced in
+    one atomic step, so serve additionally refuses a mixed pair at startup
+    (pair_matches) with re-running recover as the remediation — a crash in
+    the promotion window can delay startup, never silently serve it.
+    Returns (cert, key) paths."""
     if not hosts:
         raise ValueError("at least one host (DNS name or IP) is required")
     for host in hosts:
@@ -177,9 +283,32 @@ def remint_server_cert(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path]:
         now - datetime.timedelta(minutes=5),
         min(now + datetime.timedelta(days=_SERVER_VALID_DAYS), ca_cert.not_valid_after_utc),
     )
+    _verify_leaf(server_cert, server_key, ca_cert, hosts)
+
     cert_path, key_path = tls_dir / CERT_FILE, tls_dir / KEY_FILE
-    _write(cert_path, server_cert.public_bytes(serialization.Encoding.PEM))
-    _write(key_path, _pem_key(server_key), private=True)
+    staged_cert, staged_key = Path(f"{cert_path}.staged"), Path(f"{key_path}.staged")
+    # The previous pair, captured for restore — promotion must leave either
+    # this pair or the new one, never a mix.
+    previous: dict[Path, tuple[bytes, bool]] = {}
+    for path, private in ((cert_path, False), (key_path, True)):
+        if path.is_file():
+            previous[path] = (path.read_bytes(), private)
+    try:
+        _stage(staged_cert, server_cert.public_bytes(serialization.Encoding.PEM))
+        _stage(staged_key, _pem_key(server_key), private=True)
+        os.replace(staged_key, key_path)
+        os.replace(staged_cert, cert_path)
+        dir_fd = os.open(tls_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception as exc:
+        for path, (data, private) in previous.items():
+            _write(path, data, private=private)
+        for staged in (staged_cert, staged_key):
+            staged.unlink(missing_ok=True)
+        raise ValueError(f"server-certificate renewal failed before taking effect: {exc}") from exc
     return cert_path, key_path
 
 

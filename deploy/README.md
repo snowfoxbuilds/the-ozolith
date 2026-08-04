@@ -347,6 +347,54 @@ view (their heartbeats arrive with unknown tokens): that list is the re-provisio
 worklist for the stale-backup case. Deleting `cache/cache.db` on a live system is
 always safe and is the documented recovery move for cache corruption.
 
+### Server-certificate renewal (routine, and the one-time compliance migration)
+
+The server leaf lives ~27 months (820 days — under Apple's 825-day cap, so
+Safari/iOS can trust it once the CA is installed); the CA lives 10 years.
+Renewal re-mints the leaf from the **same CA**: node pinning, join strings,
+and device trust are untouched — **routine renewal never rotates the CA and
+never requires node reprovisioning**. The Control Node warns you itself: from
+90 days out, a daily `server-certificate-expiring` entry lands on the
+dashboard errors panel (and the service log) with these exact commands.
+
+Bare metal (renewal is safe with the service running — the new pair is
+staged, verified, and promoted atomically; the running process keeps its
+loaded pair until the restart):
+
+```sh
+sudo theozolith recover
+sudo systemctl restart theozolith-control.service
+```
+
+Compose:
+
+```sh
+docker compose -f deploy/compose/control.yml run --rm control recover
+docker compose -f deploy/compose/control.yml restart control
+```
+
+**One-time migration** for deployments minted before the compliance fix
+(10-year leaf, no EKU — Safari refuses it even with the CA trusted): the
+commands are identical — run the renewal once after updating the product.
+
+Verify the result:
+
+```sh
+sudo openssl x509 -in /var/lib/theozolith-control/secrets/tls/server.pem \
+  -noout -issuer -enddate -ext extendedKeyUsage,subjectAltName
+# issuer=CN=TheOzolith Control CA; TLS Web Server Authentication; your control IP in the SAN
+sudo openssl x509 -in /var/lib/theozolith-control/secrets/tls/ca.pem -noout -fingerprint -sha256
+# unchanged across renewal — compare before/after if you want the proof
+```
+
+Nodes: nothing. They pin the CA, reconnect on their capped backoff through
+the restart, and never see the leaf change. **If renewal fails**, it fails
+before taking effect: the previous pair is restored and the service keeps
+serving on it — fix whatever `recover` named and re-run. If a crash lands
+exactly inside the promotion window, serve refuses to start with a
+"server.pem and server.key do not match" error naming the fix: run
+`recover` again, which re-mints a consistent pair.
+
 ### Migrating a pre-ADR-0034 home-directory install
 
 The same recover machinery relocates an existing `~/.theozolith/` deployment onto

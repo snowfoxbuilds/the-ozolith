@@ -167,6 +167,64 @@ def test_serve_matching_bind_warns_nothing(cli_env, monkeypatch, capsys):
     assert "WARNING" not in capsys.readouterr().out
 
 
+def test_serve_refuses_a_mixed_certificate_key_pair(cli_env):
+    """The startup half of the renewal-atomicity guarantee (PR #15): a
+    certificate and key that do not belong together — the interrupted-
+    promotion window — are refused with the remediation named, never
+    silently served."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
+    assert cli_main(["tls-init"]) == 0
+    stray = ec.generate_private_key(ec.SECP256R1())
+    (cli_env / "secrets" / "tls" / "server.key").write_bytes(
+        stray.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    with pytest.raises(SystemExit, match="do not match"):
+        cli_main(["serve"])
+
+
+def test_serve_expiry_pass_lands_on_the_errors_surface(cli_env):
+    """The renewal watch records a theozolith.error the dashboard errors
+    panel shows — persistent and operator-visible for a service that runs
+    continuously for years — and stays silent outside the threshold."""
+    import datetime
+
+    from theozolith_control import tls as tls_module
+    from theozolith_control.cli import _cert_expiry_pass
+    from theozolith_control.settings import load_settings
+    from theozolith_control.store import Store
+
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
+    assert cli_main(["tls-init"]) == 0
+    settings = load_settings()
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(settings.cache_db_path)
+    from cryptography import x509
+
+    expiry = x509.load_pem_x509_certificate(
+        (settings.tls_dir / "server.pem").read_bytes()
+    ).not_valid_after_utc
+
+    # Outside the window: no message, nothing recorded.
+    safe = expiry - datetime.timedelta(days=tls_module.LEAF_EXPIRY_WARNING_DAYS + 30)
+    assert _cert_expiry_pass(settings, store, now=safe) is None
+    assert store.error_events() == []
+
+    # Inside: the message lands as a filterable error with the commands.
+    message = _cert_expiry_pass(settings, store, now=expiry - datetime.timedelta(days=10))
+    assert message and "theozolith recover" in message
+    (event,) = store.error_events()
+    assert event["payload"]["error_class"] == "server-certificate-expiring"
+    assert "recover" in event["payload"]["message"]
+    assert event["component"] == "control-node"
+
+
 def test_tls_init_puts_the_control_ip_in_the_san(cli_env):
     """The TLS SAN derives from the persisted control IP alone — nodes and
     CA-trusting browsers both verify against it (ADR-0031/0034)."""
