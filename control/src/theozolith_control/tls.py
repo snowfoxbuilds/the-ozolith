@@ -18,14 +18,20 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 CA_FILE = "ca.pem"
 CA_KEY_FILE = "ca.key"
 CERT_FILE = "server.pem"
 KEY_FILE = "server.key"
 
-_VALID_DAYS = 3650  # home-lab CA: rotation story is re-running tls-init
+_CA_VALID_DAYS = 3650  # home-lab CA: rotation story is re-running init
+# Apple's trust stack refuses TLS server certificates with validity over
+# 825 days — private CAs included — so a long-lived leaf can never earn the
+# browser green lock on macOS/iOS (found on the first real Safari attempt,
+# 2026-08-04). The margin below 825 absorbs clock skew. Renewal is the
+# recover re-mint (same CA, nodes untouched).
+_SERVER_VALID_DAYS = 820
 
 
 def _write(path: Path, data: bytes, *, private: bool = False) -> None:
@@ -55,7 +61,8 @@ def provision(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
             raise ValueError(f"wildcard host {host!r} refused — one TLS identity per deployment")
     now = datetime.datetime.now(datetime.UTC)
     not_before = now - datetime.timedelta(minutes=5)
-    not_after = now + datetime.timedelta(days=_VALID_DAYS)
+    not_after = now + datetime.timedelta(days=_CA_VALID_DAYS)
+    server_not_after = now + datetime.timedelta(days=_SERVER_VALID_DAYS)
 
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "TheOzolith Control CA")])
@@ -89,7 +96,9 @@ def provision(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path, Path]:
         .sign(ca_key, hashes.SHA256())
     )
 
-    server_key, server_cert = _issue_server_cert(ca_name, ca_key, hosts, not_before, not_after)
+    server_key, server_cert = _issue_server_cert(
+        ca_name, ca_key, hosts, not_before, server_not_after
+    )
 
     ca_path = tls_dir / CA_FILE
     cert_path = tls_dir / CERT_FILE
@@ -127,6 +136,9 @@ def _issue_server_cert(
         .not_valid_before(not_before)
         .not_valid_after(not_after)
         .add_extension(x509.SubjectAlternativeName(names), critical=False)
+        # serverAuth EKU: required by Apple's trust stack (macOS 10.15+) —
+        # without it Safari/iOS reject the leaf even under a trusted CA.
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()), critical=False
@@ -163,7 +175,7 @@ def remint_server_cert(tls_dir: Path, hosts: list[str]) -> tuple[Path, Path]:
         ca_key,
         hosts,
         now - datetime.timedelta(minutes=5),
-        min(now + datetime.timedelta(days=_VALID_DAYS), ca_cert.not_valid_after_utc),
+        min(now + datetime.timedelta(days=_SERVER_VALID_DAYS), ca_cert.not_valid_after_utc),
     )
     cert_path, key_path = tls_dir / CERT_FILE, tls_dir / KEY_FILE
     _write(cert_path, server_cert.public_bytes(serialization.Encoding.PEM))

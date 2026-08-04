@@ -65,6 +65,33 @@ def test_provision_mints_ca_and_server_material(tmp_path: Path):
     assert ((tmp_path / "tls" / "ca.key").stat().st_mode & 0o777) == 0o600
 
 
+def test_server_cert_meets_apple_trust_requirements(tmp_path: Path):
+    """The optional browser green lock (ADR-0034) is only reachable if the
+    leaf satisfies Apple's trust stack: a serverAuth EKU and validity of at
+    most 825 days — a 10-year leaf is rejected by Safari/iOS even under a
+    trusted CA. The CA itself may stay long-lived (roots are exempt)."""
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    ca_path, cert_path, _key = provision(tmp_path / "tls", ["127.0.0.1"])
+    leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    eku = leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    assert ExtendedKeyUsageOID.SERVER_AUTH in eku
+    leaf_days = (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days
+    assert leaf_days <= 825
+    ca_cert = x509.load_pem_x509_certificate(ca_path.read_bytes())
+    assert (ca_cert.not_valid_after_utc - ca_cert.not_valid_before_utc).days > 825
+
+    # The recover re-mint issues through the same path: same properties.
+    from theozolith_control.tls import remint_server_cert
+
+    new_cert, _ = remint_server_cert(tmp_path / "tls", ["127.0.0.1"])
+    reminted = x509.load_pem_x509_certificate(new_cert.read_bytes())
+    eku = reminted.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    assert ExtendedKeyUsageOID.SERVER_AUTH in eku
+    assert (reminted.not_valid_after_utc - reminted.not_valid_before_utc).days <= 825
+
+
 def test_secrets_transit_tls_end_to_end(tmp_path: Path):
     """CLI-entered value -> encrypted store -> node-scoped pull, all over a
     genuinely TLS channel verified against the minted CA."""
