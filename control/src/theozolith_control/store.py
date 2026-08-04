@@ -96,6 +96,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
+CREATE INDEX IF NOT EXISTS events_received ON events (received_at, id);
+-- Eviction evidence (ADR-0038): the one deleter records a watermark in the
+-- same transaction as its deletes, so the events read view reports evicted
+-- history honestly (cache-not-archive, ADR-0016). One row, scope 'events'.
+-- It dies with cache.db by design: a wiped cache is an honestly empty
+-- store, not an incompleteness claim about rows that no longer exist.
+CREATE TABLE IF NOT EXISTS event_evictions (
+    scope TEXT PRIMARY KEY,
+    last_evicted_id INTEGER NOT NULL,
+    evicted_count INTEGER NOT NULL,
+    evicted_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     node TEXT NOT NULL,
@@ -284,6 +296,12 @@ class Store:
 
     def close(self) -> None:
         self._db.close()
+
+    def now(self) -> float:
+        """The store's clock — the same one every recorded timestamp used,
+        exposed so read models can ship a server ``now`` (ADR-0039) and
+        clients never mix their clock into staleness math."""
+        return self._clock()
 
     # -- nodes and heartbeat status ----------------------------------------
 
@@ -712,7 +730,85 @@ class Store:
                 if excess <= 0:
                     break
             self._db.executemany("DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed])
+            # The watermark rides the same transaction (ADR-0038): eviction
+            # and its evidence are one atomic fact.
+            self._db.execute(
+                "INSERT INTO event_evictions (scope, last_evicted_id, evicted_count, evicted_at)"
+                " VALUES ('events', ?, ?, ?)"
+                " ON CONFLICT (scope) DO UPDATE SET"
+                " last_evicted_id = MAX(last_evicted_id, excluded.last_evicted_id),"
+                " evicted_count = evicted_count + excluded.evicted_count,"
+                " evicted_at = excluded.evicted_at",
+                (max(doomed), len(doomed), self._clock()),
+            )
             return len(doomed)
+
+    def events_evicted(self) -> bool:
+        """True once any event row has ever been evicted from this cache
+        (the ADR-0038 indicator). False in a store that never evicted —
+        including a freshly recreated cache.db, by design."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT evicted_count FROM event_evictions WHERE scope = 'events'"
+            ).fetchone()
+        return row is not None
+
+    def events_page(
+        self,
+        *,
+        node: str | None = None,
+        component: str | None = None,
+        type: str | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """One newest-first page for GET /api/v1/events (ADR-0038): stored
+        payloads verbatim — known and unknown types alike, rendering is the
+        client's job — plus the continuation cursor and the store-level
+        eviction indicator. ``before_id`` is the decoded cursor: rows
+        strictly older than it."""
+        query = "SELECT id, type, received_at, node, component, payload FROM events"
+        clauses: list[str] = []
+        params: list[Any] = []
+        for clause, value in (
+            ("type = ?", type),
+            ("node = ?", node),
+            ("component = ?", component),
+        ):
+            if value is not None:
+                clauses.append(clause)
+                params.append(value)
+        if since is not None:
+            clauses.append("received_at >= ?")
+            params.append(since)
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            rows = self._db.execute(
+                query + " ORDER BY id DESC LIMIT ?", [*params, limit]
+            ).fetchall()
+        return {
+            "events": [
+                {
+                    "id": r["id"],
+                    "type": r["type"],
+                    "received_at": r["received_at"],
+                    "node": r["node"],
+                    "component": r["component"],
+                    "payload": json.loads(r["payload"]),
+                }
+                for r in rows
+            ],
+            # A full page may have more behind it; a short page is the end.
+            # The cursor is the last id as a decimal string — contractually
+            # opaque to clients (ADR-0038).
+            "next_cursor": str(rows[-1]["id"]) if len(rows) == limit else None,
+            "evicted": self.events_evicted(),
+        }
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------
 
