@@ -111,8 +111,10 @@ The git-backed Config Repo at `~/.theozolith/configs` on the Control Node (ADR-0
 is the deployment's source of truth: Stacks, derived images, and the product version
 pin. `deploy/configs-example/` is a complete starter — copy it in and adjust the
 `node = "..."` placements to your node names. The Implementer/Reviewer drivers are
-process-kind Stacks; `control` and the Flight Deck are container Stacks. Desired
-state distributes over the heartbeat channel; nodes cache it for degraded mode.
+process-kind Stacks; the Flight Deck is a container Stack. The Control Node is never
+a Stack — it runs as its own systemd unit (or the hand-run compose flow) on its host,
+and a `stacks/control.toml` is rejected at validation (ADR-0035). Desired state
+distributes over the heartbeat channel; nodes cache it for degraded mode.
 
 ### 4. Enter secrets
 

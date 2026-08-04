@@ -496,10 +496,11 @@ def create_app(
     @app.post("/api/v1/product/update")
     async def product_update(request: Request) -> dict[str, Any]:
         """Pin ``version`` in the Config Repo (committed) and fan the update
-        out to every known node. Nodes hosting the ``control`` Stack are
-        queued LAST: the Control Node applies its own update only after the
-        fan-out is queued (its daemon's existing os.execv path performs it).
-        Re-running with a previous version re-pins and redeploys (rollback)."""
+        out to every known node. Control is never a Stack (ADR-0035), so no
+        fan-out ordering exists for it: the Control Node updates itself
+        last through its own os.execv path (ADR-0015) after the fan-out is
+        queued. Re-running with a previous version re-pins and redeploys
+        (rollback)."""
         _authorize(request, settings.admin_token, "admin")
         body = await _json_body(request)
         version = _require(body, "version", str)
@@ -511,11 +512,7 @@ def create_app(
         # Cache, not archive: at most the pinned + previous artifact sets
         # survive a pin change (the previous set is the rollback path).
         product.prune_artifacts(settings.artifacts_dir, {version, previous} - {""})
-        control_hosts = {s.node for s in _config().stacks if s.name == "control"}
-        nodes = sorted(
-            (n["name"] for n in store.fleet_state()["nodes"]),
-            key=lambda name: (name in control_hosts, name),
-        )
+        nodes = sorted(n["name"] for n in store.fleet_state()["nodes"])
         for node in nodes:
             store.queue_command(node, "update", None, False)
             if store.release_quarantine(node):

@@ -31,7 +31,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f worker/docker/Dockerfile.claude -t theozolith-run-claude:ci .
 
-  # Same rule for the Control Node image (the `control` built-in Stack).
+  # Same rule for the Control Node image (the hand-run compose flow —
+  # control is never a Stack; ADR-0035).
   control-image:
     runs-on: ubuntu-latest
     steps:
