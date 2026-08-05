@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-07-17 by ADR-0016 and ADR-0017; amended 2026-07-22 (two update paths; update convergence & dispatch eligibility; build refuses dirty trees); amended 2026-08-04 by ADR-0038 (events read endpoint) (see Amendments)
+Status: ACCEPTED — amended 2026-07-17 by ADR-0016 and ADR-0017; amended 2026-07-22 (two update paths; update convergence & dispatch eligibility; build refuses dirty trees); amended 2026-08-04 by ADR-0038 (events read endpoint); amended 2026-08-05 by ADR-0040 (Textual joins the control-only dependency exception; the state document gains the Operator TUI's keys) (see Amendments)
 
 Date: 2026-07-16
 
@@ -90,3 +90,8 @@ Built-in Stacks (worker, reviewer, control) are ordinary files in this same form
 ## Amendment (2026-08-04, ADR-0038)
 
 - **The control-plane API gains its first events read view**: `GET /api/v1/events` (admin bearer) serves stored event rows — known and unknown namespaced types alike, rendering is the client's job — with node/component/type filters, `since`, and cursor pagination, and an eviction indicator honoring ADR-0016's cache-not-archive rule. `POST /api/v1/events` ingestion is unchanged. See ADR-0038.
+
+## Amendment (2026-08-05, ADR-0040 — M9 Operator TUI)
+
+- **`textual` joins the `control/` runtime-dependency exception** — one component, one named dependency, one stated purpose (the jinja2 precedent): it implements the approved Operator TUI, `theozolith top` (NODE-SUBSTRATE.md "Grilling 2026-08-04"). The stdlib-only rule remains unchanged for `worker/`, `nodedaemon/`, and `knowledge/`, now test-enforced from both sides: no stdlib component can import Textual or any TUI module, and the TUI package's own import closure is stdlib + Textual + itself.
+- **The state read model gains the TUI's keys**: `/api/v1/state`'s `desired_stacks` entries carry the Stack's `attach` argv and non-secret `env` declarations, and the document gains `repo` (the coordination target) and `control_toml` (the read-only settings view) — additive fields on the ADR-0039 read model, not new endpoints; the heartbeat channel is untouched. See ADR-0040.
