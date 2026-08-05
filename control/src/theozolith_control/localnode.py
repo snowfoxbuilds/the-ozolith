@@ -27,12 +27,14 @@ drift.
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from theozolith_control.bootstrap import BootstrapServer
 from theozolith_control.controltoml import COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME
@@ -269,6 +271,12 @@ def _provision_failure_class(output: str) -> str:
     return "unrecognized failure (the child's output was withheld: it could contain join material)"
 
 
+# A join-token id rides the revocation URL as a path segment: only an
+# allowlisted shape is ever captured (no '/', '.', '%', or anything else a
+# hostile response could use to steer the DELETE elsewhere).
+_TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 def _read_state_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8").strip()
@@ -276,30 +284,121 @@ def _read_state_file(path: Path) -> str:
         return ""
 
 
+def _dial_address_problem(control_url: str, expected_port: int) -> str | None:
+    """Why the persisted control URL is not EXACTLY the loopback origin
+    serve answers, or None. Structural parsing, never a prefix check: a
+    prefix accepts deceptive shapes (`https://127.0.0.1.example.com`,
+    `https://127.0.0.1@remote.example`) whose actual host is not loopback
+    at all."""
+    parts = urlsplit(control_url)
+    if parts.scheme != "https":
+        return f"persisted dial address {control_url!r} is not https"
+    if parts.username or parts.password:
+        return f"persisted dial address {control_url!r} carries userinfo"
+    try:
+        port = parts.port
+    except ValueError:
+        return f"persisted dial address {control_url!r} has a malformed port"
+    if parts.hostname != "127.0.0.1":
+        return f"persisted dial address {control_url!r} host is not exactly 127.0.0.1"
+    if (port if port is not None else 443) != expected_port:
+        return (
+            f"persisted dial address {control_url!r} port is not the persisted"
+            f" control port {expected_port}"
+        )
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        return f"persisted dial address {control_url!r} carries a path, query, or fragment"
+    return None
+
+
+def _artifact_problem(path: Path, service_uid: int, *, confidential: bool) -> str | None:
+    """Why the service user cannot rely on this identity artifact, or
+    None: a regular, non-symlink file, owned and owner-readable per the
+    installer's contract (and 0600-private for the per-node token)."""
+    import stat as stat_module
+
+    if path.is_symlink():
+        return f"{path} is a symlink — identity artifacts must be regular files"
+    try:
+        info = path.stat()
+    except OSError:
+        return f"missing or unreadable {path}"
+    if not stat_module.S_ISREG(info.st_mode):
+        return f"{path} is not a regular file"
+    if info.st_uid != service_uid:
+        return (
+            f"{path} is not owned by {NODE_SERVICE_USER} — the daemon cannot be"
+            " relied on to read it"
+        )
+    if not info.st_mode & 0o400:
+        return f"{path} is not readable by its owner"
+    if confidential and info.st_mode & 0o077:
+        return f"{path} is group/world-accessible — the per-node token must be private (0600)"
+    return None
+
+
 def local_identity_problem(
     settings: ControlSettings, state_dir: Path, node_name: str
 ) -> str | None:
     """Why the on-disk daemon identity cannot back the registered local
-    node, or None when it can (the provisioned layout, ADR-0023): a
-    loopback dial address, this box's node name, a per-node token, and
-    exactly the CA this deployment pins. A registered row is trusted only
-    on top of a valid identity — the row alone proves an exchange once
-    happened, not that this box can still be that node."""
+    node, or None when THE DAEMON CAN USE IT (the provisioned layout,
+    ADR-0023). The bar is daemon-usability, not file presence: the control
+    URL must parse structurally to exactly the loopback origin serve
+    answers on the persisted control port, and every artifact must be a
+    regular non-symlink file the ``ozolith`` service user owns and can
+    read, in a state dir it can traverse — the row alone proves an
+    exchange once happened, not that this box can still be that node."""
+    import pwd
+
+    try:
+        service = pwd.getpwnam(NODE_SERVICE_USER)
+    except KeyError:
+        return f"the {NODE_SERVICE_USER!r} service user does not exist on this box"
+
     control_url = _read_state_file(state_dir / "control-url")
     if not control_url:
         return f"missing or unreadable {state_dir / 'control-url'}"
-    if not control_url.startswith("https://127.0.0.1"):
-        return f"persisted dial address {control_url!r} is not loopback"
+    dial_problem = _dial_address_problem(control_url, settings.control_port)
+    if dial_problem:
+        return dial_problem
+
+    # The daemon must be able to reach the state dir at all: the dir is
+    # its own (owner-traversable) and every ancestor lets it through.
+    if state_dir.is_symlink():
+        return f"{state_dir} is a symlink"
+    try:
+        dir_info = state_dir.stat()
+    except OSError:
+        return f"missing daemon state dir {state_dir}"
+    if dir_info.st_uid != service.pw_uid or not dir_info.st_mode & 0o500:
+        return f"{state_dir} is not owned and traversable by {NODE_SERVICE_USER}"
+    for parent in state_dir.parents:
+        try:
+            parent_info = parent.stat()
+        except OSError:
+            return f"directory {parent} is not statable"
+        traversable = bool(parent_info.st_mode & 0o001) or (
+            parent_info.st_uid == service.pw_uid and parent_info.st_mode & 0o100
+        )
+        if not traversable:
+            return f"directory {parent} is not traversable by {NODE_SERVICE_USER}"
+
+    for path, confidential in (
+        (state_dir / "control-url", False),
+        (state_dir / "node-name", False),
+        (state_dir / "node-token", True),
+        (state_dir / "ca.pem", False),
+    ):
+        problem = _artifact_problem(path, service.pw_uid, confidential=confidential)
+        if problem:
+            return problem
+
     name = _read_state_file(state_dir / "node-name")
     if name != node_name:
         return f"persisted node name {name!r} is not {node_name!r}"
     if not _read_state_file(state_dir / "node-token"):
         return f"missing or empty {state_dir / 'node-token'}"
-    try:
-        pinned = (state_dir / "ca.pem").read_bytes()
-    except OSError:
-        return f"missing or unreadable {state_dir / 'ca.pem'}"
-    if pinned != (settings.tls_dir / CA_FILE).read_bytes():
+    if (state_dir / "ca.pem").read_bytes() != (settings.tls_dir / CA_FILE).read_bytes():
         return "the pinned ca.pem is not this deployment's CA (rotated since provisioning?)"
     return None
 
@@ -456,15 +555,23 @@ def bootstrap_local_node(
             ca=ca,
             body={"addr": f"127.0.0.1:{listener.port}"},
         )
-        minted_id = str(minted.get("id") or "") if status == 200 else ""
-        join_string = str(minted.get("join_string") or "") if status == 200 else ""
+        # The token id is captured INDEPENDENTLY of HTTP success — any
+        # response that returned an identifiable token gets best-effort
+        # revocation from the failure handler — and only in the
+        # allowlisted shape (it rides the revocation URL).
+        candidate = minted.get("id")
+        if isinstance(candidate, str) and _TOKEN_ID_RE.fullmatch(candidate):
+            minted_id = candidate
+        join_candidate = minted.get("join_string")
+        join_string = join_candidate if status == 200 and isinstance(join_candidate, str) else ""
         if not (status == 200 and minted_id and join_string):
             raise SystemExit(
                 f"error: could not mint a usable local join token (HTTP {status};"
                 f" token id {'present' if minted_id else 'MISSING'}, join string"
-                f" {'present' if join_string else 'MISSING'}) — nothing was"
-                " provisioned. An id-less mint cannot be revoked; the one-hour TTL"
-                " is the backstop. Check 'journalctl -u theozolith-control.service';"
+                f" {'present' if join_string else 'MISSING or unusable'}) — nothing"
+                " was provisioned. An identifiable token is revoked on the way out;"
+                " for anything unidentifiable the one-hour TTL is the backstop."
+                " Check 'journalctl -u theozolith-control.service';"
                 f" then {RESUME_HINT}"
             )
         log("local node [join]: token minted (single-use; the join string is machine-consumed)")

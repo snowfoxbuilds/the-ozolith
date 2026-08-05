@@ -141,6 +141,7 @@ class Harness:
         (self.state_dir / "control-url").write_text(control_url + "\n")
         (self.state_dir / "node-name").write_text(name + "\n")
         (self.state_dir / "node-token").write_text(token_value + "\n")
+        (self.state_dir / "node-token").chmod(0o600)
         (self.state_dir / "ca.pem").write_bytes(ca)
 
     def runner(self, argv, **kwargs):
@@ -327,12 +328,25 @@ def test_mint_failure_never_interpolates_the_response(tmp_path, monkeypatch):
     assert harness.revokes() == []  # a non-200 mint carries no trusted id
 
 
+def _service_user(monkeypatch, uid: int | None = None):
+    """Fake the ozolith service user as PRESENT: identity validation
+    resolves it, and the install phase's useradd is skipped (irrelevant to
+    reconcile tests). Default uid = the test's own files' owner."""
+    import os
+    import pwd
+
+    resolved = os.getuid() if uid is None else uid
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_name=name, pw_uid=resolved, pw_gid=os.getgid()),
+    )
+
+
 def test_reconcile_fresh_node_with_valid_identity_is_a_noop(tmp_path, monkeypatch):
     """A node whose heartbeat is FRESH on the server clock, backed by a
     valid on-disk identity, is reconciled without a restart or a join."""
-    import pwd
-
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    _service_user(monkeypatch)
     harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
     harness.write_identity()
     harness.bootstrap(tmp_path)
@@ -347,9 +361,7 @@ def test_reconcile_stale_historical_version_restarts_and_demands_a_heartbeat(tmp
     stale last_seen (dead daemon, old heartbeats) is restarted and resume
     succeeds only after a heartbeat newer than the stale baseline arrives,
     fresh on the server clock."""
-    import pwd
-
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    _service_user(monkeypatch)
     harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10_000})
     harness.write_identity()
     harness.bootstrap(tmp_path)
@@ -364,9 +376,7 @@ def test_reconcile_restarts_a_provisioned_but_silent_node(tmp_path, monkeypatch)
     """A node the exchange registered but whose daemon never heartbeat
     (version empty, registration touch recent) is restarted — never
     deleted, never re-provisioned."""
-    import pwd
-
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    _service_user(monkeypatch)
     harness = Harness(tmp_path, pre_row={"version": "", "last_seen": NOW - 5})
     harness.write_identity()
     harness.bootstrap(tmp_path)
@@ -381,9 +391,7 @@ def test_reconcile_fails_explicitly_on_missing_or_corrupt_identity(tmp_path, mon
     missing state fails explicitly with recovery/reprovision instructions
     — never a success report, never a restart of a daemon that cannot be
     the registered node, never an automatic deletion."""
-    import pwd
-
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    _service_user(monkeypatch)
     # Missing identity entirely — even with a FRESH row.
     harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
     with pytest.raises(SystemExit, match="cannot back it") as excinfo:
@@ -398,6 +406,108 @@ def test_reconcile_fails_explicitly_on_missing_or_corrupt_identity(tmp_path, mon
     with pytest.raises(SystemExit, match="not this deployment's CA"):
         harness.bootstrap(tmp_path)
     assert not harness.restarted_daemon()
+
+
+def test_identity_dial_address_is_parsed_structurally():
+    """Round-4 defect: a prefix check accepted deceptive URL shapes. The
+    structural parser requires exactly the https loopback origin on the
+    expected port — no userinfo, deceptive suffixes, path, query, or
+    fragment."""
+    problem = localnode._dial_address_problem
+    assert problem("https://127.0.0.1", 443) is None
+    assert problem("https://127.0.0.1/", 443) is None
+    assert problem("https://127.0.0.1:9443", 9443) is None
+    assert "not exactly 127.0.0.1" in problem("https://127.0.0.1.example.com", 443)
+    assert "userinfo" in problem("https://127.0.0.1@remote.example", 443)
+    assert "port" in problem("https://127.0.0.1:9443", 443)  # wrong loopback port
+    assert "port" in problem("https://127.0.0.1", 9443)  # implicit 443 vs expected
+    assert "not https" in problem("http://127.0.0.1", 443)
+    assert "path" in problem("https://127.0.0.1/api", 443)
+    assert "path" in problem("https://127.0.0.1?x=1", 443)
+    assert "path" in problem("https://127.0.0.1#f", 443)
+    assert "malformed port" in problem("https://127.0.0.1:abc", 443)
+
+
+def test_identity_rejects_deceptive_dial_addresses(tmp_path, monkeypatch):
+    """Bootstrap-level: the deceptive-suffix and userinfo shapes fail the
+    reconcile with the explicit cannot-back-it refusal."""
+    _service_user(monkeypatch)
+    for url, needle in (
+        ("https://127.0.0.1.example.com", "not exactly 127.0.0.1"),
+        ("https://127.0.0.1@remote.example", "userinfo"),
+        ("https://127.0.0.1:9443", "port"),
+    ):
+        harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
+        harness.write_identity(control_url=url)
+        with pytest.raises(SystemExit, match="cannot back it") as excinfo:
+            harness.bootstrap(tmp_path)
+        assert needle in str(excinfo.value)
+        assert not harness.restarted_daemon()
+
+
+def test_identity_rejects_files_the_service_user_cannot_read(tmp_path, monkeypatch):
+    """'Validated identity' means the DAEMON can use it: artifacts owned by
+    someone else (root-readable, ozolith-unreadable) are rejected."""
+    import os
+
+    _service_user(monkeypatch, uid=os.getuid() + 4242)  # files belong to 'root' stand-in
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
+    harness.write_identity()
+    with pytest.raises(SystemExit, match="cannot back it") as excinfo:
+        harness.bootstrap(tmp_path)
+    assert "not owned" in str(excinfo.value)
+
+    # Unit-level: the per-file contract names the unreadable artifact.
+    token = harness.state_dir / "node-token"
+    assert "not owned by" in localnode._artifact_problem(
+        token, os.getuid() + 4242, confidential=True
+    )
+    token.chmod(0o644)  # owner-correct but world-readable secret
+    assert "must be private" in localnode._artifact_problem(token, os.getuid(), confidential=True)
+
+
+def test_identity_rejects_symlinked_artifacts(tmp_path, monkeypatch):
+    _service_user(monkeypatch)
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
+    harness.write_identity()
+    real = tmp_path / "elsewhere-ca.pem"
+    real.write_bytes(FAKE_CA)
+    (harness.state_dir / "ca.pem").unlink()
+    (harness.state_dir / "ca.pem").symlink_to(real)
+    with pytest.raises(SystemExit, match="symlink"):
+        harness.bootstrap(tmp_path)
+
+
+def test_nonsuccess_mint_with_an_id_is_revoked(tmp_path, monkeypatch):
+    """Round-4 defect: a non-200 mint that still returned an identifiable
+    token id must be revoked — and a response carrying both id and join
+    string leaks neither into the diagnostic."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path, mint_response=(503, {"id": "tok-1", "join_string": JOIN_STRING}))
+    with pytest.raises(SystemExit, match="could not mint") as excinfo:
+        harness.bootstrap(tmp_path)
+    message = str(excinfo.value)
+    assert JOIN_STRING not in message and "MACHINE-ONLY" not in message
+    assert "tok-1" not in message  # the id is for cleanup, never for display
+    assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
+
+
+def test_hostile_token_id_shapes_are_never_captured(tmp_path, monkeypatch):
+    """The id rides the revocation URL as a path segment: only the
+    allowlisted shape is captured — a hostile id cannot steer the DELETE
+    (and an uncapturable id means no revocation attempt, TTL backstop)."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(
+        tmp_path,
+        mint_response=(200, {"id": "../nodes/box1/revoke", "join_string": JOIN_STRING}),
+    )
+    with pytest.raises(SystemExit, match="could not mint"):
+        harness.bootstrap(tmp_path)
+    assert harness.revokes() == []
 
 
 def test_interrupt_stops_the_listener_and_revokes(tmp_path, monkeypatch):

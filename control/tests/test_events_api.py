@@ -176,6 +176,46 @@ def test_legacy_watermark_reads_conservatively(control: ControlRig):
     assert _read(control, since=control.clock.now + 999)["evicted"] is True
 
 
+def test_boundary_event_eviction_leaves_the_next_page_complete(control: ControlRig):
+    """Round-4 defect: a page showing id < cursor cannot have lost a row
+    whose id was AT or after the cursor. Evicting the boundary event (the
+    newest evictable row) leaves the next page complete."""
+    control.node_post("/api/v1/events", run_event(1, "claimed"))  # id 1, kept
+    control.node_post("/api/v1/events", run_event(2, "claimed"))  # id 2, kept
+    control.node_post("/api/v1/events", _progress_event(issue=3))  # id 3, evicted
+    assert control.store.evict_progress(budget_bytes=10) == 1
+
+    # A client's first page ended at id 3; the next page shows id < 3 —
+    # the evicted row (id 3) could never have appeared there.
+    assert _read(control, cursor=3)["evicted"] is False
+    assert _read(control, cursor=3)["any_evicted"] is True
+    # Any page that could have contained id 3 is incomplete.
+    assert _read(control, cursor=4)["evicted"] is True
+    assert _read(control)["evicted"] is True  # unbounded stays incomplete
+
+
+def test_older_matching_eviction_marks_the_page_incomplete(control: ControlRig):
+    """The inverse: an evicted row OLDER than the cursor bound could have
+    appeared on the page — incomplete, composing with every filter and
+    the since window."""
+    control.node_post("/api/v1/events", _progress_event(issue=1))  # id 1, evicted
+    control.node_post("/api/v1/events", run_event(2, "claimed"))  # id 2, kept
+    control.node_post("/api/v1/events", run_event(3, "claimed"))  # id 3, kept
+    evicted_at = control.clock.now
+    assert control.store.evict_progress(budget_bytes=10) == 1
+
+    assert _read(control, cursor=3)["evicted"] is True
+    assert _read(control, cursor=1)["evicted"] is False  # id < 1 excludes it
+    # Cursor composes with type/node/component and since:
+    assert _read(control, type="theozolith.run.progress", cursor=3)["evicted"] is True
+    assert _read(control, type="theozolith.error", cursor=3)["evicted"] is False
+    assert _read(control, type="theozolith.run.progress", node="box1", cursor=3)["evicted"] is True
+    assert _read(control, type="theozolith.run.progress", node="box2", cursor=3)["evicted"] is False
+    assert _read(control, cursor=3, since=evicted_at - 10)["evicted"] is True
+    control.clock.advance(100)
+    assert _read(control, cursor=3, since=control.clock.now - 50)["evicted"] is False
+
+
 def test_scope_cap_collapses_to_the_conservative_wildcard(control: ControlRig):
     """Eviction evidence is bounded (never an archive): past the scope cap
     it collapses to the '*' sentinel, which matches every filter — the

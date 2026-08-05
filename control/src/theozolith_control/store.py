@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS event_eviction_scopes (
     type TEXT NOT NULL,
     node TEXT NOT NULL,
     component TEXT NOT NULL,
+    -- first/last evicted id bound the scope's evicted range: a strict
+    -- cursor predicate (id < before_id) can be answered exactly — some
+    -- evicted row satisfies it iff first_evicted_id < before_id. 0 means
+    -- unknown (a pre-amendment row) and reads conservatively.
+    first_evicted_id INTEGER NOT NULL DEFAULT 0,
     last_evicted_id INTEGER NOT NULL,
     evicted_count INTEGER NOT NULL,
     evicted_at REAL NOT NULL,
@@ -327,6 +332,16 @@ class Store:
             self._db.execute(
                 "ALTER TABLE event_evictions ADD COLUMN"
                 " last_evicted_received_at REAL NOT NULL DEFAULT 0"
+            )
+        scope_columns = {
+            r["name"] for r in self._db.execute("PRAGMA table_info(event_eviction_scopes)")
+        }
+        if "first_evicted_id" not in scope_columns:
+            # 0 = unknown lower bound: cursor reads treat the scope as
+            # possibly reaching any page (conservative).
+            self._db.execute(
+                "ALTER TABLE event_eviction_scopes ADD COLUMN"
+                " first_evicted_id INTEGER NOT NULL DEFAULT 0"
             )
 
     def close(self) -> None:
@@ -764,8 +779,11 @@ class Store:
             ):
                 doomed.append(row["id"])
                 key = (row["type"], row["node"] or "", row["component"] or "")
-                scope = scopes.setdefault(key, {"count": 0, "max_id": 0, "max_received": 0.0})
+                scope = scopes.setdefault(
+                    key, {"count": 0, "min_id": row["id"], "max_id": 0, "max_received": 0.0}
+                )
                 scope["count"] += 1
+                scope["min_id"] = min(scope["min_id"], row["id"])
                 scope["max_id"] = max(scope["max_id"], row["id"])
                 scope["max_received"] = max(scope["max_received"], row["received_at"])
                 excess -= row["size"]
@@ -791,21 +809,31 @@ class Store:
             # Absorb every existing scope's maxima into the sentinel, then
             # drop the per-scope rows — bounded evidence, still honest.
             absorbed = self._db.execute(
-                "SELECT MAX(last_evicted_id) AS max_id, SUM(evicted_count) AS count,"
+                "SELECT MIN(first_evicted_id) AS min_id, MAX(last_evicted_id) AS max_id,"
+                " SUM(evicted_count) AS count,"
                 " MAX(last_evicted_received_at) AS max_received"
                 " FROM event_eviction_scopes"
             ).fetchone()
             self._db.execute("DELETE FROM event_eviction_scopes")
             if absorbed["max_id"] is not None:
                 scopes = dict(scopes)
-                merged = scopes.setdefault(wildcard, {"count": 0, "max_id": 0, "max_received": 0.0})
+                merged = scopes.setdefault(
+                    wildcard,
+                    {"count": 0, "min_id": absorbed["min_id"], "max_id": 0, "max_received": 0.0},
+                )
                 merged["count"] += absorbed["count"]
+                merged["min_id"] = min(merged["min_id"], absorbed["min_id"])
                 merged["max_id"] = max(merged["max_id"], absorbed["max_id"])
                 merged["max_received"] = max(merged["max_received"], absorbed["max_received"])
         if collapse:
-            folded = {"count": 0, "max_id": 0, "max_received": 0.0}
+            folded = {"count": 0, "min_id": 0, "max_id": 0, "max_received": 0.0}
             for scope in scopes.values():
                 folded["count"] += scope["count"]
+                folded["min_id"] = (
+                    scope["min_id"]
+                    if folded["min_id"] == 0
+                    else min(folded["min_id"], scope["min_id"])
+                )
                 folded["max_id"] = max(folded["max_id"], scope["max_id"])
                 folded["max_received"] = max(folded["max_received"], scope["max_received"])
             scopes = {wildcard: folded}
@@ -813,10 +841,14 @@ class Store:
         for (type_, node, component), scope in scopes.items():
             self._db.execute(
                 "INSERT INTO event_eviction_scopes"
-                " (type, node, component, last_evicted_id, evicted_count, evicted_at,"
-                "  last_evicted_received_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " (type, node, component, first_evicted_id, last_evicted_id, evicted_count,"
+                "  evicted_at, last_evicted_received_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (type, node, component) DO UPDATE SET"
+                # 0 means unknown lower bound and must stay 0 (conservative).
+                " first_evicted_id = CASE"
+                "   WHEN first_evicted_id = 0 OR excluded.first_evicted_id = 0 THEN 0"
+                "   ELSE MIN(first_evicted_id, excluded.first_evicted_id) END,"
                 " last_evicted_id = MAX(last_evicted_id, excluded.last_evicted_id),"
                 " evicted_count = evicted_count + excluded.evicted_count,"
                 " evicted_at = excluded.evicted_at,"
@@ -826,6 +858,7 @@ class Store:
                     type_,
                     node,
                     component,
+                    scope["min_id"],
                     scope["max_id"],
                     scope["count"],
                     now,
@@ -851,14 +884,17 @@ class Store:
         node: str | None = None,
         component: str | None = None,
         since: float | None = None,
+        before_id: int | None = None,
     ) -> tuple[bool, bool]:
         """(any eviction ever, THIS query incomplete) — ADR-0038. The query
         is incomplete exactly when an evicted row COULD have matched the
-        active type/node/component filters and the ``since`` window.
-        Cursor bounds never exclude: eviction is oldest-first, so evicted
-        rows are precisely what backward pagination was heading toward.
-        The legacy single-row watermark has unknowable scope and reads
-        conservatively; the '*' sentinel matches everything."""
+        active type/node/component filters, the ``since`` window, AND the
+        strict cursor predicate: a page showing ``id < before_id`` lost a
+        row iff some evicted id in a matching scope is below the bound —
+        answered exactly by the scope's ``first_evicted_id`` (its evicted
+        minimum; 0 = unknown, conservative). The legacy single-row
+        watermark has unknowable scope and reads conservatively; the '*'
+        sentinel matches every filter."""
         any_evicted = False
         incomplete = False
         legacy = self.eviction_mark()
@@ -881,6 +917,9 @@ class Store:
                     continue
             if since is not None and since > row["last_evicted_received_at"]:
                 continue
+            first = row["first_evicted_id"]
+            if before_id is not None and first > 0 and first >= before_id:
+                continue  # every evicted row in this scope sits at/after the bound
             incomplete = True
         return any_evicted, incomplete
 
@@ -924,11 +963,11 @@ class Store:
             ).fetchall()
         # The eviction indicator is QUERY-relative (ADR-0038): `evicted` is
         # true exactly when an eviction could have matched this call's
-        # filters and window; `any_evicted` is the global fact (any
-        # eviction ever in this cache). Legacy pre-amendment watermarks
-        # have unknowable scope and read conservatively.
+        # filters, window, AND cursor bound; `any_evicted` is the global
+        # fact (any eviction ever in this cache). Legacy pre-amendment
+        # watermarks have unknowable scope and read conservatively.
         any_evicted, query_incomplete = self.eviction_evidence(
-            type=type, node=node, component=component, since=since
+            type=type, node=node, component=component, since=since, before_id=before_id
         )
         return {
             "events": [
