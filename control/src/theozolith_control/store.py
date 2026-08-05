@@ -99,14 +99,18 @@ CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
 CREATE INDEX IF NOT EXISTS events_received ON events (received_at, id);
 -- Eviction evidence (ADR-0038): the one deleter records a watermark in the
 -- same transaction as its deletes, so the events read view reports evicted
--- history honestly (cache-not-archive, ADR-0016). One row, scope 'events'.
--- It dies with cache.db by design: a wiped cache is an honestly empty
--- store, not an incompleteness claim about rows that no longer exist.
+-- history honestly (cache-not-archive, ADR-0016). One row, scope 'events';
+-- last_evicted_received_at is the newest evicted row's timestamp, which
+-- makes the indicator window-relative: a `since` query is incomplete only
+-- when its window reaches into the evicted range. The row dies with
+-- cache.db by design: a wiped cache is an honestly empty store, not an
+-- incompleteness claim about rows that no longer exist.
 CREATE TABLE IF NOT EXISTS event_evictions (
     scope TEXT PRIMARY KEY,
     last_evicted_id INTEGER NOT NULL,
     evicted_count INTEGER NOT NULL,
-    evicted_at REAL NOT NULL
+    evicted_at REAL NOT NULL,
+    last_evicted_received_at REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,6 +297,16 @@ class Store:
         event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
         if "component" not in event_columns:  # theozolith.error filter column
             self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
+        eviction_columns = {
+            r["name"] for r in self._db.execute("PRAGMA table_info(event_evictions)")
+        }
+        if "last_evicted_received_at" not in eviction_columns:
+            # 0 = recorded before the column existed: the timestamp is
+            # unknown, so window reads treat it as incomplete (conservative).
+            self._db.execute(
+                "ALTER TABLE event_evictions ADD COLUMN"
+                " last_evicted_received_at REAL NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -721,37 +735,45 @@ class Store:
             if excess <= 0:
                 return 0
             doomed: list[int] = []
+            newest_received = 0.0
             for row in self._db.execute(
-                "SELECT id, LENGTH(payload) AS size FROM events WHERE type IN (?, ?) ORDER BY id",
+                "SELECT id, received_at, LENGTH(payload) AS size FROM events"
+                " WHERE type IN (?, ?) ORDER BY id",
                 evictable,
             ):
                 doomed.append(row["id"])
+                newest_received = max(newest_received, row["received_at"])
                 excess -= row["size"]
                 if excess <= 0:
                     break
             self._db.executemany("DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed])
             # The watermark rides the same transaction (ADR-0038): eviction
-            # and its evidence are one atomic fact.
+            # and its evidence are one atomic fact — including the newest
+            # evicted timestamp, which makes the indicator window-relative.
             self._db.execute(
-                "INSERT INTO event_evictions (scope, last_evicted_id, evicted_count, evicted_at)"
-                " VALUES ('events', ?, ?, ?)"
+                "INSERT INTO event_evictions"
+                " (scope, last_evicted_id, evicted_count, evicted_at, last_evicted_received_at)"
+                " VALUES ('events', ?, ?, ?, ?)"
                 " ON CONFLICT (scope) DO UPDATE SET"
                 " last_evicted_id = MAX(last_evicted_id, excluded.last_evicted_id),"
                 " evicted_count = evicted_count + excluded.evicted_count,"
-                " evicted_at = excluded.evicted_at",
-                (max(doomed), len(doomed), self._clock()),
+                " evicted_at = excluded.evicted_at,"
+                " last_evicted_received_at = MAX(last_evicted_received_at,"
+                "                                excluded.last_evicted_received_at)",
+                (max(doomed), len(doomed), self._clock(), newest_received),
             )
             return len(doomed)
 
-    def events_evicted(self) -> bool:
-        """True once any event row has ever been evicted from this cache
-        (the ADR-0038 indicator). False in a store that never evicted —
-        including a freshly recreated cache.db, by design."""
+    def eviction_mark(self) -> dict[str, Any] | None:
+        """The eviction watermark (ADR-0038), or None while nothing was
+        ever evicted from this cache — including a freshly recreated
+        cache.db, by design."""
         with self._lock:
             row = self._db.execute(
-                "SELECT evicted_count FROM event_evictions WHERE scope = 'events'"
+                "SELECT last_evicted_id, evicted_count, evicted_at, last_evicted_received_at"
+                " FROM event_evictions WHERE scope = 'events'"
             ).fetchone()
-        return row is not None
+        return dict(row) if row is not None else None
 
     def events_page(
         self,
@@ -791,6 +813,20 @@ class Store:
             rows = self._db.execute(
                 query + " ORDER BY id DESC LIMIT ?", [*params, limit]
             ).fetchall()
+        # The eviction indicator is window-relative (ADR-0038): with a
+        # `since` bound, the response is incomplete only when the window
+        # reaches into the evicted range (a 0 timestamp is a pre-amendment
+        # watermark whose reach is unknown — treated as incomplete, the
+        # conservative direction). Without `since` the whole history is the
+        # window, so any eviction ever makes it incomplete.
+        mark = self.eviction_mark()
+        if mark is None:
+            evicted = False
+        elif since is None:
+            evicted = True
+        else:
+            cutoff = mark["last_evicted_received_at"]
+            evicted = cutoff == 0 or since <= cutoff
         return {
             "events": [
                 {
@@ -807,7 +843,7 @@ class Store:
             # The cursor is the last id as a decimal string — contractually
             # opaque to clients (ADR-0038).
             "next_cursor": str(rows[-1]["id"]) if len(rows) == limit else None,
-            "evicted": self.events_evicted(),
+            "evicted": evicted,
         }
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------

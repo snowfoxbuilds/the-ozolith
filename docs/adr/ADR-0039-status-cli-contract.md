@@ -25,8 +25,9 @@ Exit 1 when any of the following holds; reasons are reported in this order, and 
 3. **off-pin** — any node whose reported version differs from `product_pin` (skipped when either side is empty). Dispatch is paused fleet-wide until convergence.
 4. **stack off desired state** — any Stack whose actual state differs from its desired state, in either direction, including a desired-running Stack its node has not reported. A drained Stack reads as off-desired: a drained fleet is legitimately not healthy-idle. Stopped-by-desire is healthy.
 5. **recent errors** — any `theozolith.error` event inside the 15-minute window.
+6. **incomplete error history** — the events response reports the window's history evicted (ADR-0038's window-relative indicator). Lowest precedence: it is an epistemic qualifier, not an observed fault — but it is a full degraded reason, because exit 0 is the unqualified "healthy" answer and status must never give it from incomplete evidence. The human line states it plainly ("this assessment may miss failures"); with window-relative eviction it fires only when eviction actually reached into the last 15 minutes, which is itself alarming.
 
-The order runs from "a human already decided to halt" through "we cannot know" and "we know and it is converging" down to "advisory telemetry" — each reason outranks the ones a fixed version of it would subsume.
+The order runs from "a human already decided to halt" through "we cannot know" and "we know and it is converging" down to "advisory telemetry" and, last, "the telemetry itself is incomplete" — each reason outranks the ones a fixed version of it would subsume.
 
 ### Exit code 2: the read failed
 

@@ -186,7 +186,8 @@ def test_recent_errors_degrade(tmp_path):
 
 def test_degraded_precedence_orders_the_reasons(tmp_path):
     """ADR-0039: quarantined > stale > off-pin > stack-off-desired >
-    recent errors; the first line is the highest-precedence reason."""
+    recent errors > incomplete error history; the first line is the
+    highest-precedence reason."""
     state = state_doc(
         product_pin="0.4.0",
         node_health=[{"node": "box1", "quarantined": 1, "reason": "halted", "since": NOW}],
@@ -196,7 +197,7 @@ def test_degraded_precedence_orders_the_reasons(tmp_path):
     errors = {
         "events": [{"id": 1, "type": "theozolith.error", "received_at": NOW, "payload": {}}],
         "next_cursor": None,
-        "evicted": False,
+        "evicted": True,
     }
     reasons = statuscli.evaluate(state, errors)
     kinds = [
@@ -208,13 +209,33 @@ def test_degraded_precedence_orders_the_reasons(tmp_path):
         if "off-pin" in r
         else "stack"
         if "off desired state" in r
+        else "incomplete"
+        if "incomplete" in r
         else "errors"
         for r in reasons
     ]
-    assert kinds == ["quarantined", "stale", "off-pin", "stack", "errors"]
+    assert kinds == ["quarantined", "stale", "off-pin", "stack", "errors", "incomplete"]
     code, lines = _run(tmp_path, state, errors)
     assert code == 1
     assert lines[0].startswith("degraded: node box1 quarantined")
+
+
+def test_incomplete_error_history_never_reads_healthy(tmp_path):
+    """M8 amendment: an otherwise-healthy fleet whose recent-error window
+    reports evicted history is never an unqualified healthy — exit 1 with
+    the incompleteness stated explicitly, in the table and in --json."""
+    errors = {"events": [], "next_cursor": None, "evicted": True}
+    code, lines = _run(tmp_path, state_doc(), errors)
+    assert code == 1
+    assert lines[0].startswith("degraded: recent-error history is incomplete")
+    assert "may miss failures" in lines[0]
+
+    code, lines = _run(tmp_path, state_doc(), errors, json_output=True)
+    assert code == 1
+    doc = json.loads(lines[0])
+    assert doc["status"] == "degraded"  # cannot be mistaken for complete health
+    assert any("incomplete" in reason for reason in doc["reasons"])
+    assert doc["errors"]["evicted"] is True  # the raw document rides along
 
 
 # -- exit 2: the read failed (acceptance 8) --------------------------------------
@@ -371,6 +392,33 @@ def test_status_reads_the_real_state_document(tmp_path, control: ControlRig):
     code = statuscli.run(_args(), environ=_environ(tmp_path), fetch=fetch, out=lines.append)
     assert code == 1
     assert lines[0].startswith("degraded: node box1 quarantined")
+
+
+def test_status_reflects_real_eviction_through_the_events_api(tmp_path, control: ControlRig):
+    """The rig round-trip for the amendment: a real eviction inside the
+    status window rides GET /api/v1/events into a degraded verdict."""
+    control.store.record_event(
+        {
+            "type": "theozolith.run.progress",
+            "worker": "worker-a",
+            "node": "box1",
+            "issue": 1,
+            "run_id": "r1",
+            "transcript_tail": "x" * 1000,
+        }
+    )
+    assert control.store.evict_progress(budget_bytes=1) == 1
+
+    def fetch(url, path, token, ca):
+        answer = control.client.get(path, headers={"Authorization": f"Bearer {token}"})
+        if answer.status_code >= 400:
+            raise statuscli.Unreachable(url, f"HTTP {answer.status_code}", answer.text)
+        return answer.json()
+
+    lines: list[str] = []
+    code = statuscli.run(_args(), environ=_environ(tmp_path), fetch=fetch, out=lines.append)
+    assert code == 1
+    assert lines[0].startswith("degraded: recent-error history is incomplete")
 
 
 def test_status_subcommand_is_wired_with_json_flag(tmp_path, monkeypatch, capsys):

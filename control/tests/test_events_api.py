@@ -105,10 +105,10 @@ def test_limit_clamps_to_the_page_bounds(control: ControlRig):
 
 
 def test_eviction_indicator_appears_exactly_when_rows_were_evicted(control: ControlRig):
-    """ADR-0038: the indicator is a store-level fact recorded by the one
-    deleter in the same transaction — false before any eviction, true on
-    every response after one, so clients exhausting pagination report the
-    history as incomplete."""
+    """ADR-0038: the indicator is recorded by the one deleter in the same
+    transaction and is WINDOW-relative — false before any eviction; after
+    one, true for unbounded reads and for any `since` window reaching into
+    the evicted range, false for windows entirely after it."""
     progress = {
         "type": "theozolith.run.progress",
         "worker": "worker-a",
@@ -119,10 +119,20 @@ def test_eviction_indicator_appears_exactly_when_rows_were_evicted(control: Cont
     }
     control.node_post("/api/v1/events", progress)
     control.node_post("/api/v1/events", run_event(1, "claimed"))
+    evicted_at = control.clock.now
     assert _read(control)["evicted"] is False
 
     assert control.store.evict_progress(budget_bytes=10) == 1
     page = _read(control)
-    assert page["evicted"] is True
+    assert page["evicted"] is True  # unbounded read: all history is the window
     # Terminal events survive eviction (ADR-0016); only the progress row died.
     assert [e["type"] for e in page["events"]] == ["theozolith.run"]
+
+    # A window that reaches into the evicted range is incomplete…
+    assert _read(control, since=evicted_at - 10)["evicted"] is True
+    assert _read(control, since=evicted_at)["evicted"] is True
+    # …and a window entirely after it is complete again.
+    control.clock.advance(100)
+    later = _read(control, since=control.clock.now - 50)
+    assert later["evicted"] is False
+    assert later["events"] == []

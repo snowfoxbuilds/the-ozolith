@@ -127,9 +127,12 @@ def _fetch(url: str, path: str, token: str, ca: str | None) -> Any:
 
 def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
     """Degraded reasons in precedence order (ADR-0039): quarantined >
-    stale > off-pin > stack-off-desired > recent errors — from 'a human
-    already decided to halt' down to advisory telemetry. Empty = healthy.
-    All staleness math uses the server clock shipped in the document."""
+    stale > off-pin > stack-off-desired > recent errors > incomplete error
+    history — from 'a human already decided to halt' down to advisory
+    telemetry and, last, the epistemic qualifier. Empty = healthy; a
+    non-empty list is exit 1, so an incomplete recent-error window can
+    never read as unqualified health. All staleness math uses the server
+    clock shipped in the document."""
     now = float(state.get("now") or 0.0)
     reasons: list[str] = []
 
@@ -180,6 +183,15 @@ def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
         reasons.append(
             f"{len(recent)} recent theozolith.error event(s) in the last"
             f" {ERROR_WINDOW_SECONDS / 60:.0f}m (latest: {where}: {message})"
+        )
+    # The events response says whether the window itself is trustworthy
+    # (ADR-0038): evicted history means this assessment may miss failures —
+    # never an unqualified healthy verdict on incomplete evidence.
+    if errors.get("evicted"):
+        reasons.append(
+            "recent-error history is incomplete: events inside the"
+            f" {ERROR_WINDOW_SECONDS / 60:.0f}m window were evicted"
+            " (cache-not-archive, ADR-0016) — this assessment may miss failures"
         )
     return reasons
 
