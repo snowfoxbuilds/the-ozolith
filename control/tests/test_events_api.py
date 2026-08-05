@@ -174,6 +174,9 @@ def test_legacy_watermark_reads_conservatively(control: ControlRig):
     page = _read(control, type="theozolith.error", node="box-unrelated")
     assert page["evicted"] is True and page["any_evicted"] is True
     assert _read(control, since=control.clock.now + 999)["evicted"] is True
+    # Crossed constraints stay conservative too: the legacy row cannot
+    # prove any conjunction complete.
+    assert _read(control, cursor=1, since=control.clock.now + 999)["evicted"] is True
 
 
 def test_boundary_event_eviction_leaves_the_next_page_complete(control: ControlRig):
@@ -214,6 +217,74 @@ def test_older_matching_eviction_marks_the_page_incomplete(control: ControlRig):
     assert _read(control, cursor=3, since=evicted_at - 10)["evicted"] is True
     control.clock.advance(100)
     assert _read(control, cursor=3, since=control.clock.now - 50)["evicted"] is False
+
+
+def test_since_and_cursor_conjoin_over_the_same_evicted_row(control: ControlRig):
+    """Round-5 defect: incompleteness was inferred from a scope's id
+    MINIMUM and timestamp MAXIMUM — potentially different rows. With the
+    scope's correlated samples complete, the conjunction (filters AND
+    since AND cursor) is evaluated per single evicted row: crossed
+    constraints no one row satisfies read complete."""
+    import json
+
+    control.clock.now = 100.0
+    for issue in range(1, 10):  # ids 1..9: terminal, kept
+        control.store.record_event(run_event(issue, "claimed", run_id=f"r{issue}"))
+    control.store.record_event(_progress_event(issue=10))  # id 10, received_at 100
+    control.clock.now = 200.0
+    for issue in range(11, 20):  # ids 11..19: terminal, kept
+        control.store.record_event(run_event(issue, "claimed", run_id=f"r{issue}"))
+    control.store.record_event(_progress_event(issue=20))  # id 20, received_at 200
+    assert control.store.evict_progress(budget_bytes=10) == 2
+
+    row = control.store._db.execute("SELECT * FROM event_eviction_scopes").fetchone()
+    assert row["samples_complete"] == 1
+    assert json.loads(row["samples"]) == [[10, 100.0], [20, 200.0]]
+
+    # Neither evicted row satisfies (id < 20 AND received_at >= 150):
+    # id 10 fails the window, id 20 fails the cursor — complete.
+    crossed = _read(control, cursor=20, since=150)
+    assert crossed["evicted"] is False
+    assert crossed["any_evicted"] is True  # the global fact is untouched
+    # id 20 satisfies (id < 21 AND received_at >= 150) — incomplete.
+    assert _read(control, cursor=21, since=150)["evicted"] is True
+    # id 10 satisfies (id < 20 AND received_at >= 50) — incomplete.
+    assert _read(control, cursor=20, since=50)["evicted"] is True
+    # Both ids excluded by the cursor bound — complete.
+    assert _read(control, cursor=10, since=50)["evicted"] is False
+    # The conjunction still composes with every filter.
+    assert _read(control, type="theozolith.error", cursor=21, since=50)["evicted"] is False
+    progress = "theozolith.run.progress"
+    assert _read(control, type=progress, node="box2", cursor=21, since=50)["evicted"] is False
+    assert (
+        _read(control, type=progress, component="node-daemon", cursor=21, since=50)["evicted"]
+        is False
+    )
+    assert _read(control, type=progress, node="box1", cursor=21, since=50)["evicted"] is True
+
+
+def test_overflowed_samples_fall_back_to_conservative_bounds(control: ControlRig):
+    """Past the per-scope sample cap the correlated set is dropped
+    (evidence stays bounded, never an archive): a crossed query that
+    complete samples would prove complete reads incomplete — the
+    conservative direction, exactly as documented."""
+    import json
+
+    from theozolith_control.store import EVICTION_SAMPLE_CAP
+
+    control.clock.now = 100.0
+    control.store.record_event(_progress_event(issue=1))  # id 1, received_at 100
+    control.clock.now = 200.0
+    for i in range(2, EVICTION_SAMPLE_CAP + 3):  # ids 2.., received_at 200
+        control.store.record_event(_progress_event(issue=i))
+    assert control.store.evict_progress(budget_bytes=0) == EVICTION_SAMPLE_CAP + 2
+
+    row = control.store._db.execute("SELECT * FROM event_eviction_scopes").fetchone()
+    assert row["samples_complete"] == 0
+    assert json.loads(row["samples"]) == []
+    # Only id 1 sits below the cursor and its timestamp misses the window
+    # — but bounds-only evidence cannot prove that: conservative True.
+    assert _read(control, cursor=2, since=150)["evicted"] is True
 
 
 def test_scope_cap_collapses_to_the_conservative_wildcard(control: ControlRig):
