@@ -229,6 +229,14 @@ def test_serve_without_browser_origin_refuses_the_web_surface(cli_env, monkeypat
     assert healthz.status_code == 200
 
 
+def test_tls_init_refuses_hostname_input(cli_env):
+    """M8 amendment: the machine-surface mint commands accept IP literals
+    only; hostnames enter the certificate exactly one way — origin-init."""
+    controltoml.write_control_address(cli_env / "configs", CONTROL_IP, port=443)
+    with pytest.raises(SystemExit, match="origin-init"):
+        cli_main(["tls-init", "--host", "ozolith.lan"])
+
+
 def test_tls_init_puts_the_control_ip_in_the_san(cli_env):
     """The TLS SAN derives from the persisted control IP alone — nodes and
     CA-trusting browsers both verify against it (ADR-0031/0034)."""

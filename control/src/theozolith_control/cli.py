@@ -175,7 +175,7 @@ def _serve(args) -> int:
     if not tls and not args.insecure_dev:
         raise SystemExit(
             f"error: no TLS material at {settings.tls_dir} — run 'theozolith tls-init"
-            " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
+            " --host <ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
         )
     control_address = None
     if not args.insecure_dev or settings.control_ip:
@@ -326,10 +326,31 @@ def _prompt_password(args) -> str:
 
 
 def _write_private(path: Path, text: str) -> None:
+    """One 0600 credential file, written atomically: the record either
+    keeps its previous content or carries the complete new one — a crash
+    can never leave a partial credential (ADR-0036). Ownership follows the
+    parent directory's owner, so a sudo-run subcommand (origin-init,
+    set-password) hands the file straight to the service user whose
+    partition it lands in (ADR-0034) instead of stranding a root-owned
+    record the service cannot read after a restart."""
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text + "\n")
+    parent = path.parent.stat()
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(fd, 0o600)
+            if os.geteuid() == 0 and parent.st_uid != 0:
+                os.fchown(fd, parent.st_uid, parent.st_gid)
+            handle.write(text + "\n")
+            handle.flush()
+            os.fsync(fd)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _git_init(config_repo: Path) -> None:
@@ -581,7 +602,10 @@ def _init(args) -> int:
 
     # Root-mediated init fails BEFORE any state is written: a bad
     # THEOZOLITH_DATA_DIR (or an unreachable executable) must not leave a
-    # half-laid partition behind the eventual installer refusal.
+    # half-laid partition behind the eventual installer refusal. SAN input
+    # is validated in the same zone: hostnames are refused here, not after
+    # the address landed (ADR-0036: IP SANs only from init).
+    extra_hosts = _ip_literals_only(list(args.host or []), "--host")
     if os.geteuid() == 0 and not _running_in_container() and _systemd_present():
         _validated_root_data_dir(settings.data_dir)
         _service_executable()
@@ -652,7 +676,7 @@ def _init(args) -> int:
         # origin-init --force; init must not die on it.
         with contextlib.suppress(OriginError):
             hosts.append(origin.san_host(origin.parse_browser_origin(persisted_origin)))
-    hosts = list(dict.fromkeys(hosts + list(args.host or [])))
+    hosts = list(dict.fromkeys(hosts + extra_hosts))
     try:
         provision(settings.tls_dir, hosts)
     except ValueError as exc:
@@ -716,6 +740,38 @@ def _prompt_browser_origin(default_origin: str) -> str:
     return input(f"browser origin [{default_origin}]: ").strip() or default_origin
 
 
+def _repair_partition_ownership(settings: ControlSettings) -> None:
+    """Hand a sudo-run subcommand's writes back to the service user
+    (ADR-0036): origin-init, set-password, and tls-init mutate the
+    partition AFTER init's chown handed it over, and a root-owned
+    credential or server key is unreadable to theozolith-control.service
+    on its next restart. Same blast radius as the installer (ADR-0034,
+    PR #12): the ONE path a root recursive chown may touch is the constant
+    system leaf, symlink-free — everything else is skipped (unprivileged
+    and hand-run-dev partitions are already owned correctly, and a
+    root-owned partition means no service user exists to hand over to)."""
+    if os.geteuid() != 0:
+        return
+    from theozolith_control.settings import DEFAULT_ROOT_DATA_DIR
+
+    expected = Path(DEFAULT_ROOT_DATA_DIR)
+    data_dir = settings.data_dir
+    if data_dir != expected or data_dir.is_symlink() or data_dir.resolve() != expected.resolve():
+        return
+    try:
+        owner = data_dir.stat()
+    except OSError:
+        return
+    if owner.st_uid == 0:
+        return
+    import subprocess
+
+    subprocess.run(
+        ["chown", "-R", f"{owner.st_uid}:{owner.st_gid}", str(data_dir)],
+        check=True,
+    )
+
+
 def _origin_init(args) -> int:
     """The opt-in browser step (ADR-0036): take the two browser-only
     credentials together — the origin browsers may dial (default: the IP
@@ -750,20 +806,29 @@ def _origin_init(args) -> int:
     password = _prompt_password(args)
 
     # Certificate first (recover's machinery: same CA), then the password
-    # hash, then the origin — the enablement bit lands last.
+    # hash, then the origin — the enablement bit lands last. Whatever this
+    # sudo-run writes, complete or interrupted, is handed back to the
+    # service user in the finally: a root-owned server key or password
+    # record must never survive to break the next service restart.
     hosts = list(dict.fromkeys([settings.control_ip, LOOPBACK_IP, origin.san_host(parsed)]))
     try:
-        cert, _key = tls.remint_server_cert(settings.tls_dir, hosts)
-    except ValueError as exc:
-        raise SystemExit(f"error: {exc}") from exc
-    _log(f"re-minted {cert.name} from the existing CA (SAN: {', '.join(hosts)}) — nodes")
-    _log("pin the CA, not the server cert: no node is touched")
-    _write_private(settings.admin_password_path, passwords.hash_password(password))
-    Store(settings.cache_db_path).truncate_sessions()
-    try:
-        controltoml.write_browser_origin(settings.config_repo, parsed.origin, log=_log)
-    except controltoml.ControlTomlError as exc:
-        raise SystemExit(f"error: {exc}") from exc
+        try:
+            cert, _key = tls.remint_server_cert(settings.tls_dir, hosts)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+        _log(f"re-minted {cert.name} from the existing CA (SAN: {', '.join(hosts)}) — nodes")
+        _log("pin the CA, not the server cert: no node is touched")
+        _write_private(settings.admin_password_path, passwords.hash_password(password))
+        # Invalidate sessions without root-creating the service's cache
+        # database: no cache.db means no sessions exist to invalidate.
+        if settings.cache_db_path.is_file():
+            Store(settings.cache_db_path).truncate_sessions()
+        try:
+            controltoml.write_browser_origin(settings.config_repo, parsed.origin, log=_log)
+        except controltoml.ControlTomlError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+    finally:
+        _repair_partition_ownership(settings)
     _log("")
     _log(f"browser surface enabled: {parsed.origin}")
     _log(f"restart the service to arm it: sudo systemctl restart {CONTROL_SERVICE_NAME}")
@@ -777,12 +842,19 @@ def _origin_init(args) -> int:
 
 def _set_password(args) -> int:
     """Change the admin password: rewrite the hash and truncate the session
-    table — every browser session dies now (ADR-0023)."""
+    table — every browser session dies now (ADR-0023). Under sudo the
+    record is handed to the service user (ADR-0036)."""
     settings = load_settings()
     if not settings.secrets_dir.is_dir():
         raise SystemExit("error: not initialized — run 'theozolith init' first")
-    _write_private(settings.admin_password_path, passwords.hash_password(_prompt_password(args)))
-    Store(settings.cache_db_path).truncate_sessions()
+    try:
+        _write_private(
+            settings.admin_password_path, passwords.hash_password(_prompt_password(args))
+        )
+        if settings.cache_db_path.is_file():
+            Store(settings.cache_db_path).truncate_sessions()
+    finally:
+        _repair_partition_ownership(settings)
     _log("admin password updated; every browser session was invalidated")
     return 0
 
@@ -917,14 +989,33 @@ def _recover(args) -> int:
     return 0
 
 
+def _ip_literals_only(values: list[str], flag: str) -> list[str]:
+    """SAN inputs on the machine-surface commands are IP literals only
+    (ADR-0036): a hostname enters the certificate exactly one way — the
+    persisted browser origin, via origin-init."""
+    import ipaddress
+
+    checked: list[str] = []
+    for value in values:
+        try:
+            checked.append(str(ipaddress.ip_address(value)))
+        except ValueError as exc:
+            raise SystemExit(
+                f"error: {flag} {value!r} is not an IP literal — init and tls-init"
+                " mint IP SANs only; hostnames enter the certificate exactly one"
+                " way: 'theozolith origin-init' (ADR-0036)"
+            ) from exc
+    return checked
+
+
 def _tls_init(args) -> int:
     settings = load_settings()
-    hosts = list(args.host or [])
+    hosts = _ip_literals_only(list(args.host or []), "--host")
     # Every persisted dial identity belongs in the certificate SAN: the
     # control IP (ADR-0031/0034), loopback (ADR-0037), and the browser
     # origin's host when one is enabled (ADR-0036) — a manual re-mint must
     # not silently break the node channel or the dashboard. Extra --host
-    # entries (a LAN alias, a public name) are additive.
+    # entries (extra LAN addresses) are additive and IP-only.
     if settings.control_ip:
         preserved = [settings.control_ip, LOOPBACK_IP]
         if settings.browser_origin:
@@ -941,9 +1032,12 @@ def _tls_init(args) -> int:
     if not hosts:
         raise SystemExit("error: pass --host, or run 'theozolith init' first (ADR-0031)")
     try:
-        ca, cert, key = provision(settings.tls_dir, hosts)
-    except ValueError as exc:
-        raise SystemExit(f"error: {exc}") from exc
+        try:
+            ca, cert, key = provision(settings.tls_dir, hosts)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+    finally:
+        _repair_partition_ownership(settings)
     _log(f"wrote {ca}, {cert}, {key}")
     _log(f"distribute {ca.name} to every node (install script --ca, or THEOZOLITH_TLS_CA)")
     return 0
@@ -1095,7 +1189,9 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument(
         "--host",
         action="append",
-        help="Extra DNS name or IP for the certificate SAN (repeatable).",
+        help="Extra IP literal for the certificate SAN (repeatable). Hostnames are"
+        " refused: init mints IP SANs only, and a hostname enters the certificate"
+        " exactly one way — 'theozolith origin-init' (ADR-0036).",
     )
     init.add_argument(
         "--with-local-node",
@@ -1161,8 +1257,10 @@ def main(argv: list[str] | None = None) -> int:
     tls_init.add_argument(
         "--host",
         action="append",
-        help="DNS name or IP (repeatable; the persisted control IP is always included)."
-        " Wildcards are refused — every deployment gets its own TLS identity.",
+        help="Extra IP literal (repeatable; the persisted control IP, loopback, and"
+        " any enabled browser-origin host are always included). Hostnames and"
+        " wildcards are refused — hostnames enter only via 'theozolith"
+        " origin-init' (ADR-0036).",
     )
     tls_init.set_defaults(func=_tls_init)
 

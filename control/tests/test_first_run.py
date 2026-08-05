@@ -184,6 +184,55 @@ def test_origin_init_before_init_refuses(home):
         cli_main(["origin-init"])
 
 
+def test_origin_init_force_invalidates_every_session(home, monkeypatch):
+    """Forced replacement of the browser credentials kills every live
+    session — the replaced password must not leave old cookies working."""
+    assert _init(home) == 0
+    assert _origin_init(monkeypatch) == 0
+    settings = load_settings()
+    store = Store(settings.cache_db_path)
+    session = store.create_session(3600)
+    store.close()
+    assert _origin_init(monkeypatch, "--force") == 0
+    assert not Store(settings.cache_db_path).session_active(session)
+
+
+def test_password_record_write_is_atomic(home, monkeypatch):
+    """A failed write can never leave a partial or missing record: the
+    previous record survives byte-for-byte and no temp file litters the
+    secrets dir (ADR-0036 amendment)."""
+    from theozolith_control.cli import _write_private
+
+    target = home / "secrets" / "admin-password"
+    target.parent.mkdir(parents=True)
+    _write_private(target, "first-record")
+    assert target.read_text() == "first-record\n"
+
+    import os as os_module
+
+    def broken_fsync(fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os_module, "fsync", broken_fsync)
+    with pytest.raises(OSError, match="disk full"):
+        _write_private(target, "second-record")
+    assert target.read_text() == "first-record\n"  # the old record survives
+    assert [p.name for p in target.parent.iterdir()] == ["admin-password"]  # no litter
+
+
+def test_init_refuses_hostname_san_input(home):
+    """M8 amendment: init mints IP SANs only — a hostname --host is refused
+    before any state lands; origin-init is the one hostname entry point."""
+    with pytest.raises(SystemExit, match="origin-init"):
+        cli_main(["init", "--ip", "127.0.0.1", "--host", "ozolith.lan"])
+    assert not (home / "secrets").exists()  # refused before any state
+    # Validated IP literals remain accepted, additively.
+    assert cli_main(["init", "--ip", "192.0.2.20", "--host", "192.0.2.99"]) == 0
+    ips, dns = _server_san(home)
+    assert ips == {"192.0.2.20", "127.0.0.1", "192.0.2.99"}
+    assert dns == set()
+
+
 def test_init_refuses_to_autodetect_inside_a_container(home, monkeypatch, capsys):
     """ADR-0031: a containerized init must never silently ship the bridge
     IP — no --ip means refusal with the exact compose line to run."""

@@ -17,6 +17,7 @@ ADR-0023 made `init` a unified first run ending in an admin-password prompt and 
 `theozolith init` becomes: master key → admin bearer token → control address (`control_ip`, `control_port`; ADR-0031/0034 unchanged) → CA + server certificate with **IP SANs only** — the control IP and `127.0.0.1` — → systemd unit (root-mediated, ADR-0034 unchanged) → operator handoff. No origin prompt, no password prompt, no browser instructions beyond one pointer at `origin-init`.
 
 - The **loopback SAN is unconditional**, on every deployment shape: the local Node Daemon of a Single-Node Deployment persists a loopback dial address, and the Operator TUI is a loopback API consumer — both verify against the same server certificate. IPv6 loopback is omitted until something dials it.
+- **SAN input on the machine surface is IP-literals-only**: `init --host` and `tls-init --host` validate every entry as an IP address and refuse hostnames before any state is written. A hostname enters the certificate exactly one way — the persisted browser origin, via `origin-init` — so the pre-browser machine identity is IP-only by construction.
 - `--force` semantics: re-init still mints a new CA and re-mints the server certificate; if a browser origin is already persisted, its hostname is included in the new SAN set so an enabled browser surface survives re-init. The password is never prompted by init in any form.
 - The handoff names the finish lines: start serving, provision nodes (`join-token create`), `theozolith status`, and — optional, later — `origin-init` for the dashboard.
 
@@ -28,6 +29,10 @@ ADR-0023 made `init` a unified first run ending in an admin-password prompt and 
 2. **The admin password** — hashed (scrypt, ADR-0023) and stored; the session table is truncated.
 
 Then origin-init persists the origin and re-mints the server certificate **via the same machinery `recover` uses** (`tls.remint_server_cert`, same CA — never a new CA): SAN = control IP + loopback + the origin hostname when it is not an IP literal. Nodes pin the CA, not the server cert, so a re-mint touches no node. Re-run requires `--force` once an origin is persisted; the non-TTY form reads origin (blank line = default) then password from stdin.
+
+### Credentials written under sudo belong to the service
+
+On a root-mediated install, origin-init and set-password run under `sudo` **after** init's chown handed the partition to the service user — so everything they write (the password record, the re-minted server key, the control.toml commit) is handed back: the same guarded recursive chown the installer uses, restricted to the constant system leaf, symlink-free, skipped everywhere else (the PR #12 blast-radius rule). It runs in a `finally`, so even an interrupted origin-init never strands a root-owned server key that would break the next service restart. The password record itself is written **atomically** (temp file + rename, 0600, ownership set before the record becomes visible): a crash leaves either the previous complete record or the new complete record, never a partial one. Session invalidation never root-creates the service's cache database — with no `cache.db` there are no sessions to invalidate.
 
 ### Persistence: `browser_origin`, a read-only `[control]` field
 
@@ -54,7 +59,7 @@ The browser credentials are optional-but-consistent: no `browser_origin` → a m
 
 - **Positive**: a Single-Node Deployment (and any browserless fleet) never types a password and never sees TLS-trust prose; the two browser-only credentials are demanded exactly when a browser is wanted, together, once; the fail-closed posture is finally a per-request property instead of a startup gate, so "API up, browser off" is a first-class state.
 - **Negative**: existing deployments upgrade into the disabled state — the dashboard refuses until `origin-init` is re-run once (manual migration note in the PR; no automated migration per the M8 brief). The password is re-entered at that point.
-- **Neutral**: `tls-init --host` remains the additive path for extra SANs; ADR-0027's rate limit, ADR-0022's cookie shape, and the frozen web scope are untouched.
+- **Neutral**: `tls-init --host` remains the additive path for extra **IP** SANs (it always preserves the control IP, loopback, and any enabled browser-origin host); ADR-0027's rate limit, ADR-0022's cookie shape, and the frozen web scope are untouched.
 
 ## Alternatives rejected
 
