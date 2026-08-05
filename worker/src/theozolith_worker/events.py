@@ -124,6 +124,7 @@ def run_event(
     phase: str,
     attempt: int | None = None,
     pr: int | None = None,
+    failure_class: str | None = None,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": RUN_EVENT,
@@ -138,6 +139,12 @@ def run_event(
         event["attempt"] = attempt
     if pr is not None:
         event["pr"] = pr
+    if failure_class:
+        # Terminal failed/escalated events carry the canonical class the
+        # driver already wrote to the evidence bundle's run.json — the same
+        # value, never re-derived (ADR-0040 amendment). Absent on pr-open
+        # (no failure) and on events predating the field.
+        event["failure_class"] = failure_class
     return event
 
 

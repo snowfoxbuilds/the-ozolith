@@ -665,6 +665,7 @@ def _fail_run(
             run_id=report.run_id,
             phase=events.PHASE_FAILED,
             attempt=report.round,
+            failure_class=report.failure_class,
         )
     )
     log(f"run {report.run_id} failed [{report.failure_class}]: {report.reason}")
@@ -889,6 +890,7 @@ def _escalate_claim(
             run_id=last.run_id,
             phase=events.PHASE_ESCALATED,
             attempt=last.round,
+            failure_class=last.failure_class,
         )
     )
     log(

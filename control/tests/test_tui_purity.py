@@ -174,20 +174,29 @@ def test_model_derivations_align_with_the_real_state_document(control: ControlRi
 
 def test_model_runs_align_with_the_real_events_documents(control: ControlRig):
     """Run + progress events ingested through the real API reduce to the
-    same run detail the dashboard computes server-side."""
-    control.node_post(
-        "/api/v1/events",
-        {
-            "type": "theozolith.run",
-            "worker": "worker-a",
-            "node": "box1",
-            "stack": "worker",
-            "issue": 7,
-            "run_id": "r2",
-            "phase": "gate",
-            "attempt": 2,
-        },
-    )
+    same run detail the dashboard computes server-side — through the
+    RunIndex's real cursor walk (small pages force multiple fetches), with
+    the worker's failure_class round-tripping the channel verbatim
+    (ADR-0040 amendment)."""
+    for issue, run_id, phase, extra in (
+        (3, "r1", "claimed", {}),
+        (3, "r1", "failed", {"failure_class": "timeout"}),
+        (7, "r2", "claimed", {"attempt": 2}),
+        (7, "r2", "gate", {"attempt": 2}),
+    ):
+        control.node_post(
+            "/api/v1/events",
+            {
+                "type": "theozolith.run",
+                "worker": "worker-a",
+                "node": "box1",
+                "stack": "worker",
+                "issue": issue,
+                "run_id": run_id,
+                "phase": phase,
+                **extra,
+            },
+        )
     control.node_post(
         "/api/v1/events",
         {
@@ -206,12 +215,25 @@ def test_model_runs_align_with_the_real_events_documents(control: ControlRig):
             "transcript_tail": "...tail...",
         },
     )
-    runs = control.admin("GET", "/api/v1/events?type=theozolith.run").json()
-    progress = control.admin("GET", "/api/v1/events?type=theozolith.run.progress").json()
     state = control.admin("GET", "/api/v1/state").json()
 
-    (row,) = model.run_rows(runs, progress, state["repo"])
-    assert row.issue == 7 and row.phase == "gate" and not row.terminal
-    assert row.tool_calls == 44 and row.transcript_bytes == 65536
-    assert row.elapsed_seconds == 480.0
-    assert model.timeout_budget_seconds(state, row.stack) == 3600.0
+    def fetch(type_name: str):
+        def page(cursor):
+            query = f"type={type_name}&limit=2" + (f"&cursor={cursor}" if cursor else "")
+            return control.admin("GET", f"/api/v1/events?{query}").json()
+
+        return page
+
+    index = model.RunIndex()
+    index.refresh(fetch("theozolith.run"), fetch("theozolith.run.progress"))
+    assert not index.truncated
+    rows = {r.issue: r for r in model.run_rows(index, state["repo"])}
+    assert set(rows) == {3, 7}  # issue 3's latest event sat beyond page one
+    live = rows[7]
+    assert live.phase == "gate" and not live.terminal
+    assert live.tool_calls == 44 and live.transcript_bytes == 65536
+    assert live.elapsed_seconds == 480.0
+    assert model.timeout_budget_seconds(state, live.stack) == 3600.0
+    failed = rows[3]
+    assert failed.terminal and failed.phase == "failed"
+    assert failed.failure_class == "timeout"  # the channel carries it verbatim

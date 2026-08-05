@@ -85,6 +85,7 @@ def run_event(
     run_id: str = "r1",
     attempt: int | None = 1,
     pr: int | None = None,
+    failure_class: str | None = None,
     at: float = NOW - 60,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -100,6 +101,8 @@ def run_event(
         payload["attempt"] = attempt
     if pr is not None:
         payload["pr"] = pr
+    if failure_class is not None:
+        payload["failure_class"] = failure_class
     return {
         "id": event_id,
         "type": "theozolith.run",
@@ -139,8 +142,10 @@ def progress_event(event_id: int, run_id: str, **over: Any) -> dict[str, Any]:
 
 class FakeClient:
     """The app's I/O seam, faked: canned documents in, every call recorded.
-    ``events_pages`` maps a filter ``type`` (or "" for none) to the page
-    answered; ``fail_with`` makes every call raise (the degraded path)."""
+    ``events_pages`` maps a filter ``type`` (or "" for none) to either one
+    page (answered for every cursor) or a cursor-keyed dict of pages
+    (``None`` is the head fetch) so tests can exercise real cursor walks;
+    ``fail_with`` makes every call raise (the degraded path)."""
 
     def __init__(self, state: dict[str, Any] | None = None):
         self.url = "https://127.0.0.1:9443"
@@ -164,7 +169,10 @@ class FakeClient:
             raise self.fail_with
         # Record what would go on the wire: the real client omits Nones.
         self.events_calls.append({k: v for k, v in params.items() if v is not None})
-        return copy.deepcopy(self.events_pages.get(params.get("type") or "", page([])))
+        answer = self.events_pages.get(params.get("type") or "", page([]))
+        if "events" not in answer:  # cursor-keyed pages: pick by cursor
+            answer = answer.get(params.get("cursor"), page([]))
+        return copy.deepcopy(answer)
 
     def queue_command(self, node: str, verb: str, target=None, *, force: bool = False):
         if self.fail_with:

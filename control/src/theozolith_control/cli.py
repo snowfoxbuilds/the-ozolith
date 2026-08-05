@@ -1382,7 +1382,12 @@ def main(argv: list[str] | None = None) -> int:
             " attach command for the selected container · f follow on/off ·"
             " r refresh · q quit.\n"
             "refresh: polls state+events every 5s; when control is unreachable the"
-            " last documents stay on screen under a banner and polling continues."
+            " last documents stay on screen under a banner and polling continues —"
+            " attach refuses while degraded (a frozen snapshot cannot prove heartbeat"
+            " freshness) until a refresh succeeds.\n"
+            "notices: per-panel 'history incomplete' lines disclose server-side"
+            " eviction and client-side follow overflows; the Runs panel discloses if"
+            " its bounded history walk ever truncates."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

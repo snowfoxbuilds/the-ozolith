@@ -53,17 +53,25 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   moment init finishes (the browser surface's enabled state is irrelevant to it).
   Panels: `1` Fleet (nodes with quarantine/stale/off-pin health on the server clock,
   live containers, the command queue with queue-behind deferrals), `2` Stacks & Runs
-  (desired vs actual; run detail with phase, attempt, elapsed vs timeout budget,
-  tool calls, and the advisory transcript tail labeled with its byte count — outcome,
-  PR, and evidence-bundle reference once terminal), `3` Events (exact node/component/
-  type filters, follow mode by cursor, per-query eviction honesty), `4` Errors,
-  `5` Settings (control.toml read-only — editing stays git-native). Keys: `c` queue a
-  command (destructive verbs demand the target name typed back), `x` release a
-  quarantine, `s` masked secret entry (value never displayed), `a` print the pastable
-  attach command resolved from fresh heartbeat evidence (print-only — no embedded
-  terminal, no PTY, no websocket, by ruling), `f` follow on/off, `r` refresh, `q`
-  quit. Polls every 5 s; an unreachable control degrades to a banner over the last
-  documents and keeps polling.
+  (the UNION of desired and reported Stacks — desired-only rows read "not reported",
+  actual-only rows read desired "(unplaced)" and are always off desired; run detail
+  with phase, attempt, elapsed vs timeout budget, tool calls, and the advisory
+  transcript tail labeled with its byte count — outcome, the worker's canonical
+  failure class, PR, and evidence-bundle reference once terminal; the Runs listing
+  stays complete across event pages via a client-side index, and ever crossing its
+  defensive history bound shows an explicit incomplete-data notice), `3` Events
+  (exact node/component/type filters, follow mode by cursor, per-query eviction
+  honesty, and a per-panel "history incomplete" warning when a follow overflow
+  skipped events client-side — distinct from server eviction, cleared only by a
+  filter change), `4` Errors, `5` Settings (control.toml read-only — editing stays
+  git-native). Keys: `c` queue a command (destructive verbs demand the target name
+  typed back), `x` release a quarantine, `s` masked secret entry (value never
+  displayed), `a` print the pastable attach command resolved from fresh heartbeat
+  evidence (print-only — no embedded terminal, no PTY, no websocket, by ruling),
+  `f` follow on/off, `r` refresh, `q` quit. Polls every 5 s; an unreachable control
+  degrades to a banner over the last documents and keeps polling — and attach
+  assistance fails CLOSED while degraded (a retained snapshot's frozen server clock
+  cannot prove heartbeat freshness; the refusal stands until a refresh succeeds).
 - **Product updates** (ADR-0015 as amended) — `theozolith update` pins a published
   release; `theozolith build` pins a CLEAN source checkout's git SHA (a dirty tree is
   refused) and uploads wheels the Control Node serves for node pulls; `theozolith

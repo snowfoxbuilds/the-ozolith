@@ -549,3 +549,61 @@ def test_claim_escalation_names_unpushed_bundles_without_dead_links():
     assert "tree/theozolith/evidence/runs/issue-7/r-2" not in body  # no dead link
     assert "runs/issue-7/r-2" in body  # …but the bundle is still named
     assert "not yet published" in body and "boot-sweep recovery" in body
+
+
+# -- the terminal run-event schema (ADR-0040 amendment) ------------------------
+
+
+def _driver_config():
+    from theozolith_worker.config import load_config
+
+    return load_config(
+        {
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "THEOZOLITH_CLONE_URL": "file:///tmp/remote",
+            "THEOZOLITH_JOBS_DIR": "/tmp/jobs",
+            "THEOZOLITH_WORKER_ID": "worker-a",
+            "CONTROL_NODE_URL": "https://control.invalid:8443",
+            "THEOZOLITH_NODE_TOKEN": "node-token",
+            "THEOZOLITH_NODE_NAME": "box1",
+            "GITHUB_TOKEN": "tok",
+            "ANTHROPIC_API_KEY": "key",
+        },
+        role="worker",
+    )
+
+
+def test_run_event_carries_failure_class_only_when_one_exists():
+    """Terminal failed/escalated events carry the canonical class verbatim;
+    pr-open (and any event built without one) omits the key entirely —
+    absence means "no failure", never an empty value (ADR-0040)."""
+    from theozolith_worker import events
+
+    config = _driver_config()
+    failed = events.run_event(
+        config,
+        issue=7,
+        run_id="r-1",
+        phase=events.PHASE_FAILED,
+        attempt=2,
+        failure_class="session-died",
+    )
+    assert failed["failure_class"] == "session-died"
+    escalated = events.run_event(
+        config,
+        issue=7,
+        run_id="r-1",
+        phase=events.PHASE_ESCALATED,
+        attempt=2,
+        failure_class="timeout",
+    )
+    assert escalated["failure_class"] == "timeout"
+    shipped = events.run_event(
+        config, issue=7, run_id="r-2", phase=events.PHASE_PR_OPEN, attempt=1, pr=41
+    )
+    assert "failure_class" not in shipped
+    # Defensive: an empty class never lands as an empty field.
+    empty = events.run_event(
+        config, issue=7, run_id="r-3", phase=events.PHASE_FAILED, failure_class=""
+    )
+    assert "failure_class" not in empty

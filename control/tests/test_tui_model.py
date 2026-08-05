@@ -55,6 +55,52 @@ def test_stack_rows_convergence_and_not_reported():
     assert row.actual == "running" and row.converged
 
 
+def test_stack_rows_render_the_union_actual_only_is_off_desired():
+    """The frozen web surface's drift behavior: rows come from the UNION of
+    desired and reported (node, stack) keys. An actual-only running Stack —
+    reported by a heartbeat but absent from desired state — renders desired
+    '(unplaced)' with the reported kind and detail preserved, and is NEVER
+    converged."""
+    state = state_doc(
+        stacks=[
+            {
+                "node": "box1",
+                "name": "ghost",
+                "kind": "container",
+                "state": "running",
+                "detail": "Up 3 hours",
+                "updated_at": NOW - 10,
+            }
+        ]
+    )
+    rows = {r.name: r for r in model.stack_rows(state)}
+    assert set(rows) == {"deck", "ghost"}  # union: desired-only AND actual-only
+    ghost = rows["ghost"]
+    assert ghost.desired == "(unplaced)"
+    assert ghost.actual == "running" and not ghost.converged
+    assert ghost.kind == "container" and ghost.detail == "Up 3 hours"  # reported, preserved
+    assert rows["deck"].actual == "not reported" and not rows["deck"].converged
+
+
+def test_stack_rows_desired_stopped_but_actual_running_is_divergent():
+    state = state_doc()
+    state["desired_stacks"][0]["state"] = "stopped"
+    (row,) = model.stack_rows(state)
+    assert row.desired == "stopped" and row.actual == "running" and not row.converged
+
+
+def test_stack_rows_deletion_transition():
+    """Desired definition deleted while the node still reports the Stack:
+    the row survives as actual-only (off desired) until the node reconciles
+    and stops reporting it — then it disappears."""
+    state = state_doc(desired_stacks=[])
+    (row,) = model.stack_rows(state)
+    assert row.name == "deck" and row.desired == "(unplaced)" and not row.converged
+    assert row.actual == "running" and row.kind == "container"
+    reconciled = state_doc(desired_stacks=[], stacks=[])
+    assert model.stack_rows(reconciled) == []
+
+
 def test_command_rows_surface_queue_behind_deferrals():
     state = state_doc(
         commands=[
@@ -89,24 +135,48 @@ def test_command_rows_surface_queue_behind_deferrals():
     assert rows[0].deferred_reason == "queued behind run r9"
 
 
-# -- runs: the client-side run_states() twin --------------------------------
+# -- runs: the client-side run_states() twin (complete across pages) --------
+
+
+def pager(pages: dict[str | None, dict[str, Any]]):
+    """A fetch callable over cursor-keyed pages (None = the head fetch)."""
+
+    def fetch(cursor: str | None) -> dict[str, Any]:
+        return pages.get(cursor, page([]))
+
+    return fetch
+
+
+def make_index(
+    runs_pages: dict[str | None, dict[str, Any]],
+    progress_pages: dict[str | None, dict[str, Any]] | None = None,
+) -> model.RunIndex:
+    index = model.RunIndex()
+    index.refresh(pager(runs_pages), pager(progress_pages or {}))
+    return index
 
 
 def test_run_rows_latest_per_issue_joined_with_latest_progress():
-    runs = page(
-        [
-            run_event(30, 7, "gate", run_id="r2", attempt=2),
-            run_event(20, 7, "claimed", run_id="r2", attempt=2),
-            run_event(10, 5, "pr-open", run_id="r9", pr=41),
-        ]
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(30, 7, "gate", run_id="r2", attempt=2),
+                    run_event(20, 7, "claimed", run_id="r2", attempt=2),
+                    run_event(10, 5, "pr-open", run_id="r9", pr=41),
+                ]
+            )
+        },
+        {
+            None: page(
+                [
+                    progress_event(31, "r2", tool_calls=44, elapsed_seconds=500.0),
+                    progress_event(21, "r2", tool_calls=14),
+                ]
+            )
+        },
     )
-    progress = page(
-        [
-            progress_event(31, "r2", tool_calls=44, elapsed_seconds=500.0),
-            progress_event(21, "r2", tool_calls=14),
-        ]
-    )
-    rows = model.run_rows(runs, progress, "acme/sandbox")
+    rows = model.run_rows(index, "acme/sandbox")
     by_issue = {r.issue: r for r in rows}
     live = by_issue[7]
     assert live.phase == "gate" and not live.terminal
@@ -120,16 +190,203 @@ def test_run_rows_latest_per_issue_joined_with_latest_progress():
         done.evidence_url
         == "https://github.com/acme/sandbox/tree/theozolith/evidence/runs/issue-5/r9"
     )
-    # The channel gap (ADR-0040): failed events carry no failure class
-    # today — the field is empty, rendered honestly absent, and lights up
-    # without TUI changes the day the event grows the field.
+    # A pr-open event carries no failure class — there is no failure; the
+    # renderer shows "not applicable", never a defect (ADR-0040 amendment).
     assert done.failure_class == ""
 
 
+def test_run_rows_carry_the_canonical_failure_class_from_the_event():
+    index = make_index(
+        {None: page([run_event(10, 5, "failed", run_id="r9", failure_class="timeout")])}
+    )
+    (row,) = model.run_rows(index, None)
+    assert row.failure_class == "timeout"
+
+
 def test_run_rows_without_a_repo_omit_links_but_keep_the_reference():
-    rows = model.run_rows(page([run_event(10, 5, "failed", run_id="r9")]), page([]), None)
+    index = make_index({None: page([run_event(10, 5, "failed", run_id="r9")])})
+    rows = model.run_rows(index, None)
     assert rows[0].pr_url == "" and rows[0].evidence_url == ""
     assert rows[0].evidence_ref == "theozolith/evidence: runs/issue-5/r9"
+    # A legacy failed event predating the channel amendment: the field is
+    # empty and the app renders the explicit legacy message (ADR-0040).
+    assert rows[0].failure_class == ""
+
+
+def test_run_index_bootstrap_is_complete_across_page_boundaries():
+    """The 500-row bound is on EVENTS, not issues: an older active issue
+    whose latest event fell off the first page must stay visible. Two pages,
+    multiple events per issue crossing the boundary, issue 3's only (still
+    live) event on page two."""
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(60, 7, "gate", run_id="r7b", attempt=2),
+                    run_event(50, 9, "pr-open", run_id="r9", pr=41),
+                    run_event(40, 7, "claimed", run_id="r7b", attempt=2),
+                ],
+                next_cursor="40",
+            ),
+            "40": page(
+                [
+                    run_event(30, 7, "failed", run_id="r7a", failure_class="timeout"),
+                    run_event(20, 3, "claimed", run_id="r3"),
+                    run_event(10, 9, "gate", run_id="r9"),
+                ]
+            ),
+        }
+    )
+    rows = {r.issue: r for r in model.run_rows(index, None)}
+    assert set(rows) == {3, 7, 9}  # the older active issue survives the boundary
+    assert rows[3].phase == "claimed" and not rows[3].terminal
+    assert rows[7].phase == "gate" and rows[7].run_id == "r7b"  # latest event wins
+    assert rows[9].phase == "pr-open"
+    assert not index.truncated
+
+
+def test_run_index_advances_incrementally_without_rescanning_history():
+    pages = {
+        None: page([run_event(20, 3, "claimed", run_id="r3")]),
+    }
+    calls: list[str | None] = []
+
+    def fetch_runs(cursor):
+        calls.append(cursor)
+        return pages.get(cursor, page([]))
+
+    index = model.RunIndex()
+    index.refresh(fetch_runs, pager({}))
+    assert calls == [None] and index.max_run_id == 20
+    # Next poll: only new head events land; overlap stops the walk on the
+    # head page — history is never re-walked.
+    pages[None] = page(
+        [run_event(40, 3, "gate", run_id="r3"), run_event(20, 3, "claimed", run_id="r3")],
+        next_cursor="20",
+    )
+    calls.clear()
+    index.refresh(fetch_runs, pager({}))
+    assert calls == [None]
+    (row,) = model.run_rows(index, None)
+    assert row.phase == "gate" and index.max_run_id == 40
+
+
+def test_run_index_gap_closed_within_the_bound_stays_complete():
+    """A large unseen backlog that the bounded advance CAN cover: every new
+    event lands and the pre-existing older issue survives untouched."""
+    index = model.RunIndex()
+    index.refresh(pager({None: page([run_event(1, 3, "claimed", run_id="r3")])}), pager({}))
+    backlog: dict[str | None, dict[str, Any]] = {
+        None: page([run_event(30, 7, "gate", run_id="r7")], next_cursor="30")
+    }
+    for event_id in range(29, 1, -1):  # 28 more pages, one unseen event each
+        backlog[str(event_id + 1)] = page(
+            [run_event(event_id, 7, "claimed", run_id="r7")], next_cursor=str(event_id)
+        )
+    backlog["2"] = page([run_event(1, 3, "claimed", run_id="r3")])
+    index.refresh(pager(backlog), pager({}))
+    rows = {r.issue: r for r in model.run_rows(index, None)}
+    assert set(rows) == {3, 7}
+    assert rows[7].phase == "gate" and not index.truncated
+
+
+def test_run_index_unclosable_gap_rebootstraps_and_discloses():
+    """More unseen run events than even the bounded advance walk covers:
+    the index re-bootstraps from the head. The rebuilt window is complete
+    for what it holds; anything beyond it is DISCLOSED via the truncated
+    flag (runs_notice) — an issue can only leave the listing with the
+    incomplete-data notice showing, never silently."""
+    index = model.RunIndex()
+    index.refresh(pager({None: page([run_event(1, 3, "claimed", run_id="r3")])}), pager({}))
+    flood: dict[str | None, dict[str, Any]] = {
+        None: page([run_event(9000, 7, "gate", run_id="r7")], next_cursor="9000")
+    }
+    for event_id in range(8999, 9000 - 3 * model.INDEX_MAX_PAGES, -1):
+        flood[str(event_id + 1)] = page(
+            [run_event(event_id, 7, "claimed", run_id="r7")], next_cursor=str(event_id)
+        )
+    index.refresh(pager(flood), pager({}))
+    rows = {r.issue: r for r in model.run_rows(index, None)}
+    assert rows[7].phase == "gate"  # the newest window is correct
+    assert index.truncated  # and the missing tail is disclosed
+    assert model.runs_notice(index.truncated) != ""
+
+
+def test_run_index_truncated_bootstrap_is_disclosed_never_silent():
+    """A bootstrap that exhausts INDEX_MAX_PAGES with history remaining
+    marks the index incomplete — runs_notice renders the disclosure."""
+    endless: dict[str | None, dict[str, Any]] = {}
+    top_id = 100_000
+    endless[None] = page([run_event(top_id, 1, "claimed")], next_cursor=str(top_id))
+    for i in range(model.INDEX_MAX_PAGES + 5):
+        event_id = top_id - 1 - i
+        endless[str(event_id + 1)] = page(
+            [run_event(event_id, 1 + i, "claimed")], next_cursor=str(event_id)
+        )
+    index = make_index(endless)
+    assert index.truncated
+    notice = model.runs_notice(True)
+    assert "incomplete" in notice and "missing" in notice
+    assert model.runs_notice(False) == ""
+
+
+def test_run_index_progress_eviction_never_removes_the_run():
+    """Progress is evictable advisory telemetry (ADR-0016): a live Run whose
+    progress records were all evicted keeps its row with telemetry fields
+    empty; a terminal Run needs no progress at all."""
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(30, 7, "gate", run_id="r2", attempt=2),
+                    run_event(10, 5, "failed", run_id="r9", failure_class="infra"),
+                ]
+            )
+        },
+        {None: page([], evicted=True)},  # every progress record evicted
+    )
+    rows = {r.issue: r for r in model.run_rows(index, None)}
+    assert set(rows) == {5, 7}
+    assert rows[7].elapsed_seconds is None and rows[7].tool_calls is None
+    assert rows[5].terminal and rows[5].failure_class == "infra"
+
+
+def test_run_index_progress_paginates_until_live_runs_are_covered():
+    """The latest progress for a live Run can sit beyond the first progress
+    page (busier runs emit more): the walk continues until every live
+    run_id is covered."""
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(90, 7, "gate", run_id="r7"),
+                    run_event(80, 3, "gate", run_id="r3"),
+                ]
+            )
+        },
+        {
+            None: page(
+                [progress_event(95, "r7", tool_calls=50)],
+                next_cursor="95",
+            ),
+            "95": page([progress_event(70, "r3", tool_calls=9)]),
+        },
+    )
+    rows = {r.issue: r for r in model.run_rows(index, None)}
+    assert rows[7].tool_calls == 50
+    assert rows[3].tool_calls == 9  # found beyond the first page
+
+
+def test_run_index_prunes_progress_for_unreferenced_runs():
+    index = make_index(
+        {None: page([run_event(30, 7, "gate", run_id="r2")])},
+        {
+            None: page(
+                [progress_event(40, "r2", tool_calls=4), progress_event(35, "r-old", tool_calls=9)]
+            )
+        },
+    )
+    assert set(index.latest_progress_by_run) == {"r2"}
 
 
 def test_timeout_budget_env_override_and_default():
@@ -169,6 +426,33 @@ def test_attach_refuses_stale_heartbeat_evidence_on_the_server_clock():
     # same document is fresh when the server clock says so.
     state["now"] = NOW - 100
     assert model.attach_command(state, "box1", "flight-deck-1").ok
+
+
+def test_attach_fails_closed_when_snapshot_freshness_is_unprovable():
+    """A retained snapshot after a failed refresh has a FROZEN server clock:
+    heartbeat evidence would look fresh forever. snapshot_fresh=False
+    refuses before any heartbeat judgment — even perfectly fresh-looking
+    evidence — naming the unprovable server-clock freshness; the local wall
+    clock is never consulted (ADR-0040 amendment)."""
+    state = state_doc()  # heartbeat evidence looks 30s fresh — but frozen
+    refused = model.attach_command(state, "box1", "flight-deck-1", snapshot_fresh=False)
+    assert not refused.ok
+    assert "cannot be established" in refused.reason
+    assert "refresh succeeds" in refused.reason
+    # The same document with a provably-current clock resolves normally —
+    # recovery restores the ordinary 150s server-clock evaluation.
+    assert model.attach_command(state, "box1", "flight-deck-1", snapshot_fresh=True).ok
+
+
+def test_freshness_degraded_tracks_failure_and_recovery():
+    fresh = model.Freshness()
+    assert fresh.degraded  # nothing received yet: nothing is provable
+    fresh.succeed(NOW)
+    assert not fresh.degraded
+    fresh.fail("https://127.0.0.1:8443", "ConnectionRefusedError")
+    assert fresh.degraded
+    fresh.succeed(NOW + 10)
+    assert not fresh.degraded
 
 
 def test_attach_refusal_ladder():
@@ -304,6 +588,23 @@ def test_eviction_notice_is_query_relative_never_global():
 def test_advance_events_propagates_the_evicted_flag():
     fresh, evicted, _gap = model.advance_events(lambda c: page([_event(3)], evicted=True), None)
     assert evicted and [e["id"] for e in fresh] == [3]
+
+
+def test_continuity_notice_distinguishes_eviction_from_follow_gap():
+    """The two incompleteness causes are different facts: server-side
+    eviction (query-relative, ADR-0038) vs a client-side follow overflow.
+    One combined 'history incomplete' line names whichever apply — and the
+    gap wording explicitly disclaims being eviction."""
+    assert model.continuity_notice(False, False) == ""
+    evicted_only = model.continuity_notice(True, False)
+    assert "may be evicted" in evicted_only and "follow mode" not in evicted_only
+    gap_only = model.continuity_notice(False, True)
+    assert "history incomplete" in gap_only
+    assert "skipped" in gap_only and "not server eviction" in gap_only
+    assert "may be evicted" not in gap_only  # never labeled as eviction
+    both = model.continuity_notice(True, True)
+    assert "may be evicted" in both and "skipped" in both
+    assert both.startswith("history incomplete")
 
 
 # -- settings + degraded banner ---------------------------------------------

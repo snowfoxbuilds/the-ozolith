@@ -21,6 +21,9 @@ markup interpretation ever applies to it.
 Degraded mode (ADR-0040): a failed refresh keeps the last documents on
 screen under a prominent banner naming the dial target and error class;
 polling continues on the cadence and the banner clears on the next success.
+Attach assistance fails CLOSED while degraded — a retained snapshot's
+server clock is frozen, so heartbeat evidence cannot be proven fresh; the
+refusal stands until a state refresh succeeds (ADR-0040 amendment).
 """
 
 from __future__ import annotations
@@ -54,10 +57,18 @@ from theozolith_control.tui.client import ControlClient, ControlUnreachable
 
 REFRESH_SECONDS = 5.0  # the polling cadence (state + events per tick)
 EVENTS_PAGE_LIMIT = 100
-RUNS_PAGE_LIMIT = 500  # one max-size page of run/progress events per tick
+RUNS_PAGE_LIMIT = 500  # max-size pages for the run-index cursor walks
 EVENTS_KEEP = 1000  # rows the events panel retains client-side
 
-FAILURE_CLASS_ABSENT = "(not on the channel — recorded in the evidence bundle's run.json; ADR-0040)"
+# Terminal run detail (ADR-0040 amendment): failed/escalated events carry the
+# worker's canonical failure class; a successful Run has none to carry, and a
+# legacy event predating the field renders the gap explicitly — never as a
+# channel defect and never as a blank.
+FAILURE_CLASS_NOT_APPLICABLE = "not applicable (the Run completed and opened a PR)"
+FAILURE_CLASS_LEGACY = (
+    "(legacy event — emitted before failure_class rode the channel; recorded in"
+    " the evidence bundle's run.json; ADR-0040)"
+)
 
 
 def _untrusted(value: Any) -> Text:
@@ -264,17 +275,24 @@ class TopApp(App):
         self._refreshing = False
         self.state_doc: dict[str, Any] = {}
         self.freshness = model.Freshness()
+        self.runs_index = model.RunIndex()
         self.run_rows: list[model.RunRow] = []
         self._selected_run: str | None = None
         # The events panel: filters, follow mode, and the client-side feed.
+        # ``_gap`` is the panel's client-side continuity fact — a follow
+        # overflow skipped matching events — kept separate from the server's
+        # query-relative ``evicted``; both stick until the conjunction
+        # changes (model.continuity_notice).
         self.events_filters: dict[str, str] = {"type": "", "node": "", "component": ""}
         self.events_feed: list[dict[str, Any]] = []
         self.events_evicted = False
+        self.events_gap = False
         self.follow = True
         # The errors panel: same machinery with the type pinned.
         self.errors_filters: dict[str, str] = {"node": "", "component": ""}
         self.errors_feed: list[dict[str, Any]] = []
         self.errors_evicted = False
+        self.errors_gap = False
 
     # -- layout -------------------------------------------------------------
 
@@ -291,6 +309,7 @@ class TopApp(App):
                 yield DataTable(id="commands")
             with TabPane("Stacks & Runs", id="runs"):
                 yield DataTable(id="stacks")
+                yield Static("", id="runs-notice", classes="notice")
                 yield DataTable(id="runs-table")
                 with VerticalScroll():
                     yield Static("", id="run-detail")
@@ -360,9 +379,16 @@ class TopApp(App):
 
         def fetch() -> dict[str, Any]:
             bundle: dict[str, Any] = {"state": self.client.state()}
-            bundle["runs"] = self.client.events(type="theozolith.run", limit=RUNS_PAGE_LIMIT)
-            bundle["progress"] = self.client.events(
-                type="theozolith.run.progress", limit=RUNS_PAGE_LIMIT
+            # The run index keeps latest-per-issue complete across page
+            # boundaries (bootstrap walk once, head advances after); a
+            # failure raises out before any partial rendering.
+            self.runs_index.refresh(
+                lambda cursor: self.client.events(
+                    type="theozolith.run", cursor=cursor, limit=RUNS_PAGE_LIMIT
+                ),
+                lambda cursor: self.client.events(
+                    type="theozolith.run.progress", cursor=cursor, limit=RUNS_PAGE_LIMIT
+                ),
             )
             if follow or events_max is None:
                 bundle["events"] = model.advance_events(
@@ -393,19 +419,27 @@ class TopApp(App):
             self._refreshing = False
         self.freshness.succeed(self._clock())
         self.state_doc = bundle["state"]
-        self.run_rows = model.run_rows(
-            bundle["runs"], bundle["progress"], self.state_doc.get("repo")
-        )
+        self.run_rows = model.run_rows(self.runs_index, self.state_doc.get("repo"))
         if "events" in bundle:
             fresh, evicted, gap = bundle["events"]
-            if gap:  # the unseen backlog outran the walk: resync honestly
+            if gap:
+                # The unseen backlog outran the bounded walk: resync from
+                # the newest rows and REMEMBER the skip — the intermediate
+                # matching events were never fetched and never will be
+                # (history is not re-fetched), so the panel stays marked
+                # until its query changes (model.continuity_notice).
                 self.events_feed = fresh
+                self.events_gap = True
             else:
                 self.events_feed = (fresh + self.events_feed)[:EVENTS_KEEP]
             self.events_evicted = self.events_evicted or evicted
         if "errors" in bundle:
             fresh, evicted, gap = bundle["errors"]
-            self.errors_feed = fresh if gap else (fresh + self.errors_feed)[:EVENTS_KEEP]
+            if gap:
+                self.errors_feed = fresh
+                self.errors_gap = True
+            else:
+                self.errors_feed = (fresh + self.errors_feed)[:EVENTS_KEEP]
             self.errors_evicted = self.errors_evicted or evicted
         self._render_all()
 
@@ -474,6 +508,11 @@ class TopApp(App):
                 _untrusted(stack.detail),
             )
 
+        runs_notice = self.query_one("#runs-notice", Static)
+        notice_text = model.runs_notice(self.runs_index.truncated)
+        runs_notice.update(notice_text)
+        runs_notice.display = bool(notice_text)
+
         runs = self.query_one("#runs-table", DataTable)
         runs.clear()
         for run in self.run_rows:
@@ -490,13 +529,19 @@ class TopApp(App):
         self._render_run_detail()
 
         self._render_feed(
-            "#events-table", "#events-notice", self.events_feed, self.events_evicted, now
+            "#events-table",
+            "#events-notice",
+            self.events_feed,
+            self.events_evicted,
+            self.events_gap,
+            now,
         )
         self._render_feed(
             "#errors-table",
             "#errors-notice",
             self.errors_feed,
             self.errors_evicted,
+            self.errors_gap,
             now,
             errors=True,
         )
@@ -512,12 +557,13 @@ class TopApp(App):
         notice_id: str,
         feed: list[dict[str, Any]],
         evicted: bool,
+        gap: bool,
         now: float,
         *,
         errors: bool = False,
     ) -> None:
         notice = self.query_one(notice_id, Static)
-        text = model.eviction_notice(evicted)
+        text = model.continuity_notice(evicted, gap)
         notice.update(text)
         notice.display = bool(text)
         table = self.query_one(table_id, DataTable)
@@ -566,7 +612,11 @@ class TopApp(App):
         if run.terminal:
             lines.append(f"outcome: {run.phase}\n")
             lines.append("failure class: ", style="bold")
-            lines.append(f"{run.failure_class or FAILURE_CLASS_ABSENT}\n")
+            if run.phase == "pr-open":
+                lines.append(f"{FAILURE_CLASS_NOT_APPLICABLE}\n")
+            else:
+                lines.append(Text(run.failure_class or FAILURE_CLASS_LEGACY))
+                lines.append("\n")
             lines.append(f"PR: {f'#{run.pr} · {run.pr_url}' if run.pr else '(none)'}\n")
             lines.append(
                 f"evidence bundle: {run.evidence_ref or '(unknown run id)'}"
@@ -581,7 +631,10 @@ class TopApp(App):
                 f" · {run.tool_calls or 0} tool call(s)\n"
             )
         else:
-            lines.append("no telemetry yet\n")
+            lines.append(
+                "telemetry unavailable (progress events are evictable advisory"
+                " telemetry, ADR-0016 — their absence never removes the Run)\n"
+            )
         if not run.terminal and run.transcript_tail:
             shown = len(run.transcript_tail.encode("utf-8", errors="replace"))
             total = run.transcript_bytes or 0
@@ -623,12 +676,13 @@ class TopApp(App):
         filters, key = mapping[event.input.id]
         filters[key] = event.value.strip()
         # A changed conjunction is a NEW query: the feed, its follow point,
-        # and its eviction verdict all reset (ADR-0038: `evicted` is
-        # query-relative — the old panel's verdict does not carry over).
+        # its eviction verdict, AND its client-side continuity state all
+        # reset (ADR-0038: `evicted` is query-relative — the old panel's
+        # verdicts do not carry over; a follow gap belongs to the old query).
         if filters is self.events_filters:
-            self.events_feed, self.events_evicted = [], False
+            self.events_feed, self.events_evicted, self.events_gap = [], False, False
         else:
-            self.errors_feed, self.errors_evicted = [], False
+            self.errors_feed, self.errors_evicted, self.errors_gap = [], False, False
         self.run_worker(self.refresh_now, exclusive=False)
 
     # -- the three writes ---------------------------------------------------
@@ -715,7 +769,13 @@ class TopApp(App):
             return
         row_key = containers.coordinate_to_cell_key(containers.cursor_coordinate).row_key
         node, container = json.loads(row_key.value or "[]")
-        result = model.attach_command(self.state_doc, node, container)
+        # Fail closed while degraded (ADR-0040 amendment): a retained
+        # snapshot's server clock is frozen, so heartbeat evidence can look
+        # fresh forever — refuse until a refresh succeeds; the write flows
+        # stay available (they attempt the server call and report failure).
+        result = model.attach_command(
+            self.state_doc, node, container, snapshot_fresh=not self.freshness.degraded
+        )
         self.push_screen(AttachScreen(result, node, container))
 
 

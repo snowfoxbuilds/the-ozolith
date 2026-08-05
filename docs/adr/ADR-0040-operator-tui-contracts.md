@@ -1,10 +1,10 @@
 Status: ACCEPTED
 
-Date: 2026-08-05
+Date: 2026-08-05 (M9 correction pass folded in the same day: the failure-class ruling accepted, degraded attach fails closed, the run reduction made complete across event pages, Stacks render the desired/actual union, client-side follow gaps disclosed)
 
-Provenance: delegated decisions from the M9 brief (Operator TUI) — the ADR-0015 amendment text, attach-command delivery, degraded-mode rendering, and the panel/keybinding/cadence surface (documented in `--help`, per the brief; recorded here only where something surprising emerged). Implements the "Grilling 2026-08-04" Operator-TUI rulings in NODE-SUBSTRATE.md; consumes ADR-0022 (attach hardening, 150 s threshold), ADR-0038 (events read view), ADR-0039 (state read model, server-clock rule); amends ADR-0015 (dependency exception, state-document keys).
+Provenance: delegated decisions from the M9 brief (Operator TUI) — the ADR-0015 amendment text, attach-command delivery, degraded-mode rendering, and the panel/keybinding/cadence surface (documented in `--help`, per the brief; recorded here only where something surprising emerged). Implements the "Grilling 2026-08-04" Operator-TUI rulings in NODE-SUBSTRATE.md and the M9 correction-pass ruling on terminal failure classes; consumes ADR-0022 (attach hardening, 150 s threshold), ADR-0038 (events read view), ADR-0039 (state read model, server-clock rule); amends ADR-0015 (dependency exception, state-document keys, terminal run-event schema).
 
-# ADR-0040: Operator TUI contracts — read-model keys, pure-consumer enforcement, and the failure-class channel gap
+# ADR-0040: Operator TUI contracts — read-model keys, pure-consumer enforcement, and the terminal failure-class channel
 
 ## Context
 
@@ -27,17 +27,31 @@ These are additive keys on an existing endpoint under the "server documents evol
 
 The `tui` package's import closure is stdlib + Textual + its own subpackage, enforced by AST test: the store, the secret store, the web surface, `sqlite3`, `subprocess`, and `pty` are unreachable from the TUI module tree, and neither database file is even named in its sources. Constants the TUI shares with other owners (the 150 s threshold, the attach identifier whitelists and placeholders, the evidence branch and bundle path shape, the worker timeout default) are **redeclared and pinned by a mirror test** — the statuscli precedent — instead of imported, because every owning module would drag a heavy or database-capable dependency into the tree. Auth resolves through `cli._admin_env` → `statuscli.resolve_target`, the one implementation; the client is the package's only I/O and sends the bearer on every call (exercised against a real loopback socket — the SSH-forwarded shape).
 
-### Terminal Runs: the failure class is not on the channel — rendered honestly, flagged for grilling
+### Terminal Runs: the failure class rides the channel (ruling accepted)
 
-The ruling's run-detail list ("outcome, failure class, PR link, evidence-bundle reference once terminal") assumed the existing channel contract carries all four. It carries three. A failed/escalated `theozolith.run` event has no `failure_class` field — the classes (`infra`, `harness`, `timeout`, `session-died`, `no-changes`) exist worker-side and land only in the evidence bundle's `run.json`. M9 may not touch `worker/` (acceptance: unchanged, stdlib-only), so the TUI renders the gap honestly: terminal run detail shows outcome, PR link, and the evidence-bundle reference, and prints "(not on the channel — recorded in the evidence bundle's run.json; ADR-0040)" for the failure class. The renderer already consumes `payload.failure_class` when present, so a future one-field amendment to the worker's terminal run events lights it up with no TUI change. **Whether to make that amendment is an open grill item**, deliberately not decided here.
+The ruling's run-detail list ("outcome, failure class, PR link, evidence-bundle reference once terminal") assumed the existing channel contract carries all four; it carried three — the classes (`infra`, `harness`, `timeout`, `session-died`, `no-changes`) existed worker-side and landed only in the evidence bundle's `run.json`. The grill item is now ruled and closed: **the worker event channel is amended**. Terminal failed/escalated `theozolith.run` events carry `failure_class` — the canonical class the driver already determined and wrote to `run.json`, the same value and vocabulary at both destinations, emitted at the two (and only two) terminal-failure emit sites so every exit path (timeout, session death, harness failure, setup/infra breakage, no-changes, local retry, final escalation) carries it. Nothing infers the class downstream — not the TUI, not the Control Node; only the already-classified label crosses the channel, never evidence-bundle contents. `pr-open` events carry no field at all (a successful Run has no failure class — the TUI renders "not applicable", never a channel defect), and the schema change is a narrow event amendment: `worker/` stays stdlib-only and architecturally untouched.
+
+Backward compatibility: events written before the field existed remain readable with no migration — an absent `failure_class` on a legacy failed/escalated event renders as an explicit "(legacy event — emitted before failure_class rode the channel; recorded in the evidence bundle's run.json)" message, never a blank and never an error. Ingestion is untouched (payloads store verbatim; unknown fields were always accepted).
+
+### Run states: a complete client-side index, honest about its telemetry
+
+The Runs panel is the client-side twin of `store.run_states()` and must be equivalent to it: the latest `theozolith.run` event per **retained issue** — never a one-page snapshot (the server's page bound is on events, not issues; a single 500-row page silently lost any issue whose latest event predated it). The TUI keeps a latest-per-issue index over the existing events endpoint: bootstrapped once by a cursor walk across the full retained run history (run events are durable cache records, never evicted — the walk sees everything), then advanced incrementally from new head events each poll, with cursor overlap handled by id filtering and an unclosable advance gap answered by a fresh bootstrap — never a per-tick rescan of unbounded history. A defensive page bound remains on any single walk; crossing it sets a visible incomplete-data notice on the panel ("Runs beyond the walked window are missing") — it never silently removes a Run, and it is a bound on event pages walked, not a count of tracked issues.
+
+Progress joins the index under ADR-0016's honesty split: run events are durable, progress is evictable advisory telemetry. The latest available progress per live run_id is found across page boundaries; a live Run whose telemetry was evicted renders "telemetry unavailable" and a terminal Run needs none — absence of progress never removes a row, because the durable run event IS the row's existence.
+
+### Stacks: the desired/actual union, drift never hidden
+
+Stack rows come from the union of `(node, stack)` keys in `desired_stacks` and heartbeat-reported `stacks` — the frozen web surface's drift behavior, transposed. Desired-only rows render "not reported"; actual-only rows (reported by a node after their desired definition was deleted or never placed) render desired `(unplaced)` with the reported kind and detail preserved, and are never converged — an actual-only running Stack is off desired by definition, not silently fine. The rows disappear only when the node reconciles and stops reporting them.
 
 ### Attach delivery: print-only
 
 The attach action shows the substituted command in a modal for the operator to copy — no OSC 52 clipboard write in v1. Terminal support for OSC 52 is inconsistent and fails silently (a "copied!" that copied nothing is worse than no copy), printing is the portable floor, and the ruling's audit posture ("pasted SSH bypasses terminal-audit.log by accepted design") is about the paste either way. Template argv elements are shell-quoted on render; the substituted identifiers pass the ADR-0022 shell-inert whitelists first, so quoting is belt over braces.
 
-### Degraded mode: banner over stale data, never blocking
+### Degraded mode: banner over stale data, never blocking — and attach fails closed
 
 A failed refresh keeps the last documents on screen under a prominent banner naming the dial target, the error class, and the age of what is shown; polling continues on the cadence and the banner clears on the next success. A blocking modal was rejected: the operator mid-incident needs the last known fleet picture more than a confirmation prompt.
+
+Attach assistance is the exception to render-and-continue, because it presents heartbeat-derived evidence as CURRENT: a retained snapshot's `now` is frozen at the last successful refresh, so its heartbeat rows would pass the 150 s check forever. From the first failed refresh until the next successful one, attach refuses outright, stating that current server-clock freshness cannot be established — it never substitutes the local wall clock to manufacture a heartbeat age (the no-local-time rule, ADR-0039). A successful refresh clears the condition and restores the ordinary 150 s evaluation against the NEW server clock. The three write flows stay available while degraded (they attempt the authenticated call and report its failure); no read-side action presents stale heartbeat evidence as live.
 
 ### The write flows
 
@@ -45,9 +59,11 @@ A failed refresh keeps the last documents on screen under a prominent banner nam
 - **Quarantine release**: one confirmed action against the existing release endpoint.
 - **Secret entry**: masked input; the value's only egress is the `PUT /api/v1/secrets/{name}` body; the confirmation names the secret, never the value (test-swept across every rendered surface).
 
-### Events follow mode and eviction honesty
+### Events follow mode and eviction honesty — including client-side gaps
 
-Follow mode keeps only ids newer than the newest row already held: each tick fetches the head page and walks the cursor **only across the unseen gap**, stopping on overlap or when the page ends exactly one id above the newest seen (ids are monotonic and never reused — ADR-0038); an unclosed gap after a bounded walk resyncs the panel honestly instead of pretending continuity. The eviction notice is the split contract verbatim: it keys on the response's query-relative `evicted` for the panel's own filter conjunction, accumulates while the conjunction stands (shown history can stay incomplete after one evicted answer), resets when the conjunction changes, and `any_evicted` alone never flags a panel.
+Follow mode keeps only ids newer than the newest row already held: each tick fetches the head page and walks the cursor **only across the unseen gap**, stopping on overlap or when the page ends exactly one id above the newest seen (ids are monotonic and never reused — ADR-0038). An unclosed gap after the bounded walk resyncs the panel from the newest rows **and records the skip as per-panel continuity state**: the intermediate matching events were dropped client-side, so the panel shows a "history incomplete" warning naming the cause as a follow overflow — explicitly not server eviction; the two facts are tracked separately (per panel: Events and Errors independently) and only their presentation combines. The warning is cleared exclusively by a change of that panel's filter conjunction — a later head poll that overlaps the already-resynced head proves nothing about the skipped events (history is never re-fetched), so it never clears the warning.
+
+The eviction notice is the split contract verbatim: it keys on the response's query-relative `evicted` for the panel's own filter conjunction, accumulates while the conjunction stands (shown history can stay incomplete after one evicted answer), resets when the conjunction changes, and `any_evicted` alone never flags a panel.
 
 ### Rendering rule: agent text is never markup
 
@@ -55,8 +71,8 @@ Transcript tails, event payloads, error messages, and every other agent-adjacent
 
 ## Consequences
 
-- **Positive**: the TUI needs zero privileged local shortcuts — pointed at an SSH-forwarded socket it works unmodified; the read-model additions serve any future API consumer, not just this one; the failure-class gap is visible instead of papered over; a worker-side amendment later is one field.
-- **Negative**: five constants exist twice (pinned by test, but still twice); run-state reduction is capped at one max-size page of run and progress events per tick — a fleet with more than 500 tracked issues renders a truncated Runs panel (far beyond V1 scale; noted, not solved).
+- **Positive**: the TUI needs zero privileged local shortcuts — pointed at an SSH-forwarded socket it works unmodified; the read-model additions serve any future API consumer, not just this one; terminal failure classes are visible without evidence-bundle inspection, and legacy events stay readable; every incompleteness the panel can suffer (server eviction, follow overflow, a truncated index walk) is disclosed on the affected panel.
+- **Negative**: five constants exist twice (pinned by test, but still twice); the run index costs a one-time bootstrap walk over the retained run history (bounded, disclosed if truncated) and holds one event per retained issue client-side; the worker event schema gained one field, so event consumers now see two generations of terminal events (handled by the explicit legacy rendering).
 - **Neutral**: Textual adds a dependency to the one component that already has five; the web surface is untouched (no template, static, or cookie-route diffs).
 
 ## Alternatives rejected

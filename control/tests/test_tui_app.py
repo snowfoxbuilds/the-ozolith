@@ -140,7 +140,29 @@ async def test_run_detail_timeout_budget_honors_the_stack_env_override():
 
 
 @pytest.mark.asyncio
-async def test_terminal_run_detail_shows_outcome_pr_and_evidence():
+async def test_terminal_run_detail_shows_the_canonical_failure_class():
+    fake = FakeClient()
+    fake.events_pages["theozolith.run"] = page(
+        [run_event(30, 5, "failed", run_id="r9", attempt=2, failure_class="session-died")]
+    )
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        detail = str(app.query_one("#run-detail", Static).content)
+        assert "outcome: failed" in detail
+        # The worker's canonical class rides the channel (ADR-0040
+        # amendment): shown verbatim, no evidence-bundle inspection needed.
+        assert "failure class: session-died" in detail
+        assert "legacy event" not in detail
+        assert "theozolith/evidence: runs/issue-5/r9" in detail
+        assert "github.com/acme/sandbox/tree/theozolith/evidence/runs/issue-5/r9" in detail
+
+
+@pytest.mark.asyncio
+async def test_legacy_terminal_run_without_the_field_says_so_explicitly():
+    """Events written before failure_class existed stay readable: the
+    detail names the compatibility gap and points at run.json — never a
+    blank, never a channel defect."""
     fake = FakeClient()
     fake.events_pages["theozolith.run"] = page([run_event(30, 5, "failed", run_id="r9", attempt=2)])
     app = make_app(fake)
@@ -148,10 +170,69 @@ async def test_terminal_run_detail_shows_outcome_pr_and_evidence():
         await app.refresh_now()
         detail = str(app.query_one("#run-detail", Static).content)
         assert "outcome: failed" in detail
-        # The channel gap, rendered honestly (ADR-0040) — never a blank.
-        assert "failure class:" in detail and "not on the channel" in detail
-        assert "theozolith/evidence: runs/issue-5/r9" in detail
-        assert "github.com/acme/sandbox/tree/theozolith/evidence/runs/issue-5/r9" in detail
+        assert "failure class:" in detail and "legacy event" in detail
+        assert "run.json" in detail
+
+
+@pytest.mark.asyncio
+async def test_successful_run_renders_failure_class_not_applicable():
+    fake = FakeClient()
+    fake.events_pages["theozolith.run"] = page([run_event(30, 5, "pr-open", run_id="r9", pr=41)])
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        detail = str(app.query_one("#run-detail", Static).content)
+        assert "outcome: pr-open" in detail
+        assert "failure class: not applicable" in detail
+        assert "legacy event" not in detail
+
+
+# -- runs: complete across event pages (ADR-0040 amendment) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_runs_panel_keeps_issues_beyond_the_first_event_page():
+    """The event-page bound is on EVENTS, not issues: an older active issue
+    whose latest event fell off the head page still renders — the index
+    walks the cursor at bootstrap."""
+    fake = FakeClient()
+    fake.events_pages["theozolith.run"] = {
+        None: page(
+            [
+                run_event(60, 7, "gate", run_id="r7b", attempt=2),
+                run_event(50, 7, "claimed", run_id="r7b", attempt=2),
+            ],
+            next_cursor="50",
+        ),
+        "50": page([run_event(20, 3, "claimed", run_id="r3")]),
+    }
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        run_rows = rows(app, "#runs-table")
+        assert [r[0] for r in run_rows] == ["#3", "#7"]  # the older issue survives
+        assert app.query_one("#runs-notice", Static).display is False  # complete: no notice
+
+
+@pytest.mark.asyncio
+async def test_progress_eviction_degrades_telemetry_without_removing_the_run():
+    fake = FakeClient()
+    fake.events_pages["theozolith.run"] = page(
+        [
+            run_event(30, 5, "failed", run_id="r9", failure_class="infra", at=NOW - 60),
+            run_event(20, 3, "gate", run_id="r3", at=NOW - 90),
+        ]
+    )
+    fake.events_pages["theozolith.run.progress"] = page([], evicted=True)
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        run_rows = rows(app, "#runs-table")
+        assert [r[0] for r in run_rows] == ["#3", "#5"]  # both Runs still listed
+        # The live Run's detail renders missing telemetry as unavailable —
+        # honestly, without dropping the row.
+        detail = str(app.query_one("#run-detail", Static).content)
+        assert "telemetry unavailable" in detail and "never removes the Run" in detail
 
 
 # -- the destructive-command flow (acceptance 3) --------------------------------
@@ -295,6 +376,65 @@ async def test_attach_refuses_on_stale_heartbeat_evidence():
         assert "stale" in reason and "server clock" in reason and "150" in reason
 
 
+@pytest.mark.asyncio
+async def test_attach_fails_closed_while_degraded_and_recovers_on_refresh():
+    """The degraded-attach ladder (ADR-0040 amendment): attach works from
+    fresh server evidence; the moment a refresh fails the retained
+    snapshot's server clock is frozen and attach refuses — naming the
+    unprovable freshness, not a manufactured heartbeat age — and STAYS
+    refused across further failed refreshes; one successful refresh
+    restores normal evaluation against the NEW server clock."""
+    fake = FakeClient()
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)) as pilot:
+        await app.refresh_now()
+        # 5: fresh server evidence resolves the command.
+        await pilot.press("a")
+        assert isinstance(app.screen, AttachScreen)
+        assert app.screen.query(  # command printed, no refusal
+            "#attach-command"
+        ) and not app.screen.query("#attach-refusal")
+        await pilot.press("escape")
+        # 6: the selected container was fresh when control vanished — the
+        # snapshot can no longer prove server-clock freshness: refuse.
+        fake.fail_with = ControlUnreachable(
+            "https://127.0.0.1:9443", "ConnectionRefusedError", "refused"
+        )
+        await app.refresh_now()
+        await pilot.press("a")
+        assert isinstance(app.screen, AttachScreen)
+        reason = str(app.screen.query_one("#attach-refusal", Static).content)
+        assert "cannot be established" in reason and "refresh succeeds" in reason
+        await pilot.press("escape")
+        # 7: still unreachable (well past 150s of local time is irrelevant —
+        # no local clock is consulted): the refusal stands until a refresh
+        # SUCCEEDS, not until time passes.
+        await app.refresh_now()
+        await pilot.press("a")
+        assert isinstance(app.screen, AttachScreen)
+        assert "cannot be established" in str(
+            app.screen.query_one("#attach-refusal", Static).content
+        )
+        await pilot.press("escape")
+        # 8a: recovery with the container still fresh on the NEW server
+        # clock: normal evaluation resumes and the command prints.
+        fake.fail_with = None
+        await app.refresh_now()
+        await pilot.press("a")
+        assert isinstance(app.screen, AttachScreen)
+        assert app.screen.query("#attach-command")
+        await pilot.press("escape")
+        # 8b: recovery whose new server clock shows the evidence stale:
+        # the ordinary 150s server-clock refusal — with the age computed
+        # from the NEW clock, never the local one.
+        fake.state_doc["now"] = NOW + 500
+        await app.refresh_now()
+        await pilot.press("a")
+        assert isinstance(app.screen, AttachScreen)
+        reason = str(app.screen.query_one("#attach-refusal", Static).content)
+        assert "stale" in reason and "150" in reason and "530s" in reason
+
+
 # -- events: follow + eviction honesty (acceptance 8) ---------------------------
 
 
@@ -353,6 +493,126 @@ async def test_changing_a_filter_resets_the_feed_and_requeries():
         assert app.events_filters["type"] == "acme.custom"
         typed = [c for c in fake.events_calls if c.get("type") == "acme.custom"]
         assert typed  # the new conjunction was queried
+
+
+# -- follow overflow: client-side continuity honesty (ADR-0040 amendment) -------
+
+
+def _flood(top_id: int, pages: int, event_id_step: int = 1):
+    """Cursor-keyed pages of entirely-unseen events, deeper than the
+    bounded follow walk: every page is full and fresh, so the walk cannot
+    reach overlap."""
+    mapping = {}
+    cursor = None
+    event_id = top_id
+    for _ in range(pages):
+        mapping[cursor] = page([run_event(event_id, 2, "claimed")], next_cursor=str(event_id))
+        cursor = str(event_id)
+        event_id -= event_id_step
+    return mapping
+
+
+@pytest.mark.asyncio
+async def test_follow_overflow_marks_skipped_continuity_per_panel():
+    """More new matching events than the bounded unseen-gap walk covers:
+    the panel keeps the newest rows, records the client-side skip, and
+    shows the incomplete-history warning — for THAT panel only; the other
+    panel (and its query-relative eviction verdict) is untouched."""
+    fake = FakeClient()
+    fake.events_pages[""] = page([run_event(10, 1, "claimed")])
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        assert app.events_gap is False
+        # Ten fully-fresh pages against a walk bounded at five.
+        fake.events_pages[""] = _flood(100, 10)
+        await app.refresh_now()
+        assert app.events_gap is True
+        assert [e["id"] for e in app.events_feed] == [100, 99, 98, 97, 96]  # newest retained
+        notice = app.query_one("#events-notice", Static)
+        assert notice.display is True
+        text = str(notice.content)
+        assert "history incomplete" in text and "skipped" in text
+        assert "not server eviction" in text  # cause named, never conflated
+        # The errors panel lost nothing and says nothing.
+        assert app.errors_gap is False
+        assert app.query_one("#errors-notice", Static).display is False
+        # An ordinary overlapping head poll later does NOT clear the
+        # warning: the skipped events never re-entered the feed.
+        fake.events_pages[""] = page(
+            [run_event(101, 1, "claimed"), run_event(100, 2, "claimed")], next_cursor="100"
+        )
+        await app.refresh_now()
+        assert app.events_gap is True
+        assert app.query_one("#events-notice", Static).display is True
+
+
+@pytest.mark.asyncio
+async def test_errors_panel_overflow_is_independent_of_events():
+    fake = FakeClient()
+    fake.events_pages["theozolith.error"] = page([run_event(10, 1, "claimed")])
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        fake.events_pages["theozolith.error"] = _flood(200, 10)
+        await app.refresh_now()
+        assert app.errors_gap is True and app.events_gap is False
+        assert app.query_one("#errors-notice", Static).display is True
+        assert app.query_one("#events-notice", Static).display is False
+
+
+@pytest.mark.asyncio
+async def test_filter_change_resets_that_panels_continuity_state_only():
+    fake = FakeClient()
+    fake.events_pages[""] = page([run_event(10, 1, "claimed")])
+    fake.events_pages["theozolith.error"] = page([run_event(11, 1, "claimed")])
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)) as pilot:
+        await app.refresh_now()
+        fake.events_pages[""] = _flood(100, 10)
+        fake.events_pages["theozolith.error"] = _flood(300, 10)
+        await app.refresh_now()
+        assert app.events_gap is True and app.errors_gap is True
+        # A new conjunction on the EVENTS panel is a new query: its gap (and
+        # eviction verdict) reset; the errors panel's continuity state stays.
+        fake.events_pages["acme.custom"] = page([run_event(400, 1, "claimed")])
+        flt = app.query_one("#flt-type", Input)
+        flt.value = "acme.custom"
+        flt.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.events_gap is False
+        assert app.errors_gap is True
+        assert app.query_one("#errors-notice", Static).display is True
+
+
+# -- stacks: desired-union-actual drift (ADR-0040 amendment) --------------------
+
+
+@pytest.mark.asyncio
+async def test_stacks_panel_shows_actual_only_rows_off_desired():
+    fake = FakeClient()
+    fake.state_doc["stacks"].append(
+        {
+            "node": "box1",
+            "name": "ghost",
+            "kind": "container",
+            "state": "running",
+            "detail": "Up 3 hours",
+            "updated_at": NOW - 10,
+        }
+    )
+    fake.state_doc["desired_stacks"] = []  # deletion: nothing desired anymore
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        stack_rows = rows(app, "#stacks")
+        by_name = {r[1]: r for r in stack_rows}
+        assert set(by_name) == {"deck", "ghost"}
+        for name in ("deck", "ghost"):
+            assert by_name[name][3] == "(unplaced)"  # desired
+            assert by_name[name][4] == "running ← off desired"  # never converged
+        assert by_name["ghost"][2] == "container" and by_name["ghost"][5] == "Up 3 hours"
 
 
 # -- degraded mode (ADR-0040) ---------------------------------------------------

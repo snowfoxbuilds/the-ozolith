@@ -10,7 +10,9 @@ mirror their owners exactly (each mirrored constant is pinned by test):
   the local one (ADR-0022/0039).
 - Run states reduce from run + progress events the way the dashboard's
   ``store.run_states()`` does server-side: the latest run event per issue,
-  joined with the latest progress telemetry per run_id.
+  joined with the latest progress telemetry per run_id — kept COMPLETE
+  across event-page boundaries by ``RunIndex`` (bootstrap cursor walk, then
+  incremental head advances; never a one-page snapshot).
 - attach resolution follows the PTY bridge's refusal order (ADR-0022) over
   the state document's heartbeat evidence — but ends in a PRINTED command,
   never a process.
@@ -128,28 +130,37 @@ class StackRow:
     node: str
     name: str
     kind: str
-    desired: str
+    desired: str  # "(unplaced)" when only a heartbeat reports the Stack
     actual: str  # "not reported" when the node has not reported it
     detail: str
     converged: bool
 
 
 def stack_rows(state: dict[str, Any]) -> list[StackRow]:
-    actual = {(row.get("node"), row.get("name")): row for row in state.get("stacks") or []}
+    """One row per (node, stack) in the UNION of desired and reported state
+    — the frozen web surface's drift behavior. Desired-only rows render
+    "not reported"; actual-only rows (a heartbeat reports a Stack the Config
+    Repo no longer places here) render desired "(unplaced)" with the
+    reported kind and detail preserved, and are never converged — an
+    actual-only running Stack is off desired, not silently fine."""
+    desired_by = {
+        (row.get("node"), row.get("name")): row for row in state.get("desired_stacks") or []
+    }
+    actual_by = {(row.get("node"), row.get("name")): row for row in state.get("stacks") or []}
     rows = []
-    for desired in sorted(
-        state.get("desired_stacks") or [],
-        key=lambda d: (d.get("node") or "", d.get("name") or ""),
+    for key in sorted(
+        set(desired_by) | set(actual_by), key=lambda k: (str(k[0] or ""), str(k[1] or ""))
     ):
-        key = (desired.get("node"), desired.get("name"))
-        have = actual.get(key)
-        want = str(desired.get("state") or "running")
+        desired = desired_by.get(key)
+        have = actual_by.get(key)
+        want = str(desired.get("state") or "running") if desired else "(unplaced)"
         have_state = str(have.get("state") or "") if have else "not reported"
+        kind = (have.get("kind") if have else "") or (desired.get("kind") if desired else "")
         rows.append(
             StackRow(
-                node=str(desired.get("node") or ""),
-                name=str(desired.get("name") or ""),
-                kind=str(desired.get("kind") or ""),
+                node=str(key[0] or ""),
+                name=str(key[1] or ""),
+                kind=str(kind or ""),
                 desired=want,
                 actual=have_state,
                 detail=str(have.get("detail") or "") if have else "",
@@ -223,29 +234,173 @@ class RunRow:
     evidence_url: str = ""
 
 
-def _first_per_key(events: list[dict[str, Any]], key: Callable[[dict], Any]) -> dict[Any, dict]:
-    """Newest-first pages: the first occurrence per key IS the latest."""
-    latest: dict[Any, dict] = {}
-    for event in events:
-        k = key(event)
-        if k is not None and k not in latest:
-            latest[k] = event
-    return latest
+# Defensive ceiling on event pages walked in one index pass. Crossing it is
+# never a silent drop: the index marks itself incomplete and the Runs panel
+# says so (ADR-0040 amendment — the one-page reduction was not equivalent to
+# ``store.run_states()``; this bound is on EVENTS walked, not on issues).
+INDEX_MAX_PAGES = 40
 
 
-def run_rows(
-    runs_page: dict[str, Any],
-    progress_page: dict[str, Any],
-    repo: str | None,
-) -> list[RunRow]:
-    """The client-side twin of ``store.run_states()``: latest run event per
-    issue joined with the latest progress telemetry per run_id."""
-    latest_runs = _first_per_key(
-        runs_page.get("events") or [], lambda e: (e.get("payload") or {}).get("issue")
+@dataclass
+class RunIndex:
+    """The client-side twin of ``store.run_states()``, complete across event
+    pages: the latest ``theozolith.run`` event per issue and the latest
+    progress telemetry per run_id. Bootstrapped once by a bounded cursor
+    walk over the full retained history (run events are durable cache
+    records — never evicted), then advanced incrementally from new head
+    events each poll; an unclosed advance gap triggers a re-bootstrap
+    instead of pretending continuity. Progress is evictable advisory
+    telemetry: a missing record renders as unavailable, never as a missing
+    Run."""
+
+    latest_run_by_issue: dict[Any, dict[str, Any]] = field(default_factory=dict)
+    latest_progress_by_run: dict[str, dict[str, Any]] = field(default_factory=dict)
+    max_run_id: int | None = None
+    max_progress_id: int | None = None
+    bootstrapped: bool = False
+    # True when a bootstrap walk hit INDEX_MAX_PAGES with history remaining:
+    # issues whose latest event lies beyond the walked window are missing
+    # and the panel shows an incomplete-data notice (never a silent drop).
+    truncated: bool = False
+
+    def refresh(
+        self,
+        fetch_runs: Callable[[str | None], dict[str, Any]],
+        fetch_progress: Callable[[str | None], dict[str, Any]],
+    ) -> None:
+        """One poll: bootstrap on first use (or when a previous walk saw no
+        events at all — an id-less index cannot advance safely), otherwise
+        advance both indexes past their newest known ids. Cursor overlap is
+        handled by id filtering; an unclosed gap re-bootstraps."""
+        if not self.bootstrapped or self.max_run_id is None:
+            self._bootstrap_runs(fetch_runs)
+        else:
+            fresh, _evicted, gap = advance_events(
+                fetch_runs, self.max_run_id, max_pages=INDEX_MAX_PAGES
+            )
+            if gap:
+                self._bootstrap_runs(fetch_runs)
+            else:
+                self._apply_runs(fresh)
+        if self.max_progress_id is None:
+            self._bootstrap_progress(fetch_progress)
+        else:
+            fresh, _evicted, gap = advance_events(
+                fetch_progress, self.max_progress_id, max_pages=INDEX_MAX_PAGES
+            )
+            if gap:
+                self._bootstrap_progress(fetch_progress)
+            else:
+                self._apply_progress(fresh)
+        self.bootstrapped = True
+        self._prune_progress()
+
+    def _bootstrap_runs(self, fetch: Callable[[str | None], dict[str, Any]]) -> None:
+        latest: dict[Any, dict[str, Any]] = {}
+        max_id: int | None = None
+        cursor: str | None = None
+        truncated = True
+        for _ in range(INDEX_MAX_PAGES):
+            page = fetch(cursor)
+            for event in page.get("events") or []:
+                if isinstance(event.get("id"), int):
+                    max_id = event["id"] if max_id is None else max(max_id, event["id"])
+                issue = (event.get("payload") or {}).get("issue")
+                # Newest-first pages: the first occurrence per issue IS the
+                # latest.
+                if issue is not None and issue not in latest:
+                    latest[issue] = event
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                truncated = False
+                break
+        # Assign only after a completed walk: a failed fetch raises out and
+        # leaves the previous (still coherent) index in place.
+        self.latest_run_by_issue = latest
+        self.max_run_id = max_id
+        self.truncated = truncated
+
+    def _apply_runs(self, fresh: list[dict[str, Any]]) -> None:
+        # Oldest-first application: the newest event per issue lands last.
+        for event in reversed(fresh):
+            issue = (event.get("payload") or {}).get("issue")
+            if issue is not None:
+                self.latest_run_by_issue[issue] = event
+            if isinstance(event.get("id"), int):
+                self.max_run_id = max(self.max_run_id or 0, event["id"])
+
+    def _live_run_ids(self) -> set[str]:
+        return {
+            str((event.get("payload") or {}).get("run_id") or "")
+            for event in self.latest_run_by_issue.values()
+            if str((event.get("payload") or {}).get("phase") or "") not in TERMINAL_PHASES
+        } - {""}
+
+    def _bootstrap_progress(self, fetch: Callable[[str | None], dict[str, Any]]) -> None:
+        """Walk progress pages until every live Run has telemetry or the
+        retained history ends (bounded). Progress is evictable: a live Run
+        with no surviving record simply renders as telemetry-unavailable."""
+        wanted = self._live_run_ids()
+        latest: dict[str, dict[str, Any]] = {}
+        max_id: int | None = None
+        cursor: str | None = None
+        for _ in range(INDEX_MAX_PAGES):
+            page = fetch(cursor)
+            for event in page.get("events") or []:
+                if isinstance(event.get("id"), int):
+                    max_id = event["id"] if max_id is None else max(max_id, event["id"])
+                run_id = (event.get("payload") or {}).get("run_id")
+                if run_id and str(run_id) not in latest:
+                    latest[str(run_id)] = event
+            cursor = page.get("next_cursor")
+            if cursor is None or wanted <= set(latest):
+                break
+        self.latest_progress_by_run = latest
+        self.max_progress_id = max_id
+
+    def _apply_progress(self, fresh: list[dict[str, Any]]) -> None:
+        for event in reversed(fresh):
+            run_id = (event.get("payload") or {}).get("run_id")
+            if run_id:
+                self.latest_progress_by_run[str(run_id)] = event
+            if isinstance(event.get("id"), int):
+                self.max_progress_id = max(self.max_progress_id or 0, event["id"])
+
+    def _prune_progress(self) -> None:
+        """Drop telemetry for run_ids no longer referenced by any latest run
+        event, so the join stays bounded by the issue count."""
+        referenced = {
+            str((event.get("payload") or {}).get("run_id") or "")
+            for event in self.latest_run_by_issue.values()
+        }
+        self.latest_progress_by_run = {
+            run_id: event
+            for run_id, event in self.latest_progress_by_run.items()
+            if run_id in referenced
+        }
+
+
+def runs_notice(truncated: bool) -> str:
+    """The Runs panel's incomplete-data line: shown exactly when the index's
+    bootstrap walk hit its defensive page bound with history remaining. The
+    bound is on event pages walked, never on issues — and crossing it is
+    disclosed, never a silent drop."""
+    if not truncated:
+        return ""
+    return (
+        "run history exceeded the bounded index walk — Runs whose latest event"
+        " lies beyond the walked window are missing from this listing"
+        " (incomplete data)"
     )
-    latest_progress = _first_per_key(
-        progress_page.get("events") or [], lambda e: (e.get("payload") or {}).get("run_id")
-    )
+
+
+def run_rows(index: RunIndex, repo: str | None) -> list[RunRow]:
+    """Rows from the complete index: latest run event per issue joined with
+    the latest progress telemetry per run_id (``store.run_states()``'s
+    shape). A Run whose progress was evicted keeps its row — the durable
+    run event is the row's existence; telemetry is advisory."""
+    latest_runs = index.latest_run_by_issue
+    latest_progress = index.latest_progress_by_run
     base = f"https://github.com/{repo}" if repo else ""
     rows = []
     for issue in sorted(latest_runs):
@@ -326,11 +481,26 @@ class AttachResult:
         return bool(self.command)
 
 
-def attach_command(state: dict[str, Any], node: str, container: str) -> AttachResult:
+def attach_command(
+    state: dict[str, Any], node: str, container: str, *, snapshot_fresh: bool = True
+) -> AttachResult:
     """Resolve the pastable attach command from heartbeat evidence in the
     state document — the PTY bridge's refusal order (ADR-0022), ending in a
     printed string instead of a process. Freshness is judged on the SERVER
-    clock (``state["now"]`` vs the row's ``updated_at``)."""
+    clock (``state["now"]`` vs the row's ``updated_at``) — and only while
+    that clock is itself provably current: ``snapshot_fresh=False`` (the
+    caller's last refresh failed, so ``state["now"]`` is frozen at some past
+    instant) refuses before any heartbeat judgment. The local wall clock is
+    never a substitute — fail closed (ADR-0040 amendment)."""
+    if not snapshot_fresh:
+        return AttachResult(
+            reason=(
+                "the Control Node is unreachable and the retained state document is"
+                " frozen — current server-clock freshness of the heartbeat evidence"
+                " cannot be established; refusing to print an attach command until a"
+                " state refresh succeeds"
+            )
+        )
     now = float(state.get("now") or 0.0)
     for record in state.get("run_containers") or []:
         if record.get("node") == node and record.get("name") == container:
@@ -484,6 +654,32 @@ def eviction_notice(page_evicted: bool) -> str:
     )
 
 
+FOLLOW_GAP_NOTICE = (
+    "follow mode fell behind: more new matching events arrived than the bounded"
+    " cursor walk could cover, so intermediate matching events were skipped"
+    " client-side (not server eviction) — the feed resumed from the newest rows"
+)
+
+
+def continuity_notice(page_evicted: bool, follow_gap: bool) -> str:
+    """One combined per-panel "history incomplete" line naming each cause
+    distinctly: server-side eviction (query-relative, ADR-0038) and a
+    client-side follow overflow are different facts and are never conflated.
+    Both accumulate while the panel's filter conjunction stands and reset
+    when it changes — a follow gap is only "restored" by a new query,
+    because the skipped events never re-enter the retained feed (history is
+    never re-fetched); a later overlapping head poll proves nothing about
+    them."""
+    causes = []
+    if page_evicted:
+        causes.append(eviction_notice(True))
+    if follow_gap:
+        causes.append(FOLLOW_GAP_NOTICE)
+    if not causes:
+        return ""
+    return "history incomplete — " + "; ".join(causes)
+
+
 # -- settings (read-only) ---------------------------------------------------
 
 
@@ -526,6 +722,17 @@ class Freshness:
         self.error = error_class
         self.dial_target = dial_target
         self.consecutive_failures += 1
+
+    @property
+    def degraded(self) -> bool:
+        """True while the retained documents cannot prove current server-
+        clock freshness: before any successful refresh, and from a failed
+        refresh until the next success. Actions that present heartbeat-
+        derived data as CURRENT (attach assistance) must fail closed on
+        this — the retained ``state["now"]`` is frozen at some past instant
+        and the local wall clock is never a substitute (ADR-0040
+        amendment)."""
+        return bool(self.error) or self.last_success_at is None
 
     def banner(self, now: float) -> str:
         if not self.error:
