@@ -72,8 +72,11 @@ class RecordingSink:
         return True
 
     def run_phases(self, issue: int | None = None) -> list[str]:
+        return [e["phase"] for e in self.run_events(issue)]
+
+    def run_events(self, issue: int | None = None) -> list[dict]:
         return [
-            e["phase"]
+            e
             for e in self.events
             if e["type"] == "theozolith.run" and (issue is None or e["issue"] == issue)
         ]

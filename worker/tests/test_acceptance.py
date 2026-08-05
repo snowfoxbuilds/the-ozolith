@@ -438,6 +438,12 @@ def test_container_crash_retries_locally_and_the_retry_ships(harness: Harness):
     # The claim never left this Worker and nothing touched the issue labels.
     assert harness.fake.assignees_of(number) == [WORKER_LOGIN]
     assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+    # The local-retry lane on the channel: the crashed Run's failed event
+    # carries its canonical class; the shipping retry's pr-open carries none.
+    (crashed,) = (e for e in harness.sink.run_events(number) if e["phase"] == "failed")
+    assert crashed["failure_class"] == "harness"
+    (shipped,) = (e for e in harness.sink.run_events(number) if e["phase"] == "pr-open")
+    assert "failure_class" not in shipped
     assert harness.fake.comments[number] == []  # no marker comments exist
     # Two distinct fresh Runs, two containers, none left behind.
     run_containers = [n for n in harness.record.launched if n.startswith("ozolith-run-")]
@@ -497,6 +503,24 @@ def _assert_escalated(
         assert record["phase"] == "failed"
         assert record["failure_class"] == failure_class
         assert reason_fragment in record["reason"]
+    # The channel carries the same canonical class as each run.json (ADR-0040
+    # amendment): every failed event names its Run's class verbatim, and the
+    # escalated event carries the final Run's.
+    events_by_phase: dict[str, list[dict]] = {}
+    for event in harness.sink.run_events(number):
+        events_by_phase.setdefault(event["phase"], []).append(event)
+    failed_by_run = {e["run_id"]: e for e in events_by_phase["failed"]}
+    assert set(failed_by_run) == set(run_ids)
+    for run_id in run_ids:
+        record = json.loads(harness.evidence_file(f"runs/issue-{number}/{run_id}/run.json"))
+        assert failed_by_run[run_id]["failure_class"] == record["failure_class"]
+    (escalated,) = events_by_phase["escalated"]
+    assert escalated["failure_class"] == failure_class
+    # Non-failure phases never carry the field — a successful Run has no
+    # failure class, not an empty one.
+    for phase in ("claimed", "gate", "pr-open"):
+        for event in events_by_phase.get(phase, []):
+            assert "failure_class" not in event
 
 
 def test_run_outcome_classification_matrix(harness: Harness):
@@ -621,6 +645,20 @@ def test_failed_run_budget_is_one_local_retry_then_escalation(harness: Harness):
         "failed",
         "escalated",
     ]
+    # Mixed classes ride the channel per-Run (ADR-0040 amendment): each
+    # failed event names ITS Run's canonical class; escalated carries the
+    # final Run's, exactly what its run.json records.
+    run_events = harness.sink.run_events(number)
+    assert [e["failure_class"] for e in run_events if e["phase"] == "failed"] == [
+        "no-changes",
+        "session-died",
+    ]
+    (escalated,) = (e for e in run_events if e["phase"] == "escalated")
+    assert escalated["failure_class"] == "session-died"
+    final_record = json.loads(
+        harness.evidence_file(f"runs/issue-{number}/{escalated['run_id']}/run.json")
+    )
+    assert final_record["failure_class"] == escalated["failure_class"]
 
     # failed + needs_human is not claimable: nothing left to do.
     assert harness.worker_once() == 0
@@ -906,6 +944,12 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
         assert "docker run failed" in event["message"]
     # The normal ADR-0016 escalation still happened.
     assert FAILED in harness.fake.labels_of(number)
+    # Driver-side breakage is the infra class — on both failed events and
+    # the escalated event, matching the evidence bundles (ADR-0040).
+    run_events = harness.sink.run_events(number)
+    assert [e["failure_class"] for e in run_events if e["phase"] == "failed"] == ["infra", "infra"]
+    (escalated,) = (e for e in run_events if e["phase"] == "escalated")
+    assert escalated["failure_class"] == "infra"
 
 
 # -- 9. headless sessions (ADR-0019) -------------------------------------------

@@ -562,3 +562,55 @@ def test_boots_and_serves_with_no_config_repo_at_all(control: ControlRig):
         "heartbeat_seconds": 60.0,
         "stop_grace_seconds": 30.0,
     }
+
+
+# -- the M9 state read model (ADR-0040, extending ADR-0039's keys) ---------------
+
+ATTACH_STACK_TOML = """\
+kind = "container"
+node = "box1"
+image = "ghcr.io/x/deck:1.0@sha256:%s"
+attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach"]
+
+[env]
+DECK_MODE = "quiet"
+"""
+
+
+def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig):
+    """The M9 Operator TUI read model (ADR-0040): desired_stacks entries
+    carry the Stack's attach argv and non-secret env declarations, and the
+    document carries the coordination repo and the read-only control_toml
+    view — a pure API consumer needs no Config Repo access for any panel.
+    The node channel is untouched: attach never rides a heartbeat."""
+    control.write_config("stacks/deck.toml", ATTACH_STACK_TOML % ("0" * 64))
+    control.write_config("stacks/worker.toml", STACK_TOML)
+
+    state = control.admin("GET", "/api/v1/state").json()
+    by_name = {s["name"]: s for s in state["desired_stacks"]}
+    assert by_name["deck"]["attach"] == [
+        "ssh",
+        "{host}",
+        "-t",
+        "docker",
+        "exec",
+        "-it",
+        "{container}",
+        "tmux",
+        "attach",
+    ]
+    assert by_name["deck"]["env"] == {"DECK_MODE": "quiet"}
+    assert by_name["worker"]["attach"] == []
+    assert by_name["worker"]["env"] == {"THEOZOLITH_REPO": "acme/sandbox"}
+
+    assert state["repo"] == "acme/sandbox"
+    toml_view = state["control_toml"]
+    assert toml_view["control_ip"] == "203.0.113.5"
+    assert toml_view["control_port"] == 443
+    assert toml_view["settings"]["heartbeat_seconds"] == 60.0
+    assert toml_view["settings"]["tail_budget_bytes"] == 10 * 1024**3
+
+    # The channel invariant survives (ADR-0015): the heartbeat's desired
+    # state carries no attach argv — it is consumed control-side only.
+    config = control.heartbeat(node="box1").json()["config"]
+    assert all("attach" not in stack for stack in config["stacks"])

@@ -32,7 +32,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from theozolith_control import joinstring, product, tls
+from theozolith_control import controltoml, joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
@@ -583,10 +583,36 @@ def create_app(
             # API consumer needs no Config Repo or cache.db access.
             "now": store.now(),
             "product_pin": config.product_version or None,
+            # M9 (ADR-0040): entries carry the Stack's attach argv and its
+            # non-secret env declarations too — the Operator TUI resolves
+            # attach commands and the Run timeout budget client-side. This
+            # is the admin read model, not the node channel: attach still
+            # never rides a heartbeat response.
             "desired_stacks": [
-                {"node": s.node, "name": s.name, "kind": s.kind, "state": s.state}
+                {
+                    "node": s.node,
+                    "name": s.name,
+                    "kind": s.kind,
+                    "state": s.state,
+                    "env": dict(s.env),
+                    "attach": list(s.attach),
+                }
                 for s in config.stacks
             ],
+            # The coordination target (owner/name, null when dispatch is
+            # off): the TUI builds issue/PR/evidence links from it exactly
+            # as the dashboard does server-side (ADR-0040).
+            "repo": settings.repo or None,
+            # The read-only settings view (ADR-0040): the address fields and
+            # the EFFECTIVE tier-2 values this serve is running with
+            # (control.toml overlaid with env overrides — what is live, not
+            # what the file says). Editing stays git-native.
+            "control_toml": {
+                "control_ip": settings.control_ip,
+                "control_port": settings.control_port,
+                "browser_origin": settings.browser_origin or None,
+                "settings": {s.key: getattr(settings, s.key) for s in controltoml.SETTINGS},
+            },
         }
 
     @app.get("/api/v1/events")
