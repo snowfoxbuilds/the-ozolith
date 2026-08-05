@@ -395,8 +395,23 @@ def test_status_reads_the_real_state_document(tmp_path, control: ControlRig):
 
 
 def test_status_reflects_real_eviction_through_the_events_api(tmp_path, control: ControlRig):
-    """The rig round-trip for the amendment: a real eviction inside the
-    status window rides GET /api/v1/events into a degraded verdict."""
+    """The rig round-trip for the amendment: status degrades exactly when
+    ITS error query is incomplete — a progress-only eviction leaves it
+    healthy; an evicted error row inside the window degrades it."""
+
+    def fetch(url, path, token, ca):
+        answer = control.client.get(path, headers={"Authorization": f"Bearer {token}"})
+        if answer.status_code >= 400:
+            raise statuscli.Unreachable(url, f"HTTP {answer.status_code}", answer.text)
+        return answer.json()
+
+    def run_status() -> tuple[int, list[str]]:
+        lines: list[str] = []
+        code = statuscli.run(_args(), environ=_environ(tmp_path), fetch=fetch, out=lines.append)
+        return code, lines
+
+    # A recent progress-only eviction: unrelated to the error query —
+    # status stays healthy (no false degradation from unrelated eviction).
     control.store.record_event(
         {
             "type": "theozolith.run.progress",
@@ -408,15 +423,24 @@ def test_status_reflects_real_eviction_through_the_events_api(tmp_path, control:
         }
     )
     assert control.store.evict_progress(budget_bytes=1) == 1
+    code, lines = run_status()
+    assert code == 0, lines
+    assert lines[0] == "healthy"
 
-    def fetch(url, path, token, ca):
-        answer = control.client.get(path, headers={"Authorization": f"Bearer {token}"})
-        if answer.status_code >= 400:
-            raise statuscli.Unreachable(url, f"HTTP {answer.status_code}", answer.text)
-        return answer.json()
-
-    lines: list[str] = []
-    code = statuscli.run(_args(), environ=_environ(tmp_path), fetch=fetch, out=lines.append)
+    # An evicted theozolith.error row inside the 15-minute window: the
+    # error evidence itself is incomplete — degraded, stated explicitly.
+    control.store.record_event(
+        {
+            "type": "theozolith.error",
+            "node": "box1",
+            "component": "node-daemon",
+            "error_class": "RuntimeError",
+            "message": "m" * 1500,
+            "context": "",
+        }
+    )
+    assert control.store.evict_progress(budget_bytes=1) == 1
+    code, lines = run_status()
     assert code == 1
     assert lines[0].startswith("degraded: recent-error history is incomplete")
 

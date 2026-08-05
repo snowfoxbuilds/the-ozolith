@@ -104,35 +104,88 @@ def test_limit_clamps_to_the_page_bounds(control: ControlRig):
     assert control.admin("GET", "/api/v1/events?since=abc").status_code == 400
 
 
-def test_eviction_indicator_appears_exactly_when_rows_were_evicted(control: ControlRig):
-    """ADR-0038: the indicator is recorded by the one deleter in the same
-    transaction and is WINDOW-relative — false before any eviction; after
-    one, true for unbounded reads and for any `since` window reaching into
-    the evicted range, false for windows entirely after it."""
-    progress = {
+def _progress_event(node: str = "box1", issue: int = 1) -> dict:
+    return {
         "type": "theozolith.run.progress",
         "worker": "worker-a",
-        "node": "box1",
-        "issue": 1,
-        "run_id": "r1",
+        "node": node,
+        "issue": issue,
+        "run_id": f"r{issue}",
         "transcript_tail": "x" * 1000,
     }
-    control.node_post("/api/v1/events", progress)
+
+
+def test_eviction_evidence_is_query_relative(control: ControlRig):
+    """ADR-0038 (amended): `evicted` answers for THIS query — filters and
+    window — while `any_evicted` is the global fact. A progress-only
+    eviction never marks an error-only or other-node read incomplete."""
+    control.node_post("/api/v1/events", _progress_event())
     control.node_post("/api/v1/events", run_event(1, "claimed"))
     evicted_at = control.clock.now
-    assert _read(control)["evicted"] is False
+    before = _read(control)
+    assert before["evicted"] is False and before["any_evicted"] is False
 
     assert control.store.evict_progress(budget_bytes=10) == 1
     page = _read(control)
     assert page["evicted"] is True  # unbounded read: all history is the window
+    assert page["any_evicted"] is True
     # Terminal events survive eviction (ADR-0016); only the progress row died.
     assert [e["type"] for e in page["events"]] == ["theozolith.run"]
 
-    # A window that reaches into the evicted range is incomplete…
-    assert _read(control, since=evicted_at - 10)["evicted"] is True
-    assert _read(control, since=evicted_at)["evicted"] is True
-    # …and a window entirely after it is complete again.
+    # Filter-relative: the evicted row was progress on box1 — an error-only
+    # or other-node query is complete and says so (any_evicted stays true).
+    error_page = _read(control, type="theozolith.error")
+    assert error_page["evicted"] is False and error_page["any_evicted"] is True
+    assert _read(control, type="theozolith.run.progress")["evicted"] is True
+    assert _read(control, type="theozolith.run.progress", node="box2")["evicted"] is False
+    assert _read(control, type="theozolith.run.progress", node="box1")["evicted"] is True
+
+    # Window-relative inside a matching filter…
+    assert _read(control, type="theozolith.run.progress", since=evicted_at - 10)["evicted"] is True
+    # …and complete again for a window entirely after the eviction.
     control.clock.advance(100)
     later = _read(control, since=control.clock.now - 50)
-    assert later["evicted"] is False
-    assert later["events"] == []
+    assert later["evicted"] is False and later["any_evicted"] is True
+
+
+def test_matching_error_eviction_marks_error_queries_incomplete(control: ControlRig):
+    error = _error_event(node="box1", component="node-daemon", message="m" * 1500)
+    control.node_post("/api/v1/events", error)
+    assert control.store.evict_progress(budget_bytes=10) == 1
+    assert _read(control, type="theozolith.error")["evicted"] is True
+    assert _read(control, type="theozolith.error", node="box1")["evicted"] is True
+    # Nonmatching node/component filters stay complete.
+    assert _read(control, type="theozolith.error", node="box2")["evicted"] is False
+    assert (
+        _read(control, type="theozolith.error", component="implementer-driver")["evicted"] is False
+    )
+
+
+def test_legacy_watermark_reads_conservatively(control: ControlRig):
+    """A pre-amendment cache carries only the single-row watermark: its
+    scope is unknowable, so every filtered query reads incomplete — and a
+    zero timestamp (unknown reach) is conservative for any window."""
+    control.store._db.execute(
+        "INSERT INTO event_evictions"
+        " (scope, last_evicted_id, evicted_count, evicted_at, last_evicted_received_at)"
+        " VALUES ('events', 5, 3, ?, 0)",
+        (control.clock.now,),
+    )
+    page = _read(control, type="theozolith.error", node="box-unrelated")
+    assert page["evicted"] is True and page["any_evicted"] is True
+    assert _read(control, since=control.clock.now + 999)["evicted"] is True
+
+
+def test_scope_cap_collapses_to_the_conservative_wildcard(control: ControlRig):
+    """Eviction evidence is bounded (never an archive): past the scope cap
+    it collapses to the '*' sentinel, which matches every filter — the
+    conservative direction."""
+    from theozolith_control.store import EVICTION_SCOPE_CAP
+
+    for i in range(EVICTION_SCOPE_CAP + 5):
+        control.store.record_event(_progress_event(node=f"n{i}", issue=i))
+    assert control.store.evict_progress(budget_bytes=0) == EVICTION_SCOPE_CAP + 5
+    scopes = control.store._db.execute("SELECT type FROM event_eviction_scopes").fetchall()
+    assert [s["type"] for s in scopes] == ["*"]
+    # The wildcard matches filters no evicted row ever carried.
+    assert _read(control, type="theozolith.error", node="nowhere")["evicted"] is True

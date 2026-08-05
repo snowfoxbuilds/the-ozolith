@@ -97,20 +97,34 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
 CREATE INDEX IF NOT EXISTS events_received ON events (received_at, id);
--- Eviction evidence (ADR-0038): the one deleter records a watermark in the
--- same transaction as its deletes, so the events read view reports evicted
--- history honestly (cache-not-archive, ADR-0016). One row, scope 'events';
--- last_evicted_received_at is the newest evicted row's timestamp, which
--- makes the indicator window-relative: a `since` query is incomplete only
--- when its window reaches into the evicted range. The row dies with
--- cache.db by design: a wiped cache is an honestly empty store, not an
--- incompleteness claim about rows that no longer exist.
+-- Legacy eviction watermark (ADR-0038, first shape): a single row whose
+-- scope is unknowable. Kept read-only as conservative evidence from
+-- pre-amendment caches — any filtered query reads as incomplete against
+-- it. New evictions write event_eviction_scopes below instead.
 CREATE TABLE IF NOT EXISTS event_evictions (
     scope TEXT PRIMARY KEY,
     last_evicted_id INTEGER NOT NULL,
     evicted_count INTEGER NOT NULL,
     evicted_at REAL NOT NULL,
     last_evicted_received_at REAL NOT NULL DEFAULT 0
+);
+-- Scoped eviction evidence (ADR-0038, filter-relative): one bounded row
+-- per (type, node, component) combination seen among evicted rows —
+-- enough to decide whether an eviction could have matched a filtered
+-- query, never a row-level archive (cache-not-archive, ADR-0016). node
+-- and component are '' when the evicted row had none; the '*' row is the
+-- overflow sentinel: past the scope cap, evidence collapses to
+-- match-everything (the conservative direction). Everything here dies
+-- with cache.db by design.
+CREATE TABLE IF NOT EXISTS event_eviction_scopes (
+    type TEXT NOT NULL,
+    node TEXT NOT NULL,
+    component TEXT NOT NULL,
+    last_evicted_id INTEGER NOT NULL,
+    evicted_count INTEGER NOT NULL,
+    evicted_at REAL NOT NULL,
+    last_evicted_received_at REAL NOT NULL,
+    PRIMARY KEY (type, node, component)
 );
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,6 +271,13 @@ LIFECYCLE_VERBS = ("drain", "recycle", "update", "restart")
 
 # Consecutive failed Runs on one node before the dispatch gate closes.
 QUARANTINE_AFTER_FAILURES = 2
+
+# Distinct (type, node, component) eviction-evidence rows kept before the
+# evidence collapses into the '*' match-everything sentinel (ADR-0038):
+# bounded by decision — evidence about evictions must never itself grow
+# into an archive inside the cache.
+EVICTION_SCOPE_CAP = 64
+EVICTION_WILDCARD = "*"
 
 
 @dataclass(frozen=True)
@@ -735,45 +756,133 @@ class Store:
             if excess <= 0:
                 return 0
             doomed: list[int] = []
-            newest_received = 0.0
+            scopes: dict[tuple[str, str, str], dict[str, Any]] = {}
             for row in self._db.execute(
-                "SELECT id, received_at, LENGTH(payload) AS size FROM events"
-                " WHERE type IN (?, ?) ORDER BY id",
+                "SELECT id, type, node, component, received_at, LENGTH(payload) AS size"
+                " FROM events WHERE type IN (?, ?) ORDER BY id",
                 evictable,
             ):
                 doomed.append(row["id"])
-                newest_received = max(newest_received, row["received_at"])
+                key = (row["type"], row["node"] or "", row["component"] or "")
+                scope = scopes.setdefault(key, {"count": 0, "max_id": 0, "max_received": 0.0})
+                scope["count"] += 1
+                scope["max_id"] = max(scope["max_id"], row["id"])
+                scope["max_received"] = max(scope["max_received"], row["received_at"])
                 excess -= row["size"]
                 if excess <= 0:
                     break
             self._db.executemany("DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed])
-            # The watermark rides the same transaction (ADR-0038): eviction
-            # and its evidence are one atomic fact — including the newest
-            # evicted timestamp, which makes the indicator window-relative.
+            # Scoped evidence rides the same transaction (ADR-0038):
+            # eviction and its evidence are one atomic fact, recorded per
+            # (type, node, component) so a filtered read can tell whether
+            # an eviction could have matched it. Past the cap — or once
+            # collapsed — everything folds into the '*' sentinel.
+            self._record_eviction_scopes(scopes)
+            return len(doomed)
+
+    def _record_eviction_scopes(self, scopes: dict[tuple[str, str, str], dict[str, Any]]) -> None:
+        wildcard = (EVICTION_WILDCARD, EVICTION_WILDCARD, EVICTION_WILDCARD)
+        existing = {
+            (r["type"], r["node"], r["component"])
+            for r in self._db.execute("SELECT type, node, component FROM event_eviction_scopes")
+        }
+        collapse = wildcard in existing or len(existing | set(scopes)) > EVICTION_SCOPE_CAP
+        if collapse and existing != {wildcard}:
+            # Absorb every existing scope's maxima into the sentinel, then
+            # drop the per-scope rows — bounded evidence, still honest.
+            absorbed = self._db.execute(
+                "SELECT MAX(last_evicted_id) AS max_id, SUM(evicted_count) AS count,"
+                " MAX(last_evicted_received_at) AS max_received"
+                " FROM event_eviction_scopes"
+            ).fetchone()
+            self._db.execute("DELETE FROM event_eviction_scopes")
+            if absorbed["max_id"] is not None:
+                scopes = dict(scopes)
+                merged = scopes.setdefault(wildcard, {"count": 0, "max_id": 0, "max_received": 0.0})
+                merged["count"] += absorbed["count"]
+                merged["max_id"] = max(merged["max_id"], absorbed["max_id"])
+                merged["max_received"] = max(merged["max_received"], absorbed["max_received"])
+        if collapse:
+            folded = {"count": 0, "max_id": 0, "max_received": 0.0}
+            for scope in scopes.values():
+                folded["count"] += scope["count"]
+                folded["max_id"] = max(folded["max_id"], scope["max_id"])
+                folded["max_received"] = max(folded["max_received"], scope["max_received"])
+            scopes = {wildcard: folded}
+        now = self._clock()
+        for (type_, node, component), scope in scopes.items():
             self._db.execute(
-                "INSERT INTO event_evictions"
-                " (scope, last_evicted_id, evicted_count, evicted_at, last_evicted_received_at)"
-                " VALUES ('events', ?, ?, ?, ?)"
-                " ON CONFLICT (scope) DO UPDATE SET"
+                "INSERT INTO event_eviction_scopes"
+                " (type, node, component, last_evicted_id, evicted_count, evicted_at,"
+                "  last_evicted_received_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (type, node, component) DO UPDATE SET"
                 " last_evicted_id = MAX(last_evicted_id, excluded.last_evicted_id),"
                 " evicted_count = evicted_count + excluded.evicted_count,"
                 " evicted_at = excluded.evicted_at,"
                 " last_evicted_received_at = MAX(last_evicted_received_at,"
                 "                                excluded.last_evicted_received_at)",
-                (max(doomed), len(doomed), self._clock(), newest_received),
+                (
+                    type_,
+                    node,
+                    component,
+                    scope["max_id"],
+                    scope["count"],
+                    now,
+                    scope["max_received"],
+                ),
             )
-            return len(doomed)
 
     def eviction_mark(self) -> dict[str, Any] | None:
-        """The eviction watermark (ADR-0038), or None while nothing was
-        ever evicted from this cache — including a freshly recreated
-        cache.db, by design."""
+        """The LEGACY single-row watermark (pre-amendment caches), or None.
+        Its scope is unknowable, so any filtered query reads conservatively
+        against it; new evictions record scoped evidence instead."""
         with self._lock:
             row = self._db.execute(
                 "SELECT last_evicted_id, evicted_count, evicted_at, last_evicted_received_at"
                 " FROM event_evictions WHERE scope = 'events'"
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def eviction_evidence(
+        self,
+        *,
+        type: str | None = None,
+        node: str | None = None,
+        component: str | None = None,
+        since: float | None = None,
+    ) -> tuple[bool, bool]:
+        """(any eviction ever, THIS query incomplete) — ADR-0038. The query
+        is incomplete exactly when an evicted row COULD have matched the
+        active type/node/component filters and the ``since`` window.
+        Cursor bounds never exclude: eviction is oldest-first, so evicted
+        rows are precisely what backward pagination was heading toward.
+        The legacy single-row watermark has unknowable scope and reads
+        conservatively; the '*' sentinel matches everything."""
+        any_evicted = False
+        incomplete = False
+        legacy = self.eviction_mark()
+        if legacy is not None:
+            any_evicted = True
+            cutoff = legacy["last_evicted_received_at"]
+            incomplete = since is None or cutoff == 0 or since <= cutoff
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM event_eviction_scopes").fetchall()
+        for row in rows:
+            any_evicted = True
+            if incomplete:
+                break
+            if row["type"] != EVICTION_WILDCARD:
+                if type is not None and row["type"] != type:
+                    continue
+                if node is not None and row["node"] != node:
+                    continue
+                if component is not None and row["component"] != component:
+                    continue
+            if since is not None and since > row["last_evicted_received_at"]:
+                continue
+            incomplete = True
+        return any_evicted, incomplete
 
     def events_page(
         self,
@@ -813,20 +922,14 @@ class Store:
             rows = self._db.execute(
                 query + " ORDER BY id DESC LIMIT ?", [*params, limit]
             ).fetchall()
-        # The eviction indicator is window-relative (ADR-0038): with a
-        # `since` bound, the response is incomplete only when the window
-        # reaches into the evicted range (a 0 timestamp is a pre-amendment
-        # watermark whose reach is unknown — treated as incomplete, the
-        # conservative direction). Without `since` the whole history is the
-        # window, so any eviction ever makes it incomplete.
-        mark = self.eviction_mark()
-        if mark is None:
-            evicted = False
-        elif since is None:
-            evicted = True
-        else:
-            cutoff = mark["last_evicted_received_at"]
-            evicted = cutoff == 0 or since <= cutoff
+        # The eviction indicator is QUERY-relative (ADR-0038): `evicted` is
+        # true exactly when an eviction could have matched this call's
+        # filters and window; `any_evicted` is the global fact (any
+        # eviction ever in this cache). Legacy pre-amendment watermarks
+        # have unknowable scope and read conservatively.
+        any_evicted, query_incomplete = self.eviction_evidence(
+            type=type, node=node, component=component, since=since
+        )
         return {
             "events": [
                 {
@@ -843,7 +946,8 @@ class Store:
             # The cursor is the last id as a decimal string — contractually
             # opaque to clients (ADR-0038).
             "next_cursor": str(rows[-1]["id"]) if len(rows) == limit else None,
-            "evicted": evicted,
+            "evicted": query_incomplete,
+            "any_evicted": any_evicted,
         }
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------
