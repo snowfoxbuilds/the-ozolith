@@ -235,6 +235,28 @@ def _http(method: str, url: str, *, token: str, ca: str, body: dict | None = Non
         return exc.code, {"detail": exc.read().decode(errors="replace")[:300]}
 
 
+# The safe-retry contract (ADR-0037): every phase is idempotent or
+# reconciled, so an interrupted bootstrap resumes with the same command —
+# no --force, no CA rotation, no join string ever shown.
+RESUME_HINT = (
+    "re-run 'sudo theozolith init --with-local-node' to resume — it reconciles"
+    " in place (no --force, no CA rotation, nothing was deleted)"
+)
+
+
+def _revoke_join_token(fetch, api: str, token: str, ca: str, token_id: str, log) -> None:
+    """Best-effort revocation of an unconsumed machine-only token on a
+    failed or interrupted join: the token was never shown to anyone, so
+    nothing should remain outstanding. Failures are swallowed — the token
+    also dies on its own one-hour TTL."""
+    try:
+        status, _ = fetch("DELETE", f"{api}/api/v1/join-tokens/{token_id}", token=token, ca=ca)
+        if status == 200:
+            log("local node [join]: revoked the unconsumed join token")
+    except Exception:  # best-effort by design
+        pass
+
+
 def bootstrap_local_node(
     settings: ControlSettings,
     *,
@@ -248,24 +270,29 @@ def bootstrap_local_node(
     state_dir: Path = NODE_STATE_DIR,
     log=print,
 ) -> None:
-    """Install the daemon, start the control service early (the real
-    supervisor from the first heartbeat; ADR-0035/0037), and run the
-    unmodified join flow against a temporary loopback bootstrap listener.
-    The join string is never logged or displayed."""
+    """The local bootstrap, in explicit phases (ADR-0037) — install,
+    start-control, reconcile, join (temporary listener → mint → provision →
+    consumption check), heartbeat. Every phase is idempotent or reconciled,
+    so a failure at any boundary is retried with the same command; the
+    reconcile phase makes an already-provisioned node a no-op and never
+    deletes provisioned state. The join string is never logged or
+    displayed."""
     from theozolith_control.cli import CONTROL_SERVICE_NAME
 
     api = _loopback_api(settings)
     ca = str(settings.tls_dir / CA_FILE)
     token = settings.admin_token
 
+    # Phase: install — service user, state dir, unit; idempotent.
     install_node_daemon(
         nodedaemon_exec, runner=runner, unit_path=unit_path, state_dir=state_dir, log=log
     )
 
-    # Early serve start: the systemd unit installed by init IS the serve
-    # lifecycle — no throwaway in-process server (ADR-0037).
+    # Phase: start-control — the systemd unit installed by init IS the
+    # serve lifecycle (no throwaway in-process server; ADR-0035/0037), and
+    # `systemctl start` is idempotent on a running service.
     _run_step(runner, ["systemctl", "start", CONTROL_SERVICE_NAME], "starting the control service")
-    log(f"started {CONTROL_SERVICE_NAME}; waiting for {api} ...")
+    log(f"local node [start-control]: {CONTROL_SERVICE_NAME} started; waiting for {api} ...")
     deadline = clock() + SERVE_READY_TIMEOUT
     while True:
         try:
@@ -278,62 +305,97 @@ def bootstrap_local_node(
             raise SystemExit(
                 f"error: the control service did not answer {api} within"
                 f" {SERVE_READY_TIMEOUT:.0f}s — check 'systemctl status"
-                f" {CONTROL_SERVICE_NAME}' and 'journalctl -u {CONTROL_SERVICE_NAME}'"
+                f" {CONTROL_SERVICE_NAME}' and 'journalctl -u {CONTROL_SERVICE_NAME}';"
+                f" then {RESUME_HINT}"
             )
         sleep(0.5)
 
-    # The temporary loopback listener (ADR-0037): the same class serve
-    # runs, second instance, loopback-only, ephemeral port — it exists so
-    # the local daemon fetches the CA and a LOOPBACK control URL, then
-    # dies. The production listener keeps answering the LAN unchanged.
-    listener = BootstrapServer(
-        ca_pem=(settings.tls_dir / CA_FILE).read_bytes(),
-        origin="",
-        control_url=api,
-        port=0,
-        host="127.0.0.1",
-    )
-    listener.start()
-    try:
-        # join-token create, through the standard endpoint with an explicit
-        # loopback addr — the same mint a human's CLI or the dashboard uses.
-        status, minted = fetch(
-            "POST",
-            f"{api}/api/v1/join-tokens",
-            token=token,
-            ca=ca,
-            body={"addr": f"127.0.0.1:{listener.port}"},
+    # Phase: reconcile — a retry must not re-provision what already
+    # exists. Provisioning is registration (ADR-0023): a node row means the
+    # exchange completed and per-node state is persisted on disk.
+    status, state = fetch("GET", f"{api}/api/v1/state", token=token, ca=ca)
+    row = None
+    if status == 200:
+        row = next((n for n in state.get("nodes", []) if n.get("name") == node_name), None)
+    if row is not None and row.get("version"):
+        log(f"local node [reconcile]: {node_name!r} is already registered and heartbeating")
+        return
+    if row is not None:
+        # Provisioned but silent: the daemon never came up (or died before
+        # its first heartbeat). Restart it — never re-provision, never
+        # delete the node.
+        log(
+            f"local node [reconcile]: {node_name!r} is provisioned but not heartbeating"
+            " — restarting the daemon"
         )
-        if status != 200 or not minted.get("join_string"):
-            raise SystemExit(f"error: could not mint the local join token: {minted}")
-        log("minted the local join token (single-use; the join string is machine-consumed)")
-
-        # The provision line, machine-composed and machine-run: the exact
-        # grammar a human paste executes, through the installed CLI.
-        proc = runner(
-            [nodedaemon_exec, "provision", str(minted["join_string"]), "--node", node_name],
-            capture_output=True,
-            text=True,
-            check=False,
+        _run_step(runner, ["systemctl", "enable", NODE_SERVICE_NAME], "enabling the node daemon")
+        _run_step(runner, ["systemctl", "restart", NODE_SERVICE_NAME], "restarting the node daemon")
+    else:
+        # Phase: join — the temporary loopback listener (ADR-0037): the
+        # same class serve runs, second instance, loopback-only, ephemeral
+        # port — it exists so the local daemon fetches the CA and a
+        # LOOPBACK control URL, then dies. The production listener keeps
+        # answering the LAN unchanged; it is stopped on every exit path.
+        listener = BootstrapServer(
+            ca_pem=(settings.tls_dir / CA_FILE).read_bytes(),
+            origin="",
+            control_url=api,
+            port=0,
+            host="127.0.0.1",
         )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()[:500]
-            raise SystemExit(f"error: local node provisioning failed: {detail}")
-        log(f"provisioned local node {node_name!r} (loopback dial address persisted)")
-
-        # The join token must be consumed (single-use, redeemed on exchange).
-        status, outstanding = fetch("GET", f"{api}/api/v1/join-tokens", token=token, ca=ca)
-        ids = {row.get("id") for row in outstanding.get("tokens", [])}
-        if minted.get("id") in ids:
-            raise SystemExit(
-                "error: the local join token was not consumed — the exchange did"
-                " not complete; check the daemon journal"
+        listener.start()
+        minted_id = ""
+        try:
+            # Mint through the standard endpoint with an explicit loopback
+            # addr — the same mint a human's CLI or the dashboard uses.
+            status, minted = fetch(
+                "POST",
+                f"{api}/api/v1/join-tokens",
+                token=token,
+                ca=ca,
+                body={"addr": f"127.0.0.1:{listener.port}"},
             )
-    finally:
-        listener.stop()
+            if status != 200 or not minted.get("join_string"):
+                raise SystemExit(f"error: could not mint the local join token: {minted}")
+            minted_id = str(minted.get("id") or "")
+            log("local node [join]: token minted (single-use; the join string is machine-consumed)")
 
-    # Registered and heartbeating: the exchange registered the node; wait
-    # for the daemon's first real heartbeat (it reports its version).
+            # The provision line, machine-composed and machine-run: the
+            # exact grammar a human paste executes, through the installed
+            # CLI — the one provisioning implementation.
+            proc = runner(
+                [nodedaemon_exec, "provision", str(minted["join_string"]), "--node", node_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()[:500]
+                raise SystemExit(f"error: local node provisioning failed: {detail}\n{RESUME_HINT}")
+            log(f"local node [join]: {node_name!r} provisioned (loopback dial address persisted)")
+
+            # The join token must be consumed (single-use, redeemed on
+            # exchange).
+            status, outstanding = fetch("GET", f"{api}/api/v1/join-tokens", token=token, ca=ca)
+            ids = {r.get("id") for r in outstanding.get("tokens", [])}
+            if minted_id and minted_id in ids:
+                raise SystemExit(
+                    "error: the local join token was not consumed — the exchange did"
+                    f" not complete; check the daemon journal, then {RESUME_HINT}"
+                )
+        except BaseException:
+            # Failed or interrupted between mint and consumption: nothing
+            # machine-only may stay outstanding.
+            if minted_id:
+                _revoke_join_token(fetch, api, token, ca, minted_id, log)
+            raise
+        finally:
+            listener.stop()
+
+    # Phase: heartbeat — the exchange registered the node; wait for the
+    # daemon's first real heartbeat (it reports its version). A timeout
+    # deletes NOTHING: the node stays provisioned and registered, and the
+    # retry's reconcile phase restarts the daemon instead of re-joining.
     deadline = clock() + HEARTBEAT_TIMEOUT
     while True:
         status, state = fetch("GET", f"{api}/api/v1/state", token=token, ca=ca)
@@ -343,12 +405,13 @@ def bootstrap_local_node(
             break
         if clock() >= deadline:
             raise SystemExit(
-                f"error: local node {node_name!r} registered but no heartbeat"
-                f" arrived within {HEARTBEAT_TIMEOUT:.0f}s — check 'journalctl -fu"
-                f" {NODE_SERVICE_NAME}'"
+                f"error: local node {node_name!r} is provisioned and registered, but no"
+                f" heartbeat arrived within {HEARTBEAT_TIMEOUT:.0f}s — nothing was"
+                f" deleted. Check 'journalctl -fu {NODE_SERVICE_NAME}'; then"
+                f" {RESUME_HINT}"
             )
         sleep(2.0)
-    log(f"local node {node_name!r} is registered and heartbeating")
+    log(f"local node [heartbeat]: {node_name!r} is registered and heartbeating")
 
 
 # -- the stage-don't-deploy scaffold (ADR-0037) ----------------------------------

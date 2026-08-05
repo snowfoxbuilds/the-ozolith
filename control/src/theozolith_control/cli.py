@@ -590,14 +590,20 @@ def _init(args) -> int:
     settings = load_settings()
     existing_ip = controltoml.read_control_ip(settings.config_repo)
     initialized = bool(existing_ip) or settings.key_path.is_file()
-    if initialized and not args.force:
+    # A repeated --with-local-node on an initialized box is a RESUME, not a
+    # re-init (ADR-0037): every local-node phase is idempotent or
+    # reconciled, and a failed bootstrap must be retryable without --force
+    # or a CA rotation.
+    resume_local = initialized and not args.force and getattr(args, "with_local_node", False)
+    if initialized and not args.force and not resume_local:
         raise SystemExit(
             f"error: {settings.data_dir} is already initialized"
             f" ({existing_ip or 'master key present'}) — pass --force to re-run."
             " A new CA invalidates the pinned ca.pem on EVERY provisioned node:"
             " the whole fleet fails TLS until each box gets one join-string"
             " re-paste. Device trust and every outstanding join string are"
-            " invalidated too."
+            " invalidated too. (A partial single-node bootstrap resumes with"
+            " 'init --with-local-node' alone — no --force needed.)"
         )
 
     # Root-mediated init fails BEFORE any state is written: a bad
@@ -622,6 +628,9 @@ def _init(args) -> int:
                 " outside any container"
             )
         nodedaemon_exec = localnode.ensure_preconditions()
+
+    if resume_local:
+        return _resume_local_node(settings, nodedaemon_exec)
 
     # The control IP (ADR-0031): confirmed once, persisted, and the ONLY
     # address any mint surface will ever embed. Inside a container the
@@ -703,6 +712,43 @@ def _init(args) -> int:
 
     # 6. The handoff.
     _print_handoff(settings, ip, port, unit_installed)
+    return 0
+
+
+def _resume_local_node(settings: ControlSettings, nodedaemon_exec: str) -> int:
+    """The retry path (ADR-0037): re-running ``init --with-local-node`` on
+    an initialized box resumes the local bootstrap in place — no --force,
+    no CA rotation, operator edits preserved. The standard-init artifacts
+    must already exist: a damaged PARTITION is recover's territory, not
+    resume's."""
+    problems = [
+        f"missing {name} at {path}"
+        for name, path in (
+            ("master key", settings.key_path),
+            ("CA certificate", settings.tls_dir / CA_FILE),
+            ("CA private key", settings.tls_dir / CA_KEY_FILE),
+            ("server certificate", settings.tls_dir / CERT_FILE),
+        )
+        if not path.is_file()
+    ]
+    if not settings.control_ip:
+        problems.append("no persisted control IP in control.toml")
+    if problems:
+        raise SystemExit(
+            "error: cannot resume --with-local-node — the standard init state is"
+            " incomplete:\n  - "
+            + "\n  - ".join(problems)
+            + "\nrestore it ('theozolith recover' from a backup) or re-init with --force."
+        )
+    _log("already initialized — resuming the local node in place (CA untouched;")
+    _log("completed phases are skipped or reconciled; ADR-0037)")
+    node_name = socket.gethostname()
+    localnode.write_scaffold(settings.config_repo, node_name, log=_log)
+    _install_systemd_unit(settings, settings.control_port)
+    localnode.bootstrap_local_node(
+        settings, node_name=node_name, nodedaemon_exec=nodedaemon_exec, log=_log
+    )
+    _print_local_handoff(settings, settings.control_ip, settings.control_port, node_name)
     return 0
 
 

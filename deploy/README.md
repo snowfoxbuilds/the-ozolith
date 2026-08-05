@@ -77,6 +77,16 @@ Stacks and worker types on top, never below.
    and the `theozolith-nodedaemon` CLI in the same install (the bare-metal
    build installs all four distributions).
 
+   **If the local bootstrap fails or is interrupted** (a phase timeout, a
+   provisioning error, Ctrl-C): re-run the same command —
+   `sudo theozolith init --with-local-node`, no `--force`. On an initialized
+   box it resumes in place: the CA never rotates, completed phases are
+   skipped or reconciled (an already-provisioned node is restarted, never
+   re-provisioned or deleted), operator edits in `configs/` are preserved,
+   an unconsumed machine-only join token was already revoked on the way
+   out, and no join string is ever shown. `--force` remains what it always
+   was — a full re-init with a NEW CA — and is never needed for a retry.
+
    Everything lands under `/var/lib/theozolith-control/` on a root-mediated
    bare-metal install — that exact path is the only one the root installer
    will manage or `chown` (a `THEOZOLITH_DATA_DIR` override is refused there;

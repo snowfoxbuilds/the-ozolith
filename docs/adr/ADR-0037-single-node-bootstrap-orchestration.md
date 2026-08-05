@@ -25,7 +25,13 @@ Both delegated options are used, each where it is honest:
 5. **Join, exactly as a human would**: init mints the join token through `POST /api/v1/join-tokens` with the admin bearer token and an explicit `addr = 127.0.0.1:<listener port>` (the same endpoint and `--addr` mechanism `join-token create` uses), installs the node-side prerequisites (the `ozolith` system user in the `docker` group, `/var/lib/theozolith` at 0750, the `theozolith-nodedaemon.service` unit, daemon-reload — the same steps `install-nodedaemon.sh` performs, minus the venv install that already happened; a test pins the two unit bodies against drift), then runs the provision line as a child process: `theozolith-nodedaemon provision '<join string>' --node <hostname>`. That is byte-for-byte the grammar a human paste runs — parse, fingerprint check against the temporary listener, TLS exchange against the real serve at loopback, persist, enable, restart. The join string is never printed.
 6. **Verification before the handoff**: init confirms the join token was consumed and waits for the node's first heartbeat to land in `/api/v1/state`, then prints a local-node handoff (service running, node registered, Stack staged — no "start serving" step, since serve already runs).
 
-Failure anywhere fails loudly with the completed steps named; re-running requires `--force` like any re-init.
+### Explicit phases, and failure is resumable — never `--force`
+
+The bootstrap runs as named phases, each idempotent or reconciled: **install** (service user, state dir, unit — repairs in place) → **start-control** (`systemctl start` is idempotent; readiness polled) → **reconcile** (see below) → **join** (temporary listener → mint → provision → consumption check) → **heartbeat** (first real heartbeat observed). A failure at any boundary names the phase and the retry: **re-running `init --with-local-node` on an initialized box is a resume, not a re-init** — it skips the standard-init mutations entirely (no CA rotation, no address rewrite, no cert re-mint), verifies the standard artifacts exist (a damaged partition is `recover`'s territory), and re-enters the phases. The plain-`init` `--force` guard stands unchanged for everything else.
+
+The **reconcile** phase is what makes retry safe: provisioning is registration (ADR-0023), so a node row in `/api/v1/state` means the exchange completed and per-node state is persisted on the node's disk. A registered node that heartbeats is a no-op; a registered node that never heartbeat gets its daemon enabled and restarted — **never re-provisioned, never deleted**. In particular a first-heartbeat timeout deletes nothing: the error says so and names the resume command. Only an unregistered node enters the join phase.
+
+Failure hygiene inside the join phase: the temporary listener is stopped on **every** exit path (including interrupts), and a machine-only join token that was minted but not consumed is **revoked best-effort** on the way out — nothing the human never saw may stay outstanding (the one-hour TTL is the backstop when revocation itself fails). A token the exchange consumed is left alone. The join string is never printed, logged, or carried in an error message on any path.
 
 ### The scaffold: complete, commented, stopped
 
@@ -45,7 +51,7 @@ Desired state stops carrying image recipes for stopped Stacks: `desired_state_fo
 
 ## Consequences
 
-- **Positive**: one provisioning mechanism at every fleet size — the internal flow is a caller of the standard machinery, testable by asserting the argv it runs and by the existing `LiveControl` end-to-end rig; the local node's loopback dial address makes LAN renumbering a non-event for it; first boot is inert by construction.
+- **Positive**: one provisioning mechanism at every fleet size — the internal flow is a caller of the standard machinery, testable by asserting the argv it runs and by the existing `LiveControl` end-to-end rig; the local node's loopback dial address makes LAN renumbering a non-event for it; first boot is inert by construction; an interrupted bootstrap retries with the same command, keeping the CA, the provisioned node, and every operator edit.
 - **Negative**: `--with-local-node` hard-requires the all-distributions bare-metal install (refusal with remediation otherwise); the node-side install steps exist twice (shell installer for remote boxes, Python for the local one) — held together by a unit-body drift test rather than a shared file, accepted because the shell installer must stay a curl-able standalone.
 - **Neutral**: multi-node join-string provisioning is byte-for-byte unchanged (the temporary listener is invisible off-box — it binds loopback); quarantine, drain, and Stack mechanics are the multi-node ones unchanged.
 
