@@ -81,11 +81,16 @@ Stacks and worker types on top, never below.
    provisioning error, Ctrl-C): re-run the same command —
    `sudo theozolith init --with-local-node`, no `--force`. On an initialized
    box it resumes in place: the CA never rotates, completed phases are
-   skipped or reconciled (an already-provisioned node is restarted, never
-   re-provisioned or deleted), operator edits in `configs/` are preserved,
-   an unconsumed machine-only join token was already revoked on the way
-   out, and no join string is ever shown. `--force` remains what it always
-   was — a full re-init with a NEW CA — and is never needed for a retry.
+   skipped or reconciled, operator edits in `configs/` are preserved, an
+   unconsumed machine-only join token was already revoked on the way out,
+   and no join string is ever shown. Reconciliation proves health rather
+   than assuming it: a registered node counts as healthy only with a fresh
+   heartbeat (on the server's clock) on top of a valid on-disk identity;
+   a stale or silent node is restarted and must heartbeat again before the
+   resume succeeds; a node whose local state is missing or corrupt fails
+   with explicit restore/re-provision instructions — nothing is deleted
+   automatically. `--force` remains what it always was — a full re-init
+   with a NEW CA — and is never needed for a retry.
 
    Everything lands under `/var/lib/theozolith-control/` on a root-mediated
    bare-metal install — that exact path is the only one the root installer
