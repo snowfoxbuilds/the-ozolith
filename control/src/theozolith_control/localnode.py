@@ -243,6 +243,66 @@ RESUME_HINT = (
     " in place (no --force, no CA rotation, nothing was deleted)"
 )
 
+# Liveness evidence must be CURRENT: a node row's `version` is historical
+# (the last heartbeat ever), so reconciliation classifies the row by the
+# state document's own server clock against the fleet staleness threshold
+# (ADR-0022/0039 — the same 150s the dashboard and status use).
+FRESH_HEARTBEAT_SECONDS = 150.0
+
+# The provision child's failure diagnostics are ALLOWLISTED classes from
+# the ADR-0025 error catalogue: once a join string exists, raw
+# stdout/stderr is never reprinted (a diagnostic that quotes argv would
+# disclose machine-only join material). Classification beats redaction —
+# every message below is a constant, disclosure-free by construction.
+PROVISION_FAILURE_CLASSES = (
+    ("malformed join string", "malformed join string"),
+    ("unsupported join-string version", "unsupported join-string version"),
+    ("CA fingerprint mismatch", "CA fingerprint mismatch (possible MITM, or a stale CA)"),
+    ("join token rejected", "join token rejected (expired, consumed, or revoked)"),
+)
+
+
+def _provision_failure_class(output: str) -> str:
+    for needle, label in PROVISION_FAILURE_CLASSES:
+        if needle in output:
+            return label
+    return "unrecognized failure (the child's output was withheld: it could contain join material)"
+
+
+def _read_state_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def local_identity_problem(
+    settings: ControlSettings, state_dir: Path, node_name: str
+) -> str | None:
+    """Why the on-disk daemon identity cannot back the registered local
+    node, or None when it can (the provisioned layout, ADR-0023): a
+    loopback dial address, this box's node name, a per-node token, and
+    exactly the CA this deployment pins. A registered row is trusted only
+    on top of a valid identity — the row alone proves an exchange once
+    happened, not that this box can still be that node."""
+    control_url = _read_state_file(state_dir / "control-url")
+    if not control_url:
+        return f"missing or unreadable {state_dir / 'control-url'}"
+    if not control_url.startswith("https://127.0.0.1"):
+        return f"persisted dial address {control_url!r} is not loopback"
+    name = _read_state_file(state_dir / "node-name")
+    if name != node_name:
+        return f"persisted node name {name!r} is not {node_name!r}"
+    if not _read_state_file(state_dir / "node-token"):
+        return f"missing or empty {state_dir / 'node-token'}"
+    try:
+        pinned = (state_dir / "ca.pem").read_bytes()
+    except OSError:
+        return f"missing or unreadable {state_dir / 'ca.pem'}"
+    if pinned != (settings.tls_dir / CA_FILE).read_bytes():
+        return "the pinned ca.pem is not this deployment's CA (rotated since provisioning?)"
+    return None
+
 
 def _revoke_join_token(fetch, api: str, token: str, ca: str, token_id: str, log) -> None:
     """Best-effort revocation of an unconsumed machine-only token on a
@@ -311,107 +371,182 @@ def bootstrap_local_node(
         sleep(0.5)
 
     # Phase: reconcile — a retry must not re-provision what already
-    # exists. Provisioning is registration (ADR-0023): a node row means the
-    # exchange completed and per-node state is persisted on disk.
+    # exists, and must not TRUST what it cannot prove. Provisioning is
+    # registration (ADR-0023): a node row means an exchange once completed
+    # — it is trusted only on top of a valid on-disk identity, and
+    # "heartbeating" is claimed only from CURRENT evidence (the server's
+    # own clock against the fleet staleness threshold), never from the
+    # historical `version` column.
     status, state = fetch("GET", f"{api}/api/v1/state", token=token, ca=ca)
-    row = None
+    row, server_now = None, 0.0
     if status == 200:
+        server_now = float(state.get("now") or 0.0)
         row = next((n for n in state.get("nodes", []) if n.get("name") == node_name), None)
-    if row is not None and row.get("version"):
-        log(f"local node [reconcile]: {node_name!r} is already registered and heartbeating")
-        return
     if row is not None:
-        # Provisioned but silent: the daemon never came up (or died before
-        # its first heartbeat). Restart it — never re-provision, never
-        # delete the node.
+        problem = local_identity_problem(settings, state_dir, node_name)
+        if problem:
+            raise SystemExit(
+                f"error: node {node_name!r} is registered on the control plane, but this"
+                f" box's daemon identity cannot back it: {problem}.\n"
+                f"Restore {state_dir} from this box's own backup, or revoke the stale"
+                f" registration (POST /api/v1/nodes/{node_name}/revoke with the admin"
+                " token) and re-run 'sudo theozolith init --with-local-node' to"
+                " re-provision. Nothing is deleted automatically."
+            )
+        last_seen = float(row.get("last_seen") or 0.0)
+        fresh = (
+            bool(row.get("version"))
+            and server_now > 0.0
+            and (server_now - last_seen) <= FRESH_HEARTBEAT_SECONDS
+        )
+        if fresh:
+            log(
+                f"local node [reconcile]: {node_name!r} heartbeat"
+                f" {server_now - last_seen:.0f}s ago (fresh) — nothing to do"
+            )
+            return
+        # Registered but not demonstrably alive (never heartbeat, or the
+        # last heartbeat is stale). Restart the daemon — never
+        # re-provision, never delete the node — and demand fresh proof.
         log(
-            f"local node [reconcile]: {node_name!r} is provisioned but not heartbeating"
-            " — restarting the daemon"
+            f"local node [reconcile]: {node_name!r} is registered but not demonstrably"
+            " heartbeating — restarting the daemon"
         )
         _run_step(runner, ["systemctl", "enable", NODE_SERVICE_NAME], "enabling the node daemon")
         _run_step(runner, ["systemctl", "restart", NODE_SERVICE_NAME], "restarting the node daemon")
-    else:
-        # Phase: join — the temporary loopback listener (ADR-0037): the
-        # same class serve runs, second instance, loopback-only, ephemeral
-        # port — it exists so the local daemon fetches the CA and a
-        # LOOPBACK control URL, then dies. The production listener keeps
-        # answering the LAN unchanged; it is stopped on every exit path.
-        listener = BootstrapServer(
-            ca_pem=(settings.tls_dir / CA_FILE).read_bytes(),
-            origin="",
-            control_url=api,
-            port=0,
-            host="127.0.0.1",
+        _await_heartbeat(
+            fetch,
+            api,
+            token=token,
+            ca=ca,
+            node_name=node_name,
+            baseline=last_seen,
+            clock=clock,
+            sleep=sleep,
         )
-        listener.start()
-        minted_id = ""
-        try:
-            # Mint through the standard endpoint with an explicit loopback
-            # addr — the same mint a human's CLI or the dashboard uses.
-            status, minted = fetch(
-                "POST",
-                f"{api}/api/v1/join-tokens",
-                token=token,
-                ca=ca,
-                body={"addr": f"127.0.0.1:{listener.port}"},
+        log(f"local node [heartbeat]: {node_name!r} is registered and heartbeating")
+        return
+
+    # Phase: join — the temporary loopback listener (ADR-0037): the same
+    # class serve runs, second instance, loopback-only, ephemeral port —
+    # it exists so the local daemon fetches the CA and a LOOPBACK control
+    # URL, then dies. The production listener keeps answering the LAN
+    # unchanged; it is stopped on every exit path.
+    listener = BootstrapServer(
+        ca_pem=(settings.tls_dir / CA_FILE).read_bytes(),
+        origin="",
+        control_url=api,
+        port=0,
+        host="127.0.0.1",
+    )
+    listener.start()
+    minted_id = ""
+    try:
+        # Mint through the standard endpoint with an explicit loopback
+        # addr — the same mint a human's CLI or the dashboard uses. The
+        # response body is NEVER interpolated into a diagnostic (it
+        # carries the join string); a mint is accepted only when the
+        # status, the token id, and the join string are all present, and
+        # the id is held separately so cleanup can revoke without the
+        # string.
+        status, minted = fetch(
+            "POST",
+            f"{api}/api/v1/join-tokens",
+            token=token,
+            ca=ca,
+            body={"addr": f"127.0.0.1:{listener.port}"},
+        )
+        minted_id = str(minted.get("id") or "") if status == 200 else ""
+        join_string = str(minted.get("join_string") or "") if status == 200 else ""
+        if not (status == 200 and minted_id and join_string):
+            raise SystemExit(
+                f"error: could not mint a usable local join token (HTTP {status};"
+                f" token id {'present' if minted_id else 'MISSING'}, join string"
+                f" {'present' if join_string else 'MISSING'}) — nothing was"
+                " provisioned. An id-less mint cannot be revoked; the one-hour TTL"
+                " is the backstop. Check 'journalctl -u theozolith-control.service';"
+                f" then {RESUME_HINT}"
             )
-            if status != 200 or not minted.get("join_string"):
-                raise SystemExit(f"error: could not mint the local join token: {minted}")
-            minted_id = str(minted.get("id") or "")
-            log("local node [join]: token minted (single-use; the join string is machine-consumed)")
+        log("local node [join]: token minted (single-use; the join string is machine-consumed)")
 
-            # The provision line, machine-composed and machine-run: the
-            # exact grammar a human paste executes, through the installed
-            # CLI — the one provisioning implementation.
-            proc = runner(
-                [nodedaemon_exec, "provision", str(minted["join_string"]), "--node", node_name],
-                capture_output=True,
-                text=True,
-                check=False,
+        # The provision line, machine-composed and machine-run: the exact
+        # grammar a human paste executes, through the installed CLI — the
+        # one provisioning implementation. From here on, raw child output
+        # is never reprinted: failures surface as allowlisted classes.
+        proc = runner(
+            [nodedaemon_exec, "provision", join_string, "--node", node_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            failure = _provision_failure_class(f"{proc.stderr or ''}\n{proc.stdout or ''}")
+            raise SystemExit(f"error: local node provisioning failed: {failure}\n{RESUME_HINT}")
+        log(f"local node [join]: {node_name!r} provisioned (loopback dial address persisted)")
+
+        # The join token must be consumed (single-use, redeemed on
+        # exchange).
+        status, outstanding = fetch("GET", f"{api}/api/v1/join-tokens", token=token, ca=ca)
+        ids = {r.get("id") for r in outstanding.get("tokens", [])}
+        if minted_id in ids:
+            raise SystemExit(
+                "error: the local join token was not consumed — the exchange did"
+                f" not complete; check the daemon journal, then {RESUME_HINT}"
             )
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()[:500]
-                raise SystemExit(f"error: local node provisioning failed: {detail}\n{RESUME_HINT}")
-            log(f"local node [join]: {node_name!r} provisioned (loopback dial address persisted)")
+    except BaseException:
+        # Failed or interrupted anywhere after the mint answered: nothing
+        # machine-only may stay outstanding when an id exists to revoke.
+        if minted_id:
+            _revoke_join_token(fetch, api, token, ca, minted_id, log)
+        raise
+    finally:
+        listener.stop()
 
-            # The join token must be consumed (single-use, redeemed on
-            # exchange).
-            status, outstanding = fetch("GET", f"{api}/api/v1/join-tokens", token=token, ca=ca)
-            ids = {r.get("id") for r in outstanding.get("tokens", [])}
-            if minted_id and minted_id in ids:
-                raise SystemExit(
-                    "error: the local join token was not consumed — the exchange did"
-                    f" not complete; check the daemon journal, then {RESUME_HINT}"
-                )
-        except BaseException:
-            # Failed or interrupted between mint and consumption: nothing
-            # machine-only may stay outstanding.
-            if minted_id:
-                _revoke_join_token(fetch, api, token, ca, minted_id, log)
-            raise
-        finally:
-            listener.stop()
+    # Phase: heartbeat — demand fresh proof of the daemon's first real
+    # heartbeat. A timeout deletes NOTHING: the node stays provisioned and
+    # registered, and the retry's reconcile phase restarts the daemon
+    # instead of re-joining.
+    _await_heartbeat(
+        fetch,
+        api,
+        token=token,
+        ca=ca,
+        node_name=node_name,
+        baseline=0.0,
+        clock=clock,
+        sleep=sleep,
+    )
+    log(f"local node [heartbeat]: {node_name!r} is registered and heartbeating")
 
-    # Phase: heartbeat — the exchange registered the node; wait for the
-    # daemon's first real heartbeat (it reports its version). A timeout
-    # deletes NOTHING: the node stays provisioned and registered, and the
-    # retry's reconcile phase restarts the daemon instead of re-joining.
+
+def _await_heartbeat(fetch, api, *, token, ca, node_name, baseline, clock, sleep) -> None:
+    """Success requires PROOF of liveness, never a stale echo: a heartbeat
+    (the `version` column is heartbeat-written) whose `last_seen` is at or
+    after the reconciliation baseline AND fresh against the fleet
+    staleness threshold on the server's own clock. A timeout deletes
+    nothing and names the resume command."""
     deadline = clock() + HEARTBEAT_TIMEOUT
     while True:
         status, state = fetch("GET", f"{api}/api/v1/state", token=token, ca=ca)
-        rows = {n.get("name"): n for n in state.get("nodes", [])} if status == 200 else {}
-        row = rows.get(node_name)
-        if row is not None and row.get("version"):
-            break
+        if status == 200:
+            server_now = float(state.get("now") or 0.0)
+            row = next((n for n in state.get("nodes", []) if n.get("name") == node_name), None)
+            if row is not None and row.get("version"):
+                last_seen = float(row.get("last_seen") or 0.0)
+                if (
+                    last_seen >= baseline
+                    and server_now > 0.0
+                    and (server_now - last_seen) <= FRESH_HEARTBEAT_SECONDS
+                ):
+                    return
         if clock() >= deadline:
             raise SystemExit(
                 f"error: local node {node_name!r} is provisioned and registered, but no"
-                f" heartbeat arrived within {HEARTBEAT_TIMEOUT:.0f}s — nothing was"
+                f" fresh heartbeat arrived within {HEARTBEAT_TIMEOUT:.0f}s — nothing was"
                 f" deleted. Check 'journalctl -fu {NODE_SERVICE_NAME}'; then"
                 f" {RESUME_HINT}"
             )
         sleep(2.0)
-    log(f"local node [heartbeat]: {node_name!r} is registered and heartbeating")
 
 
 # -- the stage-don't-deploy scaffold (ADR-0037) ----------------------------------

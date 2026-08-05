@@ -91,12 +91,19 @@ def test_install_node_daemon_lays_down_user_dir_and_unit(tmp_path, monkeypatch):
 # -- the internal join: unmodified flow, machine-consumed ------------------------
 
 
+NOW = 1_000_000.0
+JOIN_STRING = "ozjoin1:MACHINE-ONLY-SECRET"
+FAKE_CA = b"--fake ca pem--"
+
+
 class Harness:
     """Fake runner + API for bootstrap_local_node: records everything and
-    answers like a healthy serve. ``pre_registered`` seeds the node row the
-    reconcile phase sees BEFORE any provisioning (None = absent, "" =
-    registered but silent, a version = heartbeating); after a recorded
-    provision or daemon restart, the node answers as heartbeating."""
+    answers like a healthy serve with a server clock. ``pre_row`` seeds the
+    node row the reconcile phase sees BEFORE any provisioning (None =
+    absent; a dict with version/last_seen otherwise); after a recorded
+    successful provision or a daemon restart, the node answers as freshly
+    heartbeating. ``write_identity`` lays down the provisioned on-disk
+    layout the reconcile phase validates."""
 
     def __init__(
         self,
@@ -104,35 +111,56 @@ class Harness:
         *,
         consume_token: bool = True,
         provision_rc: int = 0,
-        pre_registered: str | None = None,
+        provision_stderr: str = "CA fingerprint mismatch: possible MITM, or a stale join string",
+        pre_row: dict | None = None,
+        mint_response: tuple[int, dict] | None = None,
     ):
         self.settings = make_settings(tmp_path)
         self.settings.tls_dir.mkdir(parents=True, exist_ok=True)
-        (self.settings.tls_dir / "ca.pem").write_bytes(b"--fake ca pem--")
+        (self.settings.tls_dir / "ca.pem").write_bytes(FAKE_CA)
+        self.state_dir = tmp_path / "state"
         self.calls: list[list[str]] = []
         self.fetches: list[tuple[str, str, dict | None]] = []
         self.logs: list[str] = []
         self.minted_addr = ""
         self.consume_token = consume_token
         self.provision_rc = provision_rc
-        self.pre_registered = pre_registered
+        self.provision_stderr = provision_stderr
+        self.pre_row = pre_row
+        self.mint_response = mint_response
+
+    def write_identity(
+        self,
+        *,
+        ca: bytes = FAKE_CA,
+        name: str = "localbox",
+        control_url: str = "https://127.0.0.1",
+        token_value: str = "per-node-token-value",
+    ):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "control-url").write_text(control_url + "\n")
+        (self.state_dir / "node-name").write_text(name + "\n")
+        (self.state_dir / "node-token").write_text(token_value + "\n")
+        (self.state_dir / "ca.pem").write_bytes(ca)
 
     def runner(self, argv, **kwargs):
         self.calls.append(list(argv))
         if argv[1:2] == ["provision"]:
             return SimpleNamespace(
-                returncode=self.provision_rc, stdout="", stderr="fingerprint mismatch"
+                returncode=self.provision_rc, stdout="", stderr=self.provision_stderr
             )
         return _ok()
 
+    def restarted_daemon(self) -> bool:
+        return ["systemctl", "restart", "theozolith-nodedaemon.service"] in self.calls
+
     def _node_rows(self):
         provisioned = any(c[1:2] == ["provision"] and self.provision_rc == 0 for c in self.calls)
-        restarted = ["systemctl", "restart", "theozolith-nodedaemon.service"] in self.calls
-        if provisioned or restarted:
-            return [{"name": "localbox", "version": "0.3.0"}]
-        if self.pre_registered is None:
+        if provisioned or self.restarted_daemon():
+            return [{"name": "localbox", "version": "0.3.0", "last_seen": NOW}]
+        if self.pre_row is None:
             return []
-        return [{"name": "localbox", "version": self.pre_registered}]
+        return [{"name": "localbox", **self.pre_row}]
 
     def fetch(self, method, url, *, token, ca, body=None):
         assert token == self.settings.admin_token
@@ -141,14 +169,16 @@ class Harness:
             return 200, {"ok": True}
         if method == "POST" and url.endswith("/api/v1/join-tokens"):
             self.minted_addr = body["addr"]
-            return 200, {"id": "tok-1", "join_string": "ozjoin1:MACHINE-ONLY"}
+            if self.mint_response is not None:
+                return self.mint_response
+            return 200, {"id": "tok-1", "join_string": JOIN_STRING}
         if method == "DELETE" and "/api/v1/join-tokens/" in url:
             return 200, {"revoked": True}
         if method == "GET" and url.endswith("/api/v1/join-tokens"):
             tokens = [] if self.consume_token else [{"id": "tok-1"}]
             return 200, {"tokens": tokens}
         if url.endswith("/api/v1/state"):
-            return 200, {"nodes": self._node_rows()}
+            return 200, {"now": NOW, "nodes": self._node_rows()}
         raise AssertionError(f"unexpected fetch: {method} {url}")
 
     def revokes(self) -> list[str]:
@@ -163,7 +193,7 @@ class Harness:
             fetch=self.fetch,
             sleep=lambda seconds: None,
             unit_path=tmp_path / "nodedaemon.service",
-            state_dir=tmp_path / "state",
+            state_dir=self.state_dir,
             log=self.logs.append,
         )
 
@@ -185,7 +215,7 @@ def test_bootstrap_runs_the_standard_provision_grammar(tmp_path, monkeypatch):
     assert provision_call == [
         NODEDAEMON_EXEC,
         "provision",
-        "ozjoin1:MACHINE-ONLY",
+        JOIN_STRING,
         "--node",
         "localbox",
     ]
@@ -217,62 +247,157 @@ def test_bootstrap_fails_loud_when_the_token_survives(tmp_path, monkeypatch):
     assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
 
-def test_bootstrap_surfaces_a_provision_failure_and_revokes(tmp_path, monkeypatch):
-    """A failed provision names the retry (no --force, no CA rotation) and
+def test_bootstrap_surfaces_a_provision_failure_class_and_revokes(tmp_path, monkeypatch):
+    """A failed provision surfaces an ALLOWLISTED failure class — never the
+    child's raw output — names the retry (no --force, no CA rotation), and
     revokes the token the human never saw."""
     import pwd
 
     monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
     harness = Harness(tmp_path, provision_rc=1)
-    with pytest.raises(SystemExit, match="fingerprint mismatch") as excinfo:
+    with pytest.raises(SystemExit, match="CA fingerprint mismatch") as excinfo:
         harness.bootstrap(tmp_path)
     assert "re-run 'sudo theozolith init --with-local-node'" in str(excinfo.value)
+    assert JOIN_STRING not in str(excinfo.value)
     assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
 
-def test_mint_failure_stops_the_listener_and_names_the_step(tmp_path, monkeypatch):
+def test_provision_output_containing_the_join_string_is_withheld(tmp_path, monkeypatch):
+    """Amendment: provision stdout/stderr is never reprinted once a join
+    string exists — an unrecognized failure quoting the exact join string
+    (e.g. an echoed argv) surfaces as a withheld-output class."""
     import pwd
 
     monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
-    harness = Harness(tmp_path)
-    original_fetch = harness.fetch
+    harness = Harness(
+        tmp_path,
+        provision_rc=1,
+        provision_stderr=f"usage: theozolith-nodedaemon provision {JOIN_STRING} --node localbox",
+    )
+    with pytest.raises(SystemExit, match="unrecognized failure") as excinfo:
+        harness.bootstrap(tmp_path)
+    message = str(excinfo.value)
+    assert JOIN_STRING not in message
+    assert "MACHINE-ONLY" not in message  # not even a fragment of it
+    assert "withheld" in message
+    assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
-    def refusing_fetch(method, url, *, token, ca, body=None):
-        if method == "POST" and url.endswith("/api/v1/join-tokens"):
-            return 500, {"detail": "store exploded"}
-        return original_fetch(method, url, token=token, ca=ca, body=body)
 
-    harness.fetch = refusing_fetch
+def test_mint_without_an_id_is_rejected_without_leaking(tmp_path, monkeypatch):
+    """A 200 mint missing its token id is unusable (nothing to revoke) and
+    is rejected WITHOUT interpolating the response — the join string it
+    carried never surfaces; the TTL backstop is named."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path, mint_response=(200, {"join_string": JOIN_STRING}))
+    with pytest.raises(SystemExit, match="could not mint") as excinfo:
+        harness.bootstrap(tmp_path)
+    message = str(excinfo.value)
+    assert JOIN_STRING not in message and "MACHINE-ONLY" not in message
+    assert "TTL" in message
+    assert harness.revokes() == []  # no id, nothing identifiable to revoke
+
+
+def test_mint_with_an_id_but_no_join_string_is_revoked(tmp_path, monkeypatch):
+    """The inverse defect: an id without a join string is unusable but
+    identifiable — cleanup revokes it on the way out."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path, mint_response=(200, {"id": "tok-1"}))
     with pytest.raises(SystemExit, match="could not mint"):
         harness.bootstrap(tmp_path)
-    assert harness.revokes() == []  # nothing was minted, nothing to revoke
+    assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
 
-def test_reconcile_makes_a_heartbeating_node_a_noop(tmp_path, monkeypatch):
-    """M8 amendment: an already-healthy local node is reconciled, not
-    re-provisioned — no join, no token, no provision child."""
+def test_mint_failure_never_interpolates_the_response(tmp_path, monkeypatch):
+    """A refused mint whose body carries a join string (whatever the server
+    echoed) is reported by status alone — the response is never
+    interpolated into the diagnostic."""
     import pwd
 
     monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
-    harness = Harness(tmp_path, pre_registered="0.3.0")
+    harness = Harness(tmp_path, mint_response=(500, {"detail": "boom", "join_string": JOIN_STRING}))
+    with pytest.raises(SystemExit, match="could not mint") as excinfo:
+        harness.bootstrap(tmp_path)
+    message = str(excinfo.value)
+    assert JOIN_STRING not in message and "MACHINE-ONLY" not in message
+    assert "HTTP 500" in message
+    assert harness.revokes() == []  # a non-200 mint carries no trusted id
+
+
+def test_reconcile_fresh_node_with_valid_identity_is_a_noop(tmp_path, monkeypatch):
+    """A node whose heartbeat is FRESH on the server clock, backed by a
+    valid on-disk identity, is reconciled without a restart or a join."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
+    harness.write_identity()
     harness.bootstrap(tmp_path)
     assert not any(c[1:2] == ["provision"] for c in harness.calls)
+    assert not harness.restarted_daemon()
     assert not any("join-tokens" in url for _, url, _ in harness.fetches)
-    assert any("already registered and heartbeating" in line for line in harness.logs)
+    assert any("(fresh)" in line for line in harness.logs)
+
+
+def test_reconcile_stale_historical_version_restarts_and_demands_a_heartbeat(tmp_path, monkeypatch):
+    """Amendment defect: a historical non-empty version is NOT liveness. A
+    stale last_seen (dead daemon, old heartbeats) is restarted and resume
+    succeeds only after a heartbeat newer than the stale baseline arrives,
+    fresh on the server clock."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10_000})
+    harness.write_identity()
+    harness.bootstrap(tmp_path)
+    assert harness.restarted_daemon()
+    assert not any(c[1:2] == ["provision"] for c in harness.calls)  # never re-provisioned
+    assert not any("(fresh)" in line for line in harness.logs)  # stale never read as fresh
+    assert any("not demonstrably" in line for line in harness.logs)
+    assert any("registered and heartbeating" in line for line in harness.logs)
 
 
 def test_reconcile_restarts_a_provisioned_but_silent_node(tmp_path, monkeypatch):
-    """A node the exchange registered but whose daemon never heartbeat is
-    restarted — never deleted, never re-provisioned."""
+    """A node the exchange registered but whose daemon never heartbeat
+    (version empty, registration touch recent) is restarted — never
+    deleted, never re-provisioned."""
     import pwd
 
     monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
-    harness = Harness(tmp_path, pre_registered="")
+    harness = Harness(tmp_path, pre_row={"version": "", "last_seen": NOW - 5})
+    harness.write_identity()
     harness.bootstrap(tmp_path)
     assert not any(c[1:2] == ["provision"] for c in harness.calls)
     assert ["systemctl", "enable", "theozolith-nodedaemon.service"] in harness.calls
-    assert ["systemctl", "restart", "theozolith-nodedaemon.service"] in harness.calls
+    assert harness.restarted_daemon()
     assert any("registered and heartbeating" in line for line in harness.logs)
+
+
+def test_reconcile_fails_explicitly_on_missing_or_corrupt_identity(tmp_path, monkeypatch):
+    """A registered row is trusted only on top of a valid local identity:
+    missing state fails explicitly with recovery/reprovision instructions
+    — never a success report, never a restart of a daemon that cannot be
+    the registered node, never an automatic deletion."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    # Missing identity entirely — even with a FRESH row.
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10})
+    with pytest.raises(SystemExit, match="cannot back it") as excinfo:
+        harness.bootstrap(tmp_path)
+    assert "Nothing is deleted automatically" in str(excinfo.value)
+    assert not harness.restarted_daemon()
+    assert not any(c[1:2] == ["provision"] for c in harness.calls)
+
+    # Corrupt identity (wrong CA pin) on a STALE row: same explicit refusal.
+    harness = Harness(tmp_path, pre_row={"version": "0.3.0", "last_seen": NOW - 10_000})
+    harness.write_identity(ca=b"--a different ca--")
+    with pytest.raises(SystemExit, match="not this deployment's CA"):
+        harness.bootstrap(tmp_path)
+    assert not harness.restarted_daemon()
 
 
 def test_interrupt_stops_the_listener_and_revokes(tmp_path, monkeypatch):
