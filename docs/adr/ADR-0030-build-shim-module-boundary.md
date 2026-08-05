@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED (amended by ADR-0041: the shim now also owns the bootstrap environment — managed `/opt/theozolith` venv, re-exec, entry-point links; the build-logic boundary below is unchanged)
 
 Date: 2026-07-28
 

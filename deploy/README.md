@@ -197,11 +197,13 @@ Stacks and worker types on top, never below.
    theozolith test                    # the local-development signal: run the
        # checkout's test and lint suite (iterate here, never by deploying
        # uncommitted state)
-   python3 build.py                   # bootstrap ONLY: a bare checkout with nothing
-       # installed — same build implementation as `theozolith build`, finishing by
-       # installing the `theozolith` entry point (ADR-0023/0032; the deprecated
-       # `theozolith-control` alias comes along for one release). The full
-       # bare-metal sequence: "Build / rebuild from the repo" below.
+   sudo python3 build.py              # bootstrap ONLY: a bare checkout with nothing
+       # installed — same build implementation as `theozolith build`, but the shim
+       # owns the environment (ADR-0041): it creates the /opt/theozolith venv,
+       # re-executes itself inside it, installs the wheels there, and links the
+       # `theozolith` entry point into /usr/local/bin (ADR-0023/0032; the
+       # deprecated `theozolith-control` alias comes along for one release). The
+       # full bare-metal sequence: "Build / rebuild from the repo" below.
    ```
 
    Both paths commit the pin bump to `product.toml` in the Config Repo. **The
@@ -250,14 +252,20 @@ install and every source update after it.
 
 **First install.** The executable must live at a system path the service user
 can reach (the installer refuses a home venv — `/home/<you>` is not
-world-traversable; ADR-0034), so the bootstrap venv goes under `/opt`:
+world-traversable; ADR-0034), so the managed venv goes under `/opt` — and
+`build.py` owns it (ADR-0041): it creates (or reuses) `/opt/theozolith`,
+re-executes itself with that interpreter, builds and installs the wheels
+there, and links the CLI into `/usr/local/bin`. You never create, activate,
+or name a venv:
 
 ```sh
 git clone https://github.com/snowfoxbuilds/the-ozolith && cd the-ozolith
-sudo python3 -m venv /opt/theozolith
-sudo /opt/theozolith/bin/python build.py     # builds the wheels, installs them there
-sudo ln -sf /opt/theozolith/bin/theozolith /usr/local/bin/theozolith
+sudo python3 build.py     # the whole bootstrap: venv, wheels, install, CLI links
 ```
+
+The only OS prerequisites are `python3 >= 3.11` and the distro's
+`python3-venv` package; a box missing the latter is refused with that exact
+remediation — the shim never package-manages on its own (ADR-0037 posture).
 
 Then the first run, exactly as in step 1 of Full substrate:
 
@@ -292,8 +300,9 @@ sudo theozolith build           # build, upload, pin; nodes converge on their he
 so every node — the Control Node's own host queued last — self-updates; no
 node ever pulls source or builds. The `/opt/theozolith` venv itself only needs
 touching when you want the *CLI on this box* updated too (it is just another
-node-shaped install): re-run `sudo /opt/theozolith/bin/python build.py` from
-the updated checkout.
+node-shaped install): re-run `sudo python3 build.py` from the updated
+checkout — it reuses the existing `/opt/theozolith` venv (ADR-0041; the old
+`sudo /opt/theozolith/bin/python build.py` spelling still works).
 
 ## Backup and recovery (ADR-0024)
 
