@@ -49,7 +49,16 @@ from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import bootstrap, controltoml, janitor, origin, passwords, product, tls
+from theozolith_control import (
+    bootstrap,
+    controltoml,
+    janitor,
+    origin,
+    passwords,
+    product,
+    statuscli,
+    tls,
+)
 from theozolith_control.crypto import CryptoError, SecretBox, ensure_key_file, generate_key
 from theozolith_control.origin import OriginError
 from theozolith_control.secretstore import SecretStore
@@ -104,29 +113,13 @@ def _call(
 def _admin_env(args) -> tuple[str, str, str | None]:
     """(url, admin token, ca) for the HTTP subcommands. Everything falls
     back to init's artifacts on this box — on the Control Node itself the
-    commands work with no environment at all (`.env` is gone)."""
-    settings = load_settings()
-    # The one persisted address (ADR-0031/0034): IP-based, zero DNS
-    # dependency — the server cert carries the IP SAN, so verification
-    # passes.
-    url = args.url or env_value(os.environ, "CONTROL_NODE_URL") or _node_control_url(settings)
-    if not url:
-        raise SystemExit(
-            "error: no Control Node URL — set CONTROL_NODE_URL, pass --url, or run"
-            " 'theozolith init' on this box first"
-        )
-    token = settings.admin_token
-    if not token:
-        raise SystemExit(
-            "error: no admin token — on the Control Node run this under sudo"
-            " (a root-mediated install keeps it in /var/lib/theozolith-control;"
-            " ADR-0034); elsewhere set THEOZOLITH_ADMIN_TOKEN (or its _FILE"
-            " form), or run 'theozolith init' first"
-        )
-    ca = args.ca or env_value(os.environ, "THEOZOLITH_TLS_CA")
-    if not ca and (settings.tls_dir / CA_FILE).is_file():
-        ca = str(settings.tls_dir / CA_FILE)
-    return url, token, ca
+    commands work with no environment at all (`.env` is gone). One
+    implementation: statuscli.resolve_target (ADR-0039); this wrapper only
+    converts the refusal into the CLI error contract."""
+    try:
+        return statuscli.resolve_target(args.url, args.ca)
+    except statuscli.TargetError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 # -- serve ---------------------------------------------------------------------
@@ -298,15 +291,9 @@ def _serve(args) -> int:
 
 def _node_control_url(settings: ControlSettings) -> str:
     """The IP-based URL nodes dial (ADR-0023 § node channel addressing):
-    the persisted control IP + external https port. Since ADR-0034 this is
-    also the browser origin — one address for everything. Empty until init
-    has persisted the IP."""
-    if not settings.control_ip:
-        return ""
-    try:
-        return origin.derive_origin(settings.control_ip, settings.control_port).origin
-    except OriginError:
-        return ""
+    the persisted control IP + external https port. Empty until init has
+    persisted the IP. One implementation, in statuscli (ADR-0039)."""
+    return statuscli.control_url(settings)
 
 
 def _running_in_container() -> bool:
@@ -994,9 +981,7 @@ def _unquarantine(args) -> int:
 
 
 def _status(args) -> int:
-    url, token, ca = _admin_env(args)
-    print(json.dumps(_call(url, "/api/v1/state", token=token, ca=ca), indent=2, sort_keys=True))
-    return 0
+    return statuscli.run(args)
 
 
 def _flags(args) -> int:
@@ -1142,7 +1127,20 @@ def main(argv: list[str] | None = None) -> int:
     unquarantine.add_argument("--node", required=True)
     unquarantine.set_defaults(func=_unquarantine)
 
-    sub.add_parser("status", help="Fleet state as JSON.").set_defaults(func=_status)
+    status = sub.add_parser(
+        "status",
+        help="Fleet health (ADR-0039): human table on stdout; exit 0 healthy,"
+        " 1 degraded (reason on the first line), 2 Control Node unreachable."
+        " A pure API consumer — no local systemd/docker probing, ever.",
+    )
+    status.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the raw read-model documents plus the computed verdict —"
+        " the ONLY parsing contract (the table is for humans).",
+    )
+    status.set_defaults(func=_status)
     sub.add_parser(
         "flags", help="Zombie flags, janitor actions, malformed states, quarantines."
     ).set_defaults(func=_flags)
