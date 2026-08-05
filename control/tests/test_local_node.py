@@ -230,6 +230,24 @@ def test_bootstrap_surfaces_a_provision_failure_and_revokes(tmp_path, monkeypatc
     assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
 
+def test_mint_failure_stops_the_listener_and_names_the_step(tmp_path, monkeypatch):
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path)
+    original_fetch = harness.fetch
+
+    def refusing_fetch(method, url, *, token, ca, body=None):
+        if method == "POST" and url.endswith("/api/v1/join-tokens"):
+            return 500, {"detail": "store exploded"}
+        return original_fetch(method, url, token=token, ca=ca, body=body)
+
+    harness.fetch = refusing_fetch
+    with pytest.raises(SystemExit, match="could not mint"):
+        harness.bootstrap(tmp_path)
+    assert harness.revokes() == []  # nothing was minted, nothing to revoke
+
+
 def test_reconcile_makes_a_heartbeating_node_a_noop(tmp_path, monkeypatch):
     """M8 amendment: an already-healthy local node is reconciled, not
     re-provisioned — no join, no token, no provision child."""
