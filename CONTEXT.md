@@ -138,15 +138,15 @@ A reusable instruction module: a folder containing `SKILL.md` plus optional scri
 
 **Single-Node Deployment**
 
-A deployment shape where the Control Node and one Container-Host share a physical machine, bootstrapped by `theozolith-control init --with-local-node` (standard init plus an internally executed join flow). Uses the same provisioning, Stack, and update mechanisms as any fleet — nothing downstream knows it is single-node.
+A deployment shape where the Control Node and one Container-Host share a physical machine, bootstrapped by `sudo theozolith init --with-local-node` (standard init plus an internally executed, resumable join flow; ADR-0032 retired the `theozolith-control` command spelling). Uses the same provisioning, Stack, and update mechanisms as any fleet — nothing downstream knows it is single-node.
 
 *Avoid*: "single-node mode" (implies a separate code path or product mode); skipping the join mechanism (it runs, machine-consumed).
 
 **Stack**
 
-A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command run as a supervised Node Daemon child — how worker drivers deploy). Built-in Stacks (worker, reviewer, control) and user-defined Stacks (e.g. a script runner) share the same format.
+A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command run as a supervised Node Daemon child — how worker drivers deploy). Built-in Stacks (worker, reviewer) and user-defined Stacks (e.g. a script runner) share the same format. The Control Node is never a Stack — it always runs as its own systemd unit on every deployment shape (2026-08-04).
 
-*Avoid*: "role" (legacy Home Server term).
+*Avoid*: "role" (legacy Home Server term); a control Stack kind (deleted 2026-08-04 — the substrate never supervises its own control plane).
 
 **Worker**
 
