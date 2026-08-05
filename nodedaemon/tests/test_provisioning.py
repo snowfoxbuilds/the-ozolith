@@ -249,6 +249,23 @@ def test_provision_happy_path_end_to_end(tmp_path):
         assert "copycat" not in [n["node"] for n in live.secret_store.provisioned_nodes()]
 
 
+def test_local_node_dial_address_survives_lan_renumbering(tmp_path):
+    """M8 acceptance 2: the persisted dial address is loopback and comes
+    ONLY from the daemon state dir — a LAN IP change (a new control_ip in
+    the Config Repo, a re-minted server cert) never touches the local node
+    of a Single-Node Deployment: it keeps dialing 127.0.0.1, which the
+    unconditional loopback IP SAN keeps verifying (ADR-0036/0037)."""
+    state = tmp_path / "state"
+    with LiveControl(tmp_path) as live:
+        provisioning.provision(
+            live.join_string(), state_dir=state, node_name="localbox", enable_systemd=False
+        )
+    # No live control needed: the dial address is a local fact of the state
+    # dir; nothing node-side ever reads the Config Repo's control_ip.
+    config = load_daemon_config({"THEOZOLITH_STATE_DIR": str(state)})
+    assert config.control_url.startswith("https://127.0.0.1")
+
+
 def test_reprovisioning_rotates_the_token_and_replaces_state(tmp_path):
     """One re-paste per node is the IP-change recovery path (ADR-0023 §
     node channel addressing): a second provision of the SAME node rotates
@@ -336,7 +353,7 @@ def test_node_distribution_is_stdlib_only_including_provisioning():
     included) resolves to the stdlib or the package itself."""
     package_dir = Path(provisioning.__file__).parent
     allowed = set(sys.stdlib_module_names) | {"theozolith_nodedaemon"}
-    for source in sorted(package_dir.glob("*.py")):
+    for source in sorted(package_dir.rglob("*.py")):  # rglob: subpackages cannot escape
         tree = ast.parse(source.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
