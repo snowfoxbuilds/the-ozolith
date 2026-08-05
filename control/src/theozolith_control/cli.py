@@ -1179,6 +1179,20 @@ def _status(args) -> int:
     return statuscli.run(args)
 
 
+def _top(args) -> int:
+    """The Operator TUI (M9, ADR-0040): resolve the target through the ONE
+    admin resolution path (statuscli.resolve_target via _admin_env — flags
+    beat env beats init's on-box artifacts, so `sudo theozolith top` needs
+    no environment and an SSH-forwarded socket needs only CONTROL_NODE_URL
+    + THEOZOLITH_ADMIN_TOKEN + THEOZOLITH_TLS_CA), then hand off to the
+    Textual app. Textual imports lazily: every other subcommand stays free
+    of the TUI dependency."""
+    url, token, ca = _admin_env(args)
+    from theozolith_control.tui.app import run_top
+
+    return run_top(url, token, ca)
+
+
 def _flags(args) -> int:
     url, token, ca = _admin_env(args)
     print(json.dumps(_call(url, "/api/v1/flags", token=token, ca=ca), indent=2, sort_keys=True))
@@ -1350,6 +1364,30 @@ def main(argv: list[str] | None = None) -> int:
         " the ONLY parsing contract (the table is for humans).",
     )
     status.set_defaults(func=_status)
+
+    top = sub.add_parser(
+        "top",
+        help="The Operator TUI (M9): full-screen fleet surface over the bearer"
+        " API — run 'sudo theozolith top' on the Control Node, or point it at"
+        " an SSH-forwarded socket with CONTROL_NODE_URL. A pure API consumer:"
+        " reads state+events, writes only commands / quarantine release /"
+        " secrets. No embedded terminal — attach prints a pastable command.",
+        description="The Operator TUI (`theozolith top`, M9/ADR-0040).",
+        epilog=(
+            "panels: 1 Fleet (nodes, live containers, command queue) · 2 Stacks &"
+            " Runs (run detail with the advisory transcript tail) · 3 Events"
+            " (filters + follow) · 4 Errors · 5 Settings (read-only control.toml).\n"
+            "keys: c queue command (destructive verbs demand the target name typed"
+            " back) · x release quarantine · s secret entry (masked) · a print the"
+            " attach command for the selected container · f follow on/off ·"
+            " r refresh · q quit.\n"
+            "refresh: polls state+events every 5s; when control is unreachable the"
+            " last documents stay on screen under a banner and polling continues."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    top.set_defaults(func=_top)
+
     sub.add_parser(
         "flags", help="Zombie flags, janitor actions, malformed states, quarantines."
     ).set_defaults(func=_flags)
