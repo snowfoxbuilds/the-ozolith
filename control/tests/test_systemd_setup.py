@@ -16,6 +16,7 @@ from theozolith_control import cli, controltoml
 from theozolith_control import settings as settings_module
 from theozolith_control.cli import main as cli_main
 from theozolith_control.crypto import SecretBox
+from theozolith_control.passwords import parse_record
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import load_settings
 
@@ -284,6 +285,66 @@ def test_service_executable_fails_setup_with_remediation(tmp_path, monkeypatch):
     monkeypatch.setattr("shutil.which", lambda name: str(hidden))
     with pytest.raises(SystemExit, match=r"not reachable.*install TheOzolith"):
         cli._service_executable()
+
+
+# -- browser credentials under sudo (ADR-0036 amendment) -------------------------
+
+
+def test_origin_init_under_sudo_hands_the_partition_back(home, rootmode, monkeypatch, capsys):
+    """M8 amendment: origin-init runs under sudo AFTER init's chown handed
+    the partition to the service user — everything it writes (password
+    record, re-minted server key, control.toml commit) must be readable by
+    theozolith-control.service on its next restart, and by nobody else."""
+    assert cli_main(["init", "--ip", "127.0.0.1"]) == 0
+    before = len(rootmode.recorder.named("chown"))
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n" + PASSWORD + "\n"))
+    assert cli_main(["origin-init"]) == 0
+
+    settings = load_settings()
+    record = settings.admin_password_path
+    assert record.stat().st_mode & 0o777 == 0o600  # unrelated users locked out
+    assert PASSWORD not in record.read_text()
+    parse_record(record.read_text())  # a complete, parseable record
+    # The partition was handed back to its owner (the service user on a
+    # real box) with the same guarded chown the installer uses — the
+    # service can read every artifact after its restart.
+    chowns = rootmode.recorder.named("chown")
+    assert len(chowns) == before + 1
+    owner = home.stat()
+    assert chowns[-1] == ["chown", "-R", f"{owner.st_uid}:{owner.st_gid}", str(home)]
+    # No root-created cache database: none existed, none was created (the
+    # service would otherwise be unable to write its own sessions).
+    assert not settings.cache_db_path.exists()
+
+
+def test_set_password_under_sudo_repairs_ownership_too(home, rootmode, monkeypatch):
+    assert cli_main(["init", "--ip", "127.0.0.1"]) == 0
+    before = len(rootmode.recorder.named("chown"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+    assert cli_main(["set-password"]) == 0
+    assert len(rootmode.recorder.named("chown")) == before + 1
+
+
+def test_ownership_repair_never_touches_a_nondefault_path(tmp_path, monkeypatch):
+    """The PR #12 blast-radius rule extends to the repair: a root recursive
+    chown may target only the constant system leaf — an env-overridden or
+    root-owned data dir is skipped, never chowned."""
+    from theozolith_control.settings import ControlSettings
+
+    recorder = _Recorder()
+    monkeypatch.setattr(subprocess_module, "run", recorder)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    settings = ControlSettings(
+        data_dir=elsewhere,
+        config_repo=elsewhere / "configs",
+        admin_token="",
+        repo=None,
+        github_token=None,
+    )
+    cli._repair_partition_ownership(settings)
+    assert recorder.calls == []
 
 
 def test_control_port_survives_recover_into_the_unit(home, rootmode, capsys):

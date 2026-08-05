@@ -9,11 +9,13 @@ as validated expert overrides only.
 Two tables, two write paths:
 
 - ``[control]`` holds ``control_ip`` and ``control_port``, the read-only
-  address fields (ADR-0031/0034): written by init (``recover --ip`` for the
-  IP), rendered read-only in the dashboard settings form, and refused by
-  ``set_value`` — the dashboard cannot repoint the deployment. A leftover
-  ``public_origin`` from a pre-ADR-0034 file is ignored on read and dropped
-  on the next regeneration.
+  address fields (ADR-0031/0034), plus ``browser_origin`` (ADR-0036: written
+  only by ``origin-init``; its absence is the browser-disabled state).
+  Written by init/origin-init (``recover --ip`` for the IP), rendered
+  read-only in the dashboard settings form, and refused by ``set_value`` —
+  the dashboard cannot repoint the deployment. A leftover ``public_origin``
+  from a pre-ADR-0034 file is ignored on read and dropped on the next
+  regeneration.
 - ``[settings]`` holds the tier-2 tunables. The dashboard settings form
   edits them through ``set_value``: a fixed-schema, single-file write that
   regenerates control.toml from the known key set and commits it (the
@@ -215,6 +217,14 @@ def read_control_ip(config_repo: Path) -> str:
     return _read_control_field(config_repo, "control_ip")
 
 
+def read_browser_origin(config_repo: Path) -> str:
+    """The persisted browser origin (ADR-0036), or "" while the browser
+    surface is disabled — its presence IS the enablement bit. Written only
+    by origin-init; validated there (origin.parse_browser_origin) and again
+    wherever it arms the guard."""
+    return _read_control_field(config_repo, "browser_origin")
+
+
 def read_values(config_repo: Path) -> dict[str, Any]:
     """Tier-2 values: shipped defaults overlaid with the [settings] table.
     Unknown keys and malformed values fail closed with ControlTomlError."""
@@ -241,7 +251,9 @@ def _toml_literal(value: Any) -> str:
     return str(value)
 
 
-def render(control_ip: str, control_port: int, overrides: dict[str, Any]) -> str:
+def render(
+    control_ip: str, control_port: int, browser_origin: str, overrides: dict[str, Any]
+) -> str:
     """The whole file, regenerated from the fixed schema: the read-only
     [control] table, then only the [settings] keys that differ from their
     shipped defaults (every setting has one — the file stays minimal and
@@ -253,14 +265,18 @@ def render(control_ip: str, control_port: int, overrides: dict[str, Any]) -> str
         "# variables override these (expert escape hatch).",
         "",
         "[control]",
-        "# Read-only: written by 'theozolith init' (recover --ip); the settings",
-        "# form refuses to change them. Browsers and nodes both dial this one",
-        "# address (ADR-0031/0034); the port is the EXTERNAL https port.",
+        "# Read-only: written by 'theozolith init' / 'origin-init' (recover",
+        "# --ip); the settings form refuses to change them. Nodes dial the",
+        "# address fields (ADR-0031/0034; the port is the EXTERNAL https port);",
+        "# browser_origin is the opt-in browser surface (ADR-0036) — absent",
+        "# means disabled.",
     ]
     if control_ip:
         lines.append(f"control_ip = {_toml_literal(control_ip)}")
     if control_port != DEFAULT_CONTROL_PORT:
         lines.append(f"control_port = {control_port}")
+    if browser_origin:
+        lines.append(f"browser_origin = {_toml_literal(browser_origin)}")
     set_keys = [
         setting
         for setting in SETTINGS
@@ -308,11 +324,15 @@ def _commit(config_repo: Path, message: str, *, runner=subprocess.run, log=print
 
 
 def _write(
-    config_repo: Path, control_ip: str, control_port: int, overrides: dict[str, Any]
+    config_repo: Path,
+    control_ip: str,
+    control_port: int,
+    browser_origin: str,
+    overrides: dict[str, Any],
 ) -> Path:
     config_repo.mkdir(parents=True, exist_ok=True)
     path = control_toml_path(config_repo)
-    path.write_text(render(control_ip, control_port, overrides), encoding="utf-8")
+    path.write_text(render(control_ip, control_port, browser_origin, overrides), encoding="utf-8")
     return path
 
 
@@ -320,9 +340,10 @@ def write_control_address(
     config_repo: Path, ip: str, *, port: int | None = None, runner=subprocess.run, log=print
 ) -> Path:
     """Persist the control address (init / recover --ip only; ADR-0031/0034),
-    keeping every committed setting. The IP is validated as an IP literal —
-    the channel never carries a hostname; a None port keeps the persisted
-    value (recover changes the IP, never the port)."""
+    keeping every committed setting and the browser origin. The IP is
+    validated as an IP literal — the channel never carries a hostname; a
+    None port keeps the persisted value (recover changes the IP, never the
+    port)."""
     import ipaddress
 
     try:
@@ -333,9 +354,28 @@ def write_control_address(
         port = read_control_port(config_repo)
     elif isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ControlTomlError(f"control port {port!r} must be an integer in 1-65535")
-    path = _write(config_repo, canonical, port, read_values(config_repo))
+    path = _write(
+        config_repo, canonical, port, read_browser_origin(config_repo), read_values(config_repo)
+    )
     suffix = "" if port == DEFAULT_CONTROL_PORT else f":{port}"
     _commit(config_repo, f"theozolith: control address {canonical}{suffix}", runner=runner, log=log)
+    return path
+
+
+def write_browser_origin(
+    config_repo: Path, browser_origin: str, *, runner=subprocess.run, log=print
+) -> Path:
+    """Persist the browser origin (origin-init only; ADR-0036), keeping the
+    address fields and every committed setting. The caller validates the
+    origin (origin.parse_browser_origin) — this is the storage step."""
+    path = _write(
+        config_repo,
+        read_control_ip(config_repo),
+        read_control_port(config_repo),
+        browser_origin,
+        read_values(config_repo),
+    )
+    _commit(config_repo, f"theozolith: browser origin {browser_origin}", runner=runner, log=log)
     return path
 
 
@@ -352,7 +392,13 @@ def set_value(config_repo: Path, key: str, raw: str, *, runner=subprocess.run, l
     value = setting.coerce(raw, source="settings form")
     values = read_values(config_repo)
     values[key] = value
-    _write(config_repo, read_control_ip(config_repo), read_control_port(config_repo), values)
+    _write(
+        config_repo,
+        read_control_ip(config_repo),
+        read_control_port(config_repo),
+        read_browser_origin(config_repo),
+        values,
+    )
     # The message carries the exact TOML literal that was written.
     _commit(
         config_repo,

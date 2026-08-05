@@ -39,9 +39,11 @@ _SKIP_PARTS = {
     "build",
     "node_modules",
 }
-# Not repo-authored: synced from Notion (AGENTS.md, CLAUDE.md) or generated
-# (uv.lock names the distribution). The guard covers what the repo owns.
-_SKIP_FILES = {"AGENTS.md", "CLAUDE.md", "uv.lock"}
+# Not repo-authored: synced from Notion (AGENTS.md, CLAUDE.md, CONTEXT.md)
+# or generated (uv.lock names the distribution). The guard covers what the
+# repo owns — a stale spelling in a synced doc is a Notion follow-up, not a
+# repo edit.
+_SKIP_FILES = {"AGENTS.md", "CLAUDE.md", "CONTEXT.md", "uv.lock"}
 
 
 def test_old_spelling_survives_only_in_deliberate_references():

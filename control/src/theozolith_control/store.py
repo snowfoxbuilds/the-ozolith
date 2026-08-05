@@ -96,6 +96,50 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
+CREATE INDEX IF NOT EXISTS events_received ON events (received_at, id);
+-- Legacy eviction watermark (ADR-0038, first shape): a single row whose
+-- scope is unknowable. Kept read-only as conservative evidence from
+-- pre-amendment caches — any filtered query reads as incomplete against
+-- it. New evictions write event_eviction_scopes below instead.
+CREATE TABLE IF NOT EXISTS event_evictions (
+    scope TEXT PRIMARY KEY,
+    last_evicted_id INTEGER NOT NULL,
+    evicted_count INTEGER NOT NULL,
+    evicted_at REAL NOT NULL,
+    last_evicted_received_at REAL NOT NULL DEFAULT 0
+);
+-- Scoped eviction evidence (ADR-0038, filter-relative): one bounded row
+-- per (type, node, component) combination seen among evicted rows —
+-- enough to decide whether an eviction could have matched a filtered
+-- query, never a row-level archive (cache-not-archive, ADR-0016). node
+-- and component are '' when the evicted row had none; the '*' row is the
+-- overflow sentinel: past the scope cap, evidence collapses to
+-- match-everything (the conservative direction). Everything here dies
+-- with cache.db by design.
+CREATE TABLE IF NOT EXISTS event_eviction_scopes (
+    type TEXT NOT NULL,
+    node TEXT NOT NULL,
+    component TEXT NOT NULL,
+    -- first/last evicted id and newest timestamp bound the scope's evicted
+    -- range: the CONSERVATIVE fallback evidence (each constraint checked
+    -- against an extreme, which can only over-report incompleteness).
+    -- 0 means unknown (a pre-amendment row) and reads conservatively.
+    first_evicted_id INTEGER NOT NULL DEFAULT 0,
+    last_evicted_id INTEGER NOT NULL,
+    evicted_count INTEGER NOT NULL,
+    evicted_at REAL NOT NULL,
+    last_evicted_received_at REAL NOT NULL,
+    -- Correlated (id, received_at) pairs of the evicted rows, JSON, bounded
+    -- per scope: while samples_complete=1 they ARE the scope's evicted set,
+    -- so a combined since+cursor query is answered as a true conjunction
+    -- over single rows. Past the per-scope sample cap (or for the wildcard
+    -- and migrated rows) samples are dropped and samples_complete=0 — the
+    -- bounds above take over, conservative by construction. Evidence stays
+    -- bounded: scope cap x sample cap, never an archive.
+    samples TEXT NOT NULL DEFAULT '[]',
+    samples_complete INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (type, node, component)
+);
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     node TEXT NOT NULL,
@@ -242,6 +286,19 @@ LIFECYCLE_VERBS = ("drain", "recycle", "update", "restart")
 # Consecutive failed Runs on one node before the dispatch gate closes.
 QUARANTINE_AFTER_FAILURES = 2
 
+# Distinct (type, node, component) eviction-evidence rows kept before the
+# evidence collapses into the '*' match-everything sentinel (ADR-0038):
+# bounded by decision — evidence about evictions must never itself grow
+# into an archive inside the cache.
+EVICTION_SCOPE_CAP = 64
+# Correlated (id, received_at) samples kept per scope: while under the cap
+# they are the scope's complete evicted set and combined since+cursor
+# queries are answered exactly; past it, evidence falls back to the
+# conservative bounds. Bounded by decision (ADR-0038): at most
+# EVICTION_SCOPE_CAP x EVICTION_SAMPLE_CAP pairs ever exist.
+EVICTION_SAMPLE_CAP = 32
+EVICTION_WILDCARD = "*"
+
 
 @dataclass(frozen=True)
 class LiveClaim:
@@ -281,9 +338,45 @@ class Store:
         event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
         if "component" not in event_columns:  # theozolith.error filter column
             self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
+        eviction_columns = {
+            r["name"] for r in self._db.execute("PRAGMA table_info(event_evictions)")
+        }
+        if "last_evicted_received_at" not in eviction_columns:
+            # 0 = recorded before the column existed: the timestamp is
+            # unknown, so window reads treat it as incomplete (conservative).
+            self._db.execute(
+                "ALTER TABLE event_evictions ADD COLUMN"
+                " last_evicted_received_at REAL NOT NULL DEFAULT 0"
+            )
+        scope_columns = {
+            r["name"] for r in self._db.execute("PRAGMA table_info(event_eviction_scopes)")
+        }
+        if "first_evicted_id" not in scope_columns:
+            # 0 = unknown lower bound: cursor reads treat the scope as
+            # possibly reaching any page (conservative).
+            self._db.execute(
+                "ALTER TABLE event_eviction_scopes ADD COLUMN"
+                " first_evicted_id INTEGER NOT NULL DEFAULT 0"
+            )
+        if "samples" not in scope_columns:
+            # Migrated rows carry no correlated samples: samples_complete
+            # stays 0 and the bounds-only conservative path answers.
+            self._db.execute(
+                "ALTER TABLE event_eviction_scopes ADD COLUMN samples TEXT NOT NULL DEFAULT '[]'"
+            )
+            self._db.execute(
+                "ALTER TABLE event_eviction_scopes ADD COLUMN"
+                " samples_complete INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self._db.close()
+
+    def now(self) -> float:
+        """The store's clock — the same one every recorded timestamp used,
+        exposed so read models can ship a server ``now`` (ADR-0039) and
+        clients never mix their clock into staleness math."""
+        return self._clock()
 
     # -- nodes and heartbeat status ----------------------------------------
 
@@ -703,16 +796,275 @@ class Store:
             if excess <= 0:
                 return 0
             doomed: list[int] = []
+            scopes: dict[tuple[str, str, str], dict[str, Any]] = {}
             for row in self._db.execute(
-                "SELECT id, LENGTH(payload) AS size FROM events WHERE type IN (?, ?) ORDER BY id",
+                "SELECT id, type, node, component, received_at, LENGTH(payload) AS size"
+                " FROM events WHERE type IN (?, ?) ORDER BY id",
                 evictable,
             ):
                 doomed.append(row["id"])
+                key = (row["type"], row["node"] or "", row["component"] or "")
+                scope = scopes.setdefault(
+                    key,
+                    {
+                        "count": 0,
+                        "min_id": row["id"],
+                        "max_id": 0,
+                        "max_received": 0.0,
+                        "samples": [],
+                    },
+                )
+                scope["count"] += 1
+                scope["min_id"] = min(scope["min_id"], row["id"])
+                scope["max_id"] = max(scope["max_id"], row["id"])
+                scope["max_received"] = max(scope["max_received"], row["received_at"])
+                scope["samples"].append((row["id"], row["received_at"]))
                 excess -= row["size"]
                 if excess <= 0:
                     break
             self._db.executemany("DELETE FROM events WHERE id = ?", [(id_,) for id_ in doomed])
+            # Scoped evidence rides the same transaction (ADR-0038):
+            # eviction and its evidence are one atomic fact, recorded per
+            # (type, node, component) so a filtered read can tell whether
+            # an eviction could have matched it. Past the cap — or once
+            # collapsed — everything folds into the '*' sentinel.
+            self._record_eviction_scopes(scopes)
             return len(doomed)
+
+    def _record_eviction_scopes(self, scopes: dict[tuple[str, str, str], dict[str, Any]]) -> None:
+        wildcard = (EVICTION_WILDCARD, EVICTION_WILDCARD, EVICTION_WILDCARD)
+        prior_rows = {
+            (r["type"], r["node"], r["component"]): dict(r)
+            for r in self._db.execute("SELECT * FROM event_eviction_scopes")
+        }
+        collapse = wildcard in prior_rows or len(set(prior_rows) | set(scopes)) > EVICTION_SCOPE_CAP
+        if collapse and set(prior_rows) != {wildcard}:
+            # Absorb every existing scope's bounds into the sentinel, then
+            # drop the per-scope rows — bounded evidence, still honest.
+            # Correlated samples cannot survive a collapse: the sentinel is
+            # bounds-only, conservative by construction.
+            absorbed = self._db.execute(
+                "SELECT MIN(first_evicted_id) AS min_id, MAX(last_evicted_id) AS max_id,"
+                " SUM(evicted_count) AS count,"
+                " MAX(last_evicted_received_at) AS max_received"
+                " FROM event_eviction_scopes"
+            ).fetchone()
+            self._db.execute("DELETE FROM event_eviction_scopes")
+            prior_rows = {}
+            if absorbed["max_id"] is not None:
+                scopes = dict(scopes)
+                merged = scopes.setdefault(
+                    wildcard,
+                    {
+                        "count": 0,
+                        "min_id": absorbed["min_id"],
+                        "max_id": 0,
+                        "max_received": 0.0,
+                        "samples": [],
+                    },
+                )
+                merged["count"] += absorbed["count"]
+                merged["min_id"] = min(merged["min_id"], absorbed["min_id"])
+                merged["max_id"] = max(merged["max_id"], absorbed["max_id"])
+                merged["max_received"] = max(merged["max_received"], absorbed["max_received"])
+        if collapse:
+            folded: dict[str, Any] = {"count": 0, "min_id": 0, "max_id": 0, "max_received": 0.0}
+            for scope in scopes.values():
+                folded["count"] += scope["count"]
+                folded["min_id"] = (
+                    scope["min_id"]
+                    if folded["min_id"] == 0
+                    else min(folded["min_id"], scope["min_id"])
+                )
+                folded["max_id"] = max(folded["max_id"], scope["max_id"])
+                folded["max_received"] = max(folded["max_received"], scope["max_received"])
+            folded["samples"] = []
+            scopes = {wildcard: folded}
+        now = self._clock()
+        for (type_, node, component), scope in scopes.items():
+            prior = prior_rows.get((type_, node, component))
+            if prior is None:
+                first = scope["min_id"]
+                last = scope["max_id"]
+                count = scope["count"]
+                max_received = scope["max_received"]
+                samples: list = list(scope.get("samples") or [])
+                complete = True
+            else:
+                first = (
+                    0
+                    if prior["first_evicted_id"] == 0 or scope["min_id"] == 0
+                    else min(prior["first_evicted_id"], scope["min_id"])
+                )
+                last = max(prior["last_evicted_id"], scope["max_id"])
+                count = prior["evicted_count"] + scope["count"]
+                max_received = max(prior["last_evicted_received_at"], scope["max_received"])
+                complete = bool(prior["samples_complete"])
+                samples = (
+                    json.loads(prior["samples"]) + list(scope.get("samples") or [])
+                    if complete
+                    else []
+                )
+            # The wildcard is bounds-only; a scope past the sample cap drops
+            # its samples and answers conservatively from bounds — the
+            # evidence never grows into an archive (ADR-0038).
+            if (type_, node, component) == wildcard or len(samples) > EVICTION_SAMPLE_CAP:
+                samples, complete = [], False
+            self._db.execute(
+                "INSERT OR REPLACE INTO event_eviction_scopes"
+                " (type, node, component, first_evicted_id, last_evicted_id, evicted_count,"
+                "  evicted_at, last_evicted_received_at, samples, samples_complete)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    type_,
+                    node,
+                    component,
+                    first,
+                    last,
+                    count,
+                    now,
+                    max_received,
+                    json.dumps(samples),
+                    1 if complete else 0,
+                ),
+            )
+
+    def eviction_mark(self) -> dict[str, Any] | None:
+        """The LEGACY single-row watermark (pre-amendment caches), or None.
+        Its scope is unknowable, so any filtered query reads conservatively
+        against it; new evictions record scoped evidence instead."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT last_evicted_id, evicted_count, evicted_at, last_evicted_received_at"
+                " FROM event_evictions WHERE scope = 'events'"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def eviction_evidence(
+        self,
+        *,
+        type: str | None = None,
+        node: str | None = None,
+        component: str | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+    ) -> tuple[bool, bool]:
+        """(any eviction ever, THIS query incomplete) — ADR-0038. The query
+        is incomplete when an evicted row MAY have matched the whole
+        conjunction: type/node/component filters AND ``received_at >=
+        since`` AND ``id < before_id`` — evaluated over SINGLE rows, never
+        assembled from different rows' extremes. While a scope's
+        correlated samples are complete (bounded per scope) the answer is
+        exact; bounds-only evidence — the '*' sentinel, overflowed scopes,
+        migrated rows, and the legacy single-row watermark — answers
+        conservatively, over-reporting incompleteness only."""
+        any_evicted = False
+        incomplete = False
+        legacy = self.eviction_mark()
+        if legacy is not None:
+            any_evicted = True
+            cutoff = legacy["last_evicted_received_at"]
+            incomplete = since is None or cutoff == 0 or since <= cutoff
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM event_eviction_scopes").fetchall()
+        for row in rows:
+            any_evicted = True
+            if incomplete:
+                break
+            if row["type"] != EVICTION_WILDCARD:
+                if type is not None and row["type"] != type:
+                    continue
+                if node is not None and row["node"] != node:
+                    continue
+                if component is not None and row["component"] != component:
+                    continue
+            if row["samples_complete"]:
+                # Complete correlated samples: the conjunction must hold on
+                # ONE recorded evicted row (id, received_at), never on the
+                # id-minimum of one row and the timestamp-maximum of another.
+                pairs = json.loads(row["samples"])
+                if not any(
+                    (since is None or received >= since)
+                    and (before_id is None or evicted_id < before_id)
+                    for evicted_id, received in pairs
+                ):
+                    continue
+            else:
+                # Bounds-only evidence: each constraint against the scope's
+                # extremes — conservative, may over-report incompleteness.
+                if since is not None and since > row["last_evicted_received_at"]:
+                    continue
+                first = row["first_evicted_id"]
+                if before_id is not None and first > 0 and first >= before_id:
+                    continue  # every evicted row in this scope sits at/after the bound
+            incomplete = True
+        return any_evicted, incomplete
+
+    def events_page(
+        self,
+        *,
+        node: str | None = None,
+        component: str | None = None,
+        type: str | None = None,
+        since: float | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """One newest-first page for GET /api/v1/events (ADR-0038): stored
+        payloads verbatim — known and unknown types alike, rendering is the
+        client's job — plus the continuation cursor and the store-level
+        eviction indicator. ``before_id`` is the decoded cursor: rows
+        strictly older than it."""
+        query = "SELECT id, type, received_at, node, component, payload FROM events"
+        clauses: list[str] = []
+        params: list[Any] = []
+        for clause, value in (
+            ("type = ?", type),
+            ("node = ?", node),
+            ("component = ?", component),
+        ):
+            if value is not None:
+                clauses.append(clause)
+                params.append(value)
+        if since is not None:
+            clauses.append("received_at >= ?")
+            params.append(since)
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            rows = self._db.execute(
+                query + " ORDER BY id DESC LIMIT ?", [*params, limit]
+            ).fetchall()
+        # The eviction indicator is QUERY-relative (ADR-0038): `evicted` is
+        # true exactly when an eviction could have matched this call's
+        # filters, window, AND cursor bound; `any_evicted` is the global
+        # fact (any eviction ever in this cache). Legacy pre-amendment
+        # watermarks have unknowable scope and read conservatively.
+        any_evicted, query_incomplete = self.eviction_evidence(
+            type=type, node=node, component=component, since=since, before_id=before_id
+        )
+        return {
+            "events": [
+                {
+                    "id": r["id"],
+                    "type": r["type"],
+                    "received_at": r["received_at"],
+                    "node": r["node"],
+                    "component": r["component"],
+                    "payload": json.loads(r["payload"]),
+                }
+                for r in rows
+            ],
+            # A full page may have more behind it; a short page is the end.
+            # The cursor is the last id as a decimal string — contractually
+            # opaque to clients (ADR-0038).
+            "next_cursor": str(rows[-1]["id"]) if len(rows) == limit else None,
+            "evicted": query_incomplete,
+            "any_evicted": any_evicted,
+        }
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------
 

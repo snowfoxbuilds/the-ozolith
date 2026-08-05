@@ -187,9 +187,17 @@ class DeployConfig:
         return files
 
     def desired_state_for(self, node: str) -> dict[str, Any]:
-        """The one JSON document a node reconciles from (and caches)."""
+        """The one JSON document a node reconciles from (and caches).
+
+        Image recipes ride only for Stacks whose desired state is running
+        (ADR-0037 stage-don't-deploy): a stopped Stack deploys and builds
+        nothing — flipping it to running is the single act that starts the
+        build-and-run sequence, and a scaffolded placeholder digest can
+        never fail a build on a box that was born misconfigured."""
         stacks = self.stacks_for(node)
-        image_names = {stack.run_image for stack in stacks if stack.run_image}
+        image_names = {
+            stack.run_image for stack in stacks if stack.run_image and stack.state == "running"
+        }
         return {
             "commit": self.commit,
             "product_version": self.product_version,
@@ -277,6 +285,13 @@ def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
 
 def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
     context = f"stacks/{name}.toml"
+    if name == "control":
+        raise ConfigRepoError(
+            f"{context}: the control Stack is deleted — the substrate never"
+            " supervises its own control plane (ADR-0035); the Control Node"
+            " always runs as its own systemd unit ('theozolith serve') on its"
+            " host, on every deployment shape"
+        )
     kind = _require_str(data, "kind", context)
     if kind not in STACK_KINDS:
         raise ConfigRepoError(f"{context}: kind must be one of {STACK_KINDS}, got {kind!r}")

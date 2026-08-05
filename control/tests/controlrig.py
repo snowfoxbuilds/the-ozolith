@@ -62,6 +62,14 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         serve_tls=True,  # production-like default; the dev-cookie test overrides
     )
     values.update(overrides)
+    # The rig models an origin-init-enabled deployment (ADR-0036): the
+    # browser origin is persisted (following any control_port override), so
+    # the web surface is up and the armed BrowserGuard expects exactly this
+    # origin. Pass browser_origin="" to exercise the disabled
+    # (pre-origin-init) surface.
+    if "browser_origin" not in overrides:
+        port = values.get("control_port", 443)
+        values["browser_origin"] = CONTROL_ORIGIN if port == 443 else f"https://{CONTROL_IP}:{port}"
     return ControlSettings(**values)
 
 

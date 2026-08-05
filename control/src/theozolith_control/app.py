@@ -54,6 +54,10 @@ EVENT_PAYLOAD_LIMIT = 32_768
 
 DISPATCH_ROLES = ("worker", "reviewer")
 
+# Events read view (ADR-0038): default and maximum page size.
+EVENTS_PAGE_DEFAULT = 100
+EVENTS_PAGE_MAX = 500
+
 # Join-token defaults (ADR-0023): short-lived and single-use unless the
 # operator widens them for a batch provisioning session.
 JOIN_TOKEN_TTL_SECONDS = 3600.0
@@ -496,10 +500,11 @@ def create_app(
     @app.post("/api/v1/product/update")
     async def product_update(request: Request) -> dict[str, Any]:
         """Pin ``version`` in the Config Repo (committed) and fan the update
-        out to every known node. Nodes hosting the ``control`` Stack are
-        queued LAST: the Control Node applies its own update only after the
-        fan-out is queued (its daemon's existing os.execv path performs it).
-        Re-running with a previous version re-pins and redeploys (rollback)."""
+        out to every known node. Control is never a Stack (ADR-0035), so no
+        fan-out ordering exists for it: the Control Node updates itself
+        last through its own os.execv path (ADR-0015) after the fan-out is
+        queued. Re-running with a previous version re-pins and redeploys
+        (rollback)."""
         _authorize(request, settings.admin_token, "admin")
         body = await _json_body(request)
         version = _require(body, "version", str)
@@ -511,11 +516,7 @@ def create_app(
         # Cache, not archive: at most the pinned + previous artifact sets
         # survive a pin change (the previous set is the rollback path).
         product.prune_artifacts(settings.artifacts_dir, {version, previous} - {""})
-        control_hosts = {s.node for s in _config().stacks if s.name == "control"}
-        nodes = sorted(
-            (n["name"] for n in store.fleet_state()["nodes"]),
-            key=lambda name: (name in control_hosts, name),
-        )
+        nodes = sorted(n["name"] for n in store.fleet_state()["nodes"])
         for node in nodes:
             store.queue_command(node, "update", None, False)
             if store.release_quarantine(node):
@@ -571,11 +572,63 @@ def create_app(
     @app.get("/api/v1/state")
     async def state(request: Request) -> dict[str, Any]:
         _authorize(request, settings.admin_token, "admin")
+        config = _config()
         return {
             **store.fleet_state(),
             "provisioned_nodes": secret_store.provisioned_nodes(),
             "unregistered_nodes": store.unregistered_nodes(),
+            # The status/TUI read model (ADR-0039): the server clock every
+            # staleness computation uses (client clocks never enter the
+            # math), the product pin, and desired Stack state — so a pure
+            # API consumer needs no Config Repo or cache.db access.
+            "now": store.now(),
+            "product_pin": config.product_version or None,
+            "desired_stacks": [
+                {"node": s.node, "name": s.name, "kind": s.kind, "state": s.state}
+                for s in config.stacks
+            ],
         }
+
+    @app.get("/api/v1/events")
+    async def events_read(request: Request) -> dict[str, Any]:
+        """The events read view (ADR-0038, amending ADR-0015): newest-first
+        stored rows — known and unknown types alike, payloads verbatim —
+        with node/component/type filters, ``since``, cursor pagination, and
+        the honest eviction indicator. Query params are hand-parsed like
+        every other endpoint: stdlib clients share the schema."""
+        _authorize(request, settings.admin_token, "admin")
+        params = request.query_params
+
+        def _bad(detail: str) -> None:
+            raise HTTPException(status_code=400, detail=detail)
+
+        since: float | None = None
+        if params.get("since"):
+            try:
+                since = float(params["since"])
+            except ValueError:
+                _bad("'since' must be unix seconds")
+        before_id: int | None = None
+        if params.get("cursor"):
+            try:
+                before_id = int(params["cursor"])
+            except ValueError:
+                _bad("malformed cursor — pass a response's next_cursor back unchanged")
+        limit = EVENTS_PAGE_DEFAULT
+        if params.get("limit"):
+            try:
+                limit = int(params["limit"])
+            except ValueError:
+                _bad("'limit' must be an integer")
+            limit = max(1, min(limit, EVENTS_PAGE_MAX))
+        return store.events_page(
+            node=params.get("node") or None,
+            component=params.get("component") or None,
+            type=params.get("type") or None,
+            since=since,
+            before_id=before_id,
+            limit=limit,
+        )
 
     @app.get("/api/v1/flags")
     async def flags(request: Request) -> dict[str, Any]:

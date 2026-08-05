@@ -1,9 +1,11 @@
-# The Control Node as the `control` built-in Stack (a container Stack).
-# Run it directly for bootstrap (the Control Node must exist before any node
-# can reconcile Stacks), or declare it in the Config Repo like any Stack.
+# The Control Node, run directly with docker compose — the containerized
+# reference flow. Control is never a Stack (ADR-0035: the substrate never
+# supervises its own control plane), so this file is hand-run, never
+# declared in the Config Repo or distributed to a node.
 #
-# First run (ADR-0023) — one command generates everything, then prints the
-# operator handoff (dashboard URL, optional CA-trust one-liners):
+# First run (ADR-0023/0036) — one command generates the machine surface,
+# then prints the operator handoff (the browser dashboard stays off until
+# `origin-init`):
 #
 #   docker compose -f deploy/compose/control.yml build
 #   docker compose -f deploy/compose/control.yml run --rm control init --ip <LAN-IP>

@@ -36,11 +36,11 @@ def test_full_repo_parses_and_scopes(tmp_path):
     )
     write(
         tmp_path,
-        "stacks/control.toml",
-        'kind = "container"\nnode = "pi"\ncompose = "compose/control.yml"\n'
+        "stacks/flightdeck.toml",
+        'kind = "container"\nnode = "pi"\ncompose = "compose/flightdeck.yml"\n'
         'overlays = ["overlays/ts.yml"]\n',
     )
-    write(tmp_path, "compose/control.yml", "services: {}\n")
+    write(tmp_path, "compose/flightdeck.yml", "services: {}\n")
     write(tmp_path, "overlays/ts.yml", "services: {}\n")
     write(tmp_path, "images/claude-dev.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\n')
     write(tmp_path, "product.toml", '[product]\nversion = "0.3.0"\n')
@@ -58,7 +58,7 @@ def test_full_repo_parses_and_scopes(tmp_path):
 
     pi = config.desired_state_for("pi")
     files = pi["stacks"][0]["compose_files"]
-    assert [f["name"] for f in files] == ["compose/control.yml", "overlays/ts.yml"]
+    assert [f["name"] for f in files] == ["compose/flightdeck.yml", "overlays/ts.yml"]
     assert files[0]["content"] == "services: {}\n"
 
 
@@ -97,6 +97,42 @@ def test_stack_format_violations_are_rejected(tmp_path):
     )
     with pytest.raises(ConfigRepoError, match="exactly one of image/compose"):
         load_config(tmp_path)
+
+
+def test_control_stack_is_rejected_at_validation(tmp_path):
+    """M8 acceptance 6: a control Stack in the Config Repo is rejected with
+    the ADR-0035 pointer — the substrate never supervises its own control
+    plane, whatever the Stack's kind or shape."""
+    write(tmp_path, "stacks/control.toml", 'kind = "container"\nnode = "pi"\nimage = "x"\n')
+    with pytest.raises(ConfigRepoError, match="ADR-0035"):
+        load_config(tmp_path)
+    write(tmp_path, "stacks/control.toml", 'kind = "process"\nnode = "pi"\ncommand = "x"\n')
+    with pytest.raises(ConfigRepoError, match=r"never\s+supervises its own control plane"):
+        load_config(tmp_path)
+
+
+def test_stopped_stacks_ship_no_image_recipes(tmp_path):
+    """ADR-0037 stage-don't-deploy: a stopped Stack's run_image rides no
+    desired state — the daemon builds nothing until the flip to running."""
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\nstate = "stopped"\n'
+        'command = "theozolith-worker"\nrun_image = "claude-dev"\n',
+    )
+    write(tmp_path, "images/claude-dev.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\n')
+    stopped = load_config(tmp_path).desired_state_for("box1")
+    assert [s["name"] for s in stopped["stacks"]] == ["worker"]  # the Stack itself rides
+    assert stopped["images"] == []  # its image recipe does not
+
+    write(
+        tmp_path,
+        "stacks/worker.toml",
+        'kind = "process"\nnode = "box1"\nstate = "running"\n'
+        'command = "theozolith-worker"\nrun_image = "claude-dev"\n',
+    )
+    running = load_config(tmp_path).desired_state_for("box1")
+    assert [i["name"] for i in running["images"]] == ["claude-dev"]
 
 
 def test_compose_paths_may_not_escape_the_repo(tmp_path):

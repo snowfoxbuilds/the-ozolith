@@ -90,6 +90,10 @@ class ControlSettings:
     # bind port (docker maps external onto the bind; the bare-metal systemd
     # unit binds it directly).
     control_port: int = 443
+    # The persisted browser origin (ADR-0036) — "" until origin-init runs;
+    # its presence IS the browser-enablement bit. When set it arms the exact
+    # Host/Origin guard; while empty the whole web surface refuses.
+    browser_origin: str = ""
     # True when serve terminates TLS: decides the session cookie's name and
     # Secure flag (__Host- + Secure over TLS; a plain dev cookie otherwise).
     serve_tls: bool = False
@@ -203,5 +207,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",
         control_ip=controltoml.read_control_ip(config_repo),
         control_port=control_port,
+        browser_origin=controltoml.read_browser_origin(config_repo),
         **{key: value for key, value in tunables.items() if key in _SETTING_FIELDS},
     )

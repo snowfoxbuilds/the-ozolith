@@ -450,12 +450,10 @@ def test_heartbeat_reports_command_deferrals(control: ControlRig):
 # -- the two update paths, one machinery (ADR-0015, 2026-07-22) -----------------------
 
 
-CONTROL_STACK_TOML = 'kind = "container"\nnode = "boxctl"\nimage = "theozolith-control:pinned"\n'
-
-
-def test_product_update_pins_and_fans_out_control_host_last(control: ControlRig):
-    control.write_config("stacks/control.toml", CONTROL_STACK_TOML)
-    # Three registered nodes; boxctl hosts the control Stack.
+def test_product_update_pins_and_fans_out_to_every_node(control: ControlRig):
+    # Three registered nodes; no fan-out ordering exists for control — it
+    # is never a Stack on any node (ADR-0035) and updates itself last
+    # through its own os.execv path.
     for node in ("boxctl", "box1", "box2"):
         control.heartbeat(node=node)
 
@@ -463,8 +461,6 @@ def test_product_update_pins_and_fans_out_control_host_last(control: ControlRig)
     assert answer.status_code == 200
     body = answer.json()
     assert body["version"] == "0.4.0"
-    # Fan-out to every node; the control host is queued LAST (it applies
-    # its own update only after the fan-out is queued).
     assert body["queued"] == ["box1", "box2", "boxctl"]
 
     # The pin landed in the Config Repo…

@@ -75,18 +75,26 @@ docker compose -f deploy/compose/control.yml run --rm control init --ip <this-bo
 docker compose -f deploy/compose/control.yml up -d
 ```
 
-`init` (ADR-0023) composes the whole first run: master key → the deployment's one
-public origin (`https://<128-bit-random-slug>.theozolith.internal`; `--base-domain`
-to change) → per-deployment CA + server certificate with the box's IP in the SAN →
-admin password prompt (only its scrypt hash is stored) → the **operator handoff**:
-the dashboard URL, the exact DNS/hosts line, the CA download URL, and per-OS trust
-one-liners. The two irreducibly manual actions — the trusted-network-only DNS record
-and CA trust per operator device — are copy-paste from that printout. `--ip` names
-the LAN address nodes will dial (required in the compose flow — a container cannot
-auto-detect it; give the box a static IP or DHCP reservation): the node channel is
-IP-only, the DNS record is for browsers alone. All state lands under
-`~/.theozolith/` on the host, partitioned by durability class (ADR-0024); backup is
-a copy of that folder minus `cache/`.
+`init` (ADR-0023/0034/0036) composes the machine surface in one run: master key →
+admin bearer token → the persisted control address → per-deployment CA + server
+certificate with IP SANs (the box's IP and loopback) → the **operator handoff**. No
+DNS anywhere, no password prompt, no browser step: the bearer API serves everything,
+and the browser dashboard stays off until you opt in with `theozolith origin-init`
+(it asks for the browser origin — the IP origin by default — and the admin password
+together, then re-mints the server cert from the same CA). `--ip` names the LAN
+address nodes will dial (required in the compose flow — a container cannot
+auto-detect it; give the box a static IP or DHCP reservation). All state lands under
+`~/.theozolith/` on the host (`/var/lib/theozolith-control` for a root-mediated bare-
+metal install), partitioned by durability class (ADR-0024); backup is a copy of that
+folder minus `cache/`.
+
+**Single-Node Deployment** (ADR-0037): on a bare-metal box with docker and all four
+distributions installed, `sudo theozolith init --with-local-node` additionally
+installs the Node Daemon and runs the unmodified join flow internally — the local
+node dials loopback, the join string is machine-consumed, and the Config Repo is
+seeded with a complete worker Stack staged at desired state `stopped`. Nothing
+deploys on first boot; the scaffold README names the finish line (pin the image
+digest → enter secrets → flip to `running`).
 
 ### 2. Provision the physical nodes — one paste each
 
@@ -111,8 +119,10 @@ The git-backed Config Repo at `~/.theozolith/configs` on the Control Node (ADR-0
 is the deployment's source of truth: Stacks, derived images, and the product version
 pin. `deploy/configs-example/` is a complete starter — copy it in and adjust the
 `node = "..."` placements to your node names. The Implementer/Reviewer drivers are
-process-kind Stacks; `control` and the Flight Deck are container Stacks. Desired
-state distributes over the heartbeat channel; nodes cache it for degraded mode.
+process-kind Stacks; the Flight Deck is a container Stack. The Control Node is never
+a Stack — it runs as its own systemd unit (or the hand-run compose flow) on its host,
+and a `stacks/control.toml` is rejected at validation (ADR-0035). Desired state
+distributes over the heartbeat channel; nodes cache it for degraded mode.
 
 ### 4. Enter secrets
 
@@ -130,10 +140,13 @@ on node disk.
 
 ```sh
 GITHUB_TOKEN=... theozolith-bootstrap --repo owner/name   # labels + issue forms, one-time
-theozolith status                                 # fleet state
+theozolith status          # fleet health: exit 0 healthy / 1 degraded / 2 unreachable
 ```
 
-The dashboard (at the minted origin, behind the admin password) shows the fleet —
+`theozolith status` (ADR-0039) is the terminal-native fleet answer: a human table
+with the degraded reason on the first line (`--json` is the parsing contract), fed by
+`GET /api/v1/state` and the `GET /api/v1/events` read view (ADR-0038). The optional
+dashboard (after `origin-init`, behind the admin password) shows the same fleet —
 including unregistered nodes awaiting a join-string paste — Run progress,
 `theozolith.error` summaries, secret entry, tier-2 settings (committed to
 `control.toml` in the Config Repo), join tokens, and the web terminal.

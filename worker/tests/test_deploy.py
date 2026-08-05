@@ -118,7 +118,9 @@ def test_no_tailscale_anywhere_in_product_code_or_deploy():
 
 def test_configs_example_parses_and_places_the_builtin_stacks():
     """The starter Config Repo must stay valid: worker/reviewer as process
-    Stacks, control and the Flight Deck as container Stacks (ADR-0013/0019)."""
+    Stacks, the Flight Deck as a container Stack (ADR-0013/0019). Control is
+    never a Stack — the substrate never supervises its own control plane
+    (ADR-0035) — so the example must not carry one."""
     from theozolith_control.configrepo import load_config
 
     config = load_config(REPO_ROOT / "deploy" / "configs-example")
@@ -126,7 +128,6 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     assert kinds == {
         "worker": "process",
         "reviewer": "process",
-        "control": "container",
         "flightdeck": "container",
     }
     assert config.product_version

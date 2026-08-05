@@ -61,8 +61,10 @@ new claims and review rounds pause. Drivers hold their own PATs for all non-clai
 GitHub writes.
 
 ```sh
-theozolith init                              # the unified first run (ADR-0023):
-                                                     # key, origin, CA/TLS, password, handoff
+theozolith init                              # the unified first run (ADR-0023/0036):
+                                                     # key, token, address, CA/TLS, handoff
+theozolith init --with-local-node            # + Node Daemon and the internal join (ADR-0037)
+theozolith origin-init                       # opt-in browser: origin + password (ADR-0036)
 theozolith serve                             # the service (+ dashboard + bootstrap listener)
 theozolith recover                           # after restoring ~/.theozolith minus cache/
 theozolith join-token create                         # print the one paste that provisions a node
@@ -70,6 +72,6 @@ theozolith secret set github-worker          # operator entry
 theozolith command recycle --node box1 --target worker   # queues behind a Run
 theozolith command recycle --node box1 --target worker --force
 theozolith unquarantine --node box1          # human-only release
-theozolith status                            # fleet state JSON
+theozolith status                            # fleet health (exit 0/1/2; --json to parse)
 theozolith flags                             # zombie/malformed/quarantine flags
 ```

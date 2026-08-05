@@ -281,7 +281,7 @@ def process_stack(name: str = "worker", **overrides) -> dict:
     return stack
 
 
-def container_stack(name: str = "control", **overrides) -> dict:
+def container_stack(name: str = "flightdeck", **overrides) -> dict:
     stack = {
         "name": name,
         "kind": "container",
@@ -291,7 +291,7 @@ def container_stack(name: str = "control", **overrides) -> dict:
         "secrets": {},
         "command": "",
         "run_image": "",
-        "image": "theozolith-control:local",
+        "image": "theozolith-flightdeck:local",
         "ports": ["8443:8443"],
         "volumes": [],
         "compose_files": [],

@@ -10,15 +10,18 @@ so the merged parser lives here.
 ``theozolith-control`` is a deprecated alias for the same entry point.
 
 ``init`` is the unified first-run command (root-mediated on bare metal,
-ADR-0034): master key → control address → CA/TLS (with the box's IP in the
-SAN) → admin password → systemd unit → operator handoff. Run as root, all
-state lands under ``/var/lib/theozolith-control/`` (the ADR-0024 partition
-at a system path) and the admin subcommands run under ``sudo``; unprivileged
-and containerized runs keep ``~/.theozolith/``. ``recover`` validates a
+ADR-0034; machine surface only since ADR-0036): master key → admin bearer
+token → control address → CA/TLS (IP SANs: the box's IP + loopback) →
+systemd unit → operator handoff. No browser credential is taken:
+``origin-init`` is the opt-in browser step, prompting for the browser
+origin and the admin password together and re-minting the server
+certificate with the origin host in the SAN. Run as root, all state lands
+under ``/var/lib/theozolith-control/`` (the ADR-0024 partition at a system
+path) and the admin subcommands run under ``sudo``; unprivileged and
+containerized runs keep ``~/.theozolith/``. ``recover`` validates a
 restored copy loudly and re-mints the server certificate from the restored
 CA — a same-IP restore reconnects the fleet untouched (nodes dial the
-persisted control IP directly; ADR-0023 as amended 2026-07-28). Browsers
-dial that same IP (ADR-0034 — the slug origin is retired).
+persisted control IP directly; ADR-0023 as amended 2026-07-28).
 
 Secret entry happens here and through the dashboard's web form — both write
 through the same PUT /api/v1/secrets/{name} API to the same encrypted store
@@ -30,11 +33,13 @@ the server URL from CONTROL_NODE_URL or the persisted control address.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
 import re
 import secrets as _secrets
+import socket
 import ssl
 import sys
 import threading
@@ -45,7 +50,17 @@ from typing import Any
 
 from theozolith_worker.config import ConfigError, env_value
 
-from theozolith_control import bootstrap, controltoml, janitor, origin, passwords, product, tls
+from theozolith_control import (
+    bootstrap,
+    controltoml,
+    janitor,
+    localnode,
+    origin,
+    passwords,
+    product,
+    statuscli,
+    tls,
+)
 from theozolith_control.crypto import CryptoError, SecretBox, ensure_key_file, generate_key
 from theozolith_control.origin import OriginError
 from theozolith_control.secretstore import SecretStore
@@ -100,29 +115,13 @@ def _call(
 def _admin_env(args) -> tuple[str, str, str | None]:
     """(url, admin token, ca) for the HTTP subcommands. Everything falls
     back to init's artifacts on this box — on the Control Node itself the
-    commands work with no environment at all (`.env` is gone)."""
-    settings = load_settings()
-    # The one persisted address (ADR-0031/0034): IP-based, zero DNS
-    # dependency — the server cert carries the IP SAN, so verification
-    # passes.
-    url = args.url or env_value(os.environ, "CONTROL_NODE_URL") or _node_control_url(settings)
-    if not url:
-        raise SystemExit(
-            "error: no Control Node URL — set CONTROL_NODE_URL, pass --url, or run"
-            " 'theozolith init' on this box first"
-        )
-    token = settings.admin_token
-    if not token:
-        raise SystemExit(
-            "error: no admin token — on the Control Node run this under sudo"
-            " (a root-mediated install keeps it in /var/lib/theozolith-control;"
-            " ADR-0034); elsewhere set THEOZOLITH_ADMIN_TOKEN (or its _FILE"
-            " form), or run 'theozolith init' first"
-        )
-    ca = args.ca or env_value(os.environ, "THEOZOLITH_TLS_CA")
-    if not ca and (settings.tls_dir / CA_FILE).is_file():
-        ca = str(settings.tls_dir / CA_FILE)
-    return url, token, ca
+    commands work with no environment at all (`.env` is gone). One
+    implementation: statuscli.resolve_target (ADR-0039); this wrapper only
+    converts the refusal into the CLI error contract."""
+    try:
+        return statuscli.resolve_target(args.url, args.ca)
+    except statuscli.TargetError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 # -- serve ---------------------------------------------------------------------
@@ -176,27 +175,33 @@ def _serve(args) -> int:
     if not tls and not args.insecure_dev:
         raise SystemExit(
             f"error: no TLS material at {settings.tls_dir} — run 'theozolith tls-init"
-            " --host <name-or-ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
+            " --host <ip>' first (TLS is mandatory; --insecure-dev for local dev only)"
         )
-    browser_origin = None
+    control_address = None
     if not args.insecure_dev or settings.control_ip:
-        # Production requires the persisted control address (ADR-0034 — the
-        # slug origin is retired): it arms exact Host/Origin enforcement and
-        # is the one origin browsers may reach this deployment by. It is
+        # Production requires the persisted control address (ADR-0034): it
+        # is the machine channel every node and mint surface dials. It is
         # independent of --host/--port (the bind address); a
         # persisted-but-invalid address fails closed in dev too.
         try:
-            browser_origin = origin.derive_origin(settings.control_ip, settings.control_port)
+            control_address = origin.derive_origin(settings.control_ip, settings.control_port)
         except OriginError as exc:
             raise SystemExit(
                 f"error: {exc} — production startup requires the persisted control"
                 " address (run 'theozolith init'; --insecure-dev for local dev only)"
             ) from exc
-    if not args.insecure_dev and not settings.admin_password_path.is_file():
-        raise SystemExit(
-            "error: no admin password is set — run 'theozolith init' first"
-            " (--insecure-dev for local dev only)"
-        )
+    # The browser surface is lazy (ADR-0036): no admin password is required
+    # to serve. A persisted browser origin arms the guard in mount_web; a
+    # persisted-but-malformed one fails closed here.
+    browser_origin = None
+    if settings.browser_origin:
+        try:
+            browser_origin = origin.parse_browser_origin(settings.browser_origin)
+        except OriginError as exc:
+            raise SystemExit(
+                f"error: persisted browser origin is invalid: {exc} — re-run"
+                " 'theozolith origin-init --force'"
+            ) from exc
     settings = dataclasses.replace(settings, secrets_channel_ok=True, serve_tls=tls)
     # A running fleet always has a recorded version (ADR-0015, 2026-07-22):
     # a fresh install with no product.toml pin resolves the latest release
@@ -247,20 +252,26 @@ def _serve(args) -> int:
     _log(f"control node bound to {args.host}:{args.port} (TLS {'on' if tls else 'OFF — dev mode'})")
     if browser_origin is not None:
         _log(f"browser origin (exact Host/Origin): {browser_origin.origin}")
-        # The mismatch fails loud (ADR-0034): outside a container nothing
-        # can be mapping the external port onto this bind, so a bind that
-        # differs from the persisted external port means browsers and nodes
-        # dial a port nobody answers — the exact silent failure that
-        # prompted the ADR. In the compose flow the 443:8443 mapping is the
-        # bridge, and a container bind is never the external truth.
-        if not _running_in_container() and args.port != settings.control_port:
-            _log(
-                f"WARNING: bound to port {args.port}, but the persisted external"
-                f" port is {settings.control_port} — every browser and node dials"
-                f" {browser_origin.origin}. Bare metal: use the systemd unit"
-                f" (binds --port {settings.control_port} directly), or re-run"
-                " 'theozolith init --force --port <port>' to re-point the fleet."
-            )
+    elif tls:
+        _log("browser surface disabled — enable it with 'theozolith origin-init' (ADR-0036)")
+    # The mismatch fails loud (ADR-0034): outside a container nothing can
+    # be mapping the external port onto this bind, so a bind that differs
+    # from the persisted external port means browsers and nodes dial a
+    # port nobody answers — the exact silent failure that prompted the
+    # ADR. In the compose flow the 443:8443 mapping is the bridge, and a
+    # container bind is never the external truth.
+    if (
+        control_address is not None
+        and not _running_in_container()
+        and args.port != settings.control_port
+    ):
+        _log(
+            f"WARNING: bound to port {args.port}, but the persisted external"
+            f" port is {settings.control_port} — every browser and node dials"
+            f" {control_address.origin}. Bare metal: use the systemd unit"
+            f" (binds --port {settings.control_port} directly), or re-run"
+            " 'theozolith init --force --port <port>' to re-point the fleet."
+        )
     try:
         uvicorn.run(
             app,
@@ -282,15 +293,9 @@ def _serve(args) -> int:
 
 def _node_control_url(settings: ControlSettings) -> str:
     """The IP-based URL nodes dial (ADR-0023 § node channel addressing):
-    the persisted control IP + external https port. Since ADR-0034 this is
-    also the browser origin — one address for everything. Empty until init
-    has persisted the IP."""
-    if not settings.control_ip:
-        return ""
-    try:
-        return origin.derive_origin(settings.control_ip, settings.control_port).origin
-    except OriginError:
-        return ""
+    the persisted control IP + external https port. Empty until init has
+    persisted the IP. One implementation, in statuscli (ADR-0039)."""
+    return statuscli.control_url(settings)
 
 
 def _running_in_container() -> bool:
@@ -321,10 +326,31 @@ def _prompt_password(args) -> str:
 
 
 def _write_private(path: Path, text: str) -> None:
+    """One 0600 credential file, written atomically: the record either
+    keeps its previous content or carries the complete new one — a crash
+    can never leave a partial credential (ADR-0036). Ownership follows the
+    parent directory's owner, so a sudo-run subcommand (origin-init,
+    set-password) hands the file straight to the service user whose
+    partition it lands in (ADR-0034) instead of stranding a root-owned
+    record the service cannot read after a restart."""
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text + "\n")
+    parent = path.parent.stat()
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(fd, 0o600)
+            if os.geteuid() == 0 and parent.st_uid != 0:
+                os.fchown(fd, parent.st_uid, parent.st_gid)
+            handle.write(text + "\n")
+            handle.flush()
+            os.fsync(fd)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _git_init(config_repo: Path) -> None:
@@ -339,6 +365,11 @@ def _git_init(config_repo: Path) -> None:
 CONTROL_SERVICE_USER = "ozolith-control"
 CONTROL_SERVICE_NAME = "theozolith-control.service"
 CONTROL_UNIT_PATH = Path("/etc/systemd/system") / CONTROL_SERVICE_NAME
+
+# Unconditionally in the server-cert SAN (ADR-0036/0037): the local node of
+# a Single-Node Deployment persists a loopback dial address, and the
+# Operator TUI is a loopback API consumer — both verify against this cert.
+LOOPBACK_IP = "127.0.0.1"
 
 
 def _render_unit(exec_path: str, data_dir: Path, port: int) -> str:
@@ -498,17 +529,34 @@ def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
     return True
 
 
-def _print_handoff(settings: ControlSettings, ip: str, port: int, unit_installed: bool) -> None:
-    """The operator handoff (ADR-0034): no DNS step exists; the first visit
-    clicks through the certificate interstitial (the TrueNAS model), and CA
-    trust is the optional green-lock upgrade — exact instructions, not
-    prose."""
-    dashboard = origin.derive_origin(ip, port).origin
+def _print_trust_upgrade(settings: ControlSettings, ip: str) -> None:
+    """The optional green-lock upgrade (ADR-0034): exact per-OS CA-trust
+    instructions, printed by origin-init — the step exists only once a
+    browser is wanted."""
     ca_url = f"http://{ip}:{settings.bootstrap_port}/ca.pem"
+    _log("OPTIONAL green-lock upgrade — trust the per-deployment CA on a device:")
+    _log(f"  download {ca_url} (served while serve runs), then:")
+    _log(
+        "  macOS:   sudo security add-trusted-cert -d -k /Library/Keychains/System.keychain ca.pem"
+    )
+    _log(
+        "  Linux:   sudo cp ca.pem /usr/local/share/ca-certificates/theozolith.crt"
+        " && sudo update-ca-certificates"
+    )
+    _log("  Firefox: uses its own store — Settings > Privacy & Security > Certificates > Import")
+    _log("  iOS:     send ca.pem to the device, install the profile, then enable it under")
+    _log("           Settings > General > About > Certificate Trust Settings")
+
+
+def _print_handoff(settings: ControlSettings, ip: str, port: int, unit_installed: bool) -> None:
+    """The operator handoff (ADR-0036): the machine surface only — no
+    password was taken and no browser step exists. The dashboard is one
+    optional command away and the handoff says exactly which."""
+    control_url = origin.derive_origin(ip, port).origin
     _log("")
     _log("== Control Node initialized ==")
-    _log(f"dashboard: {dashboard} (browsers and nodes dial this same address —")
-    _log("no DNS anywhere; give this box a static IP or DHCP reservation)")
+    _log(f"control address: {control_url} (nodes and the CLI dial this — no DNS")
+    _log("anywhere; give this box a static IP or DHCP reservation)")
     _log("")
     if unit_installed:
         _log(f"1) start serving:      sudo systemctl start {CONTROL_SERVICE_NAME}")
@@ -517,56 +565,72 @@ def _print_handoff(settings: ControlSettings, ip: str, port: int, unit_installed
         _log("   -f deploy/compose/control.yml up -d — the port mapping bridges the")
         _log(f"   external port {port} onto the bind)")
     _log("")
-    _log(f"2) open {dashboard} and log in with the admin password. Your browser")
-    _log("   warns about the self-signed certificate on first visit — click through")
-    _log("   (ADR-0034; nodes are unaffected: they pin the CA cryptographically).")
+    _log("2) provision nodes:    sudo theozolith join-token create   (one paste per box)")
     _log("")
-    _log("   OPTIONAL green-lock upgrade — trust the per-deployment CA on a device:")
-    _log(f"     download {ca_url} (served while serve runs), then:")
-    _log(
-        "     macOS:   sudo security add-trusted-cert -d"
-        " -k /Library/Keychains/System.keychain ca.pem"
-    )
-    _log(
-        "     Linux:   sudo cp ca.pem /usr/local/share/ca-certificates/theozolith.crt"
-        " && sudo update-ca-certificates"
-    )
-    _log("     Firefox: uses its own store — Settings > Privacy & Security > Certificates > Import")
-    _log("     iOS:     send ca.pem to the device, install the profile, then enable it under")
-    _log("              Settings > General > About > Certificate Trust Settings")
+    _log("3) check the fleet:    sudo theozolith status")
     _log("")
-    _log("3) provision nodes:    sudo theozolith join-token create   (one paste per box)")
+    _log("optional — the browser dashboard stays off until you run")
+    _log("'sudo theozolith origin-init': it asks for the browser origin and an")
+    _log("admin password together (the two browser-only credentials; ADR-0036).")
+    _log("Until then every browser route refuses and the bearer API serves")
+    _log("everything.")
     _log("")
     _log(f"backup: copy {settings.data_dir}/ minus cache/ to another device after")
     _log("enrolling nodes or adding secrets — GitHub is never a full backup (ADR-0024)")
 
 
 def _init(args) -> int:
-    """The unified first run (ADR-0023, amended by ADR-0034): master key ->
-    control address -> CA/TLS with the box's IP in the SAN -> admin password
-    -> systemd unit (root, bare metal) -> operator handoff. Re-run requires
-    --force (which mints a new CA — invalidating every outstanding join
-    string by construction — but never touches the master key: rotate-key
-    owns that, with re-encryption)."""
+    """The unified first run (ADR-0023, amended by ADR-0034/0036): master
+    key -> admin bearer token -> control address -> CA/TLS with IP SANs
+    (the box's IP + loopback) -> systemd unit (root, bare metal) ->
+    operator handoff. No browser credential is taken (origin-init owns
+    both). Re-run requires --force (which mints a new CA — invalidating
+    every outstanding join string by construction — but never touches the
+    master key: rotate-key owns that, with re-encryption)."""
     settings = load_settings()
     existing_ip = controltoml.read_control_ip(settings.config_repo)
     initialized = bool(existing_ip) or settings.key_path.is_file()
-    if initialized and not args.force:
+    # A repeated --with-local-node on an initialized box is a RESUME, not a
+    # re-init (ADR-0037): every local-node phase is idempotent or
+    # reconciled, and a failed bootstrap must be retryable without --force
+    # or a CA rotation.
+    resume_local = initialized and not args.force and getattr(args, "with_local_node", False)
+    if initialized and not args.force and not resume_local:
         raise SystemExit(
             f"error: {settings.data_dir} is already initialized"
             f" ({existing_ip or 'master key present'}) — pass --force to re-run."
             " A new CA invalidates the pinned ca.pem on EVERY provisioned node:"
             " the whole fleet fails TLS until each box gets one join-string"
             " re-paste. Device trust and every outstanding join string are"
-            " invalidated too."
+            " invalidated too. (A partial single-node bootstrap resumes with"
+            " 'init --with-local-node' alone — no --force needed.)"
         )
 
     # Root-mediated init fails BEFORE any state is written: a bad
     # THEOZOLITH_DATA_DIR (or an unreachable executable) must not leave a
-    # half-laid partition behind the eventual installer refusal.
+    # half-laid partition behind the eventual installer refusal. SAN input
+    # is validated in the same zone: hostnames are refused here, not after
+    # the address landed (ADR-0036: IP SANs only from init).
+    extra_hosts = _ip_literals_only(list(args.host or []), "--host")
     if os.geteuid() == 0 and not _running_in_container() and _systemd_present():
         _validated_root_data_dir(settings.data_dir)
         _service_executable()
+
+    # --with-local-node pre-flight (ADR-0037), same posture: everything the
+    # internal join needs must resolve before any state lands.
+    nodedaemon_exec = ""
+    if getattr(args, "with_local_node", False):
+        if os.geteuid() != 0 or _running_in_container() or not _systemd_present():
+            raise SystemExit(
+                "error: --with-local-node is a bare-metal root setup (it installs"
+                " the Node Daemon and its systemd unit; ADR-0037) — run"
+                " 'sudo theozolith init --with-local-node' on the box itself,"
+                " outside any container"
+            )
+        nodedaemon_exec = localnode.ensure_preconditions()
+
+    if resume_local:
+        return _resume_local_node(settings, nodedaemon_exec)
 
     # The control IP (ADR-0031): confirmed once, persisted, and the ONLY
     # address any mint surface will ever embed. Inside a container the
@@ -608,36 +672,235 @@ def _init(args) -> int:
     except controltoml.ControlTomlError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
-    # 3. Per-deployment CA + server cert; the persisted IP rides the SAN so
-    # the join exchange, every node dial, and CA-trusting browsers verify
-    # cleanly (ADR-0023/0034).
-    hosts = [ip] + [h for h in (args.host or []) if h != ip]
+    # 3. Per-deployment CA + server cert with IP SANs only (ADR-0036): the
+    # persisted IP so the join exchange, every node dial, and CA-trusting
+    # browsers verify cleanly (ADR-0023/0034), plus loopback (ADR-0037: the
+    # local node and the Operator TUI dial 127.0.0.1). A browser origin
+    # persisted by an earlier origin-init survives --force: its host stays
+    # in the SAN so the enabled surface outlives a re-init.
+    hosts = [ip, LOOPBACK_IP]
+    persisted_origin = controltoml.read_browser_origin(settings.config_repo)
+    if persisted_origin:
+        # A malformed persisted origin is surfaced by recover and
+        # origin-init --force; init must not die on it.
+        with contextlib.suppress(OriginError):
+            hosts.append(origin.san_host(origin.parse_browser_origin(persisted_origin)))
+    hosts = list(dict.fromkeys(hosts + extra_hosts))
     try:
         provision(settings.tls_dir, hosts)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
-    # 4. The admin password: only its scrypt hash is stored (ADR-0023).
-    _write_private(settings.admin_password_path, passwords.hash_password(_prompt_password(args)))
-    Store(settings.cache_db_path).truncate_sessions()
+    # 3b. The stage-don't-deploy scaffold (ADR-0037), before the unit
+    # install so the partition chown hands it to the service user whole.
+    node_name = socket.gethostname()
+    if nodedaemon_exec:
+        localnode.write_scaffold(settings.config_repo, node_name, log=_log)
 
-    # 5. The systemd unit (root-mediated bare metal only; ADR-0034) — after
+    # 4. The systemd unit (root-mediated bare metal only; ADR-0034) — after
     # every artifact exists, so the chown hands the complete partition over.
     unit_installed = _install_systemd_unit(settings, port)
+
+    # 5. The local node (ADR-0037): early serve start via the unit just
+    # installed, then the unmodified join flow, machine-consumed.
+    if nodedaemon_exec:
+        localnode.bootstrap_local_node(
+            settings, node_name=node_name, nodedaemon_exec=nodedaemon_exec, log=_log
+        )
+        _print_local_handoff(settings, ip, port, node_name)
+        return 0
 
     # 6. The handoff.
     _print_handoff(settings, ip, port, unit_installed)
     return 0
 
 
+def _resume_local_node(settings: ControlSettings, nodedaemon_exec: str) -> int:
+    """The retry path (ADR-0037): re-running ``init --with-local-node`` on
+    an initialized box resumes the local bootstrap in place — no --force,
+    no CA rotation, operator edits preserved. The standard-init artifacts
+    must already exist: a damaged PARTITION is recover's territory, not
+    resume's."""
+    problems = [
+        f"missing {name} at {path}"
+        for name, path in (
+            ("master key", settings.key_path),
+            ("CA certificate", settings.tls_dir / CA_FILE),
+            ("CA private key", settings.tls_dir / CA_KEY_FILE),
+            ("server certificate", settings.tls_dir / CERT_FILE),
+        )
+        if not path.is_file()
+    ]
+    if not settings.control_ip:
+        problems.append("no persisted control IP in control.toml")
+    if problems:
+        raise SystemExit(
+            "error: cannot resume --with-local-node — the standard init state is"
+            " incomplete:\n  - "
+            + "\n  - ".join(problems)
+            + "\nrestore it ('theozolith recover' from a backup) or re-init with --force."
+        )
+    _log("already initialized — resuming the local node in place (CA untouched;")
+    _log("completed phases are skipped or reconciled; ADR-0037)")
+    node_name = socket.gethostname()
+    localnode.write_scaffold(settings.config_repo, node_name, log=_log)
+    _install_systemd_unit(settings, settings.control_port)
+    localnode.bootstrap_local_node(
+        settings, node_name=node_name, nodedaemon_exec=nodedaemon_exec, log=_log
+    )
+    _print_local_handoff(settings, settings.control_ip, settings.control_port, node_name)
+    return 0
+
+
+def _print_local_handoff(settings: ControlSettings, ip: str, port: int, node_name: str) -> None:
+    """The Single-Node Deployment handoff (ADR-0037): serve already runs
+    under systemd and the local node heartbeats — no start step, no join
+    string was ever shown. The finish line lives in the scaffold README."""
+    control_url = origin.derive_origin(ip, port).origin
+    _log("")
+    _log("== Single-Node Deployment initialized ==")
+    _log(f"control address: {control_url} (the service is running; the local node")
+    _log(f"{node_name!r} is registered and heartbeating over loopback)")
+    _log("")
+    _log("a worker Stack is STAGED, not deployed — finish line (three steps) in")
+    _log(f"{settings.config_repo / 'README.md'}:")
+    _log("  1) pin the base image digest in images/claude-dev.toml")
+    _log("  2) enter secrets:      sudo theozolith secret set github-worker")
+    _log("                         sudo theozolith secret set anthropic-api-key")
+    _log('  3) flip state = "running" in stacks/worker.toml and commit')
+    _log("")
+    _log("check the fleet:       sudo theozolith status")
+    _log("more nodes later:      sudo theozolith join-token create   (one paste per box)")
+    _log("browser (optional):    sudo theozolith origin-init   (ADR-0036)")
+    _log("")
+    _log(f"backup: copy {settings.data_dir}/ minus cache/ to another device after")
+    _log("enrolling nodes or adding secrets — GitHub is never a full backup (ADR-0024)")
+
+
+def _prompt_browser_origin(default_origin: str) -> str:
+    """The browser origin, defaulting to the IP origin (ADR-0036). A piped
+    stdin (scripts, tests) reads one line — blank keeps the default; a
+    terminal prompts once."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().strip() or default_origin
+    return input(f"browser origin [{default_origin}]: ").strip() or default_origin
+
+
+def _repair_partition_ownership(settings: ControlSettings) -> None:
+    """Hand a sudo-run subcommand's writes back to the service user
+    (ADR-0036): origin-init, set-password, and tls-init mutate the
+    partition AFTER init's chown handed it over, and a root-owned
+    credential or server key is unreadable to theozolith-control.service
+    on its next restart. Same blast radius as the installer (ADR-0034,
+    PR #12): the ONE path a root recursive chown may touch is the constant
+    system leaf, symlink-free — everything else is skipped (unprivileged
+    and hand-run-dev partitions are already owned correctly, and a
+    root-owned partition means no service user exists to hand over to)."""
+    if os.geteuid() != 0:
+        return
+    from theozolith_control.settings import DEFAULT_ROOT_DATA_DIR
+
+    expected = Path(DEFAULT_ROOT_DATA_DIR)
+    data_dir = settings.data_dir
+    if data_dir != expected or data_dir.is_symlink() or data_dir.resolve() != expected.resolve():
+        return
+    try:
+        owner = data_dir.stat()
+    except OSError:
+        return
+    if owner.st_uid == 0:
+        return
+    import subprocess
+
+    subprocess.run(
+        ["chown", "-R", f"{owner.st_uid}:{owner.st_gid}", str(data_dir)],
+        check=True,
+    )
+
+
+def _origin_init(args) -> int:
+    """The opt-in browser step (ADR-0036): take the two browser-only
+    credentials together — the origin browsers may dial (default: the IP
+    origin; an operator running their own DNS may enter a hostname) and the
+    admin password — re-mint the server certificate via the same machinery
+    recover uses (same CA, never a new one), then persist the origin LAST:
+    its presence is the enablement bit, so an earlier failure leaves the
+    surface cleanly disabled."""
+    settings = load_settings()
+    if not settings.control_ip:
+        raise SystemExit("error: no persisted control IP — run 'theozolith init' first")
+    for name, path in (
+        ("CA certificate", settings.tls_dir / CA_FILE),
+        ("CA private key", settings.tls_dir / CA_KEY_FILE),
+    ):
+        if not path.is_file():
+            raise SystemExit(f"error: missing {name} at {path} — run 'theozolith init' first")
+    if settings.browser_origin and not args.force:
+        raise SystemExit(
+            f"error: browser origin already persisted ({settings.browser_origin}) — pass"
+            " --force to re-run origin-init. It re-mints the server certificate,"
+            " replaces the admin password, and invalidates every browser session."
+        )
+    try:
+        default_origin = origin.derive_origin(settings.control_ip, settings.control_port).origin
+    except OriginError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    try:
+        parsed = origin.parse_browser_origin(_prompt_browser_origin(default_origin))
+    except OriginError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    password = _prompt_password(args)
+
+    # Certificate first (recover's machinery: same CA), then the password
+    # hash, then the origin — the enablement bit lands last. Whatever this
+    # sudo-run writes, complete or interrupted, is handed back to the
+    # service user in the finally: a root-owned server key or password
+    # record must never survive to break the next service restart.
+    hosts = list(dict.fromkeys([settings.control_ip, LOOPBACK_IP, origin.san_host(parsed)]))
+    try:
+        try:
+            cert, _key = tls.remint_server_cert(settings.tls_dir, hosts)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+        _log(f"re-minted {cert.name} from the existing CA (SAN: {', '.join(hosts)}) — nodes")
+        _log("pin the CA, not the server cert: no node is touched")
+        _write_private(settings.admin_password_path, passwords.hash_password(password))
+        # Invalidate sessions without root-creating the service's cache
+        # database: no cache.db means no sessions exist to invalidate.
+        if settings.cache_db_path.is_file():
+            Store(settings.cache_db_path).truncate_sessions()
+        try:
+            controltoml.write_browser_origin(settings.config_repo, parsed.origin, log=_log)
+        except controltoml.ControlTomlError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+    finally:
+        _repair_partition_ownership(settings)
+    _log("")
+    _log(f"browser surface enabled: {parsed.origin}")
+    _log(f"restart the service to arm it: sudo systemctl restart {CONTROL_SERVICE_NAME}")
+    _log("(compose flow: docker compose -f deploy/compose/control.yml restart)")
+    _log("")
+    _log("first visit shows the self-signed-certificate interstitial — click")
+    _log("through and log in (ADR-0034; nodes are unaffected: they pin the CA).")
+    _print_trust_upgrade(settings, settings.control_ip)
+    return 0
+
+
 def _set_password(args) -> int:
     """Change the admin password: rewrite the hash and truncate the session
-    table — every browser session dies now (ADR-0023)."""
+    table — every browser session dies now (ADR-0023). Under sudo the
+    record is handed to the service user (ADR-0036)."""
     settings = load_settings()
     if not settings.secrets_dir.is_dir():
         raise SystemExit("error: not initialized — run 'theozolith init' first")
-    _write_private(settings.admin_password_path, passwords.hash_password(_prompt_password(args)))
-    Store(settings.cache_db_path).truncate_sessions()
+    try:
+        _write_private(
+            settings.admin_password_path, passwords.hash_password(_prompt_password(args))
+        )
+        if settings.cache_db_path.is_file():
+            Store(settings.cache_db_path).truncate_sessions()
+    finally:
+        _repair_partition_ownership(settings)
     _log("admin password updated; every browser session was invalidated")
     return 0
 
@@ -689,13 +952,28 @@ def _recover(args) -> int:
     ):
         if not path.is_file():
             problems.append(f"missing {name} at {path}")
-    if not settings.admin_password_path.is_file():
-        problems.append(f"missing admin password hash at {settings.admin_password_path}")
-    else:
+    # Browser credentials are optional-but-consistent (ADR-0036): with no
+    # persisted origin the surface is disabled and no password is owed;
+    # with one, the password hash must exist and parse.
+    if settings.browser_origin:
         try:
-            passwords.parse_record(settings.admin_password_path.read_text(encoding="utf-8"))
-        except passwords.PasswordFormatError as exc:
-            problems.append(f"{settings.admin_password_path}: {exc}")
+            origin.parse_browser_origin(settings.browser_origin)
+        except OriginError as exc:
+            problems.append(
+                f"persisted browser origin invalid: {exc} — re-run"
+                " 'theozolith origin-init --force' after recovery"
+            )
+        if not settings.admin_password_path.is_file():
+            problems.append(
+                "browser surface is enabled (browser origin persisted) but the admin"
+                f" password hash is missing at {settings.admin_password_path} — restore"
+                " it, or re-run 'theozolith origin-init --force' after recovery"
+            )
+        else:
+            try:
+                passwords.parse_record(settings.admin_password_path.read_text(encoding="utf-8"))
+            except passwords.PasswordFormatError as exc:
+                problems.append(f"{settings.admin_password_path}: {exc}")
     if not settings.store_db_path.is_file():
         problems.append(f"missing {settings.store_db_path}")
     elif box is not None:
@@ -715,11 +993,16 @@ def _recover(args) -> int:
         _log("restore a complete copy of the data dir (minus cache/) and re-run")
         return 1
 
+    hosts = [ip, LOOPBACK_IP]
+    if settings.browser_origin:
+        # Validated above; problems abort before this line.
+        hosts.append(origin.san_host(origin.parse_browser_origin(settings.browser_origin)))
+    hosts = list(dict.fromkeys(hosts))
     try:
-        cert, key = tls.remint_server_cert(settings.tls_dir, [ip])
+        cert, key = tls.remint_server_cert(settings.tls_dir, hosts)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
-    _log(f"re-minted {cert} and {key} from the restored CA (SAN: {ip})")
+    _log(f"re-minted {cert} and {key} from the restored CA (SAN: {', '.join(hosts)})")
     if args.ip and args.ip != persisted_ip:
         controltoml.write_control_address(settings.config_repo, args.ip, log=_log)
     # Root-mediated recovery repairs the service too (ADR-0034): same
@@ -752,20 +1035,55 @@ def _recover(args) -> int:
     return 0
 
 
+def _ip_literals_only(values: list[str], flag: str) -> list[str]:
+    """SAN inputs on the machine-surface commands are IP literals only
+    (ADR-0036): a hostname enters the certificate exactly one way — the
+    persisted browser origin, via origin-init."""
+    import ipaddress
+
+    checked: list[str] = []
+    for value in values:
+        try:
+            checked.append(str(ipaddress.ip_address(value)))
+        except ValueError as exc:
+            raise SystemExit(
+                f"error: {flag} {value!r} is not an IP literal — init and tls-init"
+                " mint IP SANs only; hostnames enter the certificate exactly one"
+                " way: 'theozolith origin-init' (ADR-0036)"
+            ) from exc
+    return checked
+
+
 def _tls_init(args) -> int:
     settings = load_settings()
-    hosts = list(args.host or [])
-    # The persisted control IP belongs in the certificate SAN (ADR-0031/
-    # 0034 — nodes and browsers both dial it); extra --host entries (a LAN
-    # alias, a public name) are additive.
-    if settings.control_ip and settings.control_ip not in hosts:
-        hosts.insert(0, settings.control_ip)
+    hosts = _ip_literals_only(list(args.host or []), "--host")
+    # Every persisted dial identity belongs in the certificate SAN: the
+    # control IP (ADR-0031/0034), loopback (ADR-0037), and the browser
+    # origin's host when one is enabled (ADR-0036) — a manual re-mint must
+    # not silently break the node channel or the dashboard. Extra --host
+    # entries (extra LAN addresses) are additive and IP-only.
+    if settings.control_ip:
+        preserved = [settings.control_ip, LOOPBACK_IP]
+        if settings.browser_origin:
+            try:
+                preserved.append(
+                    origin.san_host(origin.parse_browser_origin(settings.browser_origin))
+                )
+            except OriginError as exc:
+                raise SystemExit(
+                    f"error: persisted browser origin is invalid: {exc} — re-run"
+                    " 'theozolith origin-init --force'"
+                ) from exc
+        hosts = list(dict.fromkeys(preserved + hosts))
     if not hosts:
         raise SystemExit("error: pass --host, or run 'theozolith init' first (ADR-0031)")
     try:
-        ca, cert, key = provision(settings.tls_dir, hosts)
-    except ValueError as exc:
-        raise SystemExit(f"error: {exc}") from exc
+        try:
+            ca, cert, key = provision(settings.tls_dir, hosts)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+    finally:
+        _repair_partition_ownership(settings)
     _log(f"wrote {ca}, {cert}, {key}")
     _log(f"distribute {ca.name} to every node (install script --ca, or THEOZOLITH_TLS_CA)")
     return 0
@@ -858,9 +1176,7 @@ def _unquarantine(args) -> int:
 
 
 def _status(args) -> int:
-    url, token, ca = _admin_env(args)
-    print(json.dumps(_call(url, "/api/v1/state", token=token, ca=ca), indent=2, sort_keys=True))
-    return 0
+    return statuscli.run(args)
 
 
 def _flags(args) -> int:
@@ -899,9 +1215,10 @@ def main(argv: list[str] | None = None) -> int:
 
     init = sub.add_parser(
         "init",
-        help="The unified first run (ADR-0023/0034; run under sudo on bare metal):"
-        " master key, control address, CA/TLS with this box's IP in the SAN, admin"
-        " password, systemd unit, and the operator handoff. Re-run requires --force.",
+        help="The unified first run (ADR-0023/0034/0036; run under sudo on bare"
+        " metal): master key, admin bearer token, control address, CA/TLS with IP"
+        " SANs (this box's IP + loopback), systemd unit, and the operator handoff."
+        " No browser credential — that is 'origin-init'. Re-run requires --force.",
     )
     init.add_argument(
         "--port",
@@ -918,7 +1235,19 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument(
         "--host",
         action="append",
-        help="Extra DNS name or IP for the certificate SAN (repeatable).",
+        help="Extra IP literal for the certificate SAN (repeatable). Hostnames are"
+        " refused: init mints IP SANs only, and a hostname enters the certificate"
+        " exactly one way — 'theozolith origin-init' (ADR-0036).",
+    )
+    init.add_argument(
+        "--with-local-node",
+        action="store_true",
+        help="Single-Node Deployment (ADR-0037): after standard init, install the"
+        " Node Daemon on this box and run the UNMODIFIED join flow internally"
+        " (loopback dial address; the join string is machine-consumed, never"
+        " shown), then stage a stopped worker Stack scaffold in the Config Repo."
+        " Requires bare-metal root with systemd, docker, and the"
+        " theozolith-nodedaemon CLI installed.",
     )
     init.add_argument(
         "--force",
@@ -946,6 +1275,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     recover.set_defaults(func=_recover)
 
+    origin_init = sub.add_parser(
+        "origin-init",
+        help="Enable the browser surface (ADR-0036): prompt for the browser origin"
+        " (default: the IP origin; a hostname if you run your own DNS) and the"
+        " admin password together, re-mint the server certificate from the"
+        " existing CA with the origin host in the SAN, and persist the origin."
+        " Re-run requires --force.",
+    )
+    origin_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a persisted browser origin: re-mints the server certificate"
+        " (same CA — no node is touched), replaces the admin password, and"
+        " invalidates every browser session.",
+    )
+    origin_init.set_defaults(func=_origin_init)
+
     set_password = sub.add_parser(
         "set-password",
         help="Change the admin password (stores only the scrypt hash) and invalidate"
@@ -957,8 +1303,10 @@ def main(argv: list[str] | None = None) -> int:
     tls_init.add_argument(
         "--host",
         action="append",
-        help="DNS name or IP (repeatable; the persisted control IP is always included)."
-        " Wildcards are refused — every deployment gets its own TLS identity.",
+        help="Extra IP literal (repeatable; the persisted control IP, loopback, and"
+        " any enabled browser-origin host are always included). Hostnames and"
+        " wildcards are refused — hostnames enter only via 'theozolith"
+        " origin-init' (ADR-0036).",
     )
     tls_init.set_defaults(func=_tls_init)
 
@@ -988,7 +1336,20 @@ def main(argv: list[str] | None = None) -> int:
     unquarantine.add_argument("--node", required=True)
     unquarantine.set_defaults(func=_unquarantine)
 
-    sub.add_parser("status", help="Fleet state as JSON.").set_defaults(func=_status)
+    status = sub.add_parser(
+        "status",
+        help="Fleet health (ADR-0039): human table on stdout; exit 0 healthy,"
+        " 1 degraded (reason on the first line), 2 Control Node unreachable."
+        " A pure API consumer — no local systemd/docker probing, ever.",
+    )
+    status.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the raw read-model documents plus the computed verdict —"
+        " the ONLY parsing contract (the table is for humans).",
+    )
+    status.set_defaults(func=_status)
     sub.add_parser(
         "flags", help="Zombie flags, janitor actions, malformed states, quarantines."
     ).set_defaults(func=_flags)

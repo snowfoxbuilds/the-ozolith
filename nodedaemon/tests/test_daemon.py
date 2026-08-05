@@ -35,7 +35,7 @@ def pinned_response(stacks, commands=None, version="0.4.0") -> dict:
 
 def test_declaring_stacks_converges_the_node(rig: Rig):
     rig.control.heartbeat_answers.append(
-        heartbeat_response([process_stack("worker"), container_stack("control")])
+        heartbeat_response([process_stack("worker"), container_stack("flightdeck")])
     )
     rig.daemon.once()
 
@@ -44,8 +44,8 @@ def test_declaring_stacks_converges_the_node(rig: Rig):
     assert rig.popen.spawned[0].env["THEOZOLITH_REPO"] == "acme/sandbox"
     assert rig.popen.spawned[0].env["THEOZOLITH_NODE_NAME"] == "box1"
     # …and the container Stack runs as a labeled long-running container.
-    assert rig.docker.stacks["ozolith-stack-control"]["image"] == "theozolith-control:local"
-    assert rig.docker.stacks["ozolith-stack-control"]["ports"] == ["8443:8443"]
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == "theozolith-flightdeck:local"
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["ports"] == ["8443:8443"]
 
 
 def test_stopped_desired_state_stops_the_stack(rig: Rig):
@@ -599,11 +599,11 @@ def test_secret_pull_refused_over_plain_http_without_dev_flag(tmp_path):
 
 def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
     rig.control.secrets["admin-token"] = "the-admin-value"
-    stack = container_stack("control", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
+    stack = container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
 
-    recorded = rig.docker.stacks["ozolith-stack-control"]
+    recorded = rig.docker.stacks["ozolith-stack-flightdeck"]
     host_path = recorded["env_files"]["THEOZOLITH_ADMIN_TOKEN"]
     assert host_path == str(rig.config.secrets_dir / "admin-token")
 

@@ -45,22 +45,52 @@ Stacks and worker types on top, never below.
    listener's `/control-url`, the certificate SAN, and the browser origin carry —
    mint surfaces never re-detect it.
 
-   `init` (ADR-0023/0034) composes the whole first run: master key → control
-   address (`https://<control-ip>`; `--port` to vary) → per-deployment CA +
-   server cert with the persisted IP in the SAN → admin password prompt (only
-   its scrypt hash is stored) → on root bare metal, the systemd unit
-   (`theozolith-control.service`: a dedicated service user binding 443 via
+   `init` (ADR-0023/0034/0036) composes the machine surface: master key → admin
+   bearer token → control address (`https://<control-ip>`; `--port` to vary) →
+   per-deployment CA + server cert with IP SANs (the persisted IP and loopback)
+   → on root bare metal, the systemd unit (`theozolith-control.service`: a
+   dedicated service user binding 443 via
    `AmbientCapabilities=CAP_NET_BIND_SERVICE` — never a root serve) → the
-   **operator handoff**. There is no DNS step and no required certificate
-   install: the first browser visit clicks through the self-signed-certificate
-   interstitial and logs in (the TrueNAS model). Trusting the per-deployment CA
-   (download URL and per-OS one-liners in the handoff) is the optional
-   green-lock upgrade; operators with a public domain can substitute a publicly
-   valid certificate instead. Re-running `init` requires `--force`: **a new CA
-   invalidates the pinned `ca.pem` on every provisioned node — the whole fleet
-   fails TLS until each box gets one join-string re-paste** (outstanding join
-   strings and device trust die too; the master key and stored secrets are never
-   touched).
+   **operator handoff**. No password prompt and no browser step exist: the
+   bearer API serves everything, and every browser route refuses until you
+   opt in with `theozolith origin-init` — it asks for the browser origin (the
+   IP origin by default; a hostname if you run your own DNS) and the admin
+   password together, re-mints the server cert from the same CA, and restarts
+   nothing node-side. The first browser visit then clicks through the
+   self-signed-certificate interstitial and logs in (the TrueNAS model);
+   trusting the per-deployment CA (download URL and per-OS one-liners printed
+   by `origin-init`) is the optional green-lock upgrade, and operators with a
+   public domain can substitute a publicly valid certificate instead.
+   Re-running `init` requires `--force`: **a new CA invalidates the pinned
+   `ca.pem` on every provisioned node — the whole fleet fails TLS until each
+   box gets one join-string re-paste** (outstanding join strings and device
+   trust die too; the master key and stored secrets are never touched).
+   `origin-init` re-runs need their own `--force`.
+
+   **Single-Node Deployment** (ADR-0037): `sudo theozolith init
+   --with-local-node` additionally installs the Node Daemon on the same box
+   and runs the unmodified join flow internally — the join token is minted and
+   consumed machine-to-machine (you never see a join string), the local daemon
+   persists a **loopback** dial address (LAN renumbering never touches it),
+   and the Config Repo is seeded with a complete worker Stack staged at
+   `state = "stopped"` plus a README naming the finish line. Requires docker
+   and the `theozolith-nodedaemon` CLI in the same install (the bare-metal
+   build installs all four distributions).
+
+   **If the local bootstrap fails or is interrupted** (a phase timeout, a
+   provisioning error, Ctrl-C): re-run the same command —
+   `sudo theozolith init --with-local-node`, no `--force`. On an initialized
+   box it resumes in place: the CA never rotates, completed phases are
+   skipped or reconciled, operator edits in `configs/` are preserved, an
+   unconsumed machine-only join token was already revoked on the way out,
+   and no join string is ever shown. Reconciliation proves health rather
+   than assuming it: a registered node counts as healthy only with a fresh
+   heartbeat (on the server's clock) on top of a valid on-disk identity;
+   a stale or silent node is restarted and must heartbeat again before the
+   resume succeeds; a node whose local state is missing or corrupt fails
+   with explicit restore/re-provision instructions — nothing is deleted
+   automatically. `--force` remains what it always was — a full re-init
+   with a NEW CA — and is never needed for a retry.
 
    Everything lands under `/var/lib/theozolith-control/` on a root-mediated
    bare-metal install — that exact path is the only one the root installer
@@ -138,7 +168,7 @@ Stacks and worker types on top, never below.
 5. **Operate**:
 
    ```sh
-   theozolith status                                  # fleet state
+   theozolith status              # fleet health: table + exit 0/1/2; --json to parse
    theozolith command drain   --node box1 --target worker
    theozolith command recycle --node box1 --target worker   # kills the whole
        # driver tree, run containers included, and restarts it
@@ -236,8 +266,9 @@ sudo theozolith init            # check the auto-detected IP; --ip to correct it
 sudo systemctl start theozolith-control.service
 ```
 
-Browse to `https://<control-ip>`, click through the certificate interstitial,
-log in — then pin the product so the fleet has a recorded version:
+Check the fleet with `sudo theozolith status` (browser enablement is optional
+and separate: `sudo theozolith origin-init`; ADR-0036) — then pin the product
+so the fleet has a recorded version:
 
 ```sh
 cd the-ozolith && sudo theozolith build      # uploads the wheels, commits the pin
@@ -362,7 +393,7 @@ sudo theozolith recover      # validates, re-mints the server cert from the SAME
                              # CA, creates the service user, repairs ownership,
                              # installs and enables the unit
 sudo systemctl start theozolith-control.service
-rm -rf ~/.theozolith         # once the dashboard answers
+rm -rf ~/.theozolith         # once `sudo theozolith status` answers
 ```
 
 A deployment with no provisioned nodes and no stored secrets can skip all of
