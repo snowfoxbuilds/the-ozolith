@@ -39,6 +39,7 @@ import json
 import os
 import re
 import secrets as _secrets
+import socket
 import ssl
 import sys
 import threading
@@ -53,6 +54,7 @@ from theozolith_control import (
     bootstrap,
     controltoml,
     janitor,
+    localnode,
     origin,
     passwords,
     product,
@@ -584,6 +586,19 @@ def _init(args) -> int:
         _validated_root_data_dir(settings.data_dir)
         _service_executable()
 
+    # --with-local-node pre-flight (ADR-0037), same posture: everything the
+    # internal join needs must resolve before any state lands.
+    nodedaemon_exec = ""
+    if getattr(args, "with_local_node", False):
+        if os.geteuid() != 0 or _running_in_container() or not _systemd_present():
+            raise SystemExit(
+                "error: --with-local-node is a bare-metal root setup (it installs"
+                " the Node Daemon and its systemd unit; ADR-0037) — run"
+                " 'sudo theozolith init --with-local-node' on the box itself,"
+                " outside any container"
+            )
+        nodedaemon_exec = localnode.ensure_preconditions()
+
     # The control IP (ADR-0031): confirmed once, persisted, and the ONLY
     # address any mint surface will ever embed. Inside a container the
     # auto-detected address is the bridge IP — wrong for the LAN by
@@ -643,13 +658,53 @@ def _init(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
+    # 3b. The stage-don't-deploy scaffold (ADR-0037), before the unit
+    # install so the partition chown hands it to the service user whole.
+    node_name = socket.gethostname()
+    if nodedaemon_exec:
+        localnode.write_scaffold(settings.config_repo, node_name, log=_log)
+
     # 4. The systemd unit (root-mediated bare metal only; ADR-0034) — after
     # every artifact exists, so the chown hands the complete partition over.
     unit_installed = _install_systemd_unit(settings, port)
 
-    # 5. The handoff.
+    # 5. The local node (ADR-0037): early serve start via the unit just
+    # installed, then the unmodified join flow, machine-consumed.
+    if nodedaemon_exec:
+        localnode.bootstrap_local_node(
+            settings, node_name=node_name, nodedaemon_exec=nodedaemon_exec, log=_log
+        )
+        _print_local_handoff(settings, ip, port, node_name)
+        return 0
+
+    # 6. The handoff.
     _print_handoff(settings, ip, port, unit_installed)
     return 0
+
+
+def _print_local_handoff(settings: ControlSettings, ip: str, port: int, node_name: str) -> None:
+    """The Single-Node Deployment handoff (ADR-0037): serve already runs
+    under systemd and the local node heartbeats — no start step, no join
+    string was ever shown. The finish line lives in the scaffold README."""
+    control_url = origin.derive_origin(ip, port).origin
+    _log("")
+    _log("== Single-Node Deployment initialized ==")
+    _log(f"control address: {control_url} (the service is running; the local node")
+    _log(f"{node_name!r} is registered and heartbeating over loopback)")
+    _log("")
+    _log("a worker Stack is STAGED, not deployed — finish line (three steps) in")
+    _log(f"{settings.config_repo / 'README.md'}:")
+    _log("  1) pin the base image digest in images/claude-dev.toml")
+    _log("  2) enter secrets:      sudo theozolith secret set github-worker")
+    _log("                         sudo theozolith secret set anthropic-api-key")
+    _log('  3) flip state = "running" in stacks/worker.toml and commit')
+    _log("")
+    _log("check the fleet:       sudo theozolith status")
+    _log("more nodes later:      sudo theozolith join-token create   (one paste per box)")
+    _log("browser (optional):    sudo theozolith origin-init   (ADR-0036)")
+    _log("")
+    _log(f"backup: copy {settings.data_dir}/ minus cache/ to another device after")
+    _log("enrolling nodes or adding secrets — GitHub is never a full backup (ADR-0024)")
 
 
 def _prompt_browser_origin(default_origin: str) -> str:
@@ -1041,6 +1096,16 @@ def main(argv: list[str] | None = None) -> int:
         "--host",
         action="append",
         help="Extra DNS name or IP for the certificate SAN (repeatable).",
+    )
+    init.add_argument(
+        "--with-local-node",
+        action="store_true",
+        help="Single-Node Deployment (ADR-0037): after standard init, install the"
+        " Node Daemon on this box and run the UNMODIFIED join flow internally"
+        " (loopback dial address; the join string is machine-consumed, never"
+        " shown), then stage a stopped worker Stack scaffold in the Config Repo."
+        " Requires bare-metal root with systemd, docker, and the"
+        " theozolith-nodedaemon CLI installed.",
     )
     init.add_argument(
         "--force",
