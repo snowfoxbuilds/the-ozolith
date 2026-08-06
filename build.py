@@ -25,6 +25,7 @@ import argparse
 import contextlib
 import importlib.util
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -98,10 +99,11 @@ def ensure_environment(
 ) -> None:
     """Create-or-reuse the target venv, health-check its interpreter, and
     re-execute this shim with it (ADR-0041) — after which the build and
-    install run inside it unchanged. Every malformed or partial venv is
-    refused with remediation (repair or delete), and the shim never
-    package-manages on its own (the ADR-0037 posture). Does not return
-    except under test."""
+    install run inside it unchanged. Every malformed venv shape is refused
+    with remediation (repair or delete), and the shim never package-manages
+    on its own (the ADR-0037 posture); pip health is pre-flighted by
+    check_pip on the in-venv pass, which every entry shape funnels through.
+    Does not return except under test."""
     runner = subprocess.run if runner is None else runner
     geteuid = os.geteuid if geteuid is None else geteuid
     execv = os.execv if execv is None else execv
@@ -147,11 +149,6 @@ def ensure_environment(
             f"error: {python} is not executable — the venv is broken; restore its"
             " execute permission to repair it, or delete the venv and re-run"
         )
-    if not (venv / "bin" / "pip").is_file():
-        raise SystemExit(
-            f"error: {venv} has no bin/pip — the venv looks partially created"
-            " (an interrupted creation?); delete it and re-run"
-        )
     environ[REEXEC_MARKER] = "1"
     try:
         execv(str(python), [str(python), str(REPO_ROOT / "build.py"), *argv])
@@ -162,21 +159,75 @@ def ensure_environment(
         ) from None
 
 
+def check_pip(python: Path, *, runner=None) -> None:
+    """Pre-flight the exact operation the install step runs — ``python -m
+    pip`` (a ``bin/pip`` wrapper on disk proves nothing about the module) —
+    before any build work starts. Called on the in-venv pass, which every
+    entry shape funnels through: create + re-exec, reuse + re-exec, and the
+    direct ``sudo /opt/theozolith/bin/python build.py`` spelling."""
+    runner = subprocess.run if runner is None else runner
+    try:
+        proc = runner(
+            [str(python), "-m", "pip", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"error: could not run '{python} -m pip' ({exc.strerror or exc}) —"
+            " the venv cannot install the built wheels; repair its pip module"
+            " or delete the venv and re-run"
+        ) from None
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().splitlines()
+        cause = f" ({stderr[-1]})" if stderr else ""
+        raise SystemExit(
+            f"error: '{python} -m pip --version' failed with exit status"
+            f" {proc.returncode}{cause} — the venv cannot install the built"
+            " wheels; repair its pip module or delete the venv and re-run"
+        )
+
+
+def _own_temp_symlink(target: Path, link_dir: Path, name: str) -> Path:
+    """Create a temporary symlink to ``target`` under a name this invocation
+    provably owns: collision-resistant randomness plus exclusive creation
+    (symlink(2) fails EEXIST on any existing path, dangling links included).
+    An occupied candidate name — whatever occupies it — is left alone and
+    another name chosen; no path is ever "ours by name"."""
+    for _ in range(32):
+        tmp = link_dir / f".{name}.{secrets.token_hex(8)}.tmp"
+        try:
+            os.symlink(target, tmp)
+        except FileExistsError:
+            continue
+        return tmp
+    raise SystemExit(
+        f"error: could not create a temporary link in {link_dir} — 32 randomly"
+        f" named .{name}.*.tmp candidates were already taken; clean the"
+        " directory up and re-run"
+    )
+
+
 def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
-    """Publish the human-reachable entry points into ``link_dir`` — every
-    source and destination is validated before anything is touched; a
-    destination may only be absent or already this installation's symlink,
-    anything else is refused by name (never unlinked); each link then lands
-    atomically (temp symlink + rename in the same directory), so an
-    interrupted run leaves nothing half-published and a re-run converges."""
+    """Publish the human-reachable entry points into ``link_dir``. Every
+    source (a non-symlink regular executable file) and every destination
+    (absent, or already this installation's symlink) is validated before
+    the directory is created or anything else is touched; any other
+    occupant is refused by name, never unlinked. Each destination then
+    lands atomically — an exclusively created temp symlink renamed over it
+    in the same directory — but the set of three is sequential, not
+    transactional: an interruption can leave a valid subset published, and
+    a re-run converges on the full set. Only temp links this invocation
+    itself created are ever removed."""
     link_dir = LINK_DIR if link_dir is None else link_dir
-    link_dir.mkdir(parents=True, exist_ok=True)
     publishable: list[tuple[Path, Path]] = []
     for name in LINKED_ENTRY_POINTS:
         target = venv / "bin" / name
-        if not target.is_file() or not os.access(target, os.X_OK):
+        if target.is_symlink() or not target.is_file() or not os.access(target, os.X_OK):
             raise SystemExit(
-                f"error: the install produced no executable {target} — the wheel"
+                f"error: the install produced no executable regular file at"
+                f" {target} (missing, non-executable, or a symlink) — the wheel"
                 " set looks incomplete; nothing was linked"
             )
         link = link_dir / name
@@ -195,16 +246,20 @@ def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
                 " it; move it aside and re-run; nothing was linked"
             )
         publishable.append((target, link))
+    link_dir.mkdir(parents=True, exist_ok=True)
     for target, link in publishable:
-        tmp = link_dir / f".{link.name}.theozolith-tmp"
+        tmp = None
         try:
-            tmp.unlink(missing_ok=True)  # a leftover from an interrupted run: ours by name
-            tmp.symlink_to(target)
+            tmp = _own_temp_symlink(target, link_dir, link.name)
             os.replace(tmp, link)
         except OSError as exc:
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
-            raise SystemExit(f"error: could not publish {link}: {exc} — re-run to retry") from None
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+            raise SystemExit(
+                f"error: could not publish {link}: {exc} — links published"
+                " before this one are valid; re-run to converge on the full set"
+            ) from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # unreachable outside tests: ensure_environment re-execs or raises
     if managed:
         require_root()
+    check_pip(Path(sys.executable))
     out_dir = REPO_ROOT / "dist"
     try:
         version, wheels = build_distribution(REPO_ROOT, out_dir)

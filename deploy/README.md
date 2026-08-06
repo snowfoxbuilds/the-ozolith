@@ -256,10 +256,11 @@ world-traversable; ADR-0034), so the managed venv goes under `/opt` — and
 `build.py` owns it (ADR-0041): it creates (or reuses) `/opt/theozolith`,
 re-executes itself with that interpreter, builds and installs the wheels
 there, and links the CLI into `/usr/local/bin`. Each link is validated and
-published atomically; an unrelated file, directory, or foreign symlink
-already sitting at a link name is refused by name, never overwritten —
-resolve it and re-run (the re-run converges). You never create, activate,
-or name a venv:
+published atomically — per link, not as a set: an interrupted run can
+leave a valid subset of the three published, and re-running completes it.
+An unrelated file, directory, or foreign symlink already sitting at a link
+name is refused by name, never overwritten — resolve it and re-run (the
+re-run converges). You never create, activate, or name a venv:
 
 ```sh
 git clone https://github.com/snowfoxbuilds/the-ozolith && cd the-ozolith

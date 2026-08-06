@@ -30,17 +30,18 @@ def _load_shim():
     return module
 
 
-def _fake_venv(path: Path, *, executable: bool = True, with_pip: bool = True) -> None:
+def _fake_venv(path: Path, *, executable: bool = True) -> None:
     (path / "bin").mkdir(parents=True, exist_ok=True)
     (path / "pyvenv.cfg").write_text("")
     python = path / "bin" / "python"
     python.write_text(FAKE_PYTHON)
     if executable:
         python.chmod(0o755)
-    if with_pip:
-        pip = path / "bin" / "pip"
-        pip.write_text(FAKE_PYTHON)
-        pip.chmod(0o755)
+    # A bin/pip wrapper is always present: its existence proves nothing (the
+    # health check asks `python -m pip`, the operation the install runs).
+    pip = path / "bin" / "pip"
+    pip.write_text(FAKE_PYTHON)
+    pip.chmod(0o755)
 
 
 def _entry_points(shim, venv: Path) -> None:
@@ -243,16 +244,46 @@ def test_a_non_executable_interpreter_is_refused_with_remediation(tmp_path):
         )
 
 
-def test_a_venv_without_pip_is_refused_as_partial(tmp_path):
-    """An interrupted creation can leave a working interpreter with no pip
-    — refused as partially created, not discovered at install time."""
+def test_the_pip_preflight_asks_the_module_the_install_runs(tmp_path):
+    """The install invokes `python -m pip`, so the preflight runs exactly
+    that module path (`--version`) — it never consults a bin/pip wrapper on
+    disk, whose existence proves nothing about the module."""
     shim = _load_shim()
-    target = tmp_path / "venv"
-    _fake_venv(target, with_pip=False)
-    with pytest.raises(SystemExit, match="partially created"):
-        shim.ensure_environment(
-            target, [], managed=False, geteuid=lambda: 1000, execv=_refuse, environ={}
-        )
+    python = tmp_path / "venv" / "bin" / "python"
+    calls = []
+
+    def runner(argv, check=False, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    shim.check_pip(python, runner=runner)
+    assert calls == [[str(python), "-m", "pip", "--version"]]
+
+
+def test_a_broken_pip_module_is_a_remediation_with_the_cause(tmp_path):
+    """A nonzero `python -m pip --version` (the wrapper may well exist) is
+    refused with the failure's own last line and repair-or-delete
+    remediation — never a traceback."""
+    shim = _load_shim()
+
+    def runner(argv, check=False, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="No module named pip\n")
+
+    with pytest.raises(SystemExit, match="No module named pip") as excinfo:
+        shim.check_pip(tmp_path / "venv" / "bin" / "python", runner=runner)
+    assert "repair its pip module or delete the venv" in str(excinfo.value)
+
+
+def test_a_pip_preflight_exec_error_is_a_remediation_not_a_traceback(tmp_path):
+    """The interpreter failing to run at all for the pip check (EACCES,
+    ENOEXEC, …) gets the same repair-or-delete remediation."""
+    shim = _load_shim()
+
+    def runner(argv, check=False, **kwargs):
+        raise OSError(errno.EACCES, "Permission denied", argv[0])
+
+    with pytest.raises(SystemExit, match="repair its pip module or delete the venv"):
+        shim.check_pip(tmp_path / "venv" / "bin" / "python", runner=runner)
 
 
 def test_a_failing_exec_is_a_remediation_not_a_traceback(tmp_path):
@@ -300,7 +331,41 @@ def test_a_non_executable_entry_point_is_refused(tmp_path):
     (venv / "bin" / "theozolith").chmod(0o644)
     with pytest.raises(SystemExit, match="no executable"):
         shim.link_entry_points(venv, link_dir=bin_dir)
-    assert not bin_dir.exists() or not any(bin_dir.iterdir())
+    assert not bin_dir.exists()
+
+
+def test_a_symlink_entry_point_is_refused(tmp_path):
+    """The source contract is a NON-symlink regular executable file: a
+    symlinked entry point is refused even when it resolves to a valid
+    executable — is_file() alone would happily follow it."""
+    shim = _load_shim()
+    venv, bin_dir = tmp_path / "venv", tmp_path / "bin"
+    _entry_points(shim, venv)
+    script = venv / "bin" / "theozolith"
+    real = venv / "bin" / "somewhere-else"
+    script.rename(real)
+    script.symlink_to(real)
+    with pytest.raises(SystemExit, match="no executable regular file"):
+        shim.link_entry_points(venv, link_dir=bin_dir)
+    assert not bin_dir.exists()
+
+
+def test_the_link_dir_is_created_only_after_validation_succeeds(tmp_path):
+    """An absent link dir (a bare box's /usr/local/bin) may be created only
+    once every source and destination has validated — a refused run leaves
+    no directory behind; a valid one creates it and publishes."""
+    shim = _load_shim()
+    venv, bin_dir = tmp_path / "venv", tmp_path / "deep" / "bin"
+    _entry_points(shim, venv)
+    script = venv / "bin" / shim.LINKED_ENTRY_POINTS[-1]
+    script.chmod(0o644)
+    with pytest.raises(SystemExit, match="no executable"):
+        shim.link_entry_points(venv, link_dir=bin_dir)
+    assert not bin_dir.exists() and not bin_dir.parent.exists()
+    script.chmod(0o755)
+    shim.link_entry_points(venv, link_dir=bin_dir)
+    for name in shim.LINKED_ENTRY_POINTS:
+        assert os.readlink(bin_dir / name) == str(venv / "bin" / name)
 
 
 @pytest.mark.parametrize("collision", ["file", "directory", "foreign-symlink"])
@@ -339,35 +404,113 @@ def test_a_collision_is_refused_by_name_and_left_untouched(tmp_path, collision):
         assert not (bin_dir / name).exists() and not (bin_dir / name).is_symlink()
 
 
-def test_publication_is_atomic_and_a_leftover_temp_is_reclaimed(tmp_path):
-    """Publication goes through a temp symlink + rename (no unlink-then-
-    symlink window), a stale temp from an interrupted run is reclaimed, and
-    a failed rename cleans its temp up before refusing."""
+@pytest.mark.parametrize("occupant", ["file", "directory", "symlink"])
+def test_a_foreign_object_at_a_candidate_temp_name_survives(tmp_path, monkeypatch, occupant):
+    """Temporary names are owned by exclusive creation, not by pattern: an
+    object already sitting at a candidate temp name — whatever it is — makes
+    the shim pick another name; it is never removed and survives the whole
+    publication byte for byte."""
     shim = _load_shim()
     venv, bin_dir = tmp_path / "venv", tmp_path / "bin"
     _entry_points(shim, venv)
     bin_dir.mkdir()
-    # A stale temp symlink left by an interrupted publication is reclaimed.
-    stale = bin_dir / f".{shim.LINKED_ENTRY_POINTS[0]}.theozolith-tmp"
-    stale.symlink_to(tmp_path / "gone")
+    tokens = {"n": 0}
+
+    def fake_token_hex(nbytes):
+        tokens["n"] += 1
+        return "collide" if tokens["n"] == 1 else f"free{tokens['n']}"
+
+    monkeypatch.setattr(shim.secrets, "token_hex", fake_token_hex)
+    # Occupy the exact first candidate name the shim will generate.
+    candidate = bin_dir / f".{shim.LINKED_ENTRY_POINTS[0]}.collide.tmp"
+    elsewhere = tmp_path / "elsewhere"
+    if occupant == "file":
+        candidate.write_bytes(b"somebody else's bytes")
+    elif occupant == "directory":
+        candidate.mkdir()
+        (candidate / "keep").write_bytes(b"somebody else's bytes")
+    else:
+        candidate.symlink_to(elsewhere)  # dangling: symlink(2) still refuses EEXIST
     shim.link_entry_points(venv, link_dir=bin_dir)
-    assert not stale.is_symlink() and not stale.exists()
+    # Publication succeeded around the occupant …
+    for name in shim.LINKED_ENTRY_POINTS:
+        assert os.readlink(bin_dir / name) == str(venv / "bin" / name)
+    # … which survives byte for byte.
+    if occupant == "file":
+        assert candidate.read_bytes() == b"somebody else's bytes"
+    elif occupant == "directory":
+        assert (candidate / "keep").read_bytes() == b"somebody else's bytes"
+    else:
+        assert os.readlink(candidate) == str(elsewhere)
+
+
+def test_a_leftover_at_a_predictable_temp_name_is_foreign(tmp_path):
+    """No path is "ours by name": a file squatting on the old predictable
+    temp-name shape is somebody's until proven created by this invocation —
+    publication succeeds around it and leaves it untouched."""
+    shim = _load_shim()
+    venv, bin_dir = tmp_path / "venv", tmp_path / "bin"
+    _entry_points(shim, venv)
+    bin_dir.mkdir()
+    squatter = bin_dir / f".{shim.LINKED_ENTRY_POINTS[0]}.theozolith-tmp"
+    squatter.write_bytes(b"not actually ours")
+    shim.link_entry_points(venv, link_dir=bin_dir)
+    assert squatter.read_bytes() == b"not actually ours"
     for name in shim.LINKED_ENTRY_POINTS:
         assert os.readlink(bin_dir / name) == str(venv / "bin" / name)
 
-    # A failed rename cleans up its temp and refuses with the link's name.
+
+def test_a_failed_rename_cleans_only_its_own_temp(tmp_path, monkeypatch):
+    """A failed rename removes the temp symlink this invocation created —
+    nothing else in the directory — and the previously published links
+    survive the failed re-publication intact."""
+    shim = _load_shim()
+    venv, bin_dir = tmp_path / "venv", tmp_path / "bin"
+    _entry_points(shim, venv)
+    shim.link_entry_points(venv, link_dir=bin_dir)  # a valid installation
+    bystander = bin_dir / ".unrelated-dotfile"
+    bystander.write_bytes(b"leave me be")
+
     def failing_replace(src, dst):
         raise OSError(errno.EIO, "I/O error", str(dst))
 
-    real_replace = os.replace
-    os.replace = failing_replace
-    try:
-        with pytest.raises(SystemExit, match="could not publish"):
-            shim.link_entry_points(venv, link_dir=bin_dir)
-    finally:
-        os.replace = real_replace
-    assert not any(p.name.endswith(".theozolith-tmp") for p in bin_dir.iterdir())
-    # The prior links survived the failed re-publication attempt intact.
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(SystemExit, match="could not publish"):
+        shim.link_entry_points(venv, link_dir=bin_dir)
+    expected = {bystander.name, *shim.LINKED_ENTRY_POINTS}
+    assert {p.name for p in bin_dir.iterdir()} == expected  # no temp survived
+    assert bystander.read_bytes() == b"leave me be"
+    for name in shim.LINKED_ENTRY_POINTS:
+        assert os.readlink(bin_dir / name) == str(venv / "bin" / name)
+
+
+def test_an_interrupted_first_installation_converges_on_rerun(tmp_path, monkeypatch):
+    """The three destinations are published sequentially — atomic each, not
+    transactional as a set. Failing on the second leaves the first link
+    valid, the others absent, and no temp path of this invocation's behind;
+    the re-run completes the set."""
+    shim = _load_shim()
+    venv, bin_dir = tmp_path / "venv", tmp_path / "bin"
+    _entry_points(shim, venv)
+    first, second, third = shim.LINKED_ENTRY_POINTS
+    real_replace, renames = os.replace, []
+
+    def replace_failing_second(src, dst):
+        renames.append(dst)
+        if len(renames) == 2:
+            raise OSError(errno.EIO, "I/O error", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace_failing_second)
+    with pytest.raises(SystemExit, match="could not publish"):
+        shim.link_entry_points(venv, link_dir=bin_dir)
+    # The published subset is valid, the rest absent, no temp remains.
+    assert os.readlink(bin_dir / first) == str(venv / "bin" / first)
+    for name in (second, third):
+        assert not (bin_dir / name).exists() and not (bin_dir / name).is_symlink()
+    assert [p.name for p in bin_dir.iterdir()] == [first]
+    monkeypatch.setattr(os, "replace", real_replace)
+    shim.link_entry_points(venv, link_dir=bin_dir)  # the re-run converges
     for name in shim.LINKED_ENTRY_POINTS:
         assert os.readlink(bin_dir / name) == str(venv / "bin" / name)
 
@@ -400,7 +543,15 @@ def sandbox(monkeypatch, tmp_path):
     bin_dir = tmp_path / "usr-local-bin"
     monkeypatch.setattr(shim, "MANAGED_VENV", opt)
     monkeypatch.setattr(shim, "LINK_DIR", bin_dir)
-    state = {"environ": {}, "execs": [], "created": [], "pip": [], "euid": 0}
+    state = {
+        "environ": {},
+        "execs": [],
+        "created": [],
+        "pip": [],
+        "pip_checks": [],
+        "pip_check_rc": 0,
+        "euid": 0,
+    }
     monkeypatch.setattr(os, "environ", state["environ"])
     monkeypatch.setattr(os, "geteuid", lambda: state["euid"])
     monkeypatch.setattr(os, "execv", lambda path, argv: state["execs"].append((path, argv)))
@@ -409,6 +560,10 @@ def sandbox(monkeypatch, tmp_path):
         if argv[1:3] == ["-m", "venv"]:
             _fake_venv(Path(argv[3]))
             state["created"].append(argv[3])
+        elif argv[1:] == ["-m", "pip", "--version"]:
+            state["pip_checks"].append(argv)
+            stderr = "No module named pip\n" if state["pip_check_rc"] else ""
+            return subprocess.CompletedProcess(argv, state["pip_check_rc"], "", stderr)
         elif argv[1:4] == ["-m", "pip", "install"]:
             state["pip"].append(argv)
         return subprocess.CompletedProcess(argv, 0)
@@ -441,6 +596,7 @@ def test_main_managed_second_pass_builds_installs_and_links(sandbox):
     _entry_points(shim, opt)  # what the real pip install would have produced
     shim.inside = lambda venv: True  # this interpreter "is" the venv's
     assert shim.main([]) == 0
+    assert state["pip_checks"]  # `python -m pip` pre-flighted before the build
     (pip_argv,) = state["pip"]
     assert "--upgrade" in pip_argv
     assert [a for a in pip_argv if a.endswith(".whl")] == [
@@ -464,6 +620,22 @@ def test_main_managed_rerun_reuses_the_venv_and_converges(sandbox):
         assert shim.main([]) == 0
     for name in shim.LINKED_ENTRY_POINTS:
         assert os.readlink(bin_dir / name) == str(opt / "bin" / name)
+
+
+def test_main_a_failing_pip_module_check_stops_before_any_build(sandbox):
+    """The bin/pip wrapper exists, `python -m pip` is broken: the in-venv
+    pass (which the direct `sudo /opt/theozolith/bin/python build.py` entry
+    also lands on) refuses with remediation before any build, install, or
+    link publication begins."""
+    shim, opt, bin_dir, state = sandbox
+    _fake_venv(opt)  # bin/pip wrapper present — and proves nothing
+    _entry_points(shim, opt)
+    shim.inside = lambda venv: True
+    shim.build_distribution = _refuse  # the build must never be reached
+    state["pip_check_rc"] = 1
+    with pytest.raises(SystemExit, match="repair its pip module or delete the venv"):
+        shim.main([])
+    assert state["pip"] == [] and not bin_dir.exists()
 
 
 def test_main_managed_requires_root(sandbox):
