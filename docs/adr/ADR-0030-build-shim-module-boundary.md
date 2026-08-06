@@ -1,4 +1,4 @@
-Status: ACCEPTED (amended by ADR-0041: the shim now also owns the bootstrap environment — managed `/opt/theozolith` venv, re-exec, entry-point links; the build-logic boundary below is unchanged)
+Status: ACCEPTED (amended by ADR-0041: the shim now also owns the bootstrap environment — managed `/opt/theozolith` venv, re-exec, atomically published entry-point links — and the managed invocation is `sudo python3 build.py`; the entry file and the build-logic boundary below are unchanged)
 
 Date: 2026-07-28
 

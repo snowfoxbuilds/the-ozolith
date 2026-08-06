@@ -200,9 +200,9 @@ Stacks and worker types on top, never below.
    sudo python3 build.py              # bootstrap ONLY: a bare checkout with nothing
        # installed — same build implementation as `theozolith build`, but the shim
        # owns the environment (ADR-0041): it creates the /opt/theozolith venv,
-       # re-executes itself inside it, installs the wheels there, and links the
-       # `theozolith` entry point into /usr/local/bin (ADR-0023/0032; the
-       # deprecated `theozolith-control` alias comes along for one release). The
+       # re-executes itself inside it, installs the wheels there, and links
+       # `theozolith`, `theozolith-nodedaemon`, and the one-release deprecated
+       # `theozolith-control` alias into /usr/local/bin (ADR-0023/0032). The
        # full bare-metal sequence: "Build / rebuild from the repo" below.
    ```
 
@@ -255,7 +255,10 @@ can reach (the installer refuses a home venv — `/home/<you>` is not
 world-traversable; ADR-0034), so the managed venv goes under `/opt` — and
 `build.py` owns it (ADR-0041): it creates (or reuses) `/opt/theozolith`,
 re-executes itself with that interpreter, builds and installs the wheels
-there, and links the CLI into `/usr/local/bin`. You never create, activate,
+there, and links the CLI into `/usr/local/bin`. Each link is validated and
+published atomically; an unrelated file, directory, or foreign symlink
+already sitting at a link name is refused by name, never overwritten —
+resolve it and re-run (the re-run converges). You never create, activate,
 or name a venv:
 
 ```sh
@@ -263,9 +266,15 @@ git clone https://github.com/snowfoxbuilds/the-ozolith && cd the-ozolith
 sudo python3 build.py     # the whole bootstrap: venv, wheels, install, CLI links
 ```
 
-The only OS prerequisites are `python3 >= 3.11` and the distro's
-`python3-venv` package; a box missing the latter is refused with that exact
-remediation — the shim never package-manages on its own (ADR-0037 posture).
+Prerequisites, precisely: the OS packages are `python3 >= 3.11`, the
+distro's `python3-venv` package (a box missing it is refused with that
+exact remediation — the shim never package-manages on its own, ADR-0037
+posture), and `git` (the build derives the version pin from the checkout's
+committed SHA at run time). The repository must be a git clone, not a
+tarball. Installing the built wheels resolves their dependency closure
+from the Python package index, so the box needs network access to PyPI —
+or a pip mirror/cache you configure yourself (`PIP_INDEX_URL` /
+`pip.conf`); the bootstrap is not an offline installer.
 
 Then the first run, exactly as in step 1 of Full substrate:
 
@@ -492,10 +501,19 @@ sudo userdel ozolith-control 2>/dev/null || true    # drops its group with it
 docker ps -aq --filter label=theozolith.owner | xargs -r docker rm -f
 docker compose -f deploy/compose/control.yml down
 docker volume rm theozolith-cache
+# The /usr/local/bin links the bootstrap published (ADR-0041) — removed BEFORE
+# the venv so no dangling links survive, and only when they still point into
+# the managed venv (a foreign binary at these names was never ours to delete):
+for name in theozolith theozolith-control theozolith-nodedaemon; do  # incl. the deprecated alias link
+  [ "$(readlink "/usr/local/bin/$name")" = "/opt/theozolith/bin/$name" ] \
+    && sudo rm -f "/usr/local/bin/$name"
+done
 sudo rm -rf /opt/theozolith /var/lib/theozolith /var/lib/theozolith-control ~/.theozolith
 ```
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node
-store, both now gone (including the root-mediated partition, its unit, and its service
-user). Orphaned run containers from a mid-Run kill are reaped by the daemon on its next
+store, both now gone (including the root-mediated partition, its unit, its service
+user, the managed venv, and every `/usr/local/bin` link the bootstrap owned — a link at
+those names that pointed elsewhere is left alone, exactly as the bootstrap found it).
+Orphaned run containers from a mid-Run kill are reaped by the daemon on its next
 start; the zombie-claim janitor restores the GitHub claim state.

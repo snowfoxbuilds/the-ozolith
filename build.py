@@ -11,18 +11,21 @@ two entry paths; they cannot drift).
 The operator never manages an environment (ADR-0041): run as root, the shim
 creates (or reuses) the ``/opt/theozolith`` venv, re-executes itself with
 that interpreter, builds every component wheel from the CLEAN checkout into
-``dist/``, installs them there, and links the human entry points into
-``/usr/local/bin`` — so ``sudo python3 build.py`` is the whole bootstrap.
-From then on, source-based updates are ``theozolith build``. ``--venv
-PATH`` is the unmanaged escape hatch (dev checkouts, tests): same build and
-install, no root, no links.
+``dist/``, installs them there, and publishes the human entry points into
+``/usr/local/bin`` (validated first, linked atomically, foreign paths
+refused — never overwritten) — so ``sudo python3 build.py`` is the whole
+managed bootstrap. From then on, source-based updates are ``theozolith
+build``. ``--venv PATH`` is the unmanaged escape hatch (dev checkouts,
+tests): same build and install, no root, no links.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -58,8 +61,10 @@ LINKED_ENTRY_POINTS = (
 )
 LINK_DIR = Path("/usr/local/bin")
 
-# Belt over braces for the re-exec: if the venv interpreter does not
-# identify as the venv, fail loudly instead of exec-looping.
+# Belt over braces for the re-exec: a venv interpreter that runs but does
+# not identify as the venv would exec-loop; the marker turns pass two into
+# a hard error. One broken-venv shape only — a missing, non-executable, or
+# unrunnable interpreter is caught by its own check before the exec.
 REEXEC_MARKER = "THEOZOLITH_BOOTSTRAP_REEXEC"
 
 
@@ -68,31 +73,47 @@ def inside(venv: Path) -> bool:
     return Path(sys.prefix).resolve() == venv.resolve()
 
 
+def require_root(geteuid=None) -> None:
+    """The managed bootstrap writes system paths — refused without root on
+    BOTH passes (the second pass is reachable directly: the documented
+    `sudo /opt/theozolith/bin/python build.py` spelling short-circuits)."""
+    geteuid = os.geteuid if geteuid is None else geteuid
+    if geteuid() != 0:
+        raise SystemExit(
+            f"error: the managed bootstrap writes {MANAGED_VENV} and {LINK_DIR}"
+            " — run with sudo (or pass --venv PATH for an unmanaged dev install)"
+        )
+
+
 def ensure_environment(
     venv: Path,
     argv: list[str],
     *,
     managed: bool,
-    runner=subprocess.run,
-    geteuid=os.geteuid,
-    execv=os.execv,
-    environ=os.environ,
-    find_spec=importlib.util.find_spec,
+    runner=None,
+    geteuid=None,
+    execv=None,
+    environ=None,
+    find_spec=None,
 ) -> None:
-    """Create-or-reuse the target venv and re-execute this shim with its
-    interpreter (ADR-0041) — after which the build and install run inside
-    it unchanged. Refuses with remediation and never package-manages on
-    its own (the ADR-0037 posture). Does not return except under test."""
+    """Create-or-reuse the target venv, health-check its interpreter, and
+    re-execute this shim with it (ADR-0041) — after which the build and
+    install run inside it unchanged. Every malformed or partial venv is
+    refused with remediation (repair or delete), and the shim never
+    package-manages on its own (the ADR-0037 posture). Does not return
+    except under test."""
+    runner = subprocess.run if runner is None else runner
+    geteuid = os.geteuid if geteuid is None else geteuid
+    execv = os.execv if execv is None else execv
+    environ = os.environ if environ is None else environ
+    find_spec = importlib.util.find_spec if find_spec is None else find_spec
     if environ.get(REEXEC_MARKER):
         raise SystemExit(
             f"error: re-executed with {sys.executable} but it does not identify"
-            f" as {venv} — the venv looks broken; delete it and re-run"
+            f" as {venv} — the venv is broken; delete it and re-run"
         )
-    if managed and geteuid() != 0:
-        raise SystemExit(
-            f"error: the managed bootstrap writes {venv} and {LINK_DIR} — run"
-            " with sudo (or pass --venv PATH for an unmanaged dev install)"
-        )
+    if managed:
+        require_root(geteuid)
     if venv.exists() and not (venv / "pyvenv.cfg").is_file():
         raise SystemExit(
             f"error: {venv} exists but is not a virtual environment — refusing"
@@ -107,28 +128,83 @@ def ensure_environment(
             )
         proc = runner([sys.executable, "-m", "venv", str(venv)], check=False)
         if proc.returncode != 0:
-            raise SystemExit(f"error: could not create the venv at {venv}")
+            # The target did not exist before this run's create (the non-venv
+            # guard above), so the partial tree is this run's alone — removing
+            # it keeps a re-run starting from scratch, not from debris.
+            shutil.rmtree(venv, ignore_errors=True)
+            raise SystemExit(
+                f"error: venv creation failed with exit status {proc.returncode}"
+                f" ('{sys.executable} -m venv {venv}' — its output above has the"
+                " cause); nothing was kept — fix that and re-run"
+            )
     python = venv / "bin" / "python"
     if not python.is_file():
-        raise SystemExit(f"error: {venv} has no bin/python — delete the venv and re-run")
+        raise SystemExit(
+            f"error: {venv} has no bin/python — the venv is broken; delete it and re-run"
+        )
+    if not os.access(python, os.X_OK):
+        raise SystemExit(
+            f"error: {python} is not executable — the venv is broken; restore its"
+            " execute permission to repair it, or delete the venv and re-run"
+        )
+    if not (venv / "bin" / "pip").is_file():
+        raise SystemExit(
+            f"error: {venv} has no bin/pip — the venv looks partially created"
+            " (an interrupted creation?); delete it and re-run"
+        )
     environ[REEXEC_MARKER] = "1"
-    execv(str(python), [str(python), str(REPO_ROOT / "build.py"), *argv])
+    try:
+        execv(str(python), [str(python), str(REPO_ROOT / "build.py"), *argv])
+    except OSError as exc:
+        raise SystemExit(
+            f"error: could not execute {python} ({exc.strerror or exc}) — the"
+            " venv is broken; repair its interpreter or delete the venv and re-run"
+        ) from None
 
 
-def link_entry_points(venv: Path, *, link_dir: Path = LINK_DIR) -> None:
-    """The human-reachable entry points on PATH without the venv on it —
-    idempotent, last install wins."""
+def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
+    """Publish the human-reachable entry points into ``link_dir`` — every
+    source and destination is validated before anything is touched; a
+    destination may only be absent or already this installation's symlink,
+    anything else is refused by name (never unlinked); each link then lands
+    atomically (temp symlink + rename in the same directory), so an
+    interrupted run leaves nothing half-published and a re-run converges."""
+    link_dir = LINK_DIR if link_dir is None else link_dir
     link_dir.mkdir(parents=True, exist_ok=True)
+    publishable: list[tuple[Path, Path]] = []
     for name in LINKED_ENTRY_POINTS:
         target = venv / "bin" / name
-        if not target.is_file():
+        if not target.is_file() or not os.access(target, os.X_OK):
             raise SystemExit(
-                f"error: the install produced no {target} — the wheel set looks incomplete"
+                f"error: the install produced no executable {target} — the wheel"
+                " set looks incomplete; nothing was linked"
             )
         link = link_dir / name
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(target)
+        if link.is_symlink():
+            existing = os.readlink(link)
+            if existing != str(target):
+                raise SystemExit(
+                    f"error: {link} is a symlink to {existing}, not to this"
+                    f" installation's {target} — refusing to replace it; remove"
+                    " it yourself and re-run; nothing was linked"
+                )
+        elif link.exists():
+            kind = "directory" if link.is_dir() else "regular file"
+            raise SystemExit(
+                f"error: {link} exists and is a {kind} — refusing to overwrite"
+                " it; move it aside and re-run; nothing was linked"
+            )
+        publishable.append((target, link))
+    for target, link in publishable:
+        tmp = link_dir / f".{link.name}.theozolith-tmp"
+        try:
+            tmp.unlink(missing_ok=True)  # a leftover from an interrupted run: ours by name
+            tmp.symlink_to(target)
+            os.replace(tmp, link)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise SystemExit(f"error: could not publish {link}: {exc} — re-run to retry") from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     if not inside(venv):
         ensure_environment(venv, argv, managed=managed)
         return 0  # unreachable outside tests: ensure_environment re-execs or raises
+    if managed:
+        require_root()
     out_dir = REPO_ROOT / "dist"
     try:
         version, wheels = build_distribution(REPO_ROOT, out_dir)
