@@ -112,9 +112,10 @@ def ensure_preconditions(*, which=None) -> str:
         raise SystemExit(
             "error: --with-local-node needs the theozolith-nodedaemon CLI in this"
             " environment. The bare-metal build installs all four distributions"
-            " into one venv (python3 build.py from a source checkout, or pip"
-            " install theozolith-nodedaemon into the same venv) — install it and"
-            " re-run (ADR-0037: a root setup path never pip-installs on its own)."
+            " into one venv (sudo python3 build.py from a source checkout,"
+            " ADR-0041, or pip install theozolith-nodedaemon into the same venv)"
+            " — install it and re-run (ADR-0037: a root setup path never"
+            " pip-installs on its own)."
         )
     validate = _exec_policy()
     return validate(exec_path)
