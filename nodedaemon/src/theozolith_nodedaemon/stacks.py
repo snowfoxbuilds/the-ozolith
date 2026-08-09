@@ -134,6 +134,15 @@ class ProcessSupervisor:
         self._children: dict[str, Child] = {}
         self._last_exit: dict[str, int] = {}
 
+    def names(self) -> list[str]:
+        """The Stack names of the children this supervisor currently tracks
+        (each either live or exited-but-not-yet-reaped). The minimal inventory
+        surface the daemon needs to converge runtime objects absent from
+        desired state — a removed or renamed process Stack, or the losing side
+        of a kind transition — WITHOUT reaching into the private child map
+        (ADR-0044 amendment)."""
+        return list(self._children)
+
     def alive(self, name: str) -> bool:
         child = self._children.get(name)
         return child is not None and child.process.poll() is None

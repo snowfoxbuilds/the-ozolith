@@ -1504,3 +1504,260 @@ def test_secret_values_never_enter_fingerprint_or_persisted_state(rig: Rig):
     for path in rig.config.state_dir.rglob("*"):
         if path.is_file():
             assert "super-secret-value" not in path.read_text(errors="replace"), path
+
+
+# -- desired-inventory convergence: runtime objects absent from desired (ADR-0044) -
+#
+# Removal from desired state is a deletion, immediate: a Stack the desired
+# document no longer names must not keep running as a hidden child or an
+# orphaned container. Renames and kind flips are the boundary cases — at most
+# ONE runtime kind may exist for a Stack name.
+
+
+def test_desired_rename_stops_old_worker_and_starts_only_implementer(rig: Rig):
+    """Renaming worker -> implementer stops the old supervised child and leaves
+    exactly the new one running (its old name is gone from desired state)."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker")]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+    assert rig.daemon._supervisor.alive("worker")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("implementer")]))
+    rig.daemon.once()
+    assert first.poll() is not None  # the old child was stopped
+    assert not rig.daemon._supervisor.alive("worker")
+    assert "worker" not in rig.daemon._supervisor.names()  # not retained as a hidden child
+    assert rig.daemon._supervisor.alive("implementer")
+    assert [p.args[0] for p in rig.popen.spawned] == ["worker-driver", "implementer-driver"]
+
+
+def test_empty_desired_stops_process_and_removes_run_containers(rig: Rig):
+    """An empty desired Stack list tears a previously supervised process down
+    (kill-the-tree): the child stops and its labeled Run containers go with it."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker")]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+    rig.docker.add_run_container("run-r1", "r1", "worker")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    assert first.poll() is not None
+    assert not rig.daemon._supervisor.alive("worker")
+    assert "worker" not in rig.daemon._supervisor.names()
+    assert "run-r1" in rig.docker.removed
+    assert rig.docker.run_containers() == []
+    assert "worker" not in rig.daemon._applied_jobs_dir  # bookkeeping cleared
+
+
+def test_removing_a_container_stack_removes_its_labeled_container(rig: Rig):
+    """A single-image container Stack dropped from desired state has its labeled
+    container removed — discovered from the persistent Docker label, so this
+    holds even across a daemon restart."""
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("flightdeck")]))
+    rig.daemon.once()
+    assert "ozolith-stack-flightdeck" in rig.docker.stacks
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    assert "ozolith-stack-flightdeck" not in rig.docker.stacks
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_removing_a_compose_stack_composes_it_down(rig: Rig):
+    """A compose Stack this daemon started and desired state no longer names is
+    composed down (scoped to this daemon lifetime — the stated limitation)."""
+    stack = container_stack(
+        "control",
+        image="",
+        ports=[],
+        compose_files=[{"name": "compose/control.yml", "content": "services: {}\n"}],
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert "ozolith-control" in rig.docker.compose_projects
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    assert "ozolith-control" not in rig.docker.compose_projects
+    assert "control" not in rig.daemon._applied_compose
+
+
+def test_unrelated_stacks_are_preserved_when_one_is_removed(rig: Rig):
+    """Removing one Stack must not disturb the others."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([process_stack("worker"), container_stack("flightdeck")])
+    )
+    rig.daemon.once()
+    keep = rig.popen.spawned[0]
+
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker")]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker") and keep.poll() is None  # untouched
+    assert "ozolith-stack-flightdeck" in rig.docker.removed  # only the dropped one went
+
+
+# -- Stack kind transitions: at most one runtime kind per name (ADR-0044) ---------
+
+
+def test_process_to_container_leaves_one_container_and_no_child(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs)
+    assert rig.daemon._supervisor.alive("worker")
+
+    cont = container_stack("worker", image="ghcr.io/x/w:1")
+    rig.control.heartbeat_answers.append(heartbeat_response([cont]))
+    rig.daemon.once()
+    assert first.poll() is not None  # process form retired
+    assert not rig.daemon._supervisor.alive("worker")
+    assert "worker" not in rig.daemon._supervisor.names()
+    assert "worker" not in rig.daemon._applied_jobs_dir
+    assert rig.docker.stacks["ozolith-stack-worker"]["image"] == "ghcr.io/x/w:1"
+
+    # Stable: the transition happens once, no churn on the next pass.
+    rig.docker.removed.clear()
+    rig.control.heartbeat_answers.append(heartbeat_response([cont]))
+    rig.daemon.once()
+    assert "ozolith-stack-worker" not in rig.docker.removed
+    assert not rig.daemon._supervisor.alive("worker")
+
+
+def test_container_to_process_leaves_one_child_and_no_container(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("worker", image="ghcr.io/x/w:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-worker" in rig.docker.stacks
+
+    proc = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)})
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")
+    assert "ozolith-stack-worker" not in rig.docker.stacks  # container form removed
+    assert "ozolith-stack-worker" in rig.docker.removed
+
+    # Stable: the process is not restarted and the container does not reappear.
+    spawned = len(rig.popen.spawned)
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == spawned
+    assert "ozolith-stack-worker" not in rig.docker.stacks
+
+
+def test_process_to_container_defers_while_a_run_is_in_flight(rig: Rig, tmp_path):
+    """A process->container transition never interrupts an in-flight Run: it
+    defers off the child's APPLIED jobs dir (the desired kind is no longer
+    process), then applies exactly once after the Run ends."""
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs)
+    _plant_run(rig, jobs, "r1")
+
+    cont = container_stack("worker", image="ghcr.io/x/w:1")
+    rig.control.heartbeat_answers.append(heartbeat_response([cont]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker") and first.poll() is None  # child kept
+    assert "ozolith-stack-worker" not in rig.docker.stacks  # no container yet
+    assert "run-r1" not in rig.docker.removed  # its Run container is untouched
+    assert any("process->container transition deferred" in line for line in rig.logs)
+
+    shutil.rmtree(jobs / "r1")  # the Run ends
+    rig.control.heartbeat_answers.append(heartbeat_response([cont]))
+    rig.daemon.once()
+    assert first.poll() is not None
+    assert not rig.daemon._supervisor.alive("worker")
+    assert rig.docker.stacks["ozolith-stack-worker"]["image"] == "ghcr.io/x/w:1"
+    assert "run-r1" in rig.docker.removed  # kill-the-tree, only after the Run
+
+
+def test_process_to_container_with_unbuilt_image_keeps_the_process(rig: Rig, tmp_path):
+    """A failed derived-image build for the target container preserves the
+    running process form rather than tearing it down onto a missing image."""
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs)
+    new = image_recipe("wdeck", setup=["boom"])
+    _fail_build(rig)
+
+    cont = container_stack("worker", image=new["tag"])
+    rig.control.heartbeat_answers.append(heartbeat_response([cont], [new]))
+    rig.daemon.once()
+    assert not rig.docker.image_exists(new["tag"])
+    assert rig.daemon._supervisor.alive("worker") and first.poll() is None  # process kept
+    assert "ozolith-stack-worker" not in rig.docker.stacks
+    assert any("not built yet" in line for line in rig.logs)
+
+
+def test_container_to_process_with_unbuilt_run_image_keeps_the_container(rig: Rig, tmp_path):
+    """A failed run-image build for the target process preserves the running
+    container form (a built-in driver still requires its control-authored run
+    image, but the image must actually exist before the container is retired)."""
+    old = image_recipe("app")
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("app", image=old["tag"])], [old])
+    )
+    rig.daemon.once()
+    assert rig.docker.stacks["ozolith-stack-app"]["image"] == old["tag"]
+
+    new = image_recipe("apprun", setup=["boom"])
+    _fail_build(rig)
+    rig.docker.removed.clear()
+    proc = process_stack(
+        "app",
+        command="theozolith-worker",
+        env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": new["tag"]},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([proc], [new]))
+    rig.daemon.once()
+    assert not rig.docker.image_exists(new["tag"])
+    assert not rig.daemon._supervisor.alive("app")  # process not started
+    assert rig.docker.stacks["ozolith-stack-app"]["image"] == old["tag"]  # container kept
+    assert "ozolith-stack-app" not in rig.docker.removed
+
+
+def test_container_to_process_with_unavailable_secret_keeps_the_container(rig: Rig, tmp_path):
+    """An unavailable, uncached replacement secret preserves the running
+    container form until the secret can be materialized."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("app", image="ghcr.io/x/app:1")])
+    )
+    rig.daemon.once()
+    rig.docker.removed.clear()
+
+    rig.control.denied_secrets = True
+    proc = process_stack(
+        "app",
+        env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs")},
+        secrets={"WORKER_GITHUB_TOKEN": "tok-x"},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("app")  # process not started
+    assert rig.docker.stacks["ozolith-stack-app"]["image"] == "ghcr.io/x/app:1"  # kept
+    assert "ozolith-stack-app" not in rig.docker.removed
+    assert any("secrets unavailable" in line for line in rig.logs)
+
+    # The secret becomes available: the transition completes exactly once.
+    rig.control.denied_secrets = False
+    rig.control.secrets["tok-x"] = "X"
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("app")
+    assert "ozolith-stack-app" not in rig.docker.stacks  # container form finally removed
+
+
+def test_heartbeat_cannot_hide_a_stale_running_process(rig: Rig):
+    """The pre-fix hidden-child bug: a Stack removed from desired state kept
+    running while the heartbeat (which reports only desired Stacks) omitted it.
+    The omission must be HONEST — the daemon stops what it stops reporting."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker")]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))  # worker vanishes
+    rig.daemon.once()
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    reported = {s["name"] for s in rig.control.transcript[-1][2]["stacks"]}
+    assert "worker" not in reported  # omitted from status…
+    assert not rig.daemon._supervisor.alive("worker")  # …and genuinely not running
+    assert "worker" not in rig.daemon._supervisor.names()

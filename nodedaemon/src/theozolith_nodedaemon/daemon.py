@@ -54,7 +54,11 @@ from theozolith_nodedaemon.controlclient import (
     ControlError,
     ControlUnreachable,
 )
-from theozolith_nodedaemon.dockerctl import LABEL_STACK_SPEC, DockerCtl
+from theozolith_nodedaemon.dockerctl import (
+    LABEL_STACK_SPEC,
+    STACK_CONTAINER_PREFIX,
+    DockerCtl,
+)
 from theozolith_nodedaemon.stacks import (
     ProcessSupervisor,
     WireStack,
@@ -411,47 +415,95 @@ class NodeDaemon:
         applied = self._applied_jobs_dir.get(stack.name)
         return Path(applied) if applied else stack_jobs_dir(stack)
 
+    def _active_runs(self, jobs_dir: Path) -> list[str]:
+        """The live Run directories under a jobs dir, sorted. Dot-prefixed
+        names are never live Runs (run ids start with a timestamp digit): the
+        driver's evidence-loss tombstone (worker sweep.TOMBSTONE_PREFIX,
+        ADR-0019 parking ladder) renames undeletable remnants to a hidden name
+        exactly so this signal skips them."""
+        try:
+            return sorted(
+                p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+            )
+        except OSError:
+            return []
+
     def _inflight_blocker(self, names: list[str] | None) -> str | None:
         """The in-flight signal for queue-behind: a live driver child whose
         jobs dir holds a job directory. The jobs dir inspected is the one the
         RUNNING child was launched with (``_live_jobs_dir``), not necessarily
         the desired one, so a THEOZOLITH_JOBS_DIR change still observes a Run
         under the old path. A dead child never blocks — its orphaned dirs are
-        the boot sweep's business, not a Run. Dot-prefixed names are never live
-        Runs (run ids start with a timestamp digit): the driver's evidence-loss
-        tombstone (worker sweep.TOMBSTONE_PREFIX, ADR-0019 parking ladder)
-        renames undeletable remnants to a hidden name exactly so this signal
-        skips them."""
+        the boot sweep's business, not a Run. Scans DESIRED process Stacks, so
+        it does not see a child whose desired kind has flipped away from
+        process (that case uses ``_child_inflight_blocker``)."""
         for stack in self._stacks():
             if names is not None and stack.name not in names:
                 continue
             if stack.kind != "process" or not self._supervisor.alive(stack.name):
                 continue
-            jobs_dir = self._live_jobs_dir(stack)
-            try:
-                running = sorted(
-                    p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
-                )
-            except OSError:
-                running = []
+            running = self._active_runs(self._live_jobs_dir(stack))
             if running:
                 return f"behind run {running[0]} (stack {stack.name})"
         return None
 
+    def _child_inflight_blocker(self, name: str) -> str | None:
+        """The in-flight signal keyed off a supervised child directly, by its
+        APPLIED jobs dir — for a process->container transition, where the
+        desired Stack's kind is no longer ``process`` so ``_inflight_blocker``
+        (which scans desired process Stacks) would miss the still-running
+        child. A dead child never blocks."""
+        if not self._supervisor.alive(name):
+            return None
+        applied = self._applied_jobs_dir.get(name)
+        if not applied:
+            return None
+        running = self._active_runs(Path(applied))
+        return f"behind run {running[0]} (stack {name})" if running else None
+
+    def _remove_owned_run_containers(self, name: str) -> None:
+        """Remove every labeled run container this Stack's driver owns (its
+        share of kill-the-tree). Named after the Stack, not a WireStack, so it
+        serves both a normal stop and a kind transition where the desired
+        Stack's kind no longer matches the runtime form being torn down."""
+        for container in self._docker.run_containers():
+            if container.get("owner") == name:
+                self._log(f"removing run container {container['name']} (owner {name})")
+                self._docker.remove(container["name"])
+
+    def _stop_process_child(self, name: str) -> None:
+        """Tear a supervised process child down completely: stop it
+        (kill-the-tree), remove its labeled run containers, and clear ALL of
+        its applied-spec bookkeeping (``_applied_jobs_dir``). The single
+        teardown for stopped/drained desire, a Stack removed from desired
+        state, and a process->container transition — no path may leave a
+        hidden child or its run containers behind (ADR-0044 amendment)."""
+        self._supervisor.stop(name, grace_seconds=self._stop_grace_seconds())
+        self._applied_jobs_dir.pop(name, None)
+        self._remove_owned_run_containers(name)
+
+    def _teardown_container_forms(self, name: str) -> None:
+        """Remove any container-kind runtime under this name — a single-image
+        Stack container and/or a compose project this daemon started — so a
+        container->process transition never leaves both forms active. A no-op
+        on an ordinary process start (no container form to remove)."""
+        if self._docker.stack_containers(name):
+            self._docker.remove(f"{STACK_CONTAINER_PREFIX}{name}")
+        if name in self._applied_compose:
+            self._docker.compose(f"ozolith-{name}", [], "down")
+            self._applied_compose.pop(name, None)
+
     def _stop_stack(self, stack: WireStack) -> None:
         """Stop a Stack AND its labeled run containers (kill-the-tree)."""
         if stack.kind == "process":
-            self._supervisor.stop(stack.name, grace_seconds=self._stop_grace_seconds())
-            self._applied_jobs_dir.pop(stack.name, None)
-        elif stack.compose_files:
+            self._stop_process_child(stack.name)
+            return
+        if stack.compose_files:
             self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
             self._applied_compose.pop(stack.name, None)
         else:
             self._docker.remove(f"ozolith-stack-{stack.name}")
-        for container in self._docker.run_containers():
-            if container.get("owner") == stack.name:
-                self._log(f"removing run container {container['name']} (owner {stack.name})")
-                self._docker.remove(container["name"])
+        self._remove_owned_run_containers(stack.name)
 
     def _drain(self, target: str | None) -> None:
         names = [target] if target else [s.name for s in self._stacks()]
@@ -552,7 +604,12 @@ class NodeDaemon:
             except Exception as exc:
                 self._log(f"image {name}: build failed: {exc}")
                 self._emit_error(type(exc).__name__, f"image {name}: build failed: {exc}")
-        for stack in self._stacks():
+        desired = self._stacks()
+        # Converge runtime objects that desired state no longer names BEFORE
+        # converging the ones it does — so a rename (old name torn down, new
+        # name started) and a deletion both settle in one pass (ADR-0044).
+        self._reconcile_removed(desired)
+        for stack in desired:
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
                 if stack.kind == "process":
@@ -564,6 +621,48 @@ class NodeDaemon:
                 self._log(f"stack {stack.name}: reconcile failed: {exc}")
                 self._emit_error(type(exc).__name__, f"stack {stack.name}: reconcile failed: {exc}")
         self._reap_orphans()
+
+    def _reconcile_removed(self, desired: list[WireStack]) -> None:
+        """Runtime objects with no matching desired Stack are torn down like an
+        explicit stopped desire (ADR-0044 amendment): removal from desired
+        state is a deletion — immediate teardown. Covers a deleted Stack, a
+        renamed Stack (its old name gone), and any transition that also changed
+        the Stack name. Names still present in desired state are the converge
+        step's business (including a kind flip under the same name) and are
+        never touched here; unrelated Stacks are preserved.
+
+        Discovery differs by durability. Single-image container Stacks carry
+        persistent Docker labels, so a stale one is reaped even across a daemon
+        restart. Supervised process children and compose projects are tracked
+        in memory — children never outlive the daemon and ``_applied_compose``
+        likewise — so their orphan cleanup is scoped to this daemon's lifetime;
+        the compose limitation is spelled out below."""
+        desired_names = {s.name for s in desired}
+        for name in self._supervisor.names():
+            if name not in desired_names:
+                self._log(f"stack {name}: absent from desired state; stopping process child")
+                self._stop_process_child(name)
+        for row in self._docker.stack_containers():
+            container_name = str(row.get("name", ""))
+            if not container_name.startswith(STACK_CONTAINER_PREFIX):
+                continue
+            stack_name = container_name[len(STACK_CONTAINER_PREFIX) :]
+            if stack_name not in desired_names:
+                self._log(f"stack {stack_name}: absent from desired state; removing container")
+                self._docker.remove(container_name)
+        # Compose projects this daemon started and desired state no longer
+        # names are composed down. LIMITATION (stated, not silently skipped):
+        # there is no host-side compose-project discovery, so this reaps only
+        # projects in ``_applied_compose`` (this daemon lifetime). A compose
+        # Stack started by a PRIOR daemon and then deleted from desired state
+        # is not discoverable here and would keep running until a running-form
+        # discovery mechanism (a labeled `compose ls`) is added — a broader
+        # change deferred out of this scope.
+        for name in list(self._applied_compose):
+            if name not in desired_names:
+                self._log(f"stack {name}: absent from desired state; composing down")
+                self._docker.compose(f"ozolith-{name}", [], "down")
+                self._applied_compose.pop(name, None)
 
     def _pull_stack_secrets(self, stack: WireStack) -> bool:
         """Materialize the Stack's secrets in tmpfs; False = cannot deploy.
@@ -684,6 +783,12 @@ class NodeDaemon:
             return
         if alive:
             self._stop_stack(stack)  # kill-the-tree before relaunching
+        # container->process: a Stack that flipped from a container form to a
+        # process leaves a stale Stack container / compose project under this
+        # name. Now that the process's prerequisites (run image, secrets) are
+        # ready, remove it so the two forms never coexist (ADR-0044 amendment);
+        # a no-op on an ordinary start.
+        self._teardown_container_forms(stack.name)
         self._supervisor.ensure_running(stack.name, stack.command, env)
         self._applied_jobs_dir[stack.name] = str(stack_jobs_dir(stack))
 
@@ -731,7 +836,13 @@ class NodeDaemon:
         ).hexdigest()
 
     def _converge_container(self, stack: WireStack, want_running: bool) -> None:
+        # A process child still tracked under this name means the Stack flipped
+        # process->container: its teardown is deferred until the container's
+        # prerequisites are ready, and never happens while its Run is in flight.
+        child_lingers = stack.name in self._supervisor.names()
         if not want_running:
+            if child_lingers:
+                self._stop_process_child(stack.name)
             if stack.compose_files:
                 if self._applied_compose.get(stack.name) or self._docker.compose_ps(
                     f"ozolith-{stack.name}"
@@ -740,19 +851,30 @@ class NodeDaemon:
             elif self._docker.stack_containers(stack.name):
                 self._stop_stack(stack)
             return
+        # process->container: a live child's in-flight Run defers the WHOLE
+        # transition (read from its applied jobs dir — the desired kind is no
+        # longer process, so _inflight_blocker would not see it). A dead child
+        # never blocks and is torn down once prerequisites are ready.
+        if child_lingers and self._supervisor.alive(stack.name):
+            blocker = self._child_inflight_blocker(stack.name)
+            if blocker is not None:
+                self._log(f"stack {stack.name}: process->container transition deferred ({blocker})")
+                return
         if stack.compose_files:
             fingerprint = self._compose_fingerprint(stack)
-            if self._applied_compose.get(stack.name) == fingerprint:
+            if not child_lingers and self._applied_compose.get(stack.name) == fingerprint:
                 return
             if not self._pull_stack_secrets(stack):
                 return
+            if child_lingers:  # prerequisites (secrets) ready: retire the process form
+                self._stop_process_child(stack.name)
             self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "up")
             self._applied_compose[stack.name] = fingerprint
             return
         want = self._container_fingerprint(stack)
         rows = self._docker.stack_containers(stack.name)
         running = [r for r in rows if r.get("state") == "running"]
-        if running and running[0].get(LABEL_STACK_SPEC, "") == want:
+        if not child_lingers and running and running[0].get(LABEL_STACK_SPEC, "") == want:
             return  # verifiably running the current effective spec — no churn
         # Never replace (or first-create) onto a derived image our OWN recipes
         # declare but that is not built yet (a failed or not-yet build): keep any
@@ -778,6 +900,8 @@ class NodeDaemon:
             )
         if not self._pull_stack_secrets(stack):
             return
+        if child_lingers:  # prerequisites ready: retire the process form before the container
+            self._stop_process_child(stack.name)
         self._docker.run_stack_container(
             stack.name,
             stack.image,
