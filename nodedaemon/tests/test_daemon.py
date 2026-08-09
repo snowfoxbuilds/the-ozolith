@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
+from theozolith_nodedaemon.dockerctl import DockerCtl
 
 
 def heartbeat_response(stacks, images=None, commands=None) -> dict:
@@ -389,7 +390,7 @@ def test_failed_command_is_not_acked(rig: Rig, monkeypatch):
     def broken_stop(*args, **kwargs):
         raise RuntimeError("docker is down")
 
-    monkeypatch.setattr(rig.daemon, "_stop_stack", broken_stop)
+    monkeypatch.setattr(rig.daemon, "_teardown_all_forms", broken_stop)
     rig.control.heartbeat_answers.append(
         heartbeat_response(stacks, commands=[{"id": 9, "verb": "drain", "target": "worker"}])
     )
@@ -1761,3 +1762,354 @@ def test_heartbeat_cannot_hide_a_stale_running_process(rig: Rig):
     assert "worker" not in reported  # omitted from status…
     assert not rig.daemon._supervisor.alive("worker")  # …and genuinely not running
     assert "worker" not in rig.daemon._supervisor.names()
+
+
+# -- stopped/drained desire tears down EVERY form, whatever kind is live -----------
+#
+# A stopped or drained Stack must leave NO runtime form under its name — process
+# child, single-image container, tracked compose project, or owned Run containers
+# — even when the desired (but stopped) kind/form differs from what is actually
+# running (ADR-0044 amendment: task 1 of the runtime-form/cleanup hardening).
+
+
+def _compose_stack(name: str = "svc", files=None, **overrides) -> dict:
+    files = files or [{"name": "compose/base.yml", "content": "services: {}\n"}]
+    return container_stack(name, image="", ports=[], compose_files=files, **overrides)
+
+
+def test_running_container_with_desired_stopped_process_removes_the_container(rig: Rig):
+    """running single-image container -> desired stopped process: the container
+    is removed and no child is started."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks
+
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([process_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.stacks
+    assert "ozolith-stack-svc" in rig.docker.removed
+    assert not rig.daemon._supervisor.alive("svc")
+    assert rig.popen.spawned == []  # no child started
+
+
+def test_running_process_with_desired_stopped_container_stops_the_child(rig: Rig):
+    """running process -> desired stopped container: the child is stopped and no
+    container is started."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+    assert rig.daemon._supervisor.alive("svc")
+
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1", state="stopped")])
+    )
+    rig.daemon.once()
+    assert first.poll() is not None and not rig.daemon._supervisor.alive("svc")
+    assert "svc" not in rig.daemon._supervisor.names()
+    assert "ozolith-stack-svc" not in rig.docker.stacks  # no container started
+
+
+def test_running_compose_with_desired_stopped_single_image_composes_down(rig: Rig):
+    """running compose project -> desired stopped single-image Stack: the compose
+    project is composed down."""
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert "ozolith-svc" in rig.docker.compose_projects
+
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1", state="stopped")])
+    )
+    rig.daemon.once()
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert "svc" not in rig.daemon._applied_compose
+
+
+def test_stopped_compose_desire_downs_an_untracked_project_post_restart(rig: Rig):
+    """A compose Stack still named in desired state (now stopped) but whose
+    in-memory tracking was lost across a daemon restart is still composed down —
+    with the DESIRED compose files, a valid non-empty teardown, not left running
+    unseen. (Absent-from-desired projects remain under the tracked-only limit.)"""
+    stack = _compose_stack("svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert "ozolith-svc" in rig.docker.compose_projects
+    # Simulate a daemon restart: the compose project survives, the tracking does not.
+    rig.daemon._applied_compose.clear()
+
+    stopped = _compose_stack("svc", state="stopped")
+    rig.control.heartbeat_answers.append(heartbeat_response([stopped]))
+    rig.daemon.once()
+    assert "ozolith-svc" not in rig.docker.compose_projects  # downed despite no tracking
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[0] == "ozolith-svc" and down[1] != []  # valid, non-empty file list
+
+
+def test_running_single_image_with_desired_stopped_compose_removes_it(rig: Rig):
+    """running single-image container -> desired stopped compose Stack: the
+    single-image container is removed."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks
+
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.stacks
+    assert "ozolith-stack-svc" in rig.docker.removed
+
+
+def test_drain_removes_a_running_form_of_a_different_desired_kind(rig: Rig):
+    """A drain must stop every runtime form under the name even when the desired
+    kind has flipped to a form that is not the one running."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks
+
+    drain = {"id": 7, "verb": "drain", "target": "svc", "force": False}
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([process_stack("svc")], commands=[drain])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.stacks  # container form gone
+    assert not rig.daemon._supervisor.alive("svc")  # not started (drained)
+    assert 7 in rig.daemon._completed
+
+
+# -- single-image <-> compose transitions: at most one container form per name ----
+
+
+def test_single_image_to_compose_leaves_only_the_compose_project(rig: Rig):
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.stacks  # single-image retired
+    assert "ozolith-stack-svc" in rig.docker.removed
+    assert "ozolith-svc" in rig.docker.compose_projects  # compose is the only form
+    assert "svc" in rig.daemon._applied_compose
+
+    # Stable: no churn on the following pass.
+    rig.docker.removed.clear()
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert rig.docker.removed == []
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before
+    assert "ozolith-svc" in rig.docker.compose_projects
+
+
+def test_compose_to_single_image_leaves_only_the_single_image_container(rig: Rig):
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    up_files = dict(rig.docker.compose_projects)["ozolith-svc"]
+    assert up_files  # materialized files were used to bring it up
+
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-svc" not in rig.docker.compose_projects  # compose retired
+    assert "svc" not in rig.daemon._applied_compose
+    assert rig.docker.stacks["ozolith-stack-svc"]["image"] == "ghcr.io/x/s:1"  # only form
+    # The down carried the retained materialized paths, never an empty file list.
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[0] == "ozolith-svc" and down[1] == up_files
+
+    # Stable: no churn on the following pass.
+    rig.docker.removed.clear()
+    spawned = len(rig.popen.spawned)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.removed
+    assert len(rig.popen.spawned) == spawned
+    assert rig.docker.stacks["ozolith-stack-svc"]["image"] == "ghcr.io/x/s:1"
+
+
+def test_single_image_to_compose_with_unavailable_secret_keeps_the_container(rig: Rig):
+    """single-image -> compose defers, retaining the single-image container,
+    until the compose form's secrets can be materialized."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    rig.docker.removed.clear()
+
+    rig.control.denied_secrets = True
+    stack = _compose_stack("svc", secrets={"TOK": "tok-x"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks  # single-image kept
+    assert "ozolith-stack-svc" not in rig.docker.removed
+    assert "ozolith-svc" not in rig.docker.compose_projects  # compose not brought up
+    assert "svc" not in rig.daemon._applied_compose
+
+    # Secret becomes available: the transition completes, one form remains.
+    rig.control.denied_secrets = False
+    rig.control.secrets["tok-x"] = "X"
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert "ozolith-stack-svc" not in rig.docker.stacks
+    assert "ozolith-svc" in rig.docker.compose_projects
+
+
+def test_compose_to_single_image_with_unbuilt_image_keeps_compose(rig: Rig):
+    """compose -> single-image defers, retaining the compose project, until the
+    desired derived image is actually built."""
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert "ozolith-svc" in rig.docker.compose_projects
+
+    new = image_recipe("svcimg", setup=["boom"])
+    _fail_build(rig)
+    stack = container_stack("svc", image=new["tag"])
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], [new]))
+    rig.daemon.once()
+    assert not rig.docker.image_exists(new["tag"])
+    assert "ozolith-svc" in rig.docker.compose_projects  # compose kept
+    assert "svc" in rig.daemon._applied_compose
+    assert "ozolith-stack-svc" not in rig.docker.stacks  # no single-image yet
+    assert any("not built yet" in line for line in rig.logs)
+
+    # The image builds: the transition completes, one form remains.
+    del rig.docker.build
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], [new]))
+    rig.daemon.once()
+    assert rig.docker.image_exists(new["tag"])
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert rig.docker.stacks["ozolith-stack-svc"]["image"] == new["tag"]
+
+
+# -- retained compose teardown context + real command construction (task 3/5) ------
+
+
+def test_same_lifetime_compose_deletion_uses_retained_paths(rig: Rig):
+    """A compose project this daemon started, then dropped from desired state, is
+    composed down with the very files it was brought up with — never an empty
+    file list (ADR-0044 amendment: valid retained teardown context)."""
+    files = [
+        {"name": "compose/base.yml", "content": "services: {}\n"},
+        {"name": "overlays/net.yml", "content": "services: {}\n"},
+    ]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc", files=files)]))
+    rig.daemon.once()
+    up = [c for c in rig.docker.compose_calls if c[2] == "up"][-1]
+    assert len(up[1]) == 2 and all(p for p in up[1])  # two real paths
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[0] == "ozolith-svc"
+    assert down[1] == up[1]  # SAME materialized paths, not []
+    assert down[1] != []
+    assert "svc" not in rig.daemon._applied_compose
+
+
+def test_dockerctl_compose_builds_valid_file_scoped_commands():
+    """The real DockerCtl turns retained paths into a valid file-scoped
+    ``docker compose … --file … up/down`` — asserted on the actual argv the
+    runner receives, not merely on FakeDocker state (task 5: command-construction
+    coverage)."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    files = [Path("/state/stacks/svc/compose/base.yml"), Path("/state/stacks/svc/overlays/net.yml")]
+    ctl.compose("ozolith-svc", files, "up")
+    ctl.compose("ozolith-svc", files, "down")
+
+    up, down = calls
+    assert up == [
+        "docker", "compose", "--project-name", "ozolith-svc",
+        "--file", "/state/stacks/svc/compose/base.yml",
+        "--file", "/state/stacks/svc/overlays/net.yml",
+        "up", "--detach", "--remove-orphans",
+    ]
+    assert down == [
+        "docker", "compose", "--project-name", "ozolith-svc",
+        "--file", "/state/stacks/svc/compose/base.yml",
+        "--file", "/state/stacks/svc/overlays/net.yml",
+        "down", "--remove-orphans",
+    ]
+    assert "--file" in down  # a down is never issued with an empty file set
+
+
+# -- removed-runtime teardown failures are isolated (task 4) -----------------------
+
+
+def test_one_stale_compose_down_failure_does_not_block_an_unrelated_start(rig: Rig):
+    """A compose-down failure for an absent Stack is logged and emitted, its
+    retry state is retained, and an unrelated desired Stack still starts."""
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("gone")]))
+    rig.daemon.once()
+    assert "gone" in rig.daemon._applied_compose
+
+    rig.docker.fail_compose_down.add("ozolith-gone")
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("keep")]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("keep")  # unrelated Stack converged past the failure
+    assert "gone" in rig.daemon._applied_compose  # retry state retained (not forgotten)
+    assert "ozolith-gone" in rig.docker.compose_projects
+    assert any(e["error_class"] == "DockerError" for e in rig.control.events)
+
+
+def test_one_stale_process_stop_failure_does_not_block_reconciliation(rig: Rig, monkeypatch):
+    """A process-stop failure for an absent Stack is isolated: an unrelated
+    desired Stack still converges and the process is retried next pass."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("gone")]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("gone")
+
+    real_stop = rig.daemon._supervisor.stop
+
+    def flaky_stop(name, **kwargs):
+        if name == "gone":
+            raise RuntimeError("stop failed")
+        return real_stop(name, **kwargs)
+
+    monkeypatch.setattr(rig.daemon._supervisor, "stop", flaky_stop)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("keep", image="ghcr.io/x/k:1")])
+    )
+    rig.daemon.once()
+    assert rig.docker.stacks["ozolith-stack-keep"]["image"] == "ghcr.io/x/k:1"  # converged
+    assert "gone" in rig.daemon._supervisor.names()  # not lost: retried next pass
+    assert any(e["error_class"] == "RuntimeError" for e in rig.control.events)
+
+
+def test_failed_stale_cleanup_is_retried_on_a_later_pass(rig: Rig):
+    """A stale compose-down that fails is retried — and succeeds — on a later
+    pass, using the retained compose paths."""
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("gone")]))
+    rig.daemon.once()
+
+    rig.docker.fail_compose_down.add("ozolith-gone")
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    assert "gone" in rig.daemon._applied_compose  # first attempt failed, retained
+    assert "ozolith-gone" in rig.docker.compose_projects
+
+    rig.docker.fail_compose_down.clear()  # docker recovers
+    rig.control.heartbeat_answers.append(heartbeat_response([]))
+    rig.daemon.once()
+    assert "gone" not in rig.daemon._applied_compose  # retried and cleared
+    assert "ozolith-gone" not in rig.docker.compose_projects
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] != []  # the successful down still used retained paths
