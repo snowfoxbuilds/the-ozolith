@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
 
 
@@ -1178,3 +1180,327 @@ def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):
     rig.docker.removed.clear()
     _run_container(rig, stack)
     assert "ozolith-stack-flightdeck" not in rig.docker.removed  # stable thereafter
+
+
+# -- desired-state process changes queue behind an in-flight Run (ADR-0044) -------
+#
+# A worker-type change resolves into a live process Stack's effective spec, but
+# it must never interrupt an in-flight Run: the daemon leaves the running child
+# (and its Run containers) untouched and restarts exactly once after the Run
+# ends. Stopped/drained desire stays immediate.
+
+
+def _launch_driver(rig: Rig, jobs: Path, images=None, secrets=None, **env) -> object:
+    """Launch a generic process driver whose jobs dir is ``jobs``; return its
+    child. Generic command (not a built-in) so no run-image gating interferes."""
+    stack = process_stack(
+        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), **env}, secrets=secrets or {}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], images))
+    rig.daemon.once()
+    return rig.popen.spawned[-1]
+
+
+def _plant_run(rig: Rig, jobs: Path, run_id: str, owner: str = "worker") -> None:
+    """An in-flight Run: a job directory under the driver's jobs dir AND a
+    labeled run container the driver owns."""
+    (jobs / run_id).mkdir(parents=True, exist_ok=True)
+    rig.docker.add_run_container(f"run-{run_id}", run_id, owner)
+
+
+def test_desired_model_change_during_a_run_is_deferred(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs, THEOZOLITH_MODEL="claude-sonnet-5")
+    _plant_run(rig, jobs, "r1")
+
+    b = process_stack(
+        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_MODEL": "claude-opus-5"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+
+    # Deferred: no new child; the old child AND its run container are untouched.
+    assert len(rig.popen.spawned) == 1 and first.poll() is None
+    assert "run-r1" not in rig.docker.removed
+    assert any("restart deferred" in line for line in rig.logs)
+
+
+@pytest.mark.parametrize(
+    "env_a,env_b",
+    [
+        ({"THEOZOLITH_ADAPTER": "claude"}, {"THEOZOLITH_ADAPTER": "codex"}),
+        ({"THEOZOLITH_REPO": "acme/one"}, {"THEOZOLITH_REPO": "acme/two"}),  # workspace
+    ],
+)
+def test_other_env_spec_change_during_a_run_uses_the_same_deferral(
+    rig: Rig, tmp_path, env_a, env_b
+):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs, **env_a)
+    _plant_run(rig, jobs, "r1")
+
+    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), **env_b})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1 and first.poll() is None
+    assert "run-r1" not in rig.docker.removed
+    assert any("restart deferred" in line for line in rig.logs)
+
+
+def test_desired_run_image_change_during_a_run_is_deferred(rig: Rig, tmp_path):
+    """Even when the NEW run image builds successfully, the restart defers
+    behind the Run — the deferral path is the Run, not the missing image."""
+    jobs = tmp_path / "jobs"
+    old = image_recipe()
+    first = _launch_driver(
+        rig, jobs, images=[old], THEOZOLITH_REPO="a/x", THEOZOLITH_RUN_IMAGE=old["tag"]
+    )
+    _plant_run(rig, jobs, "r1")
+
+    new = image_recipe(setup=["pip install uv", "apt-get install -y jq"])
+    assert new["tag"] != old["tag"]
+    b = process_stack(
+        "worker",
+        env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_REPO": "a/x",
+             "THEOZOLITH_RUN_IMAGE": new["tag"]},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b], [new]))
+    rig.daemon.once()
+
+    assert rig.docker.image_exists(new["tag"])  # the new image DID build...
+    assert len(rig.popen.spawned) == 1 and first.poll() is None  # ...restart still deferred
+    assert "run-r1" not in rig.docker.removed
+
+
+def test_desired_secret_mapping_change_during_a_run_is_deferred(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    rig.control.secrets.update({"tok-a": "A", "tok-b": "B"})
+    first = _launch_driver(rig, jobs, secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    _plant_run(rig, jobs, "r1")
+
+    b = process_stack(
+        "worker",
+        env={"THEOZOLITH_JOBS_DIR": str(jobs)},
+        secrets={"WORKER_GITHUB_TOKEN": "tok-b"},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1 and first.poll() is None
+    assert "run-r1" not in rig.docker.removed
+
+
+def test_deferred_desired_change_restarts_exactly_once_after_the_run(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs, THEOZOLITH_MODEL="m1")
+    _plant_run(rig, jobs, "r1")
+
+    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_MODEL": "m2"})
+    for _ in range(2):  # two deferred passes while the Run is in flight
+        rig.control.heartbeat_answers.append(heartbeat_response([b]))
+        rig.daemon.once()
+    assert len(rig.popen.spawned) == 1
+
+    shutil.rmtree(jobs / "r1")  # the Run ends
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2 and first.poll() is not None
+    assert rig.popen.spawned[1].env["THEOZOLITH_MODEL"] == "m2"
+
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))  # and no second restart
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+
+
+def test_jobs_dir_change_still_detects_a_run_under_the_old_path(rig: Rig, tmp_path):
+    """When THEOZOLITH_JOBS_DIR itself changes, the in-flight check inspects the
+    RUNNING child's old jobs dir — a naive check of the new (empty) desired path
+    would wrongly restart mid-Run."""
+    old_jobs = tmp_path / "old-jobs"
+    new_jobs = tmp_path / "new-jobs"
+    first = _launch_driver(rig, old_jobs, THEOZOLITH_MODEL="m1")
+    _plant_run(rig, old_jobs, "r1")  # Run under the OLD path
+    new_jobs.mkdir(parents=True)  # the NEW desired path is empty
+
+    b = process_stack(
+        "worker", env={"THEOZOLITH_JOBS_DIR": str(new_jobs), "THEOZOLITH_MODEL": "m2"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1 and first.poll() is None  # deferred on the old path
+    assert any("restart deferred" in line for line in rig.logs)
+
+    shutil.rmtree(old_jobs / "r1")  # the Run ends under the old path
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["THEOZOLITH_JOBS_DIR"] == str(new_jobs)
+
+
+def test_desired_change_to_stopped_is_immediate_even_mid_run(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs)
+    _plant_run(rig, jobs, "r1")
+
+    stopped = process_stack("worker", state="stopped", env={"THEOZOLITH_JOBS_DIR": str(jobs)})
+    rig.control.heartbeat_answers.append(heartbeat_response([stopped]))
+    rig.daemon.once()
+    assert first.poll() is not None  # stopped desire takes the child down at once
+    assert not rig.daemon._supervisor.alive("worker")
+    assert "run-r1" in rig.docker.removed  # its Run containers go with it (kill-the-tree)
+
+
+def test_drain_command_is_immediate_even_mid_run(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    first = _launch_driver(rig, jobs)
+    _plant_run(rig, jobs, "r1")
+
+    stack = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)})
+    drain = {"id": 30, "verb": "drain", "target": "worker", "force": False}
+    rig.control.heartbeat_answers.append(heartbeat_response([stack], commands=[drain]))
+    rig.daemon.once()
+    assert first.poll() is not None and not rig.daemon._supervisor.alive("worker")
+    assert 30 in rig.daemon._completed  # drain is never deferred
+
+
+# -- container Stacks preserve a working image when the replacement is missing ----
+#
+# A single-image container (the Flight Deck) whose desired image is one of THIS
+# node's own recipe tags must not be torn down onto an unavailable/failed build:
+# keep the current container, defer, replace exactly once the image appears.
+# Arbitrary external image references are Docker's to pull and are not gated.
+
+
+def _fail_build(rig: Rig):
+    def failing_build(*_a, **_k):
+        raise RuntimeError("build failed")
+
+    rig.docker.build = failing_build  # type: ignore[assignment]
+
+
+def test_failed_flightdeck_build_leaves_the_old_container_running(rig: Rig):
+    old = image_recipe("flightdeck")
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("flightdeck", image=old["tag"])], [old])
+    )
+    rig.daemon.once()
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == old["tag"]
+
+    new = image_recipe("flightdeck", setup=["pip install uv", "boom"])
+    _fail_build(rig)
+    rig.docker.removed.clear()
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("flightdeck", image=new["tag"])], [new])
+    )
+    rig.daemon.once()
+
+    assert not rig.docker.image_exists(new["tag"])
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == old["tag"]  # unchanged
+    assert rig.docker.removed == []  # no remove while the new image is unavailable
+    assert any("not built yet" in line for line in rig.logs)
+
+
+def test_flightdeck_replaced_exactly_once_after_a_later_successful_build(rig: Rig):
+    old = image_recipe("flightdeck")
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("flightdeck", image=old["tag"])], [old])
+    )
+    rig.daemon.once()
+
+    new = image_recipe("flightdeck", setup=["pip install uv", "jq"])
+    stack_new = container_stack("flightdeck", image=new["tag"])
+    _fail_build(rig)
+    rig.docker.removed.clear()  # ignore the initial create's internal rm
+    for _ in range(2):  # the build keeps failing: no replacement
+        rig.control.heartbeat_answers.append(heartbeat_response([stack_new], [new]))
+        rig.daemon.once()
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == old["tag"]
+    assert rig.docker.removed == []
+
+    del rig.docker.build  # the real FakeDocker.build succeeds now
+    rig.control.heartbeat_answers.append(heartbeat_response([stack_new], [new]))
+    rig.daemon.once()
+    assert rig.docker.image_exists(new["tag"])
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == new["tag"]
+    assert rig.docker.removed.count("ozolith-stack-flightdeck") == 1  # replaced exactly once
+
+    rig.docker.removed.clear()
+    rig.control.heartbeat_answers.append(heartbeat_response([stack_new], [new]))
+    rig.daemon.once()
+    assert "ozolith-stack-flightdeck" not in rig.docker.removed  # stable thereafter
+
+
+def test_initial_deploy_with_an_unavailable_derived_image_creates_nothing(rig: Rig):
+    recipe = image_recipe("flightdeck", setup=["boom"])
+    _fail_build(rig)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("flightdeck", image=recipe["tag"])], [recipe])
+    )
+    rig.daemon.once()
+
+    assert not rig.docker.image_exists(recipe["tag"])
+    assert "ozolith-stack-flightdeck" not in rig.docker.stacks  # nothing created
+    assert rig.docker.removed == []
+    assert any("not built yet" in line for line in rig.logs)
+
+
+def test_external_container_image_is_not_gated_on_local_existence(rig: Rig):
+    """An image reference that is NOT one of this node's recipe tags is left for
+    Docker to pull — it is not required to exist locally first."""
+    stack = container_stack("flightdeck", image="ghcr.io/x/thing:1.2.3")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))  # no recipes declared
+    rig.daemon.once()
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == "ghcr.io/x/thing:1.2.3"
+
+
+# -- process restarts preflight replacement secrets before stopping (ADR-0044) ----
+#
+# Pull/materialize the new effective spec's secrets BEFORE stopping the old
+# child; if they are unavailable and uncached, keep the old child running.
+
+
+def test_unavailable_replacement_secret_keeps_the_old_child_and_run(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    rig.control.secrets["tok-a"] = "A"
+    first = _launch_driver(rig, jobs, secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    assert first.env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-a")
+    rig.docker.add_run_container("run-x", "r-x", "worker")  # a Run container it owns
+
+    # Switch to a mapping the Control Node will not serve and that is not cached.
+    rig.control.denied_secrets = True
+    b = process_stack(
+        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)}, secrets={"WORKER_GITHUB_TOKEN": "tok-b"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1 and first.poll() is None  # old child kept alive
+    assert "run-x" not in rig.docker.removed  # no Run containers removed on failed preflight
+    assert any("secrets unavailable" in line for line in rig.logs)
+
+    # The secret becomes available: restart exactly once with the new *_FILE.
+    rig.control.denied_secrets = False
+    rig.control.secrets["tok-b"] = "B"
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2 and first.poll() is not None
+    assert rig.popen.spawned[1].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-b")
+    assert "run-x" in rig.docker.removed  # kill-the-tree only now, after prerequisites ready
+
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))  # stable thereafter
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+
+
+def test_secret_values_never_enter_fingerprint_or_persisted_state(rig: Rig):
+    rig.control.secrets["tok-a"] = "super-secret-value"
+    stack = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+
+    child = rig.daemon._supervisor._children["worker"]
+    assert "super-secret-value" not in child.fingerprint
+    assert all("super-secret-value" not in v for v in rig.daemon._applied_jobs_dir.values())
+    # Nothing the daemon persisted to disk (desired cache, acks, drained marks,
+    # applied specs) carries the value — only tmpfs holds it.
+    for path in rig.config.state_dir.rglob("*"):
+        if path.is_file():
+            assert "super-secret-value" not in path.read_text(errors="replace"), path

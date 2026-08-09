@@ -148,6 +148,13 @@ class NodeDaemon:
         self._drained: set[str] = set(_read_json(config.drained_path, []))
         self._completed: list[int] = _read_json(self._acks_path, [])
         self._applied_compose: dict[str, str] = {}
+        # The jobs directory each live process child was LAUNCHED with (its
+        # applied THEOZOLITH_JOBS_DIR). The minimum non-secret applied-spec
+        # fact needed to queue a desired-state restart behind an in-flight Run
+        # even when the desired jobs dir has since changed (ADR-0044 amendment).
+        # In-memory by design: supervised children never outlive the daemon, so
+        # a restart clears both the children and this map together.
+        self._applied_jobs_dir: dict[str, str] = {}
         self._rebuild_targets: set[str] = set()
         # Queue-behind: command id -> deferral reason, reported in heartbeats.
         self._deferrals: dict[int, str] = {}
@@ -394,20 +401,33 @@ class NodeDaemon:
     def _stack_by_name(self, name: str) -> WireStack | None:
         return next((s for s in self._stacks() if s.name == name), None)
 
+    def _live_jobs_dir(self, stack: WireStack) -> Path:
+        """The jobs directory the currently running child was LAUNCHED with —
+        the applied path, which can differ from the desired one when
+        THEOZOLITH_JOBS_DIR changed but the child has not yet been restarted
+        onto it (that restart is itself queued behind the in-flight Run). Falls
+        back to the desired path when no applied path is on record (a child this
+        daemon has not launched, e.g. before the first start)."""
+        applied = self._applied_jobs_dir.get(stack.name)
+        return Path(applied) if applied else stack_jobs_dir(stack)
+
     def _inflight_blocker(self, names: list[str] | None) -> str | None:
         """The in-flight signal for queue-behind: a live driver child whose
-        jobs dir holds a job directory. A dead child never blocks — its
-        orphaned dirs are the boot sweep's business, not a Run. Dot-prefixed
-        names are never live Runs (run ids start with a timestamp digit):
-        the driver's evidence-loss tombstone (worker sweep.TOMBSTONE_PREFIX,
-        ADR-0019 parking ladder) renames undeletable remnants to a hidden
-        name exactly so this signal skips them."""
+        jobs dir holds a job directory. The jobs dir inspected is the one the
+        RUNNING child was launched with (``_live_jobs_dir``), not necessarily
+        the desired one, so a THEOZOLITH_JOBS_DIR change still observes a Run
+        under the old path. A dead child never blocks — its orphaned dirs are
+        the boot sweep's business, not a Run. Dot-prefixed names are never live
+        Runs (run ids start with a timestamp digit): the driver's evidence-loss
+        tombstone (worker sweep.TOMBSTONE_PREFIX, ADR-0019 parking ladder)
+        renames undeletable remnants to a hidden name exactly so this signal
+        skips them."""
         for stack in self._stacks():
             if names is not None and stack.name not in names:
                 continue
             if stack.kind != "process" or not self._supervisor.alive(stack.name):
                 continue
-            jobs_dir = stack_jobs_dir(stack)
+            jobs_dir = self._live_jobs_dir(stack)
             try:
                 running = sorted(
                     p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
@@ -422,6 +442,7 @@ class NodeDaemon:
         """Stop a Stack AND its labeled run containers (kill-the-tree)."""
         if stack.kind == "process":
             self._supervisor.stop(stack.name, grace_seconds=self._stop_grace_seconds())
+            self._applied_jobs_dir.pop(stack.name, None)
         elif stack.compose_files:
             self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
             self._applied_compose.pop(stack.name, None)
@@ -628,11 +649,24 @@ class NodeDaemon:
             )
         if alive and not self._supervisor.needs_restart(stack.name, stack.command, env):
             return  # already live with this exact effective spec — no churn
-        # A (re)start is due. Never restart onto a run image that is not built:
-        # if the driver's declared derived run image is missing (its recipe
-        # failed or has not built yet this pass), keep the current child running
-        # and try again next pass rather than tear a working driver down onto an
-        # unavailable image (ADR-0044 amendment).
+        # A (re)start is due for a live child ONLY because its effective spec
+        # changed; that must never interrupt an in-flight Run (ADR-0044
+        # amendment). If the running child is mid-Run, leave it and its Run
+        # containers untouched and retry on a later pass — restarting exactly
+        # once after the Run ends. The signal is read from the jobs dir the
+        # RUNNING child was launched with, so a THEOZOLITH_JOBS_DIR change still
+        # detects a Run under the old path. A dead child never blocks (its dirs
+        # are orphans); stopped/drained desire took the immediate path above.
+        if alive:
+            blocker = self._inflight_blocker([stack.name])
+            if blocker is not None:
+                self._log(f"stack {stack.name}: restart deferred ({blocker})")
+                return
+        # Never restart onto a run image that is not built: if the driver's
+        # declared derived run image is missing (its recipe failed or has not
+        # built yet this pass), keep the current child running and try again
+        # next pass rather than tear a working driver down onto an unavailable
+        # image (ADR-0044 amendment).
         image_tag = env.get("THEOZOLITH_RUN_IMAGE", "")
         declared_tags = {img.get("tag") for img in self._images().values()}
         if image_tag in declared_tags and not self._docker.image_exists(image_tag):
@@ -641,11 +675,17 @@ class NodeDaemon:
                 f" run image {image_tag} not built yet"
             )
             return
-        if alive:
-            self._stop_stack(stack)  # kill-the-tree before relaunching
+        # Preflight every replacement secret BEFORE stopping the old child: if
+        # the new effective spec's secrets are unavailable and uncached, keep
+        # the current child running and retry later rather than tear a working
+        # driver down onto a spec that cannot launch (ADR-0044 amendment). Only
+        # once all prerequisites are ready do we kill the tree and relaunch.
         if not self._pull_stack_secrets(stack):
             return
+        if alive:
+            self._stop_stack(stack)  # kill-the-tree before relaunching
         self._supervisor.ensure_running(stack.name, stack.command, env)
+        self._applied_jobs_dir[stack.name] = str(stack_jobs_dir(stack))
 
     def _compose_paths(self, stack: WireStack) -> list[Path]:
         """Materialize the inlined compose + overlay documents on disk."""
@@ -714,6 +754,19 @@ class NodeDaemon:
         running = [r for r in rows if r.get("state") == "running"]
         if running and running[0].get(LABEL_STACK_SPEC, "") == want:
             return  # verifiably running the current effective spec — no churn
+        # Never replace (or first-create) onto a derived image our OWN recipes
+        # declare but that is not built yet (a failed or not-yet build): keep any
+        # current container and its applied-spec label alive, emit a deferral,
+        # and retry next pass — replacing exactly once the image appears. An
+        # arbitrary external image reference (not one of our recipe tags) is
+        # Docker's to pull normally, so it is not gated here (ADR-0044 amendment).
+        declared_tags = {img.get("tag") for img in self._images().values()}
+        if stack.image in declared_tags and not self._docker.image_exists(stack.image):
+            self._log(
+                f"stack {stack.name}: deferring container "
+                f"{'replacement' if running else 'create'} — image {stack.image} not built yet"
+            )
+            return
         if running and not running[0].get(LABEL_STACK_SPEC):
             # A pre-existing container with no trustworthy applied-spec record
             # (older daemon, a manual start, or a degraded recovery) must not be
