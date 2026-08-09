@@ -587,3 +587,44 @@ def test_default_jobs_dirs_are_per_stack_and_unique_across_resolved_workers(tmp_
         "/var/tmp/theozolith/jobs/implementer",
         "/var/tmp/theozolith/jobs/reviewer",
     }
+
+
+# -- execution-equivalent argv parsing & workspace shape (ADR-0044 amendment) ----
+
+
+def test_quoted_builtin_command_is_rejected(tmp_path):
+    """The hard-cutover guard parses argv with shlex (execution semantics), so
+    a quoted built-in cannot slip past a naive whitespace split."""
+    for cmd in ('\'"theozolith-worker"\'', '\'"theozolith-reviewer"\''):
+        write(tmp_path, "stacks/w.toml", f'kind = "process"\nnode = "box1"\ncommand = {cmd}\n')
+        with pytest.raises(ConfigRepoError, match=r"is a built-in driver.*worker_type"):
+            load_config(tmp_path)
+
+
+def test_malformed_command_quoting_raises_config_repo_error(tmp_path):
+    toml = "kind = \"process\"\nnode = \"box1\"\ncommand = 'sleep \"30'\n"
+    write(tmp_path, "stacks/w.toml", toml)
+    with pytest.raises(ConfigRepoError, match=r"not valid shell syntax"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "bad", ["/repository", "owner/", "owner/repository/extra", "///", " / ", "owner/ "]
+)
+def test_malformed_workspace_is_rejected(tmp_path, bad):
+    driver_type(tmp_path, workspace=f'"{bad}"')
+    with pytest.raises(ConfigRepoError, match="owner/name"):
+        load_config(tmp_path)
+
+
+def test_normal_owner_repository_workspace_is_accepted(tmp_path):
+    driver_type(tmp_path, workspace='"acme/sandbox"')
+    thin_stack(tmp_path, "implementer", "claude-dev")
+    assert load_config(tmp_path).worker_types["claude-dev"].workspace == "acme/sandbox"
+
+
+def test_driverless_workspace_shape_is_enforced(tmp_path):
+    """The two-component rule applies to the optional driverless workspace too."""
+    write(tmp_path, "worker-types/fd.toml", f'base = "{BASE}"\nworkspace = "owner/repo/extra"\n')
+    with pytest.raises(ConfigRepoError, match="owner/name"):
+        load_config(tmp_path)

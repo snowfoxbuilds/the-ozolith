@@ -906,3 +906,275 @@ def test_wire_cadences_apply_unless_locally_overridden(rig: Rig):
     assert rig.daemon._next_delay() == 5.0
     # stop_grace_seconds is locally overridden (0.5 in the rig): local wins.
     assert rig.daemon._stop_grace_seconds() == 0.5
+
+
+# -- effective-spec convergence: process Stacks (ADR-0044 amendment) --------------
+#
+# A worker-type change now resolves primarily into the process env (repository,
+# adapter, model, run-image tag) and the secret mapping, so a live driver must
+# restart when any of those change — and must NOT churn when nothing does.
+
+
+def test_unchanged_process_spec_does_not_restart(rig: Rig):
+    stack = process_stack("worker")
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1 and rig.popen.spawned[0] is first
+
+
+def test_dictionary_order_only_change_does_not_restart(rig: Rig):
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "acme/sandbox", "A": "1", "B": "2"})
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    b = process_stack("worker", env={"B": "2", "THEOZOLITH_REPO": "acme/sandbox", "A": "1"})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1  # reordering is not a spec change
+
+
+def test_changed_model_restarts_the_driver(rig: Rig):
+    a = process_stack(
+        "worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-sonnet-5"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+    b = process_stack(
+        "worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-opus-5"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["THEOZOLITH_MODEL"] == "claude-opus-5"
+    assert first.poll() is not None  # kill-the-tree took the old child down
+
+
+def test_changed_adapter_restarts_the_driver(rig: Rig):
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_ADAPTER": "claude"})
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_ADAPTER": "codex"})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["THEOZOLITH_ADAPTER"] == "codex"
+
+
+def test_changed_workspace_restarts_the_driver(rig: Rig):
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "acme/one"})
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "acme/two"})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["THEOZOLITH_REPO"] == "acme/two"
+
+
+def test_changed_run_image_tag_builds_then_restarts(rig: Rig):
+    """The new recipe builds FIRST (reconcile builds images before Stacks),
+    then the driver restarts onto the new tag — never onto an unbuilt image."""
+    old = image_recipe()
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_RUN_IMAGE": old["tag"]})
+    rig.control.heartbeat_answers.append(heartbeat_response([a], [old]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    new = image_recipe(setup=["pip install uv", "apt-get install -y jq"])
+    assert new["tag"] != old["tag"]
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_RUN_IMAGE": new["tag"]})
+    rig.control.heartbeat_answers.append(heartbeat_response([b], [new]))
+    rig.daemon.once()
+
+    assert rig.docker.image_exists(new["tag"])  # built before the restart
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["THEOZOLITH_RUN_IMAGE"] == new["tag"]
+    assert first.poll() is not None
+
+
+def test_restart_is_deferred_when_the_new_run_image_is_unavailable(rig: Rig):
+    """An image build failing before a driver restart must not tear the working
+    driver down onto an unavailable image."""
+    old = image_recipe()
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_RUN_IMAGE": old["tag"]})
+    rig.control.heartbeat_answers.append(heartbeat_response([a], [old]))
+    rig.daemon.once()
+    first = rig.popen.spawned[0]
+
+    new = image_recipe(setup=["this build will fail"])
+
+    def failing_build(*_a, **_k):
+        raise RuntimeError("build failed")
+
+    rig.docker.build = failing_build  # type: ignore[assignment]
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_RUN_IMAGE": new["tag"]})
+    rig.control.heartbeat_answers.append(heartbeat_response([b], [new]))
+    rig.daemon.once()
+
+    assert not rig.docker.image_exists(new["tag"])
+    assert len(rig.popen.spawned) == 1 and first.poll() is None  # old child kept alive
+    assert any("not built yet" in line for line in rig.logs)
+
+
+def test_changed_secret_mapping_restarts_and_exposes_the_new_file(rig: Rig):
+    rig.control.secrets["tok-a"] = "A"
+    rig.control.secrets["tok-b"] = "B"
+    a = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    assert rig.popen.spawned[0].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-a")
+
+    b = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-b"})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 2
+    assert rig.popen.spawned[1].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-b")
+
+
+def test_stopped_stack_with_a_config_change_stays_stopped(rig: Rig):
+    a = process_stack("worker", state="stopped", env={"THEOZOLITH_MODEL": "a"})
+    rig.control.heartbeat_answers.append(heartbeat_response([a]))
+    rig.daemon.once()
+    b = process_stack("worker", state="stopped", env={"THEOZOLITH_MODEL": "b"})
+    rig.control.heartbeat_answers.append(heartbeat_response([b]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("worker")
+    assert not rig.popen.spawned  # a stopped-by-desire Stack never launches
+
+
+# -- fail-closed cutover: built-in drivers require a control-authored run image ---
+
+
+def test_old_builtin_implementer_without_run_image_does_not_start(rig: Rig):
+    stack = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("worker") and not rig.popen.spawned
+    (event,) = rig.control.events
+    assert "THEOZOLITH_RUN_IMAGE" in event["message"]
+    assert "incompatible/incomplete desired state" in event["message"]
+
+
+def test_old_builtin_reviewer_without_run_image_does_not_start(rig: Rig):
+    stack = process_stack(
+        "reviewer", command="theozolith-reviewer", env={"THEOZOLITH_REPO": "a/x"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("reviewer") and not rig.popen.spawned
+    (event,) = rig.control.events
+    assert "theozolith-reviewer" in event["message"]
+
+
+def test_live_builtin_driver_stops_when_run_image_env_is_lost(rig: Rig):
+    recipe = image_recipe()
+    good = process_stack(
+        "worker", command="theozolith-worker",
+        env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([good], [recipe]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")
+
+    bad = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+    rig.control.heartbeat_answers.append(heartbeat_response([bad]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("worker")  # stale execution stopped
+    assert rig.control.events  # the incompatibility is surfaced
+
+
+def test_generic_process_stack_without_run_image_starts_normally(rig: Rig):
+    stack = process_stack("batch", command="my-batch --run", env={})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("batch")  # a generic Stack needs no run image
+
+
+def test_other_stacks_reconcile_when_one_fails_closed(rig: Rig):
+    bad = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+    good = process_stack("batch", command="my-batch --run", env={})
+    rig.control.heartbeat_answers.append(heartbeat_response([bad, good]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("worker")
+    assert rig.daemon._supervisor.alive("batch")  # reconcile continued past the failure
+
+
+# -- effective-spec convergence: container Stacks (ADR-0044 amendment) ------------
+
+
+def _run_container(rig: Rig, stack: dict) -> None:
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+
+
+def test_unchanged_container_spec_is_not_recreated(rig: Rig):
+    stack = container_stack("flightdeck")
+    _run_container(rig, stack)
+    rig.docker.removed.clear()
+    _run_container(rig, stack)
+    assert "ozolith-stack-flightdeck" not in rig.docker.removed
+
+
+def test_changed_image_tag_recreates_the_flightdeck(rig: Rig):
+    _run_container(rig, container_stack("flightdeck", image="img:1"))
+    rig.docker.removed.clear()
+    _run_container(rig, container_stack("flightdeck", image="img:2"))
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == "img:2"
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_changed_container_command_recreates_it(rig: Rig):
+    _run_container(rig, container_stack("flightdeck", command="tmux new -s a"))
+    rig.docker.removed.clear()
+    _run_container(rig, container_stack("flightdeck", command="tmux new -s b"))
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["command"][-1] == "b"
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_changed_container_env_recreates_it(rig: Rig):
+    _run_container(rig, container_stack("flightdeck", env={"MODE": "a"}))
+    rig.docker.removed.clear()
+    _run_container(rig, container_stack("flightdeck", env={"MODE": "b"}))
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["env"] == {"MODE": "b"}
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_changed_container_ports_or_volumes_recreate_it(rig: Rig):
+    _run_container(rig, container_stack("flightdeck", ports=["8443:8443"], volumes=[]))
+    rig.docker.removed.clear()
+    _run_container(rig, container_stack("flightdeck", ports=["8443:8443"], volumes=["v:/p"]))
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["volumes"] == ["v:/p"]
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_changed_container_secret_mapping_recreates_it(rig: Rig):
+    rig.control.secrets["a"] = "A"
+    rig.control.secrets["b"] = "B"
+    _run_container(rig, container_stack("flightdeck", secrets={"TOK": "a"}))
+    rig.docker.removed.clear()
+    _run_container(rig, container_stack("flightdeck", secrets={"TOK": "b"}))
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["env_files"]["TOK"].endswith("b")
+    assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):
+    """Recovery after a daemon restart / a manual start: a running container
+    with no applied-spec label is not trusted — it is reconciled exactly once,
+    then stays stable."""
+    rig.docker.stacks["ozolith-stack-flightdeck"] = {
+        "stack": "flightdeck",
+        "image": "stale:0",
+        "state": "running",
+    }  # no theozolith.spec label
+    stack = container_stack("flightdeck", image="img:1")
+    _run_container(rig, stack)
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["image"] == "img:1"
+    assert rig.docker.stacks["ozolith-stack-flightdeck"]["theozolith.spec"]
+
+    rig.docker.removed.clear()
+    _run_container(rig, stack)
+    assert "ozolith-stack-flightdeck" not in rig.docker.removed  # stable thereafter

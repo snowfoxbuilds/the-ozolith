@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -333,6 +334,16 @@ def _check_jobs_dirs(stacks: tuple[StackDef, ...]) -> None:
             claims[(stack.node, path)] = stack.name
 
 
+def _valid_workspace(value: str) -> bool:
+    """The documented workspace shape: exactly two non-empty path components
+    (``owner/name``). Deliberately NOT GitHub's full naming policy — only the
+    two-component promise the schema makes. Rejects ``/repo``, ``owner/``,
+    ``owner/repo/extra``, ``///``, and any empty or whitespace-only
+    component (ADR-0044 amendment)."""
+    parts = value.split("/")
+    return len(parts) == 2 and all(part.strip() for part in parts)
+
+
 def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
     value = data.get(key, {})
     if not isinstance(value, dict) or any(
@@ -433,10 +444,26 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
     )
     if stack.kind == "process" and not stack.command:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")
+    # Parse the command with the SAME argv semantics the supervisor executes
+    # with (shlex.split, not str.split), so a quoted built-in — command =
+    # '"theozolith-worker"' — is recognized here and rejected, instead of
+    # sailing past a naive whitespace split and launching at run time.
+    # Malformed shell quoting becomes a clear ConfigRepoError, never an
+    # uncaught exception or a command that validates now and fails at launch.
+    if stack.command:
+        try:
+            argv = shlex.split(stack.command)
+        except ValueError as exc:
+            raise ConfigRepoError(
+                f"{context}: 'command' is not valid shell syntax ({exc}) — fix the"
+                " quoting"
+            ) from exc
+    else:
+        argv = []
     # The built-in drivers only work with the environment a worker type
     # injects (THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE): a plain Stack that
     # invokes one directly is the old fat-Stack form and is rejected (ADR-0044).
-    argv0 = stack.command.split()[0] if stack.command.split() else ""
+    argv0 = argv[0] if argv else ""
     if stack.kind == "process" and argv0 in BUILTIN_DRIVERS.values():
         raise ConfigRepoError(
             f"{context}: command {argv0!r} is a built-in driver — declare a"
@@ -491,8 +518,11 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
                     f"{context}: {field_name!r} is a driverless (Flight Deck) field"
                     " and is rejected when a driver is set (ADR-0044)"
                 )
-    if workspace and "/" not in workspace:
-        raise ConfigRepoError(f"{context}: 'workspace' must be owner/name, got {workspace!r}")
+    if workspace and not _valid_workspace(workspace):
+        raise ConfigRepoError(
+            f"{context}: 'workspace' must be owner/name — exactly two non-empty"
+            f" path components — got {workspace!r}"
+        )
     return WorkerTypeDef(
         name=name,
         base=base,

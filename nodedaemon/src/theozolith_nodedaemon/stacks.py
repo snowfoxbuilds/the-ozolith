@@ -20,6 +20,8 @@ modes and wired via the VAR_FILE convention; they never touch node disk.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import shlex
 import signal
@@ -91,11 +93,36 @@ def secret_env_files(stack: WireStack, secrets_dir: Path) -> dict[str, str]:
 
 # -- process Stacks: supervised children in their own process groups ------------
 
+# Env keys redacted before an effective-spec fingerprint is computed: the
+# node's control-channel token is a credential injected into every driver's
+# env, not a spec input — it must never enter a fingerprint (ADR-0044
+# amendment: secret values stay out of fingerprints, state, and logs). Stack
+# secret VALUES never reach env in the first place (only their <ENV>_FILE
+# paths do, via secret_env_files), so the mapping is captured while the
+# values are not.
+_FINGERPRINT_REDACT = ("THEOZOLITH_NODE_TOKEN",)
+
+
+def spec_fingerprint(command: str, env: dict[str, str]) -> str:
+    """A deterministic digest of a process Stack's effective launch spec —
+    the argv command plus its full environment (which already carries the
+    resolved worker-type env: repository, adapter, model, run-image tag, and
+    the secret <ENV>_FILE mappings). Dictionary ordering is irrelevant
+    (sort_keys), so a mere reordering never forces a restart; a change to any
+    effective input does."""
+    safe_env = {
+        key: ("<redacted>" if key in _FINGERPRINT_REDACT else value)
+        for key, value in env.items()
+    }
+    canonical = json.dumps({"command": command, "env": safe_env}, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 @dataclass
 class Child:
     process: subprocess.Popen
     command: str
+    fingerprint: str
 
 
 class ProcessSupervisor:
@@ -111,15 +138,29 @@ class ProcessSupervisor:
         child = self._children.get(name)
         return child is not None and child.process.poll() is None
 
+    def needs_restart(self, name: str, command: str, env: dict[str, str]) -> bool:
+        """True when a running child's effective spec no longer matches the
+        given (command, env) — the caller then tears the tree down and relaunches.
+        A missing or dead child also needs (re)starting."""
+        child = self._children.get(name)
+        if child is None or child.process.poll() is not None:
+            return True
+        return child.fingerprint != spec_fingerprint(command, env)
+
     def ensure_running(self, name: str, command: str, env: dict[str, str]) -> None:
-        """Start (or restart) the Stack's child unless it is already up."""
+        """Start (or restart) the Stack's child unless its effective spec is
+        already live. The effective spec is the argv command AND its
+        environment: a worker-type change resolves primarily into env now, so
+        comparing the command alone would miss model/adapter/workspace/run-image
+        and secret-mapping changes (ADR-0044 amendment)."""
+        fingerprint = spec_fingerprint(command, env)
         child = self._children.get(name)
         if child is not None:
             code = child.process.poll()
-            if code is None and child.command == command:
+            if code is None and child.fingerprint == fingerprint:
                 return
             if code is None:
-                # The declared command changed: recycle to the new one.
+                # The effective spec changed: recycle to the new one.
                 self.stop(name, grace_seconds=30.0)
             else:
                 self._last_exit[name] = code
@@ -130,7 +171,7 @@ class ProcessSupervisor:
             env={**os.environ, **env},
             start_new_session=True,  # its own process group: the kill-tree unit
         )
-        self._children[name] = Child(process=process, command=command)
+        self._children[name] = Child(process=process, command=command, fingerprint=fingerprint)
         self._log(f"stack {name}: started pid {process.pid} ({command})")
 
     def stop(self, name: str, *, grace_seconds: float, sleep=time.sleep) -> None:

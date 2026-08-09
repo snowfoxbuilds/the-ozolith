@@ -31,6 +31,7 @@ across daemon restarts until a recycle clears it (ADR-0015).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -53,7 +54,7 @@ from theozolith_nodedaemon.controlclient import (
     ControlError,
     ControlUnreachable,
 )
-from theozolith_nodedaemon.dockerctl import DockerCtl
+from theozolith_nodedaemon.dockerctl import LABEL_STACK_SPEC, DockerCtl
 from theozolith_nodedaemon.stacks import (
     ProcessSupervisor,
     WireStack,
@@ -62,6 +63,15 @@ from theozolith_nodedaemon.stacks import (
 )
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
+
+# The built-in driver commands a worker type resolves to control-side
+# (control's configrepo.BUILTIN_DRIVERS values). This is driver knowledge, not
+# worker-type schema — the daemon still never parses a worker type. A built-in
+# driver only functions with a control-authored THEOZOLITH_RUN_IMAGE; seeing
+# one of these commands WITHOUT that env means old or incomplete desired state,
+# and the daemon fails that Stack closed rather than launch it against the
+# worker package's default run image (ADR-0044 amendment).
+BUILTIN_DRIVER_COMMANDS = ("theozolith-worker", "theozolith-reviewer")
 
 # theozolith.error events (2026-07-21 grilling): size-capped summaries
 # pointing at the failing node/component; diagnostic depth stays in the
@@ -558,13 +568,12 @@ class NodeDaemon:
             )
             return False
 
-    def _converge_process(self, stack: WireStack, want_running: bool) -> None:
-        if not want_running:
-            if self._supervisor.alive(stack.name):
-                self._stop_stack(stack)
-            return
-        if not self._supervisor.alive(stack.name) and not self._pull_stack_secrets(stack):
-            return
+    def _process_env(self, stack: WireStack) -> dict[str, str]:
+        """The full effective environment a process Stack's child launches with.
+        This is also the convergence input: the resolved worker-type env
+        (repository/adapter/model/run-image tag) and the secret <ENV>_FILE
+        mappings all live here, so a change to any of them changes this dict and
+        drives a restart (ADR-0044 amendment)."""
         env = {
             "THEOZOLITH_NODE_NAME": self._config.node,
             # Per-process-Stack identity (ADR-0044): the Stack name becomes the
@@ -587,10 +596,55 @@ class NodeDaemon:
             if self._config.tls_ca:
                 env.setdefault("THEOZOLITH_TLS_CA", self._config.tls_ca)
         # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
-        # (resolved from the worker type, ADR-0044); the daemon no longer maps
-        # run_image to a built tag.
+        # (resolved from the worker type, ADR-0044); the daemon no longer maps a
+        # removed wire field to a built tag.
         env_files = secret_env_files(stack, self._config.secrets_dir)
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
+        return env
+
+    def _converge_process(self, stack: WireStack, want_running: bool) -> None:
+        if not want_running:
+            if self._supervisor.alive(stack.name):
+                self._stop_stack(stack)
+            return
+        env = self._process_env(stack)
+        argv = shlex.split(stack.command) if stack.command else []
+        alive = self._supervisor.alive(stack.name)
+        # Fail closed on old/incomplete built-in-driver desired state (ADR-0044
+        # amendment, Sean's ruling — no backward compatibility): a built-in
+        # driver must not launch without a control-authored THEOZOLITH_RUN_IMAGE.
+        # Its absence means old control or an old cached document; refuse to run
+        # against the worker package's default run image, stop any already-live
+        # instance, and raise so the error surfaces — reconcile continues with
+        # the other Stacks (a generic process Stack stays legal without it).
+        if argv and argv[0] in BUILTIN_DRIVER_COMMANDS and not env.get("THEOZOLITH_RUN_IMAGE"):
+            if alive:
+                self._stop_stack(stack)
+            raise RuntimeError(
+                f"built-in driver {argv[0]!r} has no control-authored"
+                " THEOZOLITH_RUN_IMAGE — incompatible/incomplete desired state"
+                " (a coordinated control upgrade is required, ADR-0044); refusing"
+                " to launch against the default run image"
+            )
+        if alive and not self._supervisor.needs_restart(stack.name, stack.command, env):
+            return  # already live with this exact effective spec — no churn
+        # A (re)start is due. Never restart onto a run image that is not built:
+        # if the driver's declared derived run image is missing (its recipe
+        # failed or has not built yet this pass), keep the current child running
+        # and try again next pass rather than tear a working driver down onto an
+        # unavailable image (ADR-0044 amendment).
+        image_tag = env.get("THEOZOLITH_RUN_IMAGE", "")
+        declared_tags = {img.get("tag") for img in self._images().values()}
+        if image_tag in declared_tags and not self._docker.image_exists(image_tag):
+            self._log(
+                f"stack {stack.name}: deferring {'restart' if alive else 'start'} —"
+                f" run image {image_tag} not built yet"
+            )
+            return
+        if alive:
+            self._stop_stack(stack)  # kill-the-tree before relaunching
+        if not self._pull_stack_secrets(stack):
+            return
         self._supervisor.ensure_running(stack.name, stack.command, env)
 
     def _compose_paths(self, stack: WireStack) -> list[Path]:
@@ -606,6 +660,36 @@ class NodeDaemon:
             paths.append(target)
         return paths
 
+    def _compose_fingerprint(self, stack: WireStack) -> str:
+        """All effective compose inputs, so any change reconciles (ADR-0044)."""
+        return json.dumps(
+            {
+                "compose_files": list(stack.compose_files),
+                "env": stack.env,
+                "secrets": stack.secrets,
+            },
+            sort_keys=True,
+        )
+
+    def _container_fingerprint(self, stack: WireStack) -> str:
+        """The effective runtime spec of a single-image container Stack: image
+        tag, command, env, secret mapping, ports, volumes. A change to any of
+        these replaces the running container. Secret VALUES never enter this —
+        only the mapping (ENV -> secret name) does (ADR-0044 amendment)."""
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "image": stack.image,
+                    "command": stack.command,
+                    "env": stack.env,
+                    "secrets": stack.secrets,
+                    "ports": list(stack.ports),
+                    "volumes": list(stack.volumes),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
     def _converge_container(self, stack: WireStack, want_running: bool) -> None:
         if not want_running:
             if stack.compose_files:
@@ -617,7 +701,7 @@ class NodeDaemon:
                 self._stop_stack(stack)
             return
         if stack.compose_files:
-            fingerprint = json.dumps(stack.compose_files, sort_keys=True)
+            fingerprint = self._compose_fingerprint(stack)
             if self._applied_compose.get(stack.name) == fingerprint:
                 return
             if not self._pull_stack_secrets(stack):
@@ -625,9 +709,20 @@ class NodeDaemon:
             self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "up")
             self._applied_compose[stack.name] = fingerprint
             return
+        want = self._container_fingerprint(stack)
         rows = self._docker.stack_containers(stack.name)
-        if any(r.get("state") == "running" for r in rows):
-            return
+        running = [r for r in rows if r.get("state") == "running"]
+        if running and running[0].get(LABEL_STACK_SPEC, "") == want:
+            return  # verifiably running the current effective spec — no churn
+        if running and not running[0].get(LABEL_STACK_SPEC):
+            # A pre-existing container with no trustworthy applied-spec record
+            # (older daemon, a manual start, or a degraded recovery) must not be
+            # silently assumed current: reconcile it once so the fingerprint is
+            # recovered from here on (ADR-0044 amendment).
+            self._log(
+                f"stack {stack.name}: running container has no applied-spec label;"
+                " reconciling once"
+            )
         if not self._pull_stack_secrets(stack):
             return
         self._docker.run_stack_container(
@@ -640,6 +735,7 @@ class NodeDaemon:
             # Optional docker-run command for the single-image form — how
             # the Flight Deck starts its named tmux session (ADR-0019).
             command=shlex.split(stack.command) if stack.command else None,
+            spec=want,
         )
 
     def _reap_orphans(self) -> None:

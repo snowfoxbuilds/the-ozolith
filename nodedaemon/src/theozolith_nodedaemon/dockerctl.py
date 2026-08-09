@@ -19,6 +19,11 @@ LABEL_RUN_ID = "theozolith.run-id"
 LABEL_OWNER = "theozolith.owner"
 # Label on containers the daemon itself runs for container Stacks.
 LABEL_STACK = "theozolith.stack"
+# Applied effective-spec fingerprint stamped on a single-image stack container
+# so convergence survives a daemon restart: the running container carries the
+# spec it was launched with, and a mismatch (or a missing label on a
+# pre-existing container) triggers exactly one controlled replacement (ADR-0044).
+LABEL_STACK_SPEC = "theozolith.spec"
 
 STACK_CONTAINER_PREFIX = "ozolith-stack-"
 
@@ -108,6 +113,7 @@ class DockerCtl:
         ports: list[str],
         volumes: list[str],
         command: list[str] | None = None,
+        spec: str = "",
     ) -> None:
         """Single-image container Stack: one long-running container."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
@@ -122,6 +128,8 @@ class DockerCtl:
             "--label",
             f"{LABEL_STACK}={stack}",
         ]
+        if spec:
+            args += ["--label", f"{LABEL_STACK_SPEC}={spec}"]
         for key, value in sorted(env.items()):
             args += ["--env", f"{key}={value}"]
         for key, host_path in sorted(env_files.items()):

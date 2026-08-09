@@ -96,8 +96,9 @@ class FakeDocker:
     # -- container Stacks ----------------------------------------------------
 
     def run_stack_container(
-        self, stack, image, *, env_files, env, ports, volumes, command=None
+        self, stack, image, *, env_files, env, ports, volumes, command=None, spec=""
     ) -> None:
+        self.remove(f"ozolith-stack-{stack}")  # faithful to DockerCtl: rm --force first
         self.stacks[f"ozolith-stack-{stack}"] = {
             "stack": stack,
             "image": image,
@@ -107,6 +108,9 @@ class FakeDocker:
             "ports": list(ports),
             "volumes": list(volumes),
             "command": list(command or []),
+            # Mirrors the real LABEL_STACK_SPEC label; stack_containers surfaces
+            # it as a row key, exactly as DockerCtl._ps flattens labels.
+            "theozolith.spec": spec,
         }
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:

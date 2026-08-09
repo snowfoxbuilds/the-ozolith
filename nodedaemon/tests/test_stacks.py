@@ -89,3 +89,47 @@ def test_materialized_secrets_are_0600_in_the_given_dir(tmp_path: Path):
         {"name": "w", "kind": "process", "command": "c", "secrets": {"TOKEN": "a"}}
     )
     assert secret_env_files(stack, tmp_path / "secrets") == {"TOKEN": str(paths["a"])}
+
+
+def test_changed_env_recycles_even_with_the_same_command():
+    """ADR-0044 amendment: convergence keys on the effective spec (command AND
+    env), so a worker-type change that lands only in env still recycles."""
+    supervisor = ProcessSupervisor(log=lambda *_: None)
+    supervisor.ensure_running("s", "sleep 300", {"PATH": os.environ["PATH"], "MODEL": "a"})
+    first = supervisor._children["s"].process
+    supervisor.ensure_running("s", "sleep 300", {"PATH": os.environ["PATH"], "MODEL": "b"})
+    assert supervisor._children["s"].process.pid != first.pid
+    assert first.poll() is not None
+    supervisor.stop_all(grace_seconds=2.0)
+
+
+def test_same_effective_spec_does_not_recycle_despite_key_reordering():
+    supervisor = ProcessSupervisor(log=lambda *_: None)
+    supervisor.ensure_running("s", "sleep 300", {"PATH": os.environ["PATH"], "MODEL": "a"})
+    first = supervisor._children["s"].process
+    supervisor.ensure_running("s", "sleep 300", {"MODEL": "a", "PATH": os.environ["PATH"]})
+    assert supervisor._children["s"].process is first  # reordering is not a change
+    supervisor.stop("s", grace_seconds=2.0)
+
+
+def test_needs_restart_tracks_command_and_env_and_liveness():
+    supervisor = ProcessSupervisor(log=lambda *_: None)
+    supervisor.ensure_running("s", "sleep 300", {"PATH": os.environ["PATH"], "M": "1"})
+    assert not supervisor.needs_restart("s", "sleep 300", {"M": "1", "PATH": os.environ["PATH"]})
+    assert supervisor.needs_restart("s", "sleep 300", {"PATH": os.environ["PATH"], "M": "2"})
+    assert supervisor.needs_restart("s", "sleep 301", {"PATH": os.environ["PATH"], "M": "1"})
+    supervisor.stop("s", grace_seconds=2.0)
+    assert supervisor.needs_restart("s", "sleep 300", {"PATH": os.environ["PATH"], "M": "1"})
+
+
+def test_node_token_value_is_redacted_from_the_fingerprint():
+    """A secret value must not enter a fingerprint: the node control-channel
+    token is redacted, so a token rotation neither churns the process nor
+    leaks the value into the digest inputs (ADR-0044 amendment)."""
+    from theozolith_nodedaemon.stacks import spec_fingerprint
+
+    a = spec_fingerprint("cmd", {"THEOZOLITH_NODE_TOKEN": "tok-1", "X": "1"})
+    b = spec_fingerprint("cmd", {"THEOZOLITH_NODE_TOKEN": "tok-2", "X": "1"})
+    assert a == b
+    # And a real spec change is still detected.
+    assert spec_fingerprint("cmd", {"X": "1"}) != spec_fingerprint("cmd", {"X": "2"})
