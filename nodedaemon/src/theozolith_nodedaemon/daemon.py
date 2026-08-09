@@ -525,7 +525,7 @@ class NodeDaemon:
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
                 if stack.kind == "process":
-                    self._converge_process(stack, want_running, images)
+                    self._converge_process(stack, want_running)
                 else:
                     self._converge_container(stack, want_running)
             except Exception as exc:
@@ -558,9 +558,7 @@ class NodeDaemon:
             )
             return False
 
-    def _converge_process(
-        self, stack: WireStack, want_running: bool, images: dict[str, dict[str, Any]]
-    ) -> None:
+    def _converge_process(self, stack: WireStack, want_running: bool) -> None:
         if not want_running:
             if self._supervisor.alive(stack.name):
                 self._stop_stack(stack)
@@ -569,6 +567,11 @@ class NodeDaemon:
             return
         env = {
             "THEOZOLITH_NODE_NAME": self._config.node,
+            # Per-process-Stack identity (ADR-0044): the Stack name becomes the
+            # theozolith.owner label on the run containers this driver creates,
+            # so _reap_orphans matches them to their supervisor. Control-authored
+            # Stack env still wins (a driver's THEOZOLITH_STACK, if declared).
+            "THEOZOLITH_STACK": stack.name,
             # The dedicated per-Stack jobs directory (ADR-0019); an explicit
             # env value in the Stack definition wins.
             "THEOZOLITH_JOBS_DIR": str(stack_jobs_dir(stack)),
@@ -583,9 +586,9 @@ class NodeDaemon:
             env.setdefault("THEOZOLITH_NODE_TOKEN", self._config.node_token)
             if self._config.tls_ca:
                 env.setdefault("THEOZOLITH_TLS_CA", self._config.tls_ca)
-        if stack.run_image and stack.run_image in images:
-            # The derived image this driver launches per Run (ADR-0013).
-            env.setdefault("THEOZOLITH_RUN_IMAGE", images[stack.run_image]["tag"])
+        # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
+        # (resolved from the worker type, ADR-0044); the daemon no longer maps
+        # run_image to a built tag.
         env_files = secret_env_files(stack, self._config.secrets_dir)
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
         self._supervisor.ensure_running(stack.name, stack.command, env)

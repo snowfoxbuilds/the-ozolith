@@ -362,7 +362,7 @@ def test_status_reads_the_real_state_document(tmp_path, control: ControlRig):
     control.write_config("product.toml", '[product]\nversion = "0.3.0"\n')
     control.write_config(
         "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\nstate = "stopped"\ncommand = "theozolith-worker"\n',
+        'kind = "process"\nnode = "box1"\nstate = "stopped"\ncommand = "sleep 30"\n',
     )
     control.heartbeat(
         stacks=[{"name": "worker", "kind": "process", "state": "stopped", "detail": ""}]

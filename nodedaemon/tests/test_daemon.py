@@ -96,7 +96,7 @@ def test_dead_process_child_is_restarted_next_pass(rig: Rig):
 
 def test_heartbeat_reports_stacks_containers_and_builds(rig: Rig):
     recipe = image_recipe()
-    stacks = [process_stack("worker", run_image="claude-dev")]
+    stacks = [process_stack("worker")]
     rig.control.heartbeat_answers.append(heartbeat_response(stacks, [recipe]))
     rig.daemon.once()  # first pass: applies config, builds the image
     rig.docker.add_run_container("ozolith-run-r1", "r1", "worker")
@@ -122,12 +122,17 @@ def test_heartbeat_reports_stacks_containers_and_builds(rig: Rig):
 
 def test_declared_image_builds_once_and_run_image_env_flows(rig: Rig):
     recipe = image_recipe()
-    stacks = [process_stack("worker", run_image="claude-dev")]
+    # THEOZOLITH_RUN_IMAGE now rides in the control-authored Stack env
+    # (resolved from the worker type, ADR-0044); the daemon no longer maps a
+    # run_image field to a built tag. It still builds every declared recipe.
+    stacks = [process_stack("worker", env={"THEOZOLITH_RUN_IMAGE": recipe["tag"]})]
     rig.control.heartbeat_answers.append(heartbeat_response(stacks, [recipe]))
     rig.daemon.once()
 
     assert [b["tag"] for b in rig.docker.builds] == [recipe["tag"]]
     assert rig.popen.spawned[0].env["THEOZOLITH_RUN_IMAGE"] == recipe["tag"]
+    # Generic per-process-Stack identity is injected (ADR-0044).
+    assert rig.popen.spawned[0].env["THEOZOLITH_STACK"] == "worker"
 
     # Unchanged instructions => same tag => no rebuild.
     rig.control.heartbeat_answers.append(heartbeat_response(stacks, [recipe]))

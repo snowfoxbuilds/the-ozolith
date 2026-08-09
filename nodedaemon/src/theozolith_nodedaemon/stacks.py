@@ -40,7 +40,6 @@ class WireStack:
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
     command: str = ""
-    run_image: str = ""
     image: str = ""
     ports: tuple[str, ...] = ()
     volumes: tuple[str, ...] = ()
@@ -55,7 +54,6 @@ class WireStack:
             env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
             secrets={str(k): str(v) for k, v in (data.get("secrets") or {}).items()},
             command=str(data.get("command", "")),
-            run_image=str(data.get("run_image", "")),
             image=str(data.get("image", "")),
             ports=tuple(str(p) for p in (data.get("ports") or [])),
             volumes=tuple(str(v) for v in (data.get("volumes") or [])),

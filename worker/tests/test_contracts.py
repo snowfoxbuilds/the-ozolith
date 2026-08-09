@@ -1,4 +1,4 @@
-"""Decisions Section, verdict-file schema, and harness-adapter contracts."""
+"""Decisions Section, verdict-file schema, and Agent-adapter contracts."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from theozolith_worker import decisions, jobdir, verdict
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
-from theozolith_worker.harness.adapters import ClaudeHarnessAdapter
+from theozolith_worker.harness.adapters import ClaudeAdapter
 from theozolith_worker.harness.validate import main as validate_main
 from theozolith_worker.harness.validate import validate_session_verdict
 from theozolith_worker.runner import RunReport, render_claim_escalation
@@ -239,11 +239,11 @@ def test_final_round_rule_rejects_revise(tmp_path):
     assert ok is not None and ok.verdict == verdict.ESCALATE
 
 
-# -- the Claude harness adapter ----------------------------------------------
+# -- the Claude Agent adapter ----------------------------------------------
 
 
 def test_claude_adapter_headless_command():
-    adapter = ClaudeHarnessAdapter()
+    adapter = ClaudeAdapter()
     manifest = jobdir.Manifest(
         run_id="r1",
         mode=jobdir.MODE_RUN,
@@ -264,7 +264,7 @@ def test_claude_adapter_headless_command():
 
 
 def test_claude_adapter_prepare_installs_no_hooks(tmp_path):
-    adapter = ClaudeHarnessAdapter()
+    adapter = ClaudeAdapter()
     workdir = tmp_path / "checkout"
     workdir.mkdir()
     env = adapter.prepare(workdir, tmp_path)
@@ -274,7 +274,7 @@ def test_claude_adapter_prepare_installs_no_hooks(tmp_path):
 
 
 def test_claude_adapter_stream_stats_reads_usage_and_tool_calls(tmp_path):
-    adapter = ClaudeHarnessAdapter()
+    adapter = ClaudeAdapter()
     stream = tmp_path / "transcript.txt"
     stream.write_text(
         "\n".join(
@@ -311,7 +311,7 @@ def test_claude_adapter_stream_stats_reads_usage_and_tool_calls(tmp_path):
 
 
 def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
-    adapter = ClaudeHarnessAdapter()
+    adapter = ClaudeAdapter()
     # No result event (session killed): per-call assistant usage is summed.
     stream = tmp_path / "transcript.txt"
     stream.write_text(
@@ -336,7 +336,7 @@ def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
 
 
 def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
-    adapter = ClaudeHarnessAdapter()
+    adapter = ClaudeAdapter()
     workdir = tmp_path / jobdir.WORK_DIR
     workdir.mkdir()
     (workdir / "verdict.json").write_text('{"verdict": "approve"}')

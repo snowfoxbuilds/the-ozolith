@@ -1,38 +1,16 @@
-# The Flight Deck (ADR-0019): the interactive, human-driven agent container
-# — a container-kind Stack running an agent CLI inside a discoverably named
-# tmux session, and the web terminal's primary attach target. It is NOT a
-# pipeline actor: it never claims issues and holds no transition authority.
-#
-# GitHub identity: its OWN machine account with a fine-grained PAT scoped to
-# issues, PRs, and contents — NO merge permission — entered once as the
-# dedicated secret below. Never a driver PAT, and never anyone's personal
-# token: a prompt-injected session must not be able to perform human-
-# authority transitions (above all the merge) as a human. Do not leave
-# Flight Deck sessions running unattended.
+# The Flight Deck as a thin Stack (ADR-0044): a driverless worker type
+# (worker-types/flightdeck.toml) resolves to a container-kind Stack — the
+# interactive, human-driven agent container and the web terminal's primary
+# attach target (ADR-0019). The image, start command, volumes, and its
+# dedicated no-merge machine-identity secret all live in the worker type.
 
-kind = "container"
+worker_type = "flightdeck"
 node = "box1"
 state = "running"
-image = "ghcr.io/example/flightdeck:1"   # agent CLI + tmux; pin your build
-
-# Start the named tmux session with the agent CLI in it, pipe the session
-# transcript (which captures typed input) to the log volume, and tie the
-# container's lifetime to the tmux SERVER: `tmux wait-for` blocks while the
-# server lives and exits when it dies, so a dead session shows as a dead
-# container (and the restart policy brings up a fresh one). The session
-# name ("flightdeck") is the discoverable attach point.
-command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tmux wait-for flightdeck-forever'"
 
 # Web-terminal attach command, executed by the Control Node's PTY bridge as
 # a structured argv array ({host}/{container} only as complete arguments,
-# validated before launch). Attach and detach are audit-logged.
+# validated before launch). Attach and detach are audit-logged. `attach`
+# lives on the Stack (a per-placement operator concern), and is only valid
+# because the resolved kind is container.
 attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]
-
-volumes = ["flightdeck-logs:/var/log/flightdeck"]
-
-# Secret NAMES only — the value lives encrypted on the Control Node
-# (`theozolith secret set flightdeck-github-token`). The name is
-# deliberately distinct from every driver PAT.
-[secrets]
-GITHUB_TOKEN = "flightdeck-github-token"
-ANTHROPIC_API_KEY = "anthropic-api-key"

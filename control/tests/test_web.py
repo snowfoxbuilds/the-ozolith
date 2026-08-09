@@ -24,10 +24,12 @@ ADMIN_BEARER = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 # Process Stacks expose no terminal (ADR-0019: run containers are headless
 # and never attach targets).
+# A neutral process Stack (worker semantics are irrelevant to the dashboard
+# rendering here); a built-in-driver command would be rejected (ADR-0044).
 WORKER_STACK_TOML = """\
 kind = "process"
 node = "box1"
-command = "theozolith-worker"
+command = "sleep 30"
 
 [secrets]
 WORKER_GITHUB_TOKEN = "github-worker"

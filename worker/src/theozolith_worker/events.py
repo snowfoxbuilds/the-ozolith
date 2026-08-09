@@ -219,8 +219,8 @@ def emit_error(
 
 def _stream_stats(config: DriverConfig, transcript: Path) -> adapters.StreamStats:
     try:
-        adapter = adapters.make_harness_adapter(config.adapter)
-    except adapters.HarnessAdapterError:
+        adapter = adapters.make_agent_adapter(config.adapter)
+    except adapters.AgentAdapterError:
         return adapters.StreamStats()
     return adapter.stream_stats(transcript)
 

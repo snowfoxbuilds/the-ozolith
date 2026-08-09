@@ -89,7 +89,7 @@ class DriverConfig:
     api_url: str
     clone_url: str  # tokenless git remote for the target repo
     model: str  # model the run-container agent runs
-    adapter: str  # harness adapter name (M2: "claude")
+    adapter: str  # Agent adapter name (M2: "claude")
     run_image: str  # the run-container image the driver launches
     stack: str  # theozolith.owner label on containers this driver creates
     poll_seconds: float

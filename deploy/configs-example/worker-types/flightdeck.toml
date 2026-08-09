@@ -1,0 +1,34 @@
+# The Flight Deck worker type (ADR-0019/ADR-0044): a DRIVERLESS type — the
+# absence of `driver` is the discriminator. It resolves to an interactive,
+# human-driven agent container (container kind) running an agent CLI inside
+# a discoverably named tmux session, the web terminal's primary attach
+# target. It is NOT a pipeline actor: it never claims issues and holds no
+# transition authority.
+#
+# GitHub identity: its OWN machine account with a fine-grained PAT scoped to
+# issues, PRs, and contents — NO merge permission — entered once as the
+# dedicated secret below. Never a driver PAT, and never anyone's personal
+# token: a prompt-injected session must not be able to perform human-
+# authority transitions (above all the merge) as a human. Do not leave
+# Flight Deck sessions running unattended.
+
+# No `driver` -> Flight Deck. Driverless types may carry `command` and
+# `volumes`; both are rejected when a driver is set.
+base = "ghcr.io/example/flightdeck:1@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+# Start the named tmux session with the agent CLI in it, pipe the session
+# transcript (which captures typed input) to the log volume, and tie the
+# container's lifetime to the tmux SERVER: `tmux wait-for` blocks while the
+# server lives and exits when it dies, so a dead session shows as a dead
+# container (and the restart policy brings up a fresh one). The session
+# name ("flightdeck") is the discoverable attach point.
+command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tmux wait-for flightdeck-forever'"
+
+volumes = ["flightdeck-logs:/var/log/flightdeck"]
+
+# Secret NAMES only — the value lives encrypted on the Control Node
+# (`theozolith secret set flightdeck-github-token`). The name is
+# deliberately distinct from every driver PAT.
+[secrets]
+GITHUB_TOKEN = "flightdeck-github-token"
+ANTHROPIC_API_KEY = "anthropic-api-key"

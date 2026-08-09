@@ -1,5 +1,6 @@
-"""Config Repo parsing: format validation, deterministic tags, scoping, and
-the wire-model handshake with the Node Daemon."""
+"""Config Repo parsing: worker-type + thin-Stack format (ADR-0044),
+deterministic tags, scoping, hard-cutover rejections, and the wire-model
+handshake with the Node Daemon."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ from theozolith_control.configrepo import ConfigRepoError, load_config
 from theozolith_nodedaemon.stacks import WireStack
 
 DIGEST = "0" * 64
+BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{DIGEST}"
 
 
 def write(tmp_path, relpath: str, text: str) -> None:
@@ -16,9 +18,32 @@ def write(tmp_path, relpath: str, text: str) -> None:
     target.write_text(text, encoding="utf-8")
 
 
+def driver_type(tmp_path, name: str = "claude-dev", **fields) -> None:
+    """A minimal valid driver (pipeline) worker type."""
+    body = {
+        "driver": '"builtin:implementer"',
+        "adapter": '"claude"',
+        "workspace": '"acme/sandbox"',
+        "base": f'"{BASE}"',
+        **{k: v for k, v in fields.items()},
+    }
+    lines = [f"{k} = {v}" for k, v in body.items() if v is not None]
+    write(tmp_path, f"worker-types/{name}.toml", "\n".join(lines) + "\n")
+
+
+def thin_stack(tmp_path, name: str, worker_type: str, **fields) -> None:
+    lines = [f'worker_type = "{worker_type}"', 'node = "box1"']
+    for key, value in fields.items():
+        lines.append(f"{key} = {value}")
+    write(tmp_path, f"stacks/{name}.toml", "\n".join(lines) + "\n")
+
+
+# -- empty / migration ----------------------------------------------------------
+
+
 def test_missing_repo_is_an_empty_deployment(tmp_path):
     config = load_config(tmp_path / "nope")
-    assert config.stacks == () and config.images == {}
+    assert config.stacks == () and config.worker_types == {}
     assert config.desired_state_for("box1") == {
         "commit": "",
         "product_version": "",
@@ -27,13 +52,290 @@ def test_missing_repo_is_an_empty_deployment(tmp_path):
     }
 
 
-def test_full_repo_parses_and_scopes(tmp_path):
+def test_images_directory_is_rejected_with_the_new_home(tmp_path):
+    """Hard cutover (ADR-0044): images/ is absorbed into worker-types/."""
+    write(tmp_path, "images/claude-dev.toml", f'base = "{BASE}"\n')
+    with pytest.raises(ConfigRepoError, match=r"images/ is gone.*worker-types/"):
+        load_config(tmp_path)
+
+
+# -- worker types ---------------------------------------------------------------
+
+
+def test_driver_worker_type_and_thin_stack_resolve_end_to_end(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/claude-dev.toml",
+        f'driver = "builtin:implementer"\nadapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{BASE}"\nsetup = ["apt-get update"]\n'
+        f'[secrets]\nGITHUB_TOKEN = "github-implementer"\n'
+        f'ANTHROPIC_API_KEY = "anthropic-api-key"\n',
+    )
+    thin_stack(tmp_path, "implementer", "claude-dev", state='"running"')
+
+    config = load_config(tmp_path)
+    stack = next(s for s in config.stacks if s.name == "implementer")
+    assert stack.kind == "process"
+    assert stack.worker_type == "claude-dev"  # kept for display
+    assert stack.command == "theozolith-worker"
+    assert stack.env == {
+        "THEOZOLITH_REPO": "acme/sandbox",
+        "THEOZOLITH_ADAPTER": "claude",
+        "THEOZOLITH_MODEL": "claude-sonnet-5",
+        "THEOZOLITH_RUN_IMAGE": config.worker_types["claude-dev"].tag,
+    }
+    assert stack.secrets == {
+        "GITHUB_TOKEN": "github-implementer",
+        "ANTHROPIC_API_KEY": "anthropic-api-key",
+    }
+    # Type-owned secrets are node-scoped through the resolved Stack.
+    assert config.secret_names_for("box1") == {"github-implementer", "anthropic-api-key"}
+
+
+def test_stack_env_overrides_injected_worker_type_env(tmp_path):
+    driver_type(tmp_path, model='"claude-sonnet-5"')
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n'
+        '[env]\nTHEOZOLITH_MODEL = "claude-opus-5"\nWORKER_ID = "w1"\n',
+    )
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "implementer")
+    assert stack.env["THEOZOLITH_MODEL"] == "claude-opus-5"  # Stack wins
+    assert stack.env["WORKER_ID"] == "w1"
+    assert stack.env["THEOZOLITH_REPO"] == "acme/sandbox"
+
+
+def test_model_omitted_leaves_no_model_env(tmp_path):
+    driver_type(tmp_path)  # no model
+    thin_stack(tmp_path, "implementer", "claude-dev")
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "implementer")
+    assert "THEOZOLITH_MODEL" not in stack.env
+
+
+def test_driverless_worker_type_resolves_to_a_flightdeck_container(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "tmux new-session -d -s flightdeck claude"\n'
+        f'volumes = ["fd-logs:/var/log/flightdeck"]\nworkspace = "acme/sandbox"\n'
+        f'[secrets]\nGITHUB_TOKEN = "flightdeck-github-token"\n',
+    )
+    thin_stack(
+        tmp_path,
+        "flightdeck",
+        "flightdeck",
+        attach='["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "sh"]',
+    )
+    config = load_config(tmp_path)
+    stack = next(s for s in config.stacks if s.name == "flightdeck")
+    assert stack.kind == "container"
+    assert stack.image == config.worker_types["flightdeck"].tag
+    assert stack.command == "tmux new-session -d -s flightdeck claude"
+    assert stack.volumes == ("fd-logs:/var/log/flightdeck",)
+    assert stack.env == {"THEOZOLITH_REPO": "acme/sandbox"}
+    assert stack.attach[1] == "{host}" and stack.attach[6] == "{container}"
+    assert stack.secrets == {"GITHUB_TOKEN": "flightdeck-github-token"}
+
+
+# -- CRITICAL: derived-image identity must not change (ADR-0044) -----------------
+
+
+def test_tag_is_golden_stable_over_image_fields_only(tmp_path):
+    """A fixed set of image inputs must produce the EXACT tag today's formula
+    computes — driver/adapter/model/workspace/secrets excluded. Renaming an
+    images/<name>.toml into worker-types/ with unchanged image fields must
+    rebuild nothing. This is the easiest thing to get wrong."""
+    golden_base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:" + "a" * 64
+    write(
+        tmp_path,
+        "worker-types/goldtype.toml",
+        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
+        f'base = "{golden_base}"\n'
+        f'setup = ["apt-get update && apt-get install -y ripgrep"]\n'
+        f'knowledge_source = "https://github.com/acme/my-knowledge.git"\n'
+        f'knowledge_pin = "{"b" * 40}"\n'
+        # These do NOT enter the hash:
+        f'adapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        f'[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+    )
+    wt = load_config(tmp_path).worker_types["goldtype"]
+    assert wt.tag == "theozolith/goldtype:0.3.0-48a66bc6e009"
+    assert wt.instruction_hash == (
+        "48a66bc6e009a3a84ebaf7bf7d05dc2c9df09851e4fddfb9344eacffbfd59f68"
+    )
+
+
+def test_per_type_fields_do_not_change_the_tag(tmp_path):
+    driver_type(tmp_path, name="a", model='"claude-sonnet-5"')
+    driver_type(tmp_path, name="b", model='"claude-opus-5"', adapter='"claude"')
+    types = load_config(tmp_path).worker_types
+    # Same image fields, different model -> identical instruction hash (only
+    # the name differs in the tag prefix).
+    assert types["a"].instruction_hash == types["b"].instruction_hash
+
+
+def test_image_field_changes_change_the_tag(tmp_path):
+    driver_type(tmp_path, name="i", setup='["a"]')
+    first = load_config(tmp_path).worker_types["i"].tag
+    driver_type(tmp_path, name="i", setup='["b"]')
+    second = load_config(tmp_path).worker_types["i"].tag
+    assert first != second
+    assert first.startswith("theozolith/i:1.2-") and second.startswith("theozolith/i:1.2-")
+
+
+# -- worker-type validation -----------------------------------------------------
+
+
+def test_unpinned_base_is_rejected(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        'driver = "builtin:implementer"\nworkspace = "a/b"\nbase = "ghcr.io/x/run:latest"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="pinned by digest"):
+        load_config(tmp_path)
+
+
+def test_unknown_builtin_driver_lists_the_known_set(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "builtin:teleporter"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"unknown built-in driver.*builtin:implementer"):
+        load_config(tmp_path)
+
+
+def test_bad_driver_ref_shape_is_rejected(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "implementer"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"builtin:<name>.*drivers/<name>"):
+        load_config(tmp_path)
+
+
+def test_custom_driver_ref_errors_at_load_not_yet_implemented(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+    )
+    thin_stack(tmp_path, "s", "i")
+    with pytest.raises(ConfigRepoError, match=r"driver delivery is not yet implemented.*ADR-0042"):
+        load_config(tmp_path)
+
+
+def test_driver_requires_workspace(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "builtin:implementer"\nbase = "{BASE}"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"'workspace'.*required when a driver is set"):
+        load_config(tmp_path)
+
+
+def test_workspace_must_be_owner_name(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "builtin:implementer"\nworkspace = "justname"\nbase = "{BASE}"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="must be owner/name"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["command", "volumes"])
+def test_driverless_fields_are_rejected_with_a_driver(tmp_path, field):
+    value = '"x"' if field == "command" else '["v:/p"]'
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "builtin:implementer"\nworkspace = "a/b"\nbase = "{BASE}"\n{field} = {value}\n',
+    )
+    with pytest.raises(ConfigRepoError, match=rf"'{field}' is a driverless"):
+        load_config(tmp_path)
+
+
+# -- thin-Stack validation & hard-cutover rejections ----------------------------
+
+
+def test_run_image_on_any_stack_is_rejected(tmp_path):
     write(
         tmp_path,
         "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "theozolith-worker"\n'
-        'run_image = "claude-dev"\n[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n',
+        'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\nrun_image = "claude-dev"\n',
     )
+    with pytest.raises(ConfigRepoError, match=r"run_image is gone.*worker_type.*ADR-0044"):
+        load_config(tmp_path)
+
+
+def test_fat_fields_on_a_worker_type_stack_name_the_new_home(tmp_path):
+    driver_type(tmp_path)
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\nkind = "process"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"'kind' moved to worker-types/claude-dev.toml"):
+        load_config(tmp_path)
+
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\ncommand = "x"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"'command' moved to worker-types/"):
+        load_config(tmp_path)
+
+
+def test_unknown_key_on_a_worker_type_stack_is_rejected(tmp_path):
+    driver_type(tmp_path)
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\nnonsense = "x"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="unknown key 'nonsense'"):
+        load_config(tmp_path)
+
+
+def test_builtin_driver_as_plain_command_is_rejected(tmp_path):
+    """A plain process Stack may not invoke a built-in driver directly — the
+    driver only works with the env a worker type injects (ADR-0044)."""
+    for cmd in ("theozolith-worker", "theozolith-reviewer --once"):
+        write(tmp_path, "stacks/w.toml", f'kind = "process"\nnode = "box1"\ncommand = "{cmd}"\n')
+        with pytest.raises(ConfigRepoError, match=r"is a built-in driver.*worker_type"):
+            load_config(tmp_path)
+
+
+def test_missing_worker_type_definition_is_rejected(tmp_path):
+    thin_stack(tmp_path, "implementer", "ghost")
+    with pytest.raises(ConfigRepoError, match=r"worker_type 'ghost' has no worker-types/ghost"):
+        load_config(tmp_path)
+
+
+def test_attach_on_a_driver_worker_type_stack_is_rejected(tmp_path):
+    driver_type(tmp_path)
+    thin_stack(
+        tmp_path,
+        "implementer",
+        "claude-dev",
+        attach='["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "sh"]',
+    )
+    with pytest.raises(ConfigRepoError, match="only valid on container-kind Stacks"):
+        load_config(tmp_path)
+
+
+# -- generic (substrate) Stacks stay legal --------------------------------------
+
+
+def test_plain_generic_stacks_remain_fully_legal(tmp_path):
+    """The substrate keeps its workload-agnostic Stack format: a plain Stack
+    with no worker_type is unchanged (ADR-0044)."""
     write(
         tmp_path,
         "stacks/flightdeck.toml",
@@ -42,39 +344,16 @@ def test_full_repo_parses_and_scopes(tmp_path):
     )
     write(tmp_path, "compose/flightdeck.yml", "services: {}\n")
     write(tmp_path, "overlays/ts.yml", "services: {}\n")
-    write(tmp_path, "images/claude-dev.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\n')
-    write(tmp_path, "product.toml", '[product]\nversion = "0.3.0"\n')
+    write(tmp_path, "stacks/job.toml", 'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\n')
 
     config = load_config(tmp_path)
-    assert config.product_version == "0.3.0"
-    assert config.secret_names_for("box1") == {"github-worker"}
-    assert config.secret_names_for("pi") == set()
-    assert config.secret_names_for("stranger") == set()
-
-    box1 = config.desired_state_for("box1")
-    assert [s["name"] for s in box1["stacks"]] == ["worker"]
-    image = box1["images"][0]
-    assert image["tag"] == f"theozolith/claude-dev:1.2-{image['instruction_hash'][:12]}"
-
+    assert {s.name: s.kind for s in config.stacks} == {
+        "flightdeck": "container",
+        "job": "process",
+    }
     pi = config.desired_state_for("pi")
     files = pi["stacks"][0]["compose_files"]
     assert [f["name"] for f in files] == ["compose/flightdeck.yml", "overlays/ts.yml"]
-    assert files[0]["content"] == "services: {}\n"
-
-
-def test_instruction_changes_change_the_tag(tmp_path):
-    write(tmp_path, "images/i.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\nsetup = ["a"]\n')
-    first = load_config(tmp_path).images["i"].tag
-    write(tmp_path, "images/i.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\nsetup = ["b"]\n')
-    second = load_config(tmp_path).images["i"].tag
-    assert first != second
-    assert first.startswith("theozolith/i:1.2-") and second.startswith("theozolith/i:1.2-")
-
-
-def test_unpinned_base_is_rejected(tmp_path):
-    write(tmp_path, "images/i.toml", 'base = "ghcr.io/x/run:latest"\n')
-    with pytest.raises(ConfigRepoError, match="pinned by digest"):
-        load_config(tmp_path)
 
 
 def test_stack_format_violations_are_rejected(tmp_path):
@@ -111,28 +390,35 @@ def test_control_stack_is_rejected_at_validation(tmp_path):
         load_config(tmp_path)
 
 
-def test_stopped_stacks_ship_no_image_recipes(tmp_path):
-    """ADR-0037 stage-don't-deploy: a stopped Stack's run_image rides no
-    desired state — the daemon builds nothing until the flip to running."""
-    write(
-        tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\nstate = "stopped"\n'
-        'command = "theozolith-worker"\nrun_image = "claude-dev"\n',
-    )
-    write(tmp_path, "images/claude-dev.toml", f'base = "ghcr.io/x/run:1.2@sha256:{DIGEST}"\n')
+# -- desired state / stage-don't-deploy -----------------------------------------
+
+
+def test_stopped_worker_type_stacks_ship_no_image_recipes(tmp_path):
+    """ADR-0037 stage-don't-deploy: a stopped Stack's derived image rides no
+    desired state — the daemon builds nothing until the flip to running.
+    Recipes ship for running Stacks of both kinds via worker_type."""
+    driver_type(tmp_path)
+    thin_stack(tmp_path, "implementer", "claude-dev", state='"stopped"')
     stopped = load_config(tmp_path).desired_state_for("box1")
-    assert [s["name"] for s in stopped["stacks"]] == ["worker"]  # the Stack itself rides
+    assert [s["name"] for s in stopped["stacks"]] == ["implementer"]  # the Stack itself rides
     assert stopped["images"] == []  # its image recipe does not
 
-    write(
-        tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\nstate = "running"\n'
-        'command = "theozolith-worker"\nrun_image = "claude-dev"\n',
-    )
+    thin_stack(tmp_path, "implementer", "claude-dev", state='"running"')
     running = load_config(tmp_path).desired_state_for("box1")
     assert [i["name"] for i in running["images"]] == ["claude-dev"]
+
+
+def test_flightdeck_image_recipe_ships_when_running(tmp_path):
+    """Both kinds' recipes ride: the Flight Deck's derived image builds
+    through the same running-only list as a driver's (ADR-0044)."""
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\n',
+    )
+    thin_stack(tmp_path, "flightdeck", "flightdeck", state='"running"')
+    running = load_config(tmp_path).desired_state_for("box1")
+    assert [i["name"] for i in running["images"]] == ["flightdeck"]
 
 
 def test_compose_paths_may_not_escape_the_repo(tmp_path):
@@ -147,19 +433,18 @@ def test_compose_paths_may_not_escape_the_repo(tmp_path):
 
 
 def test_wire_stack_roundtrips_into_the_daemon_model(tmp_path):
-    """The handshake: what control puts on the wire, the daemon parses —
-    one shared shape, two stdlib implementations."""
-    write(
-        tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "theozolith-worker --once"\n'
-        '[env]\nA = "1"\n[secrets]\nT = "name"\n',
-    )
+    """The handshake: what control puts on the wire (a resolved worker-type
+    Stack is an ordinary Stack), the daemon parses — one shared shape, two
+    stdlib implementations. run_image is gone from the wire (ADR-0044)."""
+    driver_type(tmp_path, model='"claude-sonnet-5"')
+    thin_stack(tmp_path, "implementer", "claude-dev")
     wire = load_config(tmp_path).desired_state_for("box1")["stacks"][0]
+    assert "run_image" not in wire
     stack = WireStack.from_wire(wire)
-    assert stack.name == "worker" and stack.kind == "process"
-    assert stack.command == "theozolith-worker --once"
-    assert stack.env == {"A": "1"} and stack.secrets == {"T": "name"}
+    assert stack.name == "implementer" and stack.kind == "process"
+    assert stack.command == "theozolith-worker"
+    assert stack.env["THEOZOLITH_REPO"] == "acme/sandbox"
+    assert stack.env["THEOZOLITH_RUN_IMAGE"].startswith("theozolith/claude-dev:")
     assert stack.state == "running"
 
 
@@ -169,8 +454,8 @@ def test_wire_stack_roundtrips_into_the_daemon_model(tmp_path):
 def test_attach_must_be_an_argv_array(tmp_path):
     write(
         tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        "stacks/deck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "x"\n'
         'attach = "ssh {host} -t docker exec -it {container} tmux attach"\n',
     )
     with pytest.raises(ConfigRepoError, match="argv array"):
@@ -213,8 +498,8 @@ def test_attach_is_container_kind_only(tmp_path):
     expose a run container to the terminal."""
     write(
         tmp_path,
-        "stacks/worker.toml",
-        'kind = "process"\nnode = "box1"\ncommand = "w"\n'
+        "stacks/job.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\n'
         'attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "sh"]\n',
     )
     with pytest.raises(ConfigRepoError, match="ADR-0019"):
@@ -279,16 +564,26 @@ def test_duplicate_resolved_jobs_dirs_are_rejected_per_node(tmp_path):
     assert len(load_config(tmp_path).stacks) == 2
 
 
-def test_default_jobs_dirs_are_per_stack_and_unique(tmp_path):
-    """Two driver Stacks with no explicit jobs dir resolve to distinct
-    per-Stack defaults (the daemon injects the same paths)."""
+def test_default_jobs_dirs_are_per_stack_and_unique_across_resolved_workers(tmp_path):
+    """Two worker Stacks with no explicit jobs dir resolve to distinct
+    per-Stack defaults; the check runs on the RESOLVED (process-kind) Stacks."""
     from theozolith_control.configrepo import resolved_jobs_dir
 
-    write(tmp_path, "stacks/worker.toml", 'kind = "process"\nnode = "box1"\ncommand = "w"\n')
-    write(tmp_path, "stacks/reviewer.toml", 'kind = "process"\nnode = "box1"\ncommand = "r"\n')
+    write(
+        tmp_path,
+        "worker-types/claude-dev.toml",
+        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\nbase = "{BASE}"\n',
+    )
+    write(
+        tmp_path,
+        "worker-types/claude-review.toml",
+        f'driver = "builtin:reviewer"\nworkspace = "acme/sandbox"\nbase = "{BASE}"\n',
+    )
+    thin_stack(tmp_path, "implementer", "claude-dev")
+    thin_stack(tmp_path, "reviewer", "claude-review")
     config = load_config(tmp_path)
     resolved = {resolved_jobs_dir(s) for s in config.stacks}
     assert resolved == {
-        "/var/tmp/theozolith/jobs/worker",
+        "/var/tmp/theozolith/jobs/implementer",
         "/var/tmp/theozolith/jobs/reviewer",
     }

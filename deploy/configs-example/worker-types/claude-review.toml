@@ -1,0 +1,24 @@
+# The Reviewer worker type (ADR-0044): its own driver and — critically —
+# its own GitHub identity, so no self-grading by construction (ADR-0008).
+# It shares the Implementer's run-image recipe (same base/setup/knowledge),
+# but a worker type is the complete unit: the driver and secrets differ, so
+# it is a distinct type with a distinct derived-image name.
+
+driver = "builtin:reviewer"      # the staged pipeline Reviewer (process kind)
+adapter = "claude"
+model = "claude-fable-5"
+workspace = "acme/sandbox"
+
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+setup = [
+    "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",
+    "pip install --no-cache-dir uv",
+]
+
+knowledge_source = "https://github.com/acme/my-knowledge.git"
+knowledge_pin = "0000000000000000000000000000000000000000"
+
+[secrets]
+GITHUB_TOKEN = "github-reviewer"
+ANTHROPIC_API_KEY = "anthropic-api-key"
