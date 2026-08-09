@@ -10,6 +10,12 @@ The entire configuration for one coding tool — Claude, Codex, or Pi. Tool-scop
 
 *Avoid*: confusing with "Claude agent" (a single subagent file, a much smaller unit).
 
+**Agent Adapter**
+
+The per-tool invocation layer the Agent Harness calls to run one headless session (Claude Code, Pi). Ships in the product distribution; the worker-type definition selects which adapter a worker uses (grilling 2026-08-09 — the "default harnesses" of early design talk are really default adapters).
+
+*Avoid*: "harness" (immutable product plumbing, never a per-type variable); "Agent" (an Agent is the whole tool config the adapter invokes).
+
 **Agent Harness**
 
 The credential-free half of any worker (Implementer, Reviewer, Initializer): PID 1 of an ephemeral run container. Invokes the agent headless (the adapter's one-shot mode), passes the prompt at invocation, treats process exit as completion (timeout as backstop; ADR-0019), writes outputs (decisions or verdict file, transcript, status) into the job directory, and exits — container lifetime = Run lifetime. Dumb plumbing by design: no GitHub knowledge, no policy, no state; it never appears in pipeline-state sentences.
@@ -28,11 +34,17 @@ A single `.md` subagent file used by Claude. One component inside the Claude age
 
 *Avoid*: "agent" (which means an entire tool config), "skill".
 
+**Config Distribution**
+
+The hash-pinned artifact the Control Node packages from the Config Repo's `drivers/` on every config change, served to nodes over the same artifact-pull path as `theozolith build` output. The heartbeat channel carries only the drivers-hash reference; the Node Daemon reconciles it exactly like the product pin, and an off-hash node is dispatch-ineligible (ADR-0042). Stamped with the product version it was built against; skew is advisory.
+
+*Avoid*: confusing with the product distribution (daemon, built-in drivers, harness); code riding the command channel as config payload.
+
 **Config Repo**
 
-The single source of truth for one deployment's customizations: Stack definitions, worker types (base image + setup instructions + optional Knowledge Source), compose overlays, secret names, and control-plane settings (`control.toml`; ADR-0023). A git-backed folder (default ~/.theozolith/configs) whose working home is the Control Node; the web UI is an editor that commits to it. Never contains secret values.
+The single source of truth for one deployment's customizations: Stack definitions, worker types (base image + setup instructions + optional Knowledge Source + driver reference), custom driver code (`drivers/`, delivered as the Config Distribution; ADR-0042), compose overlays, secret names, and control-plane settings (`control.toml`; ADR-0023). A git-backed folder (default ~/.theozolith/configs) whose working home is the Control Node; the web UI is an editor that commits to it — `drivers/` is code and stays git-native. Never contains secret values.
 
-*Avoid*: treating the web UI as a separate authority; per-node config dirs.
+*Avoid*: treating the web UI as a separate authority; per-node config dirs; "pure data" (narrowed by ADR-0042 — driver code is operator content).
 
 **Container-Host**
 
@@ -54,13 +66,13 @@ The mandatory section of every best-effort PR description. Fixed schema (inherit
 
 **Driver**
 
-The trusted, credentialed half of any worker: a node-resident process, spawned and supervised by the Node Daemon as a process-kind Stack. Polls GitHub, runs the Claim Protocol, materializes job inputs, creates per-Run containers, sequences gate steps as harness jobs, and performs every GitHub read and write. Holds the actor's PAT; never executes repo code or model output.
+The trusted, credentialed half of any worker: a node-resident process, spawned and supervised by the Node Daemon as a process-kind Stack. Polls GitHub, runs the Claim Protocol, materializes job inputs, creates per-Run containers, sequences gate steps as harness jobs, and performs every GitHub read and write. Holds the actor's PAT; never executes repo code or model output. Referenced by the worker-type definition as `builtin:<name>` (product distribution) or `drivers/<name>` (Config Distribution; ADR-0042).
 
 *Avoid*: "agent harness" (the credential-free in-container half); running driver logic inside a container or inside the Node Daemon process.
 
 **Flight Deck**
 
-The interactive, human-driven agent container (named 2026-07-21 — the station, not the person): a container-kind Stack running an agent CLI in an attachable tmux session — the web terminal's primary target and the only place the interactive-session convention survives (ADR-0019). Used for issue drafting and non-decomposable work (cross-cutting refactors, design-in-flux). Holds GitHub credentials under human supervision — its own machine identity (fine-grained PAT: issues, PRs, contents; no merge permission), never the operator's PAT; not a pipeline actor — it never claims issues and holds no transition authority.
+The interactive, human-driven agent container (named 2026-07-21 — the station, not the person): a container-kind Stack running an agent CLI in an attachable tmux session — the web terminal's primary target and the only place the interactive-session convention survives (ADR-0019). Used for issue drafting and non-decomposable work (cross-cutting refactors, design-in-flux); also the knowledge-authoring surface — it mounts its worker type's shared writable knowledge clone, with promote (commit/push + re-pin + rebuild) as the only path to workers (grilling 2026-08-08). Holds GitHub credentials under human supervision — its own machine identity (fine-grained PAT: issues, PRs, contents; no merge permission), never the operator's PAT; not a pipeline actor — it never claims issues and holds no transition authority.
 
 *Avoid*: "Pilot", "Helm" (rejected names); "ad-hoc container" (retired name); "Planner" (reserved for a future autonomous planning actor); confusing with workers (autonomous, headless, credential-free sessions).
 
@@ -90,9 +102,9 @@ The single paste that provisions a physical node: a versioned, checksummed blob 
 
 **Knowledge Source**
 
-An optional field on a worker-type definition: a git URL + pin pointing at a repo of agent knowledge (skills, subagents, workflows) that the knowledge machinery bakes into the derived image at build time. The same content syncs to laptop tool dirs.
+An optional field on a worker-type definition: a git URL + pin pointing at a repo of agent knowledge (skills, subagents, workflows) that the knowledge machinery bakes into the derived image at build time. The same content syncs to laptop tool dirs. Authoring happens in the Flight Deck's shared writable clone — one per worker type per node, mounted by every Flight Deck of that type, cross-node via plain git; promote = commit/push + re-pin + rebuild (grilling 2026-08-08).
 
-*Avoid*: putting machinery in the knowledge repo (it is pure data); baking at container start.
+*Avoid*: putting machinery in the knowledge repo (it is pure data); baking at container start; live-mounting knowledge into worker images (workers consume it baked at pin only).
 
 **Node Daemon**
 
@@ -144,15 +156,21 @@ A deployment shape where the Control Node and one Container-Host share a physica
 
 **Stack**
 
-A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command run as a supervised Node Daemon child — how worker drivers deploy). Built-in Stacks (worker, reviewer) and user-defined Stacks (e.g. a script runner) share the same format. The Control Node is never a Stack — it always runs as its own systemd unit on every deployment shape (2026-08-04).
+A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command from the product or config distribution, run as a supervised Node Daemon child — how worker drivers deploy; ADR-0042). Built-in Stacks (worker, reviewer) and user-defined Stacks (e.g. a script runner) share the same format. The Control Node is never a Stack — it always runs as its own systemd unit on every deployment shape (2026-08-04).
 
 *Avoid*: "role" (legacy Home Server term); a control Stack kind (deleted 2026-08-04 — the substrate never supervises its own control plane).
 
 **Worker**
 
-The base abstraction for every automated pipeline actor (redefined 2026-07-21; ADR-0020): a long-lived, node-resident driver process on a container-host, bound to one Agent config (ADR-0013 — not a container), executing ephemeral headless Runs. All worker types share the same infrastructure — heartbeat, container lifecycle, and the fetch-execute loop — and differ only in GitHub state management and the harness/model. Built-in types: Implementer, Reviewer, Initializer. The code mirrors the taxonomy with inheritance: custom worker types extend the base Worker or one of the built-in types.
+The base abstraction for every automated pipeline actor (redefined 2026-07-21; ADR-0020): a long-lived, node-resident driver process on a container-host, bound to one Agent config (ADR-0013 — not a container), executing ephemeral headless Runs. All worker types share the same infrastructure — heartbeat, container lifecycle, and the fetch-execute loop — and differ only in GitHub state management and the Agent adapter/model. Built-in types: Implementer, Reviewer, Initializer. The code mirrors the taxonomy with inheritance: custom worker types extend the base Worker or one of the built-in types.
 
 *Avoid*: "Worker" meaning the implementation actor specifically (that is the Implementer since 2026-07-21); "runner"; "agent" (an Agent is a config, not a process); "long-lived container" (retracted 2026-07-15).
+
+**Worker-Type Definition**
+
+The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source, driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, workspace (target repo), and secret names. Compiled into a derived image at config change; instantiated by a thin worker Stack (worker type + placement + desired state).
+
+*Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers); "harness" as a field (the adapter is the variable; the harness is product plumbing).
 
 **Workflow**
 
@@ -167,7 +185,7 @@ A configuration that involves multiple agents working together.
 - A Skill can be reused across agents.
 - A Workflow involves two or more agents.
 - The Orchestrator comprises planning (GitHub issues), execution (workers and Runs), review (Reviewer actor plus human), and monitoring (Control Node).
-- Worker is the base type: Implementer, Reviewer, and Initializer are worker types sharing driver infrastructure (heartbeat, container lifecycle, fetch-execute loop) and differing only in GitHub state management and the harness/model; custom worker types extend the base or a built-in type (ADR-0020).
+- Worker is the base type: Implementer, Reviewer, and Initializer are worker types sharing driver infrastructure (heartbeat, container lifecycle, fetch-execute loop) and differing only in GitHub state management and the Agent adapter/model; custom worker types extend the base or a built-in type (ADR-0020).
 - A worker is bound to exactly one Agent config; the Implementer executes one Implementer Run at a time.
 - A worker = one node-resident driver plus one ephemeral run container per Run; driver and harness communicate only through the job directory.
 - An Implementer Run belongs to exactly one Implementer and targets exactly one GitHub issue; a Review Run belongs to the Reviewer and executes exactly one round of one PR.
@@ -177,6 +195,8 @@ A configuration that involves multiple agents working together.
 - A Node Daemon runs on exactly one box, supervises its Stacks (container workloads and driver processes in its cgroup), and heartbeats to the Control Node.
 - The Flight Deck is a human-driven, credentialed, interactive agent container Stack; it never claims issues and holds no transition authority.
 - The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
+- A worker-type definition names exactly one driver: `builtin:<name>` from the product distribution or `drivers/<name>` from the Config Distribution (ADR-0042).
+- A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09).
 - The heartbeat/command channel carries desired state, references, and advisory telemetry (typed, size-capped, never coordination authority; ADR-0016); the only secret payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
 - Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision), failed + needs_human (on the issue: execution failure escalated with evidence; only the human removes failed, and failed overrides plan_ready at dispatch — ADR-0016). Issues and PRs carry separate label sets; each actor polls exactly one label.
-- TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content is data in one private config repo (ADR-0007).
+- TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content lives in one private config repo (ADR-0007) — declarations and knowledge as data, plus custom driver code under `drivers/` (ADR-0042).

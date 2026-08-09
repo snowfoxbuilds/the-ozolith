@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-07-15
+Last updated: 2026-08-09
 
 # Architecture
 
@@ -27,7 +27,7 @@ theozolith/
 │   └── sync_notion.py   # Notion -> repo docs (project tooling, not product)
 └── docs/
     ├── specs/           # <- Notion Specs/
-    └── adr/             # <- Notion ADRs/
+    └── adr/             # repo-authored (ADR-0033); frozen mirror in Notion
 ```
 
 ### Components
@@ -35,16 +35,12 @@ theozolith/
 - Every top-level component is independently installable. knowledge/ has no dependency on the cluster components and vice versa; the only coupling is that worker-type setup instructions may invoke the knowledge machinery to bake a Knowledge Source into a derived image (see [NODE-SUBSTRATE.md](http://node-substrate.md/)).
 ### Private side
 
-- One private config repo holds all operator content: deployment declarations (Stacks, worker types, overlays, secret names — the Config Repo of ADR-0006) plus agent knowledge (skills, subagents, workflows). Pure data, no machinery.
+- One private config repo holds all operator content: deployment declarations (Stacks, worker types, overlays, secret names — the Config Repo of ADR-0006), agent knowledge (skills, subagents, workflows), and custom driver code (`drivers/`, delivered to nodes as a hash-pinned config distribution; ADR-0042). Pure operator content, no machinery — ADR-0042 narrows the former "pure data" charter: driver code is operator content; machinery still never lives here.
 - The former homeserver sunsets by reduction to this private repo once its workloads migrate onto the Node Daemon (migration deferred).
 ### Sync flows
 
-- knowledge sync: private config repo -> local tool config dirs (~/.claude, etc.) via the knowledge machinery. One-way. The private repo is the source of truth.
-- sync_notion: Notion project docs -> repo ([CONTEXT.md](http://context.md/), [AGENTS.md](http://agents.md/), docs/specs/, docs/adr/). One-way. Notion is the source of truth.
-## Decisions
+- knowledge sync: private config repo -> local tool config dirs (~/.claude, etc.) via the knowledge machinery. One-way. The private repo is the source of truth. Two skill scopes: global skills live in the private repo and travel with the operator; project skills live in the target project's repo and travel with the project.
+- sync_notion: Notion project docs -> repo ([CONTEXT.md](http://context.md/), [AGENTS.md](http://agents.md/), docs/specs/). One-way. Notion is the source of truth. docs/adr/ is repo-authored since 2026-07-30 and no longer exported; Notion's ADR pages are a frozen historical mirror (ADR-0033).
+## Decision history
 
-- **Grilling 2026-06-08**: source-of-truth split -> the authoring side owns content; sync targets are never hand-edited. See ADR-0001 (amended by ADR-0007: personal configs are authored in the private config repo). [SETTLED]
-- **Grilling 2026-07-14**: one public monorepo (TheOzolith) with separable components; snow-maker renamed and absorbed; homeserver sunsets by reduction. See ADR-0007. [SETTLED]
-- **Grilling 2026-07-14**: all machinery is public-side (knowledge/); all personal content is data in one private config repo. See ADR-0007. [SETTLED]
-- **Two skill scopes**: global skills (private repo, travel with the operator) vs project skills (target project's repo, travel with the project). [SETTLED]
-- **Grilling 2026-07-15**: Node Agent renamed Node Daemon; nodeagent/ becomes nodedaemon/. worker/ = node-resident drivers plus a containerized agent harness; Runs execute in ephemeral per-Run containers. See ADR-0013. [SETTLED]
+Settled rulings are integrated into the sections above; decision records live in docs/adr/ (repo-authored since ADR-0033). Specs no longer carry a grilling log (ruled 2026-08-09).
