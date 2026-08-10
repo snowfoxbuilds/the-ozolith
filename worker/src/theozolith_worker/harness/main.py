@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Protocol
 
 from theozolith_worker import shell
-from theozolith_worker.harness.adapters import make_agent_adapter
+from theozolith_worker.adapters import make_agent_adapter
 from theozolith_worker.jobdir import (
     CONTAINER_JOB_PATH,
     PHASE_AGENT,

@@ -52,7 +52,7 @@ ERROR_CONTEXT_LIMIT = 8_192
 ERROR_MESSAGE_LIMIT = 2_048
 EVENT_PAYLOAD_LIMIT = 32_768
 
-DISPATCH_ROLES = ("worker", "reviewer")
+DISPATCH_ROLES = ("implementer", "reviewer")
 
 # Events read view (ADR-0038): default and maximum page size.
 EVENTS_PAGE_DEFAULT = 100
@@ -288,7 +288,7 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail=f"role must be one of {', '.join(DISPATCH_ROLES)}"
             )
-        worker = _require(body, "worker", str)
+        worker = _require(body, "driver", str)
         login = _require(body, "login", str)
         # The pin-eligibility gate (ADR-0015 revision) needs the recorded
         # pin. Fail-open on a broken Config Repo: an unreadable repo must
@@ -300,7 +300,7 @@ def create_app(
         # Off the event loop: the grant path does real GitHub round-trips
         # (with rate-limit sleeps) that must never stall heartbeats or the
         # terminal websockets. The dispatcher's own lock still serializes.
-        if role == "worker":
+        if role == "implementer":
             return await asyncio.to_thread(
                 lambda: dispatcher.grant_work(worker, node, login, pin=pin)
             )

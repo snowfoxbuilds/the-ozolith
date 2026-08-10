@@ -69,7 +69,7 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     wt_toml.write_text(
         'driver = "builtin:implementer"\nadapter = "claude"\nworkspace = "acme/sandbox"\n'
         f'base = "ghcr.io/x/run:1.0@sha256:{"0" * 64}"\n'
-        '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n',
+        '[secrets]\nIMPLEMENTER_GITHUB_TOKEN = "github-implementer"\n',
         encoding="utf-8",
     )
     stack_toml = tmp_path / "configs" / "stacks" / "worker.toml"
@@ -81,7 +81,7 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     store = Store(settings.cache_db_path)
     secret_store = SecretStore(settings.store_db_path)
     box = SecretBox(generate_key())
-    secret_store.put_secret("github-worker", box.encrypt(SECRET_VALUE))
+    secret_store.put_secret("github-implementer", box.encrypt(SECRET_VALUE))
     # Provisioning is registration (ADR-0023): the daemon presents the
     # per-node token the join exchange minted.
     node_token = secret_store.mint_node_token("box1")
@@ -143,14 +143,16 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
             assert set(answer) == {"commands", "config"}  # …desired state down
             # References travel: the stack names its secret, never the value.
             stacks = answer["config"]["stacks"]
-            assert stacks and stacks[0]["secrets"] == {"WORKER_GITHUB_TOKEN": "github-worker"}
+            assert stacks and stacks[0]["secrets"] == {
+                "IMPLEMENTER_GITHUB_TOKEN": "github-implementer"
+            }
 
     pulls = [e for e in transcript if e[1] == "/api/v1/secrets/pull"]
     assert len(pulls) == 1  # pulled at deploy time, not per heartbeat
-    assert json.loads(pulls[0][2]) == {"node": "box1", "names": ["github-worker"]}
-    assert json.loads(pulls[0][3]) == {"secrets": {"github-worker": SECRET_VALUE}}
+    assert json.loads(pulls[0][2]) == {"node": "box1", "names": ["github-implementer"]}
+    assert json.loads(pulls[0][3]) == {"secrets": {"github-implementer": SECRET_VALUE}}
 
     # And the daemon really deployed with it: value in tmpfs, _FILE wiring.
-    assert (config.secrets_dir / "github-worker").read_text() == SECRET_VALUE
+    assert (config.secrets_dir / "github-implementer").read_text() == SECRET_VALUE
     env = popen.spawned[-1].env
-    assert env["WORKER_GITHUB_TOKEN_FILE"] == str(config.secrets_dir / "github-worker")
+    assert env["IMPLEMENTER_GITHUB_TOKEN_FILE"] == str(config.secrets_dir / "github-implementer")

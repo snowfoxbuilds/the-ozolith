@@ -32,7 +32,7 @@ node = "box1"
 command = "sleep 30"
 
 [secrets]
-WORKER_GITHUB_TOKEN = "github-worker"
+IMPLEMENTER_GITHUB_TOKEN = "github-implementer"
 """
 
 MUTE_STACK_TOML = """\
@@ -324,17 +324,28 @@ def test_web_secret_reaches_a_referencing_node_like_the_cli(control: ControlRig)
     login(control)
     response = control.client.post(
         "/secrets",
-        data={"name": "github-worker", "value": "ghp_secret_value"},
+        data={"name": "github-implementer", "value": "ghp_secret_value"},
         follow_redirects=False,
     )
     assert response.status_code == 303
 
-    pulled = control.node_post("/api/v1/secrets/pull", {"node": "box1", "names": ["github-worker"]})
-    assert pulled.json() == {"secrets": {"github-worker": "ghp_secret_value"}}
+    pulled = control.node_post(
+        "/api/v1/secrets/pull", {"node": "box1", "names": ["github-implementer"]}
+    )
+    assert pulled.json() == {"secrets": {"github-implementer": "ghp_secret_value"}}
 
     page = control.client.get("/secrets").text
-    assert "github-worker" in page  # the name is listed…
+    assert "github-implementer" in page  # the name is listed…
     assert "ghp_secret_value" not in page  # …the value is never echoed
+
+
+def test_secrets_form_recommends_the_implementer_secret_name(control: ControlRig):
+    """The form's example copy teaches the shipped convention (ADR-0020 sweep):
+    asserted with NO secrets entered, so the listing can't mask stale copy."""
+    login(control)
+    page = control.client.get("/secrets").text
+    assert "github-implementer" in page
+    assert "github-worker" not in page
 
 
 def test_secret_form_refuses_without_the_tls_channel(tmp_path):

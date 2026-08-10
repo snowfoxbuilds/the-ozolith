@@ -70,14 +70,15 @@ from theozolith_nodedaemon.stacks import (
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
 
-# The built-in driver commands a worker type resolves to control-side
-# (control's configrepo.BUILTIN_DRIVERS values). This is driver knowledge, not
-# worker-type schema — the daemon still never parses a worker type. A built-in
-# driver only functions with a control-authored THEOZOLITH_RUN_IMAGE; seeing
-# one of these commands WITHOUT that env means old or incomplete desired state,
-# and the daemon fails that Stack closed rather than launch it against the
-# worker package's default run image (ADR-0044 amendment).
-BUILTIN_DRIVER_COMMANDS = ("theozolith-worker", "theozolith-reviewer")
+# The generic driver launcher every worker type resolves to control-side
+# (`theozolith-driver <ref>`, ADR-0020) — one executable covers builtin:* and
+# future drivers/* refs, so the daemon recognizes drivers by argv[0] alone and
+# never duplicates control's ref registry or parses a worker type. A driver
+# only functions with a control-authored THEOZOLITH_RUN_IMAGE; seeing this
+# command WITHOUT that env means old or incomplete desired state, and the
+# daemon fails that Stack closed rather than launch it against the worker
+# package's default run image (ADR-0044 amendment).
+DRIVER_LAUNCHER = "theozolith-driver"
 
 # theozolith.error events (2026-07-21 grilling): size-capped summaries
 # pointing at the failing node/component; diagnostic depth stays in the
@@ -959,18 +960,18 @@ class NodeDaemon:
         env = self._process_env(stack)
         argv = shlex.split(stack.command) if stack.command else []
         alive = self._supervisor.alive(stack.name)
-        # Fail closed on old/incomplete built-in-driver desired state (ADR-0044
-        # amendment, Sean's ruling — no backward compatibility): a built-in
-        # driver must not launch without a control-authored THEOZOLITH_RUN_IMAGE.
+        # Fail closed on old/incomplete driver desired state (ADR-0044
+        # amendment, Sean's ruling — no backward compatibility): a driver
+        # Stack must not launch without a control-authored THEOZOLITH_RUN_IMAGE.
         # Its absence means old control or an old cached document; refuse to run
         # against the worker package's default run image, stop any already-live
         # instance, and raise so the error surfaces — reconcile continues with
         # the other Stacks (a generic process Stack stays legal without it).
-        if argv and argv[0] in BUILTIN_DRIVER_COMMANDS and not env.get("THEOZOLITH_RUN_IMAGE"):
+        if argv and argv[0] == DRIVER_LAUNCHER and not env.get("THEOZOLITH_RUN_IMAGE"):
             if alive:
                 self._stop_process_child(stack.name)
             raise RuntimeError(
-                f"built-in driver {argv[0]!r} has no control-authored"
+                f"driver Stack {shlex.join(argv)!r} has no control-authored"
                 " THEOZOLITH_RUN_IMAGE — incompatible/incomplete desired state"
                 " (a coordinated control upgrade is required, ADR-0044); refusing"
                 " to launch against the default run image"

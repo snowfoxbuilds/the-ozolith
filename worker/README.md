@@ -10,7 +10,8 @@ Each actor is a trusted, credentialed **driver** — a node-resident host proces
 with a credential-free **agent harness** running as PID 1 of an ephemeral per-Run
 container:
 
-- `theozolith-worker` — the Implementer driver: requests work from the Control Node's
+- **Implementer** (`theozolith-driver builtin:implementer`) — the Implementer driver:
+  requests work from the Control Node's
   dispatch endpoint (ADR-0017 — the Control Node writes the claim on GitHub before the
   driver ever sees the issue), prepares a per-Run job directory with a **token-free
   checkout**, launches `ozolith-run-<run-id>`, sequences gate steps as harness jobs,
@@ -20,7 +21,8 @@ container:
   (ADR-0016). At boot (and idle passes) it sweeps orphaned job dirs to the evidence
   branch (`swept: true`, delete only after a confirmed push). All non-claim GitHub I/O
   happens in the driver; the driver never executes repository code or model output.
-- `theozolith-reviewer` — the Reviewer driver (own GitHub identity, stronger model):
+- **Reviewer** (`theozolith-driver builtin:reviewer`) — the Reviewer driver (own GitHub
+  identity, stronger model):
   discovers `pr_ready` PRs through dispatch, materializes review inputs as files, launches
   `ozolith-review-<pr>-round-<n>`, validates the agent's `verdict.json`, renders the
   verdict comment, and applies all post-PR state. 3 review rounds per issue; at the last

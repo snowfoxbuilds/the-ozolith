@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 
 from theozolith_worker import decisions, jobdir, verdict
+from theozolith_worker.adapters import ClaudeAdapter
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
-from theozolith_worker.harness.adapters import ClaudeAdapter
 from theozolith_worker.harness.validate import main as validate_main
 from theozolith_worker.harness.validate import validate_session_verdict
 from theozolith_worker.runner import RunReport, render_claim_escalation
@@ -569,7 +569,8 @@ def _driver_config():
             "GITHUB_TOKEN": "tok",
             "ANTHROPIC_API_KEY": "key",
         },
-        role="worker",
+        role="implementer",
+        default_model="claude-sonnet-5",
     )
 
 

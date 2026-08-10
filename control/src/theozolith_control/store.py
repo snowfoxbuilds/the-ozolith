@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL,
     -- Extracted columns for the known namespaced types (NULL otherwise).
     node TEXT,
-    worker TEXT,
+    driver TEXT,
     issue INTEGER,
     run_id TEXT,
     attempt INTEGER,
@@ -305,7 +305,7 @@ class LiveClaim:
     """The latest non-terminal Run event for one issue."""
 
     issue: int
-    worker: str
+    driver: str  # the worker_id that emitted the Run event (ADR-0020 field)
     node: str
     run_id: str
     last_event_at: float
@@ -338,6 +338,16 @@ class Store:
         event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
         if "component" not in event_columns:  # theozolith.error filter column
             self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
+        if "driver" not in event_columns:
+            # ADR-0020 sweep: the run/progress-event actor field became `driver`
+            # and the column follows. RENAME carries the old `worker` values
+            # over as the backfill, so an old-schema store opens with a
+            # populated `driver` column (review events already coalesced their
+            # reviewer into this column, so they need no separate backfill).
+            if "worker" in event_columns:
+                self._db.execute("ALTER TABLE events RENAME COLUMN worker TO driver")
+            else:
+                self._db.execute("ALTER TABLE events ADD COLUMN driver TEXT")
         eviction_columns = {
             r["name"] for r in self._db.execute("PRAGMA table_info(event_evictions)")
         }
@@ -577,7 +587,7 @@ class Store:
         issue, phase, node = _int("issue"), _str("phase"), _str("node")
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO events (type, received_at, payload, node, worker, issue,"
+                "INSERT INTO events (type, received_at, payload, node, driver, issue,"
                 " run_id, attempt, phase, pr, round, verdict, component)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -585,7 +595,10 @@ class Store:
                     self._clock(),
                     json.dumps(event, sort_keys=True),
                     node,
-                    _str("worker") or _str("reviewer"),
+                    # run/progress events carry `driver`; review events carry
+                    # `reviewer` (its own accurate vocabulary, ADR-0020) — both
+                    # land in the driver column.
+                    _str("driver") or _str("reviewer"),
                     issue,
                     _str("run_id"),
                     _int("attempt"),
@@ -719,7 +732,7 @@ class Store:
         """Issues whose LATEST Run event is non-terminal (claimed/gate)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.issue, e.worker, e.node, e.run_id, e.received_at, e.phase"
+                "SELECT e.issue, e.driver, e.node, e.run_id, e.received_at, e.phase"
                 " FROM events e JOIN ("
                 "   SELECT issue, MAX(id) AS latest FROM events"
                 "   WHERE type = ? AND issue IS NOT NULL GROUP BY issue"
@@ -729,7 +742,7 @@ class Store:
         return [
             LiveClaim(
                 issue=r["issue"],
-                worker=r["worker"] or "",
+                driver=r["driver"] or "",
                 node=r["node"] or "",
                 run_id=r["run_id"] or "",
                 last_event_at=r["received_at"],
@@ -743,7 +756,7 @@ class Store:
         telemetry for that run_id (the dashboard's Runs view)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.issue, e.worker, e.node, e.run_id, e.attempt, e.phase, e.pr,"
+                "SELECT e.issue, e.driver, e.node, e.run_id, e.attempt, e.phase, e.pr,"
                 " e.received_at FROM events e JOIN ("
                 "   SELECT issue, MAX(id) AS latest FROM events"
                 "   WHERE type = ? AND issue IS NOT NULL GROUP BY issue"
@@ -762,7 +775,7 @@ class Store:
         return [
             {
                 "issue": r["issue"],
-                "worker": r["worker"] or "",
+                "driver": r["driver"] or "",
                 "node": r["node"] or "",
                 "run_id": r["run_id"] or "",
                 "attempt": r["attempt"],
@@ -774,10 +787,10 @@ class Store:
             for r in rows
         ]
 
-    def worker_last_seen(self, worker: str) -> float | None:
+    def driver_last_seen(self, driver: str) -> float | None:
         with self._lock:
             row = self._db.execute(
-                "SELECT MAX(received_at) AS seen FROM events WHERE worker = ?", (worker,)
+                "SELECT MAX(received_at) AS seen FROM events WHERE driver = ?", (driver,)
             ).fetchone()
         return row["seen"] if row and row["seen"] is not None else None
 

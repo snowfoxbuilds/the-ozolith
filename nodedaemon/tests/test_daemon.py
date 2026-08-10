@@ -568,17 +568,17 @@ def test_orphaned_run_containers_are_reaped_live_ones_kept(rig: Rig):
 
 
 def test_secrets_materialize_in_tmpfs_only_and_wire_as_var_file(rig: Rig):
-    rig.control.secrets["github-worker"] = "s3cr3t-value"
-    stack = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "github-worker"})
+    rig.control.secrets["github-implementer"] = "s3cr3t-value"
+    stack = process_stack("worker", secrets={"IMPLEMENTER_GITHUB_TOKEN": "github-implementer"})
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
 
-    secret_file = rig.config.secrets_dir / "github-worker"
+    secret_file = rig.config.secrets_dir / "github-implementer"
     assert secret_file.read_text() == "s3cr3t-value"
     assert (secret_file.stat().st_mode & 0o777) == 0o600
     env = rig.popen.spawned[0].env
-    assert env["WORKER_GITHUB_TOKEN_FILE"] == str(secret_file)
-    assert "WORKER_GITHUB_TOKEN" not in env  # the value itself never enters env
+    assert env["IMPLEMENTER_GITHUB_TOKEN_FILE"] == str(secret_file)
+    assert "IMPLEMENTER_GITHUB_TOKEN" not in env  # the value itself never enters env
 
     # A scan of everything the daemon wrote to DISK finds no trace: the
     # value lives only under the runtime dir (tmpfs under /run).
@@ -589,7 +589,7 @@ def test_secrets_materialize_in_tmpfs_only_and_wire_as_var_file(rig: Rig):
 
 def test_denied_secret_pull_skips_the_stack(rig: Rig):
     rig.control.denied_secrets = True
-    stack = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "github-worker"})
+    stack = process_stack("worker", secrets={"IMPLEMENTER_GITHUB_TOKEN": "github-implementer"})
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
     assert not rig.daemon._supervisor.alive("worker")
@@ -601,7 +601,7 @@ def test_secret_pull_refused_over_plain_http_without_dev_flag(tmp_path):
 
     client = ControlClient("http://control.test", "tok", insecure_dev=False)
     try:
-        client.pull_secrets("box1", ["github-worker"])
+        client.pull_secrets("box1", ["github-implementer"])
     except ControlError as exc:
         assert "TLS is mandatory" in str(exc)
     else:
@@ -1027,16 +1027,16 @@ def test_restart_is_deferred_when_the_new_run_image_is_unavailable(rig: Rig):
 def test_changed_secret_mapping_restarts_and_exposes_the_new_file(rig: Rig):
     rig.control.secrets["tok-a"] = "A"
     rig.control.secrets["tok-b"] = "B"
-    a = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    a = process_stack("worker", secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-a"})
     rig.control.heartbeat_answers.append(heartbeat_response([a]))
     rig.daemon.once()
-    assert rig.popen.spawned[0].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-a")
+    assert rig.popen.spawned[0].env["IMPLEMENTER_GITHUB_TOKEN_FILE"].endswith("tok-a")
 
-    b = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-b"})
+    b = process_stack("worker", secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-b"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 2
-    assert rig.popen.spawned[1].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-b")
+    assert rig.popen.spawned[1].env["IMPLEMENTER_GITHUB_TOKEN_FILE"].endswith("tok-b")
 
 
 def test_stopped_stack_with_a_config_change_stays_stopped(rig: Rig):
@@ -1050,43 +1050,70 @@ def test_stopped_stack_with_a_config_change_stays_stopped(rig: Rig):
     assert not rig.popen.spawned  # a stopped-by-desire Stack never launches
 
 
-# -- fail-closed cutover: built-in drivers require a control-authored run image ---
+# -- fail-closed cutover: driver Stacks require a control-authored run image ------
 
 
-def test_old_builtin_implementer_without_run_image_does_not_start(rig: Rig):
-    stack = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+def test_driver_implementer_without_run_image_does_not_start(rig: Rig):
+    stack = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/x"},
+    )
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
-    assert not rig.daemon._supervisor.alive("worker") and not rig.popen.spawned
+    assert not rig.daemon._supervisor.alive("implementer") and not rig.popen.spawned
     (event,) = rig.control.events
     assert "THEOZOLITH_RUN_IMAGE" in event["message"]
     assert "incompatible/incomplete desired state" in event["message"]
 
 
-def test_old_builtin_reviewer_without_run_image_does_not_start(rig: Rig):
-    stack = process_stack("reviewer", command="theozolith-reviewer", env={"THEOZOLITH_REPO": "a/x"})
+def test_driver_reviewer_without_run_image_does_not_start(rig: Rig):
+    stack = process_stack(
+        "reviewer",
+        command="theozolith-driver builtin:reviewer",
+        env={"THEOZOLITH_REPO": "a/x"},
+    )
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
     assert not rig.daemon._supervisor.alive("reviewer") and not rig.popen.spawned
     (event,) = rig.control.events
-    assert "theozolith-reviewer" in event["message"]
+    assert "builtin:reviewer" in event["message"]
 
 
-def test_live_builtin_driver_stops_when_run_image_env_is_lost(rig: Rig):
+def test_future_custom_driver_ref_without_run_image_does_not_start(rig: Rig):
+    # The guard keys on the generic launcher, not a ref registry: a future
+    # drivers/<name> ref (ADR-0042) gets the same fail-closed treatment.
+    stack = process_stack(
+        "custom",
+        command="theozolith-driver drivers/example",
+        env={"THEOZOLITH_REPO": "a/x"},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("custom") and not rig.popen.spawned
+    (event,) = rig.control.events
+    assert "drivers/example" in event["message"]
+
+
+def test_live_driver_stops_when_run_image_env_is_lost(rig: Rig):
     recipe = image_recipe()
     good = process_stack(
-        "worker",
-        command="theozolith-worker",
+        "implementer",
+        command="theozolith-driver builtin:implementer",
         env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([good], [recipe]))
     rig.daemon.once()
-    assert rig.daemon._supervisor.alive("worker")
+    assert rig.daemon._supervisor.alive("implementer")
 
-    bad = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+    bad = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/x"},
+    )
     rig.control.heartbeat_answers.append(heartbeat_response([bad]))
     rig.daemon.once()
-    assert not rig.daemon._supervisor.alive("worker")  # stale execution stopped
+    assert not rig.daemon._supervisor.alive("implementer")  # stale execution stopped
     assert rig.control.events  # the incompatibility is surfaced
 
 
@@ -1097,12 +1124,35 @@ def test_generic_process_stack_without_run_image_starts_normally(rig: Rig):
     assert rig.daemon._supervisor.alive("batch")  # a generic Stack needs no run image
 
 
+def test_driver_guard_uses_parsed_argv_not_substring(rig: Rig):
+    # The guard matches shlex-parsed argv[0] — the same parse the supervisor
+    # executes — not a substring of the command line. A command that merely
+    # MENTIONS the launcher is a generic Stack; a shell-quoted argv[0] naming
+    # the launcher is still a driver.
+    mentions = process_stack("wrapper", command="echo theozolith-driver", env={})
+    quoted = process_stack(
+        "quoted",
+        command="'theozolith-driver' builtin:implementer",
+        env={"THEOZOLITH_REPO": "a/x"},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([mentions, quoted]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("wrapper")  # not a driver: starts freely
+    assert not rig.daemon._supervisor.alive("quoted")  # driver: fails closed
+    (event,) = rig.control.events
+    assert "THEOZOLITH_RUN_IMAGE" in event["message"]
+
+
 def test_other_stacks_reconcile_when_one_fails_closed(rig: Rig):
-    bad = process_stack("worker", command="theozolith-worker", env={"THEOZOLITH_REPO": "acme/x"})
+    bad = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/x"},
+    )
     good = process_stack("batch", command="my-batch --run", env={})
     rig.control.heartbeat_answers.append(heartbeat_response([bad, good]))
     rig.daemon.once()
-    assert not rig.daemon._supervisor.alive("worker")
+    assert not rig.daemon._supervisor.alive("implementer")
     assert rig.daemon._supervisor.alive("batch")  # reconcile continued past the failure
 
 
@@ -1279,13 +1329,13 @@ def test_desired_run_image_change_during_a_run_is_deferred(rig: Rig, tmp_path):
 def test_desired_secret_mapping_change_during_a_run_is_deferred(rig: Rig, tmp_path):
     jobs = tmp_path / "jobs"
     rig.control.secrets.update({"tok-a": "A", "tok-b": "B"})
-    first = _launch_driver(rig, jobs, secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    first = _launch_driver(rig, jobs, secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-a"})
     _plant_run(rig, jobs, "r1")
 
     b = process_stack(
         "worker",
         env={"THEOZOLITH_JOBS_DIR": str(jobs)},
-        secrets={"WORKER_GITHUB_TOKEN": "tok-b"},
+        secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-b"},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
@@ -1465,14 +1515,16 @@ def test_external_container_image_is_not_gated_on_local_existence(rig: Rig):
 def test_unavailable_replacement_secret_keeps_the_old_child_and_run(rig: Rig, tmp_path):
     jobs = tmp_path / "jobs"
     rig.control.secrets["tok-a"] = "A"
-    first = _launch_driver(rig, jobs, secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
-    assert first.env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-a")
+    first = _launch_driver(rig, jobs, secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-a"})
+    assert first.env["IMPLEMENTER_GITHUB_TOKEN_FILE"].endswith("tok-a")
     rig.docker.add_run_container("run-x", "r-x", "worker")  # a Run container it owns
 
     # Switch to a mapping the Control Node will not serve and that is not cached.
     rig.control.denied_secrets = True
     b = process_stack(
-        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)}, secrets={"WORKER_GITHUB_TOKEN": "tok-b"}
+        "worker",
+        env={"THEOZOLITH_JOBS_DIR": str(jobs)},
+        secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-b"},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
@@ -1486,7 +1538,7 @@ def test_unavailable_replacement_secret_keeps_the_old_child_and_run(rig: Rig, tm
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 2 and first.poll() is not None
-    assert rig.popen.spawned[1].env["WORKER_GITHUB_TOKEN_FILE"].endswith("tok-b")
+    assert rig.popen.spawned[1].env["IMPLEMENTER_GITHUB_TOKEN_FILE"].endswith("tok-b")
     assert "run-x" in rig.docker.removed  # kill-the-tree only now, after prerequisites ready
 
     rig.control.heartbeat_answers.append(heartbeat_response([b]))  # stable thereafter
@@ -1496,7 +1548,7 @@ def test_unavailable_replacement_secret_keeps_the_old_child_and_run(rig: Rig, tm
 
 def test_secret_values_never_enter_fingerprint_or_persisted_state(rig: Rig):
     rig.control.secrets["tok-a"] = "super-secret-value"
-    stack = process_stack("worker", secrets={"WORKER_GITHUB_TOKEN": "tok-a"})
+    stack = process_stack("worker", secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-a"})
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
 
@@ -1706,7 +1758,7 @@ def test_container_to_process_with_unbuilt_run_image_keeps_the_container(rig: Ri
     rig.docker.removed.clear()
     proc = process_stack(
         "app",
-        command="theozolith-worker",
+        command="theozolith-driver builtin:implementer",
         env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": new["tag"]},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([proc], [new]))
@@ -1730,7 +1782,7 @@ def test_container_to_process_with_unavailable_secret_keeps_the_container(rig: R
     proc = process_stack(
         "app",
         env={"THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs")},
-        secrets={"WORKER_GITHUB_TOKEN": "tok-x"},
+        secrets={"IMPLEMENTER_GITHUB_TOKEN": "tok-x"},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([proc]))
     rig.daemon.once()

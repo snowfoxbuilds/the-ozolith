@@ -48,7 +48,9 @@ def test_request_work_returns_the_granted_issue(control_node):
     granted = DispatchClient(url, "node-token").request_work("worker-a", "box1", "login-a")
     assert granted is not None and granted["number"] == 7
     # The request carries the driver's identity — registration included.
-    assert seen == [{"role": "worker", "worker": "worker-a", "node": "box1", "login": "login-a"}]
+    assert seen == [
+        {"role": "implementer", "driver": "worker-a", "node": "box1", "login": "login-a"}
+    ]
 
 
 def test_no_grant_and_refusals_answer_none(control_node):

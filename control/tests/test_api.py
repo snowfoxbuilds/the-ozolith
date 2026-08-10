@@ -20,7 +20,7 @@ base = "ghcr.io/x/run:1.0@sha256:{digest}"
 setup = ["pip install uv"]
 
 [secrets]
-WORKER_GITHUB_TOKEN = "github-worker"
+IMPLEMENTER_GITHUB_TOKEN = "github-implementer"
 """.format(digest="0" * 64)
 
 STACK_TOML = """\
@@ -99,7 +99,7 @@ def test_heartbeat_distributes_only_this_nodes_desired_state(control: ControlRig
 
     config = control.heartbeat(node="box1").json()["config"]
     assert [s["name"] for s in config["stacks"]] == ["worker"]
-    assert config["stacks"][0]["secrets"] == {"WORKER_GITHUB_TOKEN": "github-worker"}
+    assert config["stacks"][0]["secrets"] == {"IMPLEMENTER_GITHUB_TOKEN": "github-implementer"}
     # Only images referenced by this node's Stacks travel with it.
     assert [i["name"] for i in config["images"]] == ["claude-dev"]
     assert config["images"][0]["tag"].startswith("theozolith/claude-dev:1.0-")
@@ -160,7 +160,7 @@ def test_build_skew_between_nodes_is_visible_in_state(control: ControlRig):
 def test_run_and_review_events_are_stored_typed(control: ControlRig):
     assert control.node_post("/api/v1/events", run_event(5, "claimed")).status_code == 200
     stored = control.store.events(type="theozolith.run", issue=5)
-    assert stored[0]["phase"] == "claimed" and stored[0]["worker"] == "worker-a"
+    assert stored[0]["phase"] == "claimed" and stored[0]["driver"] == "worker-a"
 
 
 def test_unknown_event_types_are_accepted_and_stored(control: ControlRig):
@@ -281,7 +281,7 @@ def test_pin_bump_pauses_dispatch_fleet_wide_until_nodes_converge(control: Contr
     # Reviewer discovery pauses on the same gate.
     review = control.node_post(
         "/api/v1/dispatch",
-        {"role": "reviewer", "worker": "rev-1", "node": "box1", "login": "ozolith-rev"},
+        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
     ).json()
     assert review["prs"] == [] and "pin is 0.4.0" in review["reason"]
 
@@ -349,7 +349,7 @@ def test_dispatch_without_a_control_pat_answers_503(tmp_path):
 
 
 def test_dispatch_requires_the_node_token(control: ControlRig):
-    body = {"role": "worker", "worker": "w", "node": "n", "login": "l"}
+    body = {"role": "implementer", "driver": "w", "node": "n", "login": "l"}
     assert control.node_post("/api/v1/dispatch", body, token="wrong").status_code == 401
 
 
@@ -358,7 +358,7 @@ def test_dispatch_registers_the_driver(control: ControlRig):
     drivers = control.store.drivers()
     assert drivers[0]["worker"] == "worker-a"
     assert drivers[0]["login"] == "ozolith-worker-a"
-    assert drivers[0]["role"] == "worker"
+    assert drivers[0]["role"] == "implementer"
 
 
 # -- grant activation (ADR-0017: never-activated grants are released) --------------
@@ -378,7 +378,7 @@ def test_claimed_event_activates_and_retires_the_grant(control: ControlRig):
 def test_progress_transcript_tail_is_truncated_at_ingestion(control: ControlRig):
     event = {
         "type": "theozolith.run.progress",
-        "worker": "worker-a",
+        "driver": "worker-a",
         "issue": 5,
         "run_id": "r1",
         "phase": "agent",

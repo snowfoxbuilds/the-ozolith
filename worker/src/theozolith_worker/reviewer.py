@@ -1,6 +1,6 @@
 """The Reviewer driver: a separate node-resident process owning all post-PR state.
 
-Own GitHub identity, stronger model than the Worker adapters — no
+Own GitHub identity, stronger model than the Implementer adapters — no
 self-grading by construction (ADR-0008). Discovers reviewable pr_ready PRs
 through the Control Node's dispatch endpoint (ADR-0017, discovery-only) and
 runs each review round as an
@@ -30,15 +30,13 @@ harness job.
 
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
-import sys
-import time
-import traceback
 from pathlib import Path
+from typing import ClassVar
 
 from theozolith_worker import evidence, gitops, jobdir, runner, verdict
+from theozolith_worker.base import Worker
 from theozolith_worker.bootstrap.vocabulary import (
     BLOCKED,
     DEVIATION_PREFIX,
@@ -52,31 +50,27 @@ from theozolith_worker.bootstrap.vocabulary import (
     attempts_on,
     reviewable,
 )
-from theozolith_worker.config import ConfigError, DriverConfig, load_config
+from theozolith_worker.config import DriverConfig
 from theozolith_worker.containers import (
     ContainerSpec,
-    DockerEngine,
     container_labels,
     review_container_name,
 )
 from theozolith_worker.decisions import section_text
-from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
 from theozolith_worker.events import EventSink, emit_error, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
 from theozolith_worker.sessions import SessionFactory
 from theozolith_worker.signals import compute_signals
-from theozolith_worker.sweep import sweep_orphans
-from theozolith_worker.worker import container_session_factory
 
 DIFF_LIMIT = 200_000
 
 NO_PATCH_NOTE = "(no patch available — binary or very large file; see signals.md)"
 
 REVIEW_PROMPT = """\
-You are the Reviewer in TheOzolith agentic coding pipeline. A Worker shipped \
-a best-effort PR; you own the verdict. You never implement — you judge the \
-diff against the issue's stated intent and acceptance criteria, and you judge \
-the decisions the Worker recorded, not just the code.
+You are the Reviewer in TheOzolith agentic coding pipeline. An Implementer \
+shipped a best-effort PR; you own the verdict. You never implement — you judge \
+the diff against the issue's stated intent and acceptance criteria, and you \
+judge the decisions the Implementer recorded, not just the code.
 
 Your working directory contains the review inputs as files:
 
@@ -85,7 +79,7 @@ Your working directory contains the review inputs as files:
 API. Binary and very large files carry no patch (marked "{no_patch_note}" \
 and listed in `signals.md`): the diff is partial for those entries — say so \
 in your evidence rather than guessing at their contents.
-- `decisions.md` — the PR's Decisions Section (recorded by the Worker)
+- `decisions.md` — the PR's Decisions Section (recorded by the Implementer)
 - `signals.md` — mechanical diff signals (computed evidence — weigh it, it \
 is not a grader)
 
@@ -512,96 +506,39 @@ def _push_review_evidence(
     )
 
 
-def run_reviewer(
-    config: DriverConfig,
-    client: GitHubClient | None = None,
-    session_factory: SessionFactory | None = None,
-    dispatch: WorkDispatch | None = None,
-    *,
-    sleep=time.sleep,
-    once: bool = False,
-    log=_log,
-    sink: EventSink | None = None,
-) -> int:
-    """The Reviewer loop; returns the number of verdicts applied.
+class Reviewer(Worker):
+    """Discovers reviewable pr_ready PRs and applies one verdict per round.
 
     Discovery goes through the Control Node's dispatch endpoint (ADR-0017,
     discovery-only — no claim label exists on PRs); the verdict itself is
     still applied with the Reviewer's own PAT. Control Node down = new
-    review rounds pause.
-    """
-    client = client or GitHubClient(config.repo, config.token, api_url=config.api_url)
-    session_factory = session_factory or container_session_factory(DockerEngine())
-    sink = sink or make_sink(config, log)
-    dispatch = dispatch or DispatchClient(
-        config.control_node_url,
-        config.control_token,
-        ca=config.control_ca,
-        log=log,
-        on_error=lambda error_class, message: emit_error(
-            sink, config, error_class=error_class, message=message
-        ),
-    )
-    me = client.viewer_login()
-    log(f"reviewer driver ({me}) requesting {PR_READY} PRs for {config.repo} via dispatch")
-    sweep_orphans(config, log=log)  # recover orphaned review workspaces (ADR-0016)
+    review rounds pause. The whole reviewable set is fetched per pass, so the
+    loop sleeps out the poll interval after each (base default)."""
 
-    verdicts = 0
-    unreachable_streak = 0
-    while True:
-        try:
-            targets = dispatch.review_targets(config.worker_id, config.node_name, me)
-            if targets is None:
-                log("control node unreachable; review rounds paused (ADR-0017)")
-                unreachable_streak += 1
-                targets = []
-            else:
-                unreachable_streak = 0
-            for number in targets:
-                pr = client.get_pull(number)
-                if not reviewable(pr.labels):
-                    continue  # discovery is advisory: GitHub decides
-                if review_pr(config, client, pr, session_factory, log=log, sink=sink) is not None:
-                    verdicts += 1
-        except Exception as exc:
-            log(f"review pass failed: {exc}")
-            # The pass-level summary (2026-07-21): review-container start
-            # failures and GitHub write failures in _publish surface here.
-            emit_error(
-                sink,
-                config,
-                error_class=type(exc).__name__,
-                message=f"review pass failed: {exc}",
-                context=traceback.format_exc(),
-            )
-        if once:
-            return verdicts
-        # Unreachable-Control backoff (ADR-0015 revision): capped doubling,
-        # snapping back to the poll interval on recovery.
-        sleep(backoff_delay(config.poll_seconds, unreachable_streak))
+    role: ClassVar[str] = "reviewer"
+    default_model: ClassVar[str] = "claude-fable-5"  # the stronger model (ADR-0008)
+    pass_label: ClassVar[str] = "review"
 
+    def _startup_log(self) -> None:
+        self.log(
+            f"reviewer driver ({self.me}) requesting {PR_READY} PRs"
+            f" for {self.config.repo} via dispatch"
+        )
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="theozolith-reviewer",
-        description=(
-            "TheOzolith Reviewer driver: poll pr_ready PRs, run review rounds in "
-            "ephemeral containers, own all post-PR state."
-        ),
-    )
-    parser.add_argument("--once", action="store_true", help="One poll pass, then exit.")
-    args = parser.parse_args(argv)
-    try:
-        config = load_config(role="reviewer")
-    except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    try:
-        run_reviewer(config, once=args.once)
-    except KeyboardInterrupt:
-        print("reviewer driver stopped", flush=True)
-    return 0
+    def fetch_work(self) -> list | None:
+        targets = self.dispatch.review_targets(
+            self.config.worker_id, self.config.node_name, self.me
+        )
+        if targets is None:
+            self.log("control node unreachable; review rounds paused (ADR-0017)")
+            return None
+        return targets
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+    def execute(self, item: int) -> int:
+        pr = self.client.get_pull(item)
+        if not reviewable(pr.labels):
+            return 0  # discovery is advisory: GitHub decides
+        result = review_pr(
+            self.config, self.client, pr, self.session_factory, log=self.log, sink=self.sink
+        )
+        return 1 if result is not None else 0

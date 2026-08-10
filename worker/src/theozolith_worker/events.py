@@ -23,9 +23,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
-from theozolith_worker import jobdir
+from theozolith_worker import adapters, jobdir
 from theozolith_worker.config import DriverConfig
-from theozolith_worker.harness import adapters
 
 RUN_EVENT = "theozolith.run"
 REVIEW_EVENT = "theozolith.review"
@@ -128,7 +127,7 @@ def run_event(
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": RUN_EVENT,
-        "worker": config.worker_id,
+        "driver": config.worker_id,
         "node": config.node_name,
         "stack": config.stack,
         "issue": issue,
@@ -151,6 +150,14 @@ def run_event(
 def review_event(
     config: DriverConfig, *, pr: int, issue: int, round_number: int, verdict: str
 ) -> dict[str, Any]:
+    """A review round as a fact for the Control Node.
+
+    The actor field is ``reviewer`` (not ``driver``): "reviewer" is accurate
+    vocabulary, not the taxonomy drift ADR-0020 renamed (ruled 2026-08-09),
+    so this sweep left it. Unifying the actor field across run and review
+    events is deliberately deferred; because this shape is frozen into
+    ``theozolith_worker.api``, that unification would be a release-note api
+    change (ADR-0042)."""
     return {
         "type": REVIEW_EVENT,
         "reviewer": config.worker_id,
@@ -167,8 +174,9 @@ def review_event(
 
 
 def driver_component(config: DriverConfig) -> str:
-    """The dashboard-facing component name (ADR-0020 terminology)."""
-    return "implementer-driver" if config.role == "worker" else f"{config.role}-driver"
+    """The dashboard-facing component name (ADR-0020 terminology): the role
+    is already the worker-type name, so ``<role>-driver`` names it directly."""
+    return f"{config.role}-driver"
 
 
 def error_event(
@@ -217,14 +225,6 @@ def emit_error(
 # -- run-progress telemetry (ADR-0016) ------------------------------------------
 
 
-def _stream_stats(config: DriverConfig, transcript: Path) -> adapters.StreamStats:
-    try:
-        adapter = adapters.make_agent_adapter(config.adapter)
-    except adapters.AgentAdapterError:
-        return adapters.StreamStats()
-    return adapter.stream_stats(transcript)
-
-
 def _transcript_snapshot(path: Path) -> tuple[int, str]:
     """(size in bytes, decoded tail) without reading the whole file — a
     multi-hour session transcript can be tens of MB and this runs every
@@ -253,10 +253,10 @@ def progress_event(
     here and again at ingestion."""
     status = jobdir.read_status(job)
     transcript_bytes, tail = _transcript_snapshot(job / jobdir.TRANSCRIPT_FILE)
-    stats = _stream_stats(config, job / jobdir.TRANSCRIPT_FILE)
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
     return {
         "type": PROGRESS_EVENT,
-        "worker": config.worker_id,
+        "driver": config.worker_id,
         "node": config.node_name,
         "stack": config.stack,
         "issue": issue,

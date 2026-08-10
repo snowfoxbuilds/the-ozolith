@@ -157,7 +157,7 @@ Stacks and worker types on top, never below.
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
    ```sh
-   theozolith secret set github-worker    # on the Control Node; no env needed
+   theozolith secret set github-implementer    # on the Control Node; no env needed
                                           # (under sudo on a root-mediated install)
    ```
 
@@ -170,8 +170,8 @@ Stacks and worker types on top, never below.
 
    ```sh
    theozolith status              # fleet health: table + exit 0/1/2; --json to parse
-   theozolith command drain   --node box1 --target worker
-   theozolith command recycle --node box1 --target worker   # kills the whole
+   theozolith command drain   --node box1 --target implementer
+   theozolith command recycle --node box1 --target implementer   # kills the whole
        # driver tree, run containers included, and restarts it
    theozolith command rebuild --node box1 --target claude-dev
    theozolith command update  --node box1             # nudge convergence now
@@ -240,7 +240,7 @@ Stacks and worker types on top, never below.
    free-form command strings are rejected, ADR-0022). Run containers are headless and
    never attach targets (ADR-0019).
 
-   The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Worker only
+   The zombie-claim janitor escalates evidence-first (ADR-0016): a silent Implementer only
    flags the dashboard; once the returned driver's boot sweep pushes the Run's evidence
    bundle, the claim is released and the issue escalated `failed` + `needs_human` with
    the evidence link — never auto-re-queued. An optional slow GitHub-Action backstop
@@ -442,24 +442,26 @@ partition, including `store.db`, which only exists once a node or secret does).
 
    ```sh
    pip install ./knowledge ./worker
-   export THEOZOLITH_REPO=owner/name WORKER_GITHUB_TOKEN=... REVIEWER_GITHUB_TOKEN=... \
+   export THEOZOLITH_REPO=owner/name IMPLEMENTER_GITHUB_TOKEN=... REVIEWER_GITHUB_TOKEN=... \
           ANTHROPIC_API_KEY=... CONTROL_NODE_URL=... THEOZOLITH_NODE_TOKEN=... \
           THEOZOLITH_RUN_IMAGE=theozolith-run-claude:local
    ```
 
-   The Worker and the Reviewer must be **different GitHub identities** (ADR-0008: no
+   The Implementer and the Reviewer must be **different GitHub identities** (ADR-0008: no
    self-grading by construction). PATs live in the drivers only; no run container ever
    sees them (ADR-0013).
 
 4. Run the drivers (don't run them as root):
 
    ```sh
-   theozolith-worker --once       # single poll-claim-run pass; or no flag for the loop
-   theozolith-reviewer --once
+   theozolith-driver builtin:implementer --once   # single poll-claim-run pass; or no flag for the loop
+   theozolith-driver builtin:reviewer --once
    ```
 
-   With `CONTROL_NODE_URL` unset, the claim pre-filter and event emission are skipped
-   cleanly. The M2 driver units (`theozolith-worker.service`,
+   Every built-in worker type runs through the one generic launcher (`theozolith-driver
+   <ref>`, ADR-0020). A reachable Control Node is **required**: new dispatch and review
+   work flows through it (ADR-0017), so when it is down, in-flight work finishes and
+   new work pauses until it returns. The M2 driver units (`theozolith-implementer.service`,
    `theozolith-reviewer.service` in `deploy/systemd/`) remain as conveniences — unlike
    `theozolith-control.service` there, which is the ADR-0034 production unit; from M3 on
    the deployment contract is the Node Daemon supervising the drivers as process Stacks.

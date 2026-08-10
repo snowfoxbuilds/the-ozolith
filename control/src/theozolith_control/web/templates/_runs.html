@@ -2,7 +2,7 @@
 {% if runs %}
 <table>
   <thead><tr>
-    <th>Issue</th><th>Phase</th><th>Attempt</th><th>Worker · Node</th>
+    <th>Issue</th><th>Phase</th><th>Attempt</th><th>Driver · Node</th>
     <th>Run</th><th>PR</th><th>Last event</th><th>Live progress</th>
   </tr></thead>
   <tbody>
@@ -12,7 +12,7 @@
           {% else %}#{{ run.issue }}{% endif %}</td>
       <td><span class="badge b-{{ run.status }}">● {{ run.phase }}</span></td>
       <td>{{ run.attempt or "–" }}</td>
-      <td>{{ run.worker }} · {{ run.node }}</td>
+      <td>{{ run.driver }} · {{ run.node }}</td>
       <td><code>{{ run.run_id }}</code></td>
       <td>{% if run.pr_url %}<a href="{{ run.pr_url }}">#{{ run.pr }}</a>{% else %}–{% endif %}</td>
       <td class="muted">{{ run.last_event }}</td>

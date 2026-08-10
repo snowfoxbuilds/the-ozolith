@@ -56,10 +56,10 @@ def _last_seen(store: Store, claim: LiveClaim) -> float:
         node_seen = store.node_last_seen(claim.node)
         if node_seen is not None:
             candidates.append(node_seen)
-    if claim.worker:
-        worker_seen = store.worker_last_seen(claim.worker)
-        if worker_seen is not None:
-            candidates.append(worker_seen)
+    if claim.driver:
+        driver_seen = store.driver_last_seen(claim.driver)
+        if driver_seen is not None:
+            candidates.append(driver_seen)
     return max(candidates)
 
 
@@ -82,7 +82,7 @@ def _evidence_landed(client: GitHubClient, claim: LiveClaim) -> bool:
 
 def _escalation_comment(claim: LiveClaim, repo: str, silence: float) -> str:
     return (
-        f"Run `{claim.run_id or 'unknown'}` (worker {claim.worker or 'unknown'}) went silent"
+        f"Run `{claim.run_id or 'unknown'}` (worker {claim.driver or 'unknown'}) went silent"
         f" mid-flight ({silence:.0f}s past its last signal) and its evidence bundle has landed."
         f" The claim is released and escalated: `{FAILED}` + `{NEEDS_HUMAN}` (ADR-0016)."
         f"\n\nEvidence: {issue_evidence_url(repo, claim.issue)}"
@@ -128,13 +128,13 @@ def _sweep_one(
         return False
 
     # Phase 1: dashboard flag only — GitHub is untouched.
-    store.flag_zombie(claim.issue, claim.run_id, claim.worker, claim.node)
+    store.flag_zombie(claim.issue, claim.run_id, claim.driver, claim.node)
 
     # Events are advisory: GitHub decides what actually needs releasing.
     issue = client.get_issue(claim.issue)
     if IN_PROGRESS not in issue.labels and not issue.assignees:
         store.record_janitor_action(
-            claim.issue, claim.run_id, claim.worker, "claim already released on GitHub"
+            claim.issue, claim.run_id, claim.driver, "claim already released on GitHub"
         )
         store.clear_zombie_flag(claim.issue, claim.run_id)
         return False
@@ -143,7 +143,7 @@ def _sweep_one(
         # A shipped PR awaits the Reviewer; the Run did not die mid-flight
         # (or its death no longer matters). Never touch the claim under it.
         store.record_janitor_action(
-            claim.issue, claim.run_id, claim.worker, f"skipped: PR #{pr.number} is pr_ready"
+            claim.issue, claim.run_id, claim.driver, f"skipped: PR #{pr.number} is pr_ready"
         )
         store.clear_zombie_flag(claim.issue, claim.run_id)
         return False
@@ -161,11 +161,11 @@ def _sweep_one(
         client.remove_assignee(claim.issue, login)
     client.remove_label(claim.issue, IN_PROGRESS)
     reason = (
-        f"worker {claim.worker or 'unknown'} silent {silence:.0f}s"
+        f"worker {claim.driver or 'unknown'} silent {silence:.0f}s"
         f" (grace {grace_seconds:.0f}s); run {claim.run_id or 'unknown'} escalated"
         f" {FAILED} + {NEEDS_HUMAN} with swept evidence"
     )
-    store.record_janitor_action(claim.issue, claim.run_id, claim.worker, reason)
+    store.record_janitor_action(claim.issue, claim.run_id, claim.driver, reason)
     store.clear_zombie_flag(claim.issue, claim.run_id)
     log(f"janitor: issue #{claim.issue} escalated ({reason})")
     return True

@@ -126,10 +126,10 @@ distributes over the heartbeat channel; nodes cache it for degraded mode.
 
 ### 4. Enter secrets
 
-Stacks reference secrets by name (e.g. `github-worker`); enter each value once:
+Stacks reference secrets by name (e.g. `github-implementer`); enter each value once:
 
 ```sh
-theozolith secret set github-worker    # on the Control Node; or the dashboard
+theozolith secret set github-implementer    # on the Control Node; or the dashboard
 ```
 
 Secrets are encrypted at rest on the Control Node, pulled node-scoped over TLS (only
