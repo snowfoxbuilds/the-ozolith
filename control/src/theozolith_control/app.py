@@ -617,11 +617,16 @@ def create_app(
     @app.get("/api/v1/config/artifacts/{drivers_hash}")
     async def pull_config_artifact(drivers_hash: str, request: Request):
         """Serve the config distribution by hash (ADR-0042). Node-authenticated;
-        the hash is validated stricter than ``safe_segment``. Serve the cached
-        ``<hash>.zip`` if present, else build on demand from the current working
-        Config Repo — if the built hash differs from the requested one the repo
-        moved on, so answer 409 (converge to the fresh hash next heartbeat),
-        never 500. There is no PUT twin: control packages from its own repo."""
+        the hash is validated stricter than ``safe_segment``. A cached
+        ``<hash>.zip`` is served only after it unpacks and recomputes to the
+        requested hash — a corrupted or truncated cache entry is discarded and
+        rebuilt rather than served forever. Absent (or discarded) cache builds
+        on demand from the current working Config Repo; a built hash that
+        differs from the requested one means the repo moved on, so answer 409
+        (converge to the fresh hash next heartbeat), never 500. Every published
+        artifact is verified by unpack-and-recompute before it lands under
+        ``<hash>.zip`` (never trusted by filename or bytes). There is no PUT
+        twin: control packages from its own repo."""
         _node_auth(request)
         if not re.fullmatch(r"[0-9a-f]{64}", drivers_hash):
             raise HTTPException(
@@ -629,7 +634,18 @@ def create_app(
             )
         cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
         if cached.is_file():
-            return FileResponse(cached, media_type="application/zip")
+            # Never serve a cached artifact on the strength of its filename: a
+            # corrupted or truncated <hash>.zip must not be served forever
+            # (ADR-0042). Verify it unpacks and recomputes to this hash; if it
+            # does not, discard it and fall through to an on-demand rebuild.
+            try:
+                recomputed, _ = configdist.verify_artifact(cached)
+            except configdist.ConfigDistError:
+                recomputed = None
+            if recomputed == drivers_hash:
+                return FileResponse(cached, media_type="application/zip")
+            with contextlib.suppress(OSError):
+                cached.unlink()
         try:
             built, path = configdist.build_artifact(
                 settings.config_repo,

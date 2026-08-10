@@ -741,6 +741,79 @@ def test_persistently_offhash_node_gets_restart_then_error(control: ControlRig):
     assert control.store.observe_drivers("box1", digest, digest, 3) is None
 
 
+def test_simultaneous_offpin_and_offhash_queue_exactly_one_restart(control: ControlRig):
+    """A node off BOTH the pin and the drivers-hash needs a single re-exec, not
+    two: the two subsystems share the one restart lever but keep independent
+    counters and each emits its own terminal error (ADR-0042)."""
+    digest = _write_driver(control)
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    off_hash = "c" * 64
+    for _ in range(2):
+        control.heartbeat(node="box1", version="0.3.0", drivers_hash=off_hash)
+    beat = control.heartbeat(node="box1", version="0.3.0", drivers_hash=off_hash).json()
+    # Exactly one restart despite BOTH subsystems reaching the restart rung.
+    assert [c["verb"] for c in beat["commands"]] == ["restart"]
+    restart_id = beat["commands"][0]["id"]
+    state = control.admin("GET", "/api/v1/state").json()
+    assert [c["verb"] for c in state["commands"] if c["verb"] == "restart"] == ["restart"]
+    # Completing that restart reveals no second stale restart, and each
+    # subsystem still emits its OWN distinct error class past 2x the threshold.
+    for _ in range(3):
+        control.heartbeat(
+            node="box1", version="0.3.0", drivers_hash=off_hash, completed_commands=[restart_id]
+        )
+    state = control.admin("GET", "/api/v1/state").json()
+    assert [c["verb"] for c in state["commands"] if c["verb"] == "restart"] == ["restart"]
+    classes = sorted(
+        e["payload"]["error_class"] for e in control.store.error_events(component="control-node")
+    )
+    assert classes == ["config-dist-not-converging", "update-not-converging"]
+    # Converging BOTH clears BOTH trackers.
+    control.heartbeat(node="box1", version="0.4.0", drivers_hash=digest)
+    assert control.store.observe_version("box1", "0.4.0", "0.4.0", 3) is None
+    assert control.store.observe_drivers("box1", digest, digest, 3) is None
+
+
+def test_corrupted_cached_config_artifact_is_repaired_on_next_pull(control: ControlRig):
+    """A corrupted <hash>.zip in the deletable cache must not be served forever:
+    the next pull discards it and rebuilds from the working repo (ADR-0042)."""
+    digest = _write_driver(control)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    first = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert first.status_code == 200
+    cached = control.settings.config_artifacts_dir / f"{digest}.zip"
+    assert cached.is_file()
+    cached.write_bytes(b"corrupted, not a zip")  # poison the cache entry
+    again = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert again.status_code == 200
+    # The repaired artifact verifies by recompute on the node side.
+    from theozolith_nodedaemon import configdist as node_configdist
+
+    dest = control.settings.data_dir / "repaired"
+    dest.mkdir(parents=True, exist_ok=True)
+    node_configdist.extract_zip(again.content, dest)
+    assert node_configdist.manifest_hash_of_tree(dest) == digest
+
+
+def test_broken_config_dist_keeps_dispatch_fail_open(control: ControlRig):
+    """A config-distribution validation failure (symlinked drivers root) must
+    preserve dispatch's documented fail-open posture: the grant path proceeds
+    as if no pin/hash were recorded, rather than 500-ing (ADR-0042)."""
+    import os
+
+    external = control.settings.data_dir / "external"
+    external.mkdir(parents=True, exist_ok=True)
+    (external / "x.py").write_text("escape\n", encoding="utf-8")
+    control.settings.config_repo.mkdir(parents=True, exist_ok=True)
+    os.symlink(external, control.settings.config_repo / "drivers")
+    control.github.add_issue(3, labels={"plan_ready"}, assignees=[])
+    # Heartbeat still answers (degraded desired state) rather than crashing.
+    assert control.heartbeat(node="box1").status_code == 500
+    # Dispatch stays fail-open on the broken repo — a grant still lands.
+    granted = control.dispatch(worker="worker-a", node="box1").json()
+    assert granted["issue"]["number"] == 3
+
+
 def test_flags_lists_stamp_skew_and_state_carries_the_hash(control: ControlRig):
     digest = _write_driver(control)
     # A node whose applied dist was built against a different product version.

@@ -28,6 +28,10 @@ DRIVERS_DIR = "drivers"
 # The metadata member at the archive/unpacked root (control side writes it):
 # metadata ABOUT the manifest, excluded from the hash by construction.
 ARTIFACT_METADATA = "config-dist.json"
+# The metadata envelope version the control side stamps (configdist.ARTIFACT_FORMAT).
+# Validated when the node reads config-dist.json — a foreign format is not
+# trusted for built_against — while the drivers_hash proves content integrity.
+ARTIFACT_FORMAT = 1
 
 
 class ConfigDistError(RuntimeError):

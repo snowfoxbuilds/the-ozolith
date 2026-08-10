@@ -31,6 +31,7 @@ import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # The single git-native code exception (ADR-0042); the folder name whose
 # contents ride the config distribution.
@@ -68,9 +69,30 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
     the name filter raises ``ConfigDistError`` — ``drivers/`` fails closed
     because a symlink could package a file from outside the repo. Without it
     (folder-mode commit hashing) such entries are simply skipped: a stray
-    symlink in the wider Config Repo must never fail-close heartbeats."""
+    symlink in the wider Config Repo must never fail-close heartbeats.
+
+    The ROOT itself is guarded the same way under ``refuse_irregular``: a
+    ``drivers`` that is a symlink (even to a directory), a regular file, or any
+    other non-directory entry is refused — a symlinked root would otherwise
+    package a whole external tree, and a non-directory root would silently read
+    as the empty sentinel. Only a genuinely missing root is the empty
+    distribution; a real, non-symlink directory is walked."""
     root = Path(root)
-    if not root.is_dir():
+    if refuse_irregular:
+        if root.is_symlink():
+            raise ConfigDistError(
+                f"{root} is a symlink — the config distribution refuses a symlinked"
+                " drivers root (it could package a tree from outside the repo, ADR-0042)"
+            )
+        if not root.exists():
+            return []  # a genuinely missing drivers/ is the empty sentinel
+        if not root.is_dir():
+            raise ConfigDistError(
+                f"{root} is not a directory — the config distribution refuses a"
+                " non-directory drivers root (regular file, FIFO, socket, device;"
+                " ADR-0042)"
+            )
+    elif not root.is_dir():
         return []
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -112,7 +134,16 @@ def drivers_manifest(repo_dir: Path) -> list[list[str]]:
     entries: list[list[str]] = []
     for path in regular_files(root, refuse_irregular=True):
         relpath = path.relative_to(repo_dir).as_posix()
-        entries.append([relpath, hashlib.sha256(path.read_bytes()).hexdigest()])
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            # An unreadable drivers/ file is a packaging error, normalized to
+            # ConfigDistError so the config-loading boundary can convert it into
+            # the established ConfigRepoError path (ADR-0042).
+            raise ConfigDistError(
+                f"cannot read {relpath!r} for the config distribution: {exc}"
+            ) from exc
+        entries.append([relpath, hashlib.sha256(data).hexdigest()])
     return sorted(entries)
 
 
@@ -155,15 +186,49 @@ def build_artifact(
         "built_against": built_against,
         "built_at": built_at or datetime.now(UTC).isoformat(),
     }
+    # Snapshot each file's bytes ONCE and drive both the manifest digest and
+    # the archive members off that single snapshot, so a member can never carry
+    # bytes that disagree with the hash it was packaged under (the manifest was
+    # computed from a first read, the archive from a second — a file mutated
+    # between them would otherwise poison the artifact). The completed archive
+    # is then verified by unpack-and-recompute before it is published, which
+    # also catches any file that changed after this snapshot was taken.
+    snapshot: dict[str, bytes] = {}
+    for relpath, expected in entries:
+        try:
+            data = (repo_dir / relpath).read_bytes()
+        except OSError as exc:
+            raise ConfigDistError(
+                f"cannot read {relpath!r} for the config distribution: {exc}"
+            ) from exc
+        if hashlib.sha256(data).hexdigest() != expected:
+            # The file changed between manifest creation and this snapshot: the
+            # working tree moved past ``digest``. Fail the build; the node
+            # retries and converges to the fresh hash on the next heartbeat.
+            raise ConfigDistError(
+                f"{relpath!r} changed while packaging {digest[:12]} — the working"
+                " Config Repo moved on; retry the build"
+            )
+        snapshot[relpath] = data
     fd, tmp = tempfile.mkstemp(dir=str(out_dir), prefix=f".{digest}.", suffix=".zip")
     os.close(fd)
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
             for relpath, _ in entries:
                 info = zipfile.ZipInfo(relpath, date_time=_ZIP_DATE_TIME)
-                archive.writestr(info, (repo_dir / relpath).read_bytes())
+                archive.writestr(info, snapshot[relpath])
             meta = zipfile.ZipInfo(ARTIFACT_METADATA, date_time=_ZIP_DATE_TIME)
             archive.writestr(meta, json.dumps(metadata, sort_keys=True).encode("utf-8"))
+        # Publish ONLY a completed archive that unpacks and recomputes to the
+        # requested hash with structurally valid metadata naming that same hash
+        # (ADR-0042): never the filename, never the archive bytes. verify_artifact
+        # raises on any disagreement, and the tempfile is cleaned below.
+        recomputed, _ = verify_artifact(Path(tmp))
+        if recomputed != digest:  # defensive: verify_artifact already enforces this
+            raise ConfigDistError(
+                f"built artifact recomputes to {recomputed[:12] or '(empty)'},"
+                f" expected {digest[:12]}"
+            )
         target = out_dir / f"{digest}.zip"
         os.replace(tmp, target)
     except BaseException:
@@ -171,6 +236,76 @@ def build_artifact(
             os.unlink(tmp)
         raise
     return digest, target
+
+
+def safe_member(name: str) -> bool:
+    """True for a zip member name safe to extract under a destination dir:
+    non-empty, POSIX-relative, no parent-traversal component, no absolute or
+    Windows drive-letter prefix. Validated explicitly — mirror of the node
+    side's ``theozolith_nodedaemon.configdist.safe_member`` (verification must
+    apply the SAME safety rule the node applies on extraction)."""
+    if not name or name.startswith("/") or name.startswith("\\"):
+        return False
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or (len(name) >= 2 and name[1] == ":"):
+        return False
+    parts = normalized.split("/")
+    return not any(part in ("", ".", "..") for part in parts)
+
+
+def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
+    """Unpack a built ``<hash>.zip`` into a throwaway temp dir, recompute the
+    drivers manifest over the unpacked tree, and validate the metadata member;
+    return ``(recomputed_hash, metadata)``. This is the ONLY proof an artifact
+    is publishable or servable — never the filename, never the archive bytes.
+
+    Raises ``ConfigDistError`` when: the file is not a valid zip; any member
+    name is unsafe (traversal / absolute / drive-letter); the metadata member
+    is missing or malformed; ``format`` is not the current artifact format; or
+    the metadata's ``drivers_hash`` does not equal the tree's recomputed hash.
+    ``built_against`` is not checked — it is advisory (ADR-0042)."""
+    path = Path(path)
+    try:
+        archive = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ConfigDistError(f"config distribution is not a valid zip: {exc}") from exc
+    with archive, tempfile.TemporaryDirectory(prefix=".verify-configdist-") as td:
+        root = Path(td)
+        resolved_root = root.resolve()
+        for name in archive.namelist():
+            if not safe_member(name):
+                raise ConfigDistError(f"config distribution member {name!r} is unsafe to extract")
+        for info in archive.infolist():
+            target = (root / info.filename).resolve()
+            if resolved_root != target and resolved_root not in target.parents:
+                raise ConfigDistError(
+                    f"config distribution member {info.filename!r} escapes the destination"
+                )
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(info))
+        recomputed = drivers_hash(root)
+        meta_path = root / ARTIFACT_METADATA
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigDistError(f"config distribution metadata is unreadable: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ConfigDistError("config distribution metadata is not an object")
+    if metadata.get("format") != ARTIFACT_FORMAT:
+        raise ConfigDistError(
+            f"config distribution metadata format {metadata.get('format')!r} is not"
+            f" {ARTIFACT_FORMAT}"
+        )
+    if metadata.get("drivers_hash") != recomputed:
+        raise ConfigDistError(
+            "config distribution metadata drivers_hash"
+            f" {str(metadata.get('drivers_hash'))[:12]!r} does not match the unpacked"
+            f" tree's recomputed hash {recomputed[:12] or '(empty)'}"
+        )
+    return recomputed, metadata
 
 
 def prune_config_artifacts(out_dir: Path, keep: int = 2) -> list[str]:

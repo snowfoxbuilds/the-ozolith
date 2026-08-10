@@ -120,6 +120,134 @@ def test_build_with_no_drivers_yields_nothing(tmp_path):
     assert built == "" and path is None
 
 
+# -- the drivers root itself must fail closed (ADR-0042) ---------------------
+
+
+def test_drivers_root_symlink_to_external_dir_is_rejected(tmp_path):
+    """A ``drivers`` that is a symlink — even to a real directory — would
+    package a whole tree from outside the repo. Refused at the root."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "x.py").write_text("escape\n", encoding="utf-8")
+    os.symlink(external, tmp_path / "drivers")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_manifest(tmp_path)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+
+
+def test_drivers_root_as_regular_file_is_rejected(tmp_path):
+    """A ``drivers`` regular file must not read as the empty sentinel."""
+    (tmp_path / "drivers").write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+
+
+def test_drivers_root_as_fifo_is_rejected(tmp_path):
+    """A FIFO / socket / device at ``drivers`` is an irregular root — refused."""
+    os.mkfifo(tmp_path / "drivers")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+
+
+def test_missing_drivers_root_stays_the_empty_sentinel(tmp_path):
+    """A genuinely absent ``drivers/`` is the no-distribution shape, not an
+    error — the regression the root guard must not break."""
+    assert configdist.drivers_hash(tmp_path) == ""
+    assert configdist.drivers_manifest(tmp_path) == []
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0, reason="root bypasses file permissions"
+)
+def test_unreadable_drivers_file_is_config_dist_error(tmp_path):
+    """An unreadable drivers/ file is a packaging error normalized to
+    ConfigDistError (so the config boundary can turn it into ConfigRepoError)."""
+    _write(tmp_path, "drivers/secret.py", "x = 1\n")
+    target = tmp_path / "drivers" / "secret.py"
+    os.chmod(target, 0)
+    try:
+        with pytest.raises(configdist.ConfigDistError):
+            configdist.drivers_hash(tmp_path)
+    finally:
+        os.chmod(target, 0o644)
+
+
+# -- artifact integrity: no poisoning past verify-by-recompute ---------------
+
+
+def test_build_refuses_mutation_between_manifest_and_archive(tmp_path, monkeypatch):
+    """A file that changes after the manifest is computed but before the archive
+    is written must never publish an artifact whose bytes disagree with its
+    hash. Simulated by a stale manifest: the byte snapshot detects the drift."""
+    _populate(tmp_path)
+    real = configdist.drivers_manifest(tmp_path)
+    stale = [[relpath, "0" * 64] for relpath, _ in real]  # hashes no longer match disk
+    monkeypatch.setattr(configdist, "drivers_manifest", lambda repo: stale)
+    out = tmp_path / "out"
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.build_artifact(tmp_path, out, built_against="1.0")
+    assert not list(out.glob("*.zip"))  # nothing published, no torn tempfile
+    assert not list(out.glob(".*"))
+
+
+def test_verify_artifact_accepts_a_clean_build(tmp_path):
+    _populate(tmp_path)
+    expected = configdist.drivers_hash(tmp_path)
+    _, path = configdist.build_artifact(tmp_path, tmp_path / "out", built_against="9.9")
+    recomputed, meta = configdist.verify_artifact(path)
+    assert recomputed == expected
+    assert meta["drivers_hash"] == expected and meta["built_against"] == "9.9"
+
+
+def test_verify_artifact_rejects_tampered_member(tmp_path):
+    """A packaged file altered while the metadata still names the old hash is
+    caught by unpack-and-recompute — never trusted by filename or bytes."""
+    _populate(tmp_path)
+    _, path = configdist.build_artifact(tmp_path, tmp_path / "out", built_against="1.0")
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(tampered, "w") as dst:
+        for info in src.infolist():
+            data = src.read(info)
+            if info.filename.endswith("impl.py"):
+                data = data + b"# injected\n"
+            dst.writestr(info, data)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(tampered)
+
+
+def test_verify_artifact_rejects_bad_metadata_and_unsafe_members(tmp_path):
+    _populate(tmp_path)
+    entries = configdist.drivers_manifest(tmp_path)
+    # A zip whose metadata format is wrong is rejected even if the tree is fine.
+    import json
+
+    bad_meta = tmp_path / "bad_meta.zip"
+    with zipfile.ZipFile(bad_meta, "w") as z:
+        for relpath, _ in entries:
+            z.writestr(relpath, (tmp_path / relpath).read_bytes())
+        z.writestr(
+            configdist.ARTIFACT_METADATA,
+            json.dumps({"format": 999, "drivers_hash": configdist.drivers_hash(tmp_path)}),
+        )
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(bad_meta)
+    # A traversal member is refused before any recompute.
+    evil = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil, "w") as z:
+        z.writestr("drivers/ok.py", "ok\n")
+        z.writestr("../escape.py", "pwned\n")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(evil)
+
+
+def test_control_and_node_safe_member_agree(tmp_path):
+    """The control-side verifier and the node-side extractor apply the SAME
+    member-safety rule (both must reject the same traversal names)."""
+    for name in ("drivers/a.py", "../escape", "/abs", "C:\\win", "", "drivers/./x"):
+        assert configdist.safe_member(name) == node_configdist.safe_member(name)
+
+
 def test_prune_keeps_two(tmp_path):
     out = tmp_path / "out"
     out.mkdir()

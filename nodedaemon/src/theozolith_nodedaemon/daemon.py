@@ -35,6 +35,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -259,6 +260,14 @@ class NodeDaemon:
         # desired state, checked every pass and applied at most once per pass.
         self._drivers_attempted = False
         self._drivers_blocker: str | None = None
+        # The verified applied drivers-hash, memoized for the duration of ONE
+        # pass (reset in ``once``). The ``current`` pointer alone is never proof:
+        # each pass re-derives the applied hash by recomputing the manifest over
+        # the pointed-at tree (``_verify_applied_drivers``), so a missing tree, a
+        # malformed pointer, or a mutated tree reads as non-converged and is
+        # repaired on the next fetch. None = not yet computed this pass; a swap
+        # or retirement sets it directly to the freshly verified value.
+        self._verified_drivers_hash: str | None = None
         # Capped exponential backoff while the Control Node is unreachable.
         self._unreachable_streak = 0
 
@@ -279,6 +288,10 @@ class NodeDaemon:
     def once(self) -> None:
         self._product_attempted = False  # at most one install attempt per pass
         self._drivers_attempted = False  # at most one config-dist swap per pass
+        # Re-verify the applied distribution from scratch each pass — startup
+        # (the first pass) and every heartbeat thereafter — so a partial restore
+        # or a runtime-mutated tree is detected rather than trusted (ADR-0042).
+        self._verified_drivers_hash = None
         commands = self._exchange_heartbeat()
         for command in commands:
             if not self._execute(command):
@@ -798,22 +811,66 @@ class NodeDaemon:
     # -- config distribution (ADR-0042) -----------------------------------------------
 
     def _current_drivers_hash(self) -> str:
-        """The applied config-distribution hash from the ``current`` pointer
-        ('' when none applied) — what the heartbeat reports and what the swap
-        compares against."""
+        """The VERIFIED applied config-distribution hash ('' when none applied) —
+        what the heartbeat reports and what the swap compares against. The
+        ``current`` pointer alone is not proof: the hash is only returned when
+        the pointer is well-formed AND its tree exists AND that tree recomputes
+        to the pointer (``_verify_applied_drivers``). Memoized per pass."""
+        if self._verified_drivers_hash is None:
+            self._verified_drivers_hash = self._verify_applied_drivers()
+        return self._verified_drivers_hash
+
+    def _verify_applied_drivers(self) -> str:
+        """Recompute-and-verify the applied distribution (ADR-0042). Returns the
+        applied hash only when the ``current`` pointer is a 64-hex value whose
+        tree exists under ``config-dist/<hash>/`` and recomputes to it; a
+        missing pointer, a malformed value, a missing tree, or a mismatch all
+        read as '' (non-converged), so ``_converge_drivers`` refetches and
+        repairs it — while the old verified tree keeps being used until a
+        replacement is fully verified and swapped in."""
         try:
-            return self._config.config_dist_current.read_text(encoding="utf-8").strip()
+            pointer = self._config.config_dist_current.read_text(encoding="utf-8").strip()
         except OSError:
             return ""
+        if not pointer:
+            return ""
+        if not re.fullmatch(r"[0-9a-f]{64}", pointer):
+            self._log(f"config distribution pointer {pointer[:20]!r} is malformed; not converged")
+            return ""
+        tree = self._config.config_dist_dir / pointer
+        if not tree.is_dir():
+            self._log(f"config distribution {pointer[:12]} has no applied tree; not converged")
+            return ""
+        try:
+            recomputed = configdist.manifest_hash_of_tree(tree)
+        except OSError:
+            return ""
+        if recomputed != pointer:
+            self._log(
+                f"config distribution {pointer[:12]} tree recomputes to"
+                f" {recomputed[:12] or '(empty)'}; not converged"
+            )
+            return ""
+        return pointer
 
     def _current_built_against(self) -> str:
         """The product version the applied distribution was built against, from
-        its ``config-dist.json`` ('' when none, or unreadable)."""
+        its ``config-dist.json`` ('' when none). Advisory only, so a missing or
+        unreadable stamp is simply '' — but ``config-dist.json`` is NOT trusted
+        as proof of content: it is only read once the tree has verified, and its
+        ``format`` and ``drivers_hash`` are checked against the verified hash
+        before ``built_against`` is reported (a stale/foreign envelope yields
+        '', never a wrong stamp)."""
         current = self._current_drivers_hash()
         if not current:
             return ""
         meta = _read_json(self._config.config_dist_dir / current / configdist.ARTIFACT_METADATA, {})
-        return str(meta.get("built_against", "")) if isinstance(meta, dict) else ""
+        if not isinstance(meta, dict):
+            return ""
+        if meta.get("format") != configdist.ARTIFACT_FORMAT or meta.get("drivers_hash") != current:
+            return ""
+        built = meta.get("built_against", "")
+        return built if isinstance(built, str) else ""
 
     def _drivers_stack_names(self) -> list[str]:
         """Desired process Stacks whose command is ``theozolith-driver
@@ -898,6 +955,9 @@ class NodeDaemon:
         # _reconcile restarts them on the new tree, then publish the pointer.
         self._stop_drivers_stacks()
         self._write_current_pointer(desired)
+        # Just verified above (recomputed == desired): record it so this pass's
+        # heartbeat reports the new hash without recomputing the tree again.
+        self._verified_drivers_hash = desired
         self._log(f"config distribution converged to {desired[:12]}")
         self._gc_config_dist(keep={desired, previous} - {""})
 
@@ -908,6 +968,7 @@ class NodeDaemon:
         with contextlib.suppress(OSError):
             self._config.config_dist_current.unlink()
         self._gc_config_dist(keep=set())
+        self._verified_drivers_hash = ""  # nothing applied now
         if previous:
             self._log("config distribution retired (none desired)")
 

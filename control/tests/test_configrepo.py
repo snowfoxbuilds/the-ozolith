@@ -676,6 +676,37 @@ def test_folder_mode_commit_bumps_on_a_drivers_edit(tmp_path):
     assert after.startswith("folder-") and after != before
 
 
+def test_symlinked_drivers_root_surfaces_as_config_repo_error(tmp_path):
+    """A config-distribution validation failure (a symlinked drivers root) is
+    normalized to ConfigRepoError at the loading boundary, NOT a raw
+    ConfigDistError — so the API turns it into the documented config-repo error
+    and dispatch stays fail-open (ADR-0042)."""
+    import os
+
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "x.py").write_text("escape\n", encoding="utf-8")
+    os.symlink(external, tmp_path / "drivers")
+    with pytest.raises(ConfigRepoError, match="config distribution"):
+        load_config(tmp_path)
+
+
+@pytest.mark.skipif(
+    getattr(__import__("os"), "geteuid", lambda: 1)() == 0, reason="root bypasses file permissions"
+)
+def test_unreadable_drivers_file_surfaces_as_config_repo_error(tmp_path):
+    import os
+
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    target = tmp_path / "drivers" / "custom" / "impl.py"
+    os.chmod(target, 0)
+    try:
+        with pytest.raises(ConfigRepoError, match="config distribution"):
+            load_config(tmp_path)
+    finally:
+        os.chmod(target, 0o644)
+
+
 def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
     from theozolith_control import configrepo
 

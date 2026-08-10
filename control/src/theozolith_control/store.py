@@ -499,7 +499,17 @@ class Store:
         restart_queued, escalated)`` health table (version_health /
         drivers_health): reset on match / no desired / no report; count
         otherwise; queue one restart at ``threshold``; mark escalated at
-        ``2 * threshold``. ``table`` is a fixed module constant, never input."""
+        ``2 * threshold``. ``table`` is a fixed module constant, never input.
+
+        The two subsystems keep INDEPENDENT counters and each emits its own
+        terminal error, but they share the ONE restart lever: a node that is
+        simultaneously off-pin and off-hash needs a single re-exec, not two.
+        So the restart rung queues a ``restart`` command only when the node has
+        no pending (uncompleted) one — a restart another subsystem (or an
+        operator) already queued satisfies this subsystem's rung too. Each
+        subsystem still marks its OWN ``restart_queued`` so it never re-queues
+        and climbs on to its own escalation; because the flag latches, a
+        completed restart is never followed by a second stale one (ADR-0042)."""
         with self._lock, self._db:
             if not desired or not reported or reported == desired:
                 self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
@@ -515,11 +525,19 @@ class Store:
             )
             row = self._db.execute(f"SELECT * FROM {table} WHERE node = ?", (node,)).fetchone()
             if not row["restart_queued"] and row["offpin_beats"] >= threshold:
-                self._db.execute(
-                    "INSERT INTO commands (node, verb, target, force, created_at)"
-                    " VALUES (?, 'restart', NULL, 0, ?)",
-                    (node, self._clock()),
-                )
+                # Deduplicate the restart against any pending one (the other
+                # subsystem's, or an operator's): one re-exec converges both.
+                pending_restart = self._db.execute(
+                    "SELECT 1 FROM commands"
+                    " WHERE node = ? AND verb = 'restart' AND completed_at IS NULL LIMIT 1",
+                    (node,),
+                ).fetchone()
+                if pending_restart is None:
+                    self._db.execute(
+                        "INSERT INTO commands (node, verb, target, force, created_at)"
+                        " VALUES (?, 'restart', NULL, 0, ?)",
+                        (node, self._clock()),
+                    )
                 self._db.execute(f"UPDATE {table} SET restart_queued = 1 WHERE node = ?", (node,))
                 return "restart-queued"
             if (

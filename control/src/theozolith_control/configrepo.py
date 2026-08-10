@@ -716,11 +716,21 @@ def load_config(repo_dir: Path) -> DeployConfig:
             version = table.get("version", "")
             if isinstance(version, str):
                 product_version = version
+    # Normalize config-distribution validation/read failures (a symlinked or
+    # non-directory drivers root, an unreadable drivers/ file) into the
+    # established ConfigRepoError path (ADR-0042), so the API's config boundary
+    # turns them into the documented HTTP error and dispatch stays fail-open on
+    # a broken repo. Only ConfigDistError is caught — a programming error must
+    # not be swallowed by an overbroad except.
+    try:
+        drivers_hash = configdist.drivers_hash(repo_dir)
+    except configdist.ConfigDistError as exc:
+        raise ConfigRepoError(f"config distribution: {exc}") from exc
     return DeployConfig(
         commit=_commit(repo_dir),
         stacks=stacks,
         worker_types=worker_types,
         product_version=product_version,
-        drivers_hash=configdist.drivers_hash(repo_dir),
+        drivers_hash=drivers_hash,
         repo_dir=repo_dir,
     )

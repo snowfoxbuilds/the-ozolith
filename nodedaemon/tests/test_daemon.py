@@ -3895,3 +3895,94 @@ def test_config_dist_zip_traversal_refused(rig: Rig):
     assert not (rig.config.state_dir / "config-dist" / "current").exists()
     assert not (rig.config.state_dir.parent / "escape.py").exists()
     assert rig.control.events  # error emitted
+
+
+# -- evidence-based applied-state reporting (ADR-0042) -----------------------
+
+
+def _last_heartbeat(rig: Rig) -> dict:
+    """The most recent status payload the daemon POSTed (the report is sent at
+    the START of a pass, before convergence acts)."""
+    return [req for _, path, req, _ in rig.control.transcript if path == "/heartbeats"][-1]
+
+
+def _apply_dist(rig: Rig, files: dict[str, str], *, built_against: str = "0.3.0") -> str:
+    digest, data = make_config_dist(files, built_against=built_against)
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (rig.config.state_dir / "config-dist" / "current").read_text().strip() == digest
+    return digest
+
+
+def test_config_dist_pointer_without_tree_is_not_converged_then_repaired(rig: Rig):
+    """Partial restore: the ``current`` pointer survived but its tree did not.
+    The pointer alone is not proof — the node reports non-convergence and the
+    next fetch repairs it (ADR-0042)."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    root = rig.config.state_dir / "config-dist"
+    shutil.rmtree(root / digest)  # only the pointer remains
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    # Reported non-converged at status time, then repaired this same pass.
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert (root / digest / "drivers" / "custom" / "impl.py").is_file()
+    assert (root / "current").read_text().strip() == digest
+
+
+def test_config_dist_modified_tree_is_not_converged_then_repaired(rig: Rig):
+    """A runtime-mutated applied tree recomputes to a different hash, so it is
+    reported non-converged and the next fetch restores the verified content."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # recompute mismatch
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
+    assert any("recomputes to" in line for line in rig.logs)
+
+
+def test_config_dist_malformed_pointer_is_not_converged(rig: Rig):
+    """A malformed ``current`` value never reads as an applied hash."""
+    root = rig.config.state_dir / "config-dist"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "current").write_text("not-a-valid-hash\n", encoding="utf-8")
+    rig.control.heartbeat_answers.append(dist_response([], ""))  # nothing desired
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert any("malformed" in line for line in rig.logs)
+
+
+def test_config_dist_foreign_metadata_yields_no_built_against(rig: Rig):
+    """The tree recomputes to the hash (content verified, hash reported) but a
+    stale/foreign ``config-dist.json`` is NOT trusted for the advisory stamp."""
+    import json
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"}, built_against="0.2.9")
+    meta_path = rig.config.state_dir / "config-dist" / digest / "config-dist.json"
+    meta_path.write_text(
+        json.dumps({"format": 999, "drivers_hash": "z" * 64, "built_against": "9.9.9"}),
+        encoding="utf-8",
+    )
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest  # content still verifies
+    assert reported["drivers_built_against"] == ""  # foreign metadata not trusted
+
+
+def test_config_dist_old_distribution_stays_until_replacement_verified(rig: Rig):
+    """A swap whose served artifact fails verification leaves the old, verified
+    distribution in place and still usable (ADR-0042)."""
+    a_hash = _apply_dist(rig, {"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, _good = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    _, tampered = make_config_dist({"drivers/custom/impl.py": "TAMPERED = 3\n"})
+    rig.control.config_artifacts[b_hash] = tampered  # bytes recompute to a different hash
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == a_hash  # old still current
+    assert (root / a_hash / "drivers" / "custom" / "impl.py").read_text() == "v = 1\n"
+    assert not (root / b_hash).exists()
+    assert _last_heartbeat(rig)["drivers_hash"] == a_hash  # still reports the old good hash
