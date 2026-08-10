@@ -60,7 +60,7 @@ from theozolith_worker.containers import (
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
-from theozolith_worker.harness.adapters import HarnessAdapterError, make_harness_adapter
+from theozolith_worker.harness.adapters import AgentAdapterError, make_agent_adapter
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -249,8 +249,8 @@ def _run_tokens(config: DriverConfig, job: Path) -> int | None:
     """Token usage from the structured output stream (ADR-0019); None when
     the adapter's stream carries no usage."""
     try:
-        adapter = make_harness_adapter(config.adapter)
-    except HarnessAdapterError:
+        adapter = make_agent_adapter(config.adapter)
+    except AgentAdapterError:
         return None
     return adapter.stream_stats(job / jobdir.TRANSCRIPT_FILE).tokens
 

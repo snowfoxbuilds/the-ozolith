@@ -62,11 +62,20 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
         api_url="",
         secrets_channel_ok=True,  # TLS-mandatory is proven in test_tls.py
     )
+    # A worker-types Config Repo (ADR-0044): a thin Stack + its worker type.
+    # The resolved process Stack still references its secret by NAME only.
+    wt_toml = tmp_path / "configs" / "worker-types" / "claude-dev.toml"
+    wt_toml.parent.mkdir(parents=True)
+    wt_toml.write_text(
+        'driver = "builtin:implementer"\nadapter = "claude"\nworkspace = "acme/sandbox"\n'
+        f'base = "ghcr.io/x/run:1.0@sha256:{"0" * 64}"\n'
+        '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n',
+        encoding="utf-8",
+    )
     stack_toml = tmp_path / "configs" / "stacks" / "worker.toml"
     stack_toml.parent.mkdir(parents=True)
     stack_toml.write_text(
-        'kind = "process"\nnode = "box1"\ncommand = "theozolith-worker"\n'
-        '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n',
+        'worker_type = "claude-dev"\nnode = "box1"\n',
         encoding="utf-8",
     )
     store = Store(settings.cache_db_path)

@@ -1,0 +1,18 @@
+# The Implementer as a thin Stack (ADR-0044): worker type + placement +
+# desired state, nothing else. Everything that defines the worker — driver,
+# adapter, model, workspace, secrets, run image — lives in the worker type
+# (worker-types/claude-dev.toml). Copy this tree into your Config Repo
+# (default ~/.theozolith/configs on the Control Node) and adjust.
+#
+# No `attach` key: the resolved kind is process (the type has a driver), and
+# run containers are headless and never attach targets (ADR-0019).
+# Interactive work happens in the Flight Deck (stacks/flightdeck.toml).
+
+worker_type = "claude-dev"
+node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
+state = "running"
+
+# Optional [env] = per-placement expert overrides (they win over the values
+# the worker type injects).
+[env]
+WORKER_ID = "worker-box1"

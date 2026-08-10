@@ -97,7 +97,7 @@ class Manifest:
 
     run_id: str
     mode: str  # "run" | "review"
-    adapter: str  # harness adapter name (M2: "claude")
+    adapter: str  # Agent adapter name (M2: "claude")
     model: str
     workdir: str = CHECKOUT_DIR  # job-dir-relative agent working directory
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT

@@ -49,7 +49,7 @@ NODE_STATE_DIR = Path("/var/lib/theozolith")
 SERVE_READY_TIMEOUT = 60.0
 HEARTBEAT_TIMEOUT = 90.0
 
-SCAFFOLD_FILES = ("stacks/worker.toml", "images/claude-dev.toml", "README.md")
+SCAFFOLD_FILES = ("stacks/implementer.toml", "worker-types/claude-dev.toml", "README.md")
 
 # The base ref of the example worker type. The digest is a deliberate
 # placeholder: fetching a real one at init would need a registry round-trip
@@ -671,37 +671,36 @@ def _product_version() -> str:
 
 
 def _scaffold_stack(node_name: str) -> str:
-    return f"""# The staged Implementer worker Stack (ADR-0037 scaffold): complete,
-# commented, desired state STOPPED — nothing deploys or builds on first
-# boot. The finish line is three steps; see README.md in this repo.
+    return f"""# The staged Implementer Stack (ADR-0037/ADR-0044 scaffold): thin by
+# design — a worker type plus placement and desired state, nothing else.
+# Desired state STOPPED, so nothing deploys or builds on first boot. The
+# finish line is three steps; see README.md in this repo.
 
-kind = "process"             # a worker driver runs as a supervised daemon child
+worker_type = "claude-dev"   # worker-types/claude-dev.toml owns the rest
 node = "{node_name}"
 state = "stopped"            # step 3: flip to "running" and commit
-command = "theozolith-worker"
-run_image = "claude-dev"     # images/claude-dev.toml — the derived run image
 
-[env]
-# Step 2 (while entering secrets): the GitHub repository (owner/name) the
-# Implementer works.
-THEOZOLITH_REPO = "you/your-repo"
-WORKER_MODEL = "claude-sonnet-5"
-WORKER_ID = "worker-{node_name}"
-
-[secrets]
-# Secret NAMES only — values live in the encrypted store, never this repo
-# (ADR-0024): enter each once with 'sudo theozolith secret set <name>'.
-WORKER_GITHUB_TOKEN = "github-worker"
-ANTHROPIC_API_KEY = "anthropic-api-key"
+# Optional [env] = per-placement expert overrides (e.g. a distinct
+# WORKER_ID). Everything that defines the worker — driver, adapter, model,
+# workspace, secrets, run image — lives in the worker type.
+# [env]
+# WORKER_ID = "worker-{node_name}"
 """
 
 
-def _scaffold_image() -> str:
+def _scaffold_worker_type() -> str:
     version = _product_version().split("+")[0]
-    return f"""# The example worker type (ADR-0037): the product's Claude run image
-# plus your setup, built into a derived image by the local daemon when the
-# Stack flips to running. The base MUST be pinned by digest (ADR-0006) —
-# the zeros below are a placeholder; README.md step 1 replaces them.
+    return f"""# The example worker type (ADR-0044): the complete customization unit for
+# one worker — the built-in Implementer driver, its Agent adapter and model,
+# the target workspace, the secrets it needs, and the derived run image the
+# local daemon builds when the Stack flips to running. The base MUST be
+# pinned by digest (ADR-0006) — the zeros below are a placeholder; README.md
+# step 1 replaces them.
+
+driver = "builtin:implementer"   # the staged pipeline Implementer
+adapter = "claude"               # the Agent adapter the harness invokes
+model = "claude-sonnet-5"
+workspace = "you/your-repo"      # step 2: the repository (owner/name) it works
 
 base = "{SCAFFOLD_BASE_IMAGE}:{version}@sha256:{PLACEHOLDER_DIGEST}"
 
@@ -715,6 +714,12 @@ base = "{SCAFFOLD_BASE_IMAGE}:{version}@sha256:{PLACEHOLDER_DIGEST}"
 # start).
 # knowledge_source = "https://github.com/you/your-knowledge.git"
 # knowledge_pin = "<commit sha>"
+
+[secrets]
+# Secret NAMES only — values live in the encrypted store, never this repo
+# (ADR-0024): enter each once with 'sudo theozolith secret set <name>'.
+GITHUB_TOKEN = "github-implementer"
+ANTHROPIC_API_KEY = "anthropic-api-key"
 """
 
 
@@ -724,33 +729,34 @@ def _scaffold_readme(node_name: str) -> str:
     return f"""# Your Config Repo — staged, not deployed
 
 `theozolith init --with-local-node` seeded this git-backed Config Repo
-(ADR-0037) with a complete, commented Implementer worker Stack
-(`stacks/worker.toml`) and its worker-type image definition
-(`images/claude-dev.toml`) at desired state **stopped**. Nothing runs and
-nothing builds on first boot: `theozolith status` shows node `{node_name}`
-healthy and the Stack stopped-by-desire.
+(ADR-0037/ADR-0044) with a thin Implementer Stack (`stacks/implementer.toml`
+— worker type + placement + desired state) and the worker type it names
+(`worker-types/claude-dev.toml` — driver, adapter, model, workspace,
+secrets, and the derived run image) at desired state **stopped**. Nothing
+runs and nothing builds on first boot: `theozolith status` shows node
+`{node_name}` healthy and the Stack stopped-by-desire.
 
 The finish line, three steps:
 
-1. **Pin the base image digest** in `images/claude-dev.toml` — replace the
-   placeholder zeros with the real digest:
+1. **Pin the base image digest** in `worker-types/claude-dev.toml` — replace
+   the placeholder zeros with the real digest:
 
        docker pull {ref}
        docker inspect --format '{{{{index .RepoDigests 0}}}}' {ref}
 
-2. **Enter the secrets** the Stack references (values go to the encrypted
-   store on the Control Node, never into this repo):
+2. **Enter the secrets** the worker type references (values go to the
+   encrypted store on the Control Node, never into this repo):
 
-       sudo theozolith secret set github-worker
+       sudo theozolith secret set github-implementer
        sudo theozolith secret set anthropic-api-key
 
-   While you are here, set `THEOZOLITH_REPO` in `stacks/worker.toml` to
+   While you are here, set `workspace` in `worker-types/claude-dev.toml` to
    the repository the Implementer works.
 
 3. **Flip desired state and commit**: set `state = "running"` in
-   `stacks/worker.toml` and commit. On the next heartbeat the local daemon
-   builds the derived image and brings the worker up — `theozolith status`
-   exits 0 with the Stack running.
+   `stacks/implementer.toml` and commit. On the next heartbeat the local
+   daemon builds the derived image and brings the worker up — `theozolith
+   status` exits 0 with the Stack running.
 
 Everything here is ordinary git: edit, commit, done. Secrets never live in
 this repo (ADR-0024), and a Stack named `control` is rejected — the
@@ -765,8 +771,8 @@ def write_scaffold(
     files are never overwritten — a --force re-init keeps operator edits.
     Returns the relative paths written."""
     contents = {
-        "stacks/worker.toml": _scaffold_stack(node_name),
-        "images/claude-dev.toml": _scaffold_image(),
+        "stacks/implementer.toml": _scaffold_stack(node_name),
+        "worker-types/claude-dev.toml": _scaffold_worker_type(),
         "README.md": _scaffold_readme(node_name),
     }
     written: list[str] = []

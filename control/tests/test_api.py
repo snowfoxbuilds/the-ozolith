@@ -9,23 +9,24 @@ from __future__ import annotations
 
 from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
 
-STACK_TOML = """\
-kind = "process"
-node = "box1"
-command = "theozolith-worker"
-run_image = "claude-dev"
-
-[env]
-THEOZOLITH_REPO = "acme/sandbox"
+# A driver worker type + the thin Stack that names it (ADR-0044). The
+# resolved Stack is an ordinary process Stack: command/env/secrets come from
+# the worker type, and its derived-image recipe rides in the wire `images`.
+WORKER_TYPE_TOML = """\
+driver = "builtin:implementer"
+adapter = "claude"
+workspace = "acme/sandbox"
+base = "ghcr.io/x/run:1.0@sha256:{digest}"
+setup = ["pip install uv"]
 
 [secrets]
 WORKER_GITHUB_TOKEN = "github-worker"
-"""
-
-IMAGE_TOML = """\
-base = "ghcr.io/x/run:1.0@sha256:{digest}"
-setup = ["pip install uv"]
 """.format(digest="0" * 64)
+
+STACK_TOML = """\
+worker_type = "claude-dev"
+node = "box1"
+"""
 
 
 # -- auth --------------------------------------------------------------------------
@@ -92,9 +93,9 @@ def test_provisioning_is_registration_no_register_endpoint(control: ControlRig):
 
 
 def test_heartbeat_distributes_only_this_nodes_desired_state(control: ControlRig):
+    control.write_config("worker-types/claude-dev.toml", WORKER_TYPE_TOML)
     control.write_config("stacks/worker.toml", STACK_TOML)
     control.write_config("stacks/elsewhere.toml", STACK_TOML.replace("box1", "box2"))
-    control.write_config("images/claude-dev.toml", IMAGE_TOML)
 
     config = control.heartbeat(node="box1").json()["config"]
     assert [s["name"] for s in config["stacks"]] == ["worker"]
@@ -584,6 +585,7 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     view — a pure API consumer needs no Config Repo access for any panel.
     The node channel is untouched: attach never rides a heartbeat."""
     control.write_config("stacks/deck.toml", ATTACH_STACK_TOML % ("0" * 64))
+    control.write_config("worker-types/claude-dev.toml", WORKER_TYPE_TOML)
     control.write_config("stacks/worker.toml", STACK_TOML)
 
     state = control.admin("GET", "/api/v1/state").json()
@@ -601,7 +603,12 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     ]
     assert by_name["deck"]["env"] == {"DECK_MODE": "quiet"}
     assert by_name["worker"]["attach"] == []
-    assert by_name["worker"]["env"] == {"THEOZOLITH_REPO": "acme/sandbox"}
+    # The resolved worker-type env surfaces in the read model (ADR-0044): the
+    # type injects THEOZOLITH_REPO/ADAPTER/RUN_IMAGE control-side.
+    worker_env = by_name["worker"]["env"]
+    assert worker_env["THEOZOLITH_REPO"] == "acme/sandbox"
+    assert worker_env["THEOZOLITH_ADAPTER"] == "claude"
+    assert worker_env["THEOZOLITH_RUN_IMAGE"].startswith("theozolith/claude-dev:")
 
     assert state["repo"] == "acme/sandbox"
     toml_view = state["control_toml"]

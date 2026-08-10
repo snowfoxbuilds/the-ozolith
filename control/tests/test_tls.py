@@ -19,8 +19,10 @@ from theozolith_nodedaemon.controlclient import ControlClient
 
 SENTINEL = "tls-transported-secret-value"
 
+# A neutral process Stack (the worker semantics are irrelevant to TLS
+# transport); a built-in-driver command would be rejected (ADR-0044).
 WORKER_STACK = (
-    'kind = "process"\nnode = "box1"\ncommand = "theozolith-worker"\n'
+    'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\n'
     '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n'
 )
 

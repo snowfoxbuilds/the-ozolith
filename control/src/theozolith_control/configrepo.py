@@ -8,14 +8,27 @@ topology is desired state), secret and image *values* never are.
 
 Layout::
 
-    stacks/<name>.toml   one Stack per file (kind, node, state, env, secrets,
-                         command/run_image | image/compose+overlays)
-    images/<name>.toml   derived-image recipes (digest-pinned base, setup,
-                         optional Knowledge Source)
-    product.toml         optional [product] version pin for the update command
+    stacks/<name>.toml        one Stack per file. A worker-type Stack is thin
+                              (worker_type + node + state + env + attach); a
+                              plain generic Stack carries the substrate format
+                              (kind, node, state, env, secrets, command |
+                              image/compose+overlays)
+    worker-types/<name>.toml  the complete customization unit for one worker
+                              (ADR-0044): driver/adapter/model/workspace/secrets
+                              plus the derived-image recipe (digest-pinned base,
+                              setup, optional Knowledge Source). Driverless
+                              types are Flight Decks (interactive containers).
+    product.toml              optional [product] version pin for the update command
 
 An empty or missing repo is a legal deployment (the deletion test): every
 node's desired state is simply empty.
+
+Worker-type Stacks are resolved into concrete generic ``StackDef``s at
+``load_config`` time, so every downstream consumer (secret scoping, jobs-dir
+checks, desired state, the wire) works on the substrate format and the daemon
+never special-cases workers (ADR-0044). The wire keys stay ``stacks`` and
+``images``: a resolved worker-type Stack is an ordinary Stack, and a worker
+type's derived-image recipe rides in ``images`` via ``recipe_wire()``.
 """
 
 from __future__ import annotations
@@ -23,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -31,6 +45,15 @@ from typing import Any
 
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
+
+# The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
+# supervised argv each resolves to control-side. The ADR-0020 sub-issue
+# repoints these to `theozolith-driver builtin:<name>`; the custom-driver
+# sub-issue (ADR-0042) turns `drivers/<name>` refs into real resolution.
+BUILTIN_DRIVERS = {
+    "builtin:implementer": "theozolith-worker",
+    "builtin:reviewer": "theozolith-reviewer",
+}
 
 # Where a node keeps per-Stack jobs directories unless a Stack's env says
 # otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
@@ -51,14 +74,37 @@ class ConfigRepoError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class ImageDef:
-    """One derived-image recipe (images/<name>.toml)."""
+class WorkerTypeDef:
+    """The complete customization unit for one worker (worker-types/<name>.toml,
+    ADR-0044): the run-image recipe plus the per-type variables — driver,
+    Agent adapter, model, workspace, and secrets. A strict superset of the
+    old ImageDef. Absence of ``driver`` is the discriminator: a driverless
+    type is a Flight Deck (interactive container) and may carry ``command``
+    and ``volumes``; a driver type is a pipeline worker (process kind).
+
+    The derived-image identity (``instruction_hash`` and ``tag``) is computed
+    over the image fields ONLY — driver/adapter/model/workspace/secrets do
+    not change image bytes, so renaming images/<name>.toml into worker-types/
+    with unchanged image fields yields the identical tag and rebuilds nothing
+    (ADR-0044 CRITICAL)."""
 
     name: str
     base: str  # full ref, pinned by digest
     setup: tuple[str, ...] = ()
     knowledge_source: str = ""
     knowledge_pin: str = ""
+    # -- per-type variables (excluded from the image identity) --
+    driver: str = ""  # "" (Flight Deck) | "builtin:<name>" | "drivers/<name>"
+    adapter: str = "claude"  # Agent adapter the harness invokes
+    model: str = ""  # "" = the driver's shipped default
+    workspace: str = ""  # target repo, owner/name (required with driver)
+    secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
+    command: str = ""  # driverless only: container start command
+    volumes: tuple[str, ...] = ()  # driverless only
+
+    @property
+    def is_driver(self) -> bool:
+        return bool(self.driver)
 
     @property
     def base_digest(self) -> str:
@@ -73,6 +119,9 @@ class ImageDef:
 
     @property
     def instruction_hash(self) -> str:
+        # CRITICAL (ADR-0044): exactly these four image fields, canonical JSON
+        # with sort_keys. Adding driver/adapter/model/workspace/secrets here
+        # would rehash every fleet image and trigger a rebuild storm.
         canonical = json.dumps(
             {
                 "base": self.base,
@@ -89,7 +138,10 @@ class ImageDef:
         """Deterministic: base tag + instruction hash (NODE-SUBSTRATE.md)."""
         return f"theozolith/{self.name}:{self.base_tag}-{self.instruction_hash[:12]}"
 
-    def as_wire(self) -> dict[str, Any]:
+    def recipe_wire(self) -> dict[str, Any]:
+        """The derived-image recipe as it rides in the ``images`` wire list —
+        byte-identical to the pre-ADR-0044 ImageDef.as_wire() so the daemon
+        needs no new keys and degraded-mode caches stay shape-compatible."""
         return {
             "name": self.name,
             "base": self.base,
@@ -111,13 +163,16 @@ class StackDef:
     kind: str  # "process" | "container"
     node: str  # placement: exact node name
     state: str = "running"  # desired: "running" | "stopped"
+    # The worker type this Stack resolved from (ADR-0044); "" for a plain
+    # generic Stack. Kept populated after resolution for display only — every
+    # other field is already concrete, so consumers never special-case it.
+    worker_type: str = ""
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
     # process kind: the supervised argv string. Container kind (single-image
     # form only): an optional docker-run command — how the Flight Deck
     # starts its named tmux session (ADR-0019).
     command: str = ""
-    run_image: str = ""  # process kind: images/<name> the driver launches
     image: str = ""  # container kind, single-image form
     ports: tuple[str, ...] = ()
     volumes: tuple[str, ...] = ()
@@ -143,7 +198,6 @@ class StackDef:
             "env": dict(self.env),
             "secrets": dict(self.secrets),
             "command": self.command,
-            "run_image": self.run_image,
             "image": self.image,
             "ports": list(self.ports),
             "volumes": list(self.volumes),
@@ -154,8 +208,8 @@ class StackDef:
 @dataclass(frozen=True)
 class DeployConfig:
     commit: str
-    stacks: tuple[StackDef, ...]
-    images: dict[str, ImageDef]
+    stacks: tuple[StackDef, ...]  # worker-type Stacks already resolved to concrete
+    worker_types: dict[str, WorkerTypeDef]
     product_version: str = ""
     repo_dir: Path | None = None
 
@@ -195,15 +249,19 @@ class DeployConfig:
         build-and-run sequence, and a scaffolded placeholder digest can
         never fail a build on a box that was born misconfigured."""
         stacks = self.stacks_for(node)
-        image_names = {
-            stack.run_image for stack in stacks if stack.run_image and stack.state == "running"
+        # Recipes ride for running Stacks of BOTH kinds (ADR-0044): the Flight
+        # Deck's derived image builds through the same list as a driver's.
+        recipe_names = {
+            stack.worker_type for stack in stacks if stack.worker_type and stack.state == "running"
         }
         return {
             "commit": self.commit,
             "product_version": self.product_version,
             "stacks": [stack.as_wire(self._compose_files(stack)) for stack in stacks],
             "images": [
-                self.images[name].as_wire() for name in sorted(image_names) if name in self.images
+                self.worker_types[name].recipe_wire()
+                for name in sorted(recipe_names)
+                if name in self.worker_types
             ],
         }
 
@@ -274,6 +332,16 @@ def _check_jobs_dirs(stacks: tuple[StackDef, ...]) -> None:
             claims[(stack.node, path)] = stack.name
 
 
+def _valid_workspace(value: str) -> bool:
+    """The documented workspace shape: exactly two non-empty path components
+    (``owner/name``). Deliberately NOT GitHub's full naming policy — only the
+    two-component promise the schema makes. Rejects ``/repo``, ``owner/``,
+    ``owner/repo/extra``, ``///``, and any empty or whitespace-only
+    component (ADR-0044 amendment)."""
+    parts = value.split("/")
+    return len(parts) == 2 and all(part.strip() for part in parts)
+
+
 def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
     value = data.get(key, {})
     if not isinstance(value, dict) or any(
@@ -281,6 +349,21 @@ def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
     ):
         raise ConfigRepoError(f"{context}: {key!r} must be a table of strings")
     return dict(value)
+
+
+# Fields that a fat pre-ADR-0044 Stack carried but that now live in the worker
+# type. A thin worker-type Stack that still declares one is rejected by name.
+_MOVED_TO_WORKER_TYPE = (
+    "kind",
+    "command",
+    "image",
+    "compose",
+    "overlays",
+    "ports",
+    "volumes",
+    "secrets",
+)
+_WORKER_TYPE_STACK_KEYS = ("worker_type", "node", "state", "env", "attach")
 
 
 def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
@@ -292,6 +375,50 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
             " always runs as its own systemd unit ('theozolith serve') on its"
             " host, on every deployment shape"
         )
+    if "run_image" in data:
+        raise ConfigRepoError(
+            f"{context}: run_image is gone — declare a worker type and set"
+            " worker_type on the Stack (ADR-0044)"
+        )
+    if "worker_type" in data:
+        return _parse_worker_type_stack(name, data, context)
+    return _parse_generic_stack(name, data, context)
+
+
+def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> StackDef:
+    """A thin worker-type Stack (ADR-0044): worker_type + placement + desired
+    state, nothing else. kind/command/image/... all moved into the worker
+    type; the concrete StackDef is produced later at resolution."""
+    worker_type = _require_str(data, "worker_type", context)
+    for key in data:
+        if key in _MOVED_TO_WORKER_TYPE:
+            raise ConfigRepoError(
+                f"{context}: {key!r} moved to worker-types/{worker_type}.toml"
+                " (ADR-0044) — a worker-type Stack declares only worker_type,"
+                " node, state, env, attach"
+            )
+        if key not in _WORKER_TYPE_STACK_KEYS:
+            raise ConfigRepoError(
+                f"{context}: unknown key {key!r} on a worker-type Stack"
+                " (allowed: worker_type, node, state, env, attach)"
+            )
+    state = _require_str(data, "state", context, default="running")
+    if state not in DESIRED_STATES:
+        raise ConfigRepoError(f"{context}: state must be one of {DESIRED_STATES}, got {state!r}")
+    return StackDef(
+        name=name,
+        kind="",  # derived at resolution: driver type -> process, else container
+        node=_require_str(data, "node", context),
+        state=state,
+        worker_type=worker_type,
+        env=_str_map(data, "env", context),
+        attach=_parse_attach(data, context),
+    )
+
+
+def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> StackDef:
+    """A plain substrate Stack (no worker_type): the workload-agnostic format
+    the substrate keeps for arbitrary process/container workloads."""
     kind = _require_str(data, "kind", context)
     if kind not in STACK_KINDS:
         raise ConfigRepoError(f"{context}: kind must be one of {STACK_KINDS}, got {kind!r}")
@@ -306,7 +433,6 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
         env=_str_map(data, "env", context),
         secrets=_str_map(data, "secrets", context),
         command=_require_str(data, "command", context, default=""),
-        run_image=_require_str(data, "run_image", context, default=""),
         image=_require_str(data, "image", context, default=""),
         ports=_str_list(data, "ports", context),
         volumes=_str_list(data, "volumes", context),
@@ -316,6 +442,32 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
     )
     if stack.kind == "process" and not stack.command:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")
+    # Parse the command with the SAME argv semantics the supervisor executes
+    # with (shlex.split, not str.split), so a quoted built-in — command =
+    # '"theozolith-worker"' — is recognized here and rejected, instead of
+    # sailing past a naive whitespace split and launching at run time.
+    # Malformed shell quoting becomes a clear ConfigRepoError, never an
+    # uncaught exception or a command that validates now and fails at launch.
+    if stack.command:
+        try:
+            argv = shlex.split(stack.command)
+        except ValueError as exc:
+            raise ConfigRepoError(
+                f"{context}: 'command' is not valid shell syntax ({exc}) — fix the quoting"
+            ) from exc
+    else:
+        argv = []
+    # The built-in drivers only work with the environment a worker type
+    # injects (THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE): a plain Stack that
+    # invokes one directly is the old fat-Stack form and is rejected (ADR-0044).
+    argv0 = argv[0] if argv else ""
+    if stack.kind == "process" and argv0 in BUILTIN_DRIVERS.values():
+        raise ConfigRepoError(
+            f"{context}: command {argv0!r} is a built-in driver — declare a"
+            " worker type (worker-types/<name>.toml) and set worker_type on the"
+            " Stack instead (ADR-0044); the driver only runs with the env a"
+            " worker type injects"
+        )
     if stack.kind == "container" and bool(stack.image) == bool(stack.compose):
         raise ConfigRepoError(f"{context}: container Stacks declare exactly one of image/compose")
     if stack.attach and stack.kind != "container":
@@ -332,18 +484,131 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
     return stack
 
 
-def _parse_image(name: str, data: dict[str, Any]) -> ImageDef:
-    context = f"images/{name}.toml"
+def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
+    context = f"worker-types/{name}.toml"
     base = _require_str(data, "base", context)
     if "@sha256:" not in base:
         raise ConfigRepoError(f"{context}: base must be pinned by digest (ADR-0006)")
-    return ImageDef(
+    driver = _require_str(data, "driver", context, default="")
+    workspace = _require_str(data, "workspace", context, default="")
+    command = _require_str(data, "command", context, default="")
+    volumes = _str_list(data, "volumes", context)
+    if driver:
+        is_custom = driver.startswith("drivers/") and len(driver) > len("drivers/")
+        if driver not in BUILTIN_DRIVERS and not is_custom:
+            if driver.startswith("builtin:"):
+                known = ", ".join(sorted(BUILTIN_DRIVERS))
+                raise ConfigRepoError(
+                    f"{context}: unknown built-in driver {driver!r} (known: {known})"
+                )
+            raise ConfigRepoError(
+                f"{context}: driver must be 'builtin:<name>' or 'drivers/<name>'"
+                f" (ADR-0042), got {driver!r}"
+            )
+        if not workspace:
+            raise ConfigRepoError(
+                f"{context}: 'workspace' (owner/name) is required when a driver is set"
+            )
+        for field_name, present in (("command", command), ("volumes", volumes)):
+            if present:
+                raise ConfigRepoError(
+                    f"{context}: {field_name!r} is a driverless (Flight Deck) field"
+                    " and is rejected when a driver is set (ADR-0044)"
+                )
+    if workspace and not _valid_workspace(workspace):
+        raise ConfigRepoError(
+            f"{context}: 'workspace' must be owner/name — exactly two non-empty"
+            f" path components — got {workspace!r}"
+        )
+    return WorkerTypeDef(
         name=name,
         base=base,
         setup=_str_list(data, "setup", context),
         knowledge_source=_require_str(data, "knowledge_source", context, default=""),
         knowledge_pin=_require_str(data, "knowledge_pin", context, default=""),
+        driver=driver,
+        adapter=_require_str(data, "adapter", context, default="claude"),
+        model=_require_str(data, "model", context, default=""),
+        workspace=workspace,
+        secrets=_str_map(data, "secrets", context),
+        command=command,
+        volumes=volumes,
     )
+
+
+def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
+    """Turn a thin worker-type Stack into a concrete generic StackDef (ADR-0044).
+
+    Env injection happens control-side (the daemon's run_image linkage is
+    gone): the type supplies THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE, then the
+    Stack's own [env] overrides. The kind is derived from the type's driver."""
+    context = f"stacks/{stack.name}.toml"
+    if wt.is_driver:
+        if wt.driver.startswith("drivers/"):
+            raise ConfigRepoError(
+                f"worker-types/{wt.name}.toml: config-distribution driver delivery"
+                " is not yet implemented (ADR-0042)"
+            )
+        if stack.attach:
+            raise ConfigRepoError(
+                f"{context}: 'attach' is only valid on container-kind Stacks — worker"
+                f" type {wt.name!r} has a driver, so the Stack resolves to process"
+                " kind (ADR-0019/ADR-0044)"
+            )
+        env = {
+            "THEOZOLITH_REPO": wt.workspace,
+            "THEOZOLITH_ADAPTER": wt.adapter,
+            "THEOZOLITH_RUN_IMAGE": wt.tag,
+        }
+        if wt.model:
+            env["THEOZOLITH_MODEL"] = wt.model
+        env.update(stack.env)
+        return StackDef(
+            name=stack.name,
+            kind="process",
+            node=stack.node,
+            state=stack.state,
+            worker_type=wt.name,
+            env=env,
+            secrets=dict(wt.secrets),
+            command=BUILTIN_DRIVERS[wt.driver],
+        )
+    # Driverless: an interactive Flight Deck container running the derived tag.
+    env: dict[str, str] = {}
+    if wt.workspace:
+        env["THEOZOLITH_REPO"] = wt.workspace
+    env.update(stack.env)
+    return StackDef(
+        name=stack.name,
+        kind="container",
+        node=stack.node,
+        state=stack.state,
+        worker_type=wt.name,
+        env=env,
+        secrets=dict(wt.secrets),
+        command=wt.command,
+        image=wt.tag,
+        volumes=wt.volumes,
+        attach=stack.attach,
+    )
+
+
+def _resolve_stacks(
+    stacks: tuple[StackDef, ...], worker_types: dict[str, WorkerTypeDef]
+) -> tuple[StackDef, ...]:
+    resolved: list[StackDef] = []
+    for stack in stacks:
+        if not stack.worker_type:
+            resolved.append(stack)
+            continue
+        wt = worker_types.get(stack.worker_type)
+        if wt is None:
+            raise ConfigRepoError(
+                f"stacks/{stack.name}.toml: worker_type {stack.worker_type!r} has no"
+                f" worker-types/{stack.worker_type}.toml"
+            )
+        resolved.append(_resolve_worker_stack(stack, wt))
+    return tuple(resolved)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -375,16 +640,25 @@ def _commit(repo_dir: Path) -> str:
 def load_config(repo_dir: Path) -> DeployConfig:
     """Parse the Config Repo; a missing repo is an empty deployment."""
     if not repo_dir.is_dir():
-        return DeployConfig(commit="", stacks=(), images={})
-    stacks = tuple(
-        _parse_stack(path.stem, _load_toml(path))
-        for path in sorted((repo_dir / "stacks").glob("*.toml"))
+        return DeployConfig(commit="", stacks=(), worker_types={})
+    if any((repo_dir / "images").glob("*.toml")):
+        raise ConfigRepoError(
+            "images/ is gone — rename each images/<name>.toml into"
+            " worker-types/<name>.toml and add the worker-type fields"
+            " (driver/adapter/model/workspace/secrets) (ADR-0044)"
+        )
+    worker_types = {
+        path.stem: _parse_worker_type(path.stem, _load_toml(path))
+        for path in sorted((repo_dir / "worker-types").glob("*.toml"))
+    }
+    stacks = _resolve_stacks(
+        tuple(
+            _parse_stack(path.stem, _load_toml(path))
+            for path in sorted((repo_dir / "stacks").glob("*.toml"))
+        ),
+        worker_types,
     )
     _check_jobs_dirs(stacks)
-    images = {
-        path.stem: _parse_image(path.stem, _load_toml(path))
-        for path in sorted((repo_dir / "images").glob("*.toml"))
-    }
     product_version = ""
     product = repo_dir / "product.toml"
     if product.is_file():
@@ -396,7 +670,7 @@ def load_config(repo_dir: Path) -> DeployConfig:
     return DeployConfig(
         commit=_commit(repo_dir),
         stacks=stacks,
-        images=images,
+        worker_types=worker_types,
         product_version=product_version,
         repo_dir=repo_dir,
     )

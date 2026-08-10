@@ -21,6 +21,7 @@ import pytest
 from theozolith_nodedaemon.config import DaemonConfig
 from theozolith_nodedaemon.controlclient import ControlClient, ControlUnreachable
 from theozolith_nodedaemon.daemon import NodeDaemon
+from theozolith_nodedaemon.dockerctl import DockerError
 from theozolith_nodedaemon.stacks import ProcessSupervisor
 
 _PID = itertools.count(50_000)
@@ -67,6 +68,19 @@ class FakeDocker:
         self.images: dict[str, dict[str, str]] = {}  # tag -> labels
         self.builds: list[dict[str, Any]] = []
         self.removed: list[str] = []
+        # Every compose invocation, verbatim: (project, [file paths], verb). The
+        # regression tests assert a `down` carries the retained materialized
+        # paths (never an empty file list), not merely that state mutated.
+        self.compose_calls: list[tuple[str, list[str], str]] = []
+        # Failure injection for isolation tests: a remove of a name here, or a
+        # compose `down`/`up` of a project here, raises DockerError.
+        self.fail_remove: set[str] = set()
+        self.fail_compose_down: set[str] = set()
+        self.fail_compose_up: set[str] = set()
+        # Compose projects that are present but NOT running (stopped/exited): a
+        # `compose_ps` for one of these reports a non-running row, so the daemon's
+        # liveness check treats it as down and brings it up again.
+        self.compose_stopped: set[str] = set()
 
     def add_run_container(self, name: str, run_id: str, owner: str) -> None:
         self.containers[name] = {
@@ -89,6 +103,8 @@ class FakeDocker:
         return rows
 
     def remove(self, name: str) -> None:
+        if name in self.fail_remove:
+            raise DockerError(f"remove failed for {name}")
         self.removed.append(name)
         self.containers.pop(name, None)
         self.stacks.pop(name, None)
@@ -96,8 +112,9 @@ class FakeDocker:
     # -- container Stacks ----------------------------------------------------
 
     def run_stack_container(
-        self, stack, image, *, env_files, env, ports, volumes, command=None
+        self, stack, image, *, env_files, env, ports, volumes, command=None, spec=""
     ) -> None:
+        self.remove(f"ozolith-stack-{stack}")  # faithful to DockerCtl: rm --force first
         self.stacks[f"ozolith-stack-{stack}"] = {
             "stack": stack,
             "image": image,
@@ -107,18 +124,35 @@ class FakeDocker:
             "ports": list(ports),
             "volumes": list(volumes),
             "command": list(command or []),
+            # Mirrors the real LABEL_STACK_SPEC label; stack_containers surfaces
+            # it as a row key, exactly as DockerCtl._ps flattens labels.
+            "theozolith.spec": spec,
         }
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:
+        self.compose_calls.append((project, [str(f) for f in files], verb))
+        if verb == "down" and project in self.fail_compose_down:
+            raise DockerError(f"compose down failed for {project}")
+        if verb == "up" and project in self.fail_compose_up:
+            raise DockerError(f"compose up failed for {project}")
         if verb == "up":
             self.compose_projects[project] = [str(f) for f in files]
+            self.compose_stopped.discard(project)  # a fresh up is running
         else:
             self.compose_projects.pop(project, None)
+            self.compose_stopped.discard(project)
 
     def compose_ps(self, project: str) -> list[dict[str, str]]:
         if project not in self.compose_projects:
             return []
-        return [{"name": f"{project}-control-1", "state": "running", "status": "Up"}]
+        running = project not in self.compose_stopped
+        return [
+            {
+                "name": f"{project}-control-1",
+                "state": "running" if running else "exited",
+                "status": "Up" if running else "Exited (0)",
+            }
+        ]
 
     # -- images -----------------------------------------------------------------
 
@@ -271,7 +305,6 @@ def process_stack(name: str = "worker", **overrides) -> dict:
         "env": {"THEOZOLITH_REPO": "acme/sandbox"},
         "secrets": {},
         "command": f"{name}-driver --loop",
-        "run_image": "",
         "image": "",
         "ports": [],
         "volumes": [],
@@ -290,7 +323,6 @@ def container_stack(name: str = "flightdeck", **overrides) -> dict:
         "env": {},
         "secrets": {},
         "command": "",
-        "run_image": "",
         "image": "theozolith-flightdeck:local",
         "ports": ["8443:8443"],
         "volumes": [],

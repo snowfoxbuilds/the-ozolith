@@ -72,6 +72,15 @@ class DaemonConfig:
         return self.state_dir / "drained.json"
 
     @property
+    def applied_compose_path(self) -> Path:
+        # Non-secret applied compose metadata (fingerprint + materialized file
+        # paths) that must survive a daemon restart so a compose project which
+        # outlived the daemon is still torn down / recovered on a later
+        # same-name transition (ADR-0044 amendment). Beside drained.json —
+        # applied runtime state, not deletable cache.
+        return self.state_dir / "applied-compose.json"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 

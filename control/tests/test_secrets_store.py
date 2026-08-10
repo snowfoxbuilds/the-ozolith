@@ -8,8 +8,11 @@ from theozolith_control.crypto import SecretBox, generate_key
 
 SENTINEL = "ghp_SUPERSECRETVALUE12345"
 
+# A plain process Stack referencing a secret — the worker semantics are
+# irrelevant here (this exercises secret scoping), so a neutral command
+# keeps the built-in-driver guard out of the way (ADR-0044).
 WORKER_STACK = (
-    'kind = "process"\nnode = "box1"\ncommand = "theozolith-worker"\n'
+    'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\n'
     '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n'
 )
 

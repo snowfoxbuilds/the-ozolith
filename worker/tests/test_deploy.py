@@ -126,15 +126,16 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     config = load_config(REPO_ROOT / "deploy" / "configs-example")
     kinds = {stack.name: stack.kind for stack in config.stacks}
     assert kinds == {
-        "worker": "process",
+        "implementer": "process",
         "reviewer": "process",
         "flightdeck": "container",
     }
     assert config.product_version
-    assert "claude-dev" in config.images
-    # The worker Stack's node gets exactly its referenced secrets.
-    worker = next(s for s in config.stacks if s.name == "worker")
-    assert config.secret_names_for(worker.node) >= {"github-worker", "anthropic-api-key"}
+    assert "claude-dev" in config.worker_types
+    # The Implementer Stack's node gets exactly its referenced secrets (the
+    # worker type owns them, ADR-0044).
+    implementer = next(s for s in config.stacks if s.name == "implementer")
+    assert config.secret_names_for(implementer.node) >= {"github-implementer", "anthropic-api-key"}
     # Desired state renders (compose text inlines) for every placed node.
     for node in {stack.node for stack in config.stacks}:
         state = config.desired_state_for(node)

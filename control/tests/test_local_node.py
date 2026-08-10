@@ -645,7 +645,7 @@ def test_failed_bootstrap_retries_without_force_or_ca_rotation(local_cli, monkey
     ca_after_first = (local_cli.home / "secrets" / "tls" / "ca.pem").read_bytes()
 
     # The operator edits a scaffold file between attempts.
-    stack = local_cli.home / "configs" / "stacks" / "worker.toml"
+    stack = local_cli.home / "configs" / "stacks" / "implementer.toml"
     edited = stack.read_text() + "\n# operator note\n"
     stack.write_text(edited)
 
@@ -703,16 +703,22 @@ def test_scaffold_is_complete_staged_and_committed(tmp_path):
     subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
 
     written = localnode.write_scaffold(repo, "localbox", log=lambda _: None)
-    assert sorted(written) == ["README.md", "images/claude-dev.toml", "stacks/worker.toml"]
+    assert sorted(written) == [
+        "README.md",
+        "stacks/implementer.toml",
+        "worker-types/claude-dev.toml",
+    ]
 
-    # The scaffold parses under the real validator, staged stopped.
+    # The scaffold parses under the real validator, staged stopped. The thin
+    # Stack resolves through its worker type (ADR-0044).
     config = load_config(repo)
-    worker = next(s for s in config.stacks if s.name == "worker")
+    worker = next(s for s in config.stacks if s.name == "implementer")
     assert worker.kind == "process" and worker.node == "localbox"
     assert worker.state == "stopped"
-    assert worker.run_image == "claude-dev"
-    assert set(worker.secrets.values()) == {"github-worker", "anthropic-api-key"}
-    assert "claude-dev" in config.images  # placeholder digest passes validation
+    assert worker.worker_type == "claude-dev"
+    assert worker.env["THEOZOLITH_RUN_IMAGE"].startswith("theozolith/claude-dev:")
+    assert set(worker.secrets.values()) == {"github-implementer", "anthropic-api-key"}
+    assert "claude-dev" in config.worker_types  # placeholder digest passes validation
 
     # Stage-don't-deploy (ADR-0037): nothing rides desired state to build.
     assert config.desired_state_for("localbox")["images"] == []
@@ -733,8 +739,8 @@ def test_scaffold_is_complete_staged_and_committed(tmp_path):
 def test_scaffold_never_overwrites_operator_edits(tmp_path):
     repo = tmp_path / "configs"
     (repo / "stacks").mkdir(parents=True)
-    edited = 'kind = "process"\nnode = "elsewhere"\ncommand = "theozolith-worker"\n'
-    (repo / "stacks" / "worker.toml").write_text(edited)
+    edited = 'worker_type = "claude-dev"\nnode = "elsewhere"\n'
+    (repo / "stacks" / "implementer.toml").write_text(edited)
     written = localnode.write_scaffold(repo, "localbox", log=lambda _: None)
-    assert "stacks/worker.toml" not in written
-    assert (repo / "stacks" / "worker.toml").read_text() == edited
+    assert "stacks/implementer.toml" not in written
+    assert (repo / "stacks" / "implementer.toml").read_text() == edited

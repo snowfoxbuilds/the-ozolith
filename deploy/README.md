@@ -72,8 +72,9 @@ Stacks and worker types on top, never below.
    and runs the unmodified join flow internally — the join token is minted and
    consumed machine-to-machine (you never see a join string), the local daemon
    persists a **loopback** dial address (LAN renumbering never touches it),
-   and the Config Repo is seeded with a complete worker Stack staged at
-   `state = "stopped"` plus a README naming the finish line. Requires docker
+   and the Config Repo is seeded with a thin Implementer Stack and the worker
+   type it names (ADR-0044) staged at `state = "stopped"` plus a README naming
+   the finish line. Requires docker
    and the `theozolith-nodedaemon` CLI in the same install (the bare-metal
    build installs all four distributions).
 
@@ -98,7 +99,7 @@ Stacks and worker types on top, never below.
    it stays honored for unprivileged and compose runs, which use
    `~/.theozolith/`) —
    partitioned by durability class (ADR-0024): `configs/` (the git-backed
-   Config Repo — `control.toml`, `stacks/`, `images/`, `product.toml`),
+   Config Repo — `control.toml`, `stacks/`, `worker-types/`, `product.toml`),
    `secrets/` (master key, CA keypair, TLS material, admin password hash,
    `store.db` — a **sibling** of configs/, never inside any git tree), `cache/`
    (`cache.db`, deletable at any time: costs a re-login and one heartbeat

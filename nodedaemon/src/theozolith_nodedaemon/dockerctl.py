@@ -19,6 +19,11 @@ LABEL_RUN_ID = "theozolith.run-id"
 LABEL_OWNER = "theozolith.owner"
 # Label on containers the daemon itself runs for container Stacks.
 LABEL_STACK = "theozolith.stack"
+# Applied effective-spec fingerprint stamped on a single-image stack container
+# so convergence survives a daemon restart: the running container carries the
+# spec it was launched with, and a mismatch (or a missing label on a
+# pre-existing container) triggers exactly one controlled replacement (ADR-0044).
+LABEL_STACK_SPEC = "theozolith.spec"
 
 STACK_CONTAINER_PREFIX = "ozolith-stack-"
 
@@ -93,8 +98,40 @@ class DockerCtl:
         label = LABEL_STACK if stack is None else f"{LABEL_STACK}={stack}"
         return self._ps(label)
 
+    def _container_exists(self, name: str) -> bool:
+        """Postcondition backstop for ``remove``: is a container by this exact
+        name still present? A ``ps`` failure cannot prove absence, so it reports
+        present (fail closed — a genuine removal failure must never masquerade as
+        idempotent success)."""
+        proc = self._run(
+            ["ps", "--all", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+            check=False,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            return True
+        return any(line.strip() == name for line in (proc.stdout or "").splitlines())
+
     def remove(self, name: str) -> None:
-        self._run(["rm", "--force", name], check=False, timeout=60)
+        """Force-remove a container, raising DockerError on a genuine failure.
+
+        A previous version suppressed the CLI return code, so a failed
+        ``docker rm --force`` silently looked like success — letting a caller
+        start a successor while the predecessor still ran (two forms under one
+        name). Removal stays IDEMPOTENT: an already-absent container is success,
+        classified from the CLI's ``no such container`` and, as a backstop for
+        any other non-zero result, confirmed by a postcondition existence check.
+        Only a container that genuinely survives the remove raises (ADR-0044
+        amendment)."""
+        proc = self._run(["rm", "--force", name], check=False, timeout=60)
+        if proc.returncode == 0:
+            return
+        stderr = proc.stderr or ""
+        if "no such container" in stderr.lower():
+            return  # already absent — idempotent success
+        if not self._container_exists(name):
+            return  # gone despite the non-zero result — idempotent success
+        raise DockerError(f"docker rm failed for {name}: {stderr.strip()}")
 
     # -- container Stacks ------------------------------------------------------
 
@@ -108,6 +145,7 @@ class DockerCtl:
         ports: list[str],
         volumes: list[str],
         command: list[str] | None = None,
+        spec: str = "",
     ) -> None:
         """Single-image container Stack: one long-running container."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
@@ -122,6 +160,8 @@ class DockerCtl:
             "--label",
             f"{LABEL_STACK}={stack}",
         ]
+        if spec:
+            args += ["--label", f"{LABEL_STACK_SPEC}={spec}"]
         for key, value in sorted(env.items()):
             args += ["--env", f"{key}={value}"]
         for key, host_path in sorted(env_files.items()):

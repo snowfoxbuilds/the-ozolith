@@ -1,11 +1,12 @@
-"""Harness adapters: the vendor-specific slice of a run-container image.
+"""Agent adapters: the vendor-specific slice of a run-container image (ADR-0044).
 
-An adapter knows three things about its agent CLI: the headless one-shot
-argv to invoke (a constant-size pointer prompt at invocation — the task
-content stays in the mounted job directory; completion is process exit,
-ADR-0019 as amended), how to read counters and token usage out of the
-structured output stream, and which session outputs to copy into the job
-directory. One adapter ships per image; M2 ships Claude only.
+An adapter is the per-worker-type variable the immutable harness invokes: it
+knows three things about its agent CLI — the headless one-shot argv to invoke
+(a constant-size pointer prompt at invocation — the task content stays in the
+mounted job directory; completion is process exit, ADR-0019 as amended), how
+to read counters and token usage out of the structured output stream, and
+which session outputs to copy into the job directory. One adapter ships per
+image; M2 ships Claude only.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Protocol
 from theozolith_worker.jobdir import MODE_REVIEW, VERDICT_FILE, Manifest
 
 
-class HarnessAdapterError(RuntimeError):
+class AgentAdapterError(RuntimeError):
     """No adapter for the requested agent."""
 
 
@@ -35,7 +36,7 @@ class StreamStats:
     tokens: int | None = None
 
 
-class HarnessAdapter(Protocol):
+class AgentAdapter(Protocol):
     name: str
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
@@ -56,7 +57,7 @@ class HarnessAdapter(Protocol):
         ...
 
 
-class ClaudeHarnessAdapter:
+class ClaudeAdapter:
     """Drives the Claude Code CLI. All Claude-specific mechanics live here.
 
     The session runs headless: ``claude -p`` with the pointer prompt as the
@@ -155,7 +156,7 @@ def _usage_total(usage: object) -> int | None:
     return total if seen else None
 
 
-def make_harness_adapter(name: str) -> HarnessAdapter:
+def make_agent_adapter(name: str) -> AgentAdapter:
     if name == "claude":
-        return ClaudeHarnessAdapter()
-    raise HarnessAdapterError(f"unknown harness adapter {name!r} (M2 ships: claude)")
+        return ClaudeAdapter()
+    raise AgentAdapterError(f"unknown Agent adapter {name!r} (M2 ships: claude)")

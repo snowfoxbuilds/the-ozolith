@@ -31,12 +31,15 @@ across daemon restarts until a recycle clears it (ADR-0015).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +56,11 @@ from theozolith_nodedaemon.controlclient import (
     ControlError,
     ControlUnreachable,
 )
-from theozolith_nodedaemon.dockerctl import DockerCtl
+from theozolith_nodedaemon.dockerctl import (
+    LABEL_STACK_SPEC,
+    STACK_CONTAINER_PREFIX,
+    DockerCtl,
+)
 from theozolith_nodedaemon.stacks import (
     ProcessSupervisor,
     WireStack,
@@ -62,6 +69,15 @@ from theozolith_nodedaemon.stacks import (
 )
 
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
+
+# The built-in driver commands a worker type resolves to control-side
+# (control's configrepo.BUILTIN_DRIVERS values). This is driver knowledge, not
+# worker-type schema — the daemon still never parses a worker type. A built-in
+# driver only functions with a control-authored THEOZOLITH_RUN_IMAGE; seeing
+# one of these commands WITHOUT that env means old or incomplete desired state,
+# and the daemon fails that Stack closed rather than launch it against the
+# worker package's default run image (ADR-0044 amendment).
+BUILTIN_DRIVER_COMMANDS = ("theozolith-worker", "theozolith-reviewer")
 
 # theozolith.error events (2026-07-21 grilling): size-capped summaries
 # pointing at the failing node/component; diagnostic depth stays in the
@@ -85,6 +101,77 @@ DEFAULT_JOBS_BASE = "/var/tmp/theozolith/jobs"
 def stack_jobs_dir(stack: WireStack) -> Path:
     explicit = stack.env.get("THEOZOLITH_JOBS_DIR", "")
     return Path(explicit) if explicit else Path(DEFAULT_JOBS_BASE) / stack.name
+
+
+# AppliedCompose lifecycle states (ADR-0044 amendment: crash-consistent compose
+# startup). PENDING is the write-ahead record persisted BEFORE compose up — its
+# mere presence never claims the project is healthy (compose_ps is the liveness
+# authority), it only guarantees a durable teardown/retry context if the daemon
+# dies anywhere from the write-ahead through the post-up confirmation. APPLIED is
+# the optional confirmation stamped after a successful up. Both states carry
+# identical recovery power (name + fingerprint + files); the distinction is
+# informational, so a lost confirmation degrades to a still-usable PENDING record.
+COMPOSE_PENDING = "pending"
+COMPOSE_APPLIED = "applied"
+
+
+@dataclass
+class AppliedCompose:
+    """The non-secret recovery record for a compose project this daemon is
+    bringing up or has brought up: its effective fingerprint (change detection),
+    the materialized compose/overlay file PATHS, and a lifecycle ``state``
+    (``pending`` write-ahead / ``applied`` confirmed). Retaining the paths lets a
+    later ``down`` run with real teardown context — a valid ``docker compose
+    --file … down`` — rather than an empty file list (ADR-0044 amendment). Secret
+    VALUES never enter this record: it holds file paths, and the compose documents
+    carry secret references (the VAR_FILE convention), not values.
+
+    The record is persisted to disk (``applied_compose_path``) and reloaded on
+    boot, so a compose project that outlived the daemon is still distinguishable
+    and tearable down during a later same-name kind/form transition — the paths
+    survive because they are references, and the fingerprint carries only compose
+    documents (secret references, not values), env, and the secret NAME mapping.
+
+    The referenced files live in a generation-addressed directory keyed by the
+    fingerprint (``_compose_paths``/``_compose_generation``), so a record's files
+    are IMMUTABLE for its lifetime: a new spec materializes a new generation and
+    never rewrites the bytes this record points at. Obsolete generations are
+    reclaimed only after a transition is confirmed applied or a project is downed
+    (ADR-0044 amendment: immutable/versioned materialization).
+
+    The record is written AHEAD of compose up (state ``pending``) so a crash after
+    Docker creates the project but before confirmation still leaves durable
+    recovery metadata; a successful up promotes it to ``applied`` best-effort."""
+
+    fingerprint: str
+    files: list[str]
+    state: str = COMPOSE_APPLIED
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fingerprint": self.fingerprint,
+            "files": list(self.files),
+            "state": self.state,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AppliedCompose | None:
+        """Validate a persisted record before its file paths are trusted for a
+        teardown: it must be a dict with a NON-EMPTY list of non-empty file paths
+        (an empty file list could only yield an invalid, empty ``compose … down``,
+        which is exactly what retaining the paths exists to avoid). A missing
+        ``state`` reads as ``applied`` — the only records the pre-write-ahead code
+        wrote were post-up, so treating them as confirmed is crash-correct."""
+        if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            return None
+        files = [str(f) for f in data["files"] if str(f)]
+        if not files:
+            return None
+        return cls(
+            fingerprint=str(data.get("fingerprint", "")),
+            files=files,
+            state=str(data.get("state", "") or COMPOSE_APPLIED),
+        )
 
 
 def _log(message: str) -> None:
@@ -137,7 +224,25 @@ class NodeDaemon:
         self._desired: dict[str, Any] = _read_json(config.cache_path, {})
         self._drained: set[str] = set(_read_json(config.drained_path, []))
         self._completed: list[int] = _read_json(self._acks_path, [])
-        self._applied_compose: dict[str, str] = {}
+        # Compose projects this daemon is bringing up or has brought up, name ->
+        # recovery record. The record retains the materialized compose/overlay
+        # paths so a later down (change, transition, stopped/drained,
+        # absent-from-desired) is a valid `docker compose --file … down`, never an
+        # empty file list (ADR-0044). It is written AHEAD of compose up (state
+        # pending) and confirmed after (state applied), and is persisted to disk
+        # and reloaded here: a compose project can outlive — or crash-orphan
+        # itself past — the daemon, so the record must survive a restart for a
+        # later same-name kind/form transition to distinguish and tear it down
+        # (ADR-0044 amendment). Only non-secret metadata is stored — fingerprint,
+        # file paths, and lifecycle state — never secret values.
+        self._applied_compose: dict[str, AppliedCompose] = self._load_applied_compose()
+        # The jobs directory each live process child was LAUNCHED with (its
+        # applied THEOZOLITH_JOBS_DIR). The minimum non-secret applied-spec
+        # fact needed to queue a desired-state restart behind an in-flight Run
+        # even when the desired jobs dir has since changed (ADR-0044 amendment).
+        # In-memory by design: supervised children never outlive the daemon, so
+        # a restart clears both the children and this map together.
+        self._applied_jobs_dir: dict[str, str] = {}
         self._rebuild_targets: set[str] = set()
         # Queue-behind: command id -> deferral reason, reported in heartbeats.
         self._deferrals: dict[int, str] = {}
@@ -384,59 +489,224 @@ class NodeDaemon:
     def _stack_by_name(self, name: str) -> WireStack | None:
         return next((s for s in self._stacks() if s.name == name), None)
 
+    def _live_jobs_dir(self, stack: WireStack) -> Path:
+        """The jobs directory the currently running child was LAUNCHED with —
+        the applied path, which can differ from the desired one when
+        THEOZOLITH_JOBS_DIR changed but the child has not yet been restarted
+        onto it (that restart is itself queued behind the in-flight Run). Falls
+        back to the desired path when no applied path is on record (a child this
+        daemon has not launched, e.g. before the first start)."""
+        applied = self._applied_jobs_dir.get(stack.name)
+        return Path(applied) if applied else stack_jobs_dir(stack)
+
+    def _active_runs(self, jobs_dir: Path) -> list[str]:
+        """The live Run directories under a jobs dir, sorted. Dot-prefixed
+        names are never live Runs (run ids start with a timestamp digit): the
+        driver's evidence-loss tombstone (worker sweep.TOMBSTONE_PREFIX,
+        ADR-0019 parking ladder) renames undeletable remnants to a hidden name
+        exactly so this signal skips them."""
+        try:
+            return sorted(
+                p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+            )
+        except OSError:
+            return []
+
     def _inflight_blocker(self, names: list[str] | None) -> str | None:
         """The in-flight signal for queue-behind: a live driver child whose
-        jobs dir holds a job directory. A dead child never blocks — its
-        orphaned dirs are the boot sweep's business, not a Run. Dot-prefixed
-        names are never live Runs (run ids start with a timestamp digit):
-        the driver's evidence-loss tombstone (worker sweep.TOMBSTONE_PREFIX,
-        ADR-0019 parking ladder) renames undeletable remnants to a hidden
-        name exactly so this signal skips them."""
+        jobs dir holds a job directory. The jobs dir inspected is the one the
+        RUNNING child was launched with (``_live_jobs_dir``), not necessarily
+        the desired one, so a THEOZOLITH_JOBS_DIR change still observes a Run
+        under the old path. A dead child never blocks — its orphaned dirs are
+        the boot sweep's business, not a Run. Scans DESIRED process Stacks, so
+        it does not see a child whose desired kind has flipped away from
+        process (that case uses ``_child_inflight_blocker``)."""
         for stack in self._stacks():
             if names is not None and stack.name not in names:
                 continue
             if stack.kind != "process" or not self._supervisor.alive(stack.name):
                 continue
-            jobs_dir = stack_jobs_dir(stack)
-            try:
-                running = sorted(
-                    p.name for p in jobs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
-                )
-            except OSError:
-                running = []
+            running = self._active_runs(self._live_jobs_dir(stack))
             if running:
                 return f"behind run {running[0]} (stack {stack.name})"
         return None
 
-    def _stop_stack(self, stack: WireStack) -> None:
-        """Stop a Stack AND its labeled run containers (kill-the-tree)."""
-        if stack.kind == "process":
-            self._supervisor.stop(stack.name, grace_seconds=self._stop_grace_seconds())
-        elif stack.compose_files:
-            self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
-            self._applied_compose.pop(stack.name, None)
-        else:
-            self._docker.remove(f"ozolith-stack-{stack.name}")
+    def _child_inflight_blocker(self, name: str) -> str | None:
+        """The in-flight signal keyed off a supervised child directly, by its
+        APPLIED jobs dir — for a process->container transition, where the
+        desired Stack's kind is no longer ``process`` so ``_inflight_blocker``
+        (which scans desired process Stacks) would miss the still-running
+        child. A dead child never blocks."""
+        if not self._supervisor.alive(name):
+            return None
+        applied = self._applied_jobs_dir.get(name)
+        if not applied:
+            return None
+        running = self._active_runs(Path(applied))
+        return f"behind run {running[0]} (stack {name})" if running else None
+
+    def _isolated(self, description: str, action) -> None:
+        """Run one teardown step so its failure is CONTAINED: log it, emit the
+        normal capped error event, and return. Nothing the failed step did not
+        clear (a compose project's applied record, a still-present container) is
+        dropped, so the object is retried on the next pass. The caller's other
+        teardown steps, the convergence of every desired Stack, and orphan
+        reaping all continue past it (ADR-0044 amendment: a failure stopping one
+        absent runtime never aborts the reconcile pass)."""
+        try:
+            action()
+        except Exception as exc:
+            self._log(f"{description}: cleanup failed: {exc}")
+            self._emit_error(type(exc).__name__, f"{description}: cleanup failed: {exc}")
+
+    def _remove_owned_run_containers(self, name: str) -> None:
+        """Remove every labeled run container this Stack's driver owns (its
+        share of kill-the-tree). Named after the Stack, not a WireStack, so it
+        serves both a normal stop and a kind transition where the desired
+        Stack's kind no longer matches the runtime form being torn down."""
         for container in self._docker.run_containers():
-            if container.get("owner") == stack.name:
-                self._log(f"removing run container {container['name']} (owner {stack.name})")
+            if container.get("owner") == name:
+                self._log(f"removing run container {container['name']} (owner {name})")
                 self._docker.remove(container["name"])
 
+    def _stop_process_child(self, name: str) -> None:
+        """Tear a supervised process child down completely: stop it
+        (kill-the-tree), remove its labeled run containers, and clear ALL of
+        its applied-spec bookkeeping (``_applied_jobs_dir``). The single
+        teardown for stopped/drained desire, a Stack removed from desired
+        state, and a process->container transition — no path may leave a
+        hidden child or its run containers behind (ADR-0044 amendment)."""
+        self._supervisor.stop(name, grace_seconds=self._stop_grace_seconds())
+        self._applied_jobs_dir.pop(name, None)
+        self._remove_owned_run_containers(name)
+
+    def _remove_single_image(self, name: str) -> None:
+        """Remove this name's labeled single-image Stack container, if one is
+        present. A no-op when no single-image form exists (a process or compose
+        Stack, or an ordinary start)."""
+        if self._docker.stack_containers(name):
+            self._docker.remove(f"{STACK_CONTAINER_PREFIX}{name}")
+
+    def _load_applied_compose(self) -> dict[str, AppliedCompose]:
+        """Recover the persisted applied-compose records on boot. Malformed or
+        missing state degrades to an empty map (a corrupt file must never crash
+        the daemon); each record is validated by ``AppliedCompose.from_dict``."""
+        raw = _read_json(self._config.applied_compose_path, {})
+        result: dict[str, AppliedCompose] = {}
+        if isinstance(raw, dict):
+            for name, record in raw.items():
+                applied = AppliedCompose.from_dict(record)
+                if applied is not None:
+                    result[str(name)] = applied
+        return result
+
+    def _persist_applied_compose(self) -> None:
+        """Write the applied-compose map atomically. Called after every mutation
+        (an up records, a down drops) so the on-disk record always mirrors what
+        is actually applied — the fact a restart needs to tear a surviving
+        compose project down. Only fingerprint + file paths are written; secret
+        values never reach this file (ADR-0044 amendment)."""
+        _atomic_json(
+            self._config.applied_compose_path,
+            {name: record.to_dict() for name, record in sorted(self._applied_compose.items())},
+        )
+
+    def _write_ahead_compose(self, name: str, record: AppliedCompose) -> None:
+        """Adopt and atomically persist a compose recovery record BEFORE the
+        compose up it describes (ADR-0044 amendment). On a persist failure the
+        in-memory map is rolled back to its prior entry — so memory and disk never
+        diverge — and the error re-raises, which stops the caller from invoking
+        compose up: no project is created without a durable record able to tear it
+        down. The record's files must be non-empty (a compose Stack always
+        materializes at least one document)."""
+        if not record.files:
+            raise RuntimeError(f"stack {name}: refusing a compose recovery record with no files")
+        prior = self._applied_compose.get(name)
+        self._applied_compose[name] = record
+        try:
+            self._persist_applied_compose()
+        except Exception:
+            if prior is None:
+                self._applied_compose.pop(name, None)
+            else:
+                self._applied_compose[name] = prior
+            raise
+
+    def _compose_running(self, name: str) -> bool:
+        """Whether the deterministic compose project has running workload — the
+        SAME liveness rule the heartbeat status reports (a ``compose_ps`` row in
+        the running state). An AppliedCompose fingerprint proves which spec was
+        applied, not that the project still runs, so convergence consults this
+        before declaring a compose Stack already converged (ADR-0044 amendment)."""
+        return any(
+            row.get("state") == "running" for row in self._docker.compose_ps(f"ozolith-{name}")
+        )
+
+    def _compose_down(self, name: str) -> None:
+        """Compose a tracked project down using the compose/overlay files it was
+        brought up with (retained in ``_applied_compose``, across restarts) — a
+        valid teardown, never an empty file list. The applied record is dropped
+        (and the change persisted) only AFTER the down succeeds, so a failed down
+        is retried on the next pass rather than forgotten (ADR-0044 amendment). A
+        no-op for a name this daemon has no record of — the accepted prior-daemon
+        compose-discovery limitation, now only when the persisted record is also
+        gone."""
+        applied = self._applied_compose.get(name)
+        if applied is None:
+            return
+        self._docker.compose(f"ozolith-{name}", [Path(p) for p in applied.files], "down")
+        self._applied_compose.pop(name, None)
+        self._persist_applied_compose()
+        # The downed generation is now referenced by no record; the per-pass
+        # ``_sweep_compose_generations`` reclaims every unreferenced generation
+        # dir for this (now recordless) name and retries any deletion that fails,
+        # so cleanup is not tied to this teardown succeeding (ADR-0044 amendment).
+
+    def _teardown_container_forms(self, name: str) -> None:
+        """Remove any container-kind runtime under this name — a single-image
+        Stack container and/or a compose project this daemon started — so a
+        container->process transition never leaves both forms active. Raises on
+        the first failure (the caller retries the whole transition next pass); a
+        no-op on an ordinary process start (no container form to remove)."""
+        self._remove_single_image(name)
+        self._compose_down(name)
+
+    def _teardown_all_forms(self, name: str) -> None:
+        """Tear down EVERY runtime form under one Stack name — supervised
+        process child (with its owned Run containers and applied bookkeeping),
+        labeled single-image container, and tracked compose project — regardless
+        of which kind/form is currently live. The teardown for a stopped or
+        drained desire whose desired kind/form may differ from what is actually
+        running (ADR-0044 amendment): a container->stopped-process,
+        process->stopped-container, compose->stopped-single-image, or
+        single-image->stopped-compose desire each leave nothing behind.
+
+        Raises on the first form that fails — the caller (a drain/recycle
+        command handler, or the reconcile per-stack handler) logs it, emits the
+        capped error event exactly once, leaves the command un-acked (drain) or
+        the Stack for the next pass, and whatever a failed step did not clear is
+        retried then. In the ordinary error-free case all three forms are torn
+        down in the one call. Failures of STALE (absent-from-desired) objects
+        are isolated separately in ``_reconcile_removed`` so one never aborts the
+        whole sweep."""
+        self._stop_process_child(name)
+        self._remove_single_image(name)
+        self._compose_down(name)
+
     def _drain(self, target: str | None) -> None:
+        # Every runtime form under the name goes, whatever kind is live (a drain
+        # must not leave a form of a different kind behind); each pass re-tears
+        # a drained Stack down via the want_running=False converge path.
         names = [target] if target else [s.name for s in self._stacks()]
         for name in names:
-            stack = self._stack_by_name(name)
-            if stack is not None:
-                self._stop_stack(stack)
+            self._teardown_all_forms(name)
             self._drained.add(name)
         _atomic_json(self._config.drained_path, sorted(self._drained))
 
     def _recycle(self, target: str | None) -> None:
         names = [target] if target else [s.name for s in self._stacks()]
         for name in names:
-            stack = self._stack_by_name(name)
-            if stack is not None:
-                self._stop_stack(stack)
+            self._teardown_all_forms(name)
             self._drained.discard(name)
         _atomic_json(self._config.drained_path, sorted(self._drained))
         # The reconcile step of this same pass starts them again.
@@ -521,18 +791,104 @@ class NodeDaemon:
             except Exception as exc:
                 self._log(f"image {name}: build failed: {exc}")
                 self._emit_error(type(exc).__name__, f"image {name}: build failed: {exc}")
-        for stack in self._stacks():
+        desired = self._stacks()
+        # Converge runtime objects that desired state no longer names BEFORE
+        # converging the ones it does — so a rename (old name torn down, new
+        # name started) and a deletion both settle in one pass (ADR-0044).
+        # A backstop around the whole sweep (each object is already isolated
+        # inside it): even a failure enumerating the live inventory must not
+        # stop the desired Stacks from converging or the orphan reap from running.
+        try:
+            self._reconcile_removed(desired)
+        except Exception as exc:
+            self._log(f"removed-runtime sweep failed: {exc}")
+            self._emit_error(type(exc).__name__, f"removed-runtime sweep failed: {exc}")
+        for stack in desired:
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
                 if stack.kind == "process":
-                    self._converge_process(stack, want_running, images)
+                    self._converge_process(stack, want_running)
                 else:
                     self._converge_container(stack, want_running)
             except Exception as exc:
                 # Config-apply and container-start failures both land here.
                 self._log(f"stack {stack.name}: reconcile failed: {exc}")
                 self._emit_error(type(exc).__name__, f"stack {stack.name}: reconcile failed: {exc}")
-        self._reap_orphans()
+        try:
+            self._reap_orphans()
+        except Exception as exc:
+            self._log(f"orphan reap failed: {exc}")
+            self._emit_error(type(exc).__name__, f"orphan reap failed: {exc}")
+        # Reclaim obsolete compose generation dirs repo-wide, every pass, so a
+        # deletion that failed earlier is retried and an orphaned generation is
+        # discovered even for a Stack that transitioned form, stopped/drained, or
+        # left desired state — none of which retains a record to trigger cleanup
+        # (ADR-0044 amendment). Non-blocking: isolated per deletion, with a
+        # backstop around enumeration so it never aborts the pass.
+        try:
+            self._sweep_compose_generations()
+        except Exception as exc:
+            self._log(f"compose generation sweep failed: {exc}")
+            self._emit_error(type(exc).__name__, f"compose generation sweep failed: {exc}")
+
+    def _reconcile_removed(self, desired: list[WireStack]) -> None:
+        """Runtime objects with no matching desired Stack are torn down like an
+        explicit stopped desire (ADR-0044 amendment): removal from desired
+        state is a deletion — immediate teardown. Covers a deleted Stack, a
+        renamed Stack (its old name gone), and any transition that also changed
+        the Stack name. Names still present in desired state are the converge
+        step's business (including a kind flip under the same name) and are
+        never touched here; unrelated Stacks are preserved.
+
+        Discovery differs by durability. Single-image container Stacks carry
+        persistent Docker labels, so a stale one is reaped even across a daemon
+        restart. Supervised process children and compose projects are tracked
+        in memory — children never outlive the daemon and ``_applied_compose``
+        likewise — so their orphan cleanup is scoped to this daemon's lifetime;
+        the compose limitation is spelled out below."""
+        desired_names = {s.name for s in desired}
+        # Each stale object's teardown is isolated: one failure is logged and
+        # emitted, its retry state is preserved, and the sweep continues to the
+        # next object and on to converging the desired Stacks (ADR-0044).
+        for name in self._supervisor.names():
+            if name not in desired_names:
+                self._log(f"stack {name}: absent from desired state; stopping process child")
+                self._isolated(
+                    f"stack {name}: absent process child",
+                    lambda name=name: self._stop_process_child(name),
+                )
+        for row in self._docker.stack_containers():
+            container_name = str(row.get("name", ""))
+            if not container_name.startswith(STACK_CONTAINER_PREFIX):
+                continue
+            stack_name = container_name[len(STACK_CONTAINER_PREFIX) :]
+            if stack_name not in desired_names:
+                self._log(f"stack {stack_name}: absent from desired state; removing container")
+                self._isolated(
+                    f"stack {stack_name}: absent single-image container",
+                    lambda cn=container_name: self._docker.remove(cn),
+                )
+        # Compose projects whose applied record desired state no longer names are
+        # composed down with their RETAINED files (never an empty file list). The
+        # record now survives a daemon restart (``_applied_compose`` is persisted
+        # and reloaded), so a project a PRIOR daemon started and desired state has
+        # since dropped is reaped here too, as long as its persisted record
+        # survives. LIMITATION (stated, not silently skipped, and unchanged in
+        # kind): there is still no host-side compose-project discovery (a labeled
+        # `compose ls`), so a project whose persisted record is also gone — the
+        # deletable cache was cleared, or it predates persistence — remains
+        # undiscoverable while absent from desired state; adding that discovery is
+        # a broader change deferred out of scope. This residual limitation never
+        # applies to a name STILL present in desired state: a same-name transition
+        # or a stopped/drained desire recovers and tears the project down via the
+        # persisted record (or, as a post-restart backstop, the desired files).
+        for name in list(self._applied_compose):
+            if name not in desired_names:
+                self._log(f"stack {name}: absent from desired state; composing down")
+                self._isolated(
+                    f"stack {name}: absent compose project",
+                    lambda name=name: self._compose_down(name),
+                )
 
     def _pull_stack_secrets(self, stack: WireStack) -> bool:
         """Materialize the Stack's secrets in tmpfs; False = cannot deploy.
@@ -558,17 +914,19 @@ class NodeDaemon:
             )
             return False
 
-    def _converge_process(
-        self, stack: WireStack, want_running: bool, images: dict[str, dict[str, Any]]
-    ) -> None:
-        if not want_running:
-            if self._supervisor.alive(stack.name):
-                self._stop_stack(stack)
-            return
-        if not self._supervisor.alive(stack.name) and not self._pull_stack_secrets(stack):
-            return
+    def _process_env(self, stack: WireStack) -> dict[str, str]:
+        """The full effective environment a process Stack's child launches with.
+        This is also the convergence input: the resolved worker-type env
+        (repository/adapter/model/run-image tag) and the secret <ENV>_FILE
+        mappings all live here, so a change to any of them changes this dict and
+        drives a restart (ADR-0044 amendment)."""
         env = {
             "THEOZOLITH_NODE_NAME": self._config.node,
+            # Per-process-Stack identity (ADR-0044): the Stack name becomes the
+            # theozolith.owner label on the run containers this driver creates,
+            # so _reap_orphans matches them to their supervisor. Control-authored
+            # Stack env still wins (a driver's THEOZOLITH_STACK, if declared).
+            "THEOZOLITH_STACK": stack.name,
             # The dedicated per-Stack jobs directory (ADR-0019); an explicit
             # env value in the Stack definition wins.
             "THEOZOLITH_JOBS_DIR": str(stack_jobs_dir(stack)),
@@ -583,50 +941,454 @@ class NodeDaemon:
             env.setdefault("THEOZOLITH_NODE_TOKEN", self._config.node_token)
             if self._config.tls_ca:
                 env.setdefault("THEOZOLITH_TLS_CA", self._config.tls_ca)
-        if stack.run_image and stack.run_image in images:
-            # The derived image this driver launches per Run (ADR-0013).
-            env.setdefault("THEOZOLITH_RUN_IMAGE", images[stack.run_image]["tag"])
+        # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
+        # (resolved from the worker type, ADR-0044); the daemon no longer maps a
+        # removed wire field to a built tag.
         env_files = secret_env_files(stack, self._config.secrets_dir)
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
+        return env
+
+    def _converge_process(self, stack: WireStack, want_running: bool) -> None:
+        if not want_running:
+            # Stopped/drained: tear down EVERY form under this name, not just a
+            # live process child. A desire that flipped to a stopped process
+            # while a container/compose form is actually running must leave
+            # nothing behind (ADR-0044 amendment).
+            self._teardown_all_forms(stack.name)
+            return
+        env = self._process_env(stack)
+        argv = shlex.split(stack.command) if stack.command else []
+        alive = self._supervisor.alive(stack.name)
+        # Fail closed on old/incomplete built-in-driver desired state (ADR-0044
+        # amendment, Sean's ruling — no backward compatibility): a built-in
+        # driver must not launch without a control-authored THEOZOLITH_RUN_IMAGE.
+        # Its absence means old control or an old cached document; refuse to run
+        # against the worker package's default run image, stop any already-live
+        # instance, and raise so the error surfaces — reconcile continues with
+        # the other Stacks (a generic process Stack stays legal without it).
+        if argv and argv[0] in BUILTIN_DRIVER_COMMANDS and not env.get("THEOZOLITH_RUN_IMAGE"):
+            if alive:
+                self._stop_process_child(stack.name)
+            raise RuntimeError(
+                f"built-in driver {argv[0]!r} has no control-authored"
+                " THEOZOLITH_RUN_IMAGE — incompatible/incomplete desired state"
+                " (a coordinated control upgrade is required, ADR-0044); refusing"
+                " to launch against the default run image"
+            )
+        if alive and not self._supervisor.needs_restart(stack.name, stack.command, env):
+            # Already live at this exact effective spec. Declaring the successor
+            # converged and returning must NOT mask a stale single-image container
+            # or tracked compose project under this name (a predecessor whose
+            # removal failed on an earlier pass): reap the stale form — without
+            # churning the healthy child — then return. A teardown failure here
+            # raises to reconcile (surfaced, retried next pass) and the child
+            # stays untouched; two forms never coexist unnoticed (ADR-0044
+            # amendment). The common case (process is the SOLE form) tears nothing
+            # down and returns straight away.
+            if self._docker.stack_containers(stack.name) or stack.name in self._applied_compose:
+                self._teardown_container_forms(stack.name)
+            return
+        # A (re)start is due for a live child ONLY because its effective spec
+        # changed; that must never interrupt an in-flight Run (ADR-0044
+        # amendment). If the running child is mid-Run, leave it and its Run
+        # containers untouched and retry on a later pass — restarting exactly
+        # once after the Run ends. The signal is read from the jobs dir the
+        # RUNNING child was launched with, so a THEOZOLITH_JOBS_DIR change still
+        # detects a Run under the old path. A dead child never blocks (its dirs
+        # are orphans); stopped/drained desire took the immediate path above.
+        if alive:
+            blocker = self._inflight_blocker([stack.name])
+            if blocker is not None:
+                self._log(f"stack {stack.name}: restart deferred ({blocker})")
+                return
+        # Never restart onto a run image that is not built: if the driver's
+        # declared derived run image is missing (its recipe failed or has not
+        # built yet this pass), keep the current child running and try again
+        # next pass rather than tear a working driver down onto an unavailable
+        # image (ADR-0044 amendment).
+        image_tag = env.get("THEOZOLITH_RUN_IMAGE", "")
+        declared_tags = {img.get("tag") for img in self._images().values()}
+        if image_tag in declared_tags and not self._docker.image_exists(image_tag):
+            self._log(
+                f"stack {stack.name}: deferring {'restart' if alive else 'start'} —"
+                f" run image {image_tag} not built yet"
+            )
+            return
+        # Preflight every replacement secret BEFORE stopping the old child: if
+        # the new effective spec's secrets are unavailable and uncached, keep
+        # the current child running and retry later rather than tear a working
+        # driver down onto a spec that cannot launch (ADR-0044 amendment). Only
+        # once all prerequisites are ready do we kill the tree and relaunch.
+        if not self._pull_stack_secrets(stack):
+            return
+        if alive:
+            self._stop_process_child(stack.name)  # kill-the-tree before relaunching
+        # container->process: a Stack that flipped from a container form to a
+        # process leaves a stale Stack container / compose project under this
+        # name. Now that the process's prerequisites (run image, secrets) are
+        # ready, remove it so the two forms never coexist (ADR-0044 amendment);
+        # a no-op on an ordinary start.
+        self._teardown_container_forms(stack.name)
         self._supervisor.ensure_running(stack.name, stack.command, env)
+        self._applied_jobs_dir[stack.name] = str(stack_jobs_dir(stack))
+
+    def _compose_generation(self, fingerprint: str) -> str:
+        """The generation directory name for a compose fingerprint: a stable,
+        filesystem-safe digest. Same effective spec -> same generation dir;
+        any change (content, an added/removed/renamed file, an env or secret
+        mapping change) yields a DIFFERENT generation, so a new spec never
+        overwrites the bytes an existing record still references (ADR-0044
+        amendment: immutable/versioned materialization)."""
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
 
     def _compose_paths(self, stack: WireStack) -> list[Path]:
-        """Materialize the inlined compose + overlay documents on disk."""
-        base = self._config.state_dir / "stacks" / stack.name
+        """Materialize the inlined compose + overlay documents into a
+        GENERATION-addressed directory — ``<state>/stacks/<name>/<generation>/`` —
+        so a given applied/pending record's files are IMMUTABLE for that record's
+        lifetime. A different effective spec resolves to a different generation
+        and its own paths, so materializing a candidate never mutates the bytes
+        the predecessor's retained record still points at (ADR-0044 amendment).
+
+        Each document is written atomically (tmp + os.replace), then the COMPLETE
+        candidate set is validated — a non-empty list whose every file reads back
+        byte-for-byte — before it can be referenced by a pending record, so an
+        interrupted write never exposes a half-written document as a referenced
+        generation."""
+        generation = self._compose_generation(self._compose_fingerprint(stack))
+        base = self._config.state_dir / "stacks" / stack.name / generation
+        root = base.resolve()
         paths = []
         for entry in stack.compose_files:
             target = (base / entry["name"]).resolve()
-            if base.resolve() not in target.parents:
+            if root not in target.parents:
                 raise RuntimeError(f"compose path {entry['name']!r} escapes the stack dir")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(entry["content"], encoding="utf-8")
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_text(entry["content"], encoding="utf-8")
+            os.replace(tmp, target)
             paths.append(target)
+        if not paths:
+            raise RuntimeError(f"stack {stack.name}: a compose Stack materialized no files")
+        for path, entry in zip(paths, stack.compose_files, strict=True):
+            if path.read_text(encoding="utf-8") != entry["content"]:
+                raise RuntimeError(f"stack {stack.name}: compose file {path} failed validation")
         return paths
 
+    def _gc_compose_generations(self, name: str, keep: set[str]) -> None:
+        """Reclaim obsolete materialized compose directories for ONE Stack —
+        every child dir whose name is not in ``keep``: the top-level entries
+        under ``stacks/<name>/`` (generation dirs, or a legacy record's
+        name-addressed roots such as ``compose/``) that some current record's
+        ACTUAL file paths still reference; empty when none. Never removes a
+        referenced entry, so a stopped/drained or absent Stack's still-recorded
+        teardown context is preserved; the caller never invokes this at all for
+        a Stack with a pending record (that Stack retains everything — see
+        ``_sweep_compose_generations``). Each removal is isolated: a cleanup
+        failure is logged, emitted as the normal capped error event, and left on
+        disk so ``_sweep_compose_generations`` retries it on a later pass
+        without blocking the rest of convergence (ADR-0044 amendment)."""
+        stack_dir = self._config.state_dir / "stacks" / name
+        if not stack_dir.is_dir():
+            return
+        for child in sorted(stack_dir.iterdir()):
+            if child.is_dir() and child.name not in keep:
+                self._isolated(
+                    f"stack {name}: reclaiming obsolete compose generation {child.name}",
+                    lambda child=child: shutil.rmtree(child),
+                )
+
+    def _sweep_compose_generations(self) -> None:
+        """The repo-wide RETRY path for obsolete compose generation dirs, run once
+        per reconcile pass (ADR-0044 amendment). It is keyed off the on-disk
+        ``stacks/`` tree, NOT off a live compose project or a surviving
+        AppliedCompose record, so a failed ``shutil.rmtree`` is retried every
+        later pass and an orphaned generation is still discovered after the Stack
+        transitions to another runtime form, is stopped/drained, or disappears
+        from desired state entirely — none of which leaves a record to trigger the
+        per-transition cleanup.
+
+        What is retained follows two rules, both computed from EVERY current
+        record (``_applied_compose`` reflects all of this pass's mutations by the
+        time this runs at the end of ``_reconcile``):
+
+        1. A record's ACTUAL file paths are the references — never a generation
+           inferred from its fingerprint. Each path is normalized under
+           ``stacks/`` and the top-level entry containing it is retained, which
+           protects generation-addressed layouts AND a legacy pre-generation
+           record's name-addressed paths (``stacks/<name>/compose/base.yml``) —
+           paths a valid AppliedCompose record still needs for teardown. A path
+           that cannot be safely mapped under ``stacks/`` conservatively retains
+           EVERYTHING under that record's Stack name.
+
+        2. A Stack whose record is PENDING retains ALL entries under its name.
+           The pending write-ahead REPLACED the predecessor's applied record
+           before compose up, so no surviving record references the predecessor
+           generation — yet the predecessor may still be the running project if
+           the up failed or the daemon crashed first. Predecessor generations are
+           reclaimed only once the successor is confirmed applied (or the
+           project is composed down and the record cleared).
+
+        A name with no record keeps nothing: every generation dir under it is
+        unreferenced and reclaimed. The sweep is bounded (one ``iterdir`` per
+        Stack dir) and deterministic (sorted), stays per-Stack (a retained Stack
+        never blocks another's cleanup), and each deletion is isolated via
+        ``_gc_compose_generations`` — a failure logs, emits the capped error
+        event, and stays retryable rather than blocking runtime convergence."""
+        stacks_root = self._config.state_dir / "stacks"
+        if not stacks_root.is_dir():
+            return
+        root = stacks_root.resolve()
+        retain_all: set[str] = set()  # Stack dir names where nothing may be deleted
+        keep_by_name: dict[str, set[str]] = {}  # dir name -> referenced top-level entries
+        for stack_name, record in self._applied_compose.items():
+            if record.state != COMPOSE_APPLIED:
+                retain_all.add(stack_name)  # pending: predecessors are unrecorded
+            for file in record.files:
+                try:
+                    parts = Path(file).resolve().relative_to(root).parts
+                except (OSError, ValueError):
+                    retain_all.add(stack_name)  # unmappable: preserve conservatively
+                    continue
+                if len(parts) >= 2:
+                    keep_by_name.setdefault(parts[0], set()).add(parts[1])
+                elif parts:
+                    retain_all.add(parts[0])  # a bare stacks/<x> reference: keep x whole
+                else:
+                    retain_all.add(stack_name)
+        for stack_dir in sorted(stacks_root.iterdir()):
+            if not stack_dir.is_dir() or stack_dir.name in retain_all:
+                continue
+            self._gc_compose_generations(stack_dir.name, keep_by_name.get(stack_dir.name, set()))
+
+    def _compose_fingerprint(self, stack: WireStack) -> str:
+        """All effective compose inputs, so any change reconciles (ADR-0044)."""
+        return json.dumps(
+            {
+                "compose_files": list(stack.compose_files),
+                "env": stack.env,
+                "secrets": stack.secrets,
+            },
+            sort_keys=True,
+        )
+
+    def _container_fingerprint(self, stack: WireStack) -> str:
+        """The effective runtime spec of a single-image container Stack: image
+        tag, command, env, secret mapping, ports, volumes. A change to any of
+        these replaces the running container. Secret VALUES never enter this —
+        only the mapping (ENV -> secret name) does (ADR-0044 amendment)."""
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "image": stack.image,
+                    "command": stack.command,
+                    "env": stack.env,
+                    "secrets": stack.secrets,
+                    "ports": list(stack.ports),
+                    "volumes": list(stack.volumes),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
     def _converge_container(self, stack: WireStack, want_running: bool) -> None:
+        # A process child still tracked under this name means the Stack flipped
+        # process->container: its teardown is deferred until the container's
+        # prerequisites are ready, and never happens while its Run is in flight.
+        child_lingers = stack.name in self._supervisor.names()
         if not want_running:
-            if stack.compose_files:
-                if self._applied_compose.get(stack.name) or self._docker.compose_ps(
-                    f"ozolith-{stack.name}"
-                ):
-                    self._stop_stack(stack)
-            elif self._docker.stack_containers(stack.name):
-                self._stop_stack(stack)
+            # Stopped/drained: tear down EVERY form under this name (process
+            # child, single-image container, tracked compose project, owned Run
+            # containers), whatever kind the desired-but-stopped Stack declares
+            # — a compose->stopped-single-image or single-image->stopped-compose
+            # desire must not strand the currently running form (ADR-0044).
+            self._teardown_all_forms(stack.name)
+            # Post-restart safety: a compose project for a Stack STILL named in
+            # desired state (now stopped/drained) but not tracked this lifetime —
+            # its in-memory record was lost across a daemon restart — is downed
+            # with the DESIRED compose files (a valid, non-empty teardown), so a
+            # stopped compose Stack does not keep running unseen. An ABSENT Stack
+            # has no files and stays under the stated prior-daemon discovery
+            # limitation (handled, tracked-only, in _reconcile_removed).
+            if (
+                stack.compose_files
+                and stack.name not in self._applied_compose
+                and self._docker.compose_ps(f"ozolith-{stack.name}")
+            ):
+                self._log(f"stack {stack.name}: downing untracked compose project (post-restart)")
+                self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
+                # No record references the just-materialized generation; the
+                # per-pass sweep reclaims it (and retries on failure).
             return
+        # process->container: a live child's in-flight Run defers the WHOLE
+        # transition (read from its applied jobs dir — the desired kind is no
+        # longer process, so _inflight_blocker would not see it). A dead child
+        # never blocks and is torn down once prerequisites are ready.
+        if child_lingers and self._supervisor.alive(stack.name):
+            blocker = self._child_inflight_blocker(stack.name)
+            if blocker is not None:
+                self._log(f"stack {stack.name}: process->container transition deferred ({blocker})")
+                return
         if stack.compose_files:
-            fingerprint = json.dumps(stack.compose_files, sort_keys=True)
-            if self._applied_compose.get(stack.name) == fingerprint:
-                return
-            if not self._pull_stack_secrets(stack):
-                return
-            self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "up")
-            self._applied_compose[stack.name] = fingerprint
+            self._converge_compose(stack, child_lingers)
             return
-        rows = self._docker.stack_containers(stack.name)
-        if any(r.get("state") == "running" for r in rows):
-            return
+        self._converge_single_image(stack, child_lingers)
+
+    def _converge_compose(self, stack: WireStack, child_lingers: bool) -> None:
+        """Bring the compose form up as the SOLE runtime form under this name.
+        Handles a single-image->compose (and process->compose) transition too: the
+        losing form is retained until the compose prerequisites (secrets, valid
+        materialized files) are ready AND the write-ahead recovery record has been
+        durably persisted, then retired BEFORE compose up so the two runtime forms
+        never coexist. Persisting the pending record ahead of the teardown means a
+        failed write-ahead leaves the losing form running and touches nothing
+        (ADR-0044 amendment).
+
+        The candidate compose documents are materialized into a NEW
+        generation-addressed directory (``_compose_paths``), distinct from any
+        generation a predecessor's applied/pending record still references, so a
+        failed write-ahead persist mutates none of the predecessor's recovery
+        inputs. Obsolete generations are reclaimed only AFTER the transition is
+        confirmed applied (ADR-0044 amendment: immutable/versioned
+        materialization)."""
+        fingerprint = self._compose_fingerprint(stack)
+        single_present = bool(self._docker.stack_containers(stack.name))
+        applied = self._applied_compose.get(stack.name)
+        if (
+            not child_lingers
+            and not single_present
+            and applied is not None
+            and applied.state == COMPOSE_APPLIED
+            and applied.fingerprint == fingerprint
+        ):
+            # Only a CONFIRMED (applied) record may take the healthy early return.
+            # A pending record proves its spec was write-ahead-persisted, NOT that
+            # compose up ever ran it: the deterministic project name
+            # (ozolith-<name>) is identical across generations, so a compose_ps
+            # running row cannot distinguish "B is up" from "the predecessor A is
+            # still running and B never reached Docker." A crash between persisting
+            # B's pending record and invoking compose up leaves exactly that
+            # ambiguity — A running under a pending B record — and treating the
+            # fingerprint+liveness match as converged would strand A while claiming
+            # B. So a pending record ALWAYS falls through to compose up with its
+            # retained immutable files (below), which converges the deterministic
+            # project from A to B in place (never a down to resolve the ambiguity);
+            # the post-up confirmation then promotes it to applied (ADR-0044
+            # amendment: pending never claims specification convergence; compose_ps
+            # stays the liveness authority, distinct from specification identity).
+            #
+            # Even for a confirmed record the fingerprint proves only which spec
+            # was applied, not that the project still runs (it can die, or the
+            # daemon can restart while it keeps running). Only skip as
+            # already-converged when it is verifiably running; otherwise fall
+            # through and compose up again with the retained/current files. No
+            # churn when healthy.
+            if self._compose_running(stack.name):
+                return  # confirmed-applied, at this exact spec, and running
+            self._log(
+                f"stack {stack.name}: applied compose project not running; composing up again"
+            )
         if not self._pull_stack_secrets(stack):
             return
+        # Materialize + validate the candidate into its OWN generation dir before
+        # any teardown — never overwriting the bytes the predecessor's record
+        # still references (ADR-0044 amendment: immutable/versioned materialization).
+        files = self._compose_paths(stack)
+        # Write-ahead the recovery record BEFORE retiring the losing runtime form
+        # AND before compose up (ADR-0044 amendment: crash-consistent startup). The
+        # pending record (name + fingerprint + retained non-empty file paths) must
+        # be durable BEFORE the predecessor teardown so no ordering — a crash or a
+        # persist failure — can leave an old form retired with no record able to
+        # bring the compose project up or tear it back down. If this persist FAILS,
+        # nothing is retired: the process child and its owned Run containers, and
+        # any single-image container, keep running; the previous applied record is
+        # preserved (rolled back in _write_ahead_compose); and the raise reaches
+        # _reconcile, which retries next pass. A compose spec change over a running
+        # old project likewise keeps that project running — compose up is gated on
+        # this persist, so a failed write-ahead never touches the live project.
+        paths = [str(f) for f in files]
+        self._write_ahead_compose(stack.name, AppliedCompose(fingerprint, paths, COMPOSE_PENDING))
+        # Only after the write-ahead persists do we retire the predecessor form(s).
+        # A teardown failure here raises BEFORE compose up, so the two runtime forms
+        # never coexist and the durable pending record is retained for the retry
+        # that completes the transition on a later pass (ADR-0044 amendment).
+        if child_lingers:  # process->compose: retire the process form
+            self._stop_process_child(stack.name)
+        if single_present:  # single-image->compose: retire the single-image form first
+            self._log(
+                f"stack {stack.name}: single-image->compose;"
+                " removing the single-image container before compose up"
+            )
+            self._remove_single_image(stack.name)
+        self._docker.compose(f"ozolith-{stack.name}", files, "up")
+        # Confirm APPLIED after a successful up — best-effort: a failure to persist
+        # the confirmation must NOT drop the durable write-ahead record, so it is
+        # isolated. compose_ps stays the liveness authority; the pending/applied
+        # distinction is informational and a lingering pending record is harmless.
+        self._applied_compose[stack.name].state = COMPOSE_APPLIED
+        self._isolated(
+            f"stack {stack.name}: confirm applied compose", self._persist_applied_compose
+        )
+        # The transition is complete and this record is now the only one that
+        # matters for this name. The per-pass ``_sweep_compose_generations`` (end
+        # of ``_reconcile``) reclaims every OTHER materialized generation — a
+        # predecessor compose spec's dir, or an unreferenced candidate left by an
+        # earlier failed write-ahead — keeping only the paths the current records
+        # actually reference, and RETRIES any deletion that fails on later passes
+        # even once this Stack early-returns healthy or leaves the compose form
+        # entirely (ADR-0044 amendment: cleanup has a real retry path, not a
+        # one-shot tied to reaching this line). Had this up FAILED, the record
+        # would still be pending and the sweep would retain the predecessor
+        # generation too — it is reclaimed only after this point.
+
+    def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
+        """Run the single-image form as the SOLE runtime form under this name.
+        Handles a compose->single-image transition too: the desired image and
+        secrets are preflighted and the old compose project is RETAINED until
+        they are ready, then composed down (with its retained files) BEFORE
+        docker run so the two forms never coexist (ADR-0044 amendment)."""
+        want = self._container_fingerprint(stack)
+        compose_tracked = stack.name in self._applied_compose
+        rows = self._docker.stack_containers(stack.name)
+        running = [r for r in rows if r.get("state") == "running"]
+        if (
+            not child_lingers
+            and not compose_tracked
+            and running
+            and running[0].get(LABEL_STACK_SPEC, "") == want
+        ):
+            return  # verifiably the only form, at the current effective spec — no churn
+        # Never replace (or first-create) onto a derived image our OWN recipes
+        # declare but that is not built yet (a failed or not-yet build): keep any
+        # current container OR the old compose project alive, emit a deferral,
+        # and retry next pass — replacing exactly once the image appears. An
+        # arbitrary external image reference (not one of our recipe tags) is
+        # Docker's to pull normally, so it is not gated here (ADR-0044 amendment).
+        declared_tags = {img.get("tag") for img in self._images().values()}
+        if stack.image in declared_tags and not self._docker.image_exists(stack.image):
+            self._log(
+                f"stack {stack.name}: deferring container "
+                f"{'replacement' if (running or compose_tracked) else 'create'} —"
+                f" image {stack.image} not built yet"
+            )
+            return
+        if running and not running[0].get(LABEL_STACK_SPEC):
+            # A pre-existing container with no trustworthy applied-spec record
+            # (older daemon, a manual start, or a degraded recovery) must not be
+            # silently assumed current: reconcile it once so the fingerprint is
+            # recovered from here on (ADR-0044 amendment).
+            self._log(
+                f"stack {stack.name}: running container has no applied-spec label; reconciling once"
+            )
+        if not self._pull_stack_secrets(stack):
+            return
+        if child_lingers:  # prerequisites ready: retire the process form before the container
+            self._stop_process_child(stack.name)
+        if compose_tracked:  # compose->single-image: retire the compose form first
+            self._log(
+                f"stack {stack.name}: compose->single-image;"
+                " composing the old project down before docker run"
+            )
+            self._compose_down(stack.name)
         self._docker.run_stack_container(
             stack.name,
             stack.image,
@@ -637,6 +1399,7 @@ class NodeDaemon:
             # Optional docker-run command for the single-image form — how
             # the Flight Deck starts its named tmux session (ADR-0019).
             command=shlex.split(stack.command) if stack.command else None,
+            spec=want,
         )
 
     def _reap_orphans(self) -> None:

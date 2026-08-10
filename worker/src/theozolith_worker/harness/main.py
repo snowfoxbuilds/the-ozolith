@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Protocol
 
 from theozolith_worker import shell
-from theozolith_worker.harness.adapters import make_harness_adapter
+from theozolith_worker.harness.adapters import make_agent_adapter
 from theozolith_worker.jobdir import (
     CONTAINER_JOB_PATH,
     PHASE_AGENT,
@@ -192,7 +192,7 @@ def run_harness(
 ) -> int:
     manifest = read_manifest(job)
     write_status(job, Status(phase=PHASE_STARTING))
-    adapter = make_harness_adapter(manifest.adapter)
+    adapter = make_agent_adapter(manifest.adapter)
     workdir = job / manifest.workdir
     if not workdir.is_dir():
         write_status(job, Status(phase=PHASE_FAILED, error=f"missing workdir {manifest.workdir}"))

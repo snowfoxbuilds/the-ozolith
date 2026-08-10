@@ -1,0 +1,33 @@
+# The Implementer worker type (ADR-0044): the complete customization unit
+# for one worker — the built-in Implementer driver, its Agent adapter and
+# model, the target workspace, the secrets it needs, and the derived run
+# image the container-host builds locally.
+#
+# The derived-image identity (tag = base tag + instruction hash) is computed
+# over the image fields ONLY (base/setup/knowledge_*), so driver/adapter/
+# model/workspace/secrets never trigger a rebuild. Changing an image field
+# changes the tag; nodes rebuild on their next pass and heartbeats report
+# the new build metadata (skew is visible, ADR-0006).
+
+driver = "builtin:implementer"   # the staged pipeline Implementer (process kind)
+adapter = "claude"               # the Agent adapter the harness invokes
+model = "claude-sonnet-5"
+workspace = "acme/sandbox"       # the repository (owner/name) it works
+
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+setup = [
+    "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",
+    "pip install --no-cache-dir uv",
+]
+
+# Baked at IMAGE BUILD time by the M1 bake CLI — never at container start.
+knowledge_source = "https://github.com/acme/my-knowledge.git"
+knowledge_pin = "0000000000000000000000000000000000000000"
+
+# Secret NAMES only — values live encrypted on the Control Node, entered
+# once via `theozolith secret set <name>`, pulled node-scoped at deploy
+# time, and delivered as <ENV>_FILE from tmpfs (never node disk).
+[secrets]
+GITHUB_TOKEN = "github-implementer"
+ANTHROPIC_API_KEY = "anthropic-api-key"
