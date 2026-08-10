@@ -4658,3 +4658,136 @@ def test_config_dist_missing_or_nonstring_built_against_is_empty_advisory(rig: R
     reported = _last_heartbeat(rig)
     assert reported["drivers_hash"] == digest
     assert reported["drivers_built_against"] == ""
+
+
+# -- filesystem-corruption normalization: pointer bytes and entry classifiers --
+
+
+def test_config_dist_invalid_utf8_pointer_keeps_heartbeat_alive_then_repairs(rig: Rig):
+    """A corrupted/restored ``current`` pointer holding invalid UTF-8 bytes is
+    malformed state exactly like a non-64-hex value: the heartbeat pass
+    completes (no UnicodeDecodeError escapes), the node honestly reports
+    non-convergence, and the same pass refetches and repairs the desired
+    distribution (ADR-0042)."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"}, built_against="0.2.9")
+    pointer = rig.config.state_dir / "config-dist" / "current"
+    pointer.write_bytes(b"\xff\xfe not a hash")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()  # completes — the undecodable pointer never raises out
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == ""
+    assert reported["drivers_built_against"] == ""
+    assert any("pointer is not valid UTF-8" in line for line in rig.logs)
+    assert not any("UnicodeDecodeError" in line for line in rig.logs)
+    # The same pass repaired the pointer and tree; the next heartbeat reports
+    # the applied hash and its advisory stamp again.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == "0.2.9"
+
+
+class _UnstatableEntry:
+    """A DirEntry stand-in whose metadata classifiers raise OSError — the
+    stat-after-scandir failure mode (an entry ACL-blocked or lost between the
+    directory read and the lazy lstat). ``name``/``path`` still read fine;
+    only classification fails."""
+
+    def __init__(self, entry):
+        self.name = entry.name
+        self.path = entry.path
+
+    def is_symlink(self):
+        raise OSError(5, "injected: cannot stat entry")
+
+    def is_dir(self, follow_symlinks=True):
+        raise OSError(5, "injected: cannot stat entry")
+
+    def is_file(self, follow_symlinks=True):
+        raise OSError(5, "injected: cannot stat entry")
+
+
+def _boom_entry_classifiers(monkeypatch, target: Path) -> dict:
+    """Patch ``os.scandir`` so the single entry at ``target`` fails
+    CLASSIFICATION (DirEntry metadata OSError) while enumeration itself still
+    succeeds; every other directory — and every fd-based scandir, e.g. inside
+    ``shutil.rmtree`` — passes through untouched. Returns the ``{'on': bool}``
+    toggle that clears the injected fault."""
+    import os
+
+    active = {"on": True}
+    real_scandir = os.scandir
+
+    @contextlib.contextmanager
+    def fake(path="."):
+        with real_scandir(path) as it:
+            entries = list(it)
+        if active["on"] and isinstance(path, (str, os.PathLike)):
+            entries = [_UnstatableEntry(e) if Path(e.path) == target else e for e in entries]
+        yield iter(entries)
+
+    monkeypatch.setattr(os, "scandir", fake)
+    return active
+
+
+@pytest.mark.parametrize("target_rel", ["drivers", "config-dist.json", "drivers/custom"])
+def test_config_dist_applied_entry_classifier_failure_not_converged_then_repaired(
+    rig: Rig, monkeypatch, target_rel
+):
+    """An applied-tree entry whose DirEntry metadata cannot be read after a
+    successful scandir — the root ``drivers`` dir, the ``config-dist.json``
+    envelope, or an entry below ``drivers/`` — is a normalized verification
+    failure, never an OSError escaping ``_status_payload``: the heartbeat
+    survives, reports ``("", "")``, and the same pass refetches and repairs
+    (ADR-0042)."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"}, built_against="0.2.9")
+    tree = rig.config.state_dir / "config-dist" / digest
+    active = _boom_entry_classifiers(monkeypatch, tree / target_rel)
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()  # completes — the classifier OSError never escapes
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == ""
+    assert reported["drivers_built_against"] == ""
+    assert any("cannot be classified" in line or "cannot classify" in line for line in rig.logs)
+    active["on"] = False  # the fault clears; the repair already landed this pass
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == "0.2.9"
+
+
+def test_config_dist_staging_classifier_failure_rejected_before_stop(rig: Rig, monkeypatch):
+    """A fetched artifact whose STAGING verification hits a per-entry
+    classifier OSError is rejected as a normalized ConfigDistError with the
+    live custom driver never stopped and the old tree still current — the
+    staging-filesystem failure lands before the stop boundary, and the swap
+    completes once the fault clears (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([custom], a_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns_before = len(rig.popen.spawned)
+    b_files = {"drivers/custom/impl.py": "v = 2\n"}
+    b_hash, b_data = make_config_dist(b_files)
+    rig.control.config_artifacts[b_hash] = b_data
+    root = rig.config.state_dir / "config-dist"
+    active = _boom_entry_classifiers(monkeypatch, root / f".{b_hash}.tmp" / "drivers" / "custom")
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")  # never stopped
+    assert len(rig.popen.spawned) == spawns_before  # never restarted either
+    assert (root / "current").read_text().strip() == a_hash  # old tree current
+    assert not (root / b_hash).exists()  # nothing exchanged or published
+    assert any("cannot classify" in line for line in rig.logs)
+    active["on"] = False
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert (root / "current").read_text().strip() == b_hash  # converged after the fault
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == b_hash
+    assert rig.daemon._supervisor.alive("custom-impl")

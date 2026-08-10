@@ -778,6 +778,109 @@ def test_folder_mode_enumeration_stays_non_fail_closed(tmp_path, monkeypatch):
     assert (tmp_path / "top.py") in found
 
 
+# -- per-entry classifier failures normalize like enumeration (ADR-0042) ------
+#
+# DirEntry.is_symlink/is_dir/is_file can each raise OSError AFTER a successful
+# scandir (the metadata stat is lazy). The posture split mirrors enumeration:
+# the drivers manifest fails closed with ConfigDistError, folder-mode commit
+# hashing skips the entry, and the node's recompute rejects like the manifest.
+
+
+class _UnstatableEntry:
+    """A DirEntry stand-in whose metadata classifiers raise OSError — the
+    stat-after-scandir failure mode. ``name``/``path`` still read fine; only
+    classification fails."""
+
+    def __init__(self, entry):
+        self.name = entry.name
+        self.path = entry.path
+
+    def is_symlink(self):
+        raise OSError(5, "injected: cannot stat entry")
+
+    def is_dir(self, follow_symlinks=True):
+        raise OSError(5, "injected: cannot stat entry")
+
+    def is_file(self, follow_symlinks=True):
+        raise OSError(5, "injected: cannot stat entry")
+
+
+def _boom_entry_classifiers(monkeypatch, target: Path) -> None:
+    """Patch ``os.scandir`` so the single entry at ``target`` fails
+    classification while enumeration itself still succeeds; every other
+    directory (and every fd-based scandir) passes through untouched."""
+    import contextlib
+
+    real_scandir = os.scandir
+
+    @contextlib.contextmanager
+    def fake(path="."):
+        with real_scandir(path) as it:
+            entries = list(it)
+        if isinstance(path, (str, os.PathLike)):
+            entries = [_UnstatableEntry(e) if Path(e.path) == target else e for e in entries]
+        yield iter(entries)
+
+    monkeypatch.setattr(os, "scandir", fake)
+
+
+def test_root_entry_classifier_failure_fails_closed(tmp_path, monkeypatch):
+    """An entry directly under the drivers root whose metadata cannot be read
+    raises ConfigDistError under refuse_irregular — an unclassifiable entry
+    must never silently drop from the manifest."""
+    _write(tmp_path, "drivers/a.py", "a = 1\n")
+    _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / "a.py")
+    with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
+        configdist.drivers_hash(tmp_path)
+
+
+@pytest.mark.parametrize("target_rel", ["sub", "sub/leaf.py"])
+def test_nested_entry_classifier_failure_fails_closed(tmp_path, monkeypatch, target_rel):
+    """A classifier failure on a nested directory entry or a nested file also
+    fails closed — neither the subtree nor the file is silently omitted."""
+    _write(tmp_path, "drivers/top.py", "t = 1\n")
+    _write(tmp_path, "drivers/sub/leaf.py", "leaf = 1\n")
+    _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / target_rel)
+    with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
+        configdist.drivers_manifest(tmp_path)
+
+
+def test_entry_classifier_failure_becomes_config_repo_error_at_load(tmp_path, monkeypatch):
+    """The ConfigDistError from a per-entry classifier failure is normalized to
+    ConfigRepoError at the config-loading boundary — control config loading
+    sees the documented error type, never a raw OSError."""
+    from theozolith_control import configrepo
+
+    _write(tmp_path, "drivers/a.py", "a = 1\n")
+    _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / "a.py")
+    with pytest.raises(configrepo.ConfigRepoError, match="cannot classify"):
+        configrepo.load_config(tmp_path)
+
+
+def test_folder_mode_entry_classifier_failure_is_skipped(tmp_path, monkeypatch):
+    """Folder-mode commit hashing keeps its non-fail-closed contract: an entry
+    whose metadata cannot be classified is skipped (never descended), not an
+    abort of the commit calculation."""
+    _write(tmp_path, "top.py", "t = 1\n")
+    _write(tmp_path, "sub/leaf.py", "leaf = 1\n")
+    _boom_entry_classifiers(monkeypatch, tmp_path / "sub")
+    found = configdist.regular_files(tmp_path)
+    assert (tmp_path / "top.py") in found
+    assert not any(p.name == "leaf.py" for p in found)  # skipped, never descended
+
+
+def test_cross_package_entry_classifier_failure_fails_closed(tmp_path, monkeypatch):
+    """The node's recompute normalizes a per-entry classifier OSError into its
+    ConfigDistError exactly like control's manifest — the manifest/staging
+    boundary rejects, never leaks a raw OSError."""
+    _write(tmp_path, "drivers/custom/impl.py", "x = 1\n")
+    _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / "custom" / "impl.py")
+    with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
+        configdist.drivers_hash(tmp_path)
+    with pytest.raises(node_configdist.ConfigDistError, match="cannot classify"):
+        node_configdist.manifest_hash_of_tree(tmp_path)
+
+
 # -- the applied tree fails closed on BOTH sides (ADR-0042 amendment) ---------
 
 

@@ -839,19 +839,28 @@ class NodeDaemon:
         a ``config-dist.json`` that passes the full envelope rule against that
         recompute (``validate_metadata_tree``: UTF-8, JSON object, current
         format, string drivers_hash equal to the recomputed value). A missing
-        pointer, a malformed value, a missing tree, a rogue or irregular
-        applied-tree entry, an unenumerable subtree, a recompute mismatch, or a
-        malformed metadata envelope all read as ``("", "")`` (non-converged),
-        so ``_converge_drivers`` refetches and repairs it — while the old
+        pointer, a pointer that is not valid UTF-8 (a corrupted/restored
+        pointer file is malformed state like any other), a malformed value, a
+        missing tree, a rogue or irregular applied-tree entry, an unenumerable
+        or unclassifiable entry, a recompute mismatch, or a malformed metadata
+        envelope all read as ``("", "")`` (non-converged), so
+        ``_converge_drivers`` refetches and repairs it — while the old
         verified tree keeps being used until a replacement is fully verified
         and swapped in. Verification is FAIL CLOSED but never raises out of the
         heartbeat loop: ``manifest_hash_of_tree`` and ``validate_metadata_tree``
-        raise on symlinks, FIFO/socket/device entries, enumeration failures,
-        and every malformed-metadata shape rather than silently skipping them,
-        and every such failure is normalized here to a non-converged report."""
+        raise on symlinks, FIFO/socket/device entries, enumeration and
+        entry-classification failures, and every malformed-metadata shape
+        rather than silently skipping them, and every such failure is
+        normalized here to a non-converged report."""
         try:
             pointer = self._config.config_dist_current.read_text(encoding="utf-8").strip()
         except OSError:
+            return "", ""
+        except UnicodeDecodeError:
+            # Not an OSError and never a programming error here: the pointer
+            # file's BYTES are on-disk state that can be corrupted or restored
+            # like the trees it selects — malformed state, not an applied hash.
+            self._log("config distribution pointer is not valid UTF-8; not converged")
             return "", ""
         if not pointer:
             return "", ""
@@ -903,8 +912,11 @@ class NodeDaemon:
         droppings. The drivers manifest covers only ``drivers/``, so any rogue
         sibling would otherwise be unhashed-but-present content riding a
         converged report (ADR-0042: the applied state directory is potentially
-        malformed after a restore or local corruption). Returns a reason, or
-        ``None`` when the shape is valid."""
+        malformed after a restore or local corruption). Entry CLASSIFICATION
+        can itself fail with OSError after a successful scandir (the metadata
+        stat is lazy) — that too is a shape failure: an entry that cannot be
+        proven regular must never ride a converged report. Returns a reason,
+        or ``None`` when the shape is valid."""
         if tree.is_symlink():
             return "applied tree is a symlink"
         try:
@@ -913,11 +925,17 @@ class NodeDaemon:
         except OSError as exc:
             return f"applied tree cannot be enumerated ({exc})"
         for entry in entries:
-            if entry.name == configdist.DRIVERS_DIR and entry.is_dir(follow_symlinks=False):
-                continue
-            if entry.name == configdist.ARTIFACT_METADATA and entry.is_file(follow_symlinks=False):
-                continue
-            return f"applied tree holds an unexpected or irregular entry {entry.name!r}"
+            try:
+                expected = (
+                    entry.name == configdist.DRIVERS_DIR and entry.is_dir(follow_symlinks=False)
+                ) or (
+                    entry.name == configdist.ARTIFACT_METADATA
+                    and entry.is_file(follow_symlinks=False)
+                )
+            except OSError as exc:
+                return f"applied tree entry {entry.name!r} cannot be classified ({exc})"
+            if not expected:
+                return f"applied tree holds an unexpected or irregular entry {entry.name!r}"
         return None
 
     def _current_built_against(self) -> str:

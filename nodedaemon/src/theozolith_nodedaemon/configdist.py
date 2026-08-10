@@ -84,7 +84,10 @@ def _regular_files(root: Path) -> list[Path]:
       report,
     - every symlink, FIFO, socket, or device raises,
     - a failure to enumerate the root or any descended directory raises —
-      an unreadable subtree must never silently drop from the manifest.
+      an unreadable subtree must never silently drop from the manifest,
+    - a failure to CLASSIFY an enumerated entry (DirEntry metadata OSError
+      after a successful scandir) raises the same way — unclassifiable is
+      indistinguishable from irregular.
 
     STRICTER than the control side's ``regular_files(refuse_irregular=True)``
     by design: control selects from a working SOURCE tree where excluded names
@@ -127,15 +130,29 @@ def _regular_files(root: Path) -> list[Path]:
                     " component, __pycache__, or *.pyc) — a planted entry in the"
                     " applied tree, never skipped (ADR-0042)"
                 )
-            if entry.is_symlink():
+            # DirEntry.is_symlink/is_dir/is_file can themselves raise OSError
+            # after a successful scandir (the metadata stat is lazy) — same
+            # fail-closed rule as an unenumerable subtree: an entry that cannot
+            # be classified must never silently drop from the manifest.
+            try:
+                is_symlink = entry.is_symlink()
+                is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+                is_file = not is_symlink and not is_dir and entry.is_file(follow_symlinks=False)
+            except OSError as exc:
+                raise ConfigDistError(
+                    f"cannot classify {full} while verifying the config"
+                    f" distribution: {exc} (an unclassifiable entry must never"
+                    " silently drop from the manifest, ADR-0042)"
+                ) from exc
+            if is_symlink:
                 raise ConfigDistError(
                     f"{full} is a symlink — a verified tree refuses symlinks"
                     " (unhashed reachable content, ADR-0042)"
                 )
-            if entry.is_dir(follow_symlinks=False):
+            if is_dir:
                 stack.append(full)
                 continue
-            if not entry.is_file(follow_symlinks=False):
+            if not is_file:
                 raise ConfigDistError(
                     f"{full} is not a regular file — a verified tree refuses"
                     " FIFOs, sockets, and devices (ADR-0042)"

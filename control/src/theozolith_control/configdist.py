@@ -70,9 +70,12 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
 
     With ``refuse_irregular`` a symlink or other non-regular entry that passes
     the name filter raises ``ConfigDistError`` — ``drivers/`` fails closed
-    because a symlink could package a file from outside the repo. Without it
-    (folder-mode commit hashing) such entries are simply skipped: a stray
-    symlink in the wider Config Repo must never fail-close heartbeats.
+    because a symlink could package a file from outside the repo — and so does
+    an entry whose METADATA cannot be read at all (a classifier OSError after
+    a successful scandir): unclassifiable is indistinguishable from irregular.
+    Without it (folder-mode commit hashing) such entries are simply skipped: a
+    stray symlink or unreadable entry in the wider Config Repo must never
+    fail-close heartbeats.
 
     The ROOT itself is guarded the same way under ``refuse_irregular``: a
     ``drivers`` that is a symlink (even to a directory), a regular file, or any
@@ -122,17 +125,35 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
             if excluded_part(entry.name):
                 continue
             full = Path(entry.path)
-            if entry.is_symlink():
+            # DirEntry.is_symlink/is_dir/is_file can themselves raise OSError
+            # after a successful scandir (the metadata stat is lazy). Same
+            # posture split as enumeration: refuse_irregular fails closed — an
+            # entry that cannot be classified must never silently drop from
+            # the manifest — while folder mode skips it like any other
+            # unreadable content (ADR-0042).
+            try:
+                is_symlink = entry.is_symlink()
+                is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+                is_file = not is_symlink and not is_dir and entry.is_file(follow_symlinks=False)
+            except OSError as exc:
+                if refuse_irregular:
+                    raise ConfigDistError(
+                        f"cannot classify {full} for the config distribution: {exc}"
+                        " (an unclassifiable entry must never silently drop from"
+                        " the manifest, ADR-0042)"
+                    ) from exc
+                continue
+            if is_symlink:
                 if refuse_irregular:
                     raise ConfigDistError(
                         f"{full} is a symlink — the config distribution refuses"
                         " symlinks (a symlink could escape the repo, ADR-0042)"
                     )
                 continue  # a symlinked dir/file is skipped, never descended
-            if entry.is_dir(follow_symlinks=False):
+            if is_dir:
                 stack.append(full)
                 continue
-            if not entry.is_file(follow_symlinks=False):
+            if not is_file:
                 if refuse_irregular:
                     raise ConfigDistError(
                         f"{full} is not a regular file — the config distribution"
