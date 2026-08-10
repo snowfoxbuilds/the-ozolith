@@ -654,13 +654,37 @@ def test_cross_package_fail_closed_on_enumeration_failure(tmp_path, monkeypatch)
         node_configdist.manifest_hash_of_tree(tmp_path)
 
 
-def test_cross_package_agreement_survives_excluded_irregular_entries(tmp_path):
-    """Excluded names (dot-prefixed) are tolerated whatever they are — a
-    dot-prefixed symlink is skipped by BOTH sides before its shape is examined,
-    so the two hashes still agree on the clean content."""
+def test_source_exclusion_and_applied_tree_validation_are_different_layers(tmp_path):
+    """Source exclusion and applied-tree validation are DIFFERENT LAYERS
+    (ADR-0042 amendment). Control-side SOURCE selection skips excluded names
+    whatever their shape — a working repo legitimately holds editor droppings,
+    so a dot-prefixed symlink never changes the packaged hash. The node
+    verifies the PRODUCT OF AN EXTRACTION, and an accepted artifact can never
+    contain an excluded member — so the very same entry FAILS node-side
+    verification instead of riding unhashed beside a converged report."""
     _populate(tmp_path)
     clean_control = configdist.drivers_hash(tmp_path)
-    clean_node = node_configdist.manifest_hash_of_tree(tmp_path)
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == clean_control  # clean agreement
     (tmp_path / "drivers" / ".editor-swap").symlink_to(tmp_path / "outside-nowhere")
-    assert configdist.drivers_hash(tmp_path) == clean_control
-    assert node_configdist.manifest_hash_of_tree(tmp_path) == clean_node
+    assert configdist.drivers_hash(tmp_path) == clean_control  # source layer: skipped
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.manifest_hash_of_tree(tmp_path)  # applied layer: rejected
+
+
+@pytest.mark.parametrize(
+    "plant",
+    ["evil.pyc", "__pycache__/evil.pyc", ".hidden.py", ".hidden-dir/x.py"],
+)
+def test_node_applied_tree_rejects_excluded_names_the_source_manifest_skips(tmp_path, plant):
+    """Every excluded-name shape — an importable ``*.pyc``, a ``__pycache__``d
+    ``*.pyc``, a dot-prefixed file, a file under a dot-prefixed directory —
+    stays invisible to the control-side SOURCE manifest (hash unchanged) yet
+    fails the node's post-extraction validation: no member the artifact rule
+    rejects can be planted into an applied tree while preserving a converged
+    report."""
+    _populate(tmp_path)
+    clean_control = configdist.drivers_hash(tmp_path)
+    _write(tmp_path, f"drivers/custom/{plant}", b"\x00evil")
+    assert configdist.drivers_hash(tmp_path) == clean_control  # source layer: skipped
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.manifest_hash_of_tree(tmp_path)  # applied layer: rejected

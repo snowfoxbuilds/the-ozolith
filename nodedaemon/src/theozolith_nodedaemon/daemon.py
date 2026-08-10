@@ -871,9 +871,13 @@ class NodeDaemon:
         """The applied root ``config-dist/<hash>/`` may hold ONLY the unpacked
         artifact shape: the ``drivers`` directory (real, not a symlink) and the
         ``config-dist.json`` metadata file (regular, not a symlink) — either
-        may be absent, but nothing else non-excluded may be present. The
-        drivers manifest covers only ``drivers/``, so a rogue sibling at the
-        applied root would otherwise be unhashed-but-present content riding a
+        may be absent, but NOTHING else may be present. The source-tree
+        exclusion predicate does not apply here: it selects files from a
+        working repo, while this root is the product of an extraction that only
+        ever writes those two names — so a dot-prefixed sibling, a ``*.pyc``,
+        or an irregular hidden entry is a planted foreign entry, not tolerable
+        droppings. The drivers manifest covers only ``drivers/``, so any rogue
+        sibling would otherwise be unhashed-but-present content riding a
         converged report (ADR-0042: the applied state directory is potentially
         malformed after a restore or local corruption). Returns a reason, or
         ``None`` when the shape is valid."""
@@ -885,8 +889,6 @@ class NodeDaemon:
         except OSError as exc:
             return f"applied tree cannot be enumerated ({exc})"
         for entry in entries:
-            if configdist.excluded_part(entry.name):
-                continue
             if entry.name == configdist.DRIVERS_DIR and entry.is_dir(follow_symlinks=False):
                 continue
             if entry.name == configdist.ARTIFACT_METADATA and entry.is_file(follow_symlinks=False):
@@ -975,7 +977,10 @@ class NodeDaemon:
         very tree the child runs from), the tree exchanged, and the ``current``
         pointer published. Each transition is crash-recoverable: a failure at
         any step leaves a pointer/tree state that reads as non-converged
-        (evidence-based) and is retried honestly next pass."""
+        (evidence-based) and is retried honestly next pass — and once the
+        drivers have been stopped, they stay stopped after any such failure:
+        the reconcile gate refuses to start a custom driver until the
+        pointer-selected tree freshly verifies to the desired hash."""
         data = self._client.fetch_config_artifact(desired)
         root = self._config.config_dist_dir
         root.mkdir(parents=True, exist_ok=True)
@@ -992,11 +997,18 @@ class NodeDaemon:
                     f" {recomputed[:12] or '(empty)'}, expected {desired[:12]}"
                 )
             # The replacement is fully verified — only now touch the running
-            # world. Stop the affected driver Stacks BEFORE the active path is
-            # removed or exchanged, so no interval exists where that path is
-            # absent beneath a running process; this pass's _reconcile restarts
-            # them on the published tree. Queue-behind was already honored by
-            # _converge_drivers, so no active Run is killed here.
+            # world. From here on the pass-start memo is no longer evidence:
+            # the exchange may leave the applied world mid-transition, so drop
+            # it BEFORE anything is stopped — any later read (in particular the
+            # reconcile gate that decides whether a stopped custom driver may
+            # start) re-derives the applied hash from the pointer-selected tree
+            # on disk, never from a stale memo. Stop the affected driver Stacks
+            # BEFORE the active path is removed or exchanged, so no interval
+            # exists where that path is absent beneath a running process; this
+            # pass's _reconcile restarts them on the published tree. Queue-behind
+            # was already honored by _converge_drivers, so no active Run is
+            # killed here.
+            self._verified_drivers_hash = None
             self._stop_drivers_stacks()
             self._exchange_config_dist_tree(staging, root / desired)
         finally:
@@ -1030,7 +1042,12 @@ class NodeDaemon:
 
     def _retire_config_dist(self, previous: str) -> None:
         """Empty-desired: stop the config-distribution driver Stacks, clear the
-        ``current`` pointer, and reclaim the unpacked trees (ADR-0042)."""
+        ``current`` pointer, and reclaim the unpacked trees (ADR-0042). The
+        pass memo is dropped before anything is stopped (a failure mid-retire
+        must re-derive the applied hash from disk, never trust the stale
+        pass-start value) and set to the empty sentinel only once the retire
+        completed."""
+        self._verified_drivers_hash = None
         self._stop_drivers_stacks()
         with contextlib.suppress(OSError):
             self._config.config_dist_current.unlink()
@@ -1298,6 +1315,24 @@ class NodeDaemon:
             blocker = self._inflight_blocker([stack.name])
             if blocker is not None:
                 self._log(f"stack {stack.name}: restart deferred ({blocker})")
+                return
+        # A custom drivers/* Stack may (re)start ONLY when the freshly verified
+        # applied distribution equals this pass's desired hash (ADR-0042
+        # amendment). After a post-stop exchange or pointer-publication failure
+        # the pointer-selected tree may be invalid, unpublished, or missing —
+        # and safety is never inferred from the directory name or pointer
+        # contents alone: _current_drivers_hash only answers non-empty when the
+        # pointed-at tree recomputes to the pointer. A live child is left
+        # running (restart deferred); a child stopped for a replacement stays
+        # stopped until the existing convergence path succeeds on a later pass.
+        # Builtin drivers and generic process Stacks are untouched.
+        if len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/"):
+            desired_hash = str(self._desired.get("drivers_hash", "") or "")
+            if self._current_drivers_hash() != desired_hash:
+                self._log(
+                    f"stack {stack.name}: {'restart' if alive else 'start'} deferred —"
+                    " config distribution not converged to the desired hash"
+                )
                 return
         # Never restart onto a run image that is not built: if the driver's
         # declared derived run image is missing (its recipe failed or has not

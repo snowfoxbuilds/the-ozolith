@@ -4086,6 +4086,98 @@ def test_config_dist_unenumerable_applied_subtree_is_not_converged(rig: Rig, mon
     assert any("failed verification" in line for line in rig.logs)
 
 
+# -- applied-tree structural validation (ADR-0042 amendment) ------------------
+#
+# Source exclusion and applied-tree validation are DIFFERENT LAYERS: control's
+# source selection skips excluded names (a working repo holds them
+# legitimately), but an accepted artifact can never contain one — so an
+# excluded-name entry found in an APPLIED tree is a planted foreign entry and
+# must fail verification, never be silently skipped around.
+
+
+def test_config_dist_planted_pyc_in_applied_tree_is_not_converged_then_repaired(rig: Rig):
+    """An importable ``*.pyc`` planted under the applied drivers/ would ride
+    ``sys.path`` without ever entering the hash. It fails structural validation
+    (never skipped as a source-excluded name), the heartbeat reports
+    non-convergence, and repair removes it."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "evil.pyc").write_bytes(b"\x00evil")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # fail closed, never skipped
+    assert not (tree / "drivers" / "custom" / "evil.pyc").exists()  # repaired away
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+@pytest.mark.parametrize("plant", ["pycache_pyc", "dot_file", "dot_dir", "dot_symlink", "dot_fifo"])
+def test_config_dist_excluded_named_entry_in_applied_tree_is_not_converged_then_repaired(
+    rig: Rig, plant
+):
+    """Every entry whose NAME an accepted artifact can never contain — a
+    ``__pycache__``d ``*.pyc``, a dot-prefixed regular file, directory,
+    symlink, or FIFO — fails applied-tree validation instead of being skipped,
+    and repair removes it."""
+    import os
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    custom = rig.config.state_dir / "config-dist" / digest / "drivers" / "custom"
+    if plant == "pycache_pyc":
+        planted = custom / "__pycache__" / "evil.pyc"
+        planted.parent.mkdir()
+        planted.write_bytes(b"\x00evil")
+    elif plant == "dot_file":
+        planted = custom / ".hidden.py"
+        planted.write_text("evil = 1\n", encoding="utf-8")
+    elif plant == "dot_dir":
+        planted = custom / ".hidden"
+        planted.mkdir()
+        (planted / "evil.py").write_text("evil = 1\n", encoding="utf-8")
+    elif plant == "dot_symlink":
+        planted = custom / ".editor-swap"
+        planted.symlink_to(rig.config.state_dir / "outside-nowhere")
+    else:
+        planted = custom / ".pipe"
+        os.mkfifo(planted)
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # fail closed, never skipped
+    assert not planted.exists() and not planted.is_symlink()  # repaired away
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+@pytest.mark.parametrize("name", [".hidden.py", ".hidden-dir", ".pipe", "evil.pyc"])
+def test_config_dist_excluded_named_applied_root_sibling_fails_shape_then_repairs(rig: Rig, name):
+    """The applied root permits ONLY a real drivers/ directory and a regular
+    config-dist.json — the source-tree exclusion predicate does not apply to
+    root siblings, so dot-prefixed files/directories, irregular hidden entries,
+    and ``*.pyc`` siblings all fail structural validation and are repaired."""
+    import os
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    planted = tree / name
+    if name == ".hidden-dir":
+        planted.mkdir()
+    elif name == ".pipe":
+        os.mkfifo(planted)
+    else:
+        planted.write_text("evil = 1\n", encoding="utf-8")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert any("unexpected" in line for line in rig.logs)
+    assert not planted.exists()  # repaired away with the whole exchanged tree
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
 # -- lifecycle-safe same-hash repair (ADR-0042 amendment) ---------------------
 
 
@@ -4169,14 +4261,18 @@ def test_config_dist_same_hash_repair_defers_behind_inflight_run(rig: Rig, tmp_p
 
 
 def test_config_dist_exchange_failure_is_honest_and_retried(rig: Rig):
-    """An injected failure during the active-tree exchange leaves retryable
-    state: the desired hash is NEVER memoized, the next heartbeat reports the
-    evidence-based value, and the next pass repairs honestly."""
+    """An injected failure BEFORE the failing tree is renamed aside leaves
+    retryable state: the tree is still the known-mutated original, the stopped
+    driver is NOT restarted by reconciliation (never against known-invalid
+    state), the desired hash is NEVER memoized, the next heartbeat reports the
+    evidence-based value, and the next pass repairs honestly and restarts the
+    driver exactly once."""
     custom = driver_stack("custom-impl", "drivers/custom")
     digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
     rig.control.config_artifacts[digest] = data
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
     rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
     tree = rig.config.state_dir / "config-dist" / digest
     (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
     calls: list[str] = []
@@ -4192,11 +4288,20 @@ def test_config_dist_exchange_failure_is_honest_and_retried(rig: Rig):
     assert any("config distribution" in line and "failed" in line for line in rig.logs)
     assert rig.control.events  # a theozolith.error was emitted
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "MUTATED = 9\n"
+    # Supervisor state, not just files: the driver was stopped for the
+    # replacement and the same pass's reconcile must NOT have restarted it
+    # against the known-mutated tree.
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert any("deferred" in line and "not converged" in line for line in rig.logs)
     del rig.daemon._exchange_config_dist_tree  # restore the real method
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
     rig.daemon.once()
     assert _last_heartbeat(rig)["drivers_hash"] == ""  # never memoized on failure
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
+    # The retry pass repaired, published, and restarted the driver exactly once.
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    assert len(spawns) == 2  # the initial start + exactly one post-repair restart
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
     rig.daemon.once()
     assert _last_heartbeat(rig)["drivers_hash"] == digest
@@ -4228,6 +4333,120 @@ def test_config_dist_pointer_failure_keeps_reporting_old_hash_then_converges(rig
     assert _last_heartbeat(rig)["drivers_hash"] == a_hash
     assert (root / "current").read_text().strip() == b_hash
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == b_hash
+
+
+def test_config_dist_crash_between_renames_keeps_driver_stopped_then_repairs(rig: Rig):
+    """Injected failure AFTER the failing tree is renamed aside but BEFORE the
+    verified staging is renamed in: the active path is absent, so the stopped
+    driver must NOT restart (the pointer names a missing tree — never inferred
+    safe from its contents); the next pass repairs and restarts it exactly
+    once."""
+    import os
+
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+
+    def crashed_between_renames(staging, final):
+        retired = final.parent / f".{final.name}.retired"
+        os.replace(final, retired)
+        raise OSError(5, "injected: crashed between the renames")
+
+    rig.daemon._exchange_config_dist_tree = crashed_between_renames
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert not tree.exists()  # the active path is absent mid-transition
+    assert not rig.daemon._supervisor.alive("custom-impl")  # stopped, NOT restarted
+    del rig.daemon._exchange_config_dist_tree  # restore the real method
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    assert len(spawns) == 2  # the initial start + exactly one post-repair restart
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_pointer_failure_after_repair_allows_freshly_verified_restart(rig: Rig):
+    """Injected failure AFTER the verified staging is renamed in but BEFORE
+    pointer publication, on a same-hash repair: reporting stays based on the
+    old pointer — which here selects the freshly exchanged tree, and that tree
+    independently verifies to the desired hash, so the driver may restart. The
+    decision comes from re-verification of the pointer-selected tree, never
+    from the directory name or the pointer value alone."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+
+    def failing(drivers_hash):
+        raise OSError(5, "injected: pointer publication failed")
+
+    rig.daemon._write_current_pointer = failing
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    # The heartbeat at the start of the failing pass was honest ("").
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    # The tree was repaired; the untouched pointer selects it; it verifies to
+    # the desired hash — so the driver restarted, exactly once.
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    assert len(spawns) == 2
+    del rig.daemon._write_current_pointer  # restore the real method
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_pointer_failure_on_new_hash_keeps_driver_stopped(rig: Rig):
+    """Injected pointer-publication failure on a NEW-hash swap: the old pointer
+    stays authoritative and selects the OLD tree — which verifies, but not to
+    the desired hash — so the stopped driver stays stopped rather than restart
+    against state the desired distribution never published. The next pass
+    completes the transition and restarts it exactly once."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([custom], a_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+
+    def failing(drivers_hash):
+        raise OSError(5, "injected: pointer publication failed")
+
+    rig.daemon._write_current_pointer = failing
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == a_hash  # the old pointer stands
+    assert not rig.daemon._supervisor.alive("custom-impl")  # stopped, NOT restarted
+    del rig.daemon._write_current_pointer  # restore the real method
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    # The heartbeat at the start of the retry pass still reported the OLD hash
+    # (evidence-based: the old pointer selects the old, still-valid tree).
+    assert _last_heartbeat(rig)["drivers_hash"] == a_hash
+    assert (root / "current").read_text().strip() == b_hash
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    assert len(spawns) == 2  # the initial start + exactly one post-publication restart
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
     rig.daemon.once()
     assert _last_heartbeat(rig)["drivers_hash"] == b_hash
 

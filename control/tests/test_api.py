@@ -975,6 +975,66 @@ def test_inflight_artifact_response_survives_concurrent_pruning(control: Control
     assert zips == sorted(f"{d}.zip" for d in (digest_b, digest_c))
 
 
+def test_post_build_cache_corruption_is_never_served(control: ControlRig, monkeypatch):
+    """The build branch must send the bytes it VERIFIED, not whatever the cache
+    file happens to hold after publication: a corruption landing between
+    build_artifact's publish and the endpoint's post-build read is caught by
+    verifying that exact response snapshot against the requested hash, the
+    suspect entry is dropped, and the bounded loop rebuilds a valid artifact
+    (ADR-0042 amendment)."""
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    garbage = b"corrupted after publication, before the response read"
+    corrupted = {"done": False}
+    real_build = configdist.build_artifact
+
+    def build_then_corrupt(*args, **kwargs):
+        built, path = real_build(*args, **kwargs)
+        if path is not None and not corrupted["done"]:
+            corrupted["done"] = True
+            path.write_bytes(garbage)  # lands before the endpoint's post-build read
+        return built, path
+
+    monkeypatch.setattr(configdist, "build_artifact", build_then_corrupt)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    answer = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert corrupted["done"]  # the corruption really landed inside the window
+    assert answer.status_code == 200
+    assert answer.content != garbage  # the corrupted snapshot was never sent
+    probe = control.settings.data_dir / "postbuild.zip"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_bytes(answer.content)
+    recomputed, _ = configdist.verify_artifact(probe)
+    assert recomputed == digest
+
+
+def test_sustained_post_build_corruption_returns_the_retry_response(
+    control: ControlRig, monkeypatch
+):
+    """If EVERY rebuild's published entry is corrupted inside the
+    publish-to-read window, the endpoint exhausts its bounded loop with the
+    documented 503 retry answer — never the corrupt bytes, never an unverified
+    response (ADR-0042 amendment)."""
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    garbage = b"corrupted after every publication"
+    real_build = configdist.build_artifact
+
+    def build_then_corrupt(*args, **kwargs):
+        built, path = real_build(*args, **kwargs)
+        if path is not None:
+            path.write_bytes(garbage)
+        return built, path
+
+    monkeypatch.setattr(configdist, "build_artifact", build_then_corrupt)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    answer = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert answer.status_code == 503
+    assert garbage not in answer.content
+
+
 def test_broken_config_dist_keeps_dispatch_fail_open(control: ControlRig):
     """A config-distribution validation failure (symlinked drivers root) must
     preserve dispatch's documented fail-open posture: the grant path proceeds

@@ -18,6 +18,18 @@ can be malformed after a restore, interrupted maintenance, or local corruption,
 so a symlink, irregular entry (FIFO/socket/device), or unenumerable subtree
 raises ``ConfigDistError`` rather than being skipped — an entry either
 participates in the recomputed hash or fails verification outright.
+
+Source exclusion and applied-tree validation are DIFFERENT LAYERS (ADR-0042
+amendment). Control-side SOURCE selection excludes dot-prefixed components,
+``__pycache__``, and ``*.pyc`` from the manifest (the working repo may hold
+them legitimately). An accepted ARTIFACT can never contain such members
+(``artifact_structure_error``), so a verified tree on this side — always the
+product of an extraction — must be a structural instance of an accepted
+artifact: an excluded-name entry found under the applied ``drivers/`` is a
+planted foreign entry (an importable ``*.pyc`` rides ``sys.path`` without ever
+entering the hash) and FAILS verification rather than being skipped. The
+clean-tree hash stays byte-for-byte the control side's — a tree with no such
+entries hashes identically under both walks.
 """
 
 from __future__ import annotations
@@ -46,29 +58,40 @@ class ConfigDistError(RuntimeError):
 
 
 def excluded_part(part: str) -> bool:
-    """One path component the config-distribution file set ignores — dot-prefixed,
-    ``__pycache__``, or ``*.pyc``. Mirror of the control side (pinned by the
-    cross-package contract test)."""
+    """One path component the config-distribution SOURCE file set ignores —
+    dot-prefixed, ``__pycache__``, or ``*.pyc``. Mirror of the control side
+    (pinned by the cross-package contract test). On this side the predicate is
+    a REJECTION rule, not a skip rule: an accepted artifact can never contain
+    such a member, so finding one in a verified tree is a structural failure."""
     return part.startswith(".") or part == "__pycache__" or part.endswith(".pyc")
 
 
 def _regular_files(root: Path) -> list[Path]:
-    """Sorted regular files under ``root`` whose every path component passes
-    ``excluded_part`` — FAIL CLOSED (ADR-0042). Extraction never writes a
-    symlink or irregular entry (``safe_member``), but the APPLIED tree this
+    """Sorted regular files under ``root``, enforcing the POST-EXTRACTION
+    structure of an accepted artifact — FAIL CLOSED (ADR-0042). Extraction
+    never writes an excluded name, a symlink, or an irregular entry
+    (``artifact_structure_error`` + ``safe_member``), but the APPLIED tree this
     verifies can be anything after a restore, interrupted maintenance, or local
     corruption — so nothing is skipped silently:
 
     - a ``root`` that is a symlink (even to a directory), a regular file, or
       any other non-directory entry raises ``ConfigDistError``; only a
       genuinely missing root is the empty distribution,
-    - a non-excluded symlink, FIFO, socket, or device anywhere below raises,
+    - any entry with an excluded name (dot-prefixed, ``__pycache__``, ``*.pyc``)
+      raises — an accepted artifact can never contain one, and skipping it
+      would let an importable planted ``*.pyc`` coexist with a converged
+      report,
+    - every symlink, FIFO, socket, or device raises,
     - a failure to enumerate the root or any descended directory raises —
       an unreadable subtree must never silently drop from the manifest.
 
-    Mirror of the control side's ``regular_files(refuse_irregular=True)``
-    (pinned by the cross-package contract tests): an entry can only be hashed
-    content or a verification failure, never unhashed-but-present."""
+    STRICTER than the control side's ``regular_files(refuse_irregular=True)``
+    by design: control selects from a working SOURCE tree where excluded names
+    are legitimate and skipped; this side validates the product of an
+    extraction, where they cannot legitimately exist. The two walks agree
+    byte-for-byte on any clean tree (pinned by the cross-package contract
+    tests): an entry can only be hashed content or a verification failure,
+    never unhashed-but-present."""
     root = Path(root)
     if root.is_symlink():
         raise ConfigDistError(
@@ -96,9 +119,13 @@ def _regular_files(root: Path) -> list[Path]:
                 " drop from the manifest, ADR-0042)"
             ) from exc
         for entry in entries:
-            if excluded_part(entry.name):
-                continue
             full = Path(entry.path)
+            if excluded_part(entry.name):
+                raise ConfigDistError(
+                    f"{full} has a name an accepted artifact can never contain (a dot"
+                    " component, __pycache__, or *.pyc) — a planted entry in the"
+                    " applied tree, never skipped (ADR-0042)"
+                )
             if entry.is_symlink():
                 raise ConfigDistError(
                     f"{full} is a symlink — a verified tree refuses symlinks"
@@ -125,10 +152,11 @@ def manifest_hash_of_tree(dist_root: Path) -> str:
     side's ``manifest_hash(drivers_manifest(...))``.
 
     FAIL CLOSED (ADR-0042): a symlinked or otherwise irregular ``drivers``
-    root, any non-excluded symlink/FIFO/socket/device below it, a failure to
-    enumerate any included directory, or an unreadable file all raise
-    ``ConfigDistError`` — the caller reads that as non-converged and repairs;
-    an irregular entry is never silently omitted from the hash."""
+    root, any symlink/FIFO/socket/device below it, any entry whose name an
+    accepted artifact can never contain (a dot component, ``__pycache__``, a
+    ``*.pyc``), a failure to enumerate any included directory, or an unreadable
+    file all raise ``ConfigDistError`` — the caller reads that as non-converged
+    and repairs; an entry is never silently omitted from the hash."""
     dist_root = Path(dist_root)
     root = dist_root / DRIVERS_DIR
     entries: list[list[str]] = []

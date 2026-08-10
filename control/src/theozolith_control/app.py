@@ -652,10 +652,15 @@ def create_app(
             Returns an immutable BYTE SNAPSHOT, never a pathname: the cache is
             prunable (keep-two), so a concurrent request building a third hash
             may unlink this entry between verification and response send — the
-            response must own what it verified through completion. The snapshot
-            is read first and verified as bytes; nothing after that point can
-            touch it. No cross-request lock: the fd-lifetime/snapshot mechanism
-            is sufficient, so artifact requests never serialize."""
+            response must own what it verified through completion. BOTH exit
+            branches read the snapshot first and verify that exact snapshot
+            (recomputing to the requested hash) — the cached branch on its
+            read, the build branch on its post-publication re-read, since a
+            concurrent replace inside the publish-to-read window could hand
+            back bytes build_artifact never verified. Nothing after that point
+            can touch what is returned. No cross-request lock: the
+            fd-lifetime/snapshot mechanism is sufficient, so artifact requests
+            never serialize."""
             cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
             for _ in range(3):
                 snapshot: bytes | None
@@ -702,6 +707,21 @@ def create_app(
                 except OSError:
                     # Concurrent requests built enough newer hashes to prune this
                     # one inside the publish-to-read window; rebuild and retry.
+                    continue
+                # What is sent must be what was VERIFIED: build_artifact verified
+                # the tempfile it published, but THESE bytes were read after
+                # publication — a concurrent replace or corruption inside the
+                # publish-to-read window could hand back different bytes. Verify
+                # this exact snapshot and require it to recompute to the requested
+                # hash before it can be the response; on any disagreement drop the
+                # suspect cache entry (best effort) and retry in the bounded loop.
+                try:
+                    recomputed, _ = configdist.verify_artifact_bytes(snapshot)
+                except configdist.ConfigDistError:
+                    recomputed = None
+                if recomputed != drivers_hash:
+                    with contextlib.suppress(OSError):
+                        cached.unlink()
                     continue
                 configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
                 return snapshot
