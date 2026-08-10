@@ -21,6 +21,7 @@ import io
 import json
 import os
 import zipfile
+import zlib
 from pathlib import Path
 
 DRIVERS_DIR = "drivers"
@@ -82,7 +83,16 @@ def manifest_hash_of_tree(dist_root: Path) -> str:
     entries: list[list[str]] = []
     for path in _regular_files(root):
         relpath = path.relative_to(dist_root).as_posix()
-        entries.append([relpath, hashlib.sha256(path.read_bytes()).hexdigest()])
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            # Normalize a read failure over the unpacked tree to ConfigDistError
+            # so the caller treats it as non-converged / a repair trigger rather
+            # than an unhandled crash (ADR-0042).
+            raise ConfigDistError(
+                f"cannot read {relpath!r} while recomputing the config distribution: {exc}"
+            ) from exc
+        entries.append([relpath, hashlib.sha256(data).hexdigest()])
     entries.sort()
     if not entries:
         return ""
@@ -104,32 +114,86 @@ def safe_member(name: str) -> bool:
     return not any(part in ("", ".", "..") for part in parts)
 
 
+def artifact_structure_error(names: list[str]) -> str | None:
+    """The complete structural rule for a config-distribution archive's member
+    list (ADR-0042). Mirror of ``theozolith_control.configdist``'s function of
+    the same name — the node validates the shape INDEPENDENTLY before extraction,
+    so control's and the node's rules must agree byte-for-byte (pinned by a
+    cross-package contract test).
+
+    A valid archive holds EXACTLY the single ``config-dist.json`` metadata member
+    at the root plus zero or more ``drivers/...`` files the canonical manifest
+    counts. Anything the manifest would ignore (a dot component, ``__pycache__``,
+    a ``*.pyc``, a bare directory entry, a second top-level file, an unsafe name,
+    or a duplicate) is rejected, so no ignored-but-importable content can ride
+    along outside ``drivers_hash``."""
+    seen: set[str] = set()
+    saw_metadata = False
+    for name in names:
+        if name in seen:
+            return f"member {name!r} is a duplicate"
+        seen.add(name)
+        if not safe_member(name):
+            return f"member {name!r} is unsafe or not a plain relative file"
+        if name == ARTIFACT_METADATA:
+            saw_metadata = True
+            continue
+        parts = name.split("/")
+        if parts[0] != DRIVERS_DIR or len(parts) < 2:
+            return (
+                f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
+                f" {DRIVERS_DIR}/ file"
+            )
+        if any(excluded_part(part) for part in parts):
+            return (
+                f"member {name!r} is ignored by the manifest (a dot component,"
+                " __pycache__, or *.pyc) yet rides the archive"
+            )
+    if not saw_metadata:
+        return f"missing the {ARTIFACT_METADATA} metadata member"
+    return None
+
+
 def extract_zip(data: bytes, dest: Path) -> None:
     """Extract a config-distribution zip into ``dest`` (which must exist),
-    validating every member name with ``safe_member`` FIRST — a single unsafe
-    member fails the whole extraction before anything is written outside the
-    check. Directory members are honored; file members are written under
-    ``dest``."""
+    validating the COMPLETE structural rule FIRST (``artifact_structure_error``)
+    — a single bad member fails the whole extraction before anything is written.
+    Every failure mode (a corrupt zip, a bad member list, a bad-CRC or
+    corrupt/encrypted member, a filesystem error) surfaces as ConfigDistError,
+    so the caller treats it as non-converged and repairs on the next fetch."""
     dest = Path(dest)
     root = dest.resolve()
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as exc:
+    except (OSError, zipfile.BadZipFile) as exc:
         raise ConfigDistError(f"config distribution is not a valid zip: {exc}") from exc
     with archive:
-        names = archive.namelist()
-        for name in names:
-            if not safe_member(name):
-                raise ConfigDistError(f"config distribution member {name!r} is unsafe to extract")
-        for info in archive.infolist():
+        try:
+            names = archive.namelist()
+            infos = archive.infolist()
+        except (OSError, zipfile.BadZipFile, EOFError, zlib.error) as exc:
+            raise ConfigDistError(f"config distribution member list is unreadable: {exc}") from exc
+        structure_error = artifact_structure_error(names)
+        if structure_error:
+            raise ConfigDistError(f"config distribution {structure_error}")
+        for info in infos:
             target = (dest / info.filename).resolve()
             if root != target and root not in target.parents:
-                # Defence in depth: safe_member already rejected traversal.
+                # Defence in depth: the structural rule already rejected traversal.
                 raise ConfigDistError(
                     f"config distribution member {info.filename!r} escapes the destination"
                 )
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(info))
+            # The structural rule forbids directory members, so this is a file.
+            try:
+                payload = archive.read(info)
+            except (OSError, zipfile.BadZipFile, EOFError, zlib.error, RuntimeError) as exc:
+                raise ConfigDistError(
+                    f"config distribution member {info.filename!r} is unreadable: {exc}"
+                ) from exc
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+            except OSError as exc:
+                raise ConfigDistError(
+                    f"config distribution member {info.filename!r} cannot be extracted: {exc}"
+                ) from exc

@@ -29,6 +29,7 @@ import json
 import os
 import tempfile
 import zipfile
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -94,27 +95,42 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
             )
     elif not root.is_dir():
         return []
+    # Explicit DFS rather than os.walk: os.walk's default onerror SWALLOWS a
+    # scandir failure, silently omitting an unreadable subtree — which would
+    # change the manifest without a sound. Under refuse_irregular a failure to
+    # enumerate the root or any descended directory raises ConfigDistError
+    # (fail closed); folder-mode (refuse_irregular=False) keeps the broader
+    # skip-the-unreadable-subtree posture unchanged (ADR-0042).
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        kept_dirs = []
-        for name in sorted(dirnames):
-            if excluded_part(name):
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            if refuse_irregular:
+                raise ConfigDistError(
+                    f"cannot enumerate {current} for the config distribution: {exc}"
+                    " (an unreadable subtree must never silently drop from the"
+                    " manifest, ADR-0042)"
+                ) from exc
+            continue
+        for entry in entries:
+            if excluded_part(entry.name):
                 continue
-            if (Path(dirpath) / name).is_symlink():
+            full = Path(entry.path)
+            if entry.is_symlink():
                 if refuse_irregular:
                     raise ConfigDistError(
-                        f"{Path(dirpath) / name} is a symlink — the config"
-                        " distribution refuses symlinks (a symlink could escape"
-                        " the repo, ADR-0042)"
+                        f"{full} is a symlink — the config distribution refuses"
+                        " symlinks (a symlink could escape the repo, ADR-0042)"
                     )
-                continue  # a symlinked dir is skipped, never descended
-            kept_dirs.append(name)
-        dirnames[:] = kept_dirs
-        for name in sorted(filenames):
-            if excluded_part(name):
+                continue  # a symlinked dir/file is skipped, never descended
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(full)
                 continue
-            full = Path(dirpath) / name
-            if full.is_symlink() or not full.is_file():
+            if not entry.is_file(follow_symlinks=False):
                 if refuse_irregular:
                     raise ConfigDistError(
                         f"{full} is not a regular file — the config distribution"
@@ -253,17 +269,66 @@ def safe_member(name: str) -> bool:
     return not any(part in ("", ".", "..") for part in parts)
 
 
+def artifact_structure_error(names: list[str]) -> str | None:
+    """The complete structural rule for a config-distribution archive's member
+    list (ADR-0042), returning a human reason on the first violation or ``None``
+    when the shape is valid. Mirrored byte-for-byte by
+    ``theozolith_nodedaemon.configdist.artifact_structure_error`` — control
+    validates before publishing OR serving, the node independently before
+    extraction, so the two must agree on what an artifact may contain.
+
+    A valid archive holds EXACTLY the single ``config-dist.json`` metadata
+    member at the root plus zero or more ``drivers/...`` files that the canonical
+    manifest counts. Every member must therefore be either that one metadata
+    file or a hash-covered drivers file — anything the manifest would ignore
+    (a dot-prefixed component, a ``__pycache__`` directory, a ``*.pyc``, a bare
+    directory entry, a second top-level file, an unsafe/traversal name, or a
+    duplicate) is rejected, so no ignored-but-importable content can ride along
+    outside ``drivers_hash``."""
+    seen: set[str] = set()
+    saw_metadata = False
+    for name in names:
+        if name in seen:
+            return f"member {name!r} is a duplicate"
+        seen.add(name)
+        if not safe_member(name):
+            # Also rejects directory entries (a trailing '/' yields an empty
+            # final component) and traversal/absolute/drive-letter names.
+            return f"member {name!r} is unsafe or not a plain relative file"
+        if name == ARTIFACT_METADATA:
+            saw_metadata = True
+            continue
+        parts = name.split("/")
+        if parts[0] != DRIVERS_DIR or len(parts) < 2:
+            return (
+                f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
+                f" {DRIVERS_DIR}/ file"
+            )
+        if any(excluded_part(part) for part in parts):
+            return (
+                f"member {name!r} is ignored by the manifest (a dot component,"
+                " __pycache__, or *.pyc) yet rides the archive"
+            )
+    if not saw_metadata:
+        return f"missing the {ARTIFACT_METADATA} metadata member"
+    return None
+
+
 def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
     """Unpack a built ``<hash>.zip`` into a throwaway temp dir, recompute the
     drivers manifest over the unpacked tree, and validate the metadata member;
     return ``(recomputed_hash, metadata)``. This is the ONLY proof an artifact
     is publishable or servable — never the filename, never the archive bytes.
 
-    Raises ``ConfigDistError`` when: the file is not a valid zip; any member
-    name is unsafe (traversal / absolute / drive-letter); the metadata member
-    is missing or malformed; ``format`` is not the current artifact format; or
-    the metadata's ``drivers_hash`` does not equal the tree's recomputed hash.
-    ``built_against`` is not checked — it is advisory (ADR-0042)."""
+    Raises ``ConfigDistError`` — and ONLY ConfigDistError — for every way an
+    artifact can be unpublishable: the file is not a valid zip; the member list
+    fails the structural rule (``artifact_structure_error``); a member's bytes
+    cannot be read (bad CRC, corrupt compression, encryption); extraction hits a
+    filesystem error; the metadata member is missing, unreadable, or malformed;
+    ``format`` is not the current artifact format; or the metadata's
+    ``drivers_hash`` does not equal the tree's recomputed hash. Programming
+    errors outside these failure modes are NOT caught. ``built_against`` is not
+    checked — it is advisory (ADR-0042)."""
     path = Path(path)
     try:
         archive = zipfile.ZipFile(path)
@@ -272,20 +337,37 @@ def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
     with archive, tempfile.TemporaryDirectory(prefix=".verify-configdist-") as td:
         root = Path(td)
         resolved_root = root.resolve()
-        for name in archive.namelist():
-            if not safe_member(name):
-                raise ConfigDistError(f"config distribution member {name!r} is unsafe to extract")
-        for info in archive.infolist():
+        try:
+            names = archive.namelist()
+            infos = archive.infolist()
+        except (OSError, zipfile.BadZipFile, EOFError, zlib.error) as exc:
+            raise ConfigDistError(f"config distribution member list is unreadable: {exc}") from exc
+        structure_error = artifact_structure_error(names)
+        if structure_error:
+            raise ConfigDistError(f"config distribution {structure_error}")
+        for info in infos:
             target = (root / info.filename).resolve()
             if resolved_root != target and resolved_root not in target.parents:
                 raise ConfigDistError(
                     f"config distribution member {info.filename!r} escapes the destination"
                 )
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(info))
+            # The structural rule already forbids directory members (a trailing
+            # slash fails safe_member), so every info here is a plain file.
+            try:
+                data = archive.read(info)
+            except (OSError, zipfile.BadZipFile, EOFError, zlib.error, RuntimeError) as exc:
+                # RuntimeError covers an encrypted member ("password required");
+                # BadZipFile covers a bad CRC; zlib.error a corrupt deflate stream.
+                raise ConfigDistError(
+                    f"config distribution member {info.filename!r} is unreadable: {exc}"
+                ) from exc
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except OSError as exc:
+                raise ConfigDistError(
+                    f"config distribution member {info.filename!r} cannot be extracted: {exc}"
+                ) from exc
         recomputed = drivers_hash(root)
         meta_path = root / ARTIFACT_METADATA
         try:

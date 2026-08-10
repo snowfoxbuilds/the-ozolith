@@ -105,13 +105,16 @@ def node_rows(state: dict[str, Any]) -> list[NodeRow]:
         age = now - float(node.get("last_seen") or 0.0)
         version = str(node.get("version") or "")
         reported_hash = str(node.get("drivers_hash") or "")
+        # Presence, not truthiness (ADR-0042): an explicit '' from a current
+        # daemon with no verified tree is off-hash; a heartbeat that omitted
+        # the field is fail-open and reads as ok.
         if name in quarantined:
             health = "quarantined"
         elif age > STALE_AFTER_SECONDS:
             health = "stale"
         elif pin and version and version != pin:
             health = "off-pin"
-        elif drivers_hash and reported_hash and reported_hash != drivers_hash:
+        elif drivers_hash and node.get("drivers_hash_reported") and reported_hash != drivers_hash:
             health = "off-hash"
         else:
             health = "ok"

@@ -7,6 +7,8 @@ the telemetry ingestion caps.
 
 from __future__ import annotations
 
+import threading
+
 from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
 
 # A driver worker type + the thin Stack that names it (ADR-0044). The
@@ -795,6 +797,117 @@ def test_corrupted_cached_config_artifact_is_repaired_on_next_pull(control: Cont
     assert node_configdist.manifest_hash_of_tree(dest) == digest
 
 
+def test_cached_artifact_with_bad_crc_is_repaired_not_500(control: ControlRig):
+    """A cached <hash>.zip that OPENS as a zip but whose member fails its CRC is
+    recovered on the next pull — rebuilt from the still-matching working repo,
+    never served and never a 500 (ADR-0042)."""
+    import io
+    import zipfile
+
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    first = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert first.status_code == 200
+    cached = control.settings.config_artifacts_dir / f"{digest}.zip"
+    # Rewrite the cache entry as a structurally-openable zip whose stored member
+    # data is corrupt: it opens, but archive.read() fails its CRC.
+    raw = cached.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        first_driver = next(n for n in src.namelist() if n.startswith("drivers/"))
+        info = src.getinfo(first_driver)
+    data_start = info.header_offset + 30 + len(first_driver.encode()) + len(info.extra or b"")
+    poisoned = bytearray(raw)
+    for offset in range(data_start, data_start + max(1, info.compress_size)):
+        poisoned[offset] ^= 0xFF
+    cached.write_bytes(bytes(poisoned))
+    # The poisoned entry must not verify (proves the corruption is real).
+    try:
+        configdist.verify_artifact(cached)
+        raise AssertionError("poisoned cache entry unexpectedly verified")
+    except configdist.ConfigDistError:
+        pass
+    # Repeated pulls each return a valid, recomputable artifact — not another 500.
+    for _ in range(2):
+        again = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+        assert again.status_code == 200
+        recomputed, _ = configdist.verify_artifact(cached)
+        assert recomputed == digest
+
+
+def test_concurrent_pulls_do_not_tear_the_cache(control: ControlRig):
+    """Cache publication is atomic (tempfile + os.replace), so concurrent pulls
+    for the same hash each get a COMPLETE, valid artifact that recomputes to the
+    requested hash — a torn/partial <hash>.zip is impossible. (Bytes may differ
+    only in the advisory built_at stamp; integrity is what matters.)"""
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    results: list[tuple[int, bytes]] = []
+    lock = threading.Lock()
+
+    def pull() -> None:
+        r = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+        with lock:
+            results.append((r.status_code, r.content))
+
+    threads = [threading.Thread(target=pull) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results and all(status == 200 for status, _ in results)
+    # Every concurrent response is a complete artifact that recomputes to digest.
+    scratch = control.settings.data_dir / "concurrent"
+    scratch.mkdir(parents=True, exist_ok=True)
+    for i, (_, content) in enumerate(results):
+        probe = scratch / f"{i}.zip"
+        probe.write_bytes(content)
+        recomputed, _ = configdist.verify_artifact(probe)
+        assert recomputed == digest
+    cached = control.settings.config_artifacts_dir / f"{digest}.zip"
+    recomputed, _ = configdist.verify_artifact(cached)
+    assert recomputed == digest
+
+
+def test_heartbeat_stays_responsive_during_a_slow_rebuild(control: ControlRig, monkeypatch):
+    """Cache verify/build run off the event loop (asyncio.to_thread): a heartbeat
+    completes while a slow rebuild is in flight, never queued behind it."""
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    entered = threading.Event()
+    release = threading.Event()
+    real_build = configdist.build_artifact
+
+    def slow_build(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "rebuild was never released"
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(configdist, "build_artifact", slow_build)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    pull_status: dict[str, int] = {}
+
+    def pull() -> None:
+        r = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+        pull_status["code"] = r.status_code
+
+    puller = threading.Thread(target=pull)
+    puller.start()
+    try:
+        assert entered.wait(5), "the rebuild never started"
+        # The build is parked in a worker thread; the loop is free to heartbeat.
+        beat = control.heartbeat(node="box1")
+        assert beat.status_code == 200
+    finally:
+        release.set()
+        puller.join()
+    assert pull_status["code"] == 200
+
+
 def test_broken_config_dist_keeps_dispatch_fail_open(control: ControlRig):
     """A config-distribution validation failure (symlinked drivers root) must
     preserve dispatch's documented fail-open posture: the grant path proceeds
@@ -826,3 +939,100 @@ def test_flags_lists_stamp_skew_and_state_carries_the_hash(control: ControlRig):
     ]
     state = control.admin("GET", "/api/v1/state").json()
     assert state["config_drivers_hash"] == digest
+
+
+# -- field-absent vs explicit-none: the two empty reports differ (ADR-0042) -------
+
+
+def test_desired_nonempty_field_absent_stays_eligible(control: ControlRig):
+    """A heartbeat that OMITS drivers_hash is the legacy/daemon-less shape:
+    fail-open eligible even when a non-empty distribution is desired."""
+    digest = _write_driver(control)
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    # The rig's default heartbeat carries NO drivers_hash key at all.
+    control.heartbeat(node="box1")
+    assert control.store.node_drivers_hash("box1") is None
+    assert control.dispatch(worker="worker-a", node="box1").json()["issue"]["number"] == 7
+    assert digest  # a real distribution is desired, yet the absent field is fail-open
+
+
+def test_desired_nonempty_field_explicit_empty_is_blocked(control: ControlRig):
+    """A current daemon that reports drivers_hash='' because it has no verified
+    applied tree is off-hash and dispatch-blocked — never conflated with the
+    legacy omission — on BOTH the implementer and reviewer paths."""
+    digest = _write_driver(control)
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
+    control.heartbeat(node="box1", drivers_hash="")  # explicit none applied
+    assert control.store.node_drivers_hash("box1") == ""
+    refused = control.dispatch(worker="worker-a", node="box1").json()
+    assert refused["issue"] is None and "config distribution" in refused["reason"]
+    assert "none applied" in refused["reason"]
+    review = control.node_post(
+        "/api/v1/dispatch",
+        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
+    ).json()
+    assert review["prs"] == [] and "config distribution" in review["reason"]
+    # A successful repair restores eligibility with no human action.
+    control.heartbeat(node="box1", drivers_hash=digest)
+    assert control.dispatch(worker="worker-a", node="box1").json()["issue"]["number"] == 7
+
+
+def test_missing_applied_tree_with_repeated_failed_fetch_stays_blocked(control: ControlRig):
+    """A node whose applied tree is missing/mutated reports '' every beat (its
+    own recompute fails) and repeated failed artifact fetches never flip the
+    gate: it stays blocked until a real converged hash arrives (ADR-0042)."""
+    digest = _write_driver(control)
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    # Two off-hash beats (below the restart threshold, so the block stays the
+    # drivers gate, not a queued lifecycle command).
+    for _ in range(2):
+        control.heartbeat(node="box1", drivers_hash="")
+        # The node retries the artifact and keeps failing on a stale hash.
+        stale = control.client.get(f"/api/v1/config/artifacts/{'d' * 64}", headers=headers)
+        assert stale.status_code == 409
+        assert control.dispatch(worker="worker-a", node="box1").json()["issue"] is None
+    # The repair (a real fetch + a converged report) restores eligibility.
+    control.heartbeat(node="box1", drivers_hash=digest)
+    assert control.dispatch(worker="worker-a", node="box1").json()["issue"]["number"] == 7
+
+
+def test_explicit_empty_participates_in_restart_then_error_escalation(control: ControlRig):
+    """An explicit '' report is a real off-hash beat: it climbs the SAME
+    restart-then-error ladder as a mismatching hash (ADR-0042)."""
+    _write_driver(control)
+    for _ in range(2):
+        assert control.heartbeat(node="box1", drivers_hash="").json()["commands"] == []
+    beat = control.heartbeat(node="box1", drivers_hash="").json()  # third off-hash beat
+    assert [c["verb"] for c in beat["commands"]] == ["restart"]
+    restart_id = beat["commands"][0]["id"]
+    for _ in range(3):
+        control.heartbeat(node="box1", drivers_hash="", completed_commands=[restart_id])
+    classes = [
+        e["payload"]["error_class"] for e in control.store.error_events(component="control-node")
+    ]
+    assert classes.count("config-dist-not-converging") == 1
+
+
+def test_field_absent_does_not_escalate(control: ControlRig):
+    """The legacy omission never climbs the ladder — no report is a reset, so
+    no restart and no error are ever queued for it (ADR-0042)."""
+    _write_driver(control)
+    for _ in range(6):
+        beat = control.heartbeat(node="box1").json()  # no drivers_hash key
+        assert beat["commands"] == []
+    assert control.store.error_events(component="control-node") == []
+
+
+def test_no_desired_distribution_stays_eligible_for_every_report(control: ControlRig):
+    """With no drivers/ desired, every report shape — absent, explicit empty,
+    or a stale non-empty hash — is eligible and never off-hash (ADR-0042)."""
+    control.github.add_issue(1, labels={"plan_ready"}, assignees=[])
+    control.github.add_issue(2, labels={"plan_ready"}, assignees=[])
+    control.heartbeat(node="box1", drivers_hash="")
+    assert control.dispatch(worker="w", node="box1").json()["issue"]
+    control.heartbeat(node="box1", drivers_hash="a" * 64)  # stale non-empty, no desired
+    assert control.dispatch(worker="w", node="box1").json()["issue"]
+    state = control.admin("GET", "/api/v1/state").json()
+    assert state["config_drivers_hash"] is None

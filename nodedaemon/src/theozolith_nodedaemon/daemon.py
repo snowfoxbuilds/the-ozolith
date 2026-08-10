@@ -843,7 +843,9 @@ class NodeDaemon:
             return ""
         try:
             recomputed = configdist.manifest_hash_of_tree(tree)
-        except OSError:
+        except (OSError, configdist.ConfigDistError):
+            # An unreadable or malformed applied tree reads as non-converged, so
+            # the next pass refetches and repairs it (ADR-0042).
             return ""
         if recomputed != pointer:
             self._log(

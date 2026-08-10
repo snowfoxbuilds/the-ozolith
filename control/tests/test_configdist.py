@@ -8,6 +8,8 @@ must agree byte-for-byte or convergence silently stalls.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import zipfile
 from pathlib import Path
@@ -15,6 +17,33 @@ from pathlib import Path
 import pytest
 from theozolith_control import configdist
 from theozolith_nodedaemon import configdist as node_configdist
+
+
+def _artifact_zip(members: dict[str, bytes], meta: dict | None, *, compression=zipfile.ZIP_STORED):
+    """A config-distribution zip built from an explicit member map (plus the
+    metadata member when ``meta`` is not None) — the escape hatch for the
+    malformed shapes ``build_artifact`` would never itself produce."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+        if meta is not None:
+            archive.writestr(configdist.ARTIFACT_METADATA, json.dumps(meta).encode("utf-8"))
+    return buf.getvalue()
+
+
+def _corrupt_member_data(raw: bytes, name: str) -> bytes:
+    """Corrupt the file-data region of ``name``, leaving the zip structurally
+    openable but its member unreadable (bad CRC for STORED, a broken stream for
+    DEFLATE). Flips every byte of the data region so a lenient decompressor
+    cannot shrug it off."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        info = archive.getinfo(name)
+    data_start = info.header_offset + 30 + len(name.encode()) + len(info.extra or b"")
+    mutable = bytearray(raw)
+    for offset in range(data_start, data_start + max(1, info.compress_size)):
+        mutable[offset] ^= 0xFF
+    return bytes(mutable)
 
 
 def _write(root: Path, relpath: str, content: bytes | str) -> None:
@@ -311,3 +340,236 @@ def test_node_rejects_zip_path_traversal(tmp_path):
 )
 def test_safe_member(name, ok):
     assert node_configdist.safe_member(name) is ok
+
+
+# -- the complete structural rule (ADR-0042) --------------------------------
+
+
+def _clean_meta(tmp_path: Path) -> dict:
+    return {
+        "format": configdist.ARTIFACT_FORMAT,
+        "drivers_hash": configdist.drivers_hash(tmp_path),
+        "built_against": "1.0",
+        "built_at": "1980-01-01T00:00:00+00:00",
+    }
+
+
+@pytest.mark.parametrize(
+    "names,reason_fragment",
+    [
+        (["drivers/a.py", "config-dist.json", "extra.py"], "neither"),  # extra top-level file
+        (["drivers/a.py", "drivers/b.pyc", "config-dist.json"], "ignored"),  # *.pyc
+        (
+            ["drivers/a.py", "drivers/__pycache__/a.pyc", "config-dist.json"],
+            "ignored",
+        ),  # __pycache__
+        (["drivers/a.py", "drivers/.hidden.py", "config-dist.json"], "ignored"),  # dot member
+        (["drivers/a.py", "config-dist.json", "config-dist.json"], "duplicate"),  # dup metadata
+        (["drivers/a.py", "drivers/a.py", "config-dist.json"], "duplicate"),  # dup drivers member
+        (["drivers/a.py"], "missing the"),  # no metadata member
+        (["drivers/", "drivers/a.py", "config-dist.json"], "unsafe"),  # a directory entry
+        (["a.py", "config-dist.json"], "neither"),  # bare top-level module
+    ],
+)
+def test_artifact_structure_rule_rejections(names, reason_fragment):
+    """Both sides' structural rule rejects the same shapes with the same reason,
+    so a member the manifest would ignore can never ride an accepted archive."""
+    control_reason = configdist.artifact_structure_error(names)
+    node_reason = node_configdist.artifact_structure_error(names)
+    assert control_reason == node_reason  # the two mirrors agree byte-for-byte
+    assert control_reason is not None and reason_fragment in control_reason
+
+
+def test_artifact_structure_rule_accepts_a_clean_shape():
+    names = ["drivers/custom/impl.py", "drivers/shared/util.py", "config-dist.json"]
+    assert configdist.artifact_structure_error(names) is None
+    assert node_configdist.artifact_structure_error(names) is None
+
+
+@pytest.mark.parametrize(
+    "extra_name,extra_data",
+    [
+        ("extra.py", b"top-level module\n"),  # extra top-level file
+        ("drivers/mod.pyc", b"\x00"),  # a *.pyc
+        ("drivers/__pycache__/mod.cpython-313.pyc", b"\x00"),  # __pycache__
+        ("drivers/.hidden.py", b"secret\n"),  # dot-prefixed member
+    ],
+)
+def test_verify_and_extract_reject_ignored_members(tmp_path, extra_name, extra_data):
+    """A verified/extracted artifact refuses any member the manifest ignores —
+    control before publishing/serving, the node before extraction (ADR-0042)."""
+    members = {"drivers/ok.py": b"ok = 1\n", extra_name: extra_data}
+    raw = _artifact_zip(members, _clean_meta_for(members))
+    control_zip = tmp_path / "art.zip"
+    control_zip.write_bytes(raw)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(control_zip)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.extract_zip(raw, dest)
+
+
+def _clean_meta_for(members: dict[str, bytes]) -> dict:
+    """Metadata whose drivers_hash matches ONLY the manifest-counted members —
+    so a rejection is proven to come from the structural rule, not a hash
+    mismatch (the ignored member never enters the manifest by construction)."""
+    import hashlib
+
+    entries = sorted(
+        [name, hashlib.sha256(data).hexdigest()]
+        for name, data in members.items()
+        if name.startswith("drivers/")
+        and not any(configdist.excluded_part(p) for p in name.split("/"))
+    )
+    digest = configdist.manifest_hash(entries)
+    return {
+        "format": configdist.ARTIFACT_FORMAT,
+        "drivers_hash": digest,
+        "built_against": "1.0",
+        "built_at": "1980-01-01T00:00:00+00:00",
+    }
+
+
+def test_duplicate_config_dist_member_is_rejected(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("drivers/a.py", b"a = 1\n")
+        archive.writestr(configdist.ARTIFACT_METADATA, json.dumps(_clean_meta(tmp_path)).encode())
+        archive.writestr(configdist.ARTIFACT_METADATA, b"{}")  # a second one
+    art = tmp_path / "dup.zip"
+    art.write_bytes(buf.getvalue())
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(art)
+
+
+def test_clean_control_built_artifact_verifies_on_both_sides(tmp_path):
+    _populate(tmp_path)
+    digest = configdist.drivers_hash(tmp_path)
+    _, path = configdist.build_artifact(tmp_path, tmp_path / "out", built_against="1.0")
+    # Control side: structural rule + recompute agree.
+    recomputed, _ = configdist.verify_artifact(path)
+    assert recomputed == digest
+    # Node side: structural rule passes, extraction + recompute agree.
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    node_configdist.extract_zip(path.read_bytes(), dest)
+    assert node_configdist.manifest_hash_of_tree(dest) == digest
+
+
+# -- verification failures are ALL ConfigDistError (ADR-0042) ----------------
+
+
+def test_verify_normalizes_bad_crc_member(tmp_path):
+    """A zip that opens fine but whose stored member fails its CRC on read is a
+    ConfigDistError, not a leaked BadZipFile."""
+    members = {"drivers/a.py": b"payload-bytes-to-flip\n"}
+    raw = _artifact_zip(members, _clean_meta_for(members), compression=zipfile.ZIP_STORED)
+    corrupt = _corrupt_member_data(raw, "drivers/a.py")
+    art = tmp_path / "badcrc.zip"
+    art.write_bytes(corrupt)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(art)
+
+
+def test_verify_normalizes_malformed_compressed_member(tmp_path):
+    """A member declared DEFLATE whose compressed bytes are garbage surfaces as
+    ConfigDistError, not a leaked zlib.error/BadZipFile."""
+    members = {"drivers/a.py": b"payload-bytes-to-flip-deflated\n" * 4}
+    raw = _artifact_zip(members, _clean_meta_for(members), compression=zipfile.ZIP_DEFLATED)
+    corrupt = _corrupt_member_data(raw, "drivers/a.py")
+    art = tmp_path / "baddeflate.zip"
+    art.write_bytes(corrupt)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(art)
+
+
+def test_node_extract_normalizes_bad_crc_member(tmp_path):
+    members = {"drivers/a.py": b"payload-bytes-to-flip\n"}
+    raw = _artifact_zip(members, _clean_meta_for(members), compression=zipfile.ZIP_STORED)
+    corrupt = _corrupt_member_data(raw, "drivers/a.py")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.extract_zip(corrupt, dest)
+
+
+# -- fail closed on directory-enumeration errors (ADR-0042) ------------------
+
+
+def test_root_enumeration_failure_fails_closed(tmp_path, monkeypatch):
+    """An injected failure to LIST the drivers root raises ConfigDistError under
+    refuse_irregular — never a silently truncated manifest. Injected, so the
+    test holds under root (chmod would not)."""
+    _write(tmp_path, "drivers/a.py", "a = 1\n")
+    root = tmp_path / "drivers"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == root:
+            raise OSError(13, "injected: cannot list drivers root")
+        return real_scandir(path)
+
+    monkeypatch.setattr(configdist.os, "scandir", boom)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+
+
+def test_nested_enumeration_failure_fails_closed(tmp_path, monkeypatch):
+    """An injected failure to list a nested included directory also fails closed
+    — the subtree is never silently omitted."""
+    _write(tmp_path, "drivers/top.py", "t = 1\n")
+    _write(tmp_path, "drivers/sub/leaf.py", "leaf = 1\n")
+    nested = tmp_path / "drivers" / "sub"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == nested:
+            raise OSError(13, "injected: cannot list nested dir")
+        return real_scandir(path)
+
+    monkeypatch.setattr(configdist.os, "scandir", boom)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_manifest(tmp_path)
+
+
+def test_enumeration_failure_becomes_config_repo_error_at_load(tmp_path, monkeypatch):
+    """The ConfigDistError from a fail-closed enumeration is normalized to
+    ConfigRepoError at the config-loading boundary, and nothing is published."""
+    from theozolith_control import configrepo
+
+    _write(tmp_path, "drivers/a.py", "a = 1\n")
+    root = tmp_path / "drivers"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == root:
+            raise OSError(13, "injected: cannot list drivers root")
+        return real_scandir(path)
+
+    monkeypatch.setattr(configdist.os, "scandir", boom)
+    with pytest.raises(configrepo.ConfigRepoError):
+        configrepo.load_config(tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.build_artifact(tmp_path, out, built_against="1.0")
+    assert not out.exists() or not list(out.glob("*.zip"))  # no partial artifact
+
+
+def test_folder_mode_enumeration_stays_non_fail_closed(tmp_path, monkeypatch):
+    """Folder-mode commit hashing (refuse_irregular=False) keeps its broader
+    posture: an unreadable subtree is skipped, not fail-closed (ADR-0042)."""
+    _write(tmp_path, "top.py", "t = 1\n")
+    _write(tmp_path, "sub/leaf.py", "leaf = 1\n")
+    nested = tmp_path / "sub"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == nested:
+            raise OSError(13, "injected: cannot list nested dir")
+        return real_scandir(path)
+
+    monkeypatch.setattr(configdist.os, "scandir", boom)
+    # No refuse_irregular: the unreadable subtree is skipped, top.py still found.
+    found = configdist.regular_files(tmp_path)
+    assert (tmp_path / "top.py") in found

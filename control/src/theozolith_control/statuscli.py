@@ -162,10 +162,14 @@ def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
     if drivers_hash:
         for node in sorted(state.get("nodes") or [], key=lambda n: n.get("name") or ""):
             reported = node.get("drivers_hash") or ""
-            if reported and reported != drivers_hash:
+            # Presence, not truthiness: a current daemon that reports '' (no
+            # verified tree) is off-hash; a heartbeat that omitted the field is
+            # fail-open and never listed here (ADR-0042).
+            if node.get("drivers_hash_reported") and reported != drivers_hash:
+                running = f"{reported[:12]}" if reported else "none applied"
                 reasons.append(
                     f"node {node['name']} off-hash: running config distribution"
-                    f" {reported[:12]}, recorded {drivers_hash[:12]}"
+                    f" {running}, recorded {drivers_hash[:12]}"
                 )
 
     actual = {
@@ -254,7 +258,9 @@ def render(state: dict[str, Any], reasons: list[str], out) -> None:
                 health = "stale"
             elif pin and node.get("version") and node.get("version") != pin:
                 health = "off-pin"
-            elif drivers_hash and reported_hash and reported_hash != drivers_hash:
+            elif (
+                drivers_hash and node.get("drivers_hash_reported") and reported_hash != drivers_hash
+            ):
                 health = "off-hash"
             else:
                 health = "ok"

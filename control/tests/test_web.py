@@ -742,6 +742,24 @@ def test_config_dist_offhash_banner_and_stamp_skew_render(control: ControlRig):
     assert "config-distribution skew" not in control.client.get("/fragments/fleet").text
 
 
+def test_explicit_empty_report_renders_off_hash_not_healthy(control: ControlRig):
+    """A current daemon that reports drivers_hash='' (no verified tree) is
+    off-hash in the fleet worklist, never healthy; a heartbeat that OMITS the
+    field is fail-open and never listed (ADR-0042)."""
+    from theozolith_control.configrepo import load_config
+    from theozolith_control.web.views import fleet_view
+
+    control.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
+    login(control)
+    control.heartbeat(node="box1", version="0.3.0", drivers_hash="")  # explicit none
+    control.heartbeat(node="box2", version="0.3.0")  # legacy omission
+    view = fleet_view(control.store, load_config(control.settings.config_repo))
+    # box1 is off-hash (explicit ''), box2 is fail-open (field absent).
+    assert view["drivers_off_hash"] == ["box1"]
+    banner = control.client.get("/fragments/fleet").text
+    assert "config-distribution skew" in banner and "box1" in banner
+
+
 def test_settings_form_refuses_a_drivers_shaped_key(control: ControlRig):
     """The one web write path into the Config Repo is a fixed control.toml
     allow-list — it can never address drivers/ (ADR-0042)."""

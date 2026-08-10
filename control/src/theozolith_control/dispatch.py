@@ -76,18 +76,24 @@ class Dispatcher:
         )
 
     def _drivers_block(self, node: str, drivers_hash: str) -> str | None:
-        """The config-distribution gate (ADR-0042): a node reporting a
-        drivers-hash other than the recorded one gets no work until it
-        converges. Fail-open on an unreported hash: the daemon-less dev shape
-        heartbeats nothing, and the pin gate already fences stale daemons; a
-        node with no recorded distribution ("" desired) is always eligible."""
+        """The config-distribution gate (ADR-0042): a node whose reported
+        drivers-hash differs from the recorded one gets no work until it
+        converges. A node with no recorded distribution ("" desired) is always
+        eligible.
+
+        Field presence decides the two empty cases (never truthiness): a
+        heartbeat that OMITS the field — ``node_drivers_hash`` returns ``None`` —
+        is the legacy/daemon-less shape and stays fail-open eligible; a current
+        daemon that reports ``''`` because it has no verified applied tree is
+        off-hash and blocked exactly like a mismatching non-empty hash."""
         if not drivers_hash:
             return None
         reported = self._store.node_drivers_hash(node)
-        if not reported or reported == drivers_hash:
+        if reported is None or reported == drivers_hash:
             return None
+        running = reported[:12] if reported else "(none applied)"
         return (
-            f"node {node!r} runs config distribution {reported[:12]}, the deployment"
+            f"node {node!r} runs config distribution {running}, the deployment"
             f" is {drivers_hash[:12]}; no new work until it converges"
         )
 

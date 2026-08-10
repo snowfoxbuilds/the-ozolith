@@ -28,6 +28,7 @@ import json
 import os
 import re
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -202,7 +203,12 @@ def create_app(
         # A valid heartbeat settles any stale sightings under this name
         # (e.g. the window between provisioning and the first heartbeat).
         store.clear_unregistered(node)
-        reported_drivers = str(body.get("drivers_hash", ""))
+        # Field presence is load-bearing (ADR-0042): a heartbeat that OMITS
+        # drivers_hash is a legacy/daemon-less client (fail-open eligible); a
+        # heartbeat that includes it — even as '' — is a current daemon reporting
+        # its verified applied tree (or the explicit absence of one). Carry the
+        # nullable value, never a truthiness collapse.
+        reported_drivers = str(body["drivers_hash"]) if "drivers_hash" in body else None
         reported_built_against = str(body.get("drivers_built_against", ""))
         store.touch_node(
             node,
@@ -632,38 +638,52 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail="drivers_hash must be 64 lowercase hex chars"
             )
-        cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
-        if cached.is_file():
-            # Never serve a cached artifact on the strength of its filename: a
-            # corrupted or truncated <hash>.zip must not be served forever
-            # (ADR-0042). Verify it unpacks and recomputes to this hash; if it
-            # does not, discard it and fall through to an on-demand rebuild.
+
+        def _resolve_artifact() -> Path:
+            """Verify-the-cache-or-build-on-demand, off the event loop: cache
+            verification unpacks-and-recomputes and on-demand packaging both do
+            real disk work (unzip, sha256 a tree, deflate) that must never stall
+            heartbeats or the terminal websockets (ADR-0042). Cache publication
+            stays atomic (tempfile + os.replace inside build_artifact), so two
+            concurrent builds each publish a valid <hash>.zip and the last
+            os.replace wins — a torn entry is impossible."""
+            cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
+            if cached.is_file():
+                # Never serve a cached artifact on the strength of its filename: a
+                # corrupted or truncated <hash>.zip must not be served forever
+                # (ADR-0042). Verify it unpacks and recomputes to this hash; if it
+                # does not, discard it and fall through to an on-demand rebuild.
+                try:
+                    recomputed, _ = configdist.verify_artifact(cached)
+                except configdist.ConfigDistError:
+                    recomputed = None
+                if recomputed == drivers_hash:
+                    return cached
+                with contextlib.suppress(OSError):
+                    cached.unlink()
             try:
-                recomputed, _ = configdist.verify_artifact(cached)
-            except configdist.ConfigDistError:
-                recomputed = None
-            if recomputed == drivers_hash:
-                return FileResponse(cached, media_type="application/zip")
-            with contextlib.suppress(OSError):
-                cached.unlink()
-        try:
-            built, path = configdist.build_artifact(
-                settings.config_repo,
-                settings.config_artifacts_dir,
-                built_against=_config_built_against(),
-            )
-        except configdist.ConfigDistError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"config distribution build failed: {exc}"
-            ) from exc
-        if built != drivers_hash or path is None:
-            # The working repo no longer packages to this hash — no background
-            # build machinery, convergence by retry (ADR-0042).
-            raise HTTPException(
-                status_code=409,
-                detail="config distribution changed; converge to the hash on the next heartbeat",
-            )
-        configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
+                built, path = configdist.build_artifact(
+                    settings.config_repo,
+                    settings.config_artifacts_dir,
+                    built_against=_config_built_against(),
+                )
+            except configdist.ConfigDistError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"config distribution build failed: {exc}"
+                ) from exc
+            if built != drivers_hash or path is None:
+                # The working repo no longer packages to this hash — no background
+                # build machinery, convergence by retry (ADR-0042).
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "config distribution changed; converge to the hash on the next heartbeat"
+                    ),
+                )
+            configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
+            return path
+
+        path = await asyncio.to_thread(_resolve_artifact)
         return FileResponse(path, media_type="application/zip")
 
     @app.post("/api/v1/nodes/{node}/quarantine/release")

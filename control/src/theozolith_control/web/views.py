@@ -107,11 +107,14 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
                 "version_skew": bool(config.product_version)
                 and bool(node["version"])
                 and node["version"] != config.product_version,
-                # Off-hash (ADR-0042): reported config distribution differs from
-                # the recorded one — a convergence state, dispatch-blocking,
-                # warning-grade (the exact analog of version skew).
+                # Off-hash (ADR-0042): the node REPORTED a config distribution
+                # (the presence bit, never truthiness — an explicit '' from a
+                # current daemon with no verified tree counts) that differs from
+                # the recorded one. A convergence state, dispatch-blocking,
+                # warning-grade (the exact analog of version skew). A heartbeat
+                # that omitted the field is fail-open, never off-hash.
                 "drivers_off_hash": bool(config.drivers_hash)
-                and bool(node["drivers_hash"])
+                and bool(node["drivers_hash_reported"])
                 and node["drivers_hash"] != config.drivers_hash,
                 "last_seen": ago(now - node["last_seen"]),
                 "stale": now - node["last_seen"] > STALE_AFTER_SECONDS,

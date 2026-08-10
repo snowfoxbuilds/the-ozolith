@@ -35,9 +35,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     name TEXT PRIMARY KEY,
     version TEXT NOT NULL DEFAULT '',
     -- Reported config-distribution convergence (ADR-0042): the drivers-hash the
-    -- node last applied ('' = none), and the product version that artifact was
-    -- built against (advisory stamp skew, never a health downgrade).
+    -- node last applied ('' = none applied), and the product version that
+    -- artifact was built against (advisory stamp skew, never a health downgrade).
+    -- drivers_hash_reported separates "the heartbeat omitted the field" (0 — a
+    -- legacy/daemon-less client, fail-open eligible) from "the current daemon
+    -- reported no verified tree" (1 with drivers_hash '' — off-hash, blocked).
+    -- Truthiness of drivers_hash can never carry that bit, so it is explicit.
     drivers_hash TEXT NOT NULL DEFAULT '',
+    drivers_hash_reported INTEGER NOT NULL DEFAULT 0,
     drivers_built_against TEXT NOT NULL DEFAULT '',
     registered_at REAL NOT NULL,
     last_seen REAL NOT NULL
@@ -346,6 +351,14 @@ class Store:
         for column in ("drivers_hash", "drivers_built_against"):  # ADR-0042
             if column not in node_columns:
                 self._db.execute(f"ALTER TABLE nodes ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        if "drivers_hash_reported" not in node_columns:
+            # Field-presence bit (ADR-0042). Pre-column rows default to 0 —
+            # "field never reported" — the fail-open reading, which is the safe
+            # migration default: a stale cache never blocks dispatch until the
+            # next heartbeat records what the daemon actually reports.
+            self._db.execute(
+                "ALTER TABLE nodes ADD COLUMN drivers_hash_reported INTEGER NOT NULL DEFAULT 0"
+            )
         present = {r["name"] for r in self._db.execute("PRAGMA table_info(commands)")}
         for column, decl in (
             ("force", "INTEGER NOT NULL DEFAULT 0"),
@@ -413,26 +426,35 @@ class Store:
         name: str,
         version: str = "",
         *,
-        drivers_hash: str = "",
+        drivers_hash: str | None = None,
         drivers_built_against: str = "",
     ) -> None:
+        # None = the heartbeat omitted drivers_hash (a legacy/daemon-less client):
+        # record the field as unreported (bit 0, stored value ''). A present value
+        # — including an explicit '' from a current daemon with no verified tree —
+        # records bit 1 with that value, so the gate can tell the two apart.
+        reported = 1 if drivers_hash is not None else 0
+        stored_hash = drivers_hash or ""
         now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO nodes (name, version, drivers_hash, drivers_built_against,"
-                " registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)"
+                "INSERT INTO nodes (name, version, drivers_hash, drivers_hash_reported,"
+                " drivers_built_against, registered_at, last_seen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (name) DO UPDATE SET last_seen = ?, version = ?,"
-                " drivers_hash = ?, drivers_built_against = ?",
+                " drivers_hash = ?, drivers_hash_reported = ?, drivers_built_against = ?",
                 (
                     name,
                     version,
-                    drivers_hash,
+                    stored_hash,
+                    reported,
                     drivers_built_against,
                     now,
                     now,
                     now,
                     version,
-                    drivers_hash,
+                    stored_hash,
+                    reported,
                     drivers_built_against,
                 ),
             )
@@ -448,14 +470,20 @@ class Store:
             row = self._db.execute("SELECT version FROM nodes WHERE name = ?", (name,)).fetchone()
         return row["version"] if row else ""
 
-    def node_drivers_hash(self, name: str) -> str:
-        """The last heartbeat-reported config-distribution hash ('' when unknown
-        or none applied) — the dispatch gate's off-hash input (ADR-0042)."""
+    def node_drivers_hash(self, name: str) -> str | None:
+        """The last heartbeat-reported config-distribution hash — the dispatch
+        gate's off-hash input (ADR-0042). ``None`` means the field was never
+        reported (an unknown node, or a legacy/daemon-less client that omits it:
+        fail-open eligible). An empty string means a current daemon explicitly
+        reported no verified applied tree (off-hash, dispatch-blocked). A 64-hex
+        value is the applied distribution."""
         with self._lock:
             row = self._db.execute(
-                "SELECT drivers_hash FROM nodes WHERE name = ?", (name,)
+                "SELECT drivers_hash, drivers_hash_reported FROM nodes WHERE name = ?", (name,)
             ).fetchone()
-        return row["drivers_hash"] if row else ""
+        if row is None or not row["drivers_hash_reported"]:
+            return None
+        return row["drivers_hash"]
 
     def drivers_skew(self) -> list[dict[str, Any]]:
         """Advisory stamp skew (ADR-0042): nodes whose applied distribution was
@@ -483,17 +511,24 @@ class Store:
         command; still off-pin ``threshold`` beats after that, mark the
         node escalated (the caller emits the theozolith.error event).
         Returns the action taken: None | "restart-queued" | "escalated"."""
-        return self._observe_convergence("version_health", node, reported, pin, threshold)
+        # An empty reported version is "no report" for convergence (fail open),
+        # so it maps to None — the reset case — exactly as before.
+        return self._observe_convergence("version_health", node, reported or None, pin, threshold)
 
-    def observe_drivers(self, node: str, reported: str, desired: str, threshold: int) -> str | None:
+    def observe_drivers(
+        self, node: str, reported: str | None, desired: str, threshold: int
+    ) -> str | None:
         """Track config-distribution convergence per heartbeat (ADR-0042): the
         exact analog of ``observe_version`` for the drivers-hash. Reuses the
         same restart ladder and the same ``offpin_beats`` knob — one concept,
-        convergence patience. Returns None | "restart-queued" | "escalated"."""
+        convergence patience. ``reported`` is ``None`` when the heartbeat omitted
+        the field (no report — reset) and ``''`` when a current daemon explicitly
+        reported no verified tree (a real off-hash report that COUNTS toward the
+        ladder, never a reset). Returns None | "restart-queued" | "escalated"."""
         return self._observe_convergence("drivers_health", node, reported, desired, threshold)
 
     def _observe_convergence(
-        self, table: str, node: str, reported: str, desired: str, threshold: int
+        self, table: str, node: str, reported: str | None, desired: str, threshold: int
     ) -> str | None:
         """The shared convergence ladder over a ``(node, offpin_beats,
         restart_queued, escalated)`` health table (version_health /
@@ -511,7 +546,10 @@ class Store:
         and climbs on to its own escalation; because the flag latches, a
         completed restart is never followed by a second stale one (ADR-0042)."""
         with self._lock, self._db:
-            if not desired or not reported or reported == desired:
+            # reported is None => the field was not reported (no report — reset).
+            # reported == '' is a REAL report (explicit none applied) that counts
+            # as off-hash whenever a non-empty distribution is desired.
+            if not desired or reported is None or reported == desired:
                 self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
                 return None
             self._db.execute(
