@@ -1076,14 +1076,17 @@ class NodeDaemon:
         return paths
 
     def _gc_compose_generations(self, name: str, keep: set[str]) -> None:
-        """Reclaim obsolete materialized compose generation directories for ONE
-        Stack — every generation dir whose name is not in ``keep`` (the
-        generations still referenced by a live applied/pending record; empty
-        when none). Never removes a referenced generation, so a stopped/drained
-        or absent Stack's still-recorded teardown context — and a pending
-        record's retained candidate — is preserved. Each removal is isolated: a
-        cleanup failure is logged, emitted as the normal capped error event, and
-        left on disk so ``_sweep_compose_generations`` retries it on a later pass
+        """Reclaim obsolete materialized compose directories for ONE Stack —
+        every child dir whose name is not in ``keep``: the top-level entries
+        under ``stacks/<name>/`` (generation dirs, or a legacy record's
+        name-addressed roots such as ``compose/``) that some current record's
+        ACTUAL file paths still reference; empty when none. Never removes a
+        referenced entry, so a stopped/drained or absent Stack's still-recorded
+        teardown context is preserved; the caller never invokes this at all for
+        a Stack with a pending record (that Stack retains everything — see
+        ``_sweep_compose_generations``). Each removal is isolated: a cleanup
+        failure is logged, emitted as the normal capped error event, and left on
+        disk so ``_sweep_compose_generations`` retries it on a later pass
         without blocking the rest of convergence (ADR-0044 amendment)."""
         stack_dir = self._config.state_dir / "stacks" / name
         if not stack_dir.is_dir():
@@ -1105,30 +1108,58 @@ class NodeDaemon:
         from desired state entirely — none of which leaves a record to trigger the
         per-transition cleanup.
 
-        References are computed from EVERY current applied/pending record
-        (``_applied_compose`` reflects all of this pass's mutations by the time
-        this runs at the end of ``_reconcile``): a record's referenced generation
-        is ``_compose_generation(record.fingerprint)`` — exactly the directory
-        ``_compose_paths`` materializes it into — so a referenced generation,
-        INCLUDING a pending write-ahead's retained candidate, is never deleted. A
-        name with no record keeps nothing: every generation dir under it is
+        What is retained follows two rules, both computed from EVERY current
+        record (``_applied_compose`` reflects all of this pass's mutations by the
+        time this runs at the end of ``_reconcile``):
+
+        1. A record's ACTUAL file paths are the references — never a generation
+           inferred from its fingerprint. Each path is normalized under
+           ``stacks/`` and the top-level entry containing it is retained, which
+           protects generation-addressed layouts AND a legacy pre-generation
+           record's name-addressed paths (``stacks/<name>/compose/base.yml``) —
+           paths a valid AppliedCompose record still needs for teardown. A path
+           that cannot be safely mapped under ``stacks/`` conservatively retains
+           EVERYTHING under that record's Stack name.
+
+        2. A Stack whose record is PENDING retains ALL entries under its name.
+           The pending write-ahead REPLACED the predecessor's applied record
+           before compose up, so no surviving record references the predecessor
+           generation — yet the predecessor may still be the running project if
+           the up failed or the daemon crashed first. Predecessor generations are
+           reclaimed only once the successor is confirmed applied (or the
+           project is composed down and the record cleared).
+
+        A name with no record keeps nothing: every generation dir under it is
         unreferenced and reclaimed. The sweep is bounded (one ``iterdir`` per
-        Stack dir) and deterministic (sorted), and each deletion is isolated via
+        Stack dir) and deterministic (sorted), stays per-Stack (a retained Stack
+        never blocks another's cleanup), and each deletion is isolated via
         ``_gc_compose_generations`` — a failure logs, emits the capped error
         event, and stays retryable rather than blocking runtime convergence."""
         stacks_root = self._config.state_dir / "stacks"
         if not stacks_root.is_dir():
             return
-        keep_by_name: dict[str, set[str]] = {}
+        root = stacks_root.resolve()
+        retain_all: set[str] = set()  # Stack dir names where nothing may be deleted
+        keep_by_name: dict[str, set[str]] = {}  # dir name -> referenced top-level entries
         for stack_name, record in self._applied_compose.items():
-            keep_by_name.setdefault(stack_name, set()).add(
-                self._compose_generation(record.fingerprint)
-            )
+            if record.state != COMPOSE_APPLIED:
+                retain_all.add(stack_name)  # pending: predecessors are unrecorded
+            for file in record.files:
+                try:
+                    parts = Path(file).resolve().relative_to(root).parts
+                except (OSError, ValueError):
+                    retain_all.add(stack_name)  # unmappable: preserve conservatively
+                    continue
+                if len(parts) >= 2:
+                    keep_by_name.setdefault(parts[0], set()).add(parts[1])
+                elif parts:
+                    retain_all.add(parts[0])  # a bare stacks/<x> reference: keep x whole
+                else:
+                    retain_all.add(stack_name)
         for stack_dir in sorted(stacks_root.iterdir()):
-            if stack_dir.is_dir():
-                self._gc_compose_generations(
-                    stack_dir.name, keep_by_name.get(stack_dir.name, set())
-                )
+            if not stack_dir.is_dir() or stack_dir.name in retain_all:
+                continue
+            self._gc_compose_generations(stack_dir.name, keep_by_name.get(stack_dir.name, set()))
 
     def _compose_fingerprint(self, stack: WireStack) -> str:
         """All effective compose inputs, so any change reconciles (ADR-0044)."""
@@ -1305,11 +1336,13 @@ class NodeDaemon:
         # matters for this name. The per-pass ``_sweep_compose_generations`` (end
         # of ``_reconcile``) reclaims every OTHER materialized generation — a
         # predecessor compose spec's dir, or an unreferenced candidate left by an
-        # earlier failed write-ahead — keeping only the generation the current
-        # applied/pending records reference, and RETRIES any deletion that fails
-        # on later passes even once this Stack early-returns healthy or leaves the
-        # compose form entirely (ADR-0044 amendment: cleanup has a real retry path,
-        # not a one-shot tied to reaching this line).
+        # earlier failed write-ahead — keeping only the paths the current records
+        # actually reference, and RETRIES any deletion that fails on later passes
+        # even once this Stack early-returns healthy or leaves the compose form
+        # entirely (ADR-0044 amendment: cleanup has a real retry path, not a
+        # one-shot tied to reaching this line). Had this up FAILED, the record
+        # would still be pending and the sweep would retain the predecessor
+        # generation too — it is reclaimed only after this point.
 
     def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
         """Run the single-image form as the SOLE runtime form under this name.

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
 from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
+from theozolith_nodedaemon.stacks import WireStack
 
 
 def heartbeat_response(stacks, images=None, commands=None) -> dict:
@@ -3338,6 +3339,211 @@ def test_sweep_never_deletes_referenced_generation_while_others_reconcile(rig: R
     _push_compose(rig, _FILES_B)
     rig.daemon.once()
     assert _generation_dirs(rig, "svc") == {b_gen}
+
+
+# -- a pending transition retains every predecessor generation (ADR-0044) ----------
+#
+# For compose A -> B the pending B record REPLACES A's applied record before
+# compose up runs, so no surviving record references A's generation — yet A is
+# still the running project if the up fails (or the daemon dies first). The
+# sweep therefore deletes NOTHING under a Stack with a pending record:
+# predecessor generations are reclaimed only after the successor is confirmed
+# applied, or the project is composed down and the record cleared.
+
+
+def _fail_up_to_pending_b(rig: Rig, name: str = "svc") -> tuple[list[str], str, str]:
+    """Bring spec A up (confirmed applied), then desire spec B with compose up
+    failing: leaves a durable pending B record while A remains the running
+    project. Returns (A's file list, A's generation name, B's generation name)."""
+    _push_compose(rig, _FILES_A, name)
+    rig.daemon.once()
+    a_files = list(rig.daemon._applied_compose[name].files)
+    assert rig.daemon._applied_compose[name].state == "applied"
+
+    rig.docker.fail_compose_up.add(f"ozolith-{name}")
+    _push_compose(rig, _FILES_B, name)
+    rig.daemon.once()
+    b_gen = _generation_dir(rig.daemon._applied_compose[name].files).name
+    return a_files, _generation_dir(a_files).name, b_gen
+
+
+def test_failed_up_of_successor_retains_predecessor_generation(rig: Rig):
+    """A -> B where compose up B fails: the pending B record, B's candidate
+    generation, AND A's predecessor generation all survive the sweep, with A
+    still the running project. The retried up brings B up and promotes the
+    record; only after that success is A's generation reclaimed; a later
+    healthy pass performs no additional up."""
+    a_files, a_gen, b_gen = _fail_up_to_pending_b(rig)
+
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}  # both intact after the sweep
+    assert rig.docker.compose_projects["ozolith-svc"] == a_files  # A remains running
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    # Another failing pass changes nothing: still pending, both still retained.
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}
+    assert rig.docker.compose_projects["ozolith-svc"] == a_files
+
+    # The up recovers: B applies, and only NOW is A's generation reclaimed.
+    rig.docker.fail_compose_up.discard("ozolith-svc")
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    record = rig.daemon._applied_compose["svc"]
+    assert record.state == "applied"
+    assert _generation_dir(record.files).name == b_gen
+    assert _generation_dirs(rig, "svc") == {b_gen}  # A reclaimed after B converged
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    # A later healthy pass is stable: no additional up, nothing re-reclaimed.
+    ups = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups
+    assert _generation_dirs(rig, "svc") == {b_gen}
+
+
+def test_predecessor_reclaim_failure_after_success_is_retried(rig: Rig, monkeypatch):
+    """After the retried up succeeds, a failing deletion of A's now-obsolete
+    generation is retried by a later pass — never forgotten, never blocking the
+    healthy Stack."""
+    _, a_gen, b_gen = _fail_up_to_pending_b(rig)
+    failing = _fail_rmtree_for(monkeypatch, a_gen)
+
+    rig.docker.fail_compose_up.discard("ozolith-svc")
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()  # B applies; A's reclaim fails and its dir stays on disk
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}
+    assert any("cleanup failed" in line for line in rig.logs)
+
+    failing.clear()
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()  # the per-pass sweep retries and reclaims A
+    assert _generation_dirs(rig, "svc") == {b_gen}
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+# -- legacy name-addressed records: actual file paths are the references -----------
+#
+# A pre-generation daemon materialized compose files at NAME-addressed paths —
+# <state>/stacks/<name>/compose/base.yml — and its persisted records point there,
+# with no ``state`` field (loads as applied). The sweep protects what a record's
+# files ACTUALLY reference, never a generation inferred from the fingerprint;
+# otherwise it would delete teardown context a valid record still needs.
+
+_LEGACY_FILES = [
+    {"name": "compose/base.yml", "content": "services: {a: {}}\n"},
+    {"name": "overlays/net.yml", "content": "services: {}\n"},
+]
+
+
+def _seed_legacy_record(rig: Rig, files=None, name: str = "svc") -> list[str]:
+    """Persist a pre-write-ahead applied record whose files live at legacy
+    name-addressed paths (no generation dir, no ``state`` field), materialize
+    those files, and leave the corresponding compose project running — exactly
+    what an upgraded daemon inherits from its predecessor. The fingerprint
+    matches the desired spec so unchanged passes take the healthy early return.
+    Restarts the rig's daemon so it loads the record; returns the legacy paths."""
+    files = files if files is not None else _LEGACY_FILES
+    paths = []
+    for entry in files:
+        target = rig.config.state_dir / "stacks" / name / entry["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(entry["content"], encoding="utf-8")
+        paths.append(str(target))
+    stack = WireStack.from_wire(_compose_stack(name, files=files))
+    record = {"fingerprint": rig.daemon._compose_fingerprint(stack), "files": paths}
+    rig.config.applied_compose_path.parent.mkdir(parents=True, exist_ok=True)
+    rig.config.applied_compose_path.write_text(json.dumps({name: record}))
+    rig.docker.compose_projects[f"ozolith-{name}"] = paths
+    _restart_daemon(rig)
+    return paths
+
+
+def test_legacy_record_files_survive_unchanged_passes_and_restart(rig: Rig):
+    """Multiple unchanged passes over a legacy name-addressed record (files under
+    two top-level legacy directories): the healthy early return holds — no up —
+    and no referenced legacy file is ever deleted, including across a restart."""
+    paths = _seed_legacy_record(rig)
+    record = rig.daemon._applied_compose["svc"]
+    assert record.state == "applied"  # a missing state field loads as applied
+    assert record.files == paths
+
+    for _ in range(3):
+        _push_compose(rig, _LEGACY_FILES)
+        rig.daemon.once()
+        assert all(Path(p).is_file() for p in paths)  # referenced: never deleted
+        assert _generation_dirs(rig, "svc") == {"compose", "overlays"}
+    assert not any(c[2] == "up" for c in rig.docker.compose_calls)  # healthy early return
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    _restart_daemon(rig)  # the record and its referenced paths survive a restart
+    _push_compose(rig, _LEGACY_FILES)
+    rig.daemon.once()
+    assert all(Path(p).is_file() for p in paths)
+    assert rig.daemon._applied_compose["svc"].files == paths
+    assert not any(c[2] == "up" for c in rig.docker.compose_calls)
+
+
+def test_legacy_record_transition_to_process_downs_with_existing_files(rig: Rig):
+    """Legacy record -> desired process: compose down receives the legacy paths —
+    still existing on disk at the moment of the call — BEFORE the process child
+    spawns; the legacy dirs become unreferenced (recordless) and are reclaimed
+    only after the down."""
+    paths = _seed_legacy_record(rig)
+
+    events, popen = _order_probe(rig)
+    down_files_existed = []
+    probed_compose = rig.docker.compose  # the _order_probe spy
+
+    def existence_probe(project, files, verb):
+        if verb == "down":
+            down_files_existed.append(all(Path(f).is_file() for f in files))
+        probed_compose(project, files, verb)
+
+    rig.docker.compose = existence_probe  # type: ignore[method-assign]
+    _restart_daemon(rig, popen=popen)
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:down", "spawn"]  # down before the child spawns
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] == paths  # the still-existing legacy files, never an empty list
+    assert down_files_existed == [True]
+    assert _active_forms(rig, "svc") == {"process"}
+    assert "svc" not in rig.daemon._applied_compose
+    assert _generation_dirs(rig, "svc") == set()  # recordless: legacy dirs reclaimed
+
+
+def test_legacy_record_survives_sweep_failures_and_restarts(rig: Rig, monkeypatch):
+    """An orphan generation beside a legacy record, its deletion failing every
+    pass: the sweep failure never spills over into the referenced legacy paths —
+    across passes and a restart — and once deletion recovers the orphan is
+    reclaimed with the legacy paths still intact."""
+    paths = _seed_legacy_record(rig)
+    orphan = rig.config.state_dir / "stacks" / "svc" / "0123456789abcdef"
+    orphan.mkdir()
+    (orphan / "stale.yml").write_text("services: {}\n")
+    failing = _fail_rmtree_for(monkeypatch, orphan.name)
+
+    for _ in range(2):
+        _push_compose(rig, _LEGACY_FILES)
+        rig.daemon.once()
+        assert any("cleanup failed" in line for line in rig.logs)
+        assert all(Path(p).is_file() for p in paths)  # referenced: never deleted
+
+    _restart_daemon(rig)  # a restart changes nothing: still referenced, still kept
+    _push_compose(rig, _LEGACY_FILES)
+    rig.daemon.once()
+    assert all(Path(p).is_file() for p in paths)
+
+    failing.clear()
+    _push_compose(rig, _LEGACY_FILES)
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {"compose", "overlays"}  # orphan reclaimed
+    assert all(Path(p).is_file() for p in paths)
 
 
 # -- real DockerCtl.remove failure semantics (ADR-0044) ----------------------------
