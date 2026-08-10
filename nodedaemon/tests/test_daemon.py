@@ -3093,6 +3093,253 @@ def test_state_dir_cleanup_never_deletes_a_referenced_generation(rig: Rig):
     assert _active_forms(rig, "svc") == {"compose"}
 
 
+# -- pending records never claim specification convergence (ADR-0044) --------------
+#
+# A pending record proves its spec was write-ahead-persisted, NOT that compose up
+# ran it. The deterministic project name is identical across generations, so a
+# `compose_ps` running row cannot tell "B is up" from "the predecessor A is still
+# running and B never applied." A pending record therefore never takes the healthy
+# early return: for a running desire it reapplies through compose up (converging
+# the project in place, never a down) and the post-up confirmation promotes it.
+
+
+def _crash_pending_spec_change(rig: Rig, name: str = "svc") -> str:
+    """Bring compose spec A up (applied), then desire spec B and simulate a real
+    crash AFTER B's pending record persists but BEFORE compose up runs: the pass
+    dies mid-``_reconcile`` (a BaseException the per-stack Exception handler does
+    not catch), so no sweep runs and A stays running under a durable pending B
+    record. Returns A's generation dir name. A's project (``ozolith-<name>``)
+    keeps its original file list — B never reached Docker."""
+    _push_compose(rig, _FILES_A, name)
+    rig.daemon.once()
+    a_files = list(rig.daemon._applied_compose[name].files)
+
+    real_compose = rig.docker.compose
+
+    def crash_before_up(project, files, verb):
+        if verb == "up" and project == f"ozolith-{name}":
+            raise KeyboardInterrupt  # process death before compose up
+        real_compose(project, files, verb)
+
+    rig.docker.compose = crash_before_up  # type: ignore[method-assign]
+    _push_compose(rig, _FILES_B, name)
+    with contextlib.suppress(KeyboardInterrupt):
+        rig.daemon.once()
+    rig.docker.compose = real_compose  # type: ignore[method-assign]
+    return _generation_dir(a_files).name
+
+
+def test_pending_spec_change_reapplies_the_new_generation_after_restart(rig: Rig):
+    """A->B pending record recovered across a restart while A is still running:
+    the daemon must compose up B's retained generation (converging the project in
+    place, never treating A's running workload as B), promote to applied, and
+    reclaim A's generation only after B succeeds — never showing two forms."""
+    a_gen = _crash_pending_spec_change(rig)
+
+    _restart_daemon(rig)  # fresh daemon: the pending B record reloads from disk
+    record = rig.daemon._applied_compose["svc"]
+    assert record.state == "pending"
+    b_gen = _generation_dir(record.files).name
+    assert b_gen != a_gen
+    # A is still the running project and BOTH generations survived the crash: A's
+    # obsolete generation is not reclaimed until B succeeds.
+    assert rig.daemon._compose_running("svc")  # a running row — but it is A's
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}
+    assert _active_forms(rig, "svc") == {"compose"}
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+
+    # compose up ran with B's retained generation despite a running row, the record
+    # is applied for B, A's generation is reclaimed, and only one form was seen.
+    ups = [c for c in rig.docker.compose_calls if c[2] == "up"]
+    assert len(ups) == ups_before + 1
+    assert [Path(f).parent.parent.name for f in ups[-1][1]] == [b_gen]  # B's generation
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert _generation_dirs(rig, "svc") == {b_gen}  # A reclaimed only after B's up
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    # A later healthy pass performs no additional up.
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_pending_record_over_a_running_project_reapplies_and_confirms(rig: Rig):
+    """Post-up confirmation-failure case: disk carries a pending B while B is
+    already running. A restart reapplies B through compose up (safe/idempotent)
+    and converges to applied; a later pass is stable with no further up."""
+    _bring_up_compose_crash_before_confirm(rig)  # pending record, project running
+    _restart_daemon(rig)
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # A pending record never claims health: it reapplies even though compose_ps
+    # reports running, and the safe re-up promotes it to applied.
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    # Stable thereafter: confirmed-applied and running → no further up.
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+# -- generation cleanup has a real retry path (ADR-0044) ---------------------------
+#
+# `_gc_compose_generations` isolates rmtree failures, but a failed deletion must
+# not be forgotten: a healthy Stack early-returns before any per-transition GC,
+# and a downed/removed/transitioned Stack no longer has a record to trigger one.
+# `_sweep_compose_generations` runs every pass, keyed off the on-disk stacks/ tree
+# and every current applied/pending record, so it retries failed deletions and
+# discovers orphans with no surviving project or record — never a referenced one.
+
+
+def _fail_rmtree_for(monkeypatch, *gen_names: str) -> set[str]:
+    """Make ``shutil.rmtree`` raise for generation dirs whose leaf name is in the
+    returned (mutable) set, delegating to the real rmtree otherwise. Clear or
+    discard from the set to let a later deletion succeed."""
+    from theozolith_nodedaemon import daemon as daemon_mod
+
+    failing = set(gen_names)
+    real = daemon_mod.shutil.rmtree
+
+    def fake_rmtree(path, *a, **k):
+        if Path(path).name in failing:
+            raise OSError(f"rmtree blocked for {path}")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(daemon_mod.shutil, "rmtree", fake_rmtree)
+    return failing
+
+
+def test_failed_generation_deletion_is_retried_on_a_later_pass(rig: Rig, monkeypatch):
+    """Replace A with B while A's generation deletion fails: B stays healthy and
+    A's dir lingers. A later unchanged-B pass — which early-returns healthy, past
+    any per-transition GC — retries the deletion and removes A with no new up."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    failing = _fail_rmtree_for(monkeypatch, a_gen)
+
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    b_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    assert rig.daemon._applied_compose["svc"].state == "applied"  # B healthy
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}  # A's dir survived the failure
+    assert any("reclaiming obsolete compose generation" in line for line in rig.logs)
+    assert any("cleanup failed" in line for line in rig.logs)
+
+    failing.clear()  # deletion recovers
+    ups = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {b_gen}  # A reclaimed on the retry pass
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups  # no new up
+
+
+def test_removed_stack_orphan_generation_is_retried_without_a_record(rig: Rig, monkeypatch):
+    """Compose a Stack down (removed from desired state) while its generation
+    deletion fails: no record remains, yet a later pass still discovers and
+    retries the orphaned generation once deletion succeeds — cleanup does not
+    require a surviving project or AppliedCompose record."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    failing = _fail_rmtree_for(monkeypatch, a_gen)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([]))  # svc absent from desired
+    rig.daemon.once()
+    assert "svc" not in rig.daemon._applied_compose  # record dropped by the down
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert _generation_dirs(rig, "svc") == {a_gen}  # orphaned; deletion failed
+
+    failing.clear()
+    rig.control.heartbeat_answers.append(heartbeat_response([]))  # still absent, still no record
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == set()  # orphan reclaimed with no record present
+
+
+def test_compose_to_process_orphan_generation_is_retried(rig: Rig, monkeypatch):
+    """compose -> process transition while the old generation deletion fails: the
+    process form runs, no compose record remains, and a later pass retries and
+    reclaims the orphan without disturbing the running child."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    blocked = _fail_rmtree_for(monkeypatch, a_gen)
+
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"process"}
+    assert "svc" not in rig.daemon._applied_compose
+    assert _generation_dirs(rig, "svc") == {a_gen}  # orphaned after the transition
+
+    blocked.clear()  # deletion recovers
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == set()  # orphan reclaimed on retry
+    assert _active_forms(rig, "svc") == {"process"}  # process undisturbed
+
+
+def test_sweep_keeps_a_pending_records_generation(rig: Rig):
+    """A pending record's retained candidate generation is never swept as an
+    orphan: it is referenced by the pending record until the up succeeds."""
+    rig.docker.fail_compose_up.add("ozolith-svc")
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()  # up fails: a pending record is retained
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    assert _generation_dirs(rig, "svc") == {a_gen}  # sweep kept the pending candidate
+
+    # Another failing pass: the pending generation is still referenced, not swept.
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {a_gen}
+
+    # Recovery: the up succeeds, the record promotes, its generation is retained.
+    rig.docker.fail_compose_up.discard("ozolith-svc")
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert _generation_dirs(rig, "svc") == {a_gen}
+
+
+def test_sweep_never_deletes_referenced_generation_while_others_reconcile(rig: Rig, monkeypatch):
+    """While an obsolete generation's deletion keeps failing across passes, the
+    referenced generation is never touched, unrelated Stacks keep reconciling, and
+    the failed candidate stays retryable — never permanently unreachable state."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+    failing = _fail_rmtree_for(monkeypatch, a_gen)
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    b_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+
+    for _ in range(3):
+        rig.control.heartbeat_answers.append(
+            heartbeat_response([_compose_stack("svc", files=_FILES_B), process_stack("worker")])
+        )
+        rig.daemon.once()
+        assert b_gen in _generation_dirs(rig, "svc")  # referenced generation retained
+        assert rig.daemon._supervisor.alive("worker")  # unrelated Stack reconciles
+    assert _generation_dirs(rig, "svc") == {a_gen, b_gen}  # candidate still tracked, retryable
+
+    failing.clear()  # not permanently unreachable: it is reclaimed once deletion works
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {b_gen}
+
+
 # -- real DockerCtl.remove failure semantics (ADR-0044) ----------------------------
 
 

@@ -658,9 +658,10 @@ class NodeDaemon:
         self._docker.compose(f"ozolith-{name}", [Path(p) for p in applied.files], "down")
         self._applied_compose.pop(name, None)
         self._persist_applied_compose()
-        # The downed generation is no longer referenced by any record: reclaim
-        # every materialized generation dir for this name (keep nothing).
-        self._gc_compose_generations(name, keep=set())
+        # The downed generation is now referenced by no record; the per-pass
+        # ``_sweep_compose_generations`` reclaims every unreferenced generation
+        # dir for this (now recordless) name and retries any deletion that fails,
+        # so cleanup is not tied to this teardown succeeding (ADR-0044 amendment).
 
     def _teardown_container_forms(self, name: str) -> None:
         """Remove any container-kind runtime under this name — a single-image
@@ -819,6 +820,17 @@ class NodeDaemon:
         except Exception as exc:
             self._log(f"orphan reap failed: {exc}")
             self._emit_error(type(exc).__name__, f"orphan reap failed: {exc}")
+        # Reclaim obsolete compose generation dirs repo-wide, every pass, so a
+        # deletion that failed earlier is retried and an orphaned generation is
+        # discovered even for a Stack that transitioned form, stopped/drained, or
+        # left desired state — none of which retains a record to trigger cleanup
+        # (ADR-0044 amendment). Non-blocking: isolated per deletion, with a
+        # backstop around enumeration so it never aborts the pass.
+        try:
+            self._sweep_compose_generations()
+        except Exception as exc:
+            self._log(f"compose generation sweep failed: {exc}")
+            self._emit_error(type(exc).__name__, f"compose generation sweep failed: {exc}")
 
     def _reconcile_removed(self, desired: list[WireStack]) -> None:
         """Runtime objects with no matching desired Stack are torn down like an
@@ -1064,14 +1076,15 @@ class NodeDaemon:
         return paths
 
     def _gc_compose_generations(self, name: str, keep: set[str]) -> None:
-        """Reclaim obsolete materialized compose generation directories for a
+        """Reclaim obsolete materialized compose generation directories for ONE
         Stack — every generation dir whose name is not in ``keep`` (the
         generations still referenced by a live applied/pending record; empty
         when none). Never removes a referenced generation, so a stopped/drained
-        or absent Stack's still-recorded teardown context is preserved. Each
-        removal is isolated: a cleanup failure is logged, emitted as the normal
-        capped error event, and retried on a later pass without blocking the
-        rest of convergence (ADR-0044 amendment)."""
+        or absent Stack's still-recorded teardown context — and a pending
+        record's retained candidate — is preserved. Each removal is isolated: a
+        cleanup failure is logged, emitted as the normal capped error event, and
+        left on disk so ``_sweep_compose_generations`` retries it on a later pass
+        without blocking the rest of convergence (ADR-0044 amendment)."""
         stack_dir = self._config.state_dir / "stacks" / name
         if not stack_dir.is_dir():
             return
@@ -1080,6 +1093,41 @@ class NodeDaemon:
                 self._isolated(
                     f"stack {name}: reclaiming obsolete compose generation {child.name}",
                     lambda child=child: shutil.rmtree(child),
+                )
+
+    def _sweep_compose_generations(self) -> None:
+        """The repo-wide RETRY path for obsolete compose generation dirs, run once
+        per reconcile pass (ADR-0044 amendment). It is keyed off the on-disk
+        ``stacks/`` tree, NOT off a live compose project or a surviving
+        AppliedCompose record, so a failed ``shutil.rmtree`` is retried every
+        later pass and an orphaned generation is still discovered after the Stack
+        transitions to another runtime form, is stopped/drained, or disappears
+        from desired state entirely — none of which leaves a record to trigger the
+        per-transition cleanup.
+
+        References are computed from EVERY current applied/pending record
+        (``_applied_compose`` reflects all of this pass's mutations by the time
+        this runs at the end of ``_reconcile``): a record's referenced generation
+        is ``_compose_generation(record.fingerprint)`` — exactly the directory
+        ``_compose_paths`` materializes it into — so a referenced generation,
+        INCLUDING a pending write-ahead's retained candidate, is never deleted. A
+        name with no record keeps nothing: every generation dir under it is
+        unreferenced and reclaimed. The sweep is bounded (one ``iterdir`` per
+        Stack dir) and deterministic (sorted), and each deletion is isolated via
+        ``_gc_compose_generations`` — a failure logs, emits the capped error
+        event, and stays retryable rather than blocking runtime convergence."""
+        stacks_root = self._config.state_dir / "stacks"
+        if not stacks_root.is_dir():
+            return
+        keep_by_name: dict[str, set[str]] = {}
+        for stack_name, record in self._applied_compose.items():
+            keep_by_name.setdefault(stack_name, set()).add(
+                self._compose_generation(record.fingerprint)
+            )
+        for stack_dir in sorted(stacks_root.iterdir()):
+            if stack_dir.is_dir():
+                self._gc_compose_generations(
+                    stack_dir.name, keep_by_name.get(stack_dir.name, set())
                 )
 
     def _compose_fingerprint(self, stack: WireStack) -> str:
@@ -1140,8 +1188,8 @@ class NodeDaemon:
                 self._docker.compose(
                     f"ozolith-{stack.name}", self._compose_paths(stack), "down"
                 )
-                # No record references the just-materialized generation: reclaim it.
-                self._gc_compose_generations(stack.name, keep=set())
+                # No record references the just-materialized generation; the
+                # per-pass sweep reclaims it (and retries on failure).
             return
         # process->container: a live child's in-flight Run defers the WHOLE
         # transition (read from its applied jobs dir — the desired kind is no
@@ -1181,15 +1229,33 @@ class NodeDaemon:
             not child_lingers
             and not single_present
             and applied is not None
+            and applied.state == COMPOSE_APPLIED
             and applied.fingerprint == fingerprint
         ):
-            # The fingerprint proves which spec was applied, not that the project
-            # is still up (it can die, or the daemon can restart while it keeps
-            # running). Only skip as already-converged when it is verifiably
-            # running; otherwise fall through and compose up again with the
-            # retained/current files (ADR-0044 amendment). No churn when healthy.
+            # Only a CONFIRMED (applied) record may take the healthy early return.
+            # A pending record proves its spec was write-ahead-persisted, NOT that
+            # compose up ever ran it: the deterministic project name
+            # (ozolith-<name>) is identical across generations, so a compose_ps
+            # running row cannot distinguish "B is up" from "the predecessor A is
+            # still running and B never reached Docker." A crash between persisting
+            # B's pending record and invoking compose up leaves exactly that
+            # ambiguity — A running under a pending B record — and treating the
+            # fingerprint+liveness match as converged would strand A while claiming
+            # B. So a pending record ALWAYS falls through to compose up with its
+            # retained immutable files (below), which converges the deterministic
+            # project from A to B in place (never a down to resolve the ambiguity);
+            # the post-up confirmation then promotes it to applied (ADR-0044
+            # amendment: pending never claims specification convergence; compose_ps
+            # stays the liveness authority, distinct from specification identity).
+            #
+            # Even for a confirmed record the fingerprint proves only which spec
+            # was applied, not that the project still runs (it can die, or the
+            # daemon can restart while it keeps running). Only skip as
+            # already-converged when it is verifiably running; otherwise fall
+            # through and compose up again with the retained/current files. No
+            # churn when healthy.
             if self._compose_running(stack.name):
-                return  # already the only form, at this exact spec, and running
+                return  # confirmed-applied, at this exact spec, and running
             self._log(
                 f"stack {stack.name}: applied compose project not running;"
                 " composing up again"
@@ -1236,11 +1302,14 @@ class NodeDaemon:
             f"stack {stack.name}: confirm applied compose", self._persist_applied_compose
         )
         # The transition is complete and this record is now the only one that
-        # matters: reclaim every OTHER materialized generation (a predecessor
-        # compose spec's dir, or an unreferenced candidate left by an earlier
-        # failed write-ahead), keeping only the generation this record
-        # references (ADR-0044 amendment: safe post-confirmation GC).
-        self._gc_compose_generations(stack.name, keep={self._compose_generation(fingerprint)})
+        # matters for this name. The per-pass ``_sweep_compose_generations`` (end
+        # of ``_reconcile``) reclaims every OTHER materialized generation — a
+        # predecessor compose spec's dir, or an unreferenced candidate left by an
+        # earlier failed write-ahead — keeping only the generation the current
+        # applied/pending records reference, and RETRIES any deletion that fails
+        # on later passes even once this Stack early-returns healthy or leaves the
+        # compose form entirely (ADR-0044 amendment: cleanup has a real retry path,
+        # not a one-shot tied to reaching this line).
 
     def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
         """Run the single-image form as the SOLE runtime form under this name.
