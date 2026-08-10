@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-10 by ADR-0044/ADR-0020: the scaffold's concrete file shapes changed with the worker-type cutover (see the amendment note in "The scaffold" section); the orchestration decisions stand unchanged.
 
 Date: 2026-08-04
 
@@ -34,6 +34,8 @@ The **reconcile** phase is what makes retry safe, and it trusts nothing it canno
 Failure hygiene inside the join phase — **machine-only join material can never escape a diagnostic**: a mint is *usable* only when the HTTP status, the token id, and the join string are all valid, and the response body is never interpolated into an error (it carries the join string; the id, not secret, is likewise never displayed). The id is captured **independently of HTTP success** and only in an allowlisted syntactic shape — it rides the revocation URL as a path segment, so a hostile id can never steer the DELETE — which means **every identifiable token gets best-effort revocation** on failure or interrupt: non-200 mints that still returned an id, malformed 200s with an id but no usable string, provision and consumption-check failures alike. Once a join string exists, the provision child's raw stdout/stderr is never reprinted: failures surface as **allowlisted classes** from the ADR-0025 error catalogue (constants, disclosure-free by construction), and unrecognized output is withheld with a message saying why — classification over redaction. The temporary listener is stopped on **every** exit path (including interrupts). The one-hour TTL is the backstop *only* for genuinely unidentifiable tokens (no valid id returned) and for failed revocation attempts. A token the exchange consumed is left alone. The join string is never printed, logged, or carried in an error message on any path.
 
 ### The scaffold: complete, commented, stopped
+
+*(Amended 2026-08-10, ADR-0044/ADR-0020 — the operative scaffold: `stacks/implementer.toml` is a **thin** Stack (`worker_type = "claude-dev"`, `node`, `state = "stopped"`, optional per-placement `[env]` overrides); `worker-types/claude-dev.toml` replaces `images/claude-dev.toml` and owns the whole customization tuple — `driver = "builtin:implementer"`, `adapter = "claude"`, `model`, `workspace`, the digest-pinned `base`, optional `setup`/Knowledge Source, and `[secrets]` names (`GITHUB_TOKEN = "github-implementer"`, `ANTHROPIC_API_KEY = "anthropic-api-key"`). Control resolves the worker type to the generic `theozolith-driver builtin:implementer` command and env; the README's three finish-line steps are unchanged. The bullets below record the pre-cutover shape.)*
 
 `--with-local-node` seeds the Config Repo (committed with the fixed machine identity) with:
 

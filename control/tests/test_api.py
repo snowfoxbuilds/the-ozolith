@@ -20,7 +20,7 @@ base = "ghcr.io/x/run:1.0@sha256:{digest}"
 setup = ["pip install uv"]
 
 [secrets]
-WORKER_GITHUB_TOKEN = "github-worker"
+IMPLEMENTER_GITHUB_TOKEN = "github-implementer"
 """.format(digest="0" * 64)
 
 STACK_TOML = """\
@@ -99,7 +99,7 @@ def test_heartbeat_distributes_only_this_nodes_desired_state(control: ControlRig
 
     config = control.heartbeat(node="box1").json()["config"]
     assert [s["name"] for s in config["stacks"]] == ["worker"]
-    assert config["stacks"][0]["secrets"] == {"WORKER_GITHUB_TOKEN": "github-worker"}
+    assert config["stacks"][0]["secrets"] == {"IMPLEMENTER_GITHUB_TOKEN": "github-implementer"}
     # Only images referenced by this node's Stacks travel with it.
     assert [i["name"] for i in config["images"]] == ["claude-dev"]
     assert config["images"][0]["tag"].startswith("theozolith/claude-dev:1.0-")

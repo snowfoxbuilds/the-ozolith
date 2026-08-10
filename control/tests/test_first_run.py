@@ -255,7 +255,7 @@ def test_filesystem_audit_no_secret_bytes_outside_secrets(home, monkeypatch):
     settings = load_settings()
     box = SecretBox(settings.key_path.read_text().strip())
     secret_store = SecretStore(settings.store_db_path)
-    secret_store.put_secret("github-worker", box.encrypt(SECRET_VALUE))
+    secret_store.put_secret("github-implementer", box.encrypt(SECRET_VALUE))
     node_token = secret_store.mint_node_token("box1")
 
     secret_bytes = [
@@ -299,7 +299,7 @@ def test_deleting_cache_db_costs_a_relogin_and_a_rewarm_only(home):
     settings = load_settings()
     box = SecretBox(settings.key_path.read_text().strip())
     secret_store = SecretStore(settings.store_db_path)
-    secret_store.put_secret("github-worker", box.encrypt(SECRET_VALUE))
+    secret_store.put_secret("github-implementer", box.encrypt(SECRET_VALUE))
     node_token = secret_store.mint_node_token("box1")
 
     store = Store(settings.cache_db_path)
@@ -316,7 +316,7 @@ def test_deleting_cache_db_costs_a_relogin_and_a_rewarm_only(home):
     assert rebuilt.fleet_state()["nodes"] == []  # …one heartbeat re-warms
     fresh = SecretStore(settings.store_db_path)
     assert fresh.node_for_token(node_token) == "box1"  # enrollment intact
-    assert box.decrypt(fresh.get_secret_token("github-worker")) == SECRET_VALUE
+    assert box.decrypt(fresh.get_secret_token("github-implementer")) == SECRET_VALUE
 
 
 def _backup(home, target):

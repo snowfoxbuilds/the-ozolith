@@ -23,7 +23,7 @@ SENTINEL = "tls-transported-secret-value"
 # transport); a built-in-driver command would be rejected (ADR-0044).
 WORKER_STACK = (
     'kind = "process"\nnode = "box1"\ncommand = "sleep 30"\n'
-    '[secrets]\nWORKER_GITHUB_TOKEN = "github-worker"\n'
+    '[secrets]\nIMPLEMENTER_GITHUB_TOKEN = "github-implementer"\n'
 )
 
 
@@ -77,7 +77,7 @@ def test_secrets_transit_tls_end_to_end(tmp_path: Path):
     with LiveServer(rig.client.app, certfile=str(cert), keyfile=str(key)) as live:
         # Admin entry over TLS (what `theozolith secret set` does).
         request = urllib.request.Request(
-            f"{live.url}/api/v1/secrets/github-worker",
+            f"{live.url}/api/v1/secrets/github-implementer",
             data=json.dumps({"value": SENTINEL}).encode(),
             method="PUT",
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"},
@@ -88,7 +88,9 @@ def test_secrets_transit_tls_end_to_end(tmp_path: Path):
 
         # The REAL node-side client, pinned to the CA (THEOZOLITH_TLS_CA).
         client = ControlClient(live.url, rig.node_token(), ca=str(ca))
-        assert client.pull_secrets("box1", ["github-worker"]) == {"github-worker": SENTINEL}
+        assert client.pull_secrets("box1", ["github-implementer"]) == {
+            "github-implementer": SENTINEL
+        }
 
         # Without the CA the handshake itself fails: nothing transits.
         with pytest.raises(urllib.error.URLError):
@@ -103,7 +105,7 @@ def test_plain_http_server_refuses_secret_traffic(tmp_path: Path):
 
     with LiveServer(rig.client.app) as live:
         request = urllib.request.Request(
-            f"{live.url}/api/v1/secrets/github-worker",
+            f"{live.url}/api/v1/secrets/github-implementer",
             data=json.dumps({"value": SENTINEL}).encode(),
             method="PUT",
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"},
@@ -114,7 +116,7 @@ def test_plain_http_server_refuses_secret_traffic(tmp_path: Path):
 
         client = ControlClient(live.url, rig.node_token(), insecure_dev=True)  # client would try…
         with pytest.raises(Exception, match="403"):
-            client.pull_secrets("box1", ["github-worker"])  # …the server still refuses
+            client.pull_secrets("box1", ["github-implementer"])  # …the server still refuses
 
 
 def test_wildcard_hosts_are_refused(tmp_path):

@@ -95,7 +95,7 @@ theozolith origin-init                       # opt-in browser: origin + password
 theozolith serve                             # the service (+ dashboard + bootstrap listener)
 theozolith recover                           # after restoring ~/.theozolith minus cache/
 theozolith join-token create                         # print the one paste that provisions a node
-theozolith secret set github-worker          # operator entry
+theozolith secret set github-implementer          # operator entry
 theozolith command recycle --node box1 --target worker   # queues behind a Run
 theozolith command recycle --node box1 --target worker --force
 theozolith unquarantine --node box1          # human-only release
