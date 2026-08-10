@@ -1316,18 +1316,29 @@ class NodeDaemon:
             if blocker is not None:
                 self._log(f"stack {stack.name}: restart deferred ({blocker})")
                 return
-        # A custom drivers/* Stack may (re)start ONLY when the freshly verified
-        # applied distribution equals this pass's desired hash (ADR-0042
-        # amendment). After a post-stop exchange or pointer-publication failure
-        # the pointer-selected tree may be invalid, unpublished, or missing —
-        # and safety is never inferred from the directory name or pointer
-        # contents alone: _current_drivers_hash only answers non-empty when the
+        # A custom drivers/* Stack may (re)start ONLY when the desired drivers
+        # hash is NON-EMPTY and the freshly verified applied distribution
+        # equals it (ADR-0042 amendment). The empty sentinel means "no
+        # distribution exists", never "converged": after an empty-desired
+        # retirement both sides read '' — equality of two empty sentinels is
+        # not authorization to start executable config code, so the driver a
+        # retirement just stopped must not relaunch in the same pass. After a
+        # post-stop exchange or pointer-publication failure the
+        # pointer-selected tree may be invalid, unpublished, or missing — and
+        # safety is never inferred from the directory name or pointer contents
+        # alone: _current_drivers_hash only answers non-empty when the
         # pointed-at tree recomputes to the pointer. A live child is left
         # running (restart deferred); a child stopped for a replacement stays
         # stopped until the existing convergence path succeeds on a later pass.
         # Builtin drivers and generic process Stacks are untouched.
         if len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/"):
             desired_hash = str(self._desired.get("drivers_hash", "") or "")
+            if not desired_hash:
+                self._log(
+                    f"stack {stack.name}: {'restart' if alive else 'start'} deferred —"
+                    " no config distribution desired/applied"
+                )
+                return
             if self._current_drivers_hash() != desired_hash:
                 self._log(
                     f"stack {stack.name}: {'restart' if alive else 'start'} deferred —"

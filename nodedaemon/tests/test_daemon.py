@@ -3865,6 +3865,10 @@ def test_config_dist_swap_restarts_only_drivers_stacks(rig: Rig):
 
 
 def test_config_dist_empty_desired_retires(rig: Rig):
+    """Retirement stops the drivers/* Stack AND the same pass's reconcile must
+    not relaunch it: '' means no distribution exists, never converged, so the
+    start gate demands a non-empty desired hash plus fresh verified equality —
+    equality of two empty sentinels is not authorization (ADR-0042)."""
     custom = driver_stack("custom-impl", "drivers/custom")
     digest, data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
     rig.control.config_artifacts[digest] = data
@@ -3872,12 +3876,58 @@ def test_config_dist_empty_desired_retires(rig: Rig):
     rig.daemon.once()
     assert (rig.config.state_dir / "config-dist" / digest).is_dir()
     assert rig.daemon._supervisor.alive("custom-impl")
+    spawns_after_apply = len(rig.popen.spawned)
 
-    # Desired distribution goes away entirely: retire it.
+    # Desired distribution goes away entirely (the Stack stays desired): the
+    # driver is stopped and stays stopped — reconcile spawns nothing.
     rig.control.heartbeat_answers.append(dist_response([custom], ""))
     rig.daemon.once()
     assert not (rig.config.state_dir / "config-dist" / "current").exists()
     assert not (rig.config.state_dir / "config-dist" / digest).exists()
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert len(rig.popen.spawned) == spawns_after_apply
+
+    # A further pass with the same empty desired hash: still stopped, no churn.
+    rig.control.heartbeat_answers.append(dist_response([custom], ""))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert len(rig.popen.spawned) == spawns_after_apply
+
+
+def test_config_dist_empty_hashes_never_start_custom_driver(rig: Rig):
+    """A drivers/* Stack that has NEVER had a distribution does not start while
+    both the current and desired hashes are empty; a builtin driver and a
+    generic process are unaffected by the gate; a valid non-empty distribution
+    then lets the custom driver start normally (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    builtin = process_stack("impl")
+    builtin["command"] = "theozolith-driver builtin:implementer"
+    builtin["env"] = {"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_RUN_IMAGE": "theozolith/y:1"}
+    generic = process_stack("plain")  # command "plain-driver --loop"
+    stacks = [custom, builtin, generic]
+
+    rig.control.heartbeat_answers.append(dist_response(stacks, ""))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert rig.daemon._supervisor.alive("impl")
+    assert rig.daemon._supervisor.alive("plain")
+    assert not any(p.args[:2] == ["theozolith-driver", "drivers/custom"] for p in rig.popen.spawned)
+
+    # A valid distribution converges: the custom driver now starts, once.
+    digest, data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response(stacks, digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    custom_spawns = [
+        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]
+    ]
+    assert len(custom_spawns) == 1
+    # The builtin and generic children were never restarted along the way.
+    assert (
+        len([p for p in rig.popen.spawned if p.args[1:2] == ["builtin:implementer"]]) == 1
+        and len([p for p in rig.popen.spawned if p.args[0] == "plain-driver"]) == 1
+    )
 
 
 def test_config_dist_zip_traversal_refused(rig: Rig):
