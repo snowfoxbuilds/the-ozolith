@@ -339,6 +339,15 @@ def test_web_secret_reaches_a_referencing_node_like_the_cli(control: ControlRig)
     assert "ghp_secret_value" not in page  # …the value is never echoed
 
 
+def test_secrets_form_recommends_the_implementer_secret_name(control: ControlRig):
+    """The form's example copy teaches the shipped convention (ADR-0020 sweep):
+    asserted with NO secrets entered, so the listing can't mask stale copy."""
+    login(control)
+    page = control.client.get("/secrets").text
+    assert "github-implementer" in page
+    assert "github-worker" not in page
+
+
 def test_secret_form_refuses_without_the_tls_channel(tmp_path):
     rig = make_rig(tmp_path, secrets_channel_ok=False)
     rig.client.post("/login", data={"password": ADMIN_PASSWORD})

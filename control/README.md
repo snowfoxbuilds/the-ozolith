@@ -9,7 +9,7 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   and build status every 60s; responses carry infrastructure commands (drain, recycle,
   update, rebuild — recycle/update queue behind an in-flight Run unless `--force`) and
   the node's desired state from the Config Repo (ADR-0006).
-- **Claim dispatch** (ADR-0017) — the single writer of claim creation: Workers request
+- **Claim dispatch** (ADR-0017) — the single writer of claim creation: Implementers request
   work, the Control Node claims the issue on GitHub itself (assign + `in_progress`,
   write-through) and returns it; the Reviewer side is discovery-only. Gates: node
   quarantine (2 consecutive failed Runs, human-only release), pending lifecycle
@@ -96,8 +96,8 @@ theozolith serve                             # the service (+ dashboard + bootst
 theozolith recover                           # after restoring ~/.theozolith minus cache/
 theozolith join-token create                         # print the one paste that provisions a node
 theozolith secret set github-implementer          # operator entry
-theozolith command recycle --node box1 --target worker   # queues behind a Run
-theozolith command recycle --node box1 --target worker --force
+theozolith command recycle --node box1 --target implementer   # queues behind a Run
+theozolith command recycle --node box1 --target implementer --force
 theozolith unquarantine --node box1          # human-only release
 theozolith status                            # fleet health (exit 0/1/2; --json to parse)
 theozolith top                               # the Operator TUI (M9; see --help for keys)
