@@ -190,14 +190,18 @@ def test_missing_drivers_root_stays_the_empty_sentinel(tmp_path):
     getattr(os, "geteuid", lambda: 1)() == 0, reason="root bypasses file permissions"
 )
 def test_unreadable_drivers_file_is_config_dist_error(tmp_path):
-    """An unreadable drivers/ file is a packaging error normalized to
-    ConfigDistError (so the config boundary can turn it into ConfigRepoError)."""
+    """An unreadable drivers/ file is normalized to ConfigDistError on BOTH
+    sides — a packaging error control-side (so the config boundary can turn it
+    into ConfigRepoError), a verification failure node-side (so the applied
+    tree reads as non-converged and repairs)."""
     _write(tmp_path, "drivers/secret.py", "x = 1\n")
     target = tmp_path / "drivers" / "secret.py"
     os.chmod(target, 0)
     try:
         with pytest.raises(configdist.ConfigDistError):
             configdist.drivers_hash(tmp_path)
+        with pytest.raises(node_configdist.ConfigDistError):
+            node_configdist.manifest_hash_of_tree(tmp_path)
     finally:
         os.chmod(target, 0o644)
 
@@ -573,3 +577,90 @@ def test_folder_mode_enumeration_stays_non_fail_closed(tmp_path, monkeypatch):
     # No refuse_irregular: the unreadable subtree is skipped, top.py still found.
     found = configdist.regular_files(tmp_path)
     assert (tmp_path / "top.py") in found
+
+
+# -- the applied tree fails closed on BOTH sides (ADR-0042 amendment) ---------
+
+
+def test_cross_package_missing_root_is_the_empty_sentinel_on_both_sides(tmp_path):
+    """Only a genuinely MISSING drivers root is the empty distribution; both
+    implementations agree (the node's dist root holds config-dist.json but no
+    drivers/ — same shape, same answer)."""
+    (tmp_path / "config-dist.json").write_text("{}", encoding="utf-8")
+    assert configdist.drivers_hash(tmp_path) == ""
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == ""
+
+
+@pytest.mark.parametrize("plant", ["file_symlink", "dir_symlink", "fifo"])
+def test_cross_package_fail_closed_on_irregular_descendants(tmp_path, plant):
+    """Both implementations refuse the same irregular shapes below the drivers
+    root — a symlinked file, a symlinked directory, a FIFO — rather than
+    skipping them: an executable filesystem entry either participates in the
+    hash or fails verification, never unhashed-but-present (ADR-0042)."""
+    _write(tmp_path, "drivers/custom/impl.py", "x = 1\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evil.py").write_text("evil = 1\n", encoding="utf-8")
+    planted = tmp_path / "drivers" / "custom" / "planted"
+    if plant == "file_symlink":
+        planted.symlink_to(outside / "evil.py")
+    elif plant == "dir_symlink":
+        planted.symlink_to(outside)
+    else:
+        os.mkfifo(planted)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.manifest_hash_of_tree(tmp_path)
+
+
+@pytest.mark.parametrize("shape", ["symlink", "regular_file"])
+def test_cross_package_fail_closed_on_irregular_drivers_root(tmp_path, shape):
+    """A drivers root that is a symlink (even to a real directory of real
+    files) or a regular file is refused by BOTH implementations — a pointer or
+    directory name is never integrity evidence by itself (ADR-0042)."""
+    root = tmp_path / "drivers"
+    if shape == "symlink":
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "impl.py").write_text("x = 1\n", encoding="utf-8")
+        root.symlink_to(external)
+    else:
+        root.write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_hash(tmp_path)
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.manifest_hash_of_tree(tmp_path)
+
+
+def test_cross_package_fail_closed_on_enumeration_failure(tmp_path, monkeypatch):
+    """The node's recompute fails closed on an unenumerable included subtree
+    exactly like control's manifest — never a silently truncated hash. Injected
+    via os.scandir, so the test holds under root."""
+    _write(tmp_path, "drivers/top.py", "t = 1\n")
+    _write(tmp_path, "drivers/sub/leaf.py", "leaf = 1\n")
+    nested = tmp_path / "drivers" / "sub"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == nested:
+            raise OSError(13, "injected: cannot list nested dir")
+        return real_scandir(path)
+
+    monkeypatch.setattr(configdist.os, "scandir", boom)
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.drivers_manifest(tmp_path)
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.manifest_hash_of_tree(tmp_path)
+
+
+def test_cross_package_agreement_survives_excluded_irregular_entries(tmp_path):
+    """Excluded names (dot-prefixed) are tolerated whatever they are — a
+    dot-prefixed symlink is skipped by BOTH sides before its shape is examined,
+    so the two hashes still agree on the clean content."""
+    _populate(tmp_path)
+    clean_control = configdist.drivers_hash(tmp_path)
+    clean_node = node_configdist.manifest_hash_of_tree(tmp_path)
+    (tmp_path / "drivers" / ".editor-swap").symlink_to(tmp_path / "outside-nowhere")
+    assert configdist.drivers_hash(tmp_path) == clean_control
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == clean_node

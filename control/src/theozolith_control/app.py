@@ -28,11 +28,10 @@ import json
 import os
 import re
 import tempfile
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from theozolith_control import configdist, controltoml, joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
@@ -631,60 +630,88 @@ def create_app(
         differs from the requested one means the repo moved on, so answer 409
         (converge to the fresh hash next heartbeat), never 500. Every published
         artifact is verified by unpack-and-recompute before it lands under
-        ``<hash>.zip`` (never trusted by filename or bytes). There is no PUT
-        twin: control packages from its own repo."""
+        ``<hash>.zip`` (never trusted by filename or bytes). The response is an
+        immutable byte snapshot verified as bytes, so a concurrent request
+        pruning the cache entry (keep-two) cannot break an in-flight response.
+        There is no PUT twin: control packages from its own repo."""
         _node_auth(request)
         if not re.fullmatch(r"[0-9a-f]{64}", drivers_hash):
             raise HTTPException(
                 status_code=400, detail="drivers_hash must be 64 lowercase hex chars"
             )
 
-        def _resolve_artifact() -> Path:
+        def _resolve_artifact() -> bytes:
             """Verify-the-cache-or-build-on-demand, off the event loop: cache
             verification unpacks-and-recomputes and on-demand packaging both do
             real disk work (unzip, sha256 a tree, deflate) that must never stall
             heartbeats or the terminal websockets (ADR-0042). Cache publication
             stays atomic (tempfile + os.replace inside build_artifact), so two
             concurrent builds each publish a valid <hash>.zip and the last
-            os.replace wins — a torn entry is impossible."""
-            cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
-            if cached.is_file():
-                # Never serve a cached artifact on the strength of its filename: a
-                # corrupted or truncated <hash>.zip must not be served forever
-                # (ADR-0042). Verify it unpacks and recomputes to this hash; if it
-                # does not, discard it and fall through to an on-demand rebuild.
-                try:
-                    recomputed, _ = configdist.verify_artifact(cached)
-                except configdist.ConfigDistError:
-                    recomputed = None
-                if recomputed == drivers_hash:
-                    return cached
-                with contextlib.suppress(OSError):
-                    cached.unlink()
-            try:
-                built, path = configdist.build_artifact(
-                    settings.config_repo,
-                    settings.config_artifacts_dir,
-                    built_against=_config_built_against(),
-                )
-            except configdist.ConfigDistError as exc:
-                raise HTTPException(
-                    status_code=500, detail=f"config distribution build failed: {exc}"
-                ) from exc
-            if built != drivers_hash or path is None:
-                # The working repo no longer packages to this hash — no background
-                # build machinery, convergence by retry (ADR-0042).
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "config distribution changed; converge to the hash on the next heartbeat"
-                    ),
-                )
-            configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
-            return path
+            os.replace wins — a torn entry is impossible.
 
-        path = await asyncio.to_thread(_resolve_artifact)
-        return FileResponse(path, media_type="application/zip")
+            Returns an immutable BYTE SNAPSHOT, never a pathname: the cache is
+            prunable (keep-two), so a concurrent request building a third hash
+            may unlink this entry between verification and response send — the
+            response must own what it verified through completion. The snapshot
+            is read first and verified as bytes; nothing after that point can
+            touch it. No cross-request lock: the fd-lifetime/snapshot mechanism
+            is sufficient, so artifact requests never serialize."""
+            cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
+            for _ in range(3):
+                snapshot: bytes | None
+                try:
+                    snapshot = cached.read_bytes()
+                except OSError:
+                    snapshot = None
+                if snapshot is not None:
+                    # Never serve a cached artifact on the strength of its
+                    # filename: a corrupted or truncated <hash>.zip must not be
+                    # served forever (ADR-0042). Verify the snapshot unpacks and
+                    # recomputes to this hash; if not, discard the cache entry
+                    # and fall through to an on-demand rebuild.
+                    try:
+                        recomputed, _ = configdist.verify_artifact_bytes(snapshot)
+                    except configdist.ConfigDistError:
+                        recomputed = None
+                    if recomputed == drivers_hash:
+                        return snapshot
+                    with contextlib.suppress(OSError):
+                        cached.unlink()
+                try:
+                    built, path = configdist.build_artifact(
+                        settings.config_repo,
+                        settings.config_artifacts_dir,
+                        built_against=_config_built_against(),
+                    )
+                except configdist.ConfigDistError as exc:
+                    raise HTTPException(
+                        status_code=500, detail=f"config distribution build failed: {exc}"
+                    ) from exc
+                if built != drivers_hash or path is None:
+                    # The working repo no longer packages to this hash — no
+                    # background build machinery, convergence by retry (ADR-0042).
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "config distribution changed; converge to the hash on the next"
+                            " heartbeat"
+                        ),
+                    )
+                try:
+                    snapshot = path.read_bytes()
+                except OSError:
+                    # Concurrent requests built enough newer hashes to prune this
+                    # one inside the publish-to-read window; rebuild and retry.
+                    continue
+                configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
+                return snapshot
+            raise HTTPException(
+                status_code=503,
+                detail="config artifact cache is churning; retry on the next heartbeat",
+            )
+
+        data = await asyncio.to_thread(_resolve_artifact)
+        return Response(content=data, media_type="application/zip")
 
     @app.post("/api/v1/nodes/{node}/quarantine/release")
     async def unquarantine(node: str, request: Request) -> dict[str, Any]:

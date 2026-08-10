@@ -3986,3 +3986,272 @@ def test_config_dist_old_distribution_stays_until_replacement_verified(rig: Rig)
     assert (root / a_hash / "drivers" / "custom" / "impl.py").read_text() == "v = 1\n"
     assert not (root / b_hash).exists()
     assert _last_heartbeat(rig)["drivers_hash"] == a_hash  # still reports the old good hash
+
+
+# -- fail-closed applied-tree verification (ADR-0042 amendment) ---------------
+
+
+def test_config_dist_symlink_in_applied_tree_is_not_converged_then_repaired(rig: Rig):
+    """A symlink planted in the applied tree after extraction FAILS verification
+    closed — it is never silently skipped as unhashed-but-present content — so
+    the node reports non-convergence and the next fetch repairs the tree."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    outside = rig.config.state_dir / "outside.py"
+    outside.write_text("evil = 1\n", encoding="utf-8")
+    (tree / "drivers" / "custom" / "planted.py").symlink_to(outside)
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # fail closed, never skipped
+    assert not (tree / "drivers" / "custom" / "planted.py").is_symlink()  # repaired away
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_fifo_in_applied_tree_is_not_converged_then_repaired(rig: Rig):
+    """An irregular entry (FIFO/socket/device) below the applied drivers root
+    fails verification closed and triggers repair."""
+    import os
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    os.mkfifo(tree / "drivers" / "custom" / "pipe")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert not (tree / "drivers" / "custom" / "pipe").exists()  # repaired away
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_rogue_applied_root_entry_is_not_converged_then_repaired(rig: Rig):
+    """A rogue sibling at the applied ROOT (outside drivers/, so outside the
+    manifest) would be unhashed-but-present content riding a converged report —
+    the shape check refuses it and the next fetch repairs the tree."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "rogue.py").write_text("evil = 1\n", encoding="utf-8")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert any("unexpected" in line for line in rig.logs)
+    assert not (tree / "rogue.py").exists()  # repaired away
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_symlinked_applied_drivers_root_is_not_converged_then_repaired(rig: Rig):
+    """A drivers root replaced by a symlink — even one pointing at the original
+    content — is refused: a pointer is never integrity evidence (ADR-0042)."""
+    import os
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    tree = rig.config.state_dir / "config-dist" / digest
+    hidden = rig.config.state_dir / "hidden-drivers"
+    os.rename(tree / "drivers", hidden)
+    (tree / "drivers").symlink_to(hidden)
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert not (tree / "drivers").is_symlink()  # repaired to a real directory
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_unenumerable_applied_subtree_is_not_converged(rig: Rig, monkeypatch):
+    """A failure to enumerate an included subtree of the APPLIED tree reads as
+    non-converged (fail closed) — never a silently truncated recompute that
+    still reports the hash. Injected via os.scandir, so the test holds under
+    root (chmod would not)."""
+    import os
+
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"})
+    locked = rig.config.state_dir / "config-dist" / digest / "drivers" / "custom"
+    real_scandir = os.scandir
+
+    def boom(path):
+        if Path(path) == locked:
+            raise OSError(13, "injected: cannot list applied subtree")
+        return real_scandir(path)
+
+    monkeypatch.setattr("theozolith_nodedaemon.configdist.os.scandir", boom)
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert any("failed verification" in line for line in rig.logs)
+
+
+# -- lifecycle-safe same-hash repair (ADR-0042 amendment) ---------------------
+
+
+def test_config_dist_same_hash_repair_stops_live_driver_before_exchange(rig: Rig, monkeypatch):
+    """Repair of a mutated tree while its custom driver is ALIVE: the child is
+    stopped only after the replacement fully verified and BEFORE the active
+    path is exchanged (never removed beneath a running process), the failing
+    tree is renamed aside rather than deleted first, and the same pass's
+    reconcile restarts the driver on the repaired tree."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+
+    alive_at_exchange: list[bool] = []
+    real_exchange = rig.daemon._exchange_config_dist_tree
+
+    def observing(staging, final):
+        alive_at_exchange.append(rig.daemon._supervisor.alive("custom-impl"))
+        assert final.is_dir()  # the failing tree is still fully present here
+        real_exchange(staging, final)
+
+    monkeypatch.setattr(rig.daemon, "_exchange_config_dist_tree", observing)
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    # Honest report at status time; stopped before the exchange; repaired;
+    # restarted by the same pass's reconcile.
+    assert _last_heartbeat(rig)["drivers_hash"] == ""
+    assert alive_at_exchange == [False]
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    assert len(spawns) == 2  # restarted exactly once
+    # Only the COMPLETE transition is reported on the next heartbeat.
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_same_hash_repair_defers_behind_inflight_run(rig: Rig, tmp_path):
+    """Repair queues behind an active Run exactly like a new distribution: the
+    node keeps reporting non-convergence, but the live child and its tree are
+    untouched — no active Run is ever killed to repair a distribution."""
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    custom = driver_stack(
+        "custom-impl",
+        "drivers/custom",
+        env={
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "THEOZOLITH_RUN_IMAGE": "theozolith/x:1",
+            "THEOZOLITH_JOBS_DIR": str(jobs),
+        },
+    )
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+    (jobs / "20260810T0900-custom-impl-1").mkdir()
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # honest while deferred
+    assert rig.daemon._supervisor.alive("custom-impl")  # the Run was not killed
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "MUTATED = 9\n"
+    assert any("deferred" in line for line in rig.logs)
+    # The Run ends; the next pass repairs and restarts the driver.
+    shutil.rmtree(jobs / "20260810T0900-custom-impl-1")
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_exchange_failure_is_honest_and_retried(rig: Rig):
+    """An injected failure during the active-tree exchange leaves retryable
+    state: the desired hash is NEVER memoized, the next heartbeat reports the
+    evidence-based value, and the next pass repairs honestly."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    tree = rig.config.state_dir / "config-dist" / digest
+    (tree / "drivers" / "custom" / "impl.py").write_text("MUTATED = 9\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def failing(staging, final):
+        calls.append("boom")
+        raise OSError(5, "injected: exchange failed")
+
+    rig.daemon._exchange_config_dist_tree = failing
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert calls == ["boom"]
+    assert any("config distribution" in line and "failed" in line for line in rig.logs)
+    assert rig.control.events  # a theozolith.error was emitted
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "MUTATED = 9\n"
+    del rig.daemon._exchange_config_dist_tree  # restore the real method
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == ""  # never memoized on failure
+    assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == digest
+
+
+def test_config_dist_pointer_failure_keeps_reporting_old_hash_then_converges(rig: Rig):
+    """An injected failure during pointer publication (new-hash path): the old
+    pointer and old tree stay authoritative, the heartbeat never reports the
+    new hash before the COMPLETE transition, and the next pass converges."""
+    a_hash = _apply_dist(rig, {"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    rig.control.config_artifacts[b_hash] = b_data
+
+    def failing(drivers_hash):
+        raise OSError(5, "injected: pointer publication failed")
+
+    rig.daemon._write_current_pointer = failing
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == a_hash  # pointer untouched
+    assert (root / a_hash / "drivers" / "custom" / "impl.py").read_text() == "v = 1\n"
+    assert rig.control.events  # a theozolith.error was emitted
+    del rig.daemon._write_current_pointer  # restore the real method
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    # The heartbeat sent at the start of THAT pass still reported A — the new
+    # hash is only ever reported after tree AND pointer both transitioned.
+    assert _last_heartbeat(rig)["drivers_hash"] == a_hash
+    assert (root / "current").read_text().strip() == b_hash
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == b_hash
+
+
+def test_config_dist_failed_verification_never_stops_the_driver(rig: Rig):
+    """Restart only after the replacement is verified: a swap whose served
+    artifact fails verification leaves the live driver untouched — never
+    stopped for an unverified replacement — and the old tree current."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([custom], a_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns_before = len(rig.popen.spawned)
+    b_hash, _good = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    _, tampered = make_config_dist({"drivers/custom/impl.py": "TAMPERED = 3\n"})
+    rig.control.config_artifacts[b_hash] = tampered
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    assert len(rig.popen.spawned) == spawns_before  # never stopped, never restarted
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == a_hash
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == a_hash

@@ -12,6 +12,12 @@ the two is a test failure, not a silent convergence stall.
 Zip extraction validates every member name EXPLICITLY (relative, no ``..``, no
 absolute or drive-letter prefix) rather than delegating to ``zipfile`` — a
 malicious artifact must never write outside the destination directory.
+
+Verification over an on-disk tree is FAIL CLOSED: the applied state directory
+can be malformed after a restore, interrupted maintenance, or local corruption,
+so a symlink, irregular entry (FIFO/socket/device), or unenumerable subtree
+raises ``ConfigDistError`` rather than being skipped — an entry either
+participates in the recomputed hash or fails verification outright.
 """
 
 from __future__ import annotations
@@ -47,26 +53,65 @@ def excluded_part(part: str) -> bool:
 
 
 def _regular_files(root: Path) -> list[Path]:
-    """Sorted regular files under ``root`` passing ``excluded_part`` on every
-    component. Symlinks and other non-regular entries are skipped (a verified
-    artifact never contains them — see ``safe_member`` — so this only ever sees
-    plain files)."""
+    """Sorted regular files under ``root`` whose every path component passes
+    ``excluded_part`` — FAIL CLOSED (ADR-0042). Extraction never writes a
+    symlink or irregular entry (``safe_member``), but the APPLIED tree this
+    verifies can be anything after a restore, interrupted maintenance, or local
+    corruption — so nothing is skipped silently:
+
+    - a ``root`` that is a symlink (even to a directory), a regular file, or
+      any other non-directory entry raises ``ConfigDistError``; only a
+      genuinely missing root is the empty distribution,
+    - a non-excluded symlink, FIFO, socket, or device anywhere below raises,
+    - a failure to enumerate the root or any descended directory raises —
+      an unreadable subtree must never silently drop from the manifest.
+
+    Mirror of the control side's ``regular_files(refuse_irregular=True)``
+    (pinned by the cross-package contract tests): an entry can only be hashed
+    content or a verification failure, never unhashed-but-present."""
     root = Path(root)
-    if not root.is_dir():
-        return []
-    found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if not excluded_part(name) and not (Path(dirpath) / name).is_symlink()
+    if root.is_symlink():
+        raise ConfigDistError(
+            f"{root} is a symlink — a verified tree refuses a symlinked drivers"
+            " root (it could alias a tree from outside the applied state, ADR-0042)"
         )
-        for name in sorted(filenames):
-            if excluded_part(name):
+    if not root.exists():
+        return []  # a genuinely missing drivers/ is the empty sentinel
+    if not root.is_dir():
+        raise ConfigDistError(
+            f"{root} is not a directory — a verified tree refuses a non-directory"
+            " drivers root (regular file, FIFO, socket, device; ADR-0042)"
+        )
+    found: list[Path] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            raise ConfigDistError(
+                f"cannot enumerate {current} while verifying the config"
+                f" distribution: {exc} (an unreadable subtree must never silently"
+                " drop from the manifest, ADR-0042)"
+            ) from exc
+        for entry in entries:
+            if excluded_part(entry.name):
                 continue
-            full = Path(dirpath) / name
-            if full.is_symlink() or not full.is_file():
+            full = Path(entry.path)
+            if entry.is_symlink():
+                raise ConfigDistError(
+                    f"{full} is a symlink — a verified tree refuses symlinks"
+                    " (unhashed reachable content, ADR-0042)"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(full)
                 continue
+            if not entry.is_file(follow_symlinks=False):
+                raise ConfigDistError(
+                    f"{full} is not a regular file — a verified tree refuses"
+                    " FIFOs, sockets, and devices (ADR-0042)"
+                )
             found.append(full)
     return sorted(found)
 
@@ -77,7 +122,13 @@ def manifest_hash_of_tree(dist_root: Path) -> str:
     The manifest covers only the ``drivers/`` file set, with relpaths INCLUDING
     the ``drivers/`` prefix — the metadata member at the root is excluded by
     construction. An empty tree hashes to ``""``. Byte-for-byte the control
-    side's ``manifest_hash(drivers_manifest(...))``."""
+    side's ``manifest_hash(drivers_manifest(...))``.
+
+    FAIL CLOSED (ADR-0042): a symlinked or otherwise irregular ``drivers``
+    root, any non-excluded symlink/FIFO/socket/device below it, a failure to
+    enumerate any included directory, or an unreadable file all raise
+    ``ConfigDistError`` — the caller reads that as non-converged and repairs;
+    an irregular entry is never silently omitted from the hash."""
     dist_root = Path(dist_root)
     root = dist_root / DRIVERS_DIR
     entries: list[list[str]] = []

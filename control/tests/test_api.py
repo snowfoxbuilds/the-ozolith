@@ -908,6 +908,73 @@ def test_heartbeat_stays_responsive_during_a_slow_rebuild(control: ControlRig, m
     assert pull_status["code"] == 200
 
 
+def test_inflight_artifact_response_survives_concurrent_pruning(control: ControlRig, monkeypatch):
+    """An artifact response accepted after verification must remain complete
+    even when another request builds a third hash and the keep-two prune
+    unlinks the entry being served: the response owns an immutable byte
+    snapshot, not a pathname (ADR-0042 amendment). Deterministic: the first
+    response is paused after verification, the prune is forced while it is
+    parked, then it resumes."""
+    import os
+
+    from theozolith_control import configdist
+
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    cache = control.settings.config_artifacts_dir
+    # Two retained artifacts, with explicit mtimes so the keep-two prune
+    # deterministically takes the oldest.
+    digest_a = _write_driver(control, "v = 1\n")
+    first = control.client.get(f"/api/v1/config/artifacts/{digest_a}", headers=headers)
+    assert first.status_code == 200
+    digest_b = _write_driver(control, "v = 2\n")
+    second = control.client.get(f"/api/v1/config/artifacts/{digest_b}", headers=headers)
+    assert second.status_code == 200
+    now = cache.stat().st_mtime
+    os.utime(cache / f"{digest_a}.zip", (now - 100, now - 100))
+    os.utime(cache / f"{digest_b}.zip", (now - 50, now - 50))
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_verify = configdist.verify_artifact_bytes
+
+    def pausing(data):
+        result = real_verify(data)
+        if result[0] == digest_a and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "the in-flight response was never released"
+        return result
+
+    monkeypatch.setattr(configdist, "verify_artifact_bytes", pausing)
+    answer: dict = {}
+
+    def pull_oldest() -> None:
+        r = control.client.get(f"/api/v1/config/artifacts/{digest_a}", headers=headers)
+        answer["status"], answer["content"] = r.status_code, r.content
+
+    puller = threading.Thread(target=pull_oldest)
+    puller.start()
+    try:
+        assert entered.wait(10), "the paused pull never reached verification"
+        # While the oldest artifact's response is parked post-verification, a
+        # THIRD hash builds and the keep-two prune takes the served entry.
+        digest_c = _write_driver(control, "v = 3\n")
+        built = control.client.get(f"/api/v1/config/artifacts/{digest_c}", headers=headers)
+        assert built.status_code == 200
+        assert not (cache / f"{digest_a}.zip").exists()  # pruned mid-flight
+    finally:
+        release.set()
+        puller.join(timeout=10)
+    assert not puller.is_alive()
+    # The resumed response is a 200 with a COMPLETE artifact that recomputes
+    # to the requested hash — the prune never touched what was verified.
+    assert answer["status"] == 200
+    recomputed, _ = real_verify(answer["content"])
+    assert recomputed == digest_a
+    # And after the in-flight use ends, the cache still converges to keep-two.
+    zips = sorted(p.name for p in cache.iterdir() if p.suffix == ".zip")
+    assert zips == sorted(f"{d}.zip" for d in (digest_b, digest_c))
+
+
 def test_broken_config_dist_keeps_dispatch_fail_open(control: ControlRig):
     """A config-distribution validation failure (symlinked drivers root) must
     preserve dispatch's documented fail-open posture: the grant path proceeds

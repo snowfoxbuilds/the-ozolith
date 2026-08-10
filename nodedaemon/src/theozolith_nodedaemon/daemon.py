@@ -823,11 +823,17 @@ class NodeDaemon:
     def _verify_applied_drivers(self) -> str:
         """Recompute-and-verify the applied distribution (ADR-0042). Returns the
         applied hash only when the ``current`` pointer is a 64-hex value whose
-        tree exists under ``config-dist/<hash>/`` and recomputes to it; a
-        missing pointer, a malformed value, a missing tree, or a mismatch all
-        read as '' (non-converged), so ``_converge_drivers`` refetches and
-        repairs it — while the old verified tree keeps being used until a
-        replacement is fully verified and swapped in."""
+        tree exists under ``config-dist/<hash>/``, holds ONLY the unpacked
+        artifact shape (``_applied_tree_shape_error``), and recomputes to the
+        pointer; a missing pointer, a malformed value, a missing tree, a rogue
+        or irregular applied-tree entry, an unenumerable subtree, or a
+        recompute mismatch all read as '' (non-converged), so
+        ``_converge_drivers`` refetches and repairs it — while the old verified
+        tree keeps being used until a replacement is fully verified and swapped
+        in. Verification is FAIL CLOSED: ``manifest_hash_of_tree`` raises on
+        symlinks, FIFO/socket/device entries, and enumeration failures rather
+        than silently omitting them, so no unhashed executable entry can
+        coexist with a converged report."""
         try:
             pointer = self._config.config_dist_current.read_text(encoding="utf-8").strip()
         except OSError:
@@ -841,11 +847,17 @@ class NodeDaemon:
         if not tree.is_dir():
             self._log(f"config distribution {pointer[:12]} has no applied tree; not converged")
             return ""
+        shape_error = self._applied_tree_shape_error(tree)
+        if shape_error is not None:
+            self._log(f"config distribution {pointer[:12]} {shape_error}; not converged")
+            return ""
         try:
             recomputed = configdist.manifest_hash_of_tree(tree)
-        except (OSError, configdist.ConfigDistError):
-            # An unreadable or malformed applied tree reads as non-converged, so
-            # the next pass refetches and repairs it (ADR-0042).
+        except (OSError, configdist.ConfigDistError) as exc:
+            # An unreadable, irregular, or malformed applied tree reads as
+            # non-converged, so the next pass refetches and repairs it
+            # (ADR-0042) — logged so the repair trigger is observable.
+            self._log(f"config distribution {pointer[:12]} failed verification: {exc}")
             return ""
         if recomputed != pointer:
             self._log(
@@ -854,6 +866,33 @@ class NodeDaemon:
             )
             return ""
         return pointer
+
+    def _applied_tree_shape_error(self, tree: Path) -> str | None:
+        """The applied root ``config-dist/<hash>/`` may hold ONLY the unpacked
+        artifact shape: the ``drivers`` directory (real, not a symlink) and the
+        ``config-dist.json`` metadata file (regular, not a symlink) — either
+        may be absent, but nothing else non-excluded may be present. The
+        drivers manifest covers only ``drivers/``, so a rogue sibling at the
+        applied root would otherwise be unhashed-but-present content riding a
+        converged report (ADR-0042: the applied state directory is potentially
+        malformed after a restore or local corruption). Returns a reason, or
+        ``None`` when the shape is valid."""
+        if tree.is_symlink():
+            return "applied tree is a symlink"
+        try:
+            with os.scandir(tree) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            return f"applied tree cannot be enumerated ({exc})"
+        for entry in entries:
+            if configdist.excluded_part(entry.name):
+                continue
+            if entry.name == configdist.DRIVERS_DIR and entry.is_dir(follow_symlinks=False):
+                continue
+            if entry.name == configdist.ARTIFACT_METADATA and entry.is_file(follow_symlinks=False):
+                continue
+            return f"applied tree holds an unexpected or irregular entry {entry.name!r}"
+        return None
 
     def _current_built_against(self) -> str:
         """The product version the applied distribution was built against, from
@@ -925,43 +964,69 @@ class NodeDaemon:
                 shutil.rmtree(child, ignore_errors=True)
 
     def _apply_config_dist(self, desired: str, previous: str) -> None:
-        """Fetch, verify by recompute, atomically swap, then stop affected
-        driver Stacks (ADR-0042). Fetch a 409 → ControlError (retry next pass).
-        Unpack into a dot-prefixed temp sibling, validate every member name,
-        verify the recomputed manifest hash equals ``desired`` — on mismatch
-        NOTHING is swapped and the old hash keeps being reported — then
-        ``os.replace`` the tree in and swap the ``current`` pointer."""
+        """Fetch → verify in staging → stop affected drivers → exchange →
+        publish the pointer (ADR-0042). Fetch a 409 → ControlError (retry next
+        pass). The replacement is unpacked into a dot-prefixed STAGING sibling
+        (every member name validated) and verified by recompute there, with the
+        currently applied tree fully intact — on any fetch/verify failure
+        NOTHING has been stopped or touched and the old tree keeps being used
+        and reported. Only after verification are the affected driver Stacks
+        stopped (never beneath a live child — a same-hash repair replaces the
+        very tree the child runs from), the tree exchanged, and the ``current``
+        pointer published. Each transition is crash-recoverable: a failure at
+        any step leaves a pointer/tree state that reads as non-converged
+        (evidence-based) and is retried honestly next pass."""
         data = self._client.fetch_config_artifact(desired)
         root = self._config.config_dist_dir
         root.mkdir(parents=True, exist_ok=True)
-        tmp = root / f".{desired}.tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
+        staging = root / f".{desired}.tmp"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
         try:
-            configdist.extract_zip(data, tmp)
-            recomputed = configdist.manifest_hash_of_tree(tmp)
+            configdist.extract_zip(data, staging)
+            recomputed = configdist.manifest_hash_of_tree(staging)
             if recomputed != desired:
                 raise configdist.ConfigDistError(
                     f"config distribution hash mismatch: unpacked tree recomputes to"
                     f" {recomputed[:12] or '(empty)'}, expected {desired[:12]}"
                 )
-            final = root / desired
-            if final.exists():
-                shutil.rmtree(final, ignore_errors=True)
-            os.replace(tmp, final)
+            # The replacement is fully verified — only now touch the running
+            # world. Stop the affected driver Stacks BEFORE the active path is
+            # removed or exchanged, so no interval exists where that path is
+            # absent beneath a running process; this pass's _reconcile restarts
+            # them on the published tree. Queue-behind was already honored by
+            # _converge_drivers, so no active Run is killed here.
+            self._stop_drivers_stacks()
+            self._exchange_config_dist_tree(staging, root / desired)
         finally:
-            if tmp.exists():
-                shutil.rmtree(tmp, ignore_errors=True)
-        # Verified and swapped: stop affected driver Stacks so this pass's
-        # _reconcile restarts them on the new tree, then publish the pointer.
-        self._stop_drivers_stacks()
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
         self._write_current_pointer(desired)
-        # Just verified above (recomputed == desired): record it so this pass's
-        # heartbeat reports the new hash without recomputing the tree again.
+        # Memoize ONLY once the applied tree and the pointer are BOTH valid: a
+        # failure anywhere above propagates first, so the heartbeat keeps
+        # reporting the evidence-based value instead of the desired hash.
         self._verified_drivers_hash = desired
         self._log(f"config distribution converged to {desired[:12]}")
         self._gc_config_dist(keep={desired, previous} - {""})
+
+    def _exchange_config_dist_tree(self, staging: Path, final: Path) -> None:
+        """Publish a verified staging tree at ``final``, crash-recoverably. A
+        directory cannot be renamed onto, so an existing ``final`` (a same-hash
+        repair of a mutated/unreadable tree) is first renamed aside to a
+        dot-prefixed sibling, the staging tree renamed in, then the retired
+        tree reclaimed. Affected driver Stacks are already stopped by the
+        caller, so no live process sits beneath the exchange. A crash between
+        the renames leaves the pointer aimed at a missing tree — which reads as
+        non-converged next pass and is refetched — and the dot-prefixed
+        leftovers are swept by ``_gc_config_dist``."""
+        retired = final.parent / f".{final.name}.retired"
+        if retired.exists():
+            shutil.rmtree(retired, ignore_errors=True)  # a crashed earlier exchange
+        if final.exists():
+            os.replace(final, retired)
+        os.replace(staging, final)
+        shutil.rmtree(retired, ignore_errors=True)
 
     def _retire_config_dist(self, previous: str) -> None:
         """Empty-desired: stop the config-distribution driver Stacks, clear the

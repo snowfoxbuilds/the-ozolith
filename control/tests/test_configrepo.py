@@ -710,7 +710,41 @@ def test_unreadable_drivers_file_surfaces_as_config_repo_error(tmp_path):
 def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
     from theozolith_control import configrepo
 
-    for bad in ("drivers/x.py", "drivers/custom/impl.py", "drivers"):
+    for bad in (
+        "drivers/x.py",
+        "drivers/custom/impl.py",
+        "drivers",
+        "drivers/",  # trailing slash: an empty component, refused as malformed
+    ):
+        with pytest.raises(configrepo.ConfigRepoError):
+            configrepo.refuse_ui_write(bad)
+
+
+def test_refuse_ui_write_rejects_aliased_drivers_spellings(tmp_path):
+    """No repository-relative spelling may resolve under drivers/ while passing
+    the guard (ADR-0042 amendment): dot/dot-dot aliases, backslash variants,
+    and absolute paths are all refused outright — parsed as path components,
+    never matched by string prefix against a partially normalized value."""
+    from theozolith_control import configrepo
+
+    for bad in (
+        "./drivers/x.py",
+        "stacks/../drivers/x.py",
+        "drivers/../drivers/x.py",
+        "drivers\\x.py",
+        ".\\drivers\\x.py",
+        "stacks\\..\\drivers\\x.py",
+        "/drivers/x.py",
+        "\\drivers\\x.py",
+        "//drivers/x.py",
+        "C:\\drivers\\x.py",
+        "C:/drivers/x.py",
+        "/etc/passwd",  # any absolute path is malformed for a repo write
+        "stacks//x.toml",  # an empty component is malformed
+        "stacks/./x.toml",  # a '.' component is refused, never resolved
+        "stacks/../stacks/x.toml",  # '..' is refused even when it stays outside drivers/
+        "",
+    ):
         with pytest.raises(configrepo.ConfigRepoError):
             configrepo.refuse_ui_write(bad)
 
@@ -718,7 +752,12 @@ def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
 def test_refuse_ui_write_allows_other_paths(tmp_path):
     from theozolith_control import configrepo
 
-    # No raise for the allow-listed fixed-filename writers' targets.
+    # No raise for the allow-listed fixed-filename writers' targets, nor for
+    # ordinary repo-relative paths a future editor would legitimately write.
     configrepo.refuse_ui_write("control.toml")
     configrepo.refuse_ui_write("product.toml")
     configrepo.refuse_ui_write("stacks/x.toml")
+    configrepo.refuse_ui_write("worker-types/x.toml")
+    configrepo.refuse_ui_write("stacks/drivers.toml")  # 'drivers' as a filename is fine
+    configrepo.refuse_ui_write("drivers.toml")  # a top-level file merely NAMED drivers*
+    configrepo.refuse_ui_write("compose/app/overlay.yaml")

@@ -90,16 +90,37 @@ class ConfigRepoError(RuntimeError):
 def refuse_ui_write(relpath: str) -> None:
     """The git-native-only guard (ADR-0042). CONTRACT: any future config editor
     MUST call this on every repo-relative path it would write, BEFORE writing —
-    a path under ``drivers/`` raises ``ConfigRepoError``. The web UI and any
-    config editor never touch ``drivers/``; that code is edited in git only,
-    because a Config Repo write there is code execution on every node. There is
-    no general repo editor today (only fixed-filename allow-list writers for
-    control.toml and product.toml), so this is the standing constraint the next
-    one inherits."""
-    normalized = relpath.replace("\\", "/").lstrip("/")
+    a path that is, or resolves under, ``drivers/`` raises ``ConfigRepoError``.
+    The web UI and any config editor never touch ``drivers/``; that code is
+    edited in git only, because a Config Repo write there is code execution on
+    every node. There is no general repo editor today (only fixed-filename
+    allow-list writers for control.toml and product.toml), so this is the
+    standing constraint the next one inherits.
+
+    The input is parsed as a repository-relative POSIX path — separators
+    normalized, then split into components — never compared by string prefix
+    against a partially normalized value. Anything that is not a plain
+    relative path is refused outright rather than resolved permissively: an
+    absolute or drive-letter path, or any empty/``.``/``..`` component. That
+    closes every aliased spelling (``./drivers/x``, ``stacks/../drivers/x``,
+    ``drivers/../drivers/x``, backslash variants) without needing filesystem
+    resolution — a config editor has no business writing through such
+    spellings anyway."""
+    normalized = relpath.replace("\\", "/")
+    parts = normalized.split("/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or (len(normalized) >= 2 and normalized[1] == ":")
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        raise ConfigRepoError(
+            f"{relpath!r} is not a plain repo-relative path — a config editor"
+            " writes canonical repo-relative POSIX paths only (no absolute or"
+            " drive-letter paths, no empty, '.' or '..' components; ADR-0042)"
+        )
     for prefix in GIT_NATIVE_ONLY:
-        bare = prefix.rstrip("/")
-        if normalized == bare or normalized.startswith(prefix):
+        if parts[0] == prefix.rstrip("/"):
             raise ConfigRepoError(
                 f"{relpath!r} is under a git-native-only path ({prefix}) — driver"
                 " code is never editable through the web UI or a config editor;"

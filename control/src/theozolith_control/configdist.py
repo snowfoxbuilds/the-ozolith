@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -315,23 +316,38 @@ def artifact_structure_error(names: list[str]) -> str | None:
 
 
 def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
-    """Unpack a built ``<hash>.zip`` into a throwaway temp dir, recompute the
+    """``verify_artifact_bytes`` over the file's contents: read the archive
+    into an immutable byte snapshot, then verify that. An unreadable file is
+    ``ConfigDistError`` like every other unpublishable shape."""
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ConfigDistError(f"config distribution is not readable: {exc}") from exc
+    return verify_artifact_bytes(data)
+
+
+def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
+    """Unpack an artifact's bytes into a throwaway temp dir, recompute the
     drivers manifest over the unpacked tree, and validate the metadata member;
     return ``(recomputed_hash, metadata)``. This is the ONLY proof an artifact
-    is publishable or servable — never the filename, never the archive bytes.
+    is publishable or servable — never the filename, never trusted archive
+    bytes. Verifying a BYTE SNAPSHOT (not a pathname) also means a caller that
+    goes on to serve these bytes owns them through response completion — a
+    concurrent prune of the cache file can never invalidate what was verified
+    (ADR-0042).
 
     Raises ``ConfigDistError`` — and ONLY ConfigDistError — for every way an
-    artifact can be unpublishable: the file is not a valid zip; the member list
-    fails the structural rule (``artifact_structure_error``); a member's bytes
-    cannot be read (bad CRC, corrupt compression, encryption); extraction hits a
-    filesystem error; the metadata member is missing, unreadable, or malformed;
-    ``format`` is not the current artifact format; or the metadata's
+    artifact can be unpublishable: the bytes are not a valid zip; the member
+    list fails the structural rule (``artifact_structure_error``); a member's
+    bytes cannot be read (bad CRC, corrupt compression, encryption); extraction
+    hits a filesystem error; the metadata member is missing, unreadable, or
+    malformed; ``format`` is not the current artifact format; or the metadata's
     ``drivers_hash`` does not equal the tree's recomputed hash. Programming
     errors outside these failure modes are NOT caught. ``built_against`` is not
     checked — it is advisory (ADR-0042)."""
-    path = Path(path)
     try:
-        archive = zipfile.ZipFile(path)
+        archive = zipfile.ZipFile(io.BytesIO(data))
     except (OSError, zipfile.BadZipFile) as exc:
         raise ConfigDistError(f"config distribution is not a valid zip: {exc}") from exc
     with archive, tempfile.TemporaryDirectory(prefix=".verify-configdist-") as td:
