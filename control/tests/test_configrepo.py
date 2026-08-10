@@ -77,7 +77,7 @@ def test_driver_worker_type_and_thin_stack_resolve_end_to_end(tmp_path):
     stack = next(s for s in config.stacks if s.name == "implementer")
     assert stack.kind == "process"
     assert stack.worker_type == "claude-dev"  # kept for display
-    assert stack.command == "theozolith-worker"
+    assert stack.command == "theozolith-driver builtin:implementer"
     assert stack.env == {
         "THEOZOLITH_REPO": "acme/sandbox",
         "THEOZOLITH_ADAPTER": "claude",
@@ -303,12 +303,28 @@ def test_unknown_key_on_a_worker_type_stack_is_rejected(tmp_path):
         load_config(tmp_path)
 
 
+def test_builtin_driver_map_matches_the_launcher_registry():
+    """The one place control names driver commands (BUILTIN_DRIVERS) and the
+    one place the launcher resolves refs to classes (drivercli.BUILTIN_WORKERS)
+    must carry identical keys, or a worker type control resolves would name a
+    ref the launcher cannot run (ADR-0020). Test-time import of the worker
+    launcher only — control never imports it at runtime."""
+    from theozolith_control.configrepo import BUILTIN_DRIVERS
+    from theozolith_worker.drivercli import BUILTIN_WORKERS
+
+    assert set(BUILTIN_DRIVERS) == set(BUILTIN_WORKERS)
+    # Each command routes through the one launcher with its own ref as argv.
+    for ref, command in BUILTIN_DRIVERS.items():
+        assert command == f"theozolith-driver {ref}"
+
+
 def test_builtin_driver_as_plain_command_is_rejected(tmp_path):
-    """A plain process Stack may not invoke a built-in driver directly — the
-    driver only works with the env a worker type injects (ADR-0044)."""
-    for cmd in ("theozolith-worker", "theozolith-reviewer --once"):
+    """A plain process Stack may not invoke the driver launcher directly — any
+    ref, builtin:* or drivers/* — the driver only works with the env a worker
+    type injects (ADR-0044/ADR-0020)."""
+    for cmd in ("theozolith-driver builtin:implementer", "theozolith-driver drivers/x"):
         write(tmp_path, "stacks/w.toml", f'kind = "process"\nnode = "box1"\ncommand = "{cmd}"\n')
-        with pytest.raises(ConfigRepoError, match=r"is a built-in driver.*worker_type"):
+        with pytest.raises(ConfigRepoError, match=r"invokes the driver launcher.*worker_type"):
             load_config(tmp_path)
 
 
@@ -442,7 +458,7 @@ def test_wire_stack_roundtrips_into_the_daemon_model(tmp_path):
     assert "run_image" not in wire
     stack = WireStack.from_wire(wire)
     assert stack.name == "implementer" and stack.kind == "process"
-    assert stack.command == "theozolith-worker"
+    assert stack.command == "theozolith-driver builtin:implementer"
     assert stack.env["THEOZOLITH_REPO"] == "acme/sandbox"
     assert stack.env["THEOZOLITH_RUN_IMAGE"].startswith("theozolith/claude-dev:")
     assert stack.state == "running"
@@ -595,9 +611,9 @@ def test_default_jobs_dirs_are_per_stack_and_unique_across_resolved_workers(tmp_
 def test_quoted_builtin_command_is_rejected(tmp_path):
     """The hard-cutover guard parses argv with shlex (execution semantics), so
     a quoted built-in cannot slip past a naive whitespace split."""
-    for cmd in ("'\"theozolith-worker\"'", "'\"theozolith-reviewer\"'"):
+    for cmd in ("'\"theozolith-driver\" builtin:implementer'", "'\"theozolith-driver\"'"):
         write(tmp_path, "stacks/w.toml", f'kind = "process"\nnode = "box1"\ncommand = {cmd}\n')
-        with pytest.raises(ConfigRepoError, match=r"is a built-in driver.*worker_type"):
+        with pytest.raises(ConfigRepoError, match=r"invokes the driver launcher.*worker_type"):
             load_config(tmp_path)
 
 

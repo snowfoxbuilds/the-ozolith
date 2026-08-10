@@ -43,7 +43,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from theozolith_worker import decisions, events, evidence, gitops, jobdir, verdict
+from theozolith_worker import adapters, decisions, events, evidence, gitops, jobdir, verdict
 from theozolith_worker.bootstrap.vocabulary import (
     FAILED,
     IN_PROGRESS,
@@ -60,7 +60,6 @@ from theozolith_worker.containers import (
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
-from theozolith_worker.harness.adapters import AgentAdapterError, make_agent_adapter
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -248,11 +247,7 @@ def _read_output(job: Path, relpath: str) -> str:
 def _run_tokens(config: DriverConfig, job: Path) -> int | None:
     """Token usage from the structured output stream (ADR-0019); None when
     the adapter's stream carries no usage."""
-    try:
-        adapter = make_agent_adapter(config.adapter)
-    except AgentAdapterError:
-        return None
-    return adapter.stream_stats(job / jobdir.TRANSCRIPT_FILE).tokens
+    return adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE).tokens
 
 
 def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:

@@ -9,8 +9,7 @@ dependencies = []
 
 [project.scripts]
 theozolith-bootstrap = "theozolith_worker.bootstrap.cli:main"
-theozolith-worker = "theozolith_worker.worker:main"
-theozolith-reviewer = "theozolith_worker.reviewer:main"
+theozolith-driver = "theozolith_worker.drivercli:main"
 theozolith-harness = "theozolith_worker.harness.main:main"
 theozolith-validate-verdict = "theozolith_worker.harness.validate:main"
 

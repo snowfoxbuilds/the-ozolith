@@ -30,9 +30,11 @@ def test_dot_env_is_no_longer_a_user_facing_surface():
 
 
 def test_systemd_units_exist_for_both_drivers():
-    for role in ("worker", "reviewer"):
+    # One generic launcher per driver (ADR-0020): the unit names the built-in
+    # worker type by ref, never a per-type console script.
+    for role in ("implementer", "reviewer"):
         unit = (DEPLOY / "systemd" / f"theozolith-{role}.service").read_text()
-        assert f"theozolith-{role}" in unit
+        assert f"theozolith-driver builtin:{role}" in unit
         assert "EnvironmentFile=" in unit
         assert "Restart=on-failure" in unit
         assert "M3" in unit  # explicitly a convenience until daemon supervision
@@ -42,7 +44,7 @@ def test_run_image_contract():
     dockerfile = DOCKERFILE.read_text()
     # PID 1 is the harness; the actors never run in this image.
     assert 'ENTRYPOINT ["theozolith-harness"]' in dockerfile
-    assert "theozolith-worker" not in re.findall(r"ENTRYPOINT.*|CMD.*", dockerfile)
+    assert "theozolith-driver" not in re.findall(r"ENTRYPOINT.*|CMD.*", dockerfile)
     # Headless sessions (ADR-0019): no tmux anywhere in the run image — the
     # session is a one-shot process and the container is never an attach
     # target. The agent must not run as root.

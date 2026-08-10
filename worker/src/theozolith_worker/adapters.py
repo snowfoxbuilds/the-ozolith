@@ -1,12 +1,15 @@
 """Agent adapters: the vendor-specific slice of a run-container image (ADR-0044).
 
-An adapter is the per-worker-type variable the immutable harness invokes: it
-knows three things about its agent CLI — the headless one-shot argv to invoke
-(a constant-size pointer prompt at invocation — the task content stays in the
-mounted job directory; completion is process exit, ADR-0019 as amended), how
-to read counters and token usage out of the structured output stream, and
-which session outputs to copy into the job directory. One adapter ships per
-image; M2 ships Claude only.
+A product component **beside** the harness (NODE-SUBSTRATE Components), not
+under it: the harness imports adapters downward, and the drivers read
+counters through this module without reaching into ``harness/`` (ADR-0020
+layering). An adapter is the per-worker-type variable the immutable harness
+invokes: it knows three things about its agent CLI — the headless one-shot
+argv to invoke (a constant-size pointer prompt at invocation — the task
+content stays in the mounted job directory; completion is process exit,
+ADR-0019 as amended), how to read counters and token usage out of the
+structured output stream, and which session outputs to copy into the job
+directory. One adapter ships per image; M2 ships Claude only.
 """
 
 from __future__ import annotations
@@ -160,3 +163,14 @@ def make_agent_adapter(name: str) -> AgentAdapter:
     if name == "claude":
         return ClaudeAdapter()
     raise AgentAdapterError(f"unknown Agent adapter {name!r} (M2 ships: claude)")
+
+
+def stream_stats(adapter_name: str, transcript: Path) -> StreamStats:
+    """Counters for ``adapter_name`` over ``transcript``, empty on an unknown
+    adapter. The single stream-stats seam the drivers (progress telemetry,
+    token accounting) call — they never construct adapters themselves."""
+    try:
+        adapter = make_agent_adapter(adapter_name)
+    except AgentAdapterError:
+        return StreamStats()
+    return adapter.stream_stats(transcript)

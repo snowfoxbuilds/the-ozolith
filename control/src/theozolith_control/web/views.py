@@ -171,7 +171,7 @@ def _summarize(event: dict[str, Any]) -> str:
     if event["type"] == EVENT_RUN:
         return (
             f"issue #{payload.get('issue')} · {payload.get('phase')}"
-            f" · run {payload.get('run_id')} · {payload.get('worker')}@{payload.get('node')}"
+            f" · run {payload.get('run_id')} · {payload.get('driver')}@{payload.get('node')}"
         )
     if event["type"] == EVENT_REVIEW:
         return (

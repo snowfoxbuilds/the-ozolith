@@ -442,7 +442,7 @@ partition, including `store.db`, which only exists once a node or secret does).
 
    ```sh
    pip install ./knowledge ./worker
-   export THEOZOLITH_REPO=owner/name WORKER_GITHUB_TOKEN=... REVIEWER_GITHUB_TOKEN=... \
+   export THEOZOLITH_REPO=owner/name IMPLEMENTER_GITHUB_TOKEN=... REVIEWER_GITHUB_TOKEN=... \
           ANTHROPIC_API_KEY=... CONTROL_NODE_URL=... THEOZOLITH_NODE_TOKEN=... \
           THEOZOLITH_RUN_IMAGE=theozolith-run-claude:local
    ```
@@ -454,12 +454,13 @@ partition, including `store.db`, which only exists once a node or secret does).
 4. Run the drivers (don't run them as root):
 
    ```sh
-   theozolith-worker --once       # single poll-claim-run pass; or no flag for the loop
-   theozolith-reviewer --once
+   theozolith-driver builtin:implementer --once   # single poll-claim-run pass; or no flag for the loop
+   theozolith-driver builtin:reviewer --once
    ```
 
-   With `CONTROL_NODE_URL` unset, the claim pre-filter and event emission are skipped
-   cleanly. The M2 driver units (`theozolith-worker.service`,
+   Every built-in worker type runs through the one generic launcher (`theozolith-driver
+   <ref>`, ADR-0020). With `CONTROL_NODE_URL` unset, the claim pre-filter and event
+   emission are skipped cleanly. The M2 driver units (`theozolith-implementer.service`,
    `theozolith-reviewer.service` in `deploy/systemd/`) remain as conveniences — unlike
    `theozolith-control.service` there, which is the ADR-0034 production unit; from M3 on
    the deployment contract is the Node Daemon supervising the drivers as process Stacks.

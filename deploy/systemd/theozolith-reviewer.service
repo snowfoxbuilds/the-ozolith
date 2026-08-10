@@ -16,7 +16,7 @@ Wants=network-online.target
 Type=simple
 User=ozolith
 EnvironmentFile=/etc/theozolith/.env
-ExecStart=/usr/local/bin/theozolith-reviewer
+ExecStart=/usr/local/bin/theozolith-driver builtin:reviewer
 Restart=on-failure
 RestartSec=30
 

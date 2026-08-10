@@ -102,7 +102,7 @@ class DispatchClient:
         return answer if isinstance(answer, dict) else None
 
     def request_work(self, worker: str, node: str, login: str) -> dict[str, Any] | None:
-        answer = self._post({"role": "worker", "worker": worker, "node": node, "login": login})
+        answer = self._post({"role": "implementer", "driver": worker, "node": node, "login": login})
         if answer is None:
             return None
         issue = answer.get("issue")
@@ -120,7 +120,7 @@ class DispatchClient:
         return issue
 
     def review_targets(self, worker: str, node: str, login: str) -> list[int] | None:
-        answer = self._post({"role": "reviewer", "worker": worker, "node": node, "login": login})
+        answer = self._post({"role": "reviewer", "driver": worker, "node": node, "login": login})
         if answer is None:
             return None
         prs = answer.get("prs")

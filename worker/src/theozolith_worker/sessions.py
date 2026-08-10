@@ -58,6 +58,13 @@ class RunSession(Protocol):
 SessionFactory = Callable[[ContainerSpec, Path, Manifest], RunSession]
 
 
+def container_session_factory(engine: Engine) -> SessionFactory:
+    """The production session factory: one live run container per job dir.
+    Lives here (not in a worker type) so no driver imports another — the
+    Reviewer and Implementer share this seam (ADR-0020)."""
+    return lambda spec, job, manifest: ContainerSession(engine, spec, job, manifest)
+
+
 class ContainerSession:
     def __init__(
         self,

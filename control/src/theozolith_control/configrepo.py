@@ -47,13 +47,20 @@ STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
 
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
-# supervised argv each resolves to control-side. The ADR-0020 sub-issue
-# repoints these to `theozolith-driver builtin:<name>`; the custom-driver
-# sub-issue (ADR-0042) turns `drivers/<name>` refs into real resolution.
+# supervised command each resolves to control-side. Every builtin runs through
+# the one generic launcher (`theozolith-driver <ref>`, ADR-0020), so control is
+# the single place that names the command; the custom-driver sub-issue
+# (ADR-0042) turns `drivers/<name>` refs into real resolution. The keys must
+# match theozolith_worker.drivercli.BUILTIN_WORKERS (pinned by contract test).
 BUILTIN_DRIVERS = {
-    "builtin:implementer": "theozolith-worker",
-    "builtin:reviewer": "theozolith-reviewer",
+    "builtin:implementer": "theozolith-driver builtin:implementer",
+    "builtin:reviewer": "theozolith-driver builtin:reviewer",
 }
+
+# The launcher command every built-in driver resolves through; a plain process
+# Stack invoking it directly is rejected (the runner only works with the env a
+# worker type injects — see _parse_stack's guard).
+DRIVER_LAUNCHER = "theozolith-driver"
 
 # Where a node keeps per-Stack jobs directories unless a Stack's env says
 # otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
@@ -443,9 +450,10 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
     if stack.kind == "process" and not stack.command:
         raise ConfigRepoError(f"{context}: process Stacks require 'command'")
     # Parse the command with the SAME argv semantics the supervisor executes
-    # with (shlex.split, not str.split), so a quoted built-in — command =
-    # '"theozolith-worker"' — is recognized here and rejected, instead of
-    # sailing past a naive whitespace split and launching at run time.
+    # with (shlex.split, not str.split), so a quoted launcher — command =
+    # '"theozolith-driver" builtin:implementer' — is recognized here and
+    # rejected, instead of sailing past a naive whitespace split and launching
+    # at run time.
     # Malformed shell quoting becomes a clear ConfigRepoError, never an
     # uncaught exception or a command that validates now and fails at launch.
     if stack.command:
@@ -459,14 +467,17 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
         argv = []
     # The built-in drivers only work with the environment a worker type
     # injects (THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE): a plain Stack that
-    # invokes one directly is the old fat-Stack form and is rejected (ADR-0044).
+    # invokes the generic launcher directly — any ref, builtin:* or drivers/* —
+    # is the old fat-Stack form and is rejected (ADR-0044/ADR-0020). Matching
+    # the launcher (not the two-token resolved commands) keeps the guard firing
+    # now that BUILTIN_DRIVERS values start with `theozolith-driver`.
     argv0 = argv[0] if argv else ""
-    if stack.kind == "process" and argv0 in BUILTIN_DRIVERS.values():
+    if stack.kind == "process" and argv0 == DRIVER_LAUNCHER:
         raise ConfigRepoError(
-            f"{context}: command {argv0!r} is a built-in driver — declare a"
-            " worker type (worker-types/<name>.toml) and set worker_type on the"
-            " Stack instead (ADR-0044); the driver only runs with the env a"
-            " worker type injects"
+            f"{context}: command {stack.command!r} invokes the driver launcher"
+            " directly — declare a worker type (worker-types/<name>.toml) and set"
+            " worker_type on the Stack instead (ADR-0044); the driver only runs"
+            " with the env a worker type injects"
         )
     if stack.kind == "container" and bool(stack.image) == bool(stack.compose):
         raise ConfigRepoError(f"{context}: container Stacks declare exactly one of image/compose")

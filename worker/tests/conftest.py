@@ -24,10 +24,10 @@ from theozolith_worker.config import DriverConfig, load_config
 from theozolith_worker.containers import ContainerSpec
 from theozolith_worker.evidence import EVIDENCE_BRANCH
 from theozolith_worker.githubapi import GitHubClient
+from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome, Manifest
-from theozolith_worker.reviewer import run_reviewer
+from theozolith_worker.reviewer import Reviewer
 from theozolith_worker.shell import run_shell
-from theozolith_worker.worker import run_worker
 
 WORKER_LOGIN = "ozolith-worker-a"
 REVIEWER_LOGIN = "ozolith-reviewer"
@@ -268,26 +268,24 @@ class Harness:
         return FakeSession(spec, job, manifest, self)
 
     def worker_once(self, client: GitHubClient | None = None, sink=None) -> int:
-        return run_worker(
+        return Implementer(
             self.worker_config,
-            client or self.worker_client,
-            self.session_factory,
-            self.dispatch,
-            once=True,
+            client=client or self.worker_client,
+            session_factory=self.session_factory,
+            dispatch=self.dispatch,
             log=self.logs.append,
             sink=sink or self.sink,
-        )
+        ).run(once=True)
 
     def reviewer_once(self, sink=None) -> int:
-        return run_reviewer(
+        return Reviewer(
             self.reviewer_config,
-            self.reviewer_client,
-            self.session_factory,
-            self.dispatch,
-            once=True,
+            client=self.reviewer_client,
+            session_factory=self.session_factory,
+            dispatch=self.dispatch,
             log=self.logs.append,
             sink=sink or self.sink,
-        )
+        ).run(once=True)
 
     # -- GitHub-side helpers --------------------------------------------------
 
@@ -383,8 +381,16 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         # credential); the GitHub PATs are not (ADR-0013).
         "ANTHROPIC_API_KEY": "model-key",
     }
-    worker_config = load_config({**base_env, "GITHUB_TOKEN": "tok-worker-a"}, role="worker")
-    reviewer_config = load_config({**base_env, "GITHUB_TOKEN": "tok-reviewer"}, role="reviewer")
+    worker_config = load_config(
+        {**base_env, "GITHUB_TOKEN": "tok-worker-a"},
+        role=Implementer.role,
+        default_model=Implementer.default_model,
+    )
+    reviewer_config = load_config(
+        {**base_env, "GITHUB_TOKEN": "tok-reviewer"},
+        role=Reviewer.role,
+        default_model=Reviewer.default_model,
+    )
 
     harness = Harness(
         fake=fake,

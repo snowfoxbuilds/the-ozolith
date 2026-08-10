@@ -24,9 +24,9 @@ from theozolith_control.store import Store
 from theozolith_worker.dispatch import DispatchClient
 from theozolith_worker.events import ControlNodeSink
 from theozolith_worker.githubapi import GitHubClient
+from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome
-from theozolith_worker.reviewer import run_reviewer
-from theozolith_worker.worker import run_worker
+from theozolith_worker.reviewer import Reviewer
 
 CONTROL_LOGIN = "ozolith-control"
 NODE_NAME = "box1"  # matches THEOZOLITH_NODE_NAME in the harness env
@@ -117,15 +117,14 @@ class DiesAfterClaim:
 
 
 def worker_once(harness: Harness, *, sink, dispatch) -> int:
-    return run_worker(
+    return Implementer(
         harness.worker_config,
-        harness.worker_client,
-        harness.session_factory,
-        dispatch,
-        once=True,
+        client=harness.worker_client,
+        session_factory=harness.session_factory,
+        dispatch=dispatch,
         log=harness.logs.append,
         sink=sink,
-    )
+    ).run(once=True)
 
 
 # -- write-through dispatch against a live Control Node -------------------------
@@ -233,21 +232,20 @@ def test_full_review_cycle_emits_run_and_review_events(harness: Harness, tmp_pat
                 "cherry_pick": [],
             }
         )
-        run_reviewer(
+        Reviewer(
             harness.reviewer_config,
-            harness.reviewer_client,
-            harness.session_factory,
-            live.dispatch(),
-            once=True,
+            client=harness.reviewer_client,
+            session_factory=harness.session_factory,
+            dispatch=live.dispatch(),
             log=harness.logs.append,
             sink=live.sink(),
-        )
+        ).run(once=True)
 
         assert live.run_phases(issue) == ["claimed", "gate", "pr-open"]
         reviews = live.store.events(type="theozolith.review", issue=issue)
         assert [(r["round"], r["verdict"]) for r in reviews] == [(1, "approve")]
         run_events = live.store.events(type="theozolith.run", issue=issue)
-        assert {e["worker"] for e in run_events} == {"worker-a"}
+        assert {e["driver"] for e in run_events} == {"worker-a"}
         assert all(e["node"] for e in run_events)  # the janitor keys on this
         # Progress telemetry rode the same channel (ADR-0016).
         progress = live.store.events(type="theozolith.run.progress", issue=issue)
@@ -325,15 +323,14 @@ def test_driver_polling_backs_off_while_control_is_unreachable(harness: Harness)
 
     config = dataclasses.replace(harness.worker_config, poll_seconds=60.0)
     with contextlib.suppress(_Stop):
-        run_worker(
+        Implementer(
             config,
-            harness.worker_client,
-            harness.session_factory,
-            dispatch,
-            sleep=sleeper,
+            client=harness.worker_client,
+            session_factory=harness.session_factory,
+            dispatch=dispatch,
             log=harness.logs.append,
             sink=RecordingSink(),
-        )
+        ).run(sleep=sleeper)
     assert delays == [60, 120, 240, 300, 60, 60]
 
 

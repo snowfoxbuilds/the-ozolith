@@ -210,7 +210,7 @@ def command_rows(state: dict[str, Any]) -> list[CommandRow]:
 @dataclass(frozen=True)
 class RunRow:
     issue: int
-    worker: str
+    driver: str  # the worker_id that emitted the Run event (ADR-0020 field)
     node: str
     stack: str
     run_id: str
@@ -420,7 +420,7 @@ def run_rows(index: RunIndex, repo: str | None) -> list[RunRow]:
         rows.append(
             RunRow(
                 issue=int(issue),
-                worker=str(payload.get("worker") or ""),
+                driver=str(payload.get("driver") or ""),
                 node=str(payload.get("node") or ""),
                 stack=str(payload.get("stack") or progress.get("stack") or ""),
                 run_id=run_id,

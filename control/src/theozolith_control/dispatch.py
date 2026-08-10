@@ -82,7 +82,7 @@ class Dispatcher:
         (with an optional ``reason``) otherwise.
         """
         with self._lock:
-            self._store.upsert_driver(worker, node, login, "worker")
+            self._store.upsert_driver(worker, node, login, "implementer")
             quarantine = self._store.node_quarantine(node)
             if quarantine is not None:
                 return {"issue": None, "reason": f"node {node!r} quarantined: {quarantine}"}

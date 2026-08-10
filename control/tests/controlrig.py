@@ -124,10 +124,10 @@ class ControlRig:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
-    def dispatch(self, role: str = "worker", worker: str = "worker-a", node: str = "box1"):
+    def dispatch(self, role: str = "implementer", worker: str = "worker-a", node: str = "box1"):
         return self.node_post(
             "/api/v1/dispatch",
-            {"role": role, "worker": worker, "node": node, "login": f"ozolith-{worker}"},
+            {"role": role, "driver": worker, "node": node, "login": f"ozolith-{worker}"},
             node=node,
         )
 
@@ -287,9 +287,9 @@ def run_event(
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": "theozolith.run",
-        "worker": worker,
+        "driver": worker,
         "node": node,
-        "stack": "worker",
+        "stack": "implementer",
         "issue": issue,
         "run_id": run_id,
         "phase": phase,

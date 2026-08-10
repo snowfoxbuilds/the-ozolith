@@ -350,7 +350,7 @@ class TopApp(App):
         )
         runs = self.query_one("#runs-table", DataTable)
         runs.cursor_type = "row"
-        runs.add_columns("issue", "phase", "attempt", "worker · node", "run", "PR", "last event")
+        runs.add_columns("issue", "phase", "attempt", "driver · node", "run", "PR", "last event")
         self.query_one("#events-table", DataTable).add_columns(
             "when", "type", "node", "component", "payload"
         )
@@ -520,7 +520,7 @@ class TopApp(App):
                 f"#{run.issue}",
                 run.phase,
                 str(run.attempt or "-"),
-                f"{run.worker} · {run.node}",
+                f"{run.driver} · {run.node}",
                 run.run_id,
                 f"#{run.pr}" if run.pr else "-",
                 model.ago(now - run.last_event_at),
@@ -602,7 +602,7 @@ class TopApp(App):
         budget = model.timeout_budget_seconds(self.state_doc, run.stack)
         lines = Text()
         lines.append(
-            f"run {run.run_id or '?'} · issue #{run.issue} · {run.worker} · {run.node}"
+            f"run {run.run_id or '?'} · issue #{run.issue} · {run.driver} · {run.node}"
             f" · stack {run.stack or '?'}\n"
         )
         lines.append(

@@ -40,7 +40,7 @@ def _first(environ: Mapping[str, str], *names: str, default: str | None = None) 
     """The first of ``names`` present in the environment (VAR_FILE honored).
 
     Lookup chains let one shared environment configure both drivers: role-prefixed
-    variables (WORKER_GITHUB_TOKEN, REVIEWER_MODEL, …) win over the generic
+    variables (IMPLEMENTER_GITHUB_TOKEN, REVIEWER_MODEL, …) win over the generic
     THEOZOLITH_* names.
     """
     for name in names:
@@ -81,9 +81,9 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
 
 @dataclass(frozen=True)
 class DriverConfig:
-    """Shared configuration for the Worker and Reviewer drivers."""
+    """Shared configuration for every worker type (ADR-0020)."""
 
-    role: str  # "worker" | "reviewer"
+    role: str  # the worker type / env prefix ("implementer" | "reviewer")
     repo: str  # target repo as owner/name
     token: str  # this driver's machine-user PAT (never enters containers)
     api_url: str
@@ -109,17 +109,23 @@ class DriverConfig:
 DEFAULT_CACHE_VOLUMES = "theozolith-cache:/home/ozolith/.cache"
 
 
-def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> DriverConfig:
-    """Build the driver config for ``role`` ("worker" or "reviewer")."""
+def load_config(
+    environ: Mapping[str, str] | None = None, *, role: str, default_model: str
+) -> DriverConfig:
+    """Build the driver config for worker type ``role`` (its env prefix).
+
+    ``default_model`` is the type's shipped model, used when neither
+    ``<ROLE>_MODEL`` nor ``THEOZOLITH_MODEL`` is set; each worker type passes
+    its ``default_model`` class attribute (ADR-0020).
+    """
     environ = os.environ if environ is None else environ
-    prefix = role.upper()  # WORKER_* / REVIEWER_* win over the generic names
+    prefix = role.upper()  # IMPLEMENTER_* / REVIEWER_* win over the generic names
     repo = _required(environ, "THEOZOLITH_REPO")
     if "/" not in repo:
         raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
     token = _required(environ, f"{prefix}_GITHUB_TOKEN", "GITHUB_TOKEN")
     api_url = env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or ""
 
-    default_model = "claude-sonnet-5" if role == "worker" else "claude-fable-5"
     model = _first(environ, f"{prefix}_MODEL", "THEOZOLITH_MODEL", default=default_model) or ""
 
     clone_url = env_value(environ, "THEOZOLITH_CLONE_URL") or f"https://github.com/{repo}.git"
@@ -129,9 +135,6 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
     if api_key:
         agent_env["ANTHROPIC_API_KEY"] = api_key
 
-    worker_id = (
-        _first(environ, "THEOZOLITH_WORKER_ID", "WORKER_ID", default=os.uname().nodename) or role
-    )
     # ADR-0017: claims dispatch through the Control Node — there is no
     # second claim path, so a driver without one cannot run. The daemon-less
     # dev shape is `theozolith serve` on the same box.
@@ -142,6 +145,14 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
             " for local dev run 'theozolith serve' and point at it"
         )
     stack = _first(environ, f"{prefix}_STACK", "THEOZOLITH_STACK", default=role) or role
+    # worker_id keys the driver registry and per-Run job dirs; the default is
+    # computed AFTER stack so it can disambiguate multiple workers on one node
+    # (the same-node id collision #21 left open). worker_id is base-abstraction
+    # vocabulary (ADR-0020) — the name stays across the identifier sweep.
+    node_default = f"{stack}-{os.uname().nodename}"
+    worker_id = (
+        _first(environ, "THEOZOLITH_WORKER_ID", "WORKER_ID", default=node_default) or node_default
+    )
     # Per-Stack default matching the Node Daemon's injection and control's
     # uniqueness check (ADR-0019): each driver owns a distinct jobs dir so
     # queue-behind never observes another Stack's Runs. Under the daemon
