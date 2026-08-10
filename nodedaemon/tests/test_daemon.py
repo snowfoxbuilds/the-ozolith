@@ -2389,3 +2389,252 @@ def test_failed_compose_recovery_is_surfaced_and_retried_without_blocking_others
     )
     rig.daemon.once()
     assert _active_forms(rig, "svc") == {"compose"}
+
+
+# -- crash-consistent compose startup: write-ahead recovery record (ADR-0044) ------
+#
+# compose up is not atomic with recording it: Docker can create the project and
+# the daemon can die before it writes anything. A recovery record is therefore
+# written AHEAD of compose up (state "pending") and only confirmed ("applied")
+# after a successful up. A crash anywhere across that window must still leave a
+# durable record able to inspect, retry, or tear the project down — and no such
+# scenario may leave two runtime forms active or leak a secret value.
+
+
+def _bring_up_compose_crash_before_confirm(rig: Rig, name: str = "svc", files=None, **overrides):
+    """Bring a compose Stack up but simulate a crash after Docker Compose creates
+    the project and BEFORE the applied-state confirmation lands: the write-ahead
+    persist (the first call) succeeds, so a durable PENDING record reaches disk;
+    the post-up confirmation persist (the second call) fails, exactly as a crash
+    at that instant would leave things. Returns the retained file paths."""
+    real_persist = rig.daemon._persist_applied_compose
+    calls = {"n": 0}
+
+    def flaky_persist() -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the post-up confirmation
+            raise OSError("simulated crash before applied-state confirmation")
+        real_persist()
+
+    rig.daemon._persist_applied_compose = flaky_persist  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack(name, files=files, **overrides)])
+    )
+    rig.daemon.once()
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    return list(rig.docker.compose_projects[f"ozolith-{name}"])
+
+
+def test_crash_after_up_before_confirm_leaves_a_durable_recovery_record(rig: Rig):
+    up_files = _bring_up_compose_crash_before_confirm(rig)
+
+    # On disk despite the confirmation never landing: name, fingerprint, non-empty
+    # retained paths, pending state.
+    on_disk = json.loads(rig.config.applied_compose_path.read_text())["svc"]
+    assert on_disk["state"] == "pending"
+    assert on_disk["files"] == up_files and up_files  # non-empty materialized paths
+    assert on_disk["fingerprint"]
+
+    # A fresh daemon (all in-memory state gone) recovers it, and it is sufficient
+    # to inspect the deterministic compose project — compose_ps is the authority.
+    _restart_daemon(rig)
+    recovered = rig.daemon._applied_compose["svc"]
+    assert recovered.files == up_files and recovered.fingerprint and recovered.state == "pending"
+    assert rig.daemon._compose_running("svc")
+
+
+def test_confirmation_failure_does_not_lose_recovery_metadata(rig: Rig):
+    up_files = _bring_up_compose_crash_before_confirm(rig)
+
+    # Only the confirmation failed, and it was isolated: the pass did not fail and
+    # the healthy project is untouched.
+    assert "ozolith-svc" in rig.docker.compose_projects
+    assert not any("reconcile failed" in line for line in rig.logs)
+    assert any("confirm applied compose" in line for line in rig.logs)
+
+    # The durable write-ahead record survives on disk with its files intact.
+    on_disk = json.loads(rig.config.applied_compose_path.read_text())["svc"]
+    assert on_disk["state"] == "pending"
+    assert on_disk["files"] == up_files and up_files
+
+
+def test_pending_record_transitions_to_single_image_downing_before_run(rig: Rig):
+    up_files = _bring_up_compose_crash_before_confirm(rig)
+
+    events, _ = _order_probe(rig)
+    _restart_daemon(rig)  # fresh daemon: the pending record reloads from disk
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:down", "docker-run"]  # down BEFORE run — never two forms
+    assert _active_forms(rig, "svc") == {"single-image"}
+    assert "svc" not in rig.daemon._applied_compose
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] == up_files  # retained paths, not an empty file list
+
+
+def test_pending_record_transitions_to_process_downing_before_spawn(rig: Rig):
+    _bring_up_compose_crash_before_confirm(rig)
+
+    events, popen = _order_probe(rig)
+    _restart_daemon(rig, popen=popen)
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:down", "spawn"]  # compose retired before the child starts
+    assert _active_forms(rig, "svc") == {"process"}
+    assert "svc" not in rig.daemon._applied_compose
+
+
+def test_stopped_desire_after_crash_tears_the_pending_project_down(rig: Rig):
+    _bring_up_compose_crash_before_confirm(rig)
+
+    _restart_daemon(rig)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == set()  # torn down, nothing left
+    assert "svc" not in rig.daemon._applied_compose
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] != []  # real teardown context, never an empty file list
+
+
+def test_drained_desire_after_crash_tears_the_pending_project_down(rig: Rig):
+    _bring_up_compose_crash_before_confirm(rig)
+
+    _restart_daemon(rig)
+    drain = {"id": 41, "verb": "drain", "target": "svc", "force": False}
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc")], commands=[drain])
+    )
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == set()  # drained: the recovered project is down
+    assert "svc" not in rig.daemon._applied_compose
+    assert 41 in rig.daemon._completed
+
+
+def test_write_ahead_persist_failure_prevents_compose_up(rig: Rig):
+    real_persist = rig.daemon._persist_applied_compose
+
+    def boom() -> None:
+        raise OSError("state dir unwritable")
+
+    rig.daemon._persist_applied_compose = boom  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # No project was created and no record falsely claims one — the write-ahead
+    # failure rolled the in-memory record back and re-raised before compose up.
+    assert not any(verb == "up" for _, _, verb in rig.docker.compose_calls)
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert "svc" not in rig.daemon._applied_compose
+    assert not rig.config.applied_compose_path.exists()
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Persistence recovers: the next pass write-aheads and ups successfully.
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_failed_first_compose_up_retains_the_write_ahead_record_and_retries(rig: Rig):
+    rig.docker.fail_compose_up.add("ozolith-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # up failed, but the write-ahead record persisted for both retry and later
+    # teardown — it does not claim health (compose_ps is the authority).
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+    assert json.loads(rig.config.applied_compose_path.read_text())["svc"]["state"] == "pending"
+    assert not rig.daemon._compose_running("svc")
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Docker recovers: the same compose desire retries and comes up.
+    rig.docker.fail_compose_up.discard("ozolith-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_pending_record_without_a_project_is_retried_for_running_desire(rig: Rig):
+    _bring_up_compose_crash_before_confirm(rig)
+    _restart_daemon(rig)
+    del rig.docker.compose_projects["ozolith-svc"]  # a pending record, no live project
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_pending_record_without_a_project_is_cleared_for_stopped_and_removed_desire(rig: Rig):
+    _bring_up_compose_crash_before_confirm(rig)
+    _restart_daemon(rig)
+    del rig.docker.compose_projects["ozolith-svc"]  # a pending record, no live project
+
+    # Stopped desire: a safe (no-op) down clears the record.
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+    assert "svc" not in rig.daemon._applied_compose
+    assert _active_forms(rig, "svc") == set()
+
+    # And removal from desired state clears an equivalent pending record too.
+    _bring_up_compose_crash_before_confirm(rig, name="two")
+    _restart_daemon(rig)
+    del rig.docker.compose_projects["ozolith-two"]
+    rig.control.heartbeat_answers.append(heartbeat_response([]))  # "two" absent from desired
+    rig.daemon.once()
+    assert "two" not in rig.daemon._applied_compose
+
+
+def test_no_crash_boundary_transition_leaves_two_forms(rig: Rig):
+    """compose -> single-image -> process, each leg seeded from a crash-boundary
+    pending record across a restart, never has two forms coexisting."""
+    _bring_up_compose_crash_before_confirm(rig)
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    _restart_daemon(rig)  # recover the pending record; compose -> single-image
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"single-image"}
+
+    _restart_daemon(rig)  # single-image -> process (container form discovered by label)
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"process"}
+
+
+def test_pending_recovery_metadata_has_no_secret_values(rig: Rig):
+    rig.control.secrets["tok-a"] = "super-secret-value"
+    files = [{"name": "compose/base.yml", "content": "services: {x: {env_file: TOK_FILE}}\n"}]
+    _bring_up_compose_crash_before_confirm(rig, files=files, secrets={"TOK": "tok-a"})
+
+    # The pending write-ahead record — and nothing else under the state dir —
+    # carries the secret value; only tmpfs holds it.
+    text = rig.config.applied_compose_path.read_text()
+    assert json.loads(text)["svc"]["state"] == "pending"
+    assert "super-secret-value" not in text
+    for path in rig.config.state_dir.rglob("*"):
+        if path.is_file():
+            assert "super-secret-value" not in path.read_text(errors="replace"), path
+
+    # The record recovered on restart is likewise value-free.
+    _restart_daemon(rig)
+    recovered = rig.daemon._applied_compose["svc"]
+    assert recovered.state == "pending"
+    assert "super-secret-value" not in recovered.fingerprint
+    assert all("super-secret-value" not in f for f in recovered.files)

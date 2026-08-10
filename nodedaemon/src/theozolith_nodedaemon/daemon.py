@@ -102,35 +102,67 @@ def stack_jobs_dir(stack: WireStack) -> Path:
     return Path(explicit) if explicit else Path(DEFAULT_JOBS_BASE) / stack.name
 
 
+# AppliedCompose lifecycle states (ADR-0044 amendment: crash-consistent compose
+# startup). PENDING is the write-ahead record persisted BEFORE compose up — its
+# mere presence never claims the project is healthy (compose_ps is the liveness
+# authority), it only guarantees a durable teardown/retry context if the daemon
+# dies anywhere from the write-ahead through the post-up confirmation. APPLIED is
+# the optional confirmation stamped after a successful up. Both states carry
+# identical recovery power (name + fingerprint + files); the distinction is
+# informational, so a lost confirmation degrades to a still-usable PENDING record.
+COMPOSE_PENDING = "pending"
+COMPOSE_APPLIED = "applied"
+
+
 @dataclass
 class AppliedCompose:
-    """The non-secret applied record for a compose project this daemon brought
-    up: its effective fingerprint (change detection) and the materialized
-    compose/overlay file PATHS. Retaining the paths lets a later ``down`` run
-    with real teardown context — a valid ``docker compose --file … down`` —
-    rather than an empty file list (ADR-0044 amendment). Secret VALUES never
-    enter this record: it holds file paths, and the compose documents carry
-    secret references (the VAR_FILE convention), not values.
+    """The non-secret recovery record for a compose project this daemon is
+    bringing up or has brought up: its effective fingerprint (change detection),
+    the materialized compose/overlay file PATHS, and a lifecycle ``state``
+    (``pending`` write-ahead / ``applied`` confirmed). Retaining the paths lets a
+    later ``down`` run with real teardown context — a valid ``docker compose
+    --file … down`` — rather than an empty file list (ADR-0044 amendment). Secret
+    VALUES never enter this record: it holds file paths, and the compose documents
+    carry secret references (the VAR_FILE convention), not values.
 
     The record is persisted to disk (``applied_compose_path``) and reloaded on
     boot, so a compose project that outlived the daemon is still distinguishable
     and tearable down during a later same-name kind/form transition — the paths
     survive because they are references, and the fingerprint carries only compose
-    documents (secret references, not values), env, and the secret NAME mapping."""
+    documents (secret references, not values), env, and the secret NAME mapping.
+
+    The record is written AHEAD of compose up (state ``pending``) so a crash after
+    Docker creates the project but before confirmation still leaves durable
+    recovery metadata; a successful up promotes it to ``applied`` best-effort."""
 
     fingerprint: str
     files: list[str]
+    state: str = COMPOSE_APPLIED
 
     def to_dict(self) -> dict[str, Any]:
-        return {"fingerprint": self.fingerprint, "files": list(self.files)}
+        return {
+            "fingerprint": self.fingerprint,
+            "files": list(self.files),
+            "state": self.state,
+        }
 
     @classmethod
     def from_dict(cls, data: Any) -> AppliedCompose | None:
+        """Validate a persisted record before its file paths are trusted for a
+        teardown: it must be a dict with a NON-EMPTY list of non-empty file paths
+        (an empty file list could only yield an invalid, empty ``compose … down``,
+        which is exactly what retaining the paths exists to avoid). A missing
+        ``state`` reads as ``applied`` — the only records the pre-write-ahead code
+        wrote were post-up, so treating them as confirmed is crash-correct."""
         if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            return None
+        files = [str(f) for f in data["files"] if str(f)]
+        if not files:
             return None
         return cls(
             fingerprint=str(data.get("fingerprint", "")),
-            files=[str(f) for f in data["files"]],
+            files=files,
+            state=str(data.get("state", "") or COMPOSE_APPLIED),
         )
 
 
@@ -184,15 +216,17 @@ class NodeDaemon:
         self._desired: dict[str, Any] = _read_json(config.cache_path, {})
         self._drained: set[str] = set(_read_json(config.drained_path, []))
         self._completed: list[int] = _read_json(self._acks_path, [])
-        # Compose projects this daemon brought up, name -> applied record. The
-        # record retains the materialized compose/overlay paths so a later down
-        # (change, transition, stopped/drained, absent-from-desired) is a valid
-        # `docker compose --file … down`, never an empty file list (ADR-0044).
-        # Persisted to disk and reloaded here: a compose project can outlive the
-        # daemon, so the record must survive a restart for a later same-name
-        # kind/form transition to distinguish and tear it down (ADR-0044
-        # amendment). Only non-secret metadata is stored — fingerprint and file
-        # paths — never secret values.
+        # Compose projects this daemon is bringing up or has brought up, name ->
+        # recovery record. The record retains the materialized compose/overlay
+        # paths so a later down (change, transition, stopped/drained,
+        # absent-from-desired) is a valid `docker compose --file … down`, never an
+        # empty file list (ADR-0044). It is written AHEAD of compose up (state
+        # pending) and confirmed after (state applied), and is persisted to disk
+        # and reloaded here: a compose project can outlive — or crash-orphan
+        # itself past — the daemon, so the record must survive a restart for a
+        # later same-name kind/form transition to distinguish and tear it down
+        # (ADR-0044 amendment). Only non-secret metadata is stored — fingerprint,
+        # file paths, and lifecycle state — never secret values.
         self._applied_compose: dict[str, AppliedCompose] = self._load_applied_compose()
         # The jobs directory each live process child was LAUNCHED with (its
         # applied THEOZOLITH_JOBS_DIR). The minimum non-secret applied-spec
@@ -568,6 +602,27 @@ class NodeDaemon:
             self._config.applied_compose_path,
             {name: record.to_dict() for name, record in sorted(self._applied_compose.items())},
         )
+
+    def _write_ahead_compose(self, name: str, record: AppliedCompose) -> None:
+        """Adopt and atomically persist a compose recovery record BEFORE the
+        compose up it describes (ADR-0044 amendment). On a persist failure the
+        in-memory map is rolled back to its prior entry — so memory and disk never
+        diverge — and the error re-raises, which stops the caller from invoking
+        compose up: no project is created without a durable record able to tear it
+        down. The record's files must be non-empty (a compose Stack always
+        materializes at least one document)."""
+        if not record.files:
+            raise RuntimeError(f"stack {name}: refusing a compose recovery record with no files")
+        prior = self._applied_compose.get(name)
+        self._applied_compose[name] = record
+        try:
+            self._persist_applied_compose()
+        except Exception:
+            if prior is None:
+                self._applied_compose.pop(name, None)
+            else:
+                self._applied_compose[name] = prior
+            raise
 
     def _compose_running(self, name: str) -> bool:
         """Whether the deterministic compose project has running workload — the
@@ -1067,12 +1122,24 @@ class NodeDaemon:
                 " removing the single-image container before compose up"
             )
             self._remove_single_image(stack.name)
+        # Write-ahead the recovery record BEFORE compose up (ADR-0044 amendment:
+        # crash-consistent startup). Once Docker Compose is invoked it may create
+        # the project and the daemon may die before recording anything; the
+        # write-ahead PENDING record (name + fingerprint + retained non-empty file
+        # paths) guarantees a later same-name transition or stopped/removed desire
+        # can still tear that project down. If this persist fails, compose up is
+        # NOT invoked (the raise reaches _reconcile, which retries next pass).
+        paths = [str(f) for f in files]
+        self._write_ahead_compose(stack.name, AppliedCompose(fingerprint, paths, COMPOSE_PENDING))
         self._docker.compose(f"ozolith-{stack.name}", files, "up")
-        # Retain the materialized paths so a later down is valid (never empty),
-        # and persist AFTER a successful up so the on-disk record only ever names
-        # a project that was actually brought up (ADR-0044 amendment).
-        self._applied_compose[stack.name] = AppliedCompose(fingerprint, [str(f) for f in files])
-        self._persist_applied_compose()
+        # Confirm APPLIED after a successful up — best-effort: a failure to persist
+        # the confirmation must NOT drop the durable write-ahead record, so it is
+        # isolated. compose_ps stays the liveness authority; the pending/applied
+        # distinction is informational and a lingering pending record is harmless.
+        self._applied_compose[stack.name].state = COMPOSE_APPLIED
+        self._isolated(
+            f"stack {stack.name}: confirm applied compose", self._persist_applied_compose
+        )
 
     def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
         """Run the single-image form as the SOLE runtime form under this name.
