@@ -139,6 +139,55 @@ def test_driverless_worker_type_resolves_to_a_flightdeck_container(tmp_path):
     assert stack.secrets == {"GITHUB_TOKEN": "flightdeck-github-token"}
 
 
+def test_stack_placeholder_substituted_in_worker_type_volumes(tmp_path):
+    """ADR-0043: {stack} in a driverless type's volume names resolves to the
+    Stack name (per-Flight-Deck state/tailnet identity), while knowledge-* is
+    left literal (shared across siblings of the type). Two same-type Flight
+    Decks on one node therefore get distinct state/tailscale volumes and the
+    same knowledge volume."""
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "/usr/local/bin/flightdeck-start"\n'
+        "volumes = [\n"
+        '    "{stack}-logs:/var/log/flightdeck",\n'
+        '    "{stack}-claude-state:/home/ozolith/.claude",\n'
+        '    "knowledge-claude-dev:/home/ozolith/knowledge",\n'
+        '    "{stack}-tailscale-state:/var/lib/tailscale",\n'
+        "]\n",
+    )
+    thin_stack(tmp_path, "flightdeck-box1", "flightdeck")
+    thin_stack(tmp_path, "flightdeck-box2", "flightdeck")
+    config = load_config(tmp_path)
+
+    box1 = next(s for s in config.stacks if s.name == "flightdeck-box1")
+    box2 = next(s for s in config.stacks if s.name == "flightdeck-box2")
+    assert box1.volumes == (
+        "flightdeck-box1-logs:/var/log/flightdeck",
+        "flightdeck-box1-claude-state:/home/ozolith/.claude",
+        "knowledge-claude-dev:/home/ozolith/knowledge",  # shared: not substituted
+        "flightdeck-box1-tailscale-state:/var/lib/tailscale",
+    )
+    # Distinct per-instance state/tailnet volumes; identical shared knowledge.
+    state1 = {v for v in box1.volumes if "claude-state" in v or "tailscale-state" in v}
+    state2 = {v for v in box2.volumes if "claude-state" in v or "tailscale-state" in v}
+    assert state1.isdisjoint(state2)
+    knowledge = "knowledge-claude-dev:/home/ozolith/knowledge"
+    assert knowledge in box1.volumes and knowledge in box2.volumes
+
+
+def test_stack_placeholder_is_not_substituted_on_generic_stack_volumes(tmp_path):
+    """A plain generic Stack owns its volumes verbatim — {stack} is a
+    worker-type resolution placeholder only, never touched on generic Stacks."""
+    write(
+        tmp_path,
+        "stacks/plain.toml",
+        'kind = "container"\nnode = "box1"\nimage = "busybox"\nvolumes = ["{stack}-data:/data"]\n',
+    )
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "plain")
+    assert stack.volumes == ("{stack}-data:/data",)  # literal, unresolved
+
+
 # -- CRITICAL: derived-image identity must not change (ADR-0044) -----------------
 
 

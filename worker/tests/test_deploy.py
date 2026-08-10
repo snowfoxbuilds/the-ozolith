@@ -8,6 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
 DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.claude"
+CONTROL_DOCKERFILE = REPO_ROOT / "control" / "docker" / "Dockerfile"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
@@ -108,12 +109,19 @@ def test_ci_builds_the_control_image():
 
 
 def test_no_tailscale_anywhere_in_product_code_or_deploy():
-    """NODE-SUBSTRATE.md: Tailscale is a private-side deployment detail —
-    never in product code, images, or deploy scripts (overlays may name it
-    as an example of the extension point, nothing more)."""
+    """NODE-SUBSTRATE.md: Tailscale is a private-side deployment detail — never
+    in product code, product IMAGES, or deploy scripts. Per-container tailnet
+    identity enters only via a worker type's setup instructions in the Config
+    Repo (ADR-0043); the ONE sanctioned home for the string is
+    ``deploy/configs-example/**`` (and its README), which this scan
+    deliberately does not touch. The product Dockerfiles are in scope: a
+    tailscaled baked into a base image would violate the doctrine just as
+    surely as product source would."""
     for component in ("worker", "control", "nodedaemon", "knowledge"):
         for path in (REPO_ROOT / component / "src").rglob("*.py"):
             assert "tailscale" not in path.read_text().lower(), path
+    for dockerfile in (DOCKERFILE, CONTROL_DOCKERFILE):
+        assert "tailscale" not in dockerfile.read_text().lower(), dockerfile
     for name in ("install-nodedaemon.sh", "compose/control.yml", "README.md"):
         assert "tailscale" not in (DEPLOY / name).read_text().lower(), name
 
@@ -156,3 +164,73 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     }
     assert flightdeck.secrets["GITHUB_TOKEN"] == "flightdeck-github-token"
     assert "flightdeck-github-token" not in driver_secrets
+
+
+def test_configs_example_flightdeck_knowledge_and_tailscale_wiring():
+    """ADR-0043 + issue #20 §1: the example Flight Deck wires per-instance
+    runtime state + tailnet identity and ONE shared knowledge clone, bakes the
+    knowledge symlinks and the userspace-tailscale start sequence, and keeps
+    the carve-out Flight-Deck-only."""
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+
+    # Per-instance state + tailnet volumes (resolved from {stack}); exactly one
+    # SHARED knowledge-* clone that is deliberately NOT per-instance.
+    assert "flightdeck-claude-state:/home/ozolith/.claude" in flightdeck.volumes
+    assert "flightdeck-tailscale-state:/var/lib/tailscale" in flightdeck.volumes
+    knowledge_mounts = [v for v in flightdeck.volumes if v.split(":")[0].startswith("knowledge-")]
+    assert len(knowledge_mounts) == 1
+    assert "{stack}" not in knowledge_mounts[0]  # shared across siblings, not per-instance
+
+    wt = config.worker_types["flightdeck"]
+    assert wt.knowledge_source == ""  # never baked; the clone is live (ADR-0043)
+    script = "\n".join(wt.setup)
+
+    # clone-init + all four symlinks are baked into flightdeck-start.
+    assert "theozolith-knowledge clone-init" in script
+    for target in (
+        "ln -sfnT /home/ozolith/knowledge/skills",
+        "ln -sfnT /home/ozolith/knowledge/agents/claude",
+        "ln -sfnT /home/ozolith/knowledge/workflows",
+        "ln -sfnT /home/ozolith/knowledge/AGENTS.md",
+    ):
+        assert target in script, target
+    for claude_dir in (
+        "/home/ozolith/.claude/skills",
+        "/home/ozolith/.claude/agents",
+        "/home/ozolith/.claude/workflows",
+        "/home/ozolith/.claude/CLAUDE.md",
+    ):
+        assert claude_dir in script, claude_dir
+
+    # The tailscale download is pinned twice — a concrete version AND a sha256
+    # verification — and the start sequence is userspace + Tailscale SSH with
+    # the file:-form auth key consumed only on an empty state volume.
+    assert "1.80.0" in script and "sha256sum -c" in script
+    assert "--tun=userspace-networking" in script
+    assert "--ssh" in script
+    assert "file:${TS_AUTHKEY_FILE}" in script
+    assert "if [ -s /var/lib/tailscale/tailscaled.state ]; then" in script
+
+    # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts a
+    # knowledge-* clone or any .claude path.
+    for stack in config.stacks:
+        if stack.name == "flightdeck":
+            continue
+        for volume in stack.volumes:
+            assert "knowledge-" not in volume and ".claude" not in volume, (stack.name, volume)
+    for name, other in config.worker_types.items():
+        if name == "flightdeck":
+            continue
+        for volume in other.volumes:
+            assert "knowledge-" not in volume and ".claude" not in volume, (name, volume)
+
+    # The tailscale auth-key secret is the flightdeck type's alone — disjoint
+    # from every driver PAT/secret.
+    driver_secret_names = {
+        n for s in config.stacks if s.kind == "process" for n in s.secrets.values()
+    }
+    assert flightdeck.secrets["TS_AUTHKEY"] == "flightdeck-tailscale-authkey"
+    assert "flightdeck-tailscale-authkey" not in driver_secret_names

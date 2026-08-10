@@ -66,7 +66,14 @@ def _float(environ: Mapping[str, str], *names: str, default: str) -> float:
 
 
 def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
-    """Parse ``name:/path,name:/path`` into named-volume mounts."""
+    """Parse ``name:/path,name:/path`` into named-volume mounts.
+
+    A cache volume whose container path carries a ``.claude`` segment is
+    refused (ADR-0043): live knowledge must never mount into a Run — it breaks
+    pin reproducibility and opens a prompt-injection persistence channel. The
+    shared-clone symlink carve-out is Flight-Deck-only; this closes the one
+    config-reachable channel that could reintroduce it on a run container.
+    """
     pairs = []
     for item in raw.split(","):
         item = item.strip()
@@ -75,6 +82,12 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
         name, sep, path = item.partition(":")
         if not sep or not name or not path.startswith("/"):
             raise ConfigError(f"THEOZOLITH_CACHE_VOLUMES entry {item!r} is not name:/path")
+        if ".claude" in path.split("/"):
+            raise ConfigError(
+                f"THEOZOLITH_CACHE_VOLUMES entry {item!r} targets a .claude path —"
+                " live knowledge must never mount into a Run (ADR-0043); the"
+                " shared-clone symlink carve-out is Flight-Deck-only"
+            )
         pairs.append((name, path))
     return tuple(pairs)
 
