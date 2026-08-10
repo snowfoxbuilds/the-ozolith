@@ -949,9 +949,7 @@ def test_changed_model_restarts_the_driver(rig: Rig):
     rig.control.heartbeat_answers.append(heartbeat_response([a]))
     rig.daemon.once()
     first = rig.popen.spawned[0]
-    b = process_stack(
-        "worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-opus-5"}
-    )
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-opus-5"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 2
@@ -1066,9 +1064,7 @@ def test_old_builtin_implementer_without_run_image_does_not_start(rig: Rig):
 
 
 def test_old_builtin_reviewer_without_run_image_does_not_start(rig: Rig):
-    stack = process_stack(
-        "reviewer", command="theozolith-reviewer", env={"THEOZOLITH_REPO": "a/x"}
-    )
+    stack = process_stack("reviewer", command="theozolith-reviewer", env={"THEOZOLITH_REPO": "a/x"})
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()
     assert not rig.daemon._supervisor.alive("reviewer") and not rig.popen.spawned
@@ -1079,7 +1075,8 @@ def test_old_builtin_reviewer_without_run_image_does_not_start(rig: Rig):
 def test_live_builtin_driver_stops_when_run_image_env_is_lost(rig: Rig):
     recipe = image_recipe()
     good = process_stack(
-        "worker", command="theozolith-worker",
+        "worker",
+        command="theozolith-worker",
         env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
     )
     rig.control.heartbeat_answers.append(heartbeat_response([good], [recipe]))
@@ -1265,8 +1262,11 @@ def test_desired_run_image_change_during_a_run_is_deferred(rig: Rig, tmp_path):
     assert new["tag"] != old["tag"]
     b = process_stack(
         "worker",
-        env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_REPO": "a/x",
-             "THEOZOLITH_RUN_IMAGE": new["tag"]},
+        env={
+            "THEOZOLITH_JOBS_DIR": str(jobs),
+            "THEOZOLITH_REPO": "a/x",
+            "THEOZOLITH_RUN_IMAGE": new["tag"],
+        },
     )
     rig.control.heartbeat_answers.append(heartbeat_response([b], [new]))
     rig.daemon.once()
@@ -2040,16 +2040,29 @@ def test_dockerctl_compose_builds_valid_file_scoped_commands():
 
     up, down = calls
     assert up == [
-        "docker", "compose", "--project-name", "ozolith-svc",
-        "--file", "/state/stacks/svc/compose/base.yml",
-        "--file", "/state/stacks/svc/overlays/net.yml",
-        "up", "--detach", "--remove-orphans",
+        "docker",
+        "compose",
+        "--project-name",
+        "ozolith-svc",
+        "--file",
+        "/state/stacks/svc/compose/base.yml",
+        "--file",
+        "/state/stacks/svc/overlays/net.yml",
+        "up",
+        "--detach",
+        "--remove-orphans",
     ]
     assert down == [
-        "docker", "compose", "--project-name", "ozolith-svc",
-        "--file", "/state/stacks/svc/compose/base.yml",
-        "--file", "/state/stacks/svc/overlays/net.yml",
-        "down", "--remove-orphans",
+        "docker",
+        "compose",
+        "--project-name",
+        "ozolith-svc",
+        "--file",
+        "/state/stacks/svc/compose/base.yml",
+        "--file",
+        "/state/stacks/svc/overlays/net.yml",
+        "down",
+        "--remove-orphans",
     ]
     assert "--file" in down  # a down is never issued with an empty file set
 
@@ -2195,9 +2208,7 @@ def _active_forms(rig: Rig, name: str) -> set[str]:
 def _bring_up_compose(rig: Rig, name: str = "svc", files=None) -> list[str]:
     """Bring a compose Stack up on the original daemon; return its retained
     file paths (the ones a later down must reuse, not an empty list)."""
-    rig.control.heartbeat_answers.append(
-        heartbeat_response([_compose_stack(name, files=files)])
-    )
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack(name, files=files)]))
     rig.daemon.once()
     assert f"ozolith-{name}" in rig.docker.compose_projects
     return list(rig.docker.compose_projects[f"ozolith-{name}"])
@@ -3553,6 +3564,7 @@ def test_dockerctl_remove_raises_on_a_genuine_failure():
     """A non-zero ``docker rm --force`` whose container genuinely survives raises
     DockerError — a suppressed failure would let a caller start a successor beside
     a still-running predecessor."""
+
     def runner(args, timeout=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(
@@ -3569,6 +3581,7 @@ def test_dockerctl_remove_raises_on_a_genuine_failure():
 
 def test_dockerctl_remove_absent_container_is_idempotent_success():
     """``no such container`` classifies as already-absent: idempotent success."""
+
     def runner(args, timeout=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(args, 1, "", "Error: No such container: ghost")
@@ -3581,6 +3594,7 @@ def test_dockerctl_remove_absent_container_is_idempotent_success():
 def test_dockerctl_remove_postcondition_absence_is_success():
     """An opaque non-zero result whose container is nonetheless gone is treated as
     idempotent success via the postcondition existence check."""
+
     def runner(args, timeout=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(args, 1, "", "some transient noise")

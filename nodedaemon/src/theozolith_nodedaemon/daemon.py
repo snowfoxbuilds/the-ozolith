@@ -639,8 +639,7 @@ class NodeDaemon:
         applied, not that the project still runs, so convergence consults this
         before declaring a compose Stack already converged (ADR-0044 amendment)."""
         return any(
-            row.get("state") == "running"
-            for row in self._docker.compose_ps(f"ozolith-{name}")
+            row.get("state") == "running" for row in self._docker.compose_ps(f"ozolith-{name}")
         )
 
     def _compose_down(self, name: str) -> None:
@@ -1216,9 +1215,7 @@ class NodeDaemon:
                 and self._docker.compose_ps(f"ozolith-{stack.name}")
             ):
                 self._log(f"stack {stack.name}: downing untracked compose project (post-restart)")
-                self._docker.compose(
-                    f"ozolith-{stack.name}", self._compose_paths(stack), "down"
-                )
+                self._docker.compose(f"ozolith-{stack.name}", self._compose_paths(stack), "down")
                 # No record references the just-materialized generation; the
                 # per-pass sweep reclaims it (and retries on failure).
             return
@@ -1288,8 +1285,7 @@ class NodeDaemon:
             if self._compose_running(stack.name):
                 return  # confirmed-applied, at this exact spec, and running
             self._log(
-                f"stack {stack.name}: applied compose project not running;"
-                " composing up again"
+                f"stack {stack.name}: applied compose project not running; composing up again"
             )
         if not self._pull_stack_secrets(stack):
             return
@@ -1381,8 +1377,7 @@ class NodeDaemon:
             # silently assumed current: reconcile it once so the fingerprint is
             # recovered from here on (ADR-0044 amendment).
             self._log(
-                f"stack {stack.name}: running container has no applied-spec label;"
-                " reconciling once"
+                f"stack {stack.name}: running container has no applied-spec label; reconciling once"
             )
         if not self._pull_stack_secrets(stack):
             return

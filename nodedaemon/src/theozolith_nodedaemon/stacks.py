@@ -111,8 +111,7 @@ def spec_fingerprint(command: str, env: dict[str, str]) -> str:
     (sort_keys), so a mere reordering never forces a restart; a change to any
     effective input does."""
     safe_env = {
-        key: ("<redacted>" if key in _FINGERPRINT_REDACT else value)
-        for key, value in env.items()
+        key: ("<redacted>" if key in _FINGERPRINT_REDACT else value) for key, value in env.items()
     }
     canonical = json.dumps({"command": command, "env": safe_env}, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

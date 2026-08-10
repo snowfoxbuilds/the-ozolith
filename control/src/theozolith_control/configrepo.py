@@ -252,9 +252,7 @@ class DeployConfig:
         # Recipes ride for running Stacks of BOTH kinds (ADR-0044): the Flight
         # Deck's derived image builds through the same list as a driver's.
         recipe_names = {
-            stack.worker_type
-            for stack in stacks
-            if stack.worker_type and stack.state == "running"
+            stack.worker_type for stack in stacks if stack.worker_type and stack.state == "running"
         }
         return {
             "commit": self.commit,
@@ -455,8 +453,7 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
             argv = shlex.split(stack.command)
         except ValueError as exc:
             raise ConfigRepoError(
-                f"{context}: 'command' is not valid shell syntax ({exc}) — fix the"
-                " quoting"
+                f"{context}: 'command' is not valid shell syntax ({exc}) — fix the quoting"
             ) from exc
     else:
         argv = []
