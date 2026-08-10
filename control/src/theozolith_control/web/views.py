@@ -107,6 +107,12 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
                 "version_skew": bool(config.product_version)
                 and bool(node["version"])
                 and node["version"] != config.product_version,
+                # Off-hash (ADR-0042): reported config distribution differs from
+                # the recorded one — a convergence state, dispatch-blocking,
+                # warning-grade (the exact analog of version skew).
+                "drivers_off_hash": bool(config.drivers_hash)
+                and bool(node["drivers_hash"])
+                and node["drivers_hash"] != config.drivers_hash,
                 "last_seen": ago(now - node["last_seen"]),
                 "stale": now - node["last_seen"] > STALE_AFTER_SECONDS,
                 "quarantine": quarantined.get(name),
@@ -122,11 +128,30 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
         if c["completed_at"] is None
     ]
     drivers = [{**d, "last_dispatch": ago(now - d["last_dispatch_at"])} for d in store.drivers()]
+    # Stamp skew (ADR-0042): a node's applied distribution was built against a
+    # product version other than the one it runs — advisory ONLY, never a
+    # health downgrade (real breakage crashes at driver start into supervision).
+    drivers_stamp_skew = [
+        {
+            "node": node["name"],
+            "built_against": node["drivers_built_against"],
+            "product_version": node["version"],
+        }
+        for node in state["nodes"]
+        if node["drivers_built_against"]
+        and node["version"]
+        and node["drivers_built_against"] != node["version"]
+    ]
     return {
         "nodes": nodes,
         "skewed_images": sorted(skewed),
         "product_version": config.product_version,
         "version_skew": sorted(n["name"] for n in nodes if n["version_skew"]),
+        # Config distribution (ADR-0042): the recorded hash, the off-hash
+        # convergence worklist (dispatch-blocking), and advisory stamp skew.
+        "config_drivers_hash": config.drivers_hash,
+        "drivers_off_hash": sorted(n["name"] for n in nodes if n["drivers_off_hash"]),
+        "drivers_stamp_skew": drivers_stamp_skew,
         "pending_commands": pending,
         "drivers": drivers,
         # Advisory display from unauthenticated input (ADR-0023): heartbeats

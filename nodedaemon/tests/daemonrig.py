@@ -188,6 +188,9 @@ class ScriptedControl:
         self.denied_secrets = False
         # (version, filename) -> wheel bytes served to artifact pulls.
         self.artifacts: dict[tuple[str, str], bytes] = {}
+        # drivers-hash -> config-distribution zip bytes (ADR-0042). A requested
+        # hash absent here answers 409, mirroring control's repo-moved-on path.
+        self.config_artifacts: dict[str, bytes] = {}
         self.transcript: list[tuple[str, str, Any, Any]] = []
 
     @property
@@ -215,6 +218,12 @@ class ScriptedControl:
             if wheel is None:
                 return 404, {"detail": f"no artifact {filename} for {version}"}
             return 200, wheel
+        if path.startswith("/config/artifacts/"):
+            _, _, digest = path.partition("/config/artifacts/")
+            artifact = self.config_artifacts.get(digest)
+            if artifact is None:
+                return 409, {"detail": "config distribution changed"}
+            return 200, artifact
         if path == "/heartbeats":
             if not self.heartbeat_answers:
                 raise ControlUnreachable("no scripted answer")
@@ -294,6 +303,54 @@ def rig(tmp_path: Path, monkeypatch) -> Rig:
 
 def desired(stacks: list[dict], images: list[dict] | None = None, **extra) -> dict:
     return {"commit": "abc123", "stacks": stacks, "images": images or [], **extra}
+
+
+def make_config_dist(files: dict[str, str], *, built_against: str = "0.3.0") -> tuple[str, bytes]:
+    """Build a config-distribution zip and its drivers-hash (ADR-0042) using the
+    node-side canonical algorithm — ``files`` are ``drivers/...`` relpaths. The
+    hash is computed exactly as ``manifest_hash_of_tree`` will recompute it on
+    unpack, so a faithful artifact verifies; corrupt one member to force a
+    mismatch."""
+    import io
+    import json
+    import tempfile
+    import zipfile
+
+    from theozolith_nodedaemon import configdist
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for relpath, content in files.items():
+            target = root / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        digest = configdist.manifest_hash_of_tree(root)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for relpath, content in sorted(files.items()):
+            archive.writestr(relpath, content)
+        archive.writestr(
+            configdist.ARTIFACT_METADATA,
+            json.dumps(
+                {
+                    "format": 1,
+                    "drivers_hash": digest,
+                    "built_against": built_against,
+                    "built_at": "1980-01-01T00:00:00+00:00",
+                }
+            ),
+        )
+    return digest, buffer.getvalue()
+
+
+def driver_stack(name: str = "custom-impl", ref: str = "drivers/custom", **overrides) -> dict:
+    """A config-distribution driver Stack as it rides the wire (ADR-0042):
+    ``theozolith-driver drivers/<ref>``. Written directly (control does not yet
+    resolve such Stacks) to exercise the daemon-side stop/restart on swap."""
+    stack = process_stack(name=name, command=f"theozolith-driver {ref}")
+    stack["env"] = {"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_RUN_IMAGE": "theozolith/x:1"}
+    stack.update(overrides)
+    return stack
 
 
 def process_stack(name: str = "worker", **overrides) -> dict:

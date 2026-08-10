@@ -3742,3 +3742,156 @@ def test_converged_child_does_not_mask_a_stale_single_image_container(rig: Rig, 
     assert "ozolith-stack-worker" in rig.docker.removed
     assert len(rig.popen.spawned) == spawned_before  # child not churned
     assert _active_forms(rig, "worker") == {"process"}  # sole form
+
+
+# -- config distribution (ADR-0042) ---------------------------------------------
+
+from daemonrig import driver_stack, make_config_dist  # noqa: E402
+
+
+def dist_response(stacks, drivers_hash, commands=None) -> dict:
+    return {"commands": commands or [], "config": desired(stacks, drivers_hash=drivers_hash)}
+
+
+def test_config_dist_fetches_verifies_and_swaps_atomically(rig: Rig):
+    digest, data = make_config_dist(
+        {"drivers/custom/impl.py": "def run():\n    return 1\n"}, built_against="0.2.9"
+    )
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+
+    root = rig.config.state_dir / "config-dist"
+    assert (root / digest / "drivers" / "custom" / "impl.py").is_file()
+    assert (root / "current").read_text().strip() == digest
+    # The next status payload reports the applied hash and its stamp.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = rig.control.transcript[-1][2]
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == "0.2.9"
+
+
+def test_config_dist_fetch_failure_retries_next_pass(rig: Rig):
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    # Artifact NOT registered yet → 409 → ControlError, nothing swapped.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert not (rig.config.state_dir / "config-dist" / "current").exists()
+    assert any("config distribution" in line and "failed" in line for line in rig.logs)
+    assert rig.control.events  # a theozolith.error was emitted
+    # It becomes available; the next pass converges.
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (rig.config.state_dir / "config-dist" / "current").read_text().strip() == digest
+
+
+def test_config_dist_verify_mismatch_is_rejected(rig: Rig):
+    digest, _ = make_config_dist({"drivers/custom/impl.py": "real = 1\n"})
+    _, tampered = make_config_dist({"drivers/custom/impl.py": "TAMPERED = 2\n"})
+    rig.control.config_artifacts[digest] = tampered  # served bytes recompute to a different hash
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    # Nothing swapped; old hash still reported ("").
+    assert not (rig.config.state_dir / "config-dist" / digest).exists()
+    assert not (rig.config.state_dir / "config-dist" / "current").exists()
+    assert any("mismatch" in line for line in rig.logs)
+
+
+def test_config_dist_defers_behind_an_in_flight_run(rig: Rig, tmp_path):
+    jobs = tmp_path / "jobs"
+    (jobs / "20260808T1200-worker-a-1").mkdir(parents=True)
+    worker = process_stack(
+        "worker", env={"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_JOBS_DIR": str(jobs)}
+    )
+    digest, data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    # Pass 1: worker runs, no distribution yet.
+    rig.control.heartbeat_answers.append(heartbeat_response([worker]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")
+    # Pass 2: a distribution is desired, but a Run is in flight → deferred.
+    rig.control.heartbeat_answers.append(dist_response([worker], digest))
+    rig.daemon.once()
+    assert not (rig.config.state_dir / "config-dist" / "current").exists()
+    assert any("config distribution" in line and "deferred" in line for line in rig.logs)
+    # Run ends → the next pass converges.
+    shutil.rmtree(jobs / "20260808T1200-worker-a-1")
+    rig.control.heartbeat_answers.append(dist_response([worker], digest))
+    rig.daemon.once()
+    assert (rig.config.state_dir / "config-dist" / "current").read_text().strip() == digest
+
+
+def test_config_dist_swap_restarts_only_drivers_stacks(rig: Rig):
+    """On a swap the daemon stops config-distribution driver Stacks (argv[0] the
+    launcher, argv[1] under drivers/) so reconcile restarts them; a builtin:*
+    driver Stack and a generic process Stack are untouched (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    builtin = process_stack("impl")
+    builtin["command"] = "theozolith-driver builtin:implementer"
+    builtin["env"] = {"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_RUN_IMAGE": "theozolith/y:1"}
+    generic = process_stack("plain")  # command "plain-driver --loop"
+    stacks = [custom, builtin, generic]
+
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.config_artifacts[b_hash] = b_data
+
+    rig.control.heartbeat_answers.append(dist_response(stacks, a_hash))
+    rig.daemon.once()
+    started = {p.args[1]: p for p in rig.popen.spawned}  # driver ref / arg by command
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns_before = len(rig.popen.spawned)
+
+    # Swap to B: the custom driver Stack is stopped then restarted; the others aren't.
+    rig.control.heartbeat_answers.append(dist_response(stacks, b_hash))
+    rig.daemon.once()
+    assert (rig.config.state_dir / "config-dist" / "current").read_text().strip() == b_hash
+    # The custom driver child was restarted exactly once (a new spawn).
+    custom_spawns = [
+        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]
+    ]
+    assert len(custom_spawns) == 2
+    # The builtin and generic children were never restarted.
+    builtin_spawns = [
+        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "builtin:implementer"]
+    ]
+    generic_spawns = [p for p in rig.popen.spawned if p.args[0] == "plain-driver"]
+    assert len(builtin_spawns) == 1 and len(generic_spawns) == 1
+    assert started  # (silence unused)
+    assert spawns_before < len(rig.popen.spawned)
+
+
+def test_config_dist_empty_desired_retires(rig: Rig):
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert (rig.config.state_dir / "config-dist" / digest).is_dir()
+    assert rig.daemon._supervisor.alive("custom-impl")
+
+    # Desired distribution goes away entirely: retire it.
+    rig.control.heartbeat_answers.append(dist_response([custom], ""))
+    rig.daemon.once()
+    assert not (rig.config.state_dir / "config-dist" / "current").exists()
+    assert not (rig.config.state_dir / "config-dist" / digest).exists()
+
+
+def test_config_dist_zip_traversal_refused(rig: Rig):
+    import io
+    import zipfile
+
+    digest = "e" * 64
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("drivers/ok.py", "ok\n")
+        archive.writestr("../escape.py", "pwned\n")
+    rig.control.config_artifacts[digest] = buffer.getvalue()
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert not (rig.config.state_dir / "config-dist" / "current").exists()
+    assert not (rig.config.state_dir.parent / "escape.py").exists()
+    assert rig.control.events  # error emitted

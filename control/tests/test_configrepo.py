@@ -47,6 +47,7 @@ def test_missing_repo_is_an_empty_deployment(tmp_path):
     assert config.desired_state_for("box1") == {
         "commit": "",
         "product_version": "",
+        "drivers_hash": "",
         "stacks": [],
         "images": [],
     }
@@ -644,3 +645,49 @@ def test_driverless_workspace_shape_is_enforced(tmp_path):
     write(tmp_path, "worker-types/fd.toml", f'base = "{BASE}"\nworkspace = "owner/repo/extra"\n')
     with pytest.raises(ConfigRepoError, match="owner/name"):
         load_config(tmp_path)
+
+
+# -- config distribution (ADR-0042) ---------------------------------------------
+
+
+def test_drivers_hash_rides_desired_state_and_is_empty_by_default(tmp_path):
+    """No drivers/ → hash "", still always present on the wire."""
+    write(tmp_path, "stacks/x.toml", 'kind = "process"\nnode = "box1"\ncommand = "sleep 1"\n')
+    config = load_config(tmp_path)
+    assert config.drivers_hash == ""
+    assert config.desired_state_for("box1")["drivers_hash"] == ""
+
+
+def test_drivers_content_produces_a_hash_on_the_wire(tmp_path):
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    config = load_config(tmp_path)
+    assert config.drivers_hash and len(config.drivers_hash) == 64
+    assert config.desired_state_for("box1")["drivers_hash"] == config.drivers_hash
+
+
+def test_folder_mode_commit_bumps_on_a_drivers_edit(tmp_path):
+    """Folder mode (no .git): a drivers/*.py edit must change the commit so
+    nodes see the change — the pre-ADR-0042 *.toml-only hash never did."""
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    before = load_config(tmp_path).commit
+    assert before.startswith("folder-")
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 2\n")
+    after = load_config(tmp_path).commit
+    assert after.startswith("folder-") and after != before
+
+
+def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
+    from theozolith_control import configrepo
+
+    for bad in ("drivers/x.py", "drivers/custom/impl.py", "drivers"):
+        with pytest.raises(configrepo.ConfigRepoError):
+            configrepo.refuse_ui_write(bad)
+
+
+def test_refuse_ui_write_allows_other_paths(tmp_path):
+    from theozolith_control import configrepo
+
+    # No raise for the allow-listed fixed-filename writers' targets.
+    configrepo.refuse_ui_write("control.toml")
+    configrepo.refuse_ui_write("product.toml")
+    configrepo.refuse_ui_write("stacks/x.toml")

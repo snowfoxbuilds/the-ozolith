@@ -558,6 +558,7 @@ def test_boots_and_serves_with_no_config_repo_at_all(control: ControlRig):
     assert answer["config"] == {
         "commit": "",
         "product_version": "",
+        "drivers_hash": "",
         "stacks": [],
         "images": [],
         "heartbeat_seconds": 60.0,
@@ -621,3 +622,134 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     # state carries no attach argv — it is consumed control-side only.
     config = control.heartbeat(node="box1").json()["config"]
     assert all("attach" not in stack for stack in config["stacks"])
+
+
+# -- config distribution (ADR-0042) ---------------------------------------------
+
+
+def _write_driver(control, content: str = "def run():\n    return 1\n") -> str:
+    from theozolith_control import configdist
+
+    control.write_config("drivers/custom/impl.py", content)
+    return configdist.drivers_hash(control.settings.config_repo)
+
+
+def test_heartbeat_carries_drivers_hash_both_directions(control: ControlRig):
+    digest = _write_driver(control)
+    beat = control.heartbeat(node="box1", drivers_hash="", drivers_built_against="").json()
+    # Down: the recorded reference rides desired state.
+    assert beat["config"]["drivers_hash"] == digest
+    # Up: what the node reports is recorded for the gate.
+    control.heartbeat(node="box1", drivers_hash=digest, drivers_built_against="0.3.0")
+    assert control.store.node_drivers_hash("box1") == digest
+
+
+def test_config_artifact_builds_on_demand_and_serves(control: ControlRig):
+    digest = _write_driver(control)
+    pulled = control.client.get(
+        f"/api/v1/config/artifacts/{digest}",
+        headers={"Authorization": f"Bearer {control.node_token()}"},
+    )
+    assert pulled.status_code == 200
+    # The served zip verifies by recompute on the node side.
+    from theozolith_nodedaemon import configdist as node_configdist
+
+    dest = control.settings.data_dir / "unpacked"
+    dest.mkdir(parents=True, exist_ok=True)
+    node_configdist.extract_zip(pulled.content, dest)
+    assert node_configdist.manifest_hash_of_tree(dest) == digest
+    # Second pull is served from cache (still 200, byte-identical).
+    again = control.client.get(
+        f"/api/v1/config/artifacts/{digest}",
+        headers={"Authorization": f"Bearer {control.node_token()}"},
+    )
+    assert again.status_code == 200 and again.content == pulled.content
+
+
+def test_config_artifact_409_when_repo_moved_past_the_requested_hash(control: ControlRig):
+    _write_driver(control, "def run():\n    return 1\n")
+    stale = "a" * 64  # a well-formed hash the current repo will never build
+    answer = control.client.get(
+        f"/api/v1/config/artifacts/{stale}",
+        headers={"Authorization": f"Bearer {control.node_token()}"},
+    )
+    assert answer.status_code == 409
+
+
+def test_config_artifact_rejects_bad_hashes_and_requires_node_token(control: ControlRig):
+    _write_driver(control)
+    for bad in ("nothex", "ABCDEF" + "0" * 58, "0" * 63, "../escape"):
+        answer = control.client.get(
+            f"/api/v1/config/artifacts/{bad}",
+            headers={"Authorization": f"Bearer {control.node_token()}"},
+        )
+        assert answer.status_code in (400, 404), bad
+    digest = _write_driver(control)
+    # The admin token is not a node token: node-authenticated endpoint.
+    unauth = control.client.get(
+        f"/api/v1/config/artifacts/{digest}",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    assert unauth.status_code == 401
+
+
+def test_offhash_node_is_dispatch_ineligible_with_a_reason(control: ControlRig):
+    digest = _write_driver(control)
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
+    # Node reports a DIFFERENT hash → blocked, with an explanatory reason.
+    control.heartbeat(node="box1", drivers_hash="b" * 64)
+    refused = control.dispatch(worker="worker-a", node="box1").json()
+    assert refused["issue"] is None and "config distribution" in refused["reason"]
+    review = control.node_post(
+        "/api/v1/dispatch",
+        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
+    ).json()
+    assert review["prs"] == [] and "config distribution" in review["reason"]
+    # Converge → eligible again, no human action.
+    control.heartbeat(node="box1", drivers_hash=digest)
+    assert control.dispatch(worker="worker-a", node="box1").json()["issue"]["number"] == 7
+
+
+def test_unreported_and_converged_and_no_recorded_hash_stay_eligible(control: ControlRig):
+    control.github.add_issue(9, labels={"plan_ready"}, assignees=[])
+    # No recorded distribution: always eligible.
+    assert control.dispatch(worker="w", node="box1").json()["issue"]["number"] == 9
+    _write_driver(control)
+    control.github.add_issue(10, labels={"plan_ready"}, assignees=[])
+    # Unreported hash (daemon-less shape heartbeats nothing) stays eligible.
+    assert control.dispatch(worker="w", node="ghost").json()["issue"]
+
+
+def test_persistently_offhash_node_gets_restart_then_error(control: ControlRig):
+    """The config-dist ladder mirrors the pin ladder exactly (ADR-0042)."""
+    digest = _write_driver(control)
+    off = "c" * 64
+    for _ in range(2):
+        assert control.heartbeat(node="box1", drivers_hash=off).json()["commands"] == []
+    beat = control.heartbeat(node="box1", drivers_hash=off).json()  # third off-hash beat
+    assert [c["verb"] for c in beat["commands"]] == ["restart"]
+    restart_id = beat["commands"][0]["id"]
+    for _ in range(3):
+        control.heartbeat(node="box1", drivers_hash=off, completed_commands=[restart_id])
+    errors = control.store.error_events(component="control-node")
+    classes = [e["payload"]["error_class"] for e in errors]
+    assert "config-dist-not-converging" in classes
+    assert sum(1 for c in classes if c == "config-dist-not-converging") == 1
+    # Convergence clears it.
+    control.heartbeat(node="box1", drivers_hash=digest)
+    assert control.store.observe_drivers("box1", digest, digest, 3) is None
+
+
+def test_flags_lists_stamp_skew_and_state_carries_the_hash(control: ControlRig):
+    digest = _write_driver(control)
+    # A node whose applied dist was built against a different product version.
+    control.heartbeat(
+        node="box1", version="0.4.0", drivers_hash=digest, drivers_built_against="0.3.0"
+    )
+    flags = control.admin("GET", "/api/v1/flags").json()
+    assert flags["drivers_skew"] == [
+        {"node": "box1", "built_against": "0.3.0", "product_version": "0.4.0"}
+    ]
+    state = control.admin("GET", "/api/v1/state").json()
+    assert state["config_drivers_hash"] == digest

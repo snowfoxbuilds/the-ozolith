@@ -31,6 +31,7 @@ across daemon restarts until a recycle clears it (ADR-0015).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from theozolith_nodedaemon import configdist
 from theozolith_nodedaemon.builds import ensure_image, image_status
 from theozolith_nodedaemon.config import (
     DEFAULT_HEARTBEAT_SECONDS,
@@ -253,6 +255,10 @@ class NodeDaemon:
         self._update_done = False
         self._update_blocker: str | None = None
         self._product_attempted = False  # per-pass latch (nudge vs. pass check)
+        # Config-distribution convergence (ADR-0042): the drivers-hash is
+        # desired state, checked every pass and applied at most once per pass.
+        self._drivers_attempted = False
+        self._drivers_blocker: str | None = None
         # Capped exponential backoff while the Control Node is unreachable.
         self._unreachable_streak = 0
 
@@ -272,6 +278,7 @@ class NodeDaemon:
 
     def once(self) -> None:
         self._product_attempted = False  # at most one install attempt per pass
+        self._drivers_attempted = False  # at most one config-dist swap per pass
         commands = self._exchange_heartbeat()
         for command in commands:
             if not self._execute(command):
@@ -280,6 +287,10 @@ class NodeDaemon:
                 # recycle it was issued after and be undone by it.
                 break
         self._converge_product()
+        # After product convergence, before reconcile: a new distribution stops
+        # its affected driver Stacks so THIS pass's _reconcile restarts them on
+        # the new tree (ADR-0042).
+        self._converge_drivers()
         self._reconcile()
 
     def _wire_setting(self, key: str, config_value: float, shipped_default: float) -> float:
@@ -369,6 +380,11 @@ class NodeDaemon:
             "stack_containers": stack_containers,
             "images": [image_status(self._docker, img) for img in self._images().values()],
             "config_commit": self._desired.get("commit", ""),
+            # The applied config distribution (ADR-0042): the hash the node has
+            # actually converged onto, and the product version its artifact was
+            # stamped against. Both "" when none is applied.
+            "drivers_hash": self._current_drivers_hash(),
+            "drivers_built_against": self._current_built_against(),
             "completed_commands": list(self._completed),
             # Queue-behind visibility: what is waiting behind an in-flight Run.
             "deferred_commands": [
@@ -778,6 +794,159 @@ class NodeDaemon:
             target.write_bytes(self._client.fetch_artifact(version, base))
             paths.append(str(target))
         return paths
+
+    # -- config distribution (ADR-0042) -----------------------------------------------
+
+    def _current_drivers_hash(self) -> str:
+        """The applied config-distribution hash from the ``current`` pointer
+        ('' when none applied) — what the heartbeat reports and what the swap
+        compares against."""
+        try:
+            return self._config.config_dist_current.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _current_built_against(self) -> str:
+        """The product version the applied distribution was built against, from
+        its ``config-dist.json`` ('' when none, or unreadable)."""
+        current = self._current_drivers_hash()
+        if not current:
+            return ""
+        meta = _read_json(self._config.config_dist_dir / current / configdist.ARTIFACT_METADATA, {})
+        return str(meta.get("built_against", "")) if isinstance(meta, dict) else ""
+
+    def _drivers_stack_names(self) -> list[str]:
+        """Desired process Stacks whose command is ``theozolith-driver
+        drivers/<ref>`` — the config-distribution drivers a swap must restart.
+        Identified by the SAME parse as the landed fail-closed guard (argv[0]
+        the launcher, argv[1] under ``drivers/``): a builtin:* driver Stack and
+        a generic process Stack are untouched by a swap (ADR-0042)."""
+        names = []
+        for stack in self._stacks():
+            if stack.kind != "process" or not stack.command:
+                continue
+            try:
+                argv = shlex.split(stack.command)
+            except ValueError:
+                continue
+            if len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/"):
+                names.append(stack.name)
+        return names
+
+    def _stop_drivers_stacks(self) -> None:
+        for name in self._drivers_stack_names():
+            if self._supervisor.alive(name):
+                self._log(f"stack {name}: stopping for config-distribution swap")
+                self._stop_process_child(name)
+
+    def _write_current_pointer(self, drivers_hash: str) -> None:
+        path = self._config.config_dist_current
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(drivers_hash, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _gc_config_dist(self, keep: set[str]) -> None:
+        """Reclaim unpacked distributions not in ``keep`` (current + previous),
+        and sweep stale dot-temps left by an interrupted unpack. The ``current``
+        pointer file is never touched here."""
+        root = self._config.config_dist_dir
+        if not root.is_dir():
+            return
+        for child in sorted(root.iterdir()):
+            if child.name == self._config.config_dist_current.name:
+                continue
+            if child.name.startswith("."):  # stale unpack temp
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+                continue
+            if child.is_dir() and child.name not in keep:
+                shutil.rmtree(child, ignore_errors=True)
+
+    def _apply_config_dist(self, desired: str, previous: str) -> None:
+        """Fetch, verify by recompute, atomically swap, then stop affected
+        driver Stacks (ADR-0042). Fetch a 409 → ControlError (retry next pass).
+        Unpack into a dot-prefixed temp sibling, validate every member name,
+        verify the recomputed manifest hash equals ``desired`` — on mismatch
+        NOTHING is swapped and the old hash keeps being reported — then
+        ``os.replace`` the tree in and swap the ``current`` pointer."""
+        data = self._client.fetch_config_artifact(desired)
+        root = self._config.config_dist_dir
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = root / f".{desired}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        try:
+            configdist.extract_zip(data, tmp)
+            recomputed = configdist.manifest_hash_of_tree(tmp)
+            if recomputed != desired:
+                raise configdist.ConfigDistError(
+                    f"config distribution hash mismatch: unpacked tree recomputes to"
+                    f" {recomputed[:12] or '(empty)'}, expected {desired[:12]}"
+                )
+            final = root / desired
+            if final.exists():
+                shutil.rmtree(final, ignore_errors=True)
+            os.replace(tmp, final)
+        finally:
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+        # Verified and swapped: stop affected driver Stacks so this pass's
+        # _reconcile restarts them on the new tree, then publish the pointer.
+        self._stop_drivers_stacks()
+        self._write_current_pointer(desired)
+        self._log(f"config distribution converged to {desired[:12]}")
+        self._gc_config_dist(keep={desired, previous} - {""})
+
+    def _retire_config_dist(self, previous: str) -> None:
+        """Empty-desired: stop the config-distribution driver Stacks, clear the
+        ``current`` pointer, and reclaim the unpacked trees (ADR-0042)."""
+        self._stop_drivers_stacks()
+        with contextlib.suppress(OSError):
+            self._config.config_dist_current.unlink()
+        self._gc_config_dist(keep=set())
+        if previous:
+            self._log("config distribution retired (none desired)")
+
+    def _converge_drivers(self) -> None:
+        """The drivers-hash is desired state (ADR-0042): every pass compares the
+        applied distribution against the desired one and converges on mismatch.
+        Queue-behind an in-flight Run like the product pin; a fetch/verify
+        failure logs, emits, and retries next pass (control-side escalates
+        persistence)."""
+        if self._update_done or self._drivers_attempted:
+            return  # a product re-exec is imminent, or already tried this pass
+        desired = str(self._desired.get("drivers_hash", "") or "")
+        current = self._current_drivers_hash()
+        if desired == current:
+            self._drivers_blocker = None
+            return
+        blocker = self._inflight_blocker(None)
+        if blocker is not None:
+            # The node keeps reporting the old hash and stays ineligible; the
+            # Run finishes, then convergence applies (log once per blocker).
+            if self._drivers_blocker != blocker:
+                self._log(f"config distribution {desired[:12] or '(none)'} deferred ({blocker})")
+            self._drivers_blocker = blocker
+            return
+        self._drivers_blocker = None
+        if desired and self._client is None:
+            return  # cache-only: cannot fetch a new distribution
+        self._drivers_attempted = True
+        try:
+            if desired:
+                self._apply_config_dist(desired, current)
+            else:
+                self._retire_config_dist(current)
+        except Exception as exc:
+            self._log(f"config distribution {desired[:12] or '(none)'} failed: {exc}")
+            self._emit_error(
+                type(exc).__name__,
+                f"config distribution {desired[:12] or '(none)'} apply failed: {exc}",
+            )
 
     # -- reconciliation ---------------------------------------------------------------
 

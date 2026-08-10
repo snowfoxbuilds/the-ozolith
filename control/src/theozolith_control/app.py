@@ -26,13 +26,14 @@ import contextlib
 import hmac
 import json
 import os
+import re
 import tempfile
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from theozolith_control import controltoml, joinstring, product, tls
+from theozolith_control import configdist, controltoml, joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
@@ -201,7 +202,14 @@ def create_app(
         # A valid heartbeat settles any stale sightings under this name
         # (e.g. the window between provisioning and the first heartbeat).
         store.clear_unregistered(node)
-        store.touch_node(node, str(body.get("version", "")))
+        reported_drivers = str(body.get("drivers_hash", ""))
+        reported_built_against = str(body.get("drivers_built_against", ""))
+        store.touch_node(
+            node,
+            str(body.get("version", "")),
+            drivers_hash=reported_drivers,
+            drivers_built_against=reported_built_against,
+        )
         store.record_status(
             node,
             _list_of_dicts(body, "stacks"),
@@ -251,6 +259,28 @@ def create_app(
                     ),
                 }
             )
+        # Config-distribution convergence watch (ADR-0042): the exact analog of
+        # the pin watch — keyed on the REPORTED drivers-hash, same restart-then-
+        # error ladder, same knob. The reference desired hash rode config_doc.
+        desired_drivers = str(config_doc.get("drivers_hash") or "")
+        drivers_action = store.observe_drivers(
+            node, reported_drivers, desired_drivers, settings.offpin_beats
+        )
+        if drivers_action == "escalated":
+            store.record_event(
+                {
+                    "type": EVENT_ERROR,
+                    "node": node,
+                    "component": "control-node",
+                    "error_class": "config-dist-not-converging",
+                    "message": (
+                        f"node {node} still reports config distribution"
+                        f" {reported_drivers or '(none)'} after a restart; the"
+                        f" deployment is {desired_drivers} — the node stays ineligible"
+                        " for dispatch until a human intervenes"
+                    ),
+                }
+            )
         return {
             "commands": store.pending_commands(node),
             "config": config_doc,
@@ -293,19 +323,29 @@ def create_app(
         # The pin-eligibility gate (ADR-0015 revision) needs the recorded
         # pin. Fail-open on a broken Config Repo: an unreadable repo must
         # not silence dispatch — it is loudly visible everywhere else.
+        # The same fail-open-on-broken-repo posture covers the config-
+        # distribution gate (ADR-0042): an unreadable repo must not silence
+        # dispatch — it is loudly visible everywhere else.
         try:
-            pin = _config().product_version
+            config = _config()
+            pin = config.product_version
+            drivers_hash = config.drivers_hash
         except HTTPException:
             pin = ""
+            drivers_hash = ""
         # Off the event loop: the grant path does real GitHub round-trips
         # (with rate-limit sleeps) that must never stall heartbeats or the
         # terminal websockets. The dispatcher's own lock still serializes.
         if role == "implementer":
             return await asyncio.to_thread(
-                lambda: dispatcher.grant_work(worker, node, login, pin=pin)
+                lambda: dispatcher.grant_work(
+                    worker, node, login, pin=pin, drivers_hash=drivers_hash
+                )
             )
         return await asyncio.to_thread(
-            lambda: dispatcher.review_targets(worker, node, login, pin=pin)
+            lambda: dispatcher.review_targets(
+                worker, node, login, pin=pin, drivers_hash=drivers_hash
+            )
         )
 
     @app.post("/api/v1/secrets/pull")
@@ -561,6 +601,55 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"no artifact {filename} for {version}")
         return FileResponse(path, media_type="application/octet-stream")
 
+    def _config_built_against() -> str:
+        """The product version a config-distribution artifact is stamped with
+        (ADR-0042): the recorded pin when set, else control's own installed
+        version. Advisory only — the stamp never gates anything."""
+        pin = product.read_pin(settings.config_repo)
+        if pin:
+            return pin
+        # No pin recorded yet: control's own stamped version (a source build
+        # stamps __version__ alongside the pin bump, so this matches the wheel).
+        from theozolith_control import __version__
+
+        return __version__
+
+    @app.get("/api/v1/config/artifacts/{drivers_hash}")
+    async def pull_config_artifact(drivers_hash: str, request: Request):
+        """Serve the config distribution by hash (ADR-0042). Node-authenticated;
+        the hash is validated stricter than ``safe_segment``. Serve the cached
+        ``<hash>.zip`` if present, else build on demand from the current working
+        Config Repo — if the built hash differs from the requested one the repo
+        moved on, so answer 409 (converge to the fresh hash next heartbeat),
+        never 500. There is no PUT twin: control packages from its own repo."""
+        _node_auth(request)
+        if not re.fullmatch(r"[0-9a-f]{64}", drivers_hash):
+            raise HTTPException(
+                status_code=400, detail="drivers_hash must be 64 lowercase hex chars"
+            )
+        cached = settings.config_artifacts_dir / f"{drivers_hash}.zip"
+        if cached.is_file():
+            return FileResponse(cached, media_type="application/zip")
+        try:
+            built, path = configdist.build_artifact(
+                settings.config_repo,
+                settings.config_artifacts_dir,
+                built_against=_config_built_against(),
+            )
+        except configdist.ConfigDistError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"config distribution build failed: {exc}"
+            ) from exc
+        if built != drivers_hash or path is None:
+            # The working repo no longer packages to this hash — no background
+            # build machinery, convergence by retry (ADR-0042).
+            raise HTTPException(
+                status_code=409,
+                detail="config distribution changed; converge to the hash on the next heartbeat",
+            )
+        configdist.prune_config_artifacts(settings.config_artifacts_dir, keep=2)
+        return FileResponse(path, media_type="application/zip")
+
     @app.post("/api/v1/nodes/{node}/quarantine/release")
     async def unquarantine(node: str, request: Request) -> dict[str, Any]:
         _authorize(request, settings.admin_token, "admin")
@@ -583,6 +672,9 @@ def create_app(
             # API consumer needs no Config Repo or cache.db access.
             "now": store.now(),
             "product_pin": config.product_version or None,
+            # The recorded config-distribution hash (ADR-0042), null when no
+            # drivers/ — the off-hash convergence input for the read models.
+            "config_drivers_hash": config.drivers_hash or None,
             # M9 (ADR-0040): entries carry the Stack's attach argv and its
             # non-secret env declarations too — the Operator TUI resolves
             # attach commands and the Run timeout budget client-side. This
@@ -664,6 +756,10 @@ def create_app(
             "janitor_actions": store.janitor_actions(),
             "malformed_states": store.malformed_states(),
             "quarantines": store.quarantines(),
+            # Advisory config-distribution stamp skew (ADR-0042): a node's
+            # applied distribution was built against a product version other
+            # than the one it now runs. Never a health downgrade — surfaced.
+            "drivers_skew": store.drivers_skew(),
         }
 
     # -- the web surface: dashboard, secret form, terminal (M4) ---------------

@@ -34,6 +34,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
     name TEXT PRIMARY KEY,
     version TEXT NOT NULL DEFAULT '',
+    -- Reported config-distribution convergence (ADR-0042): the drivers-hash the
+    -- node last applied ('' = none), and the product version that artifact was
+    -- built against (advisory stamp skew, never a health downgrade).
+    drivers_hash TEXT NOT NULL DEFAULT '',
+    drivers_built_against TEXT NOT NULL DEFAULT '',
     registered_at REAL NOT NULL,
     last_seen REAL NOT NULL
 );
@@ -247,6 +252,15 @@ CREATE TABLE IF NOT EXISTS version_health (
     restart_queued INTEGER NOT NULL DEFAULT 0,
     escalated INTEGER NOT NULL DEFAULT 0
 );
+-- Config-distribution convergence tracking (ADR-0042): the exact analog of
+-- version_health for the drivers-hash — consecutive off-hash heartbeats per
+-- node, a row only while off-hash. Same escalation ladder, same knob.
+CREATE TABLE IF NOT EXISTS drivers_health (
+    node TEXT PRIMARY KEY,
+    offpin_beats INTEGER NOT NULL DEFAULT 0,
+    restart_queued INTEGER NOT NULL DEFAULT 0,
+    escalated INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Tables of earlier schema generations, dropped on open: the advisory
@@ -328,6 +342,10 @@ class Store:
         (ADR-0016), so dropped tables lose nothing durable."""
         for table in _DROPPED_TABLES:
             self._db.execute(f"DROP TABLE IF EXISTS {table}")
+        node_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(nodes)")}
+        for column in ("drivers_hash", "drivers_built_against"):  # ADR-0042
+            if column not in node_columns:
+                self._db.execute(f"ALTER TABLE nodes ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         present = {r["name"] for r in self._db.execute("PRAGMA table_info(commands)")}
         for column, decl in (
             ("force", "INTEGER NOT NULL DEFAULT 0"),
@@ -390,14 +408,33 @@ class Store:
 
     # -- nodes and heartbeat status ----------------------------------------
 
-    def touch_node(self, name: str, version: str = "") -> None:
+    def touch_node(
+        self,
+        name: str,
+        version: str = "",
+        *,
+        drivers_hash: str = "",
+        drivers_built_against: str = "",
+    ) -> None:
         now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO nodes (name, version, registered_at, last_seen)"
-                " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT (name) DO UPDATE SET last_seen = ?, version = ?",
-                (name, version, now, now, now, version),
+                "INSERT INTO nodes (name, version, drivers_hash, drivers_built_against,"
+                " registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (name) DO UPDATE SET last_seen = ?, version = ?,"
+                " drivers_hash = ?, drivers_built_against = ?",
+                (
+                    name,
+                    version,
+                    drivers_hash,
+                    drivers_built_against,
+                    now,
+                    now,
+                    now,
+                    version,
+                    drivers_hash,
+                    drivers_built_against,
+                ),
             )
 
     def node_last_seen(self, name: str) -> float | None:
@@ -411,6 +448,34 @@ class Store:
             row = self._db.execute("SELECT version FROM nodes WHERE name = ?", (name,)).fetchone()
         return row["version"] if row else ""
 
+    def node_drivers_hash(self, name: str) -> str:
+        """The last heartbeat-reported config-distribution hash ('' when unknown
+        or none applied) — the dispatch gate's off-hash input (ADR-0042)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT drivers_hash FROM nodes WHERE name = ?", (name,)
+            ).fetchone()
+        return row["drivers_hash"] if row else ""
+
+    def drivers_skew(self) -> list[dict[str, Any]]:
+        """Advisory stamp skew (ADR-0042): nodes whose applied distribution was
+        built against a product version other than the one they now run. Both
+        non-empty and different — never a health downgrade, surfaced only."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name, version, drivers_built_against FROM nodes"
+                " WHERE drivers_built_against != '' AND version != ''"
+                " AND drivers_built_against != version ORDER BY name"
+            ).fetchall()
+        return [
+            {
+                "node": r["name"],
+                "built_against": r["drivers_built_against"],
+                "product_version": r["version"],
+            }
+            for r in rows
+        ]
+
     def observe_version(self, node: str, reported: str, pin: str, threshold: int) -> str | None:
         """Track pin convergence per heartbeat (revision ruling amending
         ADR-0015). On-pin (or no pin / no report): reset. Off-pin: count;
@@ -418,38 +483,51 @@ class Store:
         command; still off-pin ``threshold`` beats after that, mark the
         node escalated (the caller emits the theozolith.error event).
         Returns the action taken: None | "restart-queued" | "escalated"."""
+        return self._observe_convergence("version_health", node, reported, pin, threshold)
+
+    def observe_drivers(self, node: str, reported: str, desired: str, threshold: int) -> str | None:
+        """Track config-distribution convergence per heartbeat (ADR-0042): the
+        exact analog of ``observe_version`` for the drivers-hash. Reuses the
+        same restart ladder and the same ``offpin_beats`` knob — one concept,
+        convergence patience. Returns None | "restart-queued" | "escalated"."""
+        return self._observe_convergence("drivers_health", node, reported, desired, threshold)
+
+    def _observe_convergence(
+        self, table: str, node: str, reported: str, desired: str, threshold: int
+    ) -> str | None:
+        """The shared convergence ladder over a ``(node, offpin_beats,
+        restart_queued, escalated)`` health table (version_health /
+        drivers_health): reset on match / no desired / no report; count
+        otherwise; queue one restart at ``threshold``; mark escalated at
+        ``2 * threshold``. ``table`` is a fixed module constant, never input."""
         with self._lock, self._db:
-            if not pin or not reported or reported == pin:
-                self._db.execute("DELETE FROM version_health WHERE node = ?", (node,))
+            if not desired or not reported or reported == desired:
+                self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
                 return None
             self._db.execute(
-                "INSERT INTO version_health (node, offpin_beats) VALUES (?, 0)"
+                f"INSERT INTO {table} (node, offpin_beats) VALUES (?, 0)"
                 " ON CONFLICT (node) DO NOTHING",
                 (node,),
             )
             self._db.execute(
-                "UPDATE version_health SET offpin_beats = offpin_beats + 1 WHERE node = ?",
+                f"UPDATE {table} SET offpin_beats = offpin_beats + 1 WHERE node = ?",
                 (node,),
             )
-            row = self._db.execute(
-                "SELECT * FROM version_health WHERE node = ?", (node,)
-            ).fetchone()
+            row = self._db.execute(f"SELECT * FROM {table} WHERE node = ?", (node,)).fetchone()
             if not row["restart_queued"] and row["offpin_beats"] >= threshold:
                 self._db.execute(
                     "INSERT INTO commands (node, verb, target, force, created_at)"
                     " VALUES (?, 'restart', NULL, 0, ?)",
                     (node, self._clock()),
                 )
-                self._db.execute(
-                    "UPDATE version_health SET restart_queued = 1 WHERE node = ?", (node,)
-                )
+                self._db.execute(f"UPDATE {table} SET restart_queued = 1 WHERE node = ?", (node,))
                 return "restart-queued"
             if (
                 row["restart_queued"]
                 and not row["escalated"]
                 and row["offpin_beats"] >= 2 * threshold
             ):
-                self._db.execute("UPDATE version_health SET escalated = 1 WHERE node = ?", (node,))
+                self._db.execute(f"UPDATE {table} SET escalated = 1 WHERE node = ?", (node,))
                 return "escalated"
             return None
 

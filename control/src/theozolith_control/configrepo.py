@@ -43,8 +43,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from theozolith_control import configdist
+
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
+
+# Repo-relative prefixes that are git-native only (ADR-0042): Config Repo write
+# access equals code execution with driver credentials on nodes, so drivers/ is
+# never touched by the web UI or any future config editor — edited in git only.
+GIT_NATIVE_ONLY = ("drivers/",)
 
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
 # supervised command each resolves to control-side. Every builtin runs through
@@ -78,6 +85,26 @@ ATTACH_PLACEHOLDERS = (ATTACH_HOST, ATTACH_CONTAINER)
 
 class ConfigRepoError(RuntimeError):
     """A Config Repo file does not parse or violates the format."""
+
+
+def refuse_ui_write(relpath: str) -> None:
+    """The git-native-only guard (ADR-0042). CONTRACT: any future config editor
+    MUST call this on every repo-relative path it would write, BEFORE writing —
+    a path under ``drivers/`` raises ``ConfigRepoError``. The web UI and any
+    config editor never touch ``drivers/``; that code is edited in git only,
+    because a Config Repo write there is code execution on every node. There is
+    no general repo editor today (only fixed-filename allow-list writers for
+    control.toml and product.toml), so this is the standing constraint the next
+    one inherits."""
+    normalized = relpath.replace("\\", "/").lstrip("/")
+    for prefix in GIT_NATIVE_ONLY:
+        bare = prefix.rstrip("/")
+        if normalized == bare or normalized.startswith(prefix):
+            raise ConfigRepoError(
+                f"{relpath!r} is under a git-native-only path ({prefix}) — driver"
+                " code is never editable through the web UI or a config editor;"
+                " edit it in git (ADR-0042)"
+            )
 
 
 @dataclass(frozen=True)
@@ -218,6 +245,9 @@ class DeployConfig:
     stacks: tuple[StackDef, ...]  # worker-type Stacks already resolved to concrete
     worker_types: dict[str, WorkerTypeDef]
     product_version: str = ""
+    # The recorded config-distribution hash (ADR-0042): "" = no drivers/. Only
+    # this reference rides the channel; the artifact is pulled by hash.
+    drivers_hash: str = ""
     repo_dir: Path | None = None
 
     def stacks_for(self, node: str) -> list[StackDef]:
@@ -264,6 +294,9 @@ class DeployConfig:
         return {
             "commit": self.commit,
             "product_version": self.product_version,
+            # Always present; "" = no config distribution (ADR-0042). Only the
+            # reference rides the channel — the node pulls the artifact by hash.
+            "drivers_hash": self.drivers_hash,
             "stacks": [stack.as_wire(self._compose_files(stack)) for stack in stacks],
             "images": [
                 self.worker_types[name].recipe_wire()
@@ -641,9 +674,14 @@ def _commit(repo_dir: Path) -> str:
         )
         if proc.returncode == 0:
             return proc.stdout.strip()
+    # Folder mode: hash ALL regular files, not just *.toml — a drivers/*.py edit
+    # in a non-git configs folder must bump the commit so nodes see the change
+    # (ADR-0042). The exclusion predicate is shared with the drivers manifest
+    # (one source of truth for what counts as content). Existing folder-mode
+    # commits jump once when this lands: a harmless single ripple.
     digest = hashlib.sha256()
-    for path in sorted(repo_dir.rglob("*.toml")):
-        digest.update(path.as_posix().encode())
+    for path in configdist.regular_files(repo_dir):
+        digest.update(path.relative_to(repo_dir).as_posix().encode())
         digest.update(path.read_bytes())
     return f"folder-{digest.hexdigest()[:12]}"
 
@@ -683,5 +721,6 @@ def load_config(repo_dir: Path) -> DeployConfig:
         stacks=stacks,
         worker_types=worker_types,
         product_version=product_version,
+        drivers_hash=configdist.drivers_hash(repo_dir),
         repo_dir=repo_dir,
     )

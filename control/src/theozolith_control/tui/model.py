@@ -82,16 +82,18 @@ def ago(seconds: float) -> str:
 @dataclass(frozen=True)
 class NodeRow:
     name: str
-    health: str  # quarantined | stale | off-pin | ok
+    health: str  # quarantined | stale | off-pin | off-hash | ok
     version: str
     last_seen: str  # rendered age (server clock)
     quarantine_reason: str = ""
 
 
 def node_rows(state: dict[str, Any]) -> list[NodeRow]:
-    """One row per node, health at ADR-0039's per-row precedence."""
+    """One row per node, health at ADR-0039's per-row precedence, extended by
+    ADR-0042: quarantined > stale > off-pin > off-hash > ok."""
     now = float(state.get("now") or 0.0)
     pin = state.get("product_pin")
+    drivers_hash = state.get("config_drivers_hash")
     quarantined = {
         r.get("node"): str(r.get("reason") or "unspecified")
         for r in state.get("node_health") or []
@@ -102,12 +104,15 @@ def node_rows(state: dict[str, Any]) -> list[NodeRow]:
         name = str(node.get("name") or "")
         age = now - float(node.get("last_seen") or 0.0)
         version = str(node.get("version") or "")
+        reported_hash = str(node.get("drivers_hash") or "")
         if name in quarantined:
             health = "quarantined"
         elif age > STALE_AFTER_SECONDS:
             health = "stale"
         elif pin and version and version != pin:
             health = "off-pin"
+        elif drivers_hash and reported_hash and reported_hash != drivers_hash:
+            health = "off-hash"
         else:
             health = "ok"
         rows.append(
