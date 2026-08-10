@@ -506,7 +506,10 @@ distinct per-instance volumes):
 | `<stack>-claude-state` | `/home/ozolith/.claude` | **one per Flight Deck** — runtime state (sessions, transcripts, `--resume`); never shared, never worker-visible |
 | `knowledge-<worker-type>` | `/home/ozolith/knowledge` | **one per worker type per node** — the shared knowledge clone; siblings of the type mount the same name |
 | `<stack>-logs` | `/var/log/flightdeck` | one per Flight Deck |
-| one more `<stack>-…` volume | — | one per Flight Deck — the one-hop remote-access machine identity (see `configs-example/README.md`) |
+
+(One-hop remote access into a Flight Deck — and the per-instance machine-identity
+volume it will add — is split out and tracked separately; see
+`configs-example/README.md` for status and the ways in today.)
 
 **Knowledge is a live symlinked clone, not a bake.** At start the Flight Deck
 runs `theozolith-knowledge clone-init` to materialize the shared clone on the
@@ -536,8 +539,11 @@ cd ~/knowledge && git add -A && git commit && git push && git rev-parse HEAD
 ```
 
 **Cross-node** transport is plain git, human-driven — there is **no auto-sync
-daemon, ever**. To move uncommitted scratch to another node, attach that node's
-Flight Deck of the same type and `git pull` there.
+daemon, ever**. Only pushed commits travel: in the source Flight Deck, commit
+and push (to `main` or an authoring branch), then attach the other node's
+Flight Deck of the same type and `git pull` (or fetch/checkout the authoring
+branch) there. **Uncommitted scratch stays node-local** — `git pull` cannot
+carry it, and nothing else moves it for you.
 
 **Warnings.**
 

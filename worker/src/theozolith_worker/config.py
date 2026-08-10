@@ -13,9 +13,12 @@ git config at clone/fetch/push time only (see ``gitops.auth_env``).
 from __future__ import annotations
 
 import os
+import posixpath
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from theozolith_worker import jobdir
 
 
 class ConfigError(RuntimeError):
@@ -65,14 +68,42 @@ def _float(environ: Mapping[str, str], *names: str, default: str) -> float:
         raise ConfigError(f"{names[0]} must be a number, got {raw!r}") from exc
 
 
+# Container trees holding a Claude configuration a Run must never persist:
+# the home-scoped ~/.claude, and the project-scoped .claude of both session
+# workspaces inside the mounted job dir. A cache volume mounted at any of
+# these — or at any ANCESTOR (/, /home, /home/ozolith, /job, ...) — would
+# carry the tree across Runs on a persistent named volume.
+_PROTECTED_CLAUDE_TREES = (
+    "/home/ozolith/.claude",
+    f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.CHECKOUT_DIR}/.claude",
+    f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.WORK_DIR}/.claude",
+)
+
+
+def _normalize_container_path(path: str) -> str:
+    """Lexically normalize a container-side POSIX path, mirroring what the
+    engine does with a mount destination (docker runs filepath.Clean on it):
+    collapse ``//`` and ``/./``, resolve ``..`` segments."""
+    norm = posixpath.normpath(path)
+    if norm.startswith("//"):  # POSIX normpath preserves exactly two leading /
+        norm = norm[1:]
+    return norm
+
+
 def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
     """Parse ``name:/path,name:/path`` into named-volume mounts.
 
-    A cache volume whose container path carries a ``.claude`` segment is
-    refused (ADR-0043): live knowledge must never mount into a Run — it breaks
-    pin reproducibility and opens a prompt-injection persistence channel. The
+    A cache volume that would persist a Claude configuration tree is refused
+    (ADR-0043): live knowledge must never mount into a Run — it breaks pin
+    reproducibility and opens a prompt-injection persistence channel. The
     shared-clone symlink carve-out is Flight-Deck-only; this closes the one
     config-reachable channel that could reintroduce it on a run container.
+    Destinations are normalized first (the engine mounts the cleaned path, so
+    ``/home//ozolith/./.claude`` and ``/home/ozolith/.claude`` are the same
+    mount), then refused when any path segment is ``.claude`` (the tree itself
+    or anything below it) or when the mount is an ancestor that would sweep a
+    protected ``.claude`` tree onto the volume (``/home/ozolith``, ``/home``,
+    ``/job``, ``/`` — the home- and workspace-scoped trees alike).
     """
     pairs = []
     for item in raw.split(","):
@@ -82,13 +113,26 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
         name, sep, path = item.partition(":")
         if not sep or not name or not path.startswith("/"):
             raise ConfigError(f"THEOZOLITH_CACHE_VOLUMES entry {item!r} is not name:/path")
-        if ".claude" in path.split("/"):
+        dest = _normalize_container_path(path)
+        if ".claude" in dest.split("/"):
             raise ConfigError(
                 f"THEOZOLITH_CACHE_VOLUMES entry {item!r} targets a .claude path —"
                 " live knowledge must never mount into a Run (ADR-0043); the"
                 " shared-clone symlink carve-out is Flight-Deck-only"
             )
-        pairs.append((name, path))
+        covered = [
+            tree
+            for tree in _PROTECTED_CLAUDE_TREES
+            if tree == dest or tree.startswith(dest.rstrip("/") + "/")
+        ]
+        if covered:
+            raise ConfigError(
+                f"THEOZOLITH_CACHE_VOLUMES entry {item!r} mounts an ancestor of the"
+                f" protected .claude tree {covered[0]!r} — a persistent volume there"
+                " would carry a Claude configuration across Runs (ADR-0043); the"
+                " shared-clone symlink carve-out is Flight-Deck-only"
+            )
+        pairs.append((name, dest))
     return tuple(pairs)
 
 

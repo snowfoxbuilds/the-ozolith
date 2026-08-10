@@ -12,14 +12,7 @@ state = "running"
 # a structured argv array ({host}/{container} only as complete arguments,
 # validated before launch). Attach and detach are audit-logged. `attach`
 # lives on the Stack (a per-placement operator concern), and is only valid
-# because the resolved kind is container.
+# because the resolved kind is container. (One-hop remote access is tracked
+# as issue #31, gated on the issue #24 privilege spike; until it lands this
+# two-hop attach and the web terminal are the ways in.)
 attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]
-
-# Per-placement Stack env (ADR-0043). One Stack file per Flight Deck (no
-# templating), so the tailnet hostname is a literal here. Convention:
-# `flightdeck-<name>` — the name you reach in ONE hop as
-# `ssh ozolith@flightdeck-box1` and via VSCode Remote-SSH (see
-# deploy/configs-example/README.md). The worker type owns everything else; the
-# `{stack}` volume placeholders resolve to this Stack's own name (`flightdeck`).
-[env]
-FLIGHTDECK_TS_HOSTNAME = "flightdeck-box1"
