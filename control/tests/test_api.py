@@ -836,6 +836,87 @@ def test_cached_artifact_with_bad_crc_is_repaired_not_500(control: ControlRig):
         assert recomputed == digest
 
 
+def test_cached_artifact_with_invalid_utf8_metadata_is_repaired_not_500(control: ControlRig):
+    """A cached <hash>.zip whose drivers tree is intact but whose
+    ``config-dist.json`` member decays into invalid UTF-8 is discarded and
+    rebuilt on the next pull — a normalized ConfigDistError inside
+    verification, never a leaked UnicodeDecodeError surfacing as a 500
+    (ADR-0042 amendment)."""
+    import io
+    import zipfile
+
+    import pytest
+    from theozolith_control import configdist
+
+    digest = _write_driver(control)
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    first = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+    assert first.status_code == 200
+    cached = control.settings.config_artifacts_dir / f"{digest}.zip"
+    # Rewrite the cache entry keeping every drivers member byte-identical but
+    # replacing the metadata member with invalid UTF-8.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(cached.read_bytes())) as src, zipfile.ZipFile(buf, "w") as dst:
+        for info in src.infolist():
+            if info.filename == configdist.ARTIFACT_METADATA:
+                dst.writestr(info, b"\xff\xfe not utf-8 {")
+            else:
+                dst.writestr(info, src.read(info))
+    cached.write_bytes(buf.getvalue())
+    # The poison is real, and it normalizes (never UnicodeDecodeError).
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact(cached)
+    # Repeated pulls each recover: valid 200s, and the repaired cache verifies.
+    for _ in range(2):
+        again = control.client.get(f"/api/v1/config/artifacts/{digest}", headers=headers)
+        assert again.status_code == 200
+        recomputed, _ = configdist.verify_artifact(cached)
+        assert recomputed == digest
+
+
+def test_concurrent_builds_and_prunes_settle_to_keep_two(control: ControlRig):
+    """Concurrent pulls that build a THIRD hash race the keep-two prune (and
+    each other's prunes): every response is a valid verified artifact, nothing
+    500s because a candidate vanished mid-prune, and once the churn settles the
+    cache holds exactly the two newest distributions (ADR-0042 amendment)."""
+    import os
+
+    from theozolith_control import configdist
+
+    headers = {"Authorization": f"Bearer {control.node_token()}"}
+    cache = control.settings.config_artifacts_dir
+    digest_a = _write_driver(control, "v = 1\n")
+    seeded = control.client.get(f"/api/v1/config/artifacts/{digest_a}", headers=headers)
+    assert seeded.status_code == 200
+    digest_b = _write_driver(control, "v = 2\n")
+    seeded = control.client.get(f"/api/v1/config/artifacts/{digest_b}", headers=headers)
+    assert seeded.status_code == 200
+    now = cache.stat().st_mtime
+    os.utime(cache / f"{digest_a}.zip", (now - 100, now - 100))
+    os.utime(cache / f"{digest_b}.zip", (now - 50, now - 50))
+    digest_c = _write_driver(control, "v = 3\n")
+    results: list[tuple[int, bytes]] = []
+    lock = threading.Lock()
+
+    def pull() -> None:
+        r = control.client.get(f"/api/v1/config/artifacts/{digest_c}", headers=headers)
+        with lock:
+            results.append((r.status_code, r.content))
+
+    threads = [threading.Thread(target=pull) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results and all(status == 200 for status, _ in results)
+    for _, content in results:
+        recomputed, _ = configdist.verify_artifact_bytes(content)
+        assert recomputed == digest_c
+    # Churn settled: exactly the two newest survive the racing keep-two prunes.
+    zips = sorted(p.name for p in cache.iterdir() if p.suffix == ".zip")
+    assert zips == sorted(f"{d}.zip" for d in (digest_b, digest_c))
+
+
 def test_concurrent_pulls_do_not_tear_the_cache(control: ControlRig):
     """Cache publication is atomic (tempfile + os.replace), so concurrent pulls
     for the same hash each get a COMPLETE, valid artifact that recomputes to the

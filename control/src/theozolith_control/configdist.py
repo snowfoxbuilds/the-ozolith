@@ -28,6 +28,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import zipfile
 import zlib
@@ -315,6 +316,50 @@ def artifact_structure_error(names: list[str]) -> str | None:
     return None
 
 
+def validate_metadata_bytes(raw: bytes, recomputed: str) -> dict[str, Any]:
+    """Validate the complete ``config-dist.json`` envelope against a tree hash
+    that was INDEPENDENTLY recomputed over the unpacked content: the bytes must
+    decode as UTF-8, parse as JSON, decode to an object, carry ``format`` equal
+    to ``ARTIFACT_FORMAT`` (a JSON ``true`` is not the integer 1), and carry a
+    STRING ``drivers_hash`` equal to ``recomputed`` — the metadata never proves
+    content, content proves the metadata (ADR-0042). Mirror of
+    ``theozolith_nodedaemon.configdist.validate_metadata_bytes`` (pinned by the
+    cross-package contract tests): control validates before publishing or
+    serving, the node independently before stopping any live driver.
+
+    Every data-format failure — invalid UTF-8, malformed or pathologically
+    nested JSON, a scalar/array instead of an object, a wrong format, an
+    absent/non-string/mismatching hash — raises ``ConfigDistError`` and only
+    ConfigDistError. ``built_against`` is NOT validated: it is advisory
+    (ADR-0042), so a missing or non-string stamp is the caller's empty state,
+    never a rejection."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigDistError(f"config distribution metadata is not valid UTF-8: {exc}") from exc
+    try:
+        metadata = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError covers a hostile deeply-nested document — a data-format
+        # failure like any other malformed metadata, not a programming error.
+        raise ConfigDistError(f"config distribution metadata is not valid JSON: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ConfigDistError("config distribution metadata is not an object")
+    declared_format = metadata.get("format")
+    if isinstance(declared_format, bool) or declared_format != ARTIFACT_FORMAT:
+        raise ConfigDistError(
+            f"config distribution metadata format {declared_format!r} is not {ARTIFACT_FORMAT}"
+        )
+    declared = metadata.get("drivers_hash")
+    if not isinstance(declared, str) or declared != recomputed:
+        raise ConfigDistError(
+            "config distribution metadata drivers_hash"
+            f" {str(declared)[:12]!r} does not match the unpacked tree's recomputed"
+            f" hash {recomputed[:12] or '(empty)'}"
+        )
+    return metadata
+
+
 def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
     """``verify_artifact_bytes`` over the file's contents: read the archive
     into an immutable byte snapshot, then verify that. An unreadable file is
@@ -341,11 +386,12 @@ def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
     artifact can be unpublishable: the bytes are not a valid zip; the member
     list fails the structural rule (``artifact_structure_error``); a member's
     bytes cannot be read (bad CRC, corrupt compression, encryption); extraction
-    hits a filesystem error; the metadata member is missing, unreadable, or
-    malformed; ``format`` is not the current artifact format; or the metadata's
-    ``drivers_hash`` does not equal the tree's recomputed hash. Programming
-    errors outside these failure modes are NOT caught. ``built_against`` is not
-    checked — it is advisory (ADR-0042)."""
+    hits a filesystem error; or the metadata member is missing, unreadable, or
+    fails the complete envelope rule (``validate_metadata_bytes``: invalid
+    UTF-8, malformed JSON, a non-object, a wrong ``format``, an absent,
+    non-string, or mismatching ``drivers_hash``). Programming errors outside
+    these failure modes are NOT caught. ``built_against`` is not checked — it
+    is advisory (ADR-0042)."""
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except (OSError, zipfile.BadZipFile) as exc:
@@ -385,43 +431,54 @@ def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
                     f"config distribution member {info.filename!r} cannot be extracted: {exc}"
                 ) from exc
         recomputed = drivers_hash(root)
+        # The metadata is read as BYTES and validated by the shared envelope
+        # rule — decoding is part of validation, so invalid UTF-8 is a
+        # ConfigDistError like any other malformed metadata, never a leaked
+        # UnicodeDecodeError (ADR-0042).
         meta_path = root / ARTIFACT_METADATA
         try:
-            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            raw_metadata = meta_path.read_bytes()
+        except OSError as exc:
             raise ConfigDistError(f"config distribution metadata is unreadable: {exc}") from exc
-    if not isinstance(metadata, dict):
-        raise ConfigDistError("config distribution metadata is not an object")
-    if metadata.get("format") != ARTIFACT_FORMAT:
-        raise ConfigDistError(
-            f"config distribution metadata format {metadata.get('format')!r} is not"
-            f" {ARTIFACT_FORMAT}"
-        )
-    if metadata.get("drivers_hash") != recomputed:
-        raise ConfigDistError(
-            "config distribution metadata drivers_hash"
-            f" {str(metadata.get('drivers_hash'))[:12]!r} does not match the unpacked"
-            f" tree's recomputed hash {recomputed[:12] or '(empty)'}"
-        )
-    return recomputed, metadata
+    return recomputed, validate_metadata_bytes(raw_metadata, recomputed)
 
 
 def prune_config_artifacts(out_dir: Path, keep: int = 2) -> list[str]:
     """Cache, not archive (ADR-0024): keep at most the ``keep`` most recently
     built ``<hash>.zip`` files (the current and the previous distribution).
-    Returns the pruned filenames."""
+    Returns the pruned filenames.
+
+    LOCK-FREE and disappearance-tolerant (ADR-0042): the cache churns under
+    concurrent publication, replacement, and other pruners, so an entry that
+    vanishes between enumeration and its metadata lookup — or between selection
+    and its unlink — is ordinary concurrent churn (another request already
+    replaced or removed it), never an error. Sort metadata is collected with
+    per-entry OSError handling, and stale-survivor deletions suppress OSError
+    the same way; nothing here can fail an otherwise valid artifact response.
+    Ties on mtime break by name, so survivors are deterministic for any fixed
+    directory state."""
     out_dir = Path(out_dir)
-    if not out_dir.is_dir():
-        return []
-    zips = [
-        p
-        for p in out_dir.iterdir()
-        if p.is_file() and p.suffix == ".zip" and not p.name.startswith(".")
-    ]
-    zips.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    try:
+        candidates = list(out_dir.iterdir())
+    except OSError:
+        return []  # the cache dir is missing or unreadable — nothing to prune
+    entries: list[tuple[float, str]] = []
+    for path in candidates:
+        if path.name.startswith(".") or path.suffix != ".zip":
+            continue
+        try:
+            status = path.stat()
+        except OSError:
+            continue  # vanished since enumeration: concurrent churn, not an error
+        if not stat.S_ISREG(status.st_mode):
+            continue
+        entries.append((status.st_mtime, path.name))
+    entries.sort(key=lambda entry: (-entry[0], entry[1]))
     pruned: list[str] = []
-    for stale in zips[max(0, keep) :]:
-        with contextlib.suppress(OSError):
-            stale.unlink()
-            pruned.append(stale.name)
+    for _, name in entries[max(0, keep) :]:
+        try:
+            (out_dir / name).unlink()
+        except OSError:
+            continue  # another pruner or a replacement got here first
+        pruned.append(name)
     return sorted(pruned)

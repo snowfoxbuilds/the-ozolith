@@ -41,6 +41,7 @@ import os
 import zipfile
 import zlib
 from pathlib import Path
+from typing import Any
 
 DRIVERS_DIR = "drivers"
 
@@ -231,6 +232,75 @@ def artifact_structure_error(names: list[str]) -> str | None:
     if not saw_metadata:
         return f"missing the {ARTIFACT_METADATA} metadata member"
     return None
+
+
+def validate_metadata_bytes(raw: bytes, recomputed: str) -> dict[str, Any]:
+    """Validate the complete ``config-dist.json`` envelope against a tree hash
+    that was INDEPENDENTLY recomputed over the unpacked content: the bytes must
+    decode as UTF-8, parse as JSON, decode to an object, carry ``format`` equal
+    to ``ARTIFACT_FORMAT`` (a JSON ``true`` is not the integer 1), and carry a
+    STRING ``drivers_hash`` equal to ``recomputed`` — the metadata never proves
+    content, content proves the metadata (ADR-0042). Mirror of
+    ``theozolith_control.configdist.validate_metadata_bytes`` (pinned by the
+    cross-package contract tests): control validates before publishing or
+    serving, the node independently before stopping any live driver or
+    exchanging the applied tree.
+
+    Every data-format failure — invalid UTF-8, malformed or pathologically
+    nested JSON, a scalar/array instead of an object, a wrong format, an
+    absent/non-string/mismatching hash — raises ``ConfigDistError`` and only
+    ConfigDistError. ``built_against`` is NOT validated: it is advisory
+    (ADR-0042), so a missing or non-string stamp is the caller's empty state
+    (``advisory_built_against``), never a rejection."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigDistError(f"config distribution metadata is not valid UTF-8: {exc}") from exc
+    try:
+        metadata = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError covers a hostile deeply-nested document — a data-format
+        # failure like any other malformed metadata, not a programming error.
+        raise ConfigDistError(f"config distribution metadata is not valid JSON: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ConfigDistError("config distribution metadata is not an object")
+    declared_format = metadata.get("format")
+    if isinstance(declared_format, bool) or declared_format != ARTIFACT_FORMAT:
+        raise ConfigDistError(
+            f"config distribution metadata format {declared_format!r} is not {ARTIFACT_FORMAT}"
+        )
+    declared = metadata.get("drivers_hash")
+    if not isinstance(declared, str) or declared != recomputed:
+        raise ConfigDistError(
+            "config distribution metadata drivers_hash"
+            f" {str(declared)[:12]!r} does not match the unpacked tree's recomputed"
+            f" hash {recomputed[:12] or '(empty)'}"
+        )
+    return metadata
+
+
+def validate_metadata_tree(dist_root: Path, recomputed: str) -> dict[str, Any]:
+    """``validate_metadata_bytes`` over ``<dist_root>/config-dist.json``. The
+    caller passes the hash it ALREADY recomputed over the same root
+    (``manifest_hash_of_tree``) — the metadata is never trusted as content
+    proof. A missing or unreadable metadata file is ``ConfigDistError`` like
+    every other invalid envelope: an accepted artifact always contains one, so
+    a tree without it is not the product of a verified extraction."""
+    meta_path = Path(dist_root) / ARTIFACT_METADATA
+    try:
+        raw = meta_path.read_bytes()
+    except OSError as exc:
+        raise ConfigDistError(f"config distribution metadata is unreadable: {exc}") from exc
+    return validate_metadata_bytes(raw, recomputed)
+
+
+def advisory_built_against(metadata: dict[str, Any]) -> str:
+    """The advisory ``built_against`` stamp from a VALIDATED envelope: the
+    string value when present, ``""`` otherwise. Missing or non-string stays
+    the advisory empty state — never a failure and never convergence input
+    (ADR-0042)."""
+    built = metadata.get("built_against")
+    return built if isinstance(built, str) else ""
 
 
 def extract_zip(data: bytes, dest: Path) -> None:

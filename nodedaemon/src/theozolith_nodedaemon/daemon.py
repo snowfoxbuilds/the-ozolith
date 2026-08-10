@@ -190,9 +190,12 @@ def _atomic_json(path: Path, data: Any) -> None:
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    # ValueError covers json.JSONDecodeError AND UnicodeDecodeError: a local
+    # state file corrupted into invalid UTF-8 reads as the default, never an
+    # exception that wedges a daemon pass.
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return default
 
 
@@ -263,11 +266,15 @@ class NodeDaemon:
         # The verified applied drivers-hash, memoized for the duration of ONE
         # pass (reset in ``once``). The ``current`` pointer alone is never proof:
         # each pass re-derives the applied hash by recomputing the manifest over
-        # the pointed-at tree (``_verify_applied_drivers``), so a missing tree, a
-        # malformed pointer, or a mutated tree reads as non-converged and is
-        # repaired on the next fetch. None = not yet computed this pass; a swap
-        # or retirement sets it directly to the freshly verified value.
+        # the pointed-at tree AND validating its metadata envelope
+        # (``_verify_applied_drivers``), so a missing tree, a malformed pointer,
+        # a mutated tree, or a malformed config-dist.json reads as non-converged
+        # and is repaired on the next fetch. None = not yet computed this pass; a
+        # swap or retirement sets it directly to the freshly verified value. The
+        # advisory built_against stamp is memoized alongside and is meaningful
+        # only while the hash memo is non-None (read behind _current_drivers_hash).
         self._verified_drivers_hash: str | None = None
+        self._verified_built_against = ""
         # Capped exponential backoff while the Control Node is unreachable.
         self._unreachable_streak = 0
 
@@ -815,42 +822,50 @@ class NodeDaemon:
         what the heartbeat reports and what the swap compares against. The
         ``current`` pointer alone is not proof: the hash is only returned when
         the pointer is well-formed AND its tree exists AND that tree recomputes
-        to the pointer (``_verify_applied_drivers``). Memoized per pass."""
+        to the pointer AND its metadata envelope validates against that
+        recompute (``_verify_applied_drivers``). Memoized per pass."""
         if self._verified_drivers_hash is None:
-            self._verified_drivers_hash = self._verify_applied_drivers()
+            self._verified_drivers_hash, self._verified_built_against = (
+                self._verify_applied_drivers()
+            )
         return self._verified_drivers_hash
 
-    def _verify_applied_drivers(self) -> str:
-        """Recompute-and-verify the applied distribution (ADR-0042). Returns the
-        applied hash only when the ``current`` pointer is a 64-hex value whose
-        tree exists under ``config-dist/<hash>/``, holds ONLY the unpacked
-        artifact shape (``_applied_tree_shape_error``), and recomputes to the
-        pointer; a missing pointer, a malformed value, a missing tree, a rogue
-        or irregular applied-tree entry, an unenumerable subtree, or a
-        recompute mismatch all read as '' (non-converged), so
-        ``_converge_drivers`` refetches and repairs it — while the old verified
-        tree keeps being used until a replacement is fully verified and swapped
-        in. Verification is FAIL CLOSED: ``manifest_hash_of_tree`` raises on
-        symlinks, FIFO/socket/device entries, and enumeration failures rather
-        than silently omitting them, so no unhashed executable entry can
-        coexist with a converged report."""
+    def _verify_applied_drivers(self) -> tuple[str, str]:
+        """Recompute-and-verify the COMPLETE applied artifact (ADR-0042).
+        Returns ``(applied_hash, built_against)``; the hash only when the
+        ``current`` pointer is a 64-hex value whose tree exists under
+        ``config-dist/<hash>/``, holds ONLY the unpacked artifact shape
+        (``_applied_tree_shape_error``), recomputes to the pointer, AND carries
+        a ``config-dist.json`` that passes the full envelope rule against that
+        recompute (``validate_metadata_tree``: UTF-8, JSON object, current
+        format, string drivers_hash equal to the recomputed value). A missing
+        pointer, a malformed value, a missing tree, a rogue or irregular
+        applied-tree entry, an unenumerable subtree, a recompute mismatch, or a
+        malformed metadata envelope all read as ``("", "")`` (non-converged),
+        so ``_converge_drivers`` refetches and repairs it — while the old
+        verified tree keeps being used until a replacement is fully verified
+        and swapped in. Verification is FAIL CLOSED but never raises out of the
+        heartbeat loop: ``manifest_hash_of_tree`` and ``validate_metadata_tree``
+        raise on symlinks, FIFO/socket/device entries, enumeration failures,
+        and every malformed-metadata shape rather than silently skipping them,
+        and every such failure is normalized here to a non-converged report."""
         try:
             pointer = self._config.config_dist_current.read_text(encoding="utf-8").strip()
         except OSError:
-            return ""
+            return "", ""
         if not pointer:
-            return ""
+            return "", ""
         if not re.fullmatch(r"[0-9a-f]{64}", pointer):
             self._log(f"config distribution pointer {pointer[:20]!r} is malformed; not converged")
-            return ""
+            return "", ""
         tree = self._config.config_dist_dir / pointer
         if not tree.is_dir():
             self._log(f"config distribution {pointer[:12]} has no applied tree; not converged")
-            return ""
+            return "", ""
         shape_error = self._applied_tree_shape_error(tree)
         if shape_error is not None:
             self._log(f"config distribution {pointer[:12]} {shape_error}; not converged")
-            return ""
+            return "", ""
         try:
             recomputed = configdist.manifest_hash_of_tree(tree)
         except (OSError, configdist.ConfigDistError) as exc:
@@ -858,14 +873,23 @@ class NodeDaemon:
             # non-converged, so the next pass refetches and repairs it
             # (ADR-0042) — logged so the repair trigger is observable.
             self._log(f"config distribution {pointer[:12]} failed verification: {exc}")
-            return ""
+            return "", ""
         if recomputed != pointer:
             self._log(
                 f"config distribution {pointer[:12]} tree recomputes to"
                 f" {recomputed[:12] or '(empty)'}; not converged"
             )
-            return ""
-        return pointer
+            return "", ""
+        try:
+            metadata = configdist.validate_metadata_tree(tree, recomputed)
+        except (OSError, configdist.ConfigDistError) as exc:
+            # A corrupted/restored tree whose CONTENT recomputes but whose
+            # envelope is malformed is not the complete applied artifact: an
+            # honest non-converged report and a repair trigger, never a wedged
+            # heartbeat (ADR-0042).
+            self._log(f"config distribution {pointer[:12]} metadata failed verification: {exc}")
+            return "", ""
+        return pointer, configdist.advisory_built_against(metadata)
 
     def _applied_tree_shape_error(self, tree: Path) -> str | None:
         """The applied root ``config-dist/<hash>/`` may hold ONLY the unpacked
@@ -898,22 +922,16 @@ class NodeDaemon:
 
     def _current_built_against(self) -> str:
         """The product version the applied distribution was built against, from
-        its ``config-dist.json`` ('' when none). Advisory only, so a missing or
-        unreadable stamp is simply '' — but ``config-dist.json`` is NOT trusted
-        as proof of content: it is only read once the tree has verified, and its
-        ``format`` and ``drivers_hash`` are checked against the verified hash
-        before ``built_against`` is reported (a stale/foreign envelope yields
-        '', never a wrong stamp)."""
-        current = self._current_drivers_hash()
-        if not current:
+        its VALIDATED ``config-dist.json`` ('' when none applied or the stamp is
+        missing/non-string — advisory, never convergence input). The stamp is
+        memoized by the same verification that proved the applied hash
+        (``_verify_applied_drivers`` validates the complete envelope against
+        the recomputed content; the apply path captures it from the staging
+        validation), so this never re-reads disk and CANNOT raise on malformed
+        on-disk data — a corrupted envelope already read as non-converged."""
+        if not self._current_drivers_hash():
             return ""
-        meta = _read_json(self._config.config_dist_dir / current / configdist.ARTIFACT_METADATA, {})
-        if not isinstance(meta, dict):
-            return ""
-        if meta.get("format") != configdist.ARTIFACT_FORMAT or meta.get("drivers_hash") != current:
-            return ""
-        built = meta.get("built_against", "")
-        return built if isinstance(built, str) else ""
+        return self._verified_built_against
 
     def _drivers_stack_names(self) -> list[str]:
         """Desired process Stacks whose command is ``theozolith-driver
@@ -996,6 +1014,16 @@ class NodeDaemon:
                     f"config distribution hash mismatch: unpacked tree recomputes to"
                     f" {recomputed[:12] or '(empty)'}, expected {desired[:12]}"
                 )
+            # The COMPLETE envelope must validate in staging, before any live
+            # driver is stopped or the applied tree exchanged (ADR-0042): the
+            # metadata is never content proof — the manifest was recomputed
+            # first, and the envelope's drivers_hash must equal that recompute
+            # (which the check above already pinned to the requested hash).
+            # Invalid UTF-8, malformed JSON, a non-object, a wrong format, or
+            # an absent/non-string/mismatching hash all raise ConfigDistError
+            # here, with the old tree and its drivers fully untouched.
+            metadata = configdist.validate_metadata_tree(staging, recomputed)
+            built_against = configdist.advisory_built_against(metadata)
             # The replacement is fully verified — only now touch the running
             # world. From here on the pass-start memo is no longer evidence:
             # the exchange may leave the applied world mid-transition, so drop
@@ -1017,8 +1045,10 @@ class NodeDaemon:
         self._write_current_pointer(desired)
         # Memoize ONLY once the applied tree and the pointer are BOTH valid: a
         # failure anywhere above propagates first, so the heartbeat keeps
-        # reporting the evidence-based value instead of the desired hash.
+        # reporting the evidence-based value instead of the desired hash. The
+        # advisory stamp comes from the staging-validated envelope.
         self._verified_drivers_hash = desired
+        self._verified_built_against = built_against
         self._log(f"config distribution converged to {desired[:12]}")
         self._gc_config_dist(keep={desired, previous} - {""})
 
@@ -1053,6 +1083,7 @@ class NodeDaemon:
             self._config.config_dist_current.unlink()
         self._gc_config_dist(keep=set())
         self._verified_drivers_hash = ""  # nothing applied now
+        self._verified_built_against = ""
         if previous:
             self._log("config distribution retired (none desired)")
 

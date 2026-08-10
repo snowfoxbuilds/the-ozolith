@@ -4004,9 +4004,12 @@ def test_config_dist_malformed_pointer_is_not_converged(rig: Rig):
     assert any("malformed" in line for line in rig.logs)
 
 
-def test_config_dist_foreign_metadata_yields_no_built_against(rig: Rig):
-    """The tree recomputes to the hash (content verified, hash reported) but a
-    stale/foreign ``config-dist.json`` is NOT trusted for the advisory stamp."""
+def test_config_dist_foreign_metadata_is_not_converged_then_repaired(rig: Rig):
+    """A stale/foreign ``config-dist.json`` (wrong format, wrong hash) is more
+    than an untrusted stamp: convergence proves the COMPLETE applied artifact —
+    recomputed content PLUS a valid matching metadata envelope — so a foreign
+    envelope reads as non-converged, never reports a wrong stamp, and the next
+    fetch repairs the whole tree (ADR-0042 amendment)."""
     import json
 
     digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"}, built_against="0.2.9")
@@ -4018,8 +4021,15 @@ def test_config_dist_foreign_metadata_yields_no_built_against(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     reported = _last_heartbeat(rig)
-    assert reported["drivers_hash"] == digest  # content still verifies
-    assert reported["drivers_built_against"] == ""  # foreign metadata not trusted
+    assert reported["drivers_hash"] == ""  # the envelope is part of the proof
+    assert reported["drivers_built_against"] == ""  # never a wrong/foreign stamp
+    assert any("metadata failed verification" in line for line in rig.logs)
+    # That same pass repaired the tree; the next heartbeat reports the truth.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == "0.2.9"
 
 
 def test_config_dist_old_distribution_stays_until_replacement_verified(rig: Rig):
@@ -4524,3 +4534,127 @@ def test_config_dist_failed_verification_never_stops_the_driver(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
     rig.daemon.once()
     assert _last_heartbeat(rig)["drivers_hash"] == a_hash
+
+
+# -- the complete metadata envelope gates the stop boundary (ADR-0042 amendment) --
+
+
+def test_config_dist_invalid_utf8_metadata_rejected_before_stop(rig: Rig):
+    """A served artifact whose drivers tree recomputes to the requested hash
+    but whose ``config-dist.json`` is invalid UTF-8 is rejected IN STAGING:
+    the live custom driver is never stopped, the old tree stays current, and
+    the failure is a normalized ConfigDistError, never a leaked
+    UnicodeDecodeError."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([custom], a_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    spawns_before = len(rig.popen.spawned)
+    b_files = {"drivers/custom/impl.py": "v = 2\n"}
+    b_hash, _ = make_config_dist(b_files)
+    _, bad_data = make_config_dist(b_files, raw_metadata=b"\xff\xfe not utf-8 {")
+    rig.control.config_artifacts[b_hash] = bad_data
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")  # never stopped
+    assert len(rig.popen.spawned) == spawns_before  # never restarted either
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == a_hash  # old tree current
+    assert not (root / b_hash).exists()  # nothing exchanged or published
+    assert any("config distribution" in line and "failed" in line for line in rig.logs)
+    assert not any("UnicodeDecodeError" in line for line in rig.logs)
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    assert _last_heartbeat(rig)["drivers_hash"] == a_hash  # still honestly on A
+
+
+@pytest.mark.parametrize(
+    "raw_meta_shape",
+    [
+        "invalid_utf8",
+        "malformed_json",
+        "json_array",
+        "wrong_format",
+        "hash_mismatch",
+        "nonstring_hash",
+    ],
+)
+def test_config_dist_malformed_metadata_envelope_rejected_before_exchange(rig: Rig, raw_meta_shape):
+    """Every malformed-envelope shape — invalid UTF-8, malformed JSON, a
+    non-object document, a wrong ``format``, a mismatching or non-string
+    ``drivers_hash`` — is refused in staging before any tree is exchanged or
+    pointer published, and the very next pass converges once a valid artifact
+    is served (the failure normalizes to ConfigDistError and retries)."""
+    files = {"drivers/custom/impl.py": "x = 1\n"}
+    digest, good_data = make_config_dist(files)
+    raw = {
+        "invalid_utf8": b"\xff\xfe not utf-8 {",
+        "malformed_json": b"{ not json",
+        "json_array": b"[]",
+        "wrong_format": json.dumps({"format": 999, "drivers_hash": digest}).encode(),
+        "hash_mismatch": json.dumps({"format": 1, "drivers_hash": "0" * 64}).encode(),
+        "nonstring_hash": json.dumps({"format": 1, "drivers_hash": 7}).encode(),
+    }[raw_meta_shape]
+    _, bad_data = make_config_dist(files, raw_metadata=raw)
+    rig.control.config_artifacts[digest] = bad_data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert not (root / "current").exists()  # nothing published
+    assert not (root / digest).exists()  # nothing exchanged
+    assert any("config distribution" in line and "failed" in line for line in rig.logs)
+    # A valid artifact repairs on the next pass — the failure was retryable.
+    rig.control.config_artifacts[digest] = good_data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (root / "current").read_text().strip() == digest
+
+
+def test_config_dist_invalid_utf8_restored_metadata_keeps_heartbeat_alive_then_repairs(rig: Rig):
+    """A restored/corrupted applied tree whose ``config-dist.json`` holds
+    invalid UTF-8 must not wedge the heartbeat loop: the pass completes, the
+    node honestly reports non-convergence with an empty advisory stamp, and
+    the next fetch repairs the whole tree."""
+    digest = _apply_dist(rig, {"drivers/custom/impl.py": "x = 1\n"}, built_against="0.2.9")
+    meta_path = rig.config.state_dir / "config-dist" / digest / "config-dist.json"
+    meta_path.write_bytes(b"\xff\xfe not utf-8 {")
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()  # completes — malformed on-disk metadata never raises out
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == ""
+    assert reported["drivers_built_against"] == ""
+    assert any("metadata failed verification" in line for line in rig.logs)
+    # The same pass repaired; the next heartbeat proves the loop stayed healthy.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == "0.2.9"
+
+
+@pytest.mark.parametrize("stamp_shape", ["absent", "nonstring"])
+def test_config_dist_missing_or_nonstring_built_against_is_empty_advisory(rig: Rig, stamp_shape):
+    """``built_against`` stays advisory (ADR-0042): an envelope that omits it
+    or carries a non-string value still validates and converges — the stamp
+    reads as '' on both the apply path and every re-verification, and
+    convergence is never affected."""
+    files = {"drivers/custom/impl.py": "x = 1\n"}
+    digest, _ = make_config_dist(files)
+    meta: dict = {"format": 1, "drivers_hash": digest, "built_at": "1980-01-01T00:00:00+00:00"}
+    if stamp_shape == "nonstring":
+        meta["built_against"] = 123
+    _, data = make_config_dist(files, raw_metadata=json.dumps(meta).encode())
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert (root / "current").read_text().strip() == digest  # converged
+    # The next pass re-verifies the applied envelope from disk: still
+    # converged, still the empty advisory stamp.
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    reported = _last_heartbeat(rig)
+    assert reported["drivers_hash"] == digest
+    assert reported["drivers_built_against"] == ""

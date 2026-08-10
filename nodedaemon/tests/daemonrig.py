@@ -305,12 +305,18 @@ def desired(stacks: list[dict], images: list[dict] | None = None, **extra) -> di
     return {"commit": "abc123", "stacks": stacks, "images": images or [], **extra}
 
 
-def make_config_dist(files: dict[str, str], *, built_against: str = "0.3.0") -> tuple[str, bytes]:
+def make_config_dist(
+    files: dict[str, str], *, built_against: str = "0.3.0", raw_metadata: bytes | None = None
+) -> tuple[str, bytes]:
     """Build a config-distribution zip and its drivers-hash (ADR-0042) using the
     node-side canonical algorithm — ``files`` are ``drivers/...`` relpaths. The
     hash is computed exactly as ``manifest_hash_of_tree`` will recompute it on
     unpack, so a faithful artifact verifies; corrupt one member to force a
-    mismatch."""
+    mismatch. ``raw_metadata`` replaces the ``config-dist.json`` member bytes
+    verbatim — the escape hatch for malformed-envelope shapes (invalid UTF-8,
+    wrong format, mismatching hash) a real build would never produce; the
+    drivers-hash is metadata-independent, so the returned digest still names
+    the tree content."""
     import io
     import json
     import tempfile
@@ -329,17 +335,16 @@ def make_config_dist(files: dict[str, str], *, built_against: str = "0.3.0") -> 
     with zipfile.ZipFile(buffer, "w") as archive:
         for relpath, content in sorted(files.items()):
             archive.writestr(relpath, content)
-        archive.writestr(
-            configdist.ARTIFACT_METADATA,
-            json.dumps(
+        if raw_metadata is None:
+            raw_metadata = json.dumps(
                 {
                     "format": 1,
                     "drivers_hash": digest,
                     "built_against": built_against,
                     "built_at": "1980-01-01T00:00:00+00:00",
                 }
-            ),
-        )
+            ).encode("utf-8")
+        archive.writestr(configdist.ARTIFACT_METADATA, raw_metadata)
     return digest, buffer.getvalue()
 
 

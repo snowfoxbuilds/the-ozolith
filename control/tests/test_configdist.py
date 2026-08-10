@@ -298,6 +298,115 @@ def test_prune_keeps_two(tmp_path):
     assert names[0].name in pruned and names[1].name in pruned
 
 
+def test_prune_keep_zero_removes_everything(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    for i in range(3):
+        target = out / (f"{i:064d}"[:64] + ".zip")
+        target.write_bytes(b"z")
+        os.utime(target, (100 + i, 100 + i))
+    pruned = configdist.prune_config_artifacts(out, keep=0)
+    assert len(pruned) == 3
+    assert not [p for p in out.iterdir() if p.suffix == ".zip"]
+
+
+# -- race-safe keep-two pruning (ADR-0042 amendment) --------------------------
+
+
+def test_prune_tolerates_entry_vanishing_before_mtime_lookup(tmp_path, monkeypatch):
+    """DETERMINISTIC concurrent-churn injection: a collected entry is unlinked
+    between enumeration and its stat — exactly what a racing pruner or a
+    replacement does. Pruning must complete without raising, skip the vanished
+    entry (it is not reported as pruned: this pruner never removed it), and
+    still prune the genuine stale survivor deterministically."""
+    out = tmp_path / "out"
+    out.mkdir()
+    names = []
+    for i in range(4):
+        target = out / (f"{i:064d}"[:64] + ".zip")
+        target.write_bytes(b"z")
+        os.utime(target, (100 + i, 100 + i))
+        names.append(target)
+    victim = names[0]
+    state = {"vanished": False}
+    real_stat = Path.stat
+
+    def racing_stat(self, **kwargs):
+        if not state["vanished"] and self.name == victim.name and self.parent == out:
+            state["vanished"] = True
+            os.unlink(victim)  # a concurrent pruner takes it first
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    pruned = configdist.prune_config_artifacts(out, keep=2)
+    monkeypatch.undo()
+    assert state["vanished"]  # the race really fired inside the collection loop
+    assert pruned == [names[1].name]  # the vanished entry is never claimed
+    survivors = sorted(p.name for p in out.iterdir())
+    assert survivors == sorted([names[2].name, names[3].name])
+
+
+def test_prune_tolerates_entry_vanishing_before_unlink(tmp_path, monkeypatch):
+    """The second race window: a selected stale entry vanishes between the
+    sort and this pruner's unlink (two prune operations racing). The deletion
+    failure is ordinary churn — suppressed, not raised — and the entry is not
+    reported as pruned by the loser."""
+    out = tmp_path / "out"
+    out.mkdir()
+    names = []
+    for i in range(4):
+        target = out / (f"{i:064d}"[:64] + ".zip")
+        target.write_bytes(b"z")
+        os.utime(target, (100 + i, 100 + i))
+        names.append(target)
+    victim = names[0]
+    state = {"vanished": False}
+    real_unlink = Path.unlink
+
+    def racing_unlink(self, missing_ok=False):
+        if not state["vanished"] and self.name == victim.name:
+            state["vanished"] = True
+            os.unlink(victim)  # the other pruner wins the race
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", racing_unlink)
+    pruned = configdist.prune_config_artifacts(out, keep=2)
+    monkeypatch.undo()
+    assert state["vanished"]
+    assert pruned == [names[1].name]  # only what THIS pruner actually removed
+    survivors = sorted(p.name for p in out.iterdir())
+    assert survivors == sorted([names[2].name, names[3].name])
+
+
+def test_racing_prunes_settle_to_keep_two(tmp_path):
+    """Two pruners over the same churning cache complete without raising and
+    the survivors settle to the keep-two set."""
+    import threading
+
+    out = tmp_path / "out"
+    out.mkdir()
+    for i in range(6):
+        target = out / (f"{i:064d}"[:64] + ".zip")
+        target.write_bytes(b"z")
+        os.utime(target, (100 + i, 100 + i))
+    errors: list[BaseException] = []
+
+    def prune() -> None:
+        try:
+            configdist.prune_config_artifacts(out, keep=2)
+        except BaseException as exc:  # pragma: no cover - the assertion target
+            errors.append(exc)
+
+    threads = [threading.Thread(target=prune) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    survivors = sorted(p.name for p in out.iterdir())
+    assert survivors == sorted(f"{i:064d}"[:64] + ".zip" for i in (4, 5))
+
+
 # -- the mandatory cross-package contract ------------------------------------
 
 
@@ -496,6 +605,96 @@ def test_node_extract_normalizes_bad_crc_member(tmp_path):
     dest.mkdir()
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.extract_zip(corrupt, dest)
+
+
+# -- the complete metadata envelope (ADR-0042 amendment) ----------------------
+
+
+def _artifact_zip_raw_meta(members: dict[str, bytes], raw_meta: bytes) -> bytes:
+    """A structurally valid artifact whose ``config-dist.json`` member carries
+    ``raw_meta`` verbatim — the escape hatch for envelope bytes ``json.dumps``
+    could never produce (invalid UTF-8, malformed JSON)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+        archive.writestr(configdist.ARTIFACT_METADATA, raw_meta)
+    return buf.getvalue()
+
+
+def test_verify_normalizes_invalid_utf8_metadata():
+    """``config-dist.json`` holding invalid UTF-8 inside a structurally valid
+    zip is a ConfigDistError — never a leaked UnicodeDecodeError (the raw
+    data-format exception must not escape the config-distribution boundary)."""
+    members = {"drivers/a.py": b"ok = 1\n"}
+    raw = _artifact_zip_raw_meta(members, b"\xff\xfe not utf-8 {")
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.verify_artifact_bytes(raw)
+
+
+_ENVELOPE_HASH = "ab" * 32
+
+
+@pytest.mark.parametrize(
+    "raw_meta",
+    [
+        b"\xff\xfe not utf-8 {",  # invalid UTF-8
+        b"{ not json",  # valid UTF-8, malformed JSON
+        b"42",  # a JSON scalar, not an object
+        b"[]",  # a JSON array, not an object
+        json.dumps({"format": 999, "drivers_hash": _ENVELOPE_HASH}).encode(),  # wrong format
+        json.dumps({"format": True, "drivers_hash": _ENVELOPE_HASH}).encode(),  # bool is not 1
+        json.dumps({"drivers_hash": _ENVELOPE_HASH}).encode(),  # format absent
+        json.dumps({"format": 1}).encode(),  # drivers_hash absent
+        json.dumps({"format": 1, "drivers_hash": 7}).encode(),  # non-string hash
+        json.dumps({"format": 1, "drivers_hash": "0" * 64}).encode(),  # mismatching hash
+        b"[" * 4000,  # pathologically nested JSON (RecursionError normalized)
+    ],
+)
+def test_cross_package_metadata_envelope_rejections(raw_meta):
+    """Both sides' envelope rule rejects the same malformed shapes with
+    ConfigDistError and only ConfigDistError — control before publishing or
+    serving, the node before stopping a driver or exchanging a tree."""
+    with pytest.raises(configdist.ConfigDistError):
+        configdist.validate_metadata_bytes(raw_meta, _ENVELOPE_HASH)
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.validate_metadata_bytes(raw_meta, _ENVELOPE_HASH)
+
+
+def test_cross_package_metadata_envelope_acceptance_and_advisory_stamp():
+    """A valid envelope is accepted identically on both sides; ``built_against``
+    stays advisory — present-and-string is returned, absent or non-string reads
+    as the empty stamp, never a rejection (ADR-0042)."""
+    stamped = json.dumps(
+        {"format": 1, "drivers_hash": _ENVELOPE_HASH, "built_against": "0.3.0"}
+    ).encode()
+    assert configdist.validate_metadata_bytes(stamped, _ENVELOPE_HASH)["built_against"] == "0.3.0"
+    meta = node_configdist.validate_metadata_bytes(stamped, _ENVELOPE_HASH)
+    assert node_configdist.advisory_built_against(meta) == "0.3.0"
+    for advisory_empty in (
+        json.dumps({"format": 1, "drivers_hash": _ENVELOPE_HASH}).encode(),
+        json.dumps({"format": 1, "drivers_hash": _ENVELOPE_HASH, "built_against": 7}).encode(),
+    ):
+        assert configdist.validate_metadata_bytes(advisory_empty, _ENVELOPE_HASH)
+        meta = node_configdist.validate_metadata_bytes(advisory_empty, _ENVELOPE_HASH)
+        assert node_configdist.advisory_built_against(meta) == ""
+
+
+def test_node_validate_metadata_tree_normalizes_all_failures(tmp_path):
+    """The node's tree-level envelope validation: a missing metadata file, raw
+    invalid-UTF-8 bytes on disk, and a foreign envelope all normalize to
+    ConfigDistError — the callers (staging verify, applied-tree re-verify)
+    treat every one as non-converged, never as a crash."""
+    recomputed = node_configdist.manifest_hash_of_tree(tmp_path)  # empty tree: ""
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.validate_metadata_tree(tmp_path, recomputed)  # missing file
+    meta_path = tmp_path / node_configdist.ARTIFACT_METADATA
+    meta_path.write_bytes(b"\xff\xfe not utf-8 {")
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.validate_metadata_tree(tmp_path, recomputed)
+    meta_path.write_text(json.dumps({"format": 1, "drivers_hash": "0" * 64}), encoding="utf-8")
+    with pytest.raises(node_configdist.ConfigDistError):
+        node_configdist.validate_metadata_tree(tmp_path, recomputed)
 
 
 # -- fail closed on directory-enumeration errors (ADR-0042) ------------------
