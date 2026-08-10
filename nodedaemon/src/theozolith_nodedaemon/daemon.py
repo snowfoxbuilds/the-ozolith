@@ -110,10 +110,28 @@ class AppliedCompose:
     with real teardown context — a valid ``docker compose --file … down`` —
     rather than an empty file list (ADR-0044 amendment). Secret VALUES never
     enter this record: it holds file paths, and the compose documents carry
-    secret references (the VAR_FILE convention), not values."""
+    secret references (the VAR_FILE convention), not values.
+
+    The record is persisted to disk (``applied_compose_path``) and reloaded on
+    boot, so a compose project that outlived the daemon is still distinguishable
+    and tearable down during a later same-name kind/form transition — the paths
+    survive because they are references, and the fingerprint carries only compose
+    documents (secret references, not values), env, and the secret NAME mapping."""
 
     fingerprint: str
     files: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"fingerprint": self.fingerprint, "files": list(self.files)}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AppliedCompose | None:
+        if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            return None
+        return cls(
+            fingerprint=str(data.get("fingerprint", "")),
+            files=[str(f) for f in data["files"]],
+        )
 
 
 def _log(message: str) -> None:
@@ -170,7 +188,12 @@ class NodeDaemon:
         # record retains the materialized compose/overlay paths so a later down
         # (change, transition, stopped/drained, absent-from-desired) is a valid
         # `docker compose --file … down`, never an empty file list (ADR-0044).
-        self._applied_compose: dict[str, AppliedCompose] = {}
+        # Persisted to disk and reloaded here: a compose project can outlive the
+        # daemon, so the record must survive a restart for a later same-name
+        # kind/form transition to distinguish and tear it down (ADR-0044
+        # amendment). Only non-secret metadata is stored — fingerprint and file
+        # paths — never secret values.
+        self._applied_compose: dict[str, AppliedCompose] = self._load_applied_compose()
         # The jobs directory each live process child was LAUNCHED with (its
         # applied THEOZOLITH_JOBS_DIR). The minimum non-secret applied-spec
         # fact needed to queue a desired-state restart behind an in-flight Run
@@ -522,18 +545,56 @@ class NodeDaemon:
         if self._docker.stack_containers(name):
             self._docker.remove(f"{STACK_CONTAINER_PREFIX}{name}")
 
+    def _load_applied_compose(self) -> dict[str, AppliedCompose]:
+        """Recover the persisted applied-compose records on boot. Malformed or
+        missing state degrades to an empty map (a corrupt file must never crash
+        the daemon); each record is validated by ``AppliedCompose.from_dict``."""
+        raw = _read_json(self._config.applied_compose_path, {})
+        result: dict[str, AppliedCompose] = {}
+        if isinstance(raw, dict):
+            for name, record in raw.items():
+                applied = AppliedCompose.from_dict(record)
+                if applied is not None:
+                    result[str(name)] = applied
+        return result
+
+    def _persist_applied_compose(self) -> None:
+        """Write the applied-compose map atomically. Called after every mutation
+        (an up records, a down drops) so the on-disk record always mirrors what
+        is actually applied — the fact a restart needs to tear a surviving
+        compose project down. Only fingerprint + file paths are written; secret
+        values never reach this file (ADR-0044 amendment)."""
+        _atomic_json(
+            self._config.applied_compose_path,
+            {name: record.to_dict() for name, record in sorted(self._applied_compose.items())},
+        )
+
+    def _compose_running(self, name: str) -> bool:
+        """Whether the deterministic compose project has running workload — the
+        SAME liveness rule the heartbeat status reports (a ``compose_ps`` row in
+        the running state). An AppliedCompose fingerprint proves which spec was
+        applied, not that the project still runs, so convergence consults this
+        before declaring a compose Stack already converged (ADR-0044 amendment)."""
+        return any(
+            row.get("state") == "running"
+            for row in self._docker.compose_ps(f"ozolith-{name}")
+        )
+
     def _compose_down(self, name: str) -> None:
         """Compose a tracked project down using the compose/overlay files it was
-        brought up with (retained in ``_applied_compose``) — a valid teardown,
-        never an empty file list. The applied record is dropped only AFTER the
-        down succeeds, so a failed down is retried on the next pass rather than
-        forgotten (ADR-0044 amendment). A no-op for a name this daemon does not
-        track — the accepted prior-daemon compose-discovery limitation."""
+        brought up with (retained in ``_applied_compose``, across restarts) — a
+        valid teardown, never an empty file list. The applied record is dropped
+        (and the change persisted) only AFTER the down succeeds, so a failed down
+        is retried on the next pass rather than forgotten (ADR-0044 amendment). A
+        no-op for a name this daemon has no record of — the accepted prior-daemon
+        compose-discovery limitation, now only when the persisted record is also
+        gone."""
         applied = self._applied_compose.get(name)
         if applied is None:
             return
         self._docker.compose(f"ozolith-{name}", [Path(p) for p in applied.files], "down")
         self._applied_compose.pop(name, None)
+        self._persist_applied_compose()
 
     def _teardown_container_forms(self, name: str) -> None:
         """Remove any container-kind runtime under this name — a single-image
@@ -730,14 +791,20 @@ class NodeDaemon:
                     f"stack {stack_name}: absent single-image container",
                     lambda cn=container_name: self._docker.remove(cn),
                 )
-        # Compose projects this daemon started and desired state no longer
-        # names are composed down with their RETAINED files (never an empty file
-        # list). LIMITATION (stated, not silently skipped): there is no host-side
-        # compose-project discovery, so this reaps only projects in
-        # ``_applied_compose`` (this daemon lifetime). A compose Stack started by
-        # a PRIOR daemon and then deleted from desired state is not discoverable
-        # here and would keep running until a running-form discovery mechanism (a
-        # labeled `compose ls`) is added — a broader change deferred out of scope.
+        # Compose projects whose applied record desired state no longer names are
+        # composed down with their RETAINED files (never an empty file list). The
+        # record now survives a daemon restart (``_applied_compose`` is persisted
+        # and reloaded), so a project a PRIOR daemon started and desired state has
+        # since dropped is reaped here too, as long as its persisted record
+        # survives. LIMITATION (stated, not silently skipped, and unchanged in
+        # kind): there is still no host-side compose-project discovery (a labeled
+        # `compose ls`), so a project whose persisted record is also gone — the
+        # deletable cache was cleared, or it predates persistence — remains
+        # undiscoverable while absent from desired state; adding that discovery is
+        # a broader change deferred out of scope. This residual limitation never
+        # applies to a name STILL present in desired state: a same-name transition
+        # or a stopped/drained desire recovers and tears the project down via the
+        # persisted record (or, as a post-restart backstop, the desired files).
         for name in list(self._applied_compose):
             if name not in desired_names:
                 self._log(f"stack {name}: absent from desired state; composing down")
@@ -978,7 +1045,17 @@ class NodeDaemon:
             and applied is not None
             and applied.fingerprint == fingerprint
         ):
-            return  # compose is already the only form, at this exact spec — no churn
+            # The fingerprint proves which spec was applied, not that the project
+            # is still up (it can die, or the daemon can restart while it keeps
+            # running). Only skip as already-converged when it is verifiably
+            # running; otherwise fall through and compose up again with the
+            # retained/current files (ADR-0044 amendment). No churn when healthy.
+            if self._compose_running(stack.name):
+                return  # already the only form, at this exact spec, and running
+            self._log(
+                f"stack {stack.name}: applied compose project not running;"
+                " composing up again"
+            )
         if not self._pull_stack_secrets(stack):
             return
         files = self._compose_paths(stack)  # materialize + validate before any teardown
@@ -991,8 +1068,11 @@ class NodeDaemon:
             )
             self._remove_single_image(stack.name)
         self._docker.compose(f"ozolith-{stack.name}", files, "up")
-        # Retain the materialized paths so a later down is valid (never empty).
+        # Retain the materialized paths so a later down is valid (never empty),
+        # and persist AFTER a successful up so the on-disk record only ever names
+        # a project that was actually brought up (ADR-0044 amendment).
         self._applied_compose[stack.name] = AppliedCompose(fingerprint, [str(f) for f in files])
+        self._persist_applied_compose()
 
     def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
         """Run the single-image form as the SOLE runtime form under this name.

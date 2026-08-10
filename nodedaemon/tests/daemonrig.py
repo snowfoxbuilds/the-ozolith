@@ -73,9 +73,14 @@ class FakeDocker:
         # paths (never an empty file list), not merely that state mutated.
         self.compose_calls: list[tuple[str, list[str], str]] = []
         # Failure injection for isolation tests: a remove of a name here, or a
-        # compose `down` of a project here, raises DockerError.
+        # compose `down`/`up` of a project here, raises DockerError.
         self.fail_remove: set[str] = set()
         self.fail_compose_down: set[str] = set()
+        self.fail_compose_up: set[str] = set()
+        # Compose projects that are present but NOT running (stopped/exited): a
+        # `compose_ps` for one of these reports a non-running row, so the daemon's
+        # liveness check treats it as down and brings it up again.
+        self.compose_stopped: set[str] = set()
 
     def add_run_container(self, name: str, run_id: str, owner: str) -> None:
         self.containers[name] = {
@@ -128,15 +133,26 @@ class FakeDocker:
         self.compose_calls.append((project, [str(f) for f in files], verb))
         if verb == "down" and project in self.fail_compose_down:
             raise DockerError(f"compose down failed for {project}")
+        if verb == "up" and project in self.fail_compose_up:
+            raise DockerError(f"compose up failed for {project}")
         if verb == "up":
             self.compose_projects[project] = [str(f) for f in files]
+            self.compose_stopped.discard(project)  # a fresh up is running
         else:
             self.compose_projects.pop(project, None)
+            self.compose_stopped.discard(project)
 
     def compose_ps(self, project: str) -> list[dict[str, str]]:
         if project not in self.compose_projects:
             return []
-        return [{"name": f"{project}-control-1", "state": "running", "status": "Up"}]
+        running = project not in self.compose_stopped
+        return [
+            {
+                "name": f"{project}-control-1",
+                "state": "running" if running else "exited",
+                "status": "Up" if running else "Exited (0)",
+            }
+        ]
 
     # -- images -----------------------------------------------------------------
 

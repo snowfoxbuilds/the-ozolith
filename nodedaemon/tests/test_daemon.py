@@ -2113,3 +2113,279 @@ def test_failed_stale_cleanup_is_retried_on_a_later_pass(rig: Rig):
     assert "ozolith-gone" not in rig.docker.compose_projects
     down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
     assert down[1] != []  # the successful down still used retained paths
+
+
+# -- compose restart-boundary recovery (ADR-0044 amendment) ------------------------
+#
+# A compose project can outlive the daemon. Across a REAL restart — a brand-new
+# NodeDaemon over the same state dir and docker runtime — the daemon must recover
+# enough non-secret applied metadata (fingerprint + retained file paths, reloaded
+# from disk) to distinguish and tear that project down during a later same-name
+# kind/form transition, and must verify it is actually running before declaring a
+# still-desired compose Stack converged. No transition may leave two runtime forms
+# under one name; secret values never enter the persisted record.
+
+
+def _restart_daemon(rig: Rig, *, popen=None) -> None:
+    """Simulate a real daemon restart: a brand-new NodeDaemon over the SAME
+    state dir and FakeDocker runtime, with a fresh supervisor. In-memory state
+    (live children, the applied-compose map) is gone — only what was persisted
+    to the state dir and what survives in the docker runtime carries across,
+    exactly like the daemon process restarting on a live node."""
+    from theozolith_nodedaemon.daemon import NodeDaemon
+    from theozolith_nodedaemon.stacks import ProcessSupervisor
+
+    rig.daemon = NodeDaemon(
+        rig.config,
+        docker=rig.docker,  # type: ignore[arg-type]
+        client=rig.daemon._client,
+        supervisor=ProcessSupervisor(popen=popen or rig.popen, log=rig.logs.append),
+        log=rig.logs.append,
+        execv=lambda path, argv: rig.execv_calls.append((path, list(argv))),
+    )
+
+
+def _order_probe(rig: Rig) -> tuple[list[str], object]:
+    """Record the ORDER of teardown vs. start across the docker + popen seams so
+    a test can prove a compose ``down`` precedes the new form's docker run or
+    child spawn (the two forms never coexist). Returns (events, popen); pass the
+    returned popen to ``_restart_daemon`` so a spawned child lands in the
+    timeline. Call it AFTER the initial up so only the transition pass is seen."""
+    events: list[str] = []
+    real_compose = rig.docker.compose
+
+    def compose_spy(project, files, verb):
+        real_compose(project, files, verb)
+        events.append(f"compose:{verb}")
+
+    rig.docker.compose = compose_spy  # type: ignore[method-assign]
+    real_run = rig.docker.run_stack_container
+
+    def run_spy(*args, **kwargs):
+        real_run(*args, **kwargs)
+        events.append("docker-run")
+
+    rig.docker.run_stack_container = run_spy  # type: ignore[method-assign]
+    real_popen = rig.popen
+
+    def popen_spy(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        events.append("spawn")
+        return proc
+
+    return events, popen_spy
+
+
+def _active_forms(rig: Rig, name: str) -> set[str]:
+    """Which runtime forms are currently live for a Stack name — the invariant a
+    transition must keep to one at a time."""
+    forms = set()
+    if rig.daemon._supervisor.alive(name):
+        forms.add("process")
+    if f"ozolith-stack-{name}" in rig.docker.stacks:
+        forms.add("single-image")
+    if f"ozolith-{name}" in rig.docker.compose_projects:
+        forms.add("compose")
+    return forms
+
+
+def _bring_up_compose(rig: Rig, name: str = "svc", files=None) -> list[str]:
+    """Bring a compose Stack up on the original daemon; return its retained
+    file paths (the ones a later down must reuse, not an empty list)."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack(name, files=files)])
+    )
+    rig.daemon.once()
+    assert f"ozolith-{name}" in rig.docker.compose_projects
+    return list(rig.docker.compose_projects[f"ozolith-{name}"])
+
+
+def test_compose_to_single_image_after_restart_downs_before_docker_run(rig: Rig):
+    up_files = _bring_up_compose(rig)
+
+    events, _ = _order_probe(rig)
+    _restart_daemon(rig)  # fresh daemon: applied-compose reloaded from disk
+    assert rig.daemon._applied_compose["svc"].files == up_files  # recovered, non-empty
+
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:down", "docker-run"]  # down BEFORE run — never two forms
+    assert _active_forms(rig, "svc") == {"single-image"}
+    assert "svc" not in rig.daemon._applied_compose
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] == up_files  # retained paths, not an empty file list
+
+
+def test_compose_to_process_after_restart_downs_before_spawn(rig: Rig):
+    _bring_up_compose(rig)
+
+    events, popen = _order_probe(rig)
+    _restart_daemon(rig, popen=popen)
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:down", "spawn"]  # compose retired before the child starts
+    assert _active_forms(rig, "svc") == {"process"}
+    assert "svc" not in rig.daemon._applied_compose
+
+
+def test_compose_to_stopped_process_after_restart_leaves_nothing(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([process_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == set()  # composed down, no child started
+    assert "svc" not in rig.daemon._supervisor.names()
+    assert "svc" not in rig.daemon._applied_compose
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] != []
+
+
+def test_compose_to_stopped_single_image_after_restart_leaves_nothing(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", state="stopped")])
+    )
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == set()  # neither compose project nor container
+    assert "svc" not in rig.daemon._applied_compose
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] != []
+
+
+def test_drain_after_restart_tears_down_recovered_compose(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    drain = {"id": 30, "verb": "drain", "target": "svc", "force": False}
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc")], commands=[drain])
+    )
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == set()  # drained: the old compose form is down
+    assert "svc" not in rig.daemon._applied_compose
+    assert 30 in rig.daemon._completed
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] != []
+
+
+def test_no_restart_transition_leaves_two_forms(rig: Rig):
+    """A full compose -> single-image -> process cycle, each leg across a
+    restart, never has two forms coexisting at any observed step."""
+    _bring_up_compose(rig)
+    assert _active_forms(rig, "svc") == {"compose"}
+
+    _restart_daemon(rig)  # compose -> single-image
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"single-image"}
+
+    _restart_daemon(rig)  # single-image -> process (container form discovered by label)
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"process"}
+
+
+def test_recovered_applied_compose_has_no_secret_values(rig: Rig):
+    rig.control.secrets["tok-a"] = "super-secret-value"
+    stack = _compose_stack(
+        "svc",
+        files=[{"name": "compose/base.yml", "content": "services: {x: {env_file: TOK_FILE}}\n"}],
+        secrets={"TOK": "tok-a"},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+
+    # The persisted applied record — and nothing else under the state dir —
+    # carries the secret value; only tmpfs holds it.
+    assert "super-secret-value" not in rig.config.applied_compose_path.read_text()
+    for path in rig.config.state_dir.rglob("*"):
+        if path.is_file():
+            assert "super-secret-value" not in path.read_text(errors="replace"), path
+
+    # The record recovered on restart is likewise value-free.
+    _restart_daemon(rig)
+    recovered = rig.daemon._applied_compose["svc"]
+    assert "super-secret-value" not in recovered.fingerprint
+    assert all("super-secret-value" not in f for f in recovered.files)
+
+
+def test_healthy_unchanged_compose_after_restart_does_not_churn(rig: Rig):
+    _bring_up_compose(rig)
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    _restart_daemon(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # Healthy project, unchanged fingerprint: no re-up, no down.
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before
+    assert not any(c[2] == "down" for c in rig.docker.compose_calls)
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_missing_compose_with_matching_fingerprint_is_brought_up_again(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    del rig.docker.compose_projects["ozolith-svc"]  # died while the daemon was down
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert any("not running" in line for line in rig.logs)
+
+
+def test_stopped_compose_with_matching_fingerprint_is_brought_up_again(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    rig.docker.compose_stopped.add("ozolith-svc")  # present but not running
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert "ozolith-svc" not in rig.docker.compose_stopped  # the re-up cleared the stop
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_failed_compose_recovery_is_surfaced_and_retried_without_blocking_others(rig: Rig):
+    _bring_up_compose(rig)
+
+    _restart_daemon(rig)
+    del rig.docker.compose_projects["ozolith-svc"]  # died during the outage…
+    rig.docker.fail_compose_up.add("ozolith-svc")  # …and the recovery up will fail
+
+    # An unrelated Stack shares the pass and must still converge.
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc"), process_stack("worker")])
+    )
+    rig.daemon.once()
+
+    assert "ozolith-svc" not in rig.docker.compose_projects  # up failed
+    assert "svc" in rig.daemon._applied_compose  # record retained for retry
+    assert rig.daemon._supervisor.alive("worker")  # unrelated Stack unblocked
+    assert any("reconcile failed" in line for line in rig.logs)
+    assert any("svc" in e.get("message", "") for e in rig.control.events)  # surfaced
+
+    # Docker recovers: the next pass retries the up successfully.
+    rig.docker.fail_compose_up.discard("ozolith-svc")
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([_compose_stack("svc"), process_stack("worker")])
+    )
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
