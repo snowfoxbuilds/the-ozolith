@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
-from theozolith_nodedaemon.dockerctl import DockerCtl
+from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
 
 
 def heartbeat_response(stacks, images=None, commands=None) -> dict:
@@ -78,9 +78,11 @@ def test_compose_stack_materializes_files_and_ups(rig: Rig):
 
     files = rig.docker.compose_projects["ozolith-control"]
     assert [f.split("/")[-1] for f in files] == ["control.yml", "tailscale.yml"]
-    # The inlined desired-state documents landed under the state dir.
-    on_disk = rig.config.state_dir / "stacks" / "control" / "compose" / "control.yml"
+    # The inlined desired-state documents landed under the state dir, inside a
+    # generation-addressed directory (immutable per record, ADR-0044 amendment).
+    (on_disk,) = (rig.config.state_dir / "stacks" / "control").glob("*/compose/control.yml")
     assert on_disk.read_text() == "services: {}\n"
+    assert on_disk.parent.parent.parent == rig.config.state_dir / "stacks" / "control"
 
 
 def test_dead_process_child_is_restarted_next_pass(rig: Rig):
@@ -2939,3 +2941,285 @@ def test_transition_write_ahead_pending_record_has_no_secret_values(rig: Rig):
     for path in rig.config.state_dir.rglob("*"):
         if path.is_file():
             assert "super-secret-value" not in path.read_text(errors="replace"), path
+
+
+# -- immutable, generation-addressed compose materialization (ADR-0044) ------------
+#
+# An applied/pending record's compose files must be IMMUTABLE for that record's
+# lifetime: a new spec materializes its own generation-addressed directory and
+# never overwrites the bytes the predecessor's record still references. So a
+# failed pending persist mutates nothing the old record points at, a crash before
+# persistence recovers with the old generation fully usable, and a successful
+# transition reclaims obsolete generations.
+
+_FILES_A = [{"name": "compose/base.yml", "content": "services: {a: {}}\n"}]
+_FILES_B = [{"name": "compose/base.yml", "content": "services: {b: {}}\n"}]
+
+
+def _generation_dir(files: list[str]) -> Path:
+    """The generation directory a record's files live in:
+    <state>/stacks/<name>/<generation>/<file-name>."""
+    return Path(files[0]).parent.parent
+
+
+def _generation_dirs(rig: Rig, name: str) -> set[str]:
+    stack_dir = rig.config.state_dir / "stacks" / name
+    return {p.name for p in stack_dir.iterdir() if p.is_dir()} if stack_dir.is_dir() else set()
+
+
+def _push_compose(rig: Rig, files: list, name: str = "svc") -> None:
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack(name, files=files)]))
+
+
+def test_failed_pending_persist_leaves_predecessor_generation_bytes_untouched(rig: Rig):
+    """Spec A is running with an applied record; a spec-B write-ahead persist
+    fails. A stays running, the applied fingerprint stays A, every retained file
+    of A is byte-for-byte A, and no compose up or down occurs."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    record_a = rig.daemon._applied_compose["svc"]
+    a_files = list(record_a.files)
+    a_fingerprint = record_a.fingerprint
+    a_bytes = {p: Path(p).read_bytes() for p in a_files}
+    ups = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+    downs = sum(1 for c in rig.docker.compose_calls if c[2] == "down")
+
+    real_persist = _break_persist(rig)
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].fingerprint == a_fingerprint
+    assert rig.daemon._applied_compose["svc"].files == a_files
+    for path, original in a_bytes.items():
+        assert Path(path).read_bytes() == original  # byte-for-byte A, never overwritten by B
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups  # no up
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "down") == downs  # no down
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+
+
+def test_crash_before_pending_persist_recovers_with_the_old_generation(rig: Rig):
+    """A crash immediately after candidate B is materialized but before its
+    pending record persists: a restart from disk recovers A's record intact, and
+    a later transition composes A's retained generation down — never B's."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_files = list(rig.daemon._applied_compose["svc"].files)
+
+    # Materialize B, then fail the pending persist (the crash point).
+    _break_persist(rig)
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()
+
+    _restart_daemon(rig)  # fresh daemon: only disk carries across
+    assert rig.daemon._applied_compose["svc"].files == a_files  # A fully usable
+
+    # A transition now downs A's retained generation, not B's.
+    events, _ = _order_probe(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([container_stack("svc")]))
+    rig.daemon.once()
+    assert events == ["compose:down", "docker-run"]
+    down = [c for c in rig.docker.compose_calls if c[2] == "down"][-1]
+    assert down[1] == a_files  # A's generation, never an empty file list
+    assert _active_forms(rig, "svc") == {"single-image"}
+
+
+def test_successful_retry_to_new_spec_references_new_generation_and_gcs_old(rig: Rig):
+    """After a failed spec-B write-ahead, a successful retry brings B up, the
+    record references B's immutable generation, and A's generation is reclaimed."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_files = list(rig.daemon._applied_compose["svc"].files)
+    a_gen = _generation_dir(a_files).name
+    assert _generation_dirs(rig, "svc") == {a_gen}
+
+    real_persist = _break_persist(rig)
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()  # write-ahead fails: A preserved, B's candidate dir left unreferenced
+
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    _push_compose(rig, _FILES_B)
+    rig.daemon.once()  # retry succeeds
+
+    record_b = rig.daemon._applied_compose["svc"]
+    assert record_b.state == "applied"
+    assert record_b.files != a_files  # references B's own immutable generation
+    b_gen = _generation_dir(record_b.files).name
+    assert b_gen != a_gen
+    assert _generation_dirs(rig, "svc") == {b_gen}  # A's generation reclaimed
+    assert not _generation_dir(a_files).exists()
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_added_removed_and_renamed_compose_files_get_a_distinct_generation(rig: Rig):
+    """A change that renames a file AND adds an overlay (not merely a content edit
+    at an identical path) resolves to a distinct generation with its own paths;
+    the old generation is reclaimed after the transition."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    a_gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+
+    files_b = [
+        {"name": "compose/main.yml", "content": "services: {a: {}}\n"},  # renamed base.yml
+        {"name": "overlays/net.yml", "content": "services: {}\n"},  # added overlay
+    ]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc", files=files_b)]))
+    rig.daemon.once()
+
+    record_b = rig.daemon._applied_compose["svc"]
+    b_gen = _generation_dir(record_b.files).name
+    assert b_gen != a_gen  # a rename/add is a new generation, not an in-place rewrite
+    assert [Path(f).name for f in record_b.files] == ["main.yml", "net.yml"]
+    up = [c for c in rig.docker.compose_calls if c[2] == "up"][-1]
+    assert [f.split("/")[-1] for f in up[1]] == ["main.yml", "net.yml"]
+    assert _generation_dirs(rig, "svc") == {b_gen}  # old generation (with base.yml) reclaimed
+
+
+def test_state_dir_cleanup_never_deletes_a_referenced_generation(rig: Rig):
+    """A healthy, unchanged compose Stack keeps its referenced generation across
+    passes — GC only reclaims OTHER generations, never the live one."""
+    _push_compose(rig, _FILES_A)
+    rig.daemon.once()
+    gen = _generation_dir(rig.daemon._applied_compose["svc"].files).name
+
+    for _ in range(2):
+        rig.control.heartbeat_answers.append(
+            heartbeat_response([_compose_stack("svc", files=_FILES_A)])
+        )
+        rig.daemon.once()
+    assert _generation_dirs(rig, "svc") == {gen}  # still present, still referenced
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+# -- real DockerCtl.remove failure semantics (ADR-0044) ----------------------------
+
+
+def test_dockerctl_remove_raises_on_a_genuine_failure():
+    """A non-zero ``docker rm --force`` whose container genuinely survives raises
+    DockerError — a suppressed failure would let a caller start a successor beside
+    a still-running predecessor."""
+    def runner(args, timeout=None):
+        if args[1] == "rm":
+            return subprocess.CompletedProcess(
+                args, 1, "", "Error response from daemon: cannot remove container"
+            )
+        if args[1] == "ps":  # postcondition: the container is still present
+            return subprocess.CompletedProcess(args, 0, "ozolith-stack-svc\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    with pytest.raises(DockerError):
+        ctl.remove("ozolith-stack-svc")
+
+
+def test_dockerctl_remove_absent_container_is_idempotent_success():
+    """``no such container`` classifies as already-absent: idempotent success."""
+    def runner(args, timeout=None):
+        if args[1] == "rm":
+            return subprocess.CompletedProcess(args, 1, "", "Error: No such container: ghost")
+        raise AssertionError("no postcondition ps needed when classified absent")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.remove("ghost")  # must not raise
+
+
+def test_dockerctl_remove_postcondition_absence_is_success():
+    """An opaque non-zero result whose container is nonetheless gone is treated as
+    idempotent success via the postcondition existence check."""
+    def runner(args, timeout=None):
+        if args[1] == "rm":
+            return subprocess.CompletedProcess(args, 1, "", "some transient noise")
+        if args[1] == "ps":
+            return subprocess.CompletedProcess(args, 0, "", "")  # not present
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.remove("ghost")  # postcondition confirms absence: no raise
+
+
+def test_dockerctl_remove_success_is_a_no_op_raise():
+    """A zero return code is plain success — no postcondition ps, no raise."""
+    seen = []
+
+    def runner(args, timeout=None):
+        seen.append(args[1])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.remove("ozolith-stack-svc")
+    assert seen == ["rm"]  # no postcondition check on success
+
+
+# -- container -> process with a failed predecessor removal (ADR-0044) -------------
+
+
+def test_container_to_process_with_failed_removal_gates_the_spawn(rig: Rig, tmp_path):
+    """A failed predecessor container removal must not spawn the process child:
+    the old container remains, the error is emitted, no two forms coexist, and the
+    retry completes exactly once. Guards the 'matching child early-returns while a
+    stale container remains' state."""
+    jobs = tmp_path / "jobs"
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("worker", image="ghcr.io/x/w:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-worker" in rig.docker.stacks
+
+    rig.docker.fail_remove.add("ozolith-stack-worker")
+    proc = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)})
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+
+    # Removal failed: no child, container still there, error surfaced, one form.
+    assert not rig.daemon._supervisor.alive("worker")
+    assert rig.popen.spawned == []
+    assert "ozolith-stack-worker" in rig.docker.stacks
+    assert _active_forms(rig, "worker") == {"single-image"}
+    assert any(e["error_class"] == "DockerError" for e in rig.control.events)
+
+    # Removal recovers: the retry removes the container, then spawns exactly once.
+    rig.docker.fail_remove.discard("ozolith-stack-worker")
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("worker")
+    assert "ozolith-stack-worker" not in rig.docker.stacks
+    assert _active_forms(rig, "worker") == {"process"}
+    assert len(rig.popen.spawned) == 1  # spawned exactly once
+
+    # Stable thereafter: no early return leaves a stale form, no re-spawn.
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+    assert len(rig.popen.spawned) == 1
+    assert _active_forms(rig, "worker") == {"process"}
+
+
+def test_converged_child_does_not_mask_a_stale_single_image_container(rig: Rig, tmp_path):
+    """A live, converged process child beside a stale single-image container (a
+    predecessor whose removal failed earlier) must NOT be skipped past by the
+    early-return: the next pass reaps the stale container rather than declaring the
+    successor converged and returning."""
+    jobs = tmp_path / "jobs"
+    _launch_driver(rig, jobs)
+    assert rig.daemon._supervisor.alive("worker")
+
+    # Inject a stale single-image container under the same name (as if an earlier
+    # container->process removal had silently failed).
+    rig.docker.stacks["ozolith-stack-worker"] = {
+        "stack": "worker",
+        "image": "stale:0",
+        "state": "running",
+    }
+    assert _active_forms(rig, "worker") == {"process", "single-image"}  # the pathological state
+
+    proc = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs)})
+    spawned_before = len(rig.popen.spawned)
+    rig.control.heartbeat_answers.append(heartbeat_response([proc]))
+    rig.daemon.once()
+
+    # The stale container is reaped; the child is untouched (not restarted).
+    assert "ozolith-stack-worker" not in rig.docker.stacks
+    assert "ozolith-stack-worker" in rig.docker.removed
+    assert len(rig.popen.spawned) == spawned_before  # child not churned
+    assert _active_forms(rig, "worker") == {"process"}  # sole form

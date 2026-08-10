@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -130,6 +131,13 @@ class AppliedCompose:
     and tearable down during a later same-name kind/form transition — the paths
     survive because they are references, and the fingerprint carries only compose
     documents (secret references, not values), env, and the secret NAME mapping.
+
+    The referenced files live in a generation-addressed directory keyed by the
+    fingerprint (``_compose_paths``/``_compose_generation``), so a record's files
+    are IMMUTABLE for its lifetime: a new spec materializes a new generation and
+    never rewrites the bytes this record points at. Obsolete generations are
+    reclaimed only after a transition is confirmed applied or a project is downed
+    (ADR-0044 amendment: immutable/versioned materialization).
 
     The record is written AHEAD of compose up (state ``pending``) so a crash after
     Docker creates the project but before confirmation still leaves durable
@@ -650,6 +658,9 @@ class NodeDaemon:
         self._docker.compose(f"ozolith-{name}", [Path(p) for p in applied.files], "down")
         self._applied_compose.pop(name, None)
         self._persist_applied_compose()
+        # The downed generation is no longer referenced by any record: reclaim
+        # every materialized generation dir for this name (keep nothing).
+        self._gc_compose_generations(name, keep=set())
 
     def _teardown_container_forms(self, name: str) -> None:
         """Remove any container-kind runtime under this name — a single-image
@@ -954,7 +965,18 @@ class NodeDaemon:
                 " to launch against the default run image"
             )
         if alive and not self._supervisor.needs_restart(stack.name, stack.command, env):
-            return  # already live with this exact effective spec — no churn
+            # Already live at this exact effective spec. Declaring the successor
+            # converged and returning must NOT mask a stale single-image container
+            # or tracked compose project under this name (a predecessor whose
+            # removal failed on an earlier pass): reap the stale form — without
+            # churning the healthy child — then return. A teardown failure here
+            # raises to reconcile (surfaced, retried next pass) and the child
+            # stays untouched; two forms never coexist unnoticed (ADR-0044
+            # amendment). The common case (process is the SOLE form) tears nothing
+            # down and returns straight away.
+            if self._docker.stack_containers(stack.name) or stack.name in self._applied_compose:
+                self._teardown_container_forms(stack.name)
+            return
         # A (re)start is due for a live child ONLY because its effective spec
         # changed; that must never interrupt an in-flight Run (ADR-0044
         # amendment). If the running child is mid-Run, leave it and its Run
@@ -999,18 +1021,66 @@ class NodeDaemon:
         self._supervisor.ensure_running(stack.name, stack.command, env)
         self._applied_jobs_dir[stack.name] = str(stack_jobs_dir(stack))
 
+    def _compose_generation(self, fingerprint: str) -> str:
+        """The generation directory name for a compose fingerprint: a stable,
+        filesystem-safe digest. Same effective spec -> same generation dir;
+        any change (content, an added/removed/renamed file, an env or secret
+        mapping change) yields a DIFFERENT generation, so a new spec never
+        overwrites the bytes an existing record still references (ADR-0044
+        amendment: immutable/versioned materialization)."""
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+
     def _compose_paths(self, stack: WireStack) -> list[Path]:
-        """Materialize the inlined compose + overlay documents on disk."""
-        base = self._config.state_dir / "stacks" / stack.name
+        """Materialize the inlined compose + overlay documents into a
+        GENERATION-addressed directory — ``<state>/stacks/<name>/<generation>/`` —
+        so a given applied/pending record's files are IMMUTABLE for that record's
+        lifetime. A different effective spec resolves to a different generation
+        and its own paths, so materializing a candidate never mutates the bytes
+        the predecessor's retained record still points at (ADR-0044 amendment).
+
+        Each document is written atomically (tmp + os.replace), then the COMPLETE
+        candidate set is validated — a non-empty list whose every file reads back
+        byte-for-byte — before it can be referenced by a pending record, so an
+        interrupted write never exposes a half-written document as a referenced
+        generation."""
+        generation = self._compose_generation(self._compose_fingerprint(stack))
+        base = self._config.state_dir / "stacks" / stack.name / generation
+        root = base.resolve()
         paths = []
         for entry in stack.compose_files:
             target = (base / entry["name"]).resolve()
-            if base.resolve() not in target.parents:
+            if root not in target.parents:
                 raise RuntimeError(f"compose path {entry['name']!r} escapes the stack dir")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(entry["content"], encoding="utf-8")
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_text(entry["content"], encoding="utf-8")
+            os.replace(tmp, target)
             paths.append(target)
+        if not paths:
+            raise RuntimeError(f"stack {stack.name}: a compose Stack materialized no files")
+        for path, entry in zip(paths, stack.compose_files, strict=True):
+            if path.read_text(encoding="utf-8") != entry["content"]:
+                raise RuntimeError(f"stack {stack.name}: compose file {path} failed validation")
         return paths
+
+    def _gc_compose_generations(self, name: str, keep: set[str]) -> None:
+        """Reclaim obsolete materialized compose generation directories for a
+        Stack — every generation dir whose name is not in ``keep`` (the
+        generations still referenced by a live applied/pending record; empty
+        when none). Never removes a referenced generation, so a stopped/drained
+        or absent Stack's still-recorded teardown context is preserved. Each
+        removal is isolated: a cleanup failure is logged, emitted as the normal
+        capped error event, and retried on a later pass without blocking the
+        rest of convergence (ADR-0044 amendment)."""
+        stack_dir = self._config.state_dir / "stacks" / name
+        if not stack_dir.is_dir():
+            return
+        for child in sorted(stack_dir.iterdir()):
+            if child.is_dir() and child.name not in keep:
+                self._isolated(
+                    f"stack {name}: reclaiming obsolete compose generation {child.name}",
+                    lambda child=child: shutil.rmtree(child),
+                )
 
     def _compose_fingerprint(self, stack: WireStack) -> str:
         """All effective compose inputs, so any change reconciles (ADR-0044)."""
@@ -1070,6 +1140,8 @@ class NodeDaemon:
                 self._docker.compose(
                     f"ozolith-{stack.name}", self._compose_paths(stack), "down"
                 )
+                # No record references the just-materialized generation: reclaim it.
+                self._gc_compose_generations(stack.name, keep=set())
             return
         # process->container: a live child's in-flight Run defers the WHOLE
         # transition (read from its applied jobs dir — the desired kind is no
@@ -1093,7 +1165,15 @@ class NodeDaemon:
         durably persisted, then retired BEFORE compose up so the two runtime forms
         never coexist. Persisting the pending record ahead of the teardown means a
         failed write-ahead leaves the losing form running and touches nothing
-        (ADR-0044 amendment)."""
+        (ADR-0044 amendment).
+
+        The candidate compose documents are materialized into a NEW
+        generation-addressed directory (``_compose_paths``), distinct from any
+        generation a predecessor's applied/pending record still references, so a
+        failed write-ahead persist mutates none of the predecessor's recovery
+        inputs. Obsolete generations are reclaimed only AFTER the transition is
+        confirmed applied (ADR-0044 amendment: immutable/versioned
+        materialization)."""
         fingerprint = self._compose_fingerprint(stack)
         single_present = bool(self._docker.stack_containers(stack.name))
         applied = self._applied_compose.get(stack.name)
@@ -1116,7 +1196,10 @@ class NodeDaemon:
             )
         if not self._pull_stack_secrets(stack):
             return
-        files = self._compose_paths(stack)  # materialize + validate before any teardown
+        # Materialize + validate the candidate into its OWN generation dir before
+        # any teardown — never overwriting the bytes the predecessor's record
+        # still references (ADR-0044 amendment: immutable/versioned materialization).
+        files = self._compose_paths(stack)
         # Write-ahead the recovery record BEFORE retiring the losing runtime form
         # AND before compose up (ADR-0044 amendment: crash-consistent startup). The
         # pending record (name + fingerprint + retained non-empty file paths) must
@@ -1152,6 +1235,12 @@ class NodeDaemon:
         self._isolated(
             f"stack {stack.name}: confirm applied compose", self._persist_applied_compose
         )
+        # The transition is complete and this record is now the only one that
+        # matters: reclaim every OTHER materialized generation (a predecessor
+        # compose spec's dir, or an unreferenced candidate left by an earlier
+        # failed write-ahead), keeping only the generation this record
+        # references (ADR-0044 amendment: safe post-confirmation GC).
+        self._gc_compose_generations(stack.name, keep={self._compose_generation(fingerprint)})
 
     def _converge_single_image(self, stack: WireStack, child_lingers: bool) -> None:
         """Run the single-image form as the SOLE runtime form under this name.
