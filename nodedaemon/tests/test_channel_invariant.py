@@ -46,6 +46,8 @@ HEARTBEAT_REQUEST_KEYS = {
     "stack_containers",  # web-terminal target evidence (ADR-0019)
     "images",
     "config_commit",
+    "drivers_hash",  # applied config-distribution reference (ADR-0042)
+    "drivers_built_against",  # advisory stamp — a product version, never a value
     "completed_commands",
     "deferred_commands",  # queue-behind visibility (references, no values)
 }

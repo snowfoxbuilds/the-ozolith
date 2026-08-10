@@ -155,6 +155,23 @@ def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
             if version and version != pin:
                 reasons.append(f"node {node['name']} off-pin: running {version}, pinned {pin}")
 
+    # Off-hash (ADR-0042): a node's reported config distribution differs from
+    # the recorded one — convergence state, dispatch-blocking. Below off-pin,
+    # above stack-off-desired, mirroring the TUI's health precedence.
+    drivers_hash = state.get("config_drivers_hash")
+    if drivers_hash:
+        for node in sorted(state.get("nodes") or [], key=lambda n: n.get("name") or ""):
+            reported = node.get("drivers_hash") or ""
+            # Presence, not truthiness: a current daemon that reports '' (no
+            # verified tree) is off-hash; a heartbeat that omitted the field is
+            # fail-open and never listed here (ADR-0042).
+            if node.get("drivers_hash_reported") and reported != drivers_hash:
+                running = f"{reported[:12]}" if reported else "none applied"
+                reasons.append(
+                    f"node {node['name']} off-hash: running config distribution"
+                    f" {running}, recorded {drivers_hash[:12]}"
+                )
+
     actual = {
         (row.get("node"), row.get("name")): row.get("state") or ""
         for row in state.get("stacks") or []
@@ -227,18 +244,24 @@ def render(state: dict[str, Any], reasons: list[str], out) -> None:
     now = float(state.get("now") or 0.0)
     quarantined = {r.get("node") for r in state.get("node_health") or [] if r.get("quarantined")}
     pin = state.get("product_pin")
+    drivers_hash = state.get("config_drivers_hash")
     out(f"product pin: {pin or '(none)'}")
     nodes = state.get("nodes") or []
     if nodes:
         rows = [["NODE", "HEALTH", "VERSION", "LAST SEEN"]]
         for node in sorted(nodes, key=lambda n: n.get("name") or ""):
             age = now - float(node.get("last_seen") or 0.0)
+            reported_hash = node.get("drivers_hash") or ""
             if node.get("name") in quarantined:
                 health = "quarantined"
             elif age > STALE_AFTER_SECONDS:
                 health = "stale"
             elif pin and node.get("version") and node.get("version") != pin:
                 health = "off-pin"
+            elif (
+                drivers_hash and node.get("drivers_hash_reported") and reported_hash != drivers_hash
+            ):
+                health = "off-hash"
             else:
                 health = "ok"
             rows.append(

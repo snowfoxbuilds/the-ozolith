@@ -362,6 +362,13 @@ def mount_web(
         form = await request.form()
         key = str(form.get("key", "")).strip()
         value = str(form.get("value", "")).strip()
+        # STANDING CONSTRAINT (ADR-0042): this is the only web write path into
+        # the Config Repo, and it is a fixed control.toml allow-list — it can
+        # never address drivers/ (a drivers-shaped key is refused by
+        # controltoml.set_value below). Should a general repo editor ever land
+        # here, it MUST call configrepo.refuse_ui_write() on every repo-relative
+        # path it touches: drivers/ is git-native only, because a write there is
+        # code execution with driver credentials on every node.
         if key in ("public_origin", "control_ip", "control_port", "browser_origin"):
             return HTMLResponse(
                 "the [control] fields are read-only — re-pointing a deployment"

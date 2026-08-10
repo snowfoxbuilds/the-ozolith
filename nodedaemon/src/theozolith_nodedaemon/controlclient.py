@@ -108,6 +108,25 @@ class ControlClient:
             raise ControlError(f"artifact {filename} for {version}: HTTP {status} {detail}")
         return payload
 
+    def fetch_config_artifact(self, drivers_hash: str) -> bytes:
+        """The config-distribution zip for a drivers-hash (ADR-0042), twin of
+        ``fetch_artifact``. A 409 (the working repo moved past this hash) is a
+        ``ControlError`` like any 4xx — logged and retried next pass, when the
+        heartbeat carries the fresh hash."""
+        status, payload = self._transport(
+            "GET",
+            f"{self._url}/api/v1/config/artifacts/{drivers_hash}",
+            {
+                "Authorization": f"Bearer {self._token}",
+                "User-Agent": "theozolith-nodedaemon",
+            },
+            None,
+        )
+        if status >= 400:
+            detail = payload.decode(errors="replace")[:200]
+            raise ControlError(f"config artifact {drivers_hash[:12]}: HTTP {status} {detail}")
+        return payload
+
     def pull_secrets(self, node: str, names: list[str]) -> dict[str, str]:
         """Node-scoped secret pull — values transit TLS only (ADR-0006)."""
         if not names:

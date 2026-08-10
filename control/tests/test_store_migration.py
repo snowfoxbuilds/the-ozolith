@@ -63,3 +63,44 @@ def test_old_schema_store_opens_with_backfilled_driver_column(tmp_path):
     claims = store.live_claims()
     assert len(claims) == 1
     assert claims[0].driver == "worker-a" and claims[0].issue == 5
+
+
+# A nodes table as it shipped in the FIRST config-distribution cut (ADR-0042):
+# drivers_hash present, but no drivers_hash_reported presence bit yet.
+_OLD_NODES = """
+CREATE TABLE nodes (
+    name TEXT PRIMARY KEY,
+    version TEXT NOT NULL DEFAULT '',
+    drivers_hash TEXT NOT NULL DEFAULT '',
+    drivers_built_against TEXT NOT NULL DEFAULT '',
+    registered_at REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+"""
+
+
+def test_old_nodes_schema_gains_the_presence_bit_and_reads_fail_open(tmp_path):
+    """An old-schema nodes row (no drivers_hash_reported) opens on the current
+    code with the column added, defaulting to 0 — 'field never reported', the
+    fail-open reading — so a stale cache never blocks dispatch until the next
+    heartbeat records what the daemon actually reports (ADR-0042)."""
+    path = tmp_path / "cache.db"
+    db = sqlite3.connect(str(path))
+    db.executescript(_OLD_NODES)
+    # A pre-column row that even carried an empty drivers_hash: without the bit,
+    # empty was ambiguous; the migration must NOT read it as "explicit none".
+    db.execute(
+        "INSERT INTO nodes (name, version, drivers_hash, drivers_built_against,"
+        " registered_at, last_seen) VALUES ('box1', '0.3.0', '', '', 100.0, 100.0)",
+    )
+    db.commit()
+    db.close()
+
+    store = Store(path, clock=lambda: 200.0)
+    columns = {r["name"] for r in store._db.execute("PRAGMA table_info(nodes)")}
+    assert "drivers_hash_reported" in columns
+    # Fail-open: the migrated row reads as "field not reported" (None), never ''.
+    assert store.node_drivers_hash("box1") is None
+    # The next heartbeat that explicitly reports '' flips it to a real report.
+    store.touch_node("box1", "0.3.0", drivers_hash="")
+    assert store.node_drivers_hash("box1") == ""

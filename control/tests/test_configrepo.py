@@ -47,6 +47,7 @@ def test_missing_repo_is_an_empty_deployment(tmp_path):
     assert config.desired_state_for("box1") == {
         "commit": "",
         "product_version": "",
+        "drivers_hash": "",
         "stacks": [],
         "images": [],
     }
@@ -644,3 +645,119 @@ def test_driverless_workspace_shape_is_enforced(tmp_path):
     write(tmp_path, "worker-types/fd.toml", f'base = "{BASE}"\nworkspace = "owner/repo/extra"\n')
     with pytest.raises(ConfigRepoError, match="owner/name"):
         load_config(tmp_path)
+
+
+# -- config distribution (ADR-0042) ---------------------------------------------
+
+
+def test_drivers_hash_rides_desired_state_and_is_empty_by_default(tmp_path):
+    """No drivers/ → hash "", still always present on the wire."""
+    write(tmp_path, "stacks/x.toml", 'kind = "process"\nnode = "box1"\ncommand = "sleep 1"\n')
+    config = load_config(tmp_path)
+    assert config.drivers_hash == ""
+    assert config.desired_state_for("box1")["drivers_hash"] == ""
+
+
+def test_drivers_content_produces_a_hash_on_the_wire(tmp_path):
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    config = load_config(tmp_path)
+    assert config.drivers_hash and len(config.drivers_hash) == 64
+    assert config.desired_state_for("box1")["drivers_hash"] == config.drivers_hash
+
+
+def test_folder_mode_commit_bumps_on_a_drivers_edit(tmp_path):
+    """Folder mode (no .git): a drivers/*.py edit must change the commit so
+    nodes see the change — the pre-ADR-0042 *.toml-only hash never did."""
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    before = load_config(tmp_path).commit
+    assert before.startswith("folder-")
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 2\n")
+    after = load_config(tmp_path).commit
+    assert after.startswith("folder-") and after != before
+
+
+def test_symlinked_drivers_root_surfaces_as_config_repo_error(tmp_path):
+    """A config-distribution validation failure (a symlinked drivers root) is
+    normalized to ConfigRepoError at the loading boundary, NOT a raw
+    ConfigDistError — so the API turns it into the documented config-repo error
+    and dispatch stays fail-open (ADR-0042)."""
+    import os
+
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "x.py").write_text("escape\n", encoding="utf-8")
+    os.symlink(external, tmp_path / "drivers")
+    with pytest.raises(ConfigRepoError, match="config distribution"):
+        load_config(tmp_path)
+
+
+@pytest.mark.skipif(
+    getattr(__import__("os"), "geteuid", lambda: 1)() == 0, reason="root bypasses file permissions"
+)
+def test_unreadable_drivers_file_surfaces_as_config_repo_error(tmp_path):
+    import os
+
+    write(tmp_path, "drivers/custom/impl.py", "def run():\n    return 1\n")
+    target = tmp_path / "drivers" / "custom" / "impl.py"
+    os.chmod(target, 0)
+    try:
+        with pytest.raises(ConfigRepoError, match="config distribution"):
+            load_config(tmp_path)
+    finally:
+        os.chmod(target, 0o644)
+
+
+def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
+    from theozolith_control import configrepo
+
+    for bad in (
+        "drivers/x.py",
+        "drivers/custom/impl.py",
+        "drivers",
+        "drivers/",  # trailing slash: an empty component, refused as malformed
+    ):
+        with pytest.raises(configrepo.ConfigRepoError):
+            configrepo.refuse_ui_write(bad)
+
+
+def test_refuse_ui_write_rejects_aliased_drivers_spellings(tmp_path):
+    """No repository-relative spelling may resolve under drivers/ while passing
+    the guard (ADR-0042 amendment): dot/dot-dot aliases, backslash variants,
+    and absolute paths are all refused outright — parsed as path components,
+    never matched by string prefix against a partially normalized value."""
+    from theozolith_control import configrepo
+
+    for bad in (
+        "./drivers/x.py",
+        "stacks/../drivers/x.py",
+        "drivers/../drivers/x.py",
+        "drivers\\x.py",
+        ".\\drivers\\x.py",
+        "stacks\\..\\drivers\\x.py",
+        "/drivers/x.py",
+        "\\drivers\\x.py",
+        "//drivers/x.py",
+        "C:\\drivers\\x.py",
+        "C:/drivers/x.py",
+        "/etc/passwd",  # any absolute path is malformed for a repo write
+        "stacks//x.toml",  # an empty component is malformed
+        "stacks/./x.toml",  # a '.' component is refused, never resolved
+        "stacks/../stacks/x.toml",  # '..' is refused even when it stays outside drivers/
+        "",
+    ):
+        with pytest.raises(configrepo.ConfigRepoError):
+            configrepo.refuse_ui_write(bad)
+
+
+def test_refuse_ui_write_allows_other_paths(tmp_path):
+    from theozolith_control import configrepo
+
+    # No raise for the allow-listed fixed-filename writers' targets, nor for
+    # ordinary repo-relative paths a future editor would legitimately write.
+    configrepo.refuse_ui_write("control.toml")
+    configrepo.refuse_ui_write("product.toml")
+    configrepo.refuse_ui_write("stacks/x.toml")
+    configrepo.refuse_ui_write("worker-types/x.toml")
+    configrepo.refuse_ui_write("stacks/drivers.toml")  # 'drivers' as a filename is fine
+    configrepo.refuse_ui_write("drivers.toml")  # a top-level file merely NAMED drivers*
+    configrepo.refuse_ui_write("compose/app/overlay.yaml")

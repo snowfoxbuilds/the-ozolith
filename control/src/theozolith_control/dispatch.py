@@ -75,7 +75,31 @@ class Dispatcher:
             " no new work until it converges"
         )
 
-    def grant_work(self, worker: str, node: str, login: str, *, pin: str = "") -> dict[str, Any]:
+    def _drivers_block(self, node: str, drivers_hash: str) -> str | None:
+        """The config-distribution gate (ADR-0042): a node whose reported
+        drivers-hash differs from the recorded one gets no work until it
+        converges. A node with no recorded distribution ("" desired) is always
+        eligible.
+
+        Field presence decides the two empty cases (never truthiness): a
+        heartbeat that OMITS the field — ``node_drivers_hash`` returns ``None`` —
+        is the legacy/daemon-less shape and stays fail-open eligible; a current
+        daemon that reports ``''`` because it has no verified applied tree is
+        off-hash and blocked exactly like a mismatching non-empty hash."""
+        if not drivers_hash:
+            return None
+        reported = self._store.node_drivers_hash(node)
+        if reported is None or reported == drivers_hash:
+            return None
+        running = reported[:12] if reported else "(none applied)"
+        return (
+            f"node {node!r} runs config distribution {running}, the deployment"
+            f" is {drivers_hash[:12]}; no new work until it converges"
+        )
+
+    def grant_work(
+        self, worker: str, node: str, login: str, *, pin: str = "", drivers_hash: str = ""
+    ) -> dict[str, Any]:
         """Grant one issue to ``worker`` (write-through), or explain why not.
 
         Returns ``{"issue": {...}}`` on a grant and ``{"issue": None}``
@@ -89,6 +113,9 @@ class Dispatcher:
             version_block = self._version_block(node, pin)
             if version_block is not None:
                 return {"issue": None, "reason": version_block}
+            drivers_block = self._drivers_block(node, drivers_hash)
+            if drivers_block is not None:
+                return {"issue": None, "reason": drivers_block}
             pending = self._store.pending_lifecycle_commands(node)
             if pending:
                 return {
@@ -132,15 +159,19 @@ class Dispatcher:
             return {"issue": None}
 
     def review_targets(
-        self, worker: str, node: str, login: str, *, pin: str = ""
+        self, worker: str, node: str, login: str, *, pin: str = "", drivers_hash: str = ""
     ) -> dict[str, Any]:
         """Discovery for the Reviewer: reviewable pr_ready PRs, no writes.
         The pin-eligibility gate applies here too — an off-pin node burns
-        review rounds on the wrong product version."""
+        review rounds on the wrong product version — as does the identical
+        config-distribution gate (ADR-0042)."""
         self._store.upsert_driver(worker, node, login, "reviewer")
         version_block = self._version_block(node, pin)
         if version_block is not None:
             return {"prs": [], "reason": version_block}
+        drivers_block = self._drivers_block(node, drivers_hash)
+        if drivers_block is not None:
+            return {"prs": [], "reason": drivers_block}
         numbers = [
             candidate.number
             for candidate in self._client.list_open_prs_by_label(PR_READY)

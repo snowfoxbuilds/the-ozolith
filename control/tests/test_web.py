@@ -717,3 +717,57 @@ def test_terminal_session_cap_refuses_excess_without_launching(tmp_path):
     lines = [json.loads(line) for line in rig.settings.terminal_audit_path.read_text().splitlines()]
     # Exactly one session ever attached: the refused one launched nothing.
     assert len([line for line in lines if line["event"] == "attach"]) == 1
+
+
+# -- config distribution (ADR-0042) ---------------------------------------------
+
+
+def test_config_dist_offhash_banner_and_stamp_skew_render(control: ControlRig):
+    from theozolith_control import configdist
+
+    control.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
+    digest = configdist.drivers_hash(control.settings.config_repo)
+    login(control)
+    # box1 off-hash (blocking, warning); box2 converged but stamp-skewed (advisory).
+    control.heartbeat(node="box1", version="0.3.0", drivers_hash="d" * 64)
+    control.heartbeat(
+        node="box2", version="0.4.0", drivers_hash=digest, drivers_built_against="0.3.0"
+    )
+    page = control.client.get("/fragments/fleet").text
+    assert "config-distribution skew" in page and "box1" in page
+    assert "config-dist skew" in page  # the per-node badge
+    assert "stamp skew" in page and "advisory" in page  # muted info line
+    # Convergence clears the blocking banner (stamp skew is a separate fact).
+    control.heartbeat(node="box1", version="0.3.0", drivers_hash=digest)
+    assert "config-distribution skew" not in control.client.get("/fragments/fleet").text
+
+
+def test_explicit_empty_report_renders_off_hash_not_healthy(control: ControlRig):
+    """A current daemon that reports drivers_hash='' (no verified tree) is
+    off-hash in the fleet worklist, never healthy; a heartbeat that OMITS the
+    field is fail-open and never listed (ADR-0042)."""
+    from theozolith_control.configrepo import load_config
+    from theozolith_control.web.views import fleet_view
+
+    control.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
+    login(control)
+    control.heartbeat(node="box1", version="0.3.0", drivers_hash="")  # explicit none
+    control.heartbeat(node="box2", version="0.3.0")  # legacy omission
+    view = fleet_view(control.store, load_config(control.settings.config_repo))
+    # box1 is off-hash (explicit ''), box2 is fail-open (field absent).
+    assert view["drivers_off_hash"] == ["box1"]
+    banner = control.client.get("/fragments/fleet").text
+    assert "config-distribution skew" in banner and "box1" in banner
+
+
+def test_settings_form_refuses_a_drivers_shaped_key(control: ControlRig):
+    """The one web write path into the Config Repo is a fixed control.toml
+    allow-list — it can never address drivers/ (ADR-0042)."""
+    login(control)
+    answer = control.client.post(
+        "/settings",
+        data={"key": "drivers/custom/impl.py", "value": "x"},
+        headers={"Origin": CONTROL_ORIGIN},
+    )
+    assert answer.status_code == 400  # unknown control.toml key, refused
+    assert not (control.settings.config_repo / "drivers").exists()

@@ -151,6 +151,13 @@ class ControlSettings:
         return self.cache_dir / "artifacts"
 
     @property
+    def config_artifacts_dir(self) -> Path:
+        """Config-distribution zips the Control Node packages from ``drivers/``
+        and serves to node pulls (ADR-0042). Under cache/ (ADR-0024): deletable
+        — losing it costs one on-demand rebuild from the working Config Repo."""
+        return self.cache_dir / "config-artifacts"
+
+    @property
     def coordination_jobs_enabled(self) -> bool:
         """Dispatch + janitor need a GitHub identity and a target repo."""
         return bool(self.repo and self.github_token)

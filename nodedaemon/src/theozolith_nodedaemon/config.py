@@ -81,6 +81,18 @@ class DaemonConfig:
         return self.state_dir / "applied-compose.json"
 
     @property
+    def config_dist_dir(self) -> Path:
+        # The unpacked config distributions (ADR-0042): one <hash>/ dir per
+        # applied distribution (drivers/ + config-dist.json), plus a `current`
+        # pointer file. Applied runtime state under the state dir — survives a
+        # restart so a reconnecting node keeps reporting its applied hash.
+        return self.state_dir / "config-dist"
+
+    @property
+    def config_dist_current(self) -> Path:
+        return self.config_dist_dir / "current"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 
