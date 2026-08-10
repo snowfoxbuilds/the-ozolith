@@ -2638,3 +2638,304 @@ def test_pending_recovery_metadata_has_no_secret_values(rig: Rig):
     assert recovered.state == "pending"
     assert "super-secret-value" not in recovered.fingerprint
     assert all("super-secret-value" not in f for f in recovered.files)
+
+
+# -- write-ahead ORDERING: the pending record is durable BEFORE any teardown ------
+#
+# The write-ahead recovery record is persisted BEFORE the losing runtime form is
+# retired and BEFORE compose up (ADR-0044 amendment). So a persist failure — the
+# state dir momentarily unwritable — must leave the OLD form running untouched:
+# no process is stopped, no Run container or single-image container is removed,
+# no live compose project is disturbed. Only once the pending record is durable
+# do the teardown and the up proceed; a teardown failure after that still gates
+# the up and keeps the pending record for a later retry. No failure path may
+# leave two runtime forms coexisting or leak a secret value.
+
+
+def _break_persist(rig: Rig):
+    """Install a ``_persist_applied_compose`` that always raises (an unwritable
+    state dir), and return the real method so a later pass can restore it. Every
+    write-ahead in the interim fails and rolls back — nothing reaches disk."""
+    real = rig.daemon._persist_applied_compose
+
+    def boom() -> None:
+        raise OSError("state dir unwritable")
+
+    rig.daemon._persist_applied_compose = boom  # type: ignore[method-assign]
+    return real
+
+
+def test_single_image_to_compose_write_ahead_failure_keeps_the_container(rig: Rig):
+    """single-image -> compose: a write-ahead persist failure keeps the losing
+    single-image container running and performs NO remove — the record is durable
+    before any teardown. Recovery then completes the transition exactly once."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert "ozolith-stack-svc" in rig.docker.stacks
+    rig.docker.removed.clear()
+
+    real_persist = _break_persist(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # The single-image container is untouched: still running, never removed. No
+    # compose up, no false record on disk or in memory.
+    assert "ozolith-stack-svc" in rig.docker.stacks
+    assert "ozolith-stack-svc" not in rig.docker.removed
+    assert not any(verb == "up" for _, _, verb in rig.docker.compose_calls)
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert "svc" not in rig.daemon._applied_compose
+    assert not rig.config.applied_compose_path.exists()
+    assert _active_forms(rig, "svc") == {"single-image"}  # exactly one form
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Persistence recovers: the transition completes exactly once.
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.docker.removed.count("ozolith-stack-svc") == 1  # retired exactly once
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+    # Stable on a further pass — no second up, no churn.
+    ups = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_process_to_compose_write_ahead_failure_keeps_the_child_and_run_containers(rig: Rig):
+    """process -> compose: a write-ahead persist failure keeps the original
+    process child alive and its owned Run containers in place — the child is not
+    stopped and its containers are not removed. Recovery completes it once."""
+    rig.control.heartbeat_answers.append(heartbeat_response([process_stack("svc")]))
+    rig.daemon.once()
+    child = rig.popen.spawned[0]
+    rig.docker.add_run_container("run-svc-1", "run-1", "svc")
+    assert rig.daemon._supervisor.alive("svc")
+
+    real_persist = _break_persist(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # Child and its owned Run container both survive; nothing composed up.
+    assert rig.daemon._supervisor.alive("svc") and child.poll() is None
+    assert "run-svc-1" in rig.docker.containers
+    assert "run-svc-1" not in rig.docker.removed
+    assert not any(verb == "up" for _, _, verb in rig.docker.compose_calls)
+    assert "svc" not in rig.daemon._applied_compose
+    assert _active_forms(rig, "svc") == {"process"}  # exactly one form
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Persistence recovers: the child (and its Run container) retire, compose ups.
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("svc") and child.poll() is not None
+    assert "run-svc-1" not in rig.docker.containers  # owned Run container removed
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_compose_spec_change_write_ahead_failure_keeps_the_old_project(rig: Rig):
+    """compose spec change: a write-ahead persist failure for the NEW record keeps
+    the old compose project running and preserves the previous applied record —
+    compose up is gated on the persist, so the live project is never disturbed."""
+    files_a = [{"name": "compose/base.yml", "content": "services: {a: {}}\n"}]
+    files_b = [{"name": "compose/base.yml", "content": "services: {b: {}}\n"}]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc", files=files_a)]))
+    rig.daemon.once()
+    old = rig.daemon._applied_compose["svc"]
+    old_fingerprint = old.fingerprint
+    ups_before = sum(1 for c in rig.docker.compose_calls if c[2] == "up")
+
+    real_persist = _break_persist(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc", files=files_b)]))
+    rig.daemon.once()
+
+    # The old project keeps running and the previous applied record is preserved;
+    # no up was invoked for the new spec.
+    assert "ozolith-svc" in rig.docker.compose_projects
+    assert rig.daemon._applied_compose["svc"].fingerprint == old_fingerprint
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before
+    assert _active_forms(rig, "svc") == {"compose"}  # exactly one form
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Persistence recovers: the new spec ups exactly once and becomes the record.
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc", files=files_b)]))
+    rig.daemon.once()
+    assert sum(1 for c in rig.docker.compose_calls if c[2] == "up") == ups_before + 1
+    assert rig.daemon._applied_compose["svc"].fingerprint != old_fingerprint
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_teardown_failure_after_write_ahead_prevents_up_and_retains_pending(rig: Rig):
+    """A teardown failure AFTER a successful write-ahead prevents compose up and
+    retains the pending record for retry — the two forms never coexist. Recovery
+    completes the transition once the teardown succeeds."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+
+    rig.docker.fail_remove.add("ozolith-stack-svc")  # the predecessor teardown fails
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # Write-ahead persisted a pending record; the single-image teardown failed, so
+    # compose up never ran and the old form is still the only one live.
+    assert rig.daemon._applied_compose["svc"].state == "pending"
+    assert json.loads(rig.config.applied_compose_path.read_text())["svc"]["state"] == "pending"
+    assert not any(verb == "up" for _, _, verb in rig.docker.compose_calls)
+    assert "ozolith-svc" not in rig.docker.compose_projects
+    assert not rig.daemon._compose_running("svc")
+    assert _active_forms(rig, "svc") == {"single-image"}  # never two forms
+    assert any("reconcile failed" in line for line in rig.logs)
+
+    # Teardown recovers: the retry removes the container and ups exactly once.
+    rig.docker.fail_remove.discard("ozolith-stack-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_write_ahead_orders_persist_then_teardown_then_up(rig: Rig):
+    """An order probe over the persistence, teardown, and up seams proves the
+    exact sequence: (1) pending persistence, (2) predecessor teardown, (3) compose
+    up — followed by the best-effort applied confirmation."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+
+    events: list[str] = []
+    real_persist = rig.daemon._persist_applied_compose
+
+    def persist_spy() -> None:
+        real_persist()
+        events.append("persist")
+
+    rig.daemon._persist_applied_compose = persist_spy  # type: ignore[method-assign]
+    real_remove = rig.docker.remove
+
+    def remove_spy(name: str) -> None:
+        real_remove(name)
+        events.append(f"remove:{name}")
+
+    rig.docker.remove = remove_spy  # type: ignore[method-assign]
+    real_compose = rig.docker.compose
+
+    def compose_spy(project, files, verb) -> None:
+        real_compose(project, files, verb)
+        events.append(f"compose:{verb}")
+
+    rig.docker.compose = compose_spy  # type: ignore[method-assign]
+
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    # Pending persistence FIRST, then the predecessor teardown, then compose up —
+    # the applied confirmation persists last (best-effort).
+    assert events == [
+        "persist",
+        "remove:ozolith-stack-svc",
+        "compose:up",
+        "persist",
+    ]
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_crash_after_pending_persist_before_teardown_recovers_safely(rig: Rig):
+    """A crash AFTER the pending record persists but BEFORE the predecessor
+    teardown leaves the old form running and a durable pending record; a real
+    restart recovers to exactly one form, retiring the old form before up."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+
+    # Persist the write-ahead record, then interrupt the pass right after it (the
+    # single-image teardown raises), exactly as a crash at that instant would.
+    rig.docker.fail_remove.add("ozolith-stack-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    on_disk = json.loads(rig.config.applied_compose_path.read_text())["svc"]
+    assert on_disk["state"] == "pending"  # durable write-ahead landed
+    assert "ozolith-stack-svc" in rig.docker.stacks  # old form still running
+    assert not any(verb == "up" for _, _, verb in rig.docker.compose_calls)
+    assert _active_forms(rig, "svc") == {"single-image"}
+
+    # A real restart (all in-memory state gone) recovers from disk and completes
+    # the transition — the old single-image form is retired before compose up.
+    rig.docker.fail_remove.discard("ozolith-stack-svc")
+    _restart_daemon(rig)
+    assert rig.daemon._applied_compose["svc"].state == "pending"  # recovered pending
+    events, _ = _order_probe(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+
+    assert events == ["compose:up"]  # only the up on this seam; teardown is a remove
+    assert "ozolith-stack-svc" not in rig.docker.stacks  # old form retired
+    assert _active_forms(rig, "svc") == {"compose"}  # exactly one form, converged
+    assert rig.daemon._applied_compose["svc"].state == "applied"
+
+
+def test_no_write_ahead_failure_path_leaves_two_forms(rig: Rig):
+    """Across every write-ahead failure mode — persist failure on a single-image
+    transition, then a teardown failure, then recovery — never are two runtime
+    forms live at once for the same name."""
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+    assert len(_active_forms(rig, "svc")) == 1
+
+    # Write-ahead persist failure: still one form (the single-image container).
+    real_persist = _break_persist(rig)
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert len(_active_forms(rig, "svc")) == 1
+
+    # Persist recovers but the teardown fails: still one form, up gated.
+    rig.daemon._persist_applied_compose = real_persist  # type: ignore[method-assign]
+    rig.docker.fail_remove.add("ozolith-stack-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert len(_active_forms(rig, "svc")) == 1
+
+    # Teardown recovers: converges to exactly one form (compose).
+    rig.docker.fail_remove.discard("ozolith-stack-svc")
+    rig.control.heartbeat_answers.append(heartbeat_response([_compose_stack("svc")]))
+    rig.daemon.once()
+    assert _active_forms(rig, "svc") == {"compose"}
+
+
+def test_transition_write_ahead_pending_record_has_no_secret_values(rig: Rig):
+    """The pending record written AHEAD of a single-image -> compose transition —
+    and nothing else under the state dir — carries a secret value; the value lives
+    only in the secrets tmpfs the compose files reference by VAR_FILE."""
+    rig.control.secrets["tok-a"] = "super-secret-value"
+    rig.control.heartbeat_answers.append(
+        heartbeat_response([container_stack("svc", image="ghcr.io/x/s:1")])
+    )
+    rig.daemon.once()
+
+    files = [{"name": "compose/base.yml", "content": "services: {x: {env_file: TOK_FILE}}\n"}]
+    stack = _compose_stack("svc", files=files, secrets={"TOK": "tok-a"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()
+
+    record = rig.daemon._applied_compose["svc"]
+    assert "super-secret-value" not in record.fingerprint
+    assert all("super-secret-value" not in f for f in record.files)
+    for path in rig.config.state_dir.rglob("*"):
+        if path.is_file():
+            assert "super-secret-value" not in path.read_text(errors="replace"), path

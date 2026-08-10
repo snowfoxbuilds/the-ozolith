@@ -1087,10 +1087,13 @@ class NodeDaemon:
 
     def _converge_compose(self, stack: WireStack, child_lingers: bool) -> None:
         """Bring the compose form up as the SOLE runtime form under this name.
-        Handles a single-image->compose transition too: the losing single-image
-        container is retained until the compose prerequisites (secrets, valid
-        materialized files) are ready, then removed BEFORE compose up so the two
-        container forms never coexist (ADR-0044 amendment)."""
+        Handles a single-image->compose (and process->compose) transition too: the
+        losing form is retained until the compose prerequisites (secrets, valid
+        materialized files) are ready AND the write-ahead recovery record has been
+        durably persisted, then retired BEFORE compose up so the two runtime forms
+        never coexist. Persisting the pending record ahead of the teardown means a
+        failed write-ahead leaves the losing form running and touches nothing
+        (ADR-0044 amendment)."""
         fingerprint = self._compose_fingerprint(stack)
         single_present = bool(self._docker.stack_containers(stack.name))
         applied = self._applied_compose.get(stack.name)
@@ -1114,6 +1117,24 @@ class NodeDaemon:
         if not self._pull_stack_secrets(stack):
             return
         files = self._compose_paths(stack)  # materialize + validate before any teardown
+        # Write-ahead the recovery record BEFORE retiring the losing runtime form
+        # AND before compose up (ADR-0044 amendment: crash-consistent startup). The
+        # pending record (name + fingerprint + retained non-empty file paths) must
+        # be durable BEFORE the predecessor teardown so no ordering — a crash or a
+        # persist failure — can leave an old form retired with no record able to
+        # bring the compose project up or tear it back down. If this persist FAILS,
+        # nothing is retired: the process child and its owned Run containers, and
+        # any single-image container, keep running; the previous applied record is
+        # preserved (rolled back in _write_ahead_compose); and the raise reaches
+        # _reconcile, which retries next pass. A compose spec change over a running
+        # old project likewise keeps that project running — compose up is gated on
+        # this persist, so a failed write-ahead never touches the live project.
+        paths = [str(f) for f in files]
+        self._write_ahead_compose(stack.name, AppliedCompose(fingerprint, paths, COMPOSE_PENDING))
+        # Only after the write-ahead persists do we retire the predecessor form(s).
+        # A teardown failure here raises BEFORE compose up, so the two runtime forms
+        # never coexist and the durable pending record is retained for the retry
+        # that completes the transition on a later pass (ADR-0044 amendment).
         if child_lingers:  # process->compose: retire the process form
             self._stop_process_child(stack.name)
         if single_present:  # single-image->compose: retire the single-image form first
@@ -1122,15 +1143,6 @@ class NodeDaemon:
                 " removing the single-image container before compose up"
             )
             self._remove_single_image(stack.name)
-        # Write-ahead the recovery record BEFORE compose up (ADR-0044 amendment:
-        # crash-consistent startup). Once Docker Compose is invoked it may create
-        # the project and the daemon may die before recording anything; the
-        # write-ahead PENDING record (name + fingerprint + retained non-empty file
-        # paths) guarantees a later same-name transition or stopped/removed desire
-        # can still tear that project down. If this persist fails, compose up is
-        # NOT invoked (the raise reaches _reconcile, which retries next pass).
-        paths = [str(f) for f in files]
-        self._write_ahead_compose(stack.name, AppliedCompose(fingerprint, paths, COMPOSE_PENDING))
         self._docker.compose(f"ozolith-{stack.name}", files, "up")
         # Confirm APPLIED after a successful up — best-effort: a failure to persist
         # the confirmation must NOT drop the durable write-ahead record, so it is
