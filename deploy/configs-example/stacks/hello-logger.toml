@@ -1,0 +1,21 @@
+# The custom driver as a thin Stack (ADR-0044): worker type + placement +
+# desired state, nothing else. Staged at state = "stopped" — nothing deploys or
+# builds until you flip it to "running" and commit (ADR-0037). The resolved kind
+# is process (the worker type has a driver), so there is no `attach` key; run
+# containers are headless and never attach targets (ADR-0019).
+#
+# Bringing it up: enter the secrets the worker type references, set a real
+# `workspace` and `base` digest in worker-types/hello-logger.toml, flip this to
+# "running", and commit. The node converges the config distribution over its
+# heartbeat and starts `theozolith-driver drivers/hello_logger`. Edit
+# drivers/hello_logger.py, commit, and the hash changes → the node restarts the
+# driver on the new code, no daemon or product change.
+
+worker_type = "hello-logger"
+node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
+state = "stopped"            # flip to "running" and commit to deploy
+
+# Optional [env] = per-placement expert overrides (they win over the values the
+# worker type injects).
+[env]
+WORKER_ID = "hello-logger-box1"

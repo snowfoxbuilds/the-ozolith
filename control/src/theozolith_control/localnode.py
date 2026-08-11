@@ -761,6 +761,13 @@ The finish line, three steps:
 Everything here is ordinary git: edit, commit, done. Secrets never live in
 this repo (ADR-0024), and a Stack named `control` is rejected — the
 substrate never supervises its own control plane (ADR-0035).
+
+**Custom drivers** (ADR-0042): a `drivers/` directory here can hold your own
+worker types — a `drivers/<name>.py` module exporting a `Driver` class, named
+by a worker type as `driver = "drivers/<name>"`. It is delivered to nodes as a
+hash-pinned, verified config distribution and runs without forking the product.
+`drivers/` is **git-native only** — never edit it through any config UI: a write
+there is code execution with driver credentials on every node that runs it.
 """
 
 

@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import re
 import shlex
 import subprocess
 import tomllib
@@ -56,9 +57,9 @@ GIT_NATIVE_ONLY = ("drivers/",)
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
 # supervised command each resolves to control-side. Every builtin runs through
 # the one generic launcher (`theozolith-driver <ref>`, ADR-0020), so control is
-# the single place that names the command; the custom-driver sub-issue
-# (ADR-0042) turns `drivers/<name>` refs into real resolution. The keys must
-# match theozolith_worker.drivercli.BUILTIN_WORKERS (pinned by contract test).
+# the single place that names the command; a custom `drivers/<name>` ref
+# resolves through the same launcher (_resolve_driver_command, ADR-0042). The
+# keys must match theozolith_worker.drivercli.BUILTIN_WORKERS (contract test).
 BUILTIN_DRIVERS = {
     "builtin:implementer": "theozolith-driver builtin:implementer",
     "builtin:reviewer": "theozolith-driver builtin:reviewer",
@@ -66,8 +67,16 @@ BUILTIN_DRIVERS = {
 
 # The launcher command every built-in driver resolves through; a plain process
 # Stack invoking it directly is rejected (the runner only works with the env a
-# worker type injects — see _parse_stack's guard).
+# worker type injects — see _parse_stack's guard). A custom driver resolves to
+# the same launcher with a ``drivers/<name>`` ref (ADR-0042).
 DRIVER_LAUNCHER = "theozolith-driver"
+
+# A custom driver ref is ``drivers/<name>`` where ``<name>`` is a valid Python
+# identifier (ADR-0042): the module is imported as ``drivers.<name>``, so dashes
+# are unimportable and rejected here (the resolver) exactly as the runner rejects
+# them. Same shape both sides — one source of truth for the convention.
+CUSTOM_DRIVER_PREFIX = "drivers/"
+CUSTOM_DRIVER_NAME = re.compile(r"[a-z_][a-z0-9_]*")
 
 # Where a node keeps per-Stack jobs directories unless a Stack's env says
 # otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
@@ -568,7 +577,17 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
     command = _require_str(data, "command", context, default="")
     volumes = _str_list(data, "volumes", context)
     if driver:
-        is_custom = driver.startswith("drivers/") and len(driver) > len("drivers/")
+        if driver.startswith(CUSTOM_DRIVER_PREFIX):
+            custom_name = driver[len(CUSTOM_DRIVER_PREFIX) :]
+            if not CUSTOM_DRIVER_NAME.fullmatch(custom_name):
+                raise ConfigRepoError(
+                    f"{context}: custom driver ref {driver!r} — the name after"
+                    " 'drivers/' must be a valid Python identifier"
+                    " (^[a-z_][a-z0-9_]*$); dashes are unimportable (ADR-0042)"
+                )
+            is_custom = True
+        else:
+            is_custom = False
         if driver not in BUILTIN_DRIVERS and not is_custom:
             if driver.startswith("builtin:"):
                 known = ", ".join(sorted(BUILTIN_DRIVERS))
@@ -623,25 +642,51 @@ def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ..
     return tuple(resolved)
 
 
-def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
+def _custom_driver_exists(repo_dir: Path, name: str) -> bool:
+    """Whether a ``drivers/<name>`` custom driver is present in the Config Repo,
+    in either sanctioned form (ADR-0042): the module file ``drivers/<name>.py``
+    or the package ``drivers/<name>/__init__.py``."""
+    return (repo_dir / "drivers" / f"{name}.py").is_file() or (
+        repo_dir / "drivers" / name / "__init__.py"
+    ).is_file()
+
+
+def _resolve_driver_command(wt: WorkerTypeDef, repo_dir: Path | None) -> str:
+    """The supervised argv a driver worker type resolves to (ADR-0042/ADR-0020):
+    every driver runs through the one generic launcher. ``builtin:*`` maps to the
+    fixed command; ``drivers/<name>`` maps to ``theozolith-driver drivers/<name>``
+    after VERIFYING the module exists in the Config Repo — a dangling reference
+    fails loudly here at config-load time on the Control Node, never silently at
+    process start on a node. The name shape was validated in _parse_worker_type."""
+    if wt.driver in BUILTIN_DRIVERS:
+        return BUILTIN_DRIVERS[wt.driver]
+    name = wt.driver[len(CUSTOM_DRIVER_PREFIX) :]
+    if repo_dir is None or not _custom_driver_exists(repo_dir, name):
+        raise ConfigRepoError(
+            f"worker-types/{wt.name}.toml: custom driver {wt.driver!r} has no module"
+            f" in the Config Repo — expected drivers/{name}.py or"
+            f" drivers/{name}/__init__.py (ADR-0042)"
+        )
+    return f"{DRIVER_LAUNCHER} {wt.driver}"
+
+
+def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | None) -> StackDef:
     """Turn a thin worker-type Stack into a concrete generic StackDef (ADR-0044).
 
     Env injection happens control-side (the daemon's run_image linkage is
     gone): the type supplies THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE, then the
-    Stack's own [env] overrides. The kind is derived from the type's driver."""
+    Stack's own [env] overrides. The kind is derived from the type's driver;
+    the supervised command is resolved from the driver ref (builtin or a
+    verified drivers/<name>, ADR-0042)."""
     context = f"stacks/{stack.name}.toml"
     if wt.is_driver:
-        if wt.driver.startswith("drivers/"):
-            raise ConfigRepoError(
-                f"worker-types/{wt.name}.toml: config-distribution driver delivery"
-                " is not yet implemented (ADR-0042)"
-            )
         if stack.attach:
             raise ConfigRepoError(
                 f"{context}: 'attach' is only valid on container-kind Stacks — worker"
                 f" type {wt.name!r} has a driver, so the Stack resolves to process"
                 " kind (ADR-0019/ADR-0044)"
             )
+        command = _resolve_driver_command(wt, repo_dir)
         env = {
             "THEOZOLITH_REPO": wt.workspace,
             "THEOZOLITH_ADAPTER": wt.adapter,
@@ -658,7 +703,7 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
             worker_type=wt.name,
             env=env,
             secrets=dict(wt.secrets),
-            command=BUILTIN_DRIVERS[wt.driver],
+            command=command,
         )
     # Driverless: an interactive Flight Deck container running the derived tag.
     env: dict[str, str] = {}
@@ -681,7 +726,9 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
 
 
 def _resolve_stacks(
-    stacks: tuple[StackDef, ...], worker_types: dict[str, WorkerTypeDef]
+    stacks: tuple[StackDef, ...],
+    worker_types: dict[str, WorkerTypeDef],
+    repo_dir: Path | None,
 ) -> tuple[StackDef, ...]:
     resolved: list[StackDef] = []
     for stack in stacks:
@@ -694,7 +741,7 @@ def _resolve_stacks(
                 f"stacks/{stack.name}.toml: worker_type {stack.worker_type!r} has no"
                 f" worker-types/{stack.worker_type}.toml"
             )
-        resolved.append(_resolve_worker_stack(stack, wt))
+        resolved.append(_resolve_worker_stack(stack, wt, repo_dir))
     return tuple(resolved)
 
 
@@ -749,6 +796,7 @@ def load_config(repo_dir: Path) -> DeployConfig:
             for path in sorted((repo_dir / "stacks").glob("*.toml"))
         ),
         worker_types,
+        repo_dir,
     )
     _check_jobs_dirs(stacks)
     product_version = ""

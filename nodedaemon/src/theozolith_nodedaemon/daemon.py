@@ -951,23 +951,27 @@ class NodeDaemon:
             return ""
         return self._verified_built_against
 
+    def _is_config_dist_stack(self, stack: WireStack) -> bool:
+        """Whether this process Stack invokes a config-distribution custom driver
+        (``theozolith-driver drivers/<name>``), by the SAME argv parse the
+        swap-restart set, the fail-closed run-image guard, and the drivers env
+        injection all share (ADR-0042): argv[0] the launcher, argv[1] under
+        ``drivers/``. A builtin:* driver Stack and a generic process Stack are
+        never config-distribution Stacks."""
+        if stack.kind != "process" or not stack.command:
+            return False
+        try:
+            argv = shlex.split(stack.command)
+        except ValueError:
+            return False
+        return len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/")
+
     def _drivers_stack_names(self) -> list[str]:
         """Desired process Stacks whose command is ``theozolith-driver
         drivers/<ref>`` — the config-distribution drivers a swap must restart.
-        Identified by the SAME parse as the landed fail-closed guard (argv[0]
-        the launcher, argv[1] under ``drivers/``): a builtin:* driver Stack and
-        a generic process Stack are untouched by a swap (ADR-0042)."""
-        names = []
-        for stack in self._stacks():
-            if stack.kind != "process" or not stack.command:
-                continue
-            try:
-                argv = shlex.split(stack.command)
-            except ValueError:
-                continue
-            if len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/"):
-                names.append(stack.name)
-        return names
+        A builtin:* driver Stack and a generic process Stack are untouched by a
+        swap (ADR-0042)."""
+        return [stack.name for stack in self._stacks() if self._is_config_dist_stack(stack)]
 
     def _stop_drivers_stacks(self) -> None:
         for name in self._drivers_stack_names():
@@ -1308,6 +1312,22 @@ class NodeDaemon:
         # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
         # (resolved from the worker type, ADR-0044); the daemon no longer maps a
         # removed wire field to a built tag.
+        #
+        # A config-distribution custom driver (theozolith-driver drivers/<name>)
+        # also gets THEOZOLITH_DRIVERS_DIR — the absolute path of the VERIFIED
+        # applied distribution root (config-dist/<hash>/), from which the runner
+        # imports drivers.<name> (ADR-0042). The hash comes from the per-pass
+        # verified memo, never the `current` pointer directly (the pointer is
+        # verified, not trusted); when nothing is applied the value is omitted
+        # and the start gate in _converge_process refuses to launch. A hash swap
+        # changes this value, so the effective spec changes and drives a restart
+        # (belt-and-suspenders with the landed stop-on-swap). Stack env wins.
+        if self._is_config_dist_stack(stack):
+            applied = self._current_drivers_hash()
+            if applied:
+                env.setdefault(
+                    "THEOZOLITH_DRIVERS_DIR", str(self._config.config_dist_dir / applied)
+                )
         env_files = secret_env_files(stack, self._config.secrets_dir)
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
         return env
@@ -1382,16 +1402,28 @@ class NodeDaemon:
         # Builtin drivers and generic process Stacks are untouched.
         if len(argv) >= 2 and argv[0] == DRIVER_LAUNCHER and argv[1].startswith("drivers/"):
             desired_hash = str(self._desired.get("drivers_hash", "") or "")
-            if not desired_hash:
-                self._log(
-                    f"stack {stack.name}: {'restart' if alive else 'start'} deferred —"
-                    " no config distribution desired/applied"
+            applied_hash = self._current_drivers_hash()
+            if not desired_hash or applied_hash != desired_hash:
+                verb = "restart" if alive else "start"
+                reason = (
+                    "no config distribution desired/applied"
+                    if not desired_hash
+                    else "config distribution not converged to the desired hash"
                 )
-                return
-            if self._current_drivers_hash() != desired_hash:
-                self._log(
-                    f"stack {stack.name}: {'restart' if alive else 'start'} deferred —"
-                    " config distribution not converged to the desired hash"
+                self._log(f"stack {stack.name}: {verb} deferred — {reason}")
+                # Surface the refusal (ADR-0042): a drivers/<name> Stack whose
+                # code is not available cannot run — the same fail-closed posture
+                # as the missing-run-image guard above. Self-heals once
+                # _converge_drivers lands the distribution (it runs before
+                # _reconcile in the same pass), so a healthy convergence never
+                # trips this; a persistent miss (old/incomplete desired state, a
+                # dangling driver stack after a retirement) keeps the dashboard
+                # error fresh until the operator intervenes.
+                self._emit_error(
+                    "config-dist-missing",
+                    f"stack {stack.name}: custom driver {argv[1]!r} cannot {verb} —"
+                    f" {reason} (desired {desired_hash[:12] or '(none)'}, applied"
+                    f" {applied_hash[:12] or '(none)'})",
                 )
                 return
         # Never restart onto a run image that is not built: if the driver's

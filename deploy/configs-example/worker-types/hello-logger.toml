@@ -1,0 +1,27 @@
+# A custom worker type (ADR-0042/ADR-0044): identical in shape to the built-in
+# claude-dev type, except `driver` names a module in this repo's `drivers/`
+# tree instead of a builtin. That one line is the whole difference — control
+# resolves `drivers/hello_logger` to `theozolith-driver drivers/hello_logger`
+# after verifying `drivers/hello_logger.py` exists here, ships the tree to nodes
+# as a hash-pinned config distribution, and the node runs it. No product fork,
+# no daemon change.
+
+driver = "drivers/hello_logger"  # -> drivers/hello_logger.py in this repo
+adapter = "claude"               # the Agent adapter the harness invokes
+model = "claude-sonnet-5"
+workspace = "you/your-repo"      # target repository (owner/name); required with a driver
+
+# The derived run image the container-host builds locally. Pin by digest
+# (ADR-0006) — the zeros are a placeholder; replace with a real digest:
+#     docker pull ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0
+#     docker inspect --format '{{index .RepoDigests 0}}' \
+#         ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Secret NAMES only — values live encrypted on the Control Node (never in this
+# repo, ADR-0024/0042: a Config Repo write here is code execution on nodes),
+# entered once via `theozolith secret set <name>`, pulled node-scoped, and
+# delivered as <ENV>_FILE from tmpfs.
+[secrets]
+GITHUB_TOKEN = "github-implementer"
+ANTHROPIC_API_KEY = "anthropic-api-key"
