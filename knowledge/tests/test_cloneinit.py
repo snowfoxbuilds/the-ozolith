@@ -187,6 +187,15 @@ def test_lock_serializes_concurrent_siblings_so_exactly_one_clones(tmp_path):
 # -- crash recovery (the staged, marker-guarded promotion) ------------------------
 
 
+def _plant_marker(target: Path) -> None:
+    """A marker in the exact shape ``_create_marker`` writes — empty, one
+    link, caller-owned, mode 0600 (chmod'd so the umask can't loosen it) —
+    the only shape resume validation adopts as protocol state."""
+    marker = target / cloneinit._MARKER_NAME
+    marker.touch(mode=0o600)
+    marker.chmod(0o600)
+
+
 def _assert_complete_checkout(target: Path, source: Path) -> None:
     """The convergence bar every rerun must clear: a full, clean checkout with
     no scratch left behind and the promote flow's `git add -A` unpolluted."""
@@ -287,7 +296,7 @@ def test_crash_after_git_move_before_cleanup_recovers(tmp_path):
     target = tmp_path / "clone"
     clone_init(str(source), target)
     (target / cloneinit._STAGE_NAME).mkdir()
-    (target / cloneinit._MARKER_NAME).touch()
+    _plant_marker(target)
 
     assert clone_init(str(source), target) == "recovered"
     _assert_complete_checkout(target, source)
@@ -317,7 +326,7 @@ def test_marker_with_nothing_promotable_is_a_hard_error(tmp_path):
     source = make_source_repo(tmp_path / "src")
     target = tmp_path / "clone"
     target.mkdir()
-    (target / cloneinit._MARKER_NAME).touch()
+    _plant_marker(target)
 
     for _ in range(2):
         with pytest.raises(KnowledgeError, match="neither a promotable staging area"):
@@ -568,9 +577,9 @@ def test_source_tracking_a_reserved_name_is_rejected_before_any_promotion(tmp_pa
         (LOCK_NAME, "never holds content"),
         # … the tracked stage-name file by the non-following shape check …
         (cloneinit._STAGE_NAME, "not the staging directory"),
-        # … and the tracked marker by the tracked-name check — BEFORE the
-        # cleanup path would have unlinked it as leftover protocol state.
-        (cloneinit._MARKER_NAME, "reserved clone-init name"),
+        # … and the tracked marker by the exact-shape validation (it holds
+        # content) — BEFORE any recovery step, let alone the cleanup unlink.
+        (cloneinit._MARKER_NAME, "never holds content"),
     ],
 )
 def test_pre_existing_checkout_tracking_a_reserved_name_is_rejected_untouched(
@@ -633,7 +642,7 @@ def test_stage_symlink_under_a_marker_is_rejected_and_the_destination_untouched(
     (victim / "precious.md").write_text("precious\n")
     target = tmp_path / "clone"
     target.mkdir()
-    (target / cloneinit._MARKER_NAME).touch()
+    _plant_marker(target)
     (target / cloneinit._STAGE_NAME).symlink_to(victim)
 
     with pytest.raises(KnowledgeError, match="not the staging directory"):
@@ -674,7 +683,7 @@ def test_resumed_stage_holding_a_reserved_name_is_not_promoted(tmp_path):
     (stage / ".git").mkdir()
     (stage / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     (stage / LOCK_NAME).write_text("smuggled\n")
-    (target / cloneinit._MARKER_NAME).touch()
+    _plant_marker(target)
 
     with pytest.raises(KnowledgeError, match="refusing to promote"):
         clone_init(source, target)
@@ -682,3 +691,103 @@ def test_resumed_stage_holding_a_reserved_name_is_not_promoted(tmp_path):
     assert (stage / ".git" / "HEAD").exists()
     assert not (target / ".git").exists()  # nothing moved
     assert (target / cloneinit._MARKER_NAME).exists()
+
+
+# -- marker exact-shape validation and promotion preflight ------------------------
+
+
+def test_untracked_operator_file_at_the_marker_name_is_rejected_untouched(tmp_path):
+    """REGRESSION: in a complete checkout, an UNTRACKED non-empty operator
+    file wearing the marker name looked exactly like the post-promotion
+    cleanup window, and the old resume unlinked it and answered
+    'recovered'."""
+    source = Path(make_source_repo(tmp_path / "src"))
+    target = tmp_path / "clone"
+    clone_init(str(source), target)
+    (target / cloneinit._MARKER_NAME).write_text("operator notes — do not delete\n")
+    before = _tree_snapshot(target)
+
+    for _ in range(2):  # converges: same rejection, still byte-for-byte intact
+        with pytest.raises(KnowledgeError, match="never holds content"):
+            clone_init(str(source), target)
+        assert _tree_snapshot(target) == before
+
+
+def test_marker_hard_linked_to_another_file_is_rejected_with_link_counts_intact(tmp_path):
+    """An EMPTY file at the marker name that is a hard-link alias of operator
+    content passes the size check but must fail the link-count check —
+    unlinking it would silently drop the alias from the operator's file."""
+    source = Path(make_source_repo(tmp_path / "src"))
+    target = tmp_path / "clone"
+    clone_init(str(source), target)
+    alias = target / "alias"
+    alias.touch()
+    os.link(alias, target / cloneinit._MARKER_NAME)
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match="hard link"):
+        clone_init(str(source), target)
+    assert _tree_snapshot(target) == before  # snapshot includes link counts
+    assert os.lstat(target / cloneinit._MARKER_NAME).st_nlink == 2
+    assert os.lstat(alias).st_nlink == 2
+
+
+def test_marker_group_or_world_writable_is_rejected_untouched(tmp_path):
+    """A marker whose mode is not exactly the 0600 shape ``_create_marker``
+    pins was written by someone else — never adopted as protocol state."""
+    source = Path(make_source_repo(tmp_path / "src"))
+    target = tmp_path / "clone"
+    clone_init(str(source), target)
+    marker = target / cloneinit._MARKER_NAME
+    marker.touch(mode=0o600)
+    marker.chmod(0o666)
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match="0600"):
+        clone_init(str(source), target)
+    assert _tree_snapshot(target) == before
+    assert stat.S_IMODE(os.lstat(marker).st_mode) == 0o666  # mode untouched too
+    assert marker.exists()
+
+
+def test_checkout_plus_promotable_stage_under_one_marker_is_rejected_untouched(tmp_path):
+    """REGRESSION: a complete checkout AND a promotable staged clone under one
+    marker is a state the protocol (.git moves last, each name exactly once)
+    cannot have produced — the old resume promoted anyway, and where it tore
+    depended on which names happened to collide. Rejected before any move."""
+    source = Path(make_source_repo(tmp_path / "src"))
+    target = tmp_path / "clone"
+    clone_init(str(source), target)
+    stage = target / cloneinit._STAGE_NAME
+    _git(["clone", "-q", str(source), str(stage)], tmp_path)
+    _plant_marker(target)
+    before = _tree_snapshot(target)
+
+    for _ in range(2):
+        with pytest.raises(KnowledgeError, match="never produces"):
+            clone_init(str(source), target)
+        assert _tree_snapshot(target) == before
+
+
+def test_promotion_collision_on_a_later_child_moves_no_earlier_child(tmp_path):
+    """REGRESSION: the old per-child collision check fired mid-loop, so a
+    collision on a later-sorted name left every earlier-sorted child already
+    renamed to the root. All destinations are validated before the first
+    rename — a rejected promotion moves nothing."""
+    source = Path(make_source_repo(tmp_path / "src"))
+    target = tmp_path / "clone"
+    target.mkdir()
+    stage = target / cloneinit._STAGE_NAME
+    _git(["clone", "-q", str(source), str(stage)], tmp_path)
+    _plant_marker(target)
+    # 'skills' sorts after 'AGENTS.md' and 'extra.md' (and .git goes last).
+    (target / "skills").mkdir()
+    (target / "skills" / "mine.md").write_text("operator content\n")
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match="nothing was moved"):
+        clone_init(str(source), target)
+    _assert_only_a_fresh_lock_appeared(before, target)
+    assert not (target / "AGENTS.md").exists()  # the earlier-sorted child NOT moved
+    assert (stage / "AGENTS.md").read_text() == "v1\n"  # still fully staged
+    assert (target / "skills" / "mine.md").read_text() == "operator content\n"

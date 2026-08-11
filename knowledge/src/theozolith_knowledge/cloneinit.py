@@ -46,12 +46,21 @@ then fstat-validated as exactly what the protocol creates: an empty,
 single-link regular file owned by the caller with no group/other write bits —
 a symlink or hard-link alias aimed at operator content (say ``AGENTS.md``) is
 a hard error with the alias target untouched. The marker and stage are
-accepted only in the shapes the protocol writes (regular file / real
-directory), checked with ``lstat`` before any recovery, deletion, touch, or
-traversal. A source repository — or a pre-existing checkout — that TRACKS a
-reserved name is rejected before the marker, the excludes, or any promotion
-step, and promotion itself refuses to move a reserved name. Every rejection
-leaves all involved paths byte-for-byte unchanged.
+accepted only in the EXACT shapes the protocol writes, checked with ``lstat``
+before any recovery, deletion, touch, or traversal: the stage a real
+directory, the marker an empty, single-hard-link, caller-owned, mode-0600
+regular file (``_create_marker`` pins that mode against the umask) — an
+operator file, a hard-link alias, or a loosened mode wearing the marker name
+is never adopted as protocol state. Recovery itself preflights before moving
+anything: a checkout ``.git`` coexisting with a promotable staged ``.git``
+under one marker is a state the protocol (which moves ``.git`` last, each
+name exactly once) cannot have produced and is a hard error, and every
+promotion destination is validated before the FIRST rename, so a collision on
+a later-sorted child never strands earlier children at the root. A source
+repository — or a pre-existing checkout — that TRACKS a reserved name is
+rejected before the marker, the excludes, or any promotion step, and
+promotion itself refuses to move a reserved name. Every rejection leaves all
+involved paths byte-for-byte unchanged.
 
 Credential-agnostic: it just runs ``git``. Auth for a private knowledge repo
 is ambient (a config-side credential helper reading a token secret). This keeps
@@ -227,6 +236,7 @@ def _clone_init_locked(source: str, target: Path, branch: str | None) -> str:
         )
     recovered = False
     if marker_state == "file":
+        _validate_marker(target / _MARKER_NAME)
         _resume_promotion(target)
         recovered = True
 
@@ -320,14 +330,56 @@ def _clone(source: str, target: Path, branch: str | None) -> None:
     (target / _MARKER_NAME).unlink()
 
 
+def _validate_marker(marker: Path) -> None:
+    """A pre-existing marker is adopted as protocol state only in the EXACT
+    shape ``_create_marker`` writes: an empty, single-hard-link, mode-0600
+    regular file owned by the caller. Anything else at the marker name —
+    a non-empty operator file, a hard-link alias of one, a loosened mode —
+    is NOT ours to unlink or to recover from: reject before any recovery
+    step, leaving the file, its content, and its link count untouched. The
+    caller established via ``lstat`` that a regular file exists here."""
+    st = os.lstat(marker)
+    if st.st_size != 0:
+        raise KnowledgeError(
+            f"{marker} is not empty — the promotion marker never holds content;"
+            " refusing to treat it as clone-init state; reconcile by hand"
+            " (nothing was changed or deleted)"
+        )
+    if st.st_nlink != 1:
+        raise KnowledgeError(
+            f"{marker} has {st.st_nlink} hard links — a marker aliased to"
+            " another file is never clone-init's; reconcile by hand (the file"
+            " and its other names were not changed)"
+        )
+    if st.st_uid != os.getuid():
+        raise KnowledgeError(
+            f"{marker} is owned by uid {st.st_uid}, not uid {os.getuid()} —"
+            " refusing to treat it as clone-init state; reconcile by hand"
+            " (nothing was changed or deleted)"
+        )
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        raise KnowledgeError(
+            f"{marker} has mode {stat.filemode(st.st_mode)}, not the owner-only"
+            " 0600 shape the promotion protocol writes — refusing to treat it"
+            " as clone-init state; reconcile by hand (nothing was changed or"
+            " deleted)"
+        )
+
+
 def _create_marker(target: Path) -> None:
     """Create the promotion marker exclusively: ``O_EXCL`` never follows a
     symlink and fails on ANY pre-existing entry, so the marker can neither
     write through a planted link nor adopt someone else's file as protocol
-    state (a plain ``touch`` would do both)."""
+    state (a plain ``touch`` would do both). The mode is pinned to exactly
+    0600 (``fchmod`` — the open's mode argument is umask-masked) because
+    ``_validate_marker`` accepts exactly that shape on resume."""
     marker = target / _MARKER_NAME
     try:
-        os.close(os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
     except OSError as exc:
         raise KnowledgeError(
             f"could not create the promotion marker {marker}: {exc} — reconcile"
@@ -338,8 +390,10 @@ def _create_marker(target: Path) -> None:
 def _promote(stage: Path, target: Path) -> None:
     """Rename the staged clone's children up to the target root, ``.git``
     last — a visible ``.git`` therefore proves every sibling already moved.
-    Each rename is atomic (same filesystem), so an interruption leaves every
-    child wholly in the stage or wholly at the target, never split."""
+    Each rename is atomic (same filesystem), and EVERY destination is
+    validated before the first rename — so a rejected promotion moves
+    nothing: a collision on a later-sorted child cannot strand the
+    earlier-sorted children at the root."""
     children = sorted(stage.iterdir())
     reserved = sorted(c.name for c in children if c.name in _SCRATCH_NAMES)
     if reserved:
@@ -353,28 +407,42 @@ def _promote(stage: Path, target: Path) -> None:
             " moved)"
         )
     ordered = [c for c in children if c.name != ".git"] + [c for c in children if c.name == ".git"]
+    # The protocol moves each name exactly once, so an occupied destination is
+    # external content — never overwrite it, and never discover it mid-loop.
+    occupied = [c.name for c in ordered if os.path.lexists(target / c.name)]
+    if occupied:
+        raise KnowledgeError(
+            f"promotion found existing content at"
+            f" {', '.join(repr(n) for n in occupied)} in {target} — reconcile by"
+            " hand (nothing was moved, nothing was overwritten)"
+        )
     for child in ordered:
-        dest = target / child.name
-        if os.path.lexists(dest):
-            # The protocol moves each name exactly once, so an occupied
-            # destination is external content — never overwrite it.
-            raise KnowledgeError(
-                f"promotion of {child.name!r} found existing content at {dest} —"
-                " reconcile by hand (nothing was overwritten)"
-            )
-        _rename(str(child), str(dest))
+        _rename(str(child), str(target / child.name))
     stage.rmdir()
 
 
 def _resume_promotion(target: Path) -> None:
     """Finish (or clean up after) a promotion the marker says was interrupted.
     Converges: any further interruption lands back in one of these states.
-    The caller validated the marker and stage shapes; ``stage/.git`` is
-    additionally required to be a real directory (``lstat``) before the stage
-    is treated as promotable — a symlinked ``.git`` is tampering, not ours."""
+    The caller validated the marker's exact shape and the stage's;
+    ``stage/.git`` is additionally required to be a real directory
+    (``lstat``) before the stage is treated as promotable — a symlinked
+    ``.git`` is tampering, not ours."""
     stage = target / _STAGE_NAME
     stage_state = _scratch_state(stage)
-    if stage_state == "dir" and _scratch_state(stage / ".git") == "dir":
+    stage_promotable = stage_state == "dir" and _scratch_state(stage / ".git") == "dir"
+    if stage_promotable and (target / ".git").exists():
+        # The protocol moves each name exactly once, .git LAST — so a
+        # checkout .git can never coexist with a promotable staged .git.
+        # Promoting anyway would collide somewhere mid-tree; reject the
+        # impossible state before anything moves.
+        raise KnowledgeError(
+            f"{target}: promotion marker present with BOTH a checkout .git and a"
+            f" promotable {_STAGE_NAME!r} — a state the promotion protocol (which"
+            " moves .git last) never produces; reconcile by hand (nothing was"
+            " changed or moved)"
+        )
+    if stage_promotable:
         # Interrupted before .git moved: the stage still holds a complete-
         # minus-already-moved clone — finish the ordered promotion.
         _promote(stage, target)
