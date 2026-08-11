@@ -790,6 +790,14 @@ def load_config(repo_dir: Path) -> DeployConfig:
         path.stem: _parse_worker_type(path.stem, _load_toml(path))
         for path in sorted((repo_dir / "worker-types").glob("*.toml"))
     }
+    # Config Repo validity is independent of Stack placement (ADR-0042): every
+    # driver-bearing worker type resolves its command here, so a dangling
+    # drivers/<name> reference fails load_config() even when no Stack
+    # instantiates the type — dormant definitions break at configure time,
+    # never later when a Stack first activates them.
+    for wt in worker_types.values():
+        if wt.is_driver:
+            _resolve_driver_command(wt, repo_dir)
     stacks = _resolve_stacks(
         tuple(
             _parse_stack(path.stem, _load_toml(path))

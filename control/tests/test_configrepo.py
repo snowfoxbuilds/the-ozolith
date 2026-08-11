@@ -316,6 +316,37 @@ def test_custom_driver_dangling_reference_fails_at_load(tmp_path):
         load_config(tmp_path)
 
 
+def test_unused_custom_worker_type_with_missing_driver_fails_at_load(tmp_path):
+    """A dangling drivers/<name> reference fails load_config() even when no
+    Stack instantiates the worker type: Config Repo validity is independent of
+    placement (ADR-0042), so a dormant definition breaks at configure time."""
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "drivers/missing"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+    )
+    with pytest.raises(
+        ConfigRepoError, match=r"custom driver 'drivers/missing' has no module.*ADR-0042"
+    ):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("module_path", ["drivers/custom.py", "drivers/custom/__init__.py"])
+def test_unused_custom_worker_type_with_present_driver_loads(tmp_path, module_path):
+    """An unplaced custom worker type still loads when its module exists, in
+    either sanctioned form (ADR-0042): the load-time validation pass accepts
+    exactly what Stack resolution would."""
+    write(
+        tmp_path,
+        "worker-types/i.toml",
+        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+    )
+    write(tmp_path, module_path, "Driver = object\n")
+    config = load_config(tmp_path)
+    assert config.worker_types["i"].driver == "drivers/custom"
+    assert config.stacks == ()
+
+
 @pytest.mark.parametrize("bad", ["drivers/My-Name", "drivers/1abc", "drivers/a-b", "drivers/"])
 def test_custom_driver_name_must_be_a_python_identifier(tmp_path, bad):
     """The name after drivers/ must be an importable identifier (^[a-z_][a-z0-9_]*$):
