@@ -82,6 +82,15 @@ ATTACH_HOST = "{host}"
 ATTACH_CONTAINER = "{container}"
 ATTACH_PLACEHOLDERS = (ATTACH_HOST, ATTACH_CONTAINER)
 
+# The per-Stack placeholder a driverless worker type's volume names may carry
+# (ADR-0043): substituted with the resolving Stack's name so two same-type
+# Flight Decks on one node get distinct runtime-state and tailnet-identity
+# volumes while still sharing the one `knowledge-<worker-type>` clone (which
+# deliberately omits the placeholder). Echoes the {host}/{container} attach
+# convention; it is the only volume placeholder and is resolved control-side —
+# the daemon only ever receives concrete volume names.
+VOLUME_STACK = "{stack}"
+
 
 class ConfigRepoError(RuntimeError):
     """A Config Repo file does not parse or violates the format."""
@@ -601,6 +610,19 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
     )
 
 
+def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ...]:
+    """Substitute the ``{stack}`` placeholder in each worker-type volume entry
+    with the resolving Stack's name (ADR-0043). Only the name segment (before
+    the first ``:``) is rewritten — mount paths are fixed — and only the whole
+    ``{stack}`` token is replaced; ``knowledge-<worker-type>`` volumes that
+    deliberately omit it stay shared across siblings of the type."""
+    resolved = []
+    for volume in volumes:
+        name, sep, rest = volume.partition(":")
+        resolved.append(f"{name.replace(VOLUME_STACK, stack_name)}{sep}{rest}")
+    return tuple(resolved)
+
+
 def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
     """Turn a thin worker-type Stack into a concrete generic StackDef (ADR-0044).
 
@@ -653,7 +675,7 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef) -> StackDef:
         secrets=dict(wt.secrets),
         command=wt.command,
         image=wt.tag,
-        volumes=wt.volumes,
+        volumes=_resolve_volumes(wt.volumes, stack.name),
         attach=stack.attach,
     )
 

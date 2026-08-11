@@ -1,9 +1,9 @@
-# The Flight Deck worker type (ADR-0019/ADR-0044): a DRIVERLESS type — the
-# absence of `driver` is the discriminator. It resolves to an interactive,
-# human-driven agent container (container kind) running an agent CLI inside
-# a discoverably named tmux session, the web terminal's primary attach
-# target. It is NOT a pipeline actor: it never claims issues and holds no
-# transition authority.
+# The Flight Deck worker type (ADR-0019/ADR-0043/ADR-0044): a DRIVERLESS type
+# — the absence of `driver` is the discriminator. It resolves to an
+# interactive, human-driven agent container (container kind) running an agent
+# CLI inside a discoverably named tmux session, the web terminal's primary
+# attach target. It is NOT a pipeline actor: it never claims issues and holds
+# no transition authority.
 #
 # GitHub identity: its OWN machine account with a fine-grained PAT scoped to
 # issues, PRs, and contents — NO merge permission — entered once as the
@@ -11,24 +11,90 @@
 # token: a prompt-injected session must not be able to perform human-
 # authority transitions (above all the merge) as a human. Do not leave
 # Flight Deck sessions running unattended.
+#
+# Knowledge & state (ADR-0043): ~/.claude is split by class. Runtime state
+# (sessions/transcripts/--resume) lives on the per-Flight-Deck
+# `{stack}-claude-state` volume — never shared, never worker-visible. Knowledge
+# (skills/subagents/workflows) lives on ONE shared writable clone per worker
+# type per node — the `knowledge-*` volume — which flightdeck-start clones at
+# start (`theozolith-knowledge clone-init`) and symlinks the ~/.claude
+# knowledge dirs into. A skill edited in one Flight Deck is live in siblings of
+# the same type after an agent-CLI restart. Promote = commit/push + re-pin +
+# rebuild (see deploy/README.md). The symlink carve-out is Flight-Deck-only.
+#
+# One-hop remote access (issue #20 §1) is NOT wired here yet: it is gated on
+# the issue #24 Step 0 privilege spike, which needs a Docker-capable box —
+# split out and tracked as issue #31. Until it lands, reach the Flight Deck
+# through the web terminal or the two-hop `attach` in stacks/flightdeck.toml.
 
 # No `driver` -> Flight Deck. Driverless types may carry `command` and
 # `volumes`; both are rejected when a driver is set.
-base = "ghcr.io/example/flightdeck:1@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+#
+# `base` is the product run image, digest-pinned: it already ships `claude`,
+# git, and `theozolith-knowledge`. It deliberately has NO tmux (the headless
+# doctrine binds run containers, ADR-0019), so setup adds it. Replace the
+# placeholder digest with the one you build/pull.
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-# Start the named tmux session with the agent CLI in it, pipe the session
-# transcript (which captures typed input) to the log volume, and tie the
-# container's lifetime to the tmux SERVER: `tmux wait-for` blocks while the
-# server lives and exits when it dies, so a dead session shows as a dead
-# container (and the restart policy brings up a fresh one). The session
-# name ("flightdeck") is the discoverable attach point.
-command = "sh -c 'mkdir -p /var/log/flightdeck && tmux new-session -d -s flightdeck claude && tmux pipe-pane -o -t flightdeck \"cat >> /var/log/flightdeck/transcript.log\" && exec tmux wait-for flightdeck-forever'"
+# NO knowledge_source / knowledge_pin here (contrast the driver types): a bake
+# into /home/ozolith/.claude would be copied onto the claude-state volume on
+# first mount and then fight the flightdeck-start symlinks. The Flight Deck
+# gets its knowledge from the shared clone at start, never baked.
 
-volumes = ["flightdeck-logs:/var/log/flightdeck"]
+setup = [
+    # (1) tmux: the named attach session.
+    "apt-get update && apt-get install -y --no-install-recommends tmux && rm -rf /var/lib/apt/lists/*",
 
-# Secret NAMES only — the value lives encrypted on the Control Node
-# (`theozolith secret set flightdeck-github-token`). The name is
-# deliberately distinct from every driver PAT.
+    # (2) Seed the volume mountpoints ozolith-owned. setup runs as root;
+    #     an absent mountpoint would otherwise be created root-owned, and its
+    #     ownership is copied onto the volume on first mount.
+    "mkdir -p /home/ozolith/.claude /home/ozolith/knowledge && chown ozolith:ozolith /home/ozolith/.claude /home/ozolith/knowledge",
+
+    # (3) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
+    #     content baked by setup — never product source. The knowledge URL is a
+    #     LITERAL here: it is worker-type identity (it defines the shared clone
+    #     all siblings mount), so changing it changes the instruction hash ->
+    #     deterministic-tag rebuild. `set -eu` makes every startup step
+    #     fail-fast: a failed clone-init exits the container non-zero and
+    #     Docker's restart policy owns the retry — never an in-container loop.
+    '''printf '%s\n' \
+'#!/bin/sh' \
+'set -eu' \
+'# ADR-0043: shared knowledge clone + live symlinks' \
+'theozolith-knowledge clone-init --source "https://github.com/acme/my-knowledge.git" --target /home/ozolith/knowledge' \
+'mkdir -p /home/ozolith/knowledge/skills /home/ozolith/knowledge/agents/claude /home/ozolith/knowledge/workflows' \
+'ln -sfnT /home/ozolith/knowledge/skills        /home/ozolith/.claude/skills' \
+'ln -sfnT /home/ozolith/knowledge/agents/claude /home/ozolith/.claude/agents' \
+'ln -sfnT /home/ozolith/knowledge/workflows     /home/ozolith/.claude/workflows' \
+'ln -sfnT /home/ozolith/knowledge/AGENTS.md     /home/ozolith/.claude/CLAUDE.md' \
+'mkdir -p /var/log/flightdeck' \
+'tmux new-session -d -s flightdeck claude' \
+'tmux pipe-pane -o -t flightdeck "cat >> /var/log/flightdeck/transcript.log"' \
+'exec tmux wait-for flightdeck-forever' \
+> /usr/local/bin/flightdeck-start \
+&& chmod 0755 /usr/local/bin/flightdeck-start''',
+]
+
+command = "/usr/local/bin/flightdeck-start"
+
+# Node-local named volumes (ADR-0043). `{stack}` is substituted control-side
+# with this Flight Deck Stack's name, so two same-type Flight Decks on one node
+# get distinct runtime-state volumes. The knowledge volume is deliberately NOT
+# `{stack}` — it is `knowledge-<worker-type>`, shared by all siblings of the
+# type on the node (edit a skill once, live everywhere).
+volumes = [
+    "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
+    "{stack}-claude-state:/home/ozolith/.claude",    # per-instance runtime state (never shared)
+    "knowledge-claude-dev:/home/ozolith/knowledge",  # SHARED: worker-type name, not {stack}
+]
+
+# Secret NAMES only — values live encrypted on the Control Node
+# (`theozolith secret set <name>`), pulled node-scoped, delivered read-only as
+# <ENV>_FILE from tmpfs (never node disk). GITHUB_TOKEN is the dedicated
+# no-merge machine identity, distinct from every driver PAT.
 [secrets]
 GITHUB_TOKEN = "flightdeck-github-token"
 ANTHROPIC_API_KEY = "anthropic-api-key"
+# For a PRIVATE knowledge repo, uncomment and provide a git credential helper
+# in the base image that reads this token; clone-init auth is then ambient.
+# KNOWLEDGE_GIT_TOKEN = "knowledge-git-token"

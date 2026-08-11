@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
 DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.claude"
+CONTROL_DOCKERFILE = REPO_ROOT / "control" / "docker" / "Dockerfile"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
@@ -108,12 +111,19 @@ def test_ci_builds_the_control_image():
 
 
 def test_no_tailscale_anywhere_in_product_code_or_deploy():
-    """NODE-SUBSTRATE.md: Tailscale is a private-side deployment detail —
-    never in product code, images, or deploy scripts (overlays may name it
-    as an example of the extension point, nothing more)."""
+    """NODE-SUBSTRATE.md: Tailscale is a private-side deployment detail — never
+    in product code, product IMAGES, or deploy scripts. Per-container tailnet
+    identity enters only via a worker type's setup instructions in the Config
+    Repo (ADR-0043); the ONE sanctioned home for the string is
+    ``deploy/configs-example/**`` (and its README), which this scan
+    deliberately does not touch. The product Dockerfiles are in scope: a
+    tailscaled baked into a base image would violate the doctrine just as
+    surely as product source would."""
     for component in ("worker", "control", "nodedaemon", "knowledge"):
         for path in (REPO_ROOT / component / "src").rglob("*.py"):
             assert "tailscale" not in path.read_text().lower(), path
+    for dockerfile in (DOCKERFILE, CONTROL_DOCKERFILE):
+        assert "tailscale" not in dockerfile.read_text().lower(), dockerfile
     for name in ("install-nodedaemon.sh", "compose/control.yml", "README.md"):
         assert "tailscale" not in (DEPLOY / name).read_text().lower(), name
 
@@ -156,3 +166,175 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     }
     assert flightdeck.secrets["GITHUB_TOKEN"] == "flightdeck-github-token"
     assert "flightdeck-github-token" not in driver_secrets
+
+
+def test_configs_example_flightdeck_knowledge_wiring():
+    """ADR-0043: the example Flight Deck wires per-instance runtime state and
+    ONE shared knowledge clone, bakes the knowledge symlinks into
+    flightdeck-start, and keeps the carve-out Flight-Deck-only. The one-hop
+    tailnet half was split out to issue #31 (gated on the #24 Step 0 spike):
+    until it lands with spike evidence, the example ships no tailscale content
+    at all."""
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+
+    # Per-instance state + logs (resolved from {stack}); exactly one SHARED
+    # knowledge-* clone that is deliberately NOT per-instance — and nothing else.
+    assert set(flightdeck.volumes) == {
+        "flightdeck-logs:/var/log/flightdeck",
+        "flightdeck-claude-state:/home/ozolith/.claude",
+        "knowledge-claude-dev:/home/ozolith/knowledge",
+    }
+
+    wt = config.worker_types["flightdeck"]
+    assert wt.knowledge_source == ""  # never baked; the clone is live (ADR-0043)
+    script = "\n".join(wt.setup)
+
+    # clone-init + all four symlinks are baked into flightdeck-start.
+    assert "theozolith-knowledge clone-init" in script
+    for target in (
+        "ln -sfnT /home/ozolith/knowledge/skills",
+        "ln -sfnT /home/ozolith/knowledge/agents/claude",
+        "ln -sfnT /home/ozolith/knowledge/workflows",
+        "ln -sfnT /home/ozolith/knowledge/AGENTS.md",
+    ):
+        assert target in script, target
+    for claude_dir in (
+        "/home/ozolith/.claude/skills",
+        "/home/ozolith/.claude/agents",
+        "/home/ozolith/.claude/workflows",
+        "/home/ozolith/.claude/CLAUDE.md",
+    ):
+        assert claude_dir in script, claude_dir
+
+    # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts a
+    # knowledge-* clone or any .claude path.
+    for stack in config.stacks:
+        if stack.name == "flightdeck":
+            continue
+        for volume in stack.volumes:
+            assert "knowledge-" not in volume and ".claude" not in volume, (stack.name, volume)
+    for name, other in config.worker_types.items():
+        if name == "flightdeck":
+            continue
+        for volume in other.volumes:
+            assert "knowledge-" not in volume and ".claude" not in volume, (name, volume)
+
+    # The split-out is complete: no tailscale content anywhere in the example
+    # (its sanctioned home once #31 lands behind the spike), no auth-key
+    # secret, no tailnet env on the Stack.
+    assert "TS_AUTHKEY" not in flightdeck.secrets
+    for path in (REPO_ROOT / "deploy" / "configs-example").rglob("*"):
+        if path.is_file():
+            assert "tailscale" not in path.read_text().lower(), path
+
+
+# -- flightdeck-start: the generated script is EXECUTED, not just grepped ---------
+
+
+def _generate_flightdeck_start(tmp_path: Path) -> Path:
+    """Run the worker type's script-writing setup entry in a real /bin/sh —
+    exactly what the image build does — with the baked destination redirected
+    into tmp_path, and return the generated script."""
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    wt = config.worker_types["flightdeck"]
+    generators = [s for s in wt.setup if "/usr/local/bin/flightdeck-start" in s]
+    assert len(generators) == 1
+    dest = tmp_path / "flightdeck-start"
+    command = generators[0].replace("/usr/local/bin/flightdeck-start", str(dest))
+    subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
+    assert dest.stat().st_mode & 0o111, "flightdeck-start must be executable"
+    return dest
+
+
+def _sandboxed_script(script: Path, sandbox: Path) -> Path:
+    """Rewrite the generated script's absolute paths into a sandbox so it can
+    run as the test user; the command sequence is untouched."""
+    content = script.read_text()
+    content = content.replace("/home/ozolith", str(sandbox / "home"))
+    content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
+    rewritten = sandbox / "start"
+    rewritten.write_text(content)
+    rewritten.chmod(0o755)
+    (sandbox / "home" / ".claude").mkdir(parents=True)  # the state-volume mountpoint
+    return rewritten
+
+
+def _stub(bin_dir: Path, name: str, exit_code: int) -> Path:
+    """A recording stand-in: appends its argv to <name>.calls, exits fixed."""
+    calls = bin_dir / f"{name}.calls"
+    stub = bin_dir / name
+    stub.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\nexit {exit_code}\n')
+    stub.chmod(0o755)
+    return calls
+
+
+def test_flightdeck_start_generation_expands_nothing_at_build_time(tmp_path):
+    """The generator is one classic-Dockerfile-safe printf; the script it emits
+    must carry no shell expansion the BUILD could have resolved — every command
+    line arrives literal, to run at container start."""
+    script = _generate_flightdeck_start(tmp_path).read_text()
+    lines = script.splitlines()
+    assert lines[0] == "#!/bin/sh"
+    assert lines[1] == "set -eu"  # fail-fast: a failed step exits the container
+    assert "$" not in script  # nothing expanded at build; nothing left to expand
+    assert lines[-1] == "exec tmux wait-for flightdeck-forever"
+    # The sequence is clone -> symlinks -> tmux: knowledge must be live before
+    # the agent CLI starts.
+    assert script.index("clone-init") < script.index("ln -sfnT") < script.index("tmux")
+
+
+def test_flightdeck_start_clone_failure_fails_the_container(tmp_path):
+    """A failed clone-init must exit the container non-zero BEFORE any symlink
+    or tmux step — Docker's restart policy owns the retry; there is no
+    in-container retry loop to hide the failure."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    _stub(bin_dir, "theozolith-knowledge", exit_code=7)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+
+    proc = subprocess.run(
+        [str(script)],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 7
+    assert not tmux_calls.exists()  # tmux never launched over broken knowledge
+    assert not (sandbox / "home" / ".claude" / "skills").is_symlink()
+
+
+def test_flightdeck_start_success_wires_symlinks_then_tmux(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    knowledge_calls = _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+
+    proc = subprocess.run(
+        [str(script)],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    home = sandbox / "home"
+    assert "clone-init --source" in knowledge_calls.read_text()
+    for link, target in (
+        (".claude/skills", "knowledge/skills"),
+        (".claude/agents", "knowledge/agents/claude"),
+        (".claude/workflows", "knowledge/workflows"),
+        (".claude/CLAUDE.md", "knowledge/AGENTS.md"),
+    ):
+        assert os.readlink(home / link) == str(home / target), link
+    calls = tmux_calls.read_text().splitlines()
+    assert calls[0].startswith("new-session -d -s flightdeck")
+    assert calls[1].startswith("pipe-pane -o -t flightdeck")
+    assert calls[2] == "wait-for flightdeck-forever"

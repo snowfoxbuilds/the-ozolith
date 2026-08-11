@@ -6,6 +6,8 @@ import json
 import stat
 from pathlib import Path
 
+import pytest
+from theozolith_worker.config import ConfigError, load_config
 from theozolith_worker.containers import (
     ContainerSpec,
     DockerEngine,
@@ -13,6 +15,99 @@ from theozolith_worker.containers import (
     review_container_name,
     run_container_name,
 )
+
+_BASE_ENV = {
+    "THEOZOLITH_REPO": "acme/sandbox",
+    "GITHUB_TOKEN": "tok",
+    "CONTROL_NODE_URL": "https://control.invalid:8443",
+}
+
+
+def test_cache_volumes_reject_a_claude_target():
+    """ADR-0043: no config-reachable channel may mount live knowledge into a
+    Run — a cache volume aimed at a .claude path is refused, closing the
+    prompt-injection persistence channel. The Flight-Deck symlink carve-out is
+    the only exception and never touches run containers."""
+    with pytest.raises(ConfigError, match=r"\.claude path.*ADR-0043"):
+        load_config(
+            {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude"},
+            role="implementer",
+            default_model="claude-sonnet-5",
+        )
+    # A .claude segment anywhere in the path is refused, not only the leaf.
+    with pytest.raises(ConfigError, match=r"\.claude path"):
+        load_config(
+            {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude/skills"},
+            role="implementer",
+            default_model="claude-sonnet-5",
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Ancestor mounts: a persistent volume above a protected .claude tree
+        # sweeps the whole tree onto it.
+        "/home/ozolith",
+        "/home",
+        "/",
+        "/job",  # both session workspaces live under the mounted job dir
+        "/job/checkout",
+        "/job/work",
+        # Normalization tricks: the engine mounts the CLEANED path, so these
+        # are the same mounts as their canonical spellings.
+        "/home/ozolith/",
+        "/home//ozolith",
+        "//home/ozolith",
+        "/home/./ozolith",
+        "/home/ozolith/.claude/..",
+        "/home/ozolith/.cache/..",
+        "/home/ozolith/.claude/",
+        "/home//ozolith//.claude",
+        "/home/ozolith/./.claude",
+        "/opt/../home/ozolith/.claude",
+        # Direct target and descendants (project-scoped included).
+        "/job/checkout/.claude",
+        "/job/work/.claude/settings",
+        "/home/ozolith/.claude/skills/foo",
+    ],
+)
+def test_cache_volumes_reject_persistence_bypasses(path):
+    """ADR-0043 hardening: ancestor mounts, ``.``/``..`` and repeated-separator
+    spellings, and project-scoped workspace ``.claude`` trees are all refused —
+    not only the literal home-scoped path."""
+    with pytest.raises(ConfigError, match="ADR-0043"):
+        load_config(
+            {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": f"poison:{path}"},
+            role="implementer",
+            default_model="claude-sonnet-5",
+        )
+
+
+def test_cache_volumes_are_stored_normalized():
+    config = load_config(
+        {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "c:/home//ozolith/./.cache/"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert config.cache_volumes == (("c", "/home/ozolith/.cache"),)
+
+
+def test_cache_volumes_accept_the_default_cache_mount():
+    """The shipped default (and .claude look-alikes that are not a whole
+    segment) stay legal — the guard matches the .claude path component only."""
+    config = load_config(
+        {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "theozolith-cache:/home/ozolith/.cache"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert config.cache_volumes == (("theozolith-cache", "/home/ozolith/.cache"),)
+    ok = load_config(
+        {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "c:/home/ozolith/.claudex"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert ok.cache_volumes == (("c", "/home/ozolith/.claudex"),)
 
 
 def test_naming_and_label_conventions():

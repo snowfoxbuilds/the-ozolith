@@ -1,4 +1,4 @@
-"""Command-line interface: theozolith-knowledge {validate,sync,bake}."""
+"""Command-line interface: theozolith-knowledge {validate,sync,bake,clone-init}."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from theozolith_knowledge.bake import bake
+from theozolith_knowledge.cloneinit import clone_init
 from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
 from theozolith_knowledge.sync import SyncReport, sync
 
@@ -66,6 +67,20 @@ def _cmd_bake(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_clone_init(args: argparse.Namespace) -> int:
+    result = clone_init(args.source, args.target, branch=args.branch)
+    if result == "cloned":
+        print(f"clone-init: cloned {args.source} into {args.target}")
+    elif result == "recovered":
+        print(
+            f"clone-init: recovered an interrupted initialization of {args.target} —"
+            f" it now tracks {args.source}"
+        )
+    else:
+        print(f"clone-init: {args.target} already tracks {args.source} — unchanged")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="theozolith-knowledge",
@@ -120,6 +135,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", default="global", choices=("global", "project"))
     p.add_argument("--subdir", help="Knowledge root within the repo, if not the repo root.")
     p.set_defaults(func=_cmd_bake)
+
+    p = sub.add_parser(
+        "clone-init",
+        help="Initialize the Flight Deck's shared knowledge clone at container "
+        "start (ADR-0043): clone once into an empty target, verify origin on a "
+        "match, and never fetch or pull. flock-guarded against concurrent "
+        "sibling starts. NEVER run 'sync' against a Flight Deck ~/.claude — its "
+        "knowledge dirs are symlinks into this clone.",
+    )
+    p.add_argument("--source", required=True, help="Git URL (or local path) of the knowledge repo.")
+    p.add_argument("--target", required=True, help="Directory the shared clone lives in.")
+    p.add_argument("--branch", help="Branch to clone (default: the remote's default branch).")
+    p.set_defaults(func=_cmd_clone_init)
     return parser
 
 

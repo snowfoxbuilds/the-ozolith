@@ -12,5 +12,7 @@ state = "running"
 # a structured argv array ({host}/{container} only as complete arguments,
 # validated before launch). Attach and detach are audit-logged. `attach`
 # lives on the Stack (a per-placement operator concern), and is only valid
-# because the resolved kind is container.
+# because the resolved kind is container. (One-hop remote access is tracked
+# as issue #31, gated on the issue #24 privilege spike; until it lands this
+# two-hop attach and the web terminal are the ways in.)
 attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]

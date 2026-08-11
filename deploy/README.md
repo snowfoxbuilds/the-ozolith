@@ -492,6 +492,74 @@ the files owned by the driver user either by building the image with
   here; the human merge gate stays human by construction. Do not leave Flight Deck
   sessions running unattended.
 
+## Flight Deck knowledge & state (ADR-0043)
+
+A Flight Deck's `~/.claude` conflates two classes of content, and they are split
+across named volumes with different cardinality (`<stack>` = the Flight Deck
+Stack's name; `<worker-type>` = its worker-type name; the worker type declares
+the volumes with a literal `{stack}` placeholder that the Control Node
+substitutes at resolution time, so two same-type Flight Decks on one node get
+distinct per-instance volumes):
+
+| Volume | Mountpoint | Cardinality |
+| --- | --- | --- |
+| `<stack>-claude-state` | `/home/ozolith/.claude` | **one per Flight Deck** — runtime state (sessions, transcripts, `--resume`); never shared, never worker-visible |
+| `knowledge-<worker-type>` | `/home/ozolith/knowledge` | **one per worker type per node** — the shared knowledge clone; siblings of the type mount the same name |
+| `<stack>-logs` | `/var/log/flightdeck` | one per Flight Deck |
+
+(One-hop remote access into a Flight Deck — and the per-instance machine-identity
+volume it will add — is split out and tracked separately; see
+`configs-example/README.md` for status and the ways in today.)
+
+**Knowledge is a live symlinked clone, not a bake.** At start the Flight Deck
+runs `theozolith-knowledge clone-init` to materialize the shared clone on the
+`knowledge-<worker-type>` volume, then points its `~/.claude` knowledge
+directories at that clone's raw working tree:
+
+```
+~/.claude/skills     -> ~/knowledge/skills
+~/.claude/agents     -> ~/knowledge/agents/claude
+~/.claude/workflows  -> ~/knowledge/workflows
+~/.claude/CLAUDE.md  -> ~/knowledge/AGENTS.md
+```
+
+The symlinked view is byte-equivalent to a compiled/synced view (ADR-0009), so a
+skill edited in one Flight Deck is **live in every sibling of the same type on
+the node after an agent-CLI restart** — no sync step, no rebuild. Runtime state
+stays on the never-shared per-instance volume.
+
+**Promote** (make an edit reach the pipeline's Runs — the single review
+chokepoint):
+
+```sh
+# in the Flight Deck:
+cd ~/knowledge && git add -A && git commit && git push && git rev-parse HEAD
+# on the Control Node: bump the worker type's knowledge_pin to that SHA
+#   -> the deterministic tag changes -> nodes rebuild -> new Runs carry it.
+```
+
+**Cross-node** transport is plain git, human-driven — there is **no auto-sync
+daemon, ever**. Only pushed commits travel: in the source Flight Deck, commit
+and push (to `main` or an authoring branch), then attach the other node's
+Flight Deck of the same type and `git pull` (or fetch/checkout the authoring
+branch) there. **Uncommitted scratch stays node-local** — `git pull` cannot
+carry it, and nothing else moves it for you.
+
+**Warnings.**
+
+- The symlink carve-out is **Flight-Deck-only**. Run containers never mount
+  knowledge (it would break pin reproducibility and open a prompt-injection
+  persistence channel); a cache volume aimed at a `.claude` path is refused by
+  construction.
+- **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude`.
+  Sync damages the carve-out in both directions at once: it replaces direct
+  symlinks (like `CLAUDE.md`) with copied files, silently unsharing the clone —
+  and where a knowledge directory is a symlink, it writes *through* the link
+  into the shared knowledge clone itself, overwriting content live in every
+  sibling Flight Deck of that type on the node.
+- `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
+  it regenerates when the container recycles (accepted v0 gap).
+
 ## Cleanup / deletion test
 
 ```sh
