@@ -4791,3 +4791,92 @@ def test_config_dist_staging_classifier_failure_rejected_before_stop(rig: Rig, m
     rig.daemon.once()
     assert _last_heartbeat(rig)["drivers_hash"] == b_hash
     assert rig.daemon._supervisor.alive("custom-impl")
+
+
+# -- THEOZOLITH_DRIVERS_DIR env injection (ADR-0042, issue #25) -----------------
+
+
+def _drivers_dir(rig: Rig, digest: str) -> str:
+    return str(rig.config.state_dir / "config-dist" / digest)
+
+
+def _custom_spawns(rig: Rig):
+    return [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+
+
+def test_config_dist_stack_gets_drivers_dir_env(rig: Rig):
+    """A theozolith-driver drivers/<name> Stack launches with THEOZOLITH_DRIVERS_DIR
+    pointing at the VERIFIED applied distribution root (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("custom-impl")
+    (child,) = _custom_spawns(rig)
+    assert child.env["THEOZOLITH_DRIVERS_DIR"] == _drivers_dir(rig, digest)
+
+
+def test_config_dist_stack_without_dist_refuses_and_emits_error(rig: Rig):
+    """A drivers/<name> Stack with no verified distribution refuses to start,
+    injects no THEOZOLITH_DRIVERS_DIR, and surfaces a config-dist-missing
+    theozolith.error — the fail-closed posture of the run-image guard (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    rig.control.heartbeat_answers.append(dist_response([custom], ""))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert not _custom_spawns(rig)
+    errors = [e for e in rig.control.events if e.get("error_class") == "config-dist-missing"]
+    assert errors and "custom-impl" in errors[0]["message"]
+
+
+def test_config_dist_stack_desired_but_unconverged_refuses_and_emits_error(rig: Rig):
+    """A non-empty desired hash whose artifact never lands (409) refuses the
+    start and emits config-dist-missing — the applied side is still empty."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    digest, _ = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})  # never registered → 409
+    rig.control.heartbeat_answers.append(dist_response([custom], digest))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("custom-impl")
+    assert any(e.get("error_class") == "config-dist-missing" for e in rig.control.events)
+
+
+def test_config_dist_hash_swap_restarts_with_the_new_drivers_dir(rig: Rig):
+    """A hash swap restarts the custom driver on the fresh path: the second
+    child launches with THEOZOLITH_DRIVERS_DIR pointing at the new hash dir."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([custom], a_hash))
+    rig.daemon.once()
+    rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
+    rig.daemon.once()
+    spawns = _custom_spawns(rig)
+    assert len(spawns) == 2
+    assert spawns[0].env["THEOZOLITH_DRIVERS_DIR"] == _drivers_dir(rig, a_hash)
+    assert spawns[1].env["THEOZOLITH_DRIVERS_DIR"] == _drivers_dir(rig, b_hash)
+
+
+def test_builtin_driver_stack_gets_no_drivers_dir_and_is_untouched_by_swaps(rig: Rig):
+    """A builtin:* driver Stack never carries THEOZOLITH_DRIVERS_DIR and is not
+    restarted by a config-distribution swap (ADR-0042)."""
+    custom = driver_stack("custom-impl", "drivers/custom")
+    builtin = process_stack("impl")
+    builtin["command"] = "theozolith-driver builtin:implementer"
+    builtin["env"] = {"THEOZOLITH_REPO": "acme/sandbox", "THEOZOLITH_RUN_IMAGE": "theozolith/y:1"}
+    stacks = [custom, builtin]
+    a_hash, a_data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "v = 2\n"})
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response(stacks, a_hash))
+    rig.daemon.once()
+    rig.control.heartbeat_answers.append(dist_response(stacks, b_hash))
+    rig.daemon.once()
+    builtin_spawns = [
+        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "builtin:implementer"]
+    ]
+    assert len(builtin_spawns) == 1  # never restarted by the swap
+    assert "THEOZOLITH_DRIVERS_DIR" not in builtin_spawns[0].env

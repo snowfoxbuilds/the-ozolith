@@ -2,9 +2,21 @@
 
 A complete, minimal Config Repo (ADR-0006): copy it to your Control Node's
 `configs/` and edit in place. It declares two pipeline workers (Implementer,
-Reviewer) as process Stacks and one **Flight Deck** as an interactive container
-Stack. Everything with a placeholder — image digests, the knowledge URL, secret
-values — is yours to fill in.
+Reviewer) as process Stacks, one **Flight Deck** as an interactive container
+Stack, and one **custom driver** (`hello-logger`, staged at `state = "stopped"`)
+demonstrating ADR-0042. Everything with a placeholder — image digests, the
+knowledge URL, secret values — is yours to fill in.
+
+## Custom drivers (`drivers/`, ADR-0042)
+
+`drivers/hello_logger.py` is a minimal custom worker type: code that lives in
+this Config Repo and runs on nodes without forking the product. Its worker type
+(`worker-types/hello-logger.toml`) names it with `driver = "drivers/hello_logger"`
+and its Stack (`stacks/hello-logger.toml`) is staged stopped; flip it to running
+to deploy. `drivers/` is **git-native only** — the web UI never touches it,
+because a write here is code execution with driver credentials on every node
+that runs it. See the "Custom drivers (ADR-0042)" section in `deploy/README.md`
+for the full authoring, convergence, and trust model.
 
 This directory is the sanctioned private-side surface for deployment detail the
 product never carries (the guardrail test enforces that boundary): network

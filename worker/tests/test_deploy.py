@@ -141,9 +141,18 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
         "implementer": "process",
         "reviewer": "process",
         "flightdeck": "container",
+        # The custom-driver example (ADR-0042): a drivers/<name> worker type
+        # resolves to process kind and the generic launcher, staged stopped.
+        "hello-logger": "process",
     }
     assert config.product_version
     assert "claude-dev" in config.worker_types
+    # The custom driver resolves to the one launcher with a drivers/<name> ref
+    # (ADR-0042), and its module is present so the load did not fault.
+    hello = next(s for s in config.stacks if s.name == "hello-logger")
+    assert hello.command == "theozolith-driver drivers/hello_logger"
+    assert hello.state == "stopped"
+    assert (REPO_ROOT / "deploy" / "configs-example" / "drivers" / "hello_logger.py").is_file()
     # The Implementer Stack's node gets exactly its referenced secrets (the
     # worker type owns them, ADR-0044).
     implementer = next(s for s in config.stacks if s.name == "implementer")

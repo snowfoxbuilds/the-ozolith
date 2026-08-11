@@ -560,6 +560,68 @@ carry it, and nothing else moves it for you.
 - `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
   it regenerates when the container recycles (accepted v0 gap).
 
+## Custom drivers (ADR-0042)
+
+A worker type can name a driver that lives in your Config Repo instead of a
+built-in one — a new pipeline worker with no product fork. See
+`deploy/configs-example/drivers/hello_logger.py` and its
+`worker-types/hello-logger.toml` + `stacks/hello-logger.toml` wiring for a
+complete, staged example.
+
+**Authoring.** A driver named `<name>` is `drivers/<name>.py` or a package
+`drivers/<name>/__init__.py` (+ siblings). `<name>` must be a valid Python
+identifier (`^[a-z_][a-z0-9_]*$` — the module is imported as `drivers.<name>`,
+so dashes are out). The module MUST export a top-level `Driver` class
+subclassing `theozolith_worker.api.Worker`; there is no `main()`. **`api` is
+the only stable import** — everything outside `theozolith_worker.api` is
+internal with no stability promise, and api changes are release-note events.
+Point a worker type at it with `driver = "drivers/<name>"` (defaults are
+referenced, never copied). Intra-driver imports work unmodified
+(`from drivers.<name>.helpers import x`).
+
+**Delivery and convergence.** The Config Repo's `drivers/` tree is shipped to
+nodes as a hash-pinned artifact the Node Daemon fetches and **verifies by
+recomputing the manifest** — never trusting the archive bytes — then unpacks
+atomically. The daemon injects `THEOZOLITH_DRIVERS_DIR` (the unpacked root) and
+the launcher **appends** it to `sys.path`, so `drivers.<name>` resolves from
+the distribution while `theozolith_worker.api` still resolves from the product
+venv — one interpreter, no shadowing. Edit the driver → commit → the hash
+changes → the node converges and **restarts the driver on the new code** (queued
+behind any in-flight Run), with no daemon or product change.
+
+**The dispatch gate.** A node is dispatch-eligible only once its applied
+`drivers_hash` matches desired: an off-hash node is skipped. A `drivers/<name>`
+Stack **refuses to start** until the distribution is verified-applied — a
+`config-dist-missing` `theozolith.error` surfaces on the dashboard, and it
+self-heals once convergence lands the tree.
+
+**Advisory skew.** The artifact records the product version it was `built_against`;
+the launcher logs one advisory line on a mismatch and keeps running (a driver
+written against an older api works until it touches something that moved). Skew
+is never fail-closed.
+
+**Crash at start.** A broken driver (syntax error, wrong/missing `Driver`
+export, stale api, missing distribution) writes a traceback to the journal,
+emits a best-effort `theozolith.error` (component `driver-host`), and exits
+non-zero; the supervisor relaunches on a bounded, token-free cadence. A start
+crash before a claim burns nothing (quarantine stays Run-scoped, ADR-0016).
+
+**Fork protocol (v0).** A driver forked from another records its ancestry in one
+leading comment line, logged when it starts:
+
+```
+# forked-from: builtin:<name> @ <product-version>
+```
+
+Documentation only — no enforcement. Fresh-authored drivers carry no header.
+
+**`drivers/` is git-native only.** The web UI and any config editor refuse to
+touch `drivers/` — driver code is edited in git, because
+**Config Repo write access now equals code execution with driver credentials on
+nodes.** ADR-0042 documents this trust posture; it is not mitigated and no
+sandbox is promised. Treat Config Repo write access exactly as you treat
+merge access to product code.
+
 ## Cleanup / deletion test
 
 ```sh
