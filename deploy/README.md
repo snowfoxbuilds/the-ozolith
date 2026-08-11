@@ -551,9 +551,12 @@ carry it, and nothing else moves it for you.
   knowledge (it would break pin reproducibility and open a prompt-injection
   persistence channel); a cache volume aimed at a `.claude` path is refused by
   construction.
-- **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude`:
-  sync replaces the symlinks with copied files by design, silently unsharing the
-  clone.
+- **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude`.
+  Sync damages the carve-out in both directions at once: it replaces direct
+  symlinks (like `CLAUDE.md`) with copied files, silently unsharing the clone —
+  and where a knowledge directory is a symlink, it writes *through* the link
+  into the shared knowledge clone itself, overwriting content live in every
+  sibling Flight Deck of that type on the node.
 - `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
   it regenerates when the container recycles (accepted v0 gap).
 

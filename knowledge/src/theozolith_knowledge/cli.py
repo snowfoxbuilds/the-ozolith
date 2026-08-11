@@ -71,6 +71,11 @@ def _cmd_clone_init(args: argparse.Namespace) -> int:
     result = clone_init(args.source, args.target, branch=args.branch)
     if result == "cloned":
         print(f"clone-init: cloned {args.source} into {args.target}")
+    elif result == "recovered":
+        print(
+            f"clone-init: recovered an interrupted initialization of {args.target} —"
+            f" it now tracks {args.source}"
+        )
     else:
         print(f"clone-init: {args.target} already tracks {args.source} — unchanged")
     return 0

@@ -7,6 +7,7 @@ dependency (the isolation suite covers the dependency-free guarantee).
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -388,3 +389,296 @@ def test_cli_clone_init_exit_codes(tmp_path, capsys):
     other = make_source_repo(tmp_path / "other")
     assert main(["clone-init", "--source", other, "--target", str(target)]) == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_cli_clone_init_reports_recovery_distinctly(tmp_path, capsys, monkeypatch):
+    """A completed recovery is an event the operator should see — the CLI must
+    not fold it into 'unchanged'."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    _crash_after_renames(monkeypatch, 1)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        clone_init(source, target)
+    monkeypatch.setattr(cloneinit, "_rename", os.rename)
+
+    assert main(["clone-init", "--source", source, "--target", str(target)]) == 0
+    out = capsys.readouterr().out
+    assert "recovered" in out
+    assert "unchanged" not in out
+
+
+# -- scratch-path safety (reserved names, safe lock open, non-following checks) ----
+
+
+def _tree_snapshot(root: Path) -> list[tuple]:
+    """Every entry under ``root`` with its type, bytes (files), link
+    destination (symlinks), and hard-link count — the byte-for-byte
+    preservation bar rejected runs must clear."""
+    entries = []
+    for path in sorted(root.rglob("*")):
+        st = os.lstat(path)
+        content: object = None
+        if stat.S_ISLNK(st.st_mode):
+            content = os.readlink(path)
+        elif stat.S_ISREG(st.st_mode):
+            content = path.read_bytes()
+        entries.append((str(path.relative_to(root)), stat.S_IFMT(st.st_mode), content, st.st_nlink))
+    return entries
+
+
+def _assert_only_a_fresh_lock_appeared(before: list[tuple], root: Path) -> None:
+    """Nothing pre-existing changed; the only tolerated difference is the
+    empty lock file clone-init legitimately creates for itself."""
+    after = _tree_snapshot(root)
+    removed = [e for e in before if e not in after]
+    added = [e for e in after if e not in before]
+    assert removed == [], removed
+    assert all(e[0] == LOCK_NAME and e[2] == b"" for e in added), added
+
+
+def test_lock_symlinked_to_operator_content_is_rejected_untouched(tmp_path):
+    """REGRESSION: the old text-mode "w" open followed the symlink and
+    truncated AGENTS.md before the lock was even held."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    clone_init(source, target)
+    (target / LOCK_NAME).unlink()
+    (target / LOCK_NAME).symlink_to(target / "AGENTS.md")
+
+    with pytest.raises(KnowledgeError, match="symlink"):
+        clone_init(source, target)
+    assert (target / "AGENTS.md").read_text() == "v1\n"  # NOT truncated
+    assert (target / LOCK_NAME).is_symlink()  # the link itself also untouched
+
+
+def test_lock_dangling_symlink_is_rejected_and_nothing_created_through_it(tmp_path):
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    (target / LOCK_NAME).symlink_to(target / "victim")
+
+    with pytest.raises(KnowledgeError, match="symlink"):
+        clone_init(source, target)
+    assert not (target / "victim").exists()  # O_CREAT never wrote through
+    assert (target / LOCK_NAME).is_symlink()
+    assert not (target / ".git").exists()
+
+
+def test_lock_hard_linked_to_another_file_is_rejected_untouched(tmp_path):
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    clone_init(source, target)
+    (target / LOCK_NAME).unlink()
+    os.link(target / "AGENTS.md", target / LOCK_NAME)
+
+    with pytest.raises(KnowledgeError, match="hard link"):
+        clone_init(source, target)
+    assert (target / "AGENTS.md").read_text() == "v1\n"
+    assert (target / "AGENTS.md").stat().st_nlink == 2  # the alias still stands
+
+
+def _plant_lock_directory(lock: Path) -> None:
+    lock.mkdir()
+    (lock / "keep.txt").write_text("keep\n")
+
+
+def _plant_lock_fifo(lock: Path) -> None:
+    os.mkfifo(lock)
+
+
+def _plant_lock_nonempty(lock: Path) -> None:
+    lock.write_text("stale content\n")
+
+
+@pytest.mark.parametrize(
+    ("plant", "match"),
+    [
+        (_plant_lock_directory, "directory"),
+        (_plant_lock_fifo, "not a regular file"),
+        (_plant_lock_nonempty, "never holds content"),
+    ],
+    ids=["directory", "fifo", "non-empty"],
+)
+def test_lock_irregular_shapes_are_rejected_untouched(tmp_path, plant, match):
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    plant(target / LOCK_NAME)
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match=match):
+        clone_init(source, target)
+    assert _tree_snapshot(target) == before
+    assert not (target / ".git").exists()
+
+
+def test_lock_group_or_world_writable_is_rejected(tmp_path):
+    """Validated from the fstat mode bits, not by attempting access — so the
+    check (and this test) holds under root too."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    (target / LOCK_NAME).touch()
+    (target / LOCK_NAME).chmod(0o666)
+
+    with pytest.raises(KnowledgeError, match="writable"):
+        clone_init(source, target)
+    assert (target / LOCK_NAME).stat().st_mode & 0o777 == 0o666  # untouched
+
+
+def test_lock_open_failure_is_a_clear_knowledge_error(tmp_path, monkeypatch):
+    """An EACCES-style open failure is injected rather than provoked via
+    chmod, which root would ignore."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+
+    def denied(path, flags, mode=0o777):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(cloneinit, "_os_open", denied)
+    with pytest.raises(KnowledgeError, match="could not open the clone-init lock"):
+        clone_init(source, target)
+
+
+def _track_reserved_name(repo: Path, name: str) -> None:
+    (repo / name).write_text("repo content\n")
+    _git(["add", "--", name], repo)
+    _git(["commit", "-qm", "reserved name"], repo)
+
+
+@pytest.mark.parametrize("name", cloneinit._SCRATCH_NAMES)
+def test_source_tracking_a_reserved_name_is_rejected_before_any_promotion(tmp_path, name):
+    """A knowledge repo whose root tracks a scratch name would promote
+    repository content onto clone-init's own lock/stage/marker paths — the
+    clone is rejected while the target still holds nothing but the lock."""
+    path = tmp_path / "src"
+    source = make_source_repo(path)
+    _track_reserved_name(path, name)
+    target = tmp_path / "clone"
+
+    with pytest.raises(KnowledgeError, match="reserved clone-init name"):
+        clone_init(source, target)
+    assert [p.name for p in target.iterdir()] == [LOCK_NAME]  # no debris, no marker
+
+
+@pytest.mark.parametrize(
+    ("name", "match"),
+    [
+        # The tracked lock is caught by the safe open (it holds content) …
+        (LOCK_NAME, "never holds content"),
+        # … the tracked stage-name file by the non-following shape check …
+        (cloneinit._STAGE_NAME, "not the staging directory"),
+        # … and the tracked marker by the tracked-name check — BEFORE the
+        # cleanup path would have unlinked it as leftover protocol state.
+        (cloneinit._MARKER_NAME, "reserved clone-init name"),
+    ],
+)
+def test_pre_existing_checkout_tracking_a_reserved_name_is_rejected_untouched(
+    tmp_path, name, match
+):
+    """REGRESSION (marker case): a checkout tracking the marker name looked
+    exactly like the post-promotion cleanup window, and the old resume deleted
+    the tracked working-tree file."""
+    path = tmp_path / "src"
+    make_source_repo(path)
+    _track_reserved_name(path, name)
+    target = tmp_path / "clone"
+    _git(["clone", "-q", str(path), str(target)], tmp_path)
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match=match):
+        clone_init(str(path), target)
+    _assert_only_a_fresh_lock_appeared(before, target)
+
+
+def test_marker_symlink_is_rejected_and_never_written_through(tmp_path):
+    """REGRESSION: a dangling marker symlink was invisible to ``.exists()``,
+    and the later marker ``touch`` then created a file at the symlink's
+    DESTINATION."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    victim = tmp_path / "victim.txt"
+    (target / cloneinit._MARKER_NAME).symlink_to(victim)
+
+    with pytest.raises(KnowledgeError, match="not the regular file"):
+        clone_init(source, target)
+    assert not victim.exists()  # nothing written through the link
+    assert (target / cloneinit._MARKER_NAME).is_symlink()
+    assert not (target / cloneinit._STAGE_NAME).exists()  # no clone was started
+
+
+def test_marker_directory_is_rejected_untouched(tmp_path):
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    marker = target / cloneinit._MARKER_NAME
+    marker.mkdir()
+    (marker / "keep.txt").write_text("keep\n")
+
+    with pytest.raises(KnowledgeError, match="not the regular file"):
+        clone_init(source, target)
+    assert (marker / "keep.txt").read_text() == "keep\n"
+
+
+def test_stage_symlink_under_a_marker_is_rejected_and_the_destination_untouched(tmp_path):
+    """REGRESSION: with a promotion marker present, a stage symlinked at a
+    real directory was traversed and PROMOTED — renaming the destination's
+    children away through the link."""
+    source = make_source_repo(tmp_path / "src")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / ".git").mkdir()
+    (victim / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (victim / "precious.md").write_text("precious\n")
+    target = tmp_path / "clone"
+    target.mkdir()
+    (target / cloneinit._MARKER_NAME).touch()
+    (target / cloneinit._STAGE_NAME).symlink_to(victim)
+
+    with pytest.raises(KnowledgeError, match="not the staging directory"):
+        clone_init(source, target)
+    assert (victim / "precious.md").read_text() == "precious\n"
+    assert (victim / ".git" / "HEAD").read_text() == "ref: refs/heads/main\n"
+    assert (target / cloneinit._MARKER_NAME).exists()  # left for the human
+    assert not (target / "precious.md").exists()  # nothing promoted out of it
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [lambda p: p.write_text("not a dir\n"), os.mkfifo],
+    ids=["regular-file", "fifo"],
+)
+def test_stage_irregular_shapes_are_rejected_untouched(tmp_path, plant):
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    plant(target / cloneinit._STAGE_NAME)
+    before = _tree_snapshot(target)
+
+    with pytest.raises(KnowledgeError, match="not the staging directory"):
+        clone_init(source, target)
+    _assert_only_a_fresh_lock_appeared(before, target)
+    assert not (target / ".git").exists()
+
+
+def test_resumed_stage_holding_a_reserved_name_is_not_promoted(tmp_path):
+    """A (legacy or tampered) stage whose children include a reserved scratch
+    name must not be promoted onto the live lock/stage/marker paths — and the
+    refusal moves nothing."""
+    source = make_source_repo(tmp_path / "src")
+    target = tmp_path / "clone"
+    target.mkdir()
+    stage = target / cloneinit._STAGE_NAME
+    stage.mkdir()
+    (stage / ".git").mkdir()
+    (stage / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (stage / LOCK_NAME).write_text("smuggled\n")
+    (target / cloneinit._MARKER_NAME).touch()
+
+    with pytest.raises(KnowledgeError, match="refusing to promote"):
+        clone_init(source, target)
+    assert (stage / LOCK_NAME).read_text() == "smuggled\n"  # still in the stage
+    assert (stage / ".git" / "HEAD").exists()
+    assert not (target / ".git").exists()  # nothing moved
+    assert (target / cloneinit._MARKER_NAME).exists()

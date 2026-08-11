@@ -39,6 +39,20 @@ cannot have produced (e.g. a checkout WITH stage debris but no marker — the
 one shape the pre-recovery code could leak, or external tampering) rather
 than trusting ``.git`` alone as proof of a completed promotion.
 
+Scratch-path safety. The lock, stage, and marker names are reserved
+clone-init infrastructure, and nothing at those paths is ever trusted by name
+alone. The lock is opened without truncation and without following symlinks,
+then fstat-validated as exactly what the protocol creates: an empty,
+single-link regular file owned by the caller with no group/other write bits —
+a symlink or hard-link alias aimed at operator content (say ``AGENTS.md``) is
+a hard error with the alias target untouched. The marker and stage are
+accepted only in the shapes the protocol writes (regular file / real
+directory), checked with ``lstat`` before any recovery, deletion, touch, or
+traversal. A source repository — or a pre-existing checkout — that TRACKS a
+reserved name is rejected before the marker, the excludes, or any promotion
+step, and promotion itself refuses to move a reserved name. Every rejection
+leaves all involved paths byte-for-byte unchanged.
+
 Credential-agnostic: it just runs ``git``. Auth for a private knowledge repo
 is ambient (a config-side credential helper reading a token secret). This keeps
 ``knowledge/`` dependency-free — the isolation suite stays green.
@@ -46,9 +60,11 @@ is ambient (a config-side credential helper reading a token secret). This keeps
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -64,12 +80,75 @@ _STAGE_NAME = ".theozolith-clone.tmp"
 _MARKER_NAME = ".theozolith-clone.promoting"
 _SCRATCH_NAMES = (LOCK_NAME, _STAGE_NAME, _MARKER_NAME)
 
-# Seam for fault-injection tests: promotion goes through this name.
+# Seams for fault-injection tests: promotion renames and the lock open go
+# through these names.
 _rename = os.rename
+_os_open = os.open
 
 
 def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def _open_lock(lock_path: Path) -> int:
+    """Create-or-open the lock file WITHOUT truncation and without following
+    symlinks, then fstat-validate the descriptor as exactly the file the
+    protocol creates. A ``"w"``-mode open here would follow a planted symlink
+    and truncate whatever it points at (e.g. ``AGENTS.md``) before the lock is
+    even held — so nothing is trusted by name, and every rejection leaves the
+    pre-existing path and whatever it aliases untouched."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = _os_open(str(lock_path), flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise KnowledgeError(
+                f"{lock_path} is a symlink, which clone-init's lock never is —"
+                " refusing to follow it; reconcile by hand (the link and its"
+                " destination were not opened or changed)"
+            ) from exc
+        if exc.errno == errno.EISDIR:
+            raise KnowledgeError(
+                f"{lock_path} is a directory, not clone-init's lock file —"
+                " reconcile by hand (nothing was changed)"
+            ) from exc
+        raise KnowledgeError(
+            f"could not open the clone-init lock {lock_path}: {exc} (nothing was changed)"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise KnowledgeError(
+                f"{lock_path} is not a regular file — refusing to use it as"
+                " clone-init's lock; reconcile by hand (nothing was changed)"
+            )
+        if st.st_nlink != 1:
+            raise KnowledgeError(
+                f"{lock_path} has {st.st_nlink} hard links — a lock aliased to"
+                " another file is never clone-init's; reconcile by hand (the"
+                " file and its other names were not changed)"
+            )
+        if st.st_size != 0:
+            raise KnowledgeError(
+                f"{lock_path} is not empty — clone-init's lock never holds"
+                " content; reconcile by hand (nothing was changed)"
+            )
+        if st.st_uid != os.getuid():
+            raise KnowledgeError(
+                f"{lock_path} is owned by uid {st.st_uid}, not uid {os.getuid()} —"
+                " refusing to use it as clone-init's lock; reconcile by hand"
+                " (nothing was changed)"
+            )
+        if st.st_mode & 0o022:
+            raise KnowledgeError(
+                f"{lock_path} is group- or world-writable"
+                f" (mode {stat.filemode(st.st_mode)}) — refusing to use it as"
+                " clone-init's lock; reconcile by hand (nothing was changed)"
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def clone_init(source: str, target: str | Path, *, branch: str | None = None) -> str:
@@ -82,23 +161,77 @@ def clone_init(source: str, target: str | Path, *, branch: str | None = None) ->
         raise KnowledgeError("clone-init requires git on PATH")
     target = Path(target)
     target.mkdir(parents=True, exist_ok=True)
-    lock_path = target / LOCK_NAME
     # The lock is held only for the duration of the check-and-clone; closing the
-    # file (context-manager exit) releases it. Siblings serialize here.
-    with lock_path.open("w", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    # descriptor releases it. Siblings serialize here. The descriptor stays open
+    # across the whole locked scope — revalidating a path instead would reopen
+    # the TOCTOU the fstat validation just closed.
+    fd = _open_lock(target / LOCK_NAME)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         return _clone_init_locked(source, target, branch)
+    finally:
+        os.close(fd)
+
+
+def _scratch_state(path: Path) -> str:
+    """Classify a scratch path via ``lstat`` — never following a symlink —
+    into ``"missing"``, ``"file"``, ``"dir"``, ``"symlink"``, or another
+    st_mode type name. Protocol decisions key on this, so a planted symlink or
+    irregular file is seen as itself, never as what it points at."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "missing"
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink"
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if stat.S_ISFIFO(st.st_mode):
+        return "FIFO"
+    if stat.S_ISSOCK(st.st_mode):
+        return "socket"
+    return "special file"
+
+
+def _tracked_reserved(checkout: Path) -> list[str]:
+    """Root-level reserved scratch names the checkout TRACKS (files, or
+    directories via their contents). Tracked reserved names are repository
+    content wearing protocol names — clone-init must never delete, exclude,
+    or promote over them."""
+    proc = _git(["ls-files", "--", *_SCRATCH_NAMES], cwd=checkout)
+    if proc.returncode != 0:
+        raise KnowledgeError(
+            f"could not inspect {checkout} for reserved clone-init names:"
+            f" {proc.stderr.strip()} (nothing was changed)"
+        )
+    return sorted({line.split("/", 1)[0] for line in proc.stdout.splitlines() if line.strip()})
 
 
 def _clone_init_locked(source: str, target: Path, branch: str | None) -> str:
     stage = target / _STAGE_NAME
+    marker_state = _scratch_state(target / _MARKER_NAME)
+    if marker_state not in ("missing", "file"):
+        raise KnowledgeError(
+            f"{target / _MARKER_NAME} is a {marker_state}, not the regular file"
+            " the promotion protocol writes — refusing to treat it as clone-init"
+            " state; reconcile by hand (nothing was changed or followed)"
+        )
+    stage_state = _scratch_state(stage)
+    if stage_state not in ("missing", "dir"):
+        raise KnowledgeError(
+            f"{stage} is a {stage_state}, not the staging directory the promotion"
+            " protocol writes — refusing to treat it as clone-init state;"
+            " reconcile by hand (nothing was changed or followed)"
+        )
     recovered = False
-    if (target / _MARKER_NAME).exists():
+    if marker_state == "file":
         _resume_promotion(target)
         recovered = True
 
     if (target / ".git").exists():
-        if stage.exists() and not recovered:
+        if stage_state != "missing" and not recovered:
             # .git next to stage debris with NO marker: this protocol never
             # produces it (the stage only outlives the marker window as
             # marker-less clone debris, and then only when .git is absent).
@@ -123,6 +256,14 @@ def _clone_init_locked(source: str, target: Path, branch: str | None) -> str:
                 " reconcile by hand (clone-init never re-clones over an existing"
                 " checkout; uncommitted scratch is never discarded)"
             )
+        tracked = _tracked_reserved(target)
+        if tracked:
+            raise KnowledgeError(
+                f"{target} tracks reserved clone-init name(s)"
+                f" {', '.join(tracked)} — these names are clone-init"
+                " infrastructure; remove them from the repository (nothing was"
+                " changed)"
+            )
         # Match: do nothing to the tree. No fetch, no pull — a pull is a human
         # act and any local edits are scratch until the operator pushes them
         # (ADR-0043). The scratch excludes ARE (re)established here so a
@@ -146,8 +287,10 @@ def _clone(source: str, target: Path, branch: str | None) -> None:
     stage = target / _STAGE_NAME
     # Marker-less stage debris is an interrupted CLONE (the marker is created
     # only once a complete stage exists): pure git output, never
-    # operator-authored — clearing it and starting clean is safe.
-    if stage.exists():
+    # operator-authored — clearing it and starting clean is safe. The caller
+    # already validated the shape: at this point the stage is a real
+    # directory or absent, never a symlink.
+    if os.path.lexists(stage):
         shutil.rmtree(stage)
     args = ["clone"]
     if branch:
@@ -157,13 +300,39 @@ def _clone(source: str, target: Path, branch: str | None) -> None:
     if proc.returncode != 0:
         shutil.rmtree(stage, ignore_errors=True)
         raise KnowledgeError(f"git clone of {source!r} failed: {proc.stderr.strip()}")
+    # A source tracking a reserved scratch name would promote repository
+    # content onto the lock/stage/marker paths; reject it while the stage is
+    # still marker-less clone output that the next run simply re-clones.
+    tracked = _tracked_reserved(stage)
+    if tracked:
+        shutil.rmtree(stage)
+        raise KnowledgeError(
+            f"source {source!r} tracks reserved clone-init name(s)"
+            f" {', '.join(tracked)} — these names are clone-init infrastructure;"
+            " remove them from the knowledge repo (the target was not changed)"
+        )
     # The excludes are written INSIDE the stage, before promotion: the
     # clean-promote invariant travels with the .git dir, so no post-promotion
     # crash window can leave a checkout whose `git add -A` stages our scratch.
     _ignore_locally(stage)
-    (target / _MARKER_NAME).touch()
+    _create_marker(target)
     _promote(stage, target)
     (target / _MARKER_NAME).unlink()
+
+
+def _create_marker(target: Path) -> None:
+    """Create the promotion marker exclusively: ``O_EXCL`` never follows a
+    symlink and fails on ANY pre-existing entry, so the marker can neither
+    write through a planted link nor adopt someone else's file as protocol
+    state (a plain ``touch`` would do both)."""
+    marker = target / _MARKER_NAME
+    try:
+        os.close(os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except OSError as exc:
+        raise KnowledgeError(
+            f"could not create the promotion marker {marker}: {exc} — reconcile"
+            " by hand (nothing was changed)"
+        ) from exc
 
 
 def _promote(stage: Path, target: Path) -> None:
@@ -172,6 +341,17 @@ def _promote(stage: Path, target: Path) -> None:
     Each rename is atomic (same filesystem), so an interruption leaves every
     child wholly in the stage or wholly at the target, never split."""
     children = sorted(stage.iterdir())
+    reserved = sorted(c.name for c in children if c.name in _SCRATCH_NAMES)
+    if reserved:
+        # A staged reserved name would land ON the live lock/stage/marker
+        # paths. Refuse before ANY rename so a rejected promotion moves
+        # nothing.
+        raise KnowledgeError(
+            f"the staged clone holds reserved clone-init name(s)"
+            f" {', '.join(reserved)} — refusing to promote repository content"
+            " onto clone-init's own paths; reconcile by hand (nothing was"
+            " moved)"
+        )
     ordered = [c for c in children if c.name != ".git"] + [c for c in children if c.name == ".git"]
     for child in ordered:
         dest = target / child.name
@@ -188,17 +368,32 @@ def _promote(stage: Path, target: Path) -> None:
 
 def _resume_promotion(target: Path) -> None:
     """Finish (or clean up after) a promotion the marker says was interrupted.
-    Converges: any further interruption lands back in one of these states."""
+    Converges: any further interruption lands back in one of these states.
+    The caller validated the marker and stage shapes; ``stage/.git`` is
+    additionally required to be a real directory (``lstat``) before the stage
+    is treated as promotable — a symlinked ``.git`` is tampering, not ours."""
     stage = target / _STAGE_NAME
-    if (stage / ".git").exists():
+    stage_state = _scratch_state(stage)
+    if stage_state == "dir" and _scratch_state(stage / ".git") == "dir":
         # Interrupted before .git moved: the stage still holds a complete-
         # minus-already-moved clone — finish the ordered promotion.
         _promote(stage, target)
     elif (target / ".git").exists():
         # Interrupted after .git moved: promotion complete (.git goes last),
-        # only cleanup remains. Tolerate an empty stage remnant; content in it
-        # at this point is not ours.
-        if stage.exists():
+        # only cleanup remains — but a checkout that TRACKS the marker name is
+        # repository content wearing it, not our protocol state: deleting it
+        # would destroy a working-tree file. Reject before unlinking anything.
+        tracked = _tracked_reserved(target)
+        if tracked:
+            raise KnowledgeError(
+                f"{target} tracks reserved clone-init name(s)"
+                f" {', '.join(tracked)} — refusing to treat repository content"
+                " as promotion state; reconcile by hand (nothing was changed"
+                " or deleted)"
+            )
+        # Tolerate an empty stage remnant; content in it at this point is not
+        # ours.
+        if stage_state == "dir":
             if any(stage.iterdir()):
                 raise KnowledgeError(
                     f"{target}: promotion marker present, the checkout is complete,"
