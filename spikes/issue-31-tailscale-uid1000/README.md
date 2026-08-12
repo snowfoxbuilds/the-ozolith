@@ -35,10 +35,14 @@ nothing about another, so:
 
 ## Prerequisites
 
-- A GNU/Linux Docker-capable host on your tailnet (run the script however
-  your docker socket access requires, e.g. `sudo ./run-spike.sh` — that
-  sudo is host docker-socket access only and says nothing about the
-  container's privilege model).
+- A GNU/Linux host with an **ordinary root-daemon Docker**, on your tailnet.
+  Run the script however your docker socket access requires —
+  `sudo ./run-spike.sh` is the expected shape and fully supported (that sudo
+  is host docker-socket access only and says nothing about the container's
+  privilege model). **Rootless Docker and userns-remap daemons are
+  unsupported**: there the container's uid 1000 is not host uid 1000, so the
+  key delivery below cannot be verified — the readability preflight fails
+  closed instead of guessing.
 - A second tailnet machine to ssh from.
 - A **reusable** auth key (`tskey-auth-...`). A plain reusable key is fine
   for the spike; the production key policy (tagged `tag:flightdeck`,
@@ -65,15 +69,29 @@ file): `pass show tailnet/spike | ./run-spike.sh`.
 
 Auth-key hygiene, enforced by the script:
 
-- the key is written to a **mode-0600 temp file on a verified tmpfs**
-  (`/dev/shm`) and reaches the container only as a read-only mount of that
-  file — `file:` form only, mirroring the production tmpfs → read-only
-  `VAR_FILE` delivery;
-- the value never enters argv, shell history, or the build context. A path
-  argument is accepted **only** if the file already lives on a tmpfs;
-  durable host files and any path inside the build context are refused;
-- every exit path (success, failure, Ctrl-C) removes the temp file and
-  prints the removal as proof;
+- the key lives in a **mode-0700 directory on a verified tmpfs**
+  (`/dev/shm`) — the directory is the barrier against other host users —
+  with a single leaf file the deliberately selected container can read as
+  uid 1000 (cross-UID delivery, so `sudo` invocations work):
+  - invoked as root (sudo): leaf `chown 1000:1000`, mode `0400`;
+  - invoked as uid 1000: leaf mode `0400` (same uid as the container);
+  - invoked as any other uid: leaf mode `0444`, readable only through the
+    0700 directory (bind mounts expose the leaf *inode*, so inside the
+    container only the leaf's own owner/mode decide access; on the host the
+    directory decides);
+- a **preflight container proves the mounted leaf is readable as uid 1000**
+  — the exact mount enrollment will use, shared with the state-volume
+  scanner — without printing a byte of the value; if it fails (e.g. on an
+  unsupported rootless/userns-remap daemon), the run stops before any
+  enrollment is attempted;
+- the key reaches the container only as a read-only mount of that leaf —
+  `file:` form only, mirroring the production tmpfs → read-only `VAR_FILE`
+  delivery; the value never enters argv, shell history, environment values,
+  or the build context. A path argument is accepted **only** if the file
+  already lives on a tmpfs; durable host files and any path inside the
+  build context are refused;
+- every exit path (success, failure, SIGINT, SIGTERM) removes the **entire
+  key directory** and prints the removal as proof;
 - if the `spike-tailscale-state` volume already exists, the run is keyless:
   no prompt, nothing secret mounted (that *is* check 3). The retained
   volume holds machine state — node keys — not the auth key; the sweep
@@ -122,7 +140,7 @@ Expect the fresh-enrollment branch to succeed and a new machine to appear;
 prune the stale one in the admin console (that prune is part of the
 documented operator procedure).
 
-### 5. No secret value anywhere but the tmpfs file
+### 5. No secret value anywhere but the tmpfs leaf
 
 Automated: after you press Enter, the script sweeps for the **exact key
 value** using `grep -Ff` with the tmpfs key file as the pattern file (the
@@ -135,17 +153,39 @@ value itself never enters argv or output), across:
   uses the host's ps, so the slim image needs no tooling);
 - the full container log;
 - **every file on the `spike-tailscale-state` volume**, scanned inside a
-  scratch container so the pattern stays a path everywhere.
+  scratch container (as uid 1000, through the same leaf mount) so the
+  pattern stays a path everywhere.
 
-Each surface reports `ok`/`FAIL`; any `FAIL` fails the run. The script then
-prints proof the temporary key file is gone. Run the sweep on both fresh
-runs (checks 1 and 4) — those are exactly the runs where a key exists.
+Every sweep is **tri-state and fails closed**: grep rc 0 is a secret hit
+(FAIL), rc 1 is a clean miss (the only pass), and anything else — a grep
+error, a docker failure, or a missing/unreadable/empty evidence capture —
+is a scanner failure and FAILs the gate too, because an unscannable surface
+proves nothing. Any `FAIL` fails the run. The script then prints proof the
+key directory is gone. Run the sweep on both fresh runs (checks 1 and 4) —
+those are exactly the runs where a key exists.
+
+## Self-test (no Docker, tailnet, or key needed)
+
+```sh
+./test-run-spike.sh
+```
+
+Shell-level regression coverage with a stubbed `docker`: both sweeps'
+tri-state behavior (grep rc 0 = hit fails, rc 1 = the only pass, rc ≥ 2 and
+docker-level failures fail closed; missing/unreadable/empty evidence fails
+closed), cleanup with printed proof on normal exit, on failure, and on
+SIGINT/SIGTERM, keyless reuse runs, the uid-1000 preflight in the flow, and
+that the harness never prints the key value. Run it after any edit to
+`run-spike.sh`; it exits non-zero on any regression.
 
 ## Evidence
 
 Each run ends with a sanitized evidence block (uid line, exact
 `tailscale version`, branch taken, sweep result) to paste into #31. Include
-one block per phase: fresh enrollment, keyless reuse, re-enrollment.
+one block per phase — fresh enrollment, keyless reuse, re-enrollment — plus
+the outputs of the two SSH checks (`whoami`, `/spike-marker`) and your
+identity observations (same 100.x address and no new machine for check 3; a
+new machine + the stale prune for check 4).
 
 ## Caveat worth recording
 
@@ -165,5 +205,5 @@ docker rmi ozolith-ts-spike
 Then delete the spike machine from the tailscale admin console and **revoke
 the auth key** (admin console → Settings → Keys → revoke): the spike key
 was minted for this gate and its job is done. Nothing else persists — the
-temp key file was already removed (every exit path prints the proof), so
-after revocation no live or durable copy of the key exists anywhere.
+tmpfs key directory was already removed (every exit path prints the proof),
+so after revocation no live or durable copy of the key exists anywhere.
