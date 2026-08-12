@@ -78,10 +78,14 @@ and a new machine to appear; prune the stale one in the admin console
 ```sh
 docker history ozolith-ts-spike | grep -i tskey             # expect: nothing
 docker inspect ozolith-ts-spike --format '{{.Config.Env}}'  # path only, no key
-docker exec ozolith-ts-spike sh -c 'pgrep -a tailscale'     # file:... form only
+docker top ozolith-ts-spike                                 # no tskey- in any argv
 ```
 
-Also confirm the container log printed no key value.
+`docker top` uses the host's ps, so it needs no tooling inside the slim
+image (`pgrep`/`ps` are deliberately absent there). The long-running
+processes are the entrypoint sh, tailscaled, and sleep; the transient
+`tailscale up` carried only the `file:` path form, visible in the check-1
+log. Also confirm the container log printed no key value.
 
 ## Caveat worth recording
 
