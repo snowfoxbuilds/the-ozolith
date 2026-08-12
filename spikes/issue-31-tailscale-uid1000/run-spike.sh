@@ -4,12 +4,21 @@
 # root-daemon Docker; run it however your docker socket access requires —
 # `sudo ./run-spike.sh` is the expected shape and is fully supported (see the
 # key permission model below). Rootless Docker and userns-remap daemons are
-# NOT supported: there the container's uid 1000 is not host uid 1000, and the
-# readability preflight fails closed rather than guessing.
+# NOT supported: there the container's uid 1000 is not host uid 1000. Both are
+# POSITIVELY detected (docker info SecurityOptions) and rejected before any
+# key is read; the uid-1000 readability preflight below stays as a second,
+# independent check of the actual mount.
 #
-# FRESH run (no spike-tailscale-state volume yet — gate items 1/4): the
-# REUSABLE auth key (tskey-auth-...) is read from stdin — paste it at the
-# hidden prompt, or pipe it in from a secret manager:
+# FRESH vs REUSE is decided from ACTUAL state, not the volume's mere
+# existence: only a spike-tailscale-state volume holding a NON-EMPTY
+# tailscaled.state is a reusable identity (keyless run — gate item 3). An
+# absent volume, or a volume left behind by a failed first attempt (missing
+# or empty state file), takes the fresh-enrollment path (gate items 1/4) —
+# through the existing volume when there is one; nothing is ever deleted
+# silently. Any docker/volume probe error fails closed before a key is read.
+#
+# FRESH run: the REUSABLE auth key (tskey-auth-...) is read from stdin —
+# paste it at the hidden prompt, or pipe it in from a secret manager:
 #
 #   sudo ./run-spike.sh                     # prompts, input hidden
 #   pass show tailnet/spike | sudo ./run-spike.sh
@@ -27,12 +36,7 @@
 # 1000 (without printing a byte of it) before enrollment is attempted. The
 # value never enters argv, shell history, environment values, or the build
 # context; a path argument is accepted only if the file already lives on a
-# tmpfs, and never from inside the Docker build context. Every exit path —
-# success, failure, SIGINT, SIGTERM — removes the ENTIRE key directory and
-# prints the removal as proof.
-#
-# REUSE run (volume exists — gate item 3): no key is read and nothing secret
-# is mounted; the retained-identity branch must work keyless.
+# tmpfs, and never from inside the Docker build context.
 #
 # After you finish the SSH checks (press Enter), the script stops the
 # container and sweeps every surface for the exact key value with grep -Ff,
@@ -40,12 +44,26 @@
 # argv or output. Every sweep is TRI-STATE and FAILS CLOSED: a grep hit is a
 # failure, a clean miss is the only pass, and a scanner error — including a
 # missing, unreadable, or empty evidence capture — is a failure too (an
-# unscannable surface proves nothing). Surfaces: image history, container
-# env + mount metadata (docker inspect), recorded process argv (docker top),
+# unscannable surface proves nothing). Every promised capture is itself
+# mandatory: a failed `docker top`/`inspect`/`logs`/`history` fails the run.
+# Surfaces: image history, container env + mount metadata (docker inspect),
+# recorded process argv (docker top, live and pre-stop as separate files),
 # the full container log, and every file on the retained state volume.
 #
-# Self-test: ./test-run-spike.sh exercises the sweep tri-state and the
-# cleanup paths with a stubbed docker — no engine, tailnet, or key needed.
+# Cleanup is provable and failure-aware: every exit path — success, failure,
+# SIGINT, SIGTERM — attempts EVERY teardown step (log follower, container,
+# evidence directory, key directory) regardless of earlier failures, then
+# verifies the container is gone and the key directory no longer exists. Any
+# step that fails, or any absence that cannot be proven, turns the exit
+# status nonzero (an original failure status is preserved). If container
+# removal cannot be proven on a run that mounted a key, a prominent warning
+# tells the operator to REVOKE the key immediately — the bind mount can keep
+# the key readable inside a surviving container.
+#
+# Self-test: ./test-run-spike.sh exercises mode selection, daemon-mode
+# rejection, the sweep tri-state, entrypoint failure propagation, and the
+# cleanup paths with stubbed docker/tailscale binaries — no engine, tailnet,
+# or key needed.
 set -euo pipefail
 
 IMAGE=ozolith-ts-spike
@@ -56,26 +74,181 @@ SPIKE_KEY_DIR=""
 SPIKE_KEY_FILE=""
 EVIDENCE_DIR=""
 LOG_PID=""
+CONTAINER_STARTED=0
+MODE=""
+MODE_DETAIL=""
+VOLUME_EXISTS=0
 sweep_hit=0
 
 cleanup() {
   status=$?
   trap - EXIT
-  [[ -n "$LOG_PID" ]] && kill "$LOG_PID" 2>/dev/null || true
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  # Raw captures may only contain the key if a sweep FAILED — they live on
-  # tmpfs and are removed either way. The volume and image are deliberately
-  # retained (machine state, not secrets): checks 3/4 need them.
-  [[ -n "$EVIDENCE_DIR" ]] && rm -rf "$EVIDENCE_DIR"
+  # Cleanup must be provable: errexit is OFF in here so EVERY step below is
+  # attempted no matter what failed earlier; each failure is recorded, and any
+  # failure — or any absence that cannot be proven — turns the final exit
+  # nonzero. A nominally successful run does not get to report success past a
+  # teardown it cannot prove; an original nonzero status is preserved.
+  set +e
+  local failed=0
+
+  # 1) the log-follow process
+  if [[ -n "$LOG_PID" ]]; then
+    kill "$LOG_PID" 2>/dev/null
+    local i
+    for i in 1 2 3 4 5; do
+      kill -0 "$LOG_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "$LOG_PID" 2>/dev/null; then
+      kill -9 "$LOG_PID" 2>/dev/null
+      sleep 0.2
+    fi
+    if kill -0 "$LOG_PID" 2>/dev/null; then
+      echo "CLEANUP FAIL: log-follow process (pid $LOG_PID) could not be terminated" >&2
+      failed=1
+    fi
+    wait "$LOG_PID" 2>/dev/null
+  fi
+
+  # 2) the container: remove, then PROVE absence. An unproven removal of a
+  # container that bind-mounts the key is an emergency, not a shrug: the
+  # mount pins the inode, so the key can stay readable inside a surviving
+  # container even after the host copy below is deleted.
+  if [[ "$CONTAINER_STARTED" -eq 1 ]]; then
+    if ! docker rm -f "$CONTAINER" >/dev/null 2>&1; then
+      echo "CLEANUP FAIL: docker rm -f $CONTAINER failed" >&2
+      failed=1
+    fi
+    local remaining removal_unproven=0
+    if remaining=$(docker ps -aq --filter "name=^${CONTAINER}\$" 2>/dev/null); then
+      if [[ -n "$remaining" ]]; then
+        echo "CLEANUP FAIL: container $CONTAINER STILL EXISTS after docker rm -f" >&2
+        removal_unproven=1
+      else
+        echo "==> container removed (proof: 'docker ps -a' no longer lists $CONTAINER)"
+      fi
+    else
+      echo "CLEANUP FAIL: could not query docker for the container — removal is UNPROVEN" >&2
+      removal_unproven=1
+    fi
+    if [[ "$removal_unproven" -eq 1 ]]; then
+      failed=1
+      if [[ -n "$SPIKE_KEY_DIR" ]]; then
+        echo "!!! ------------------------------------------------------------------ !!!" >&2
+        echo "!!! WARNING: this run bind-mounted the auth key into the container and  !!!" >&2
+        echo "!!! the container's removal is UNPROVEN. The key value may still be     !!!" >&2
+        echo "!!! readable inside a surviving container even after the host copy is   !!!" >&2
+        echo "!!! deleted. REVOKE THE AUTH KEY IMMEDIATELY:                           !!!" >&2
+        echo "!!! tailscale admin console -> Settings -> Keys -> revoke.              !!!" >&2
+        echo "!!! ------------------------------------------------------------------ !!!" >&2
+      fi
+    fi
+  fi
+
+  # 3) evidence directory (tmpfs; raw captures could hold the key only if a
+  # sweep FAILED — removed either way, and the removal must be proven)
+  if [[ -n "$EVIDENCE_DIR" ]]; then
+    rm -rf "$EVIDENCE_DIR" 2>/dev/null
+    if [[ -e "$EVIDENCE_DIR" ]]; then
+      echo "CLEANUP FAIL: evidence directory STILL EXISTS: $EVIDENCE_DIR — remove it by hand" >&2
+      failed=1
+    fi
+  fi
+
+  # 4) key directory. The volume and image are deliberately retained
+  # (machine state, not secrets): checks 3/4 need them.
   if [[ -n "$SPIKE_KEY_DIR" ]]; then
-    rm -rf "$SPIKE_KEY_DIR"
+    rm -rf "$SPIKE_KEY_DIR" 2>/dev/null
     if [[ -e "$SPIKE_KEY_DIR" ]]; then
-      echo "WARNING: temporary key directory STILL EXISTS: $SPIKE_KEY_DIR" >&2
+      echo "CLEANUP FAIL: temporary key directory STILL EXISTS: $SPIKE_KEY_DIR — remove it by hand and REVOKE the key" >&2
+      failed=1
     else
       echo "==> temporary key directory removed (proof: '! -e $SPIKE_KEY_DIR' holds)"
     fi
   fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "CLEANUP FAILED: teardown could not be completed or proven — treat this run as FAILED." >&2
+    [[ "$status" -eq 0 ]] && status=1
+  fi
   exit "$status"
+}
+
+require_supported_docker() {
+  # Daemon-mode enforcement happens BEFORE any secret intake: on rootless and
+  # userns-remap daemons the container's uid 1000 is not host uid 1000, so
+  # cross-UID key delivery cannot mean what the gate needs it to mean. This
+  # is POSITIVE detection from the daemon's own SecurityOptions; the uid-1000
+  # readability preflight later is a second, independent check of the actual
+  # mount — not the daemon-mode detector.
+  command -v docker >/dev/null 2>&1 || {
+    echo "FAIL: docker not found on PATH — this harness needs an ordinary root-daemon Docker." >&2
+    exit 1
+  }
+  local secopts
+  if ! secopts=$(docker info --format '{{json .SecurityOptions}}' 2>&1); then
+    echo "FAIL: cannot query the Docker daemon (docker info failed) — refusing to read a key:" >&2
+    printf '%s\n' "$secopts" | sed 's/^/      /' >&2
+    exit 1
+  fi
+  if grep -q 'name=rootless' <<<"$secopts"; then
+    echo "FAIL: rootless Docker daemon detected (SecurityOptions reports name=rootless) — unsupported." >&2
+    echo "      Under rootless Docker the container's uid 1000 is not host uid 1000, so the gate's" >&2
+    echo "      cross-UID key delivery cannot be verified. Run on an ordinary root-daemon host." >&2
+    exit 1
+  fi
+  if grep -q 'name=userns' <<<"$secopts"; then
+    echo "FAIL: userns-remap Docker daemon detected (SecurityOptions reports name=userns) — unsupported." >&2
+    echo "      With userns-remap the container's uid 1000 maps to a shifted host uid, so the gate's" >&2
+    echo "      cross-UID key delivery cannot be verified. Run on an ordinary root-daemon host." >&2
+    exit 1
+  fi
+  echo "==> docker daemon: ordinary root daemon (no rootless / userns-remap security option)"
+}
+
+probe_mode() {
+  # Fresh-vs-reuse from ACTUAL state, not the volume's mere existence: only a
+  # non-empty tailscaled.state is a reusable identity. A volume left behind
+  # by a failed first attempt (missing or empty state file) is recovered
+  # through fresh enrollment WITHOUT deleting anything. Every probe error
+  # fails closed — and all of this runs before any key is read.
+  local out rc
+  out=$(docker volume inspect "$VOLUME" 2>&1) && rc=0 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -qi 'no such volume' <<<"$out"; then
+      MODE=fresh
+      VOLUME_EXISTS=0
+      MODE_DETAIL="fresh (no $VOLUME volume yet)"
+      echo "==> no state volume yet ($VOLUME): FRESH run — enrollment (gate items 1/4)"
+      return 0
+    fi
+    echo "FAIL: cannot tell fresh from reuse — docker volume inspect failed:" >&2
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    exit 1
+  fi
+  VOLUME_EXISTS=1
+  # The volume exists: check for a non-empty tailscaled.state from inside a
+  # scratch container — the same uid-1000 view the real run will have.
+  out=$(docker run --rm -v "$VOLUME":/state:ro --entrypoint /bin/sh "$IMAGE" \
+    -c '[ -s /state/tailscaled.state ]' 2>&1) && rc=0 || rc=$?
+  case "$rc" in
+    0)
+      MODE=reuse
+      MODE_DETAIL="reuse (non-empty tailscaled.state on $VOLUME)"
+      echo "==> volume $VOLUME holds a non-empty tailscaled.state: REUSE run — keyless identity (gate item 3)"
+      ;;
+    1)
+      MODE=fresh
+      MODE_DETAIL="fresh (existing $VOLUME volume without usable state — recovery)"
+      echo "==> volume $VOLUME exists but holds no usable tailscaled.state: FRESH run through the"
+      echo "    EXISTING volume (recovery from a failed attempt; nothing is deleted)"
+      ;;
+    *)
+      echo "FAIL: cannot tell fresh from reuse — the state probe failed (rc=$rc):" >&2
+      printf '%s\n' "$out" | sed 's/^/      /' >&2
+      exit 1
+      ;;
+  esac
 }
 
 require_tmpfs() { # $1: a path whose filesystem must be RAM-backed
@@ -148,6 +321,8 @@ read_key() { # fills $SPIKE_KEY_FILE; the value never touches argv
 preflight_key_readable() {
   # Prove the mounted leaf is readable as uid 1000 IN the container — the
   # exact mount enrollment will use — without printing a byte of the value.
+  # This is a second, independent check of the delivery path; daemon mode was
+  # already positively verified before the key was read.
   if docker run --rm \
     --mount "type=bind,source=${SPIKE_KEY_FILE},target=/run/secrets/ts-authkey,readonly" \
     --entrypoint /bin/sh "$IMAGE" \
@@ -155,9 +330,26 @@ preflight_key_readable() {
     echo "==> preflight: key file is readable as uid 1000 inside the container"
   else
     echo "FAIL: preflight — the mounted key is not readable as uid 1000 in the container." >&2
-    echo "      Rootless Docker and userns-remap daemons are unsupported for the gate (the" >&2
-    echo "      container's uid 1000 is not host uid 1000 there); run on an ordinary" >&2
-    echo "      root-daemon Docker host." >&2
+    echo "      The daemon mode already passed the SecurityOptions check, so this is a problem" >&2
+    echo "      with the leaf or its mount (permissions, /dev/shm options). Fix the delivery" >&2
+    echo "      path; do not weaken the container's privilege model to work around it." >&2
+    exit 1
+  fi
+}
+
+capture_evidence() { # $1: label, $2: dest file, $3...: command — fail closed
+  local label=$1 dest=$2
+  shift 2
+  # stderr goes into the capture too (a complete surface). On failure NOTHING
+  # captured is printed — the file could hold exactly what must never reach
+  # the terminal; cleanup removes the tmpfs evidence directory either way.
+  if ! "$@" >"$dest" 2>&1; then
+    echo "FAIL: promised evidence capture failed ($label: $*)." >&2
+    echo "      An unscannable surface proves nothing — the gate cannot pass without it." >&2
+    exit 1
+  fi
+  if [[ ! -r "$dest" || ! -s "$dest" ]]; then
+    echo "FAIL: evidence capture ($label) left a missing, unreadable, or empty file: $dest" >&2
     exit 1
   fi
 }
@@ -216,23 +408,22 @@ main() {
   cd "$(dirname "${BASH_SOURCE[0]}")"
   CONTEXT_DIR=$(pwd -P)
 
-  local mode
-  if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
-    mode=reuse
-  else
-    mode=fresh
-  fi
-
-  if [[ "$mode" == fresh ]]; then
-    make_key_dir
-    read_key "$@"
-    finalize_key_perms
-  elif [[ $# -ge 1 ]]; then
-    echo "note: volume $VOLUME exists — reuse run; the key argument is ignored and not read" >&2
-  fi
+  # Docker availability and daemon mode are validated BEFORE any key intake.
+  require_supported_docker
 
   echo "==> building the spike image (version- and sha256-pinned tailscale; see Dockerfile)"
   docker build -t "$IMAGE" .
+
+  probe_mode
+
+  if [[ "$MODE" == fresh ]]; then
+    make_key_dir
+    read_key "$@"
+    finalize_key_perms
+    preflight_key_readable
+  elif [[ $# -ge 1 ]]; then
+    echo "note: reuse run — the key argument is ignored and not read" >&2
+  fi
 
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   EVIDENCE_DIR=$(mktemp -d /dev/shm/ozolith-ts-evidence.XXXXXX)
@@ -242,10 +433,12 @@ main() {
   # IS the experiment. On a fresh run the key reaches the container only as a
   # read-only mount of the tmpfs leaf; only its PATH appears in env/argv
   # (gate item 5). On a reuse run nothing secret is mounted at all.
-  if [[ "$mode" == fresh ]]; then
-    preflight_key_readable
-    docker volume create "$VOLUME" >/dev/null
-    echo "==> fresh run: empty state volume — enrollment branch expected (gate items 1/4)"
+  CONTAINER_STARTED=1
+  if [[ "$MODE" == fresh ]]; then
+    if [[ "$VOLUME_EXISTS" -eq 0 ]]; then
+      docker volume create "$VOLUME" >/dev/null
+    fi
+    echo "==> fresh run: enrollment branch expected (gate items 1/4)"
     docker run -d --name "$CONTAINER" \
       -e TS_AUTHKEY_FILE=/run/secrets/ts-authkey \
       -e SPIKE_HOSTNAME=spike \
@@ -281,9 +474,10 @@ main() {
 
   # Argv/metadata snapshots while the daemon is live (docker top uses the
   # host's ps — the transient `tailscale up` argv carried only the file: path,
-  # visible in the log above).
-  docker top "$CONTAINER" >"$EVIDENCE_DIR/top.txt"
-  docker inspect "$CONTAINER" >"$EVIDENCE_DIR/inspect.json"
+  # visible in the log above). Every promised capture is REQUIRED: a capture
+  # failure is a run failure, never a silently skipped surface.
+  capture_evidence "process argv, live (docker top)" "$EVIDENCE_DIR/top-live.txt" docker top "$CONTAINER"
+  capture_evidence "container env + mount metadata (docker inspect)" "$EVIDENCE_DIR/inspect.json" docker inspect "$CONTAINER"
 
   echo
   echo "==> container is up. From ANOTHER tailnet machine run the SSH checks:"
@@ -299,16 +493,16 @@ main() {
     sleep "${SPIKE_SSH_WAIT_SECS:-300}"
   fi
 
-  docker top "$CONTAINER" >>"$EVIDENCE_DIR/top.txt" 2>/dev/null || true
+  capture_evidence "process argv, pre-stop (docker top)" "$EVIDENCE_DIR/top-prestop.txt" docker top "$CONTAINER"
   docker stop -t 10 "$CONTAINER" >/dev/null
   kill "$LOG_PID" 2>/dev/null || true
   wait "$LOG_PID" 2>/dev/null || true
   LOG_PID=""
-  docker logs "$CONTAINER" >"$EVIDENCE_DIR/container.log" 2>&1 # complete, incl. shutdown
-  docker history --no-trunc "$IMAGE" >"$EVIDENCE_DIR/history.txt"
+  capture_evidence "full container log" "$EVIDENCE_DIR/container.log" docker logs "$CONTAINER"
+  capture_evidence "image history (docker history --no-trunc)" "$EVIDENCE_DIR/history.txt" docker history --no-trunc "$IMAGE"
 
   local sweep_result="not run (reuse run: no secret entered this run — item-5 evidence comes from the fresh runs)"
-  if [[ "$mode" == fresh ]]; then
+  if [[ "$MODE" == fresh ]]; then
     echo
     echo "==> gate item 5 sweep: exact key value, grep -Ff with the tmpfs key file as the"
     echo "    pattern file — the value itself never enters argv or output. Tri-state and"
@@ -319,14 +513,15 @@ main() {
     else
       scan_file "image history (docker history --no-trunc)" "$EVIDENCE_DIR/history.txt"
       scan_file "container env + mount metadata (docker inspect; only the non-secret path appears)" "$EVIDENCE_DIR/inspect.json"
-      scan_file "process argv snapshots (docker top, live + pre-stop)" "$EVIDENCE_DIR/top.txt"
+      scan_file "process argv snapshot (docker top, live)" "$EVIDENCE_DIR/top-live.txt"
+      scan_file "process argv snapshot (docker top, pre-stop)" "$EVIDENCE_DIR/top-prestop.txt"
       scan_file "full container log" "$EVIDENCE_DIR/container.log"
       scan_state_volume
     fi
     if [[ "$sweep_hit" -ne 0 ]]; then
       sweep_result="FAILED — a key hit or an unscannable surface; gate item 5 does NOT pass"
     else
-      sweep_result="passed on all five surfaces (history, inspect, argv, log, state volume)"
+      sweep_result="passed on all six surfaces (history, inspect, argv live, argv pre-stop, log, state volume)"
     fi
   fi
 
@@ -334,13 +529,13 @@ main() {
   echo "==> sanitized evidence block — paste into issue #31:"
   echo "--------------------------------------------------------------------------"
   echo "harness: spikes/issue-31-tailscale-uid1000 @ $(git rev-parse --short HEAD 2>/dev/null || echo '<commit>')"
-  echo "run mode: $mode"
+  echo "run mode: $MODE_DETAIL"
   grep '^==> running as uid' "$EVIDENCE_DIR/container.log" || true
   sed -n '/^==> tailscale version/,/^==>/{/^==> tailscale version/d;/^==>/d;p;}' "$EVIDENCE_DIR/container.log" | sed 's/^/tailscale version: /'
   grep -E '^==> (existing state found|empty statedir)' "$EVIDENCE_DIR/container.log" || true
   echo "key-absence sweep: $sweep_result"
   echo "--------------------------------------------------------------------------"
-  if [[ "$mode" == fresh && "$sweep_hit" -ne 0 ]]; then
+  if [[ "$MODE" == fresh && "$sweep_hit" -ne 0 ]]; then
     exit 1
   fi
 }

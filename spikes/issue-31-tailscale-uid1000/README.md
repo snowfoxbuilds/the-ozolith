@@ -41,8 +41,11 @@ nothing about another, so:
   is host docker-socket access only and says nothing about the container's
   privilege model). **Rootless Docker and userns-remap daemons are
   unsupported**: there the container's uid 1000 is not host uid 1000, so the
-  key delivery below cannot be verified — the readability preflight fails
-  closed instead of guessing.
+  key delivery below cannot mean what the gate needs it to mean. The script
+  **positively detects both** (`docker info` SecurityOptions reporting
+  `name=rootless` / `name=userns`) and refuses to run — before any key is
+  read. The uid-1000 readability preflight below stays as a second,
+  independent check of the actual mount; it is not the daemon-mode detector.
 - A second tailnet machine to ssh from.
 - A **reusable** auth key (`tskey-auth-...`). A plain reusable key is fine
   for the spike; the production key policy (tagged `tag:flightdeck`,
@@ -66,6 +69,29 @@ nothing about another, so:
 
 or pipe the key from a secret manager (never from a durable plaintext
 file): `pass show tailnet/spike | ./run-spike.sh`.
+
+### Fresh vs reuse is decided from actual state
+
+The script probes the `spike-tailscale-state` volume **content**, not its
+mere existence, before deciding anything (and before reading a key):
+
+- **volume absent** → fresh enrollment (a new volume is created);
+- **volume present with a non-empty `tailscaled.state`** → keyless reuse
+  (check 3): no prompt, nothing secret mounted;
+- **volume present without a usable state file** (missing or zero bytes —
+  what a failed or interrupted first attempt leaves behind) → **fresh
+  enrollment through the existing volume**. Nothing is deleted: recovery
+  from a failed initial attempt is just running the script again with the
+  same key; the entrypoint applies the same non-empty-state rule inside the
+  container, so the branches cannot disagree;
+- **probe error** (docker unreachable, volume inspect or the in-container
+  state check failing) → the run stops before any key is read; the script
+  never guesses fresh-vs-reuse.
+
+A **corrupt but non-empty** state file is deliberately NOT recovered
+automatically: the reuse branch runs and `tailscale up` fails visibly —
+destroying possibly-good identity state is an operator decision
+(`docker volume rm spike-tailscale-state`), never a script default.
 
 Auth-key hygiene, enforced by the script:
 
@@ -91,11 +117,13 @@ Auth-key hygiene, enforced by the script:
   already lives on a tmpfs; durable host files and any path inside the
   build context are refused;
 - every exit path (success, failure, SIGINT, SIGTERM) removes the **entire
-  key directory** and prints the removal as proof;
-- if the `spike-tailscale-state` volume already exists, the run is keyless:
-  no prompt, nothing secret mounted (that *is* check 3). The retained
-  volume holds machine state — node keys — not the auth key; the sweep
-  below proves the auth key is not on it.
+  key directory** and prints the removal as proof (see Cleanup for the
+  failure semantics: an unprovable teardown fails the run);
+- if the `spike-tailscale-state` volume holds a non-empty
+  `tailscaled.state`, the run is keyless: no prompt, nothing secret mounted
+  (that *is* check 3). The retained volume holds machine state — node
+  keys — not the auth key; the sweep below proves the auth key is not on
+  it.
 
 The container starts with **no** `--cap-add`, **no** `--device`, **no**
 `--privileged` — that absence is the experiment. If the gate fails, capture
@@ -125,9 +153,10 @@ ssh ozolith@spike cat /spike-marker   # expect: spike-container-fs
 
 Note the node's 100.x address (`tailscale status` output in the log). Press
 Enter to finish run 1, optionally `docker build` again (same pinned
-version), then re-run `./run-spike.sh`. The volume exists, so the run is
-**keyless**: expect the log's "existing state found" branch, the same 100.x
-address, no new machine in the admin console, and ssh still landing.
+version), then re-run `./run-spike.sh`. The volume now holds a non-empty
+`tailscaled.state`, so the run is **keyless**: expect the log's "existing
+state found" branch, the same 100.x address, no new machine in the admin
+console, and ssh still landing.
 
 ### 4. State-volume loss permits deliberate re-enrollment
 
@@ -149,20 +178,24 @@ value itself never enters argv or output), across:
 - image history (`docker history --no-trunc`);
 - container environment + mount metadata (`docker inspect` — only the
   non-secret `/run/secrets/ts-authkey` path may appear);
-- recorded process argv (`docker top`, live and pre-stop snapshots — it
-  uses the host's ps, so the slim image needs no tooling);
+- recorded process argv (`docker top`, captured **twice into separate
+  files** — live after ready, and again pre-stop — it uses the host's ps,
+  so the slim image needs no tooling);
 - the full container log;
 - **every file on the `spike-tailscale-state` volume**, scanned inside a
   scratch container (as uid 1000, through the same leaf mount) so the
   pattern stays a path everywhere.
 
-Every sweep is **tri-state and fails closed**: grep rc 0 is a secret hit
-(FAIL), rc 1 is a clean miss (the only pass), and anything else — a grep
-error, a docker failure, or a missing/unreadable/empty evidence capture —
-is a scanner failure and FAILs the gate too, because an unscannable surface
-proves nothing. Any `FAIL` fails the run. The script then prints proof the
-key directory is gone. Run the sweep on both fresh runs (checks 1 and 4) —
-those are exactly the runs where a key exists.
+Every promised capture is itself **mandatory**: a failed `docker top`,
+`inspect`, `logs`, or `history` — or a capture that comes back unreadable
+or empty — fails the run before scanning starts; nothing is swallowed with
+`|| true`. Every sweep is **tri-state and fails closed**: grep rc 0 is a
+secret hit (FAIL), rc 1 is a clean miss (the only pass), and anything
+else — a grep error, a docker failure, or a missing/unreadable/empty
+evidence capture — is a scanner failure and FAILs the gate too, because an
+unscannable surface proves nothing. Any `FAIL` fails the run. The script
+then prints proof the key directory is gone. Run the sweep on both fresh
+runs (checks 1 and 4) — those are exactly the runs where a key exists.
 
 ## Self-test (no Docker, tailnet, or key needed)
 
@@ -170,13 +203,36 @@ those are exactly the runs where a key exists.
 ./test-run-spike.sh
 ```
 
-Shell-level regression coverage with a stubbed `docker`: both sweeps'
-tri-state behavior (grep rc 0 = hit fails, rc 1 = the only pass, rc ≥ 2 and
-docker-level failures fail closed; missing/unreadable/empty evidence fails
-closed), cleanup with printed proof on normal exit, on failure, and on
-SIGINT/SIGTERM, keyless reuse runs, the uid-1000 preflight in the flow, and
-that the harness never prints the key value. Run it after any edit to
-`run-spike.sh`; it exits non-zero on any regression.
+Shell-level regression coverage with stubbed `docker`, `tailscale`, and
+`tailscaled` binaries — CI runs it on every PR (the `spike-harness` job in
+`.github/workflows/ci.yml`), so the green check covers the harness itself:
+
+- **mode selection from actual state**: absent volume → fresh; non-empty
+  `tailscaled.state` → keyless reuse; existing volume without usable
+  state → fresh through the same volume (no deletion); probe errors fail
+  closed before any key intake;
+- **daemon-mode rejection**: rootless, userns-remap, and an unreachable
+  daemon all refuse to run before a key is read; the uid-1000 readability
+  preflight fails closed;
+- **entrypoint failure propagation**: `tailscale version`, LocalAPI
+  readiness (socket alone is not ready), `up` (fresh and reuse), and
+  post-up `status` failures all exit non-zero and never print ready;
+  corrupt-but-non-empty state fails visibly without being deleted;
+  post-enrollment daemon death stays non-zero;
+- **required evidence captures**: a failure of either `docker top` snapshot
+  (live or pre-stop) fails the run;
+- both sweeps' **tri-state** behavior (grep rc 0 = hit fails, rc 1 = the
+  only pass, rc ≥ 2 and docker-level failures fail closed;
+  missing/unreadable/empty evidence fails closed);
+- **cleanup**: every step attempted regardless of earlier failures;
+  container and key-directory absence proven; `docker rm` failures and
+  unprovable removal turn even a passing run non-zero (with the value-free
+  revoke-now warning); an original non-zero status is preserved; exercised
+  on normal exit, ordinary failure, SIGINT, and SIGTERM;
+- the key value never appears in the harness's output or in any argv.
+
+Run it after any edit to `run-spike.sh` or `entrypoint.sh`; it exits
+non-zero on any regression.
 
 ## Evidence
 
@@ -195,6 +251,21 @@ HTTP proxy. The Flight Deck use case is inbound-only, so this is fine —
 but note it in #31 so nobody later assumes outbound works.
 
 ## Cleanup
+
+Per-run cleanup is automatic, **failure-aware, and provable**: every exit
+path (success, failure, SIGINT, SIGTERM) attempts every teardown step —
+log follower, container, evidence directory, key directory — regardless of
+earlier failures, then verifies the container is absent (`docker ps -a`)
+and the key directory no longer exists. Any step that fails, or any absence
+the script cannot prove, makes the run exit **non-zero even if the gate
+checks themselves passed** — a run that cannot prove its own teardown is a
+failed run. If container removal cannot be proven on a run that mounted a
+key, the script prints a prominent (value-free) warning: the bind mount can
+keep the key readable inside a surviving container even after the host copy
+is deleted, so **revoke the key immediately** in that case instead of
+waiting for the end-of-gate cleanup below.
+
+After the whole gate is done:
 
 ```sh
 docker rm -f ozolith-ts-spike 2>/dev/null
