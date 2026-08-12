@@ -9,6 +9,12 @@ set -u
 
 echo "==> running as uid $(id -u) ($(id -un)); expecting 1000/ozolith"
 
+# The exact binary under test goes into the evidence: the gate verdict is
+# only valid for the release PR #35 pins (the Dockerfile installs precisely
+# that sha256-verified archive).
+echo "==> tailscale version (must match the release the production example pins):"
+tailscale version
+
 # Decide the branch before the daemon can touch the statedir.
 if [ -f /var/lib/tailscale/tailscaled.state ]; then
   ENROLL=no
