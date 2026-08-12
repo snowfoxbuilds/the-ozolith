@@ -17,13 +17,23 @@
 #   - both sweeps are tri-state and FAIL CLOSED: grep rc 0 = secret hit
 #     (fail), rc 1 = absent (the only pass), rc >= 2 / docker failure =
 #     scanner error (fail); missing, unreadable, or empty evidence fails;
-#   - cleanup attempts EVERY step regardless of earlier failures, proves
-#     container and key-directory absence, warns (value-free) to revoke the
-#     key when container removal is unproven, preserves an original nonzero
-#     status, and turns a nominal success nonzero on any cleanup failure —
-#     on normal exit, ordinary failure, SIGINT, and SIGTERM;
-#   - the key value never appears in the harness's own output or in any
-#     argv it passes to docker or tailscale.
+#   - cleanup attempts EVERY step regardless of earlier failures and proves
+#     the absence of EVERY container that received the key bind mount — the
+#     main container plus the uid-1000 preflight and state-volume scanner
+#     scratch containers, each tracked under a per-run collision-safe name
+#     recorded BEFORE its docker run (--rm is convenience, not proof). A
+#     normally auto-removed scratch container counts as already clean, a
+#     lingering one is removed with proof, per-container rm failures and
+#     unprovable queries turn the run nonzero with the value-free revoke-now
+#     warning, later cleanup steps still run after earlier failures, an
+#     original nonzero status is preserved — exercised on normal exit,
+#     ordinary failure, and SIGINT/SIGTERM parked inside each key-bearing
+#     scratch operation;
+#   - stale key-bearing scratch containers from a prior interrupted run are
+#     rejected before any key intake, and a failing stale-check query fails
+#     closed;
+#   - the key value never appears in the harness's own output, in any argv
+#     it passes to docker or tailscale, or in any container name.
 #
 # Run: ./test-run-spike.sh   (exits non-zero on any failure)
 set -euo pipefail
@@ -35,6 +45,12 @@ STUB=$TESTTMP/bin
 mkdir -p "$STUB"
 
 # --- the docker stub -------------------------------------------------------
+# Stateful when DOCKER_STUB_COUNTER_DIR is set: created containers are
+# recorded in $DOCKER_STUB_COUNTER_DIR/containers (docker run -d records the
+# main container; the --rm scratch runs record only when a *_LINGER knob
+# simulates a container surviving its own --rm), docker rm unrecords, and
+# docker ps answers name-filter queries from the record — so the harness's
+# query -> remove -> re-query proof loop runs against realistic state.
 # Env knobs:
 #   DOCKER_STUB_INFO_RC          docker info rc (daemon unreachable)
 #   DOCKER_STUB_SECOPTS          docker info SecurityOptions JSON
@@ -43,17 +59,33 @@ mkdir -p "$STUB"
 #   DOCKER_STUB_STATE_RC         state probe rc: 0 non-empty state, 1 empty/missing, >1 error
 #   DOCKER_STUB_BUILD_RC / DOCKER_STUB_BUILD_SLEEP
 #   DOCKER_STUB_PREFLIGHT_RC / DOCKER_STUB_PREFLIGHT_SLEEP
-#   DOCKER_STUB_VOLSCAN_RC / DOCKER_STUB_VOLSCAN_OUT
+#   DOCKER_STUB_PREFLIGHT_MARKER  file touched when the preflight run starts
+#   DOCKER_STUB_PREFLIGHT_LINGER  1 = the preflight scratch container survives its --rm
+#   DOCKER_STUB_VOLSCAN_RC / DOCKER_STUB_VOLSCAN_OUT / DOCKER_STUB_VOLSCAN_SLEEP
+#   DOCKER_STUB_VOLSCAN_MARKER    file touched when the scanner run starts
+#   DOCKER_STUB_VOLSCAN_LINGER    1 = the scanner scratch container survives its --rm
 #   DOCKER_STUB_TOP1_RC / DOCKER_STUB_TOP2_RC   first (live) / second (pre-stop) docker top
-#   DOCKER_STUB_RM_RC            docker rm rc
-#   DOCKER_STUB_PS_RC / DOCKER_STUB_PS_OUT      absence proof: query rc / lingering id
+#   DOCKER_STUB_RM_RC            docker rm rc (every rm call)
+#   DOCKER_STUB_RM_FAIL_MATCH    docker rm fails (rc 1) for names containing this substring
+#   DOCKER_STUB_RM_KEEP          1 = docker rm reports success but the container survives
+#   DOCKER_STUB_PS_RC            exact-name queries (name=^...$; the absence proofs) fail
+#   DOCKER_STUB_PS_PREFIX_RC     prefix-name queries (the stale-scratch check) fail
 #   DOCKER_STUB_LEAK             injected into the container log
-#   DOCKER_STUB_COUNTER_DIR      per-run scratch for the docker-top call counter
+#   DOCKER_STUB_COUNTER_DIR      per-run scratch for stub state (top counter, container records)
 #   DOCKER_STUB_CALLS            file logging every stubbed docker argv
 cat >"$STUB/docker" <<'STUBEOF'
 #!/bin/bash
 cmd=${1:-}; shift || true
 [ -n "${DOCKER_STUB_CALLS:-}" ] && printf 'docker %s %s\n' "$cmd" "$*" >>"$DOCKER_STUB_CALLS"
+REC=""
+[ -n "${DOCKER_STUB_COUNTER_DIR:-}" ] && REC="$DOCKER_STUB_COUNTER_DIR/containers"
+rec_add() { [ -n "$REC" ] && printf '%s\n' "$1" >>"$REC"; }
+rec_has() { [ -n "$REC" ] && [ -f "$REC" ] && grep -qxF -- "$1" "$REC"; }
+rec_del() {
+  rec_has "$1" || return 0
+  grep -vxF -- "$1" "$REC" >"$REC.tmp" || true
+  mv "$REC.tmp" "$REC"
+}
 case "$cmd" in
   info)
     if [ "${DOCKER_STUB_INFO_RC:-0}" != 0 ]; then
@@ -75,19 +107,59 @@ case "$cmd" in
       create) exit 0 ;;
     esac ;;
   build) sleep "${DOCKER_STUB_BUILD_SLEEP:-0}"; exit "${DOCKER_STUB_BUILD_RC:-0}" ;;
-  rm) exit "${DOCKER_STUB_RM_RC:-0}" ;;
+  rm)
+    name=""
+    for a in "$@"; do case "$a" in -*) ;; *) name=$a ;; esac; done
+    [ "${DOCKER_STUB_RM_RC:-0}" != 0 ] && exit "${DOCKER_STUB_RM_RC}"
+    case "$name" in *"${DOCKER_STUB_RM_FAIL_MATCH:-/never/}"*) exit 1 ;; esac
+    [ "${DOCKER_STUB_RM_KEEP:-0}" = 1 ] && exit 0
+    if rec_has "$name"; then rec_del "$name"; exit 0; fi
+    [ -z "$REC" ] && exit 0 # stateless mode: legacy always-succeeds behavior
+    echo "Error: No such container: $name" >&2
+    exit 1 ;;
   ps)
-    [ "${DOCKER_STUB_PS_RC:-0}" != 0 ] && exit "${DOCKER_STUB_PS_RC}"
-    [ -n "${DOCKER_STUB_PS_OUT:-}" ] && printf '%s\n' "${DOCKER_STUB_PS_OUT}"
+    pats=(); exact=0
+    for a in "$@"; do
+      case "$a" in
+        name=^*)
+          pats+=("${a#name=^}")
+          case "$a" in *\$) exact=1 ;; esac ;;
+      esac
+    done
+    if [ "$exact" = 1 ]; then
+      [ "${DOCKER_STUB_PS_RC:-0}" != 0 ] && exit "${DOCKER_STUB_PS_RC}"
+    else
+      [ "${DOCKER_STUB_PS_PREFIX_RC:-0}" != 0 ] && exit "${DOCKER_STUB_PS_PREFIX_RC}"
+    fi
+    { [ -n "$REC" ] && [ -f "$REC" ]; } || exit 0
+    while IFS= read -r n; do
+      for p in "${pats[@]}"; do
+        case "$p" in
+          *\$) [ "$n" = "${p%\$}" ] && { echo "id-$n"; break; } ;;
+          *) case "$n" in "$p"*) echo "id-$n"; break ;; esac ;;
+        esac
+      done
+    done <"$REC"
     exit 0 ;;
   run)
+    name=""; prev=""
+    for a in "$@"; do [ "$prev" = "--name" ] && name=$a; prev=$a; done
     case "$*" in
       *"tailscaled.state"*) exit "${DOCKER_STUB_STATE_RC:-1}" ;;
       *"grep -rlFf"*)
+        [ -n "${DOCKER_STUB_VOLSCAN_MARKER:-}" ] && : >"$DOCKER_STUB_VOLSCAN_MARKER"
+        sleep "${DOCKER_STUB_VOLSCAN_SLEEP:-0}"
+        [ "${DOCKER_STUB_VOLSCAN_LINGER:-0}" = 1 ] && [ -n "$name" ] && rec_add "$name"
         [ -n "${DOCKER_STUB_VOLSCAN_OUT:-}" ] && printf '%s\n' "$DOCKER_STUB_VOLSCAN_OUT"
         exit "${DOCKER_STUB_VOLSCAN_RC:-1}" ;;
-      *"id -u"*) sleep "${DOCKER_STUB_PREFLIGHT_SLEEP:-0}"; exit "${DOCKER_STUB_PREFLIGHT_RC:-0}" ;;
-      *) echo stub-container-id; exit 0 ;;
+      *"id -u"*)
+        [ -n "${DOCKER_STUB_PREFLIGHT_MARKER:-}" ] && : >"$DOCKER_STUB_PREFLIGHT_MARKER"
+        sleep "${DOCKER_STUB_PREFLIGHT_SLEEP:-0}"
+        [ "${DOCKER_STUB_PREFLIGHT_LINGER:-0}" = 1 ] && [ -n "$name" ] && rec_add "$name"
+        exit "${DOCKER_STUB_PREFLIGHT_RC:-0}" ;;
+      *)
+        [ -n "$name" ] && rec_add "$name"
+        echo stub-container-id; exit 0 ;;
     esac ;;
   logs)
     if [ "${DOCKER_STUB_STATE_RC:-1}" = 0 ]; then
@@ -451,6 +523,10 @@ expect_grep "uid-1000 readability preflight ran" "$TESTTMP/out-normal" "readable
 expect_grep "sweep passed on all six surfaces" "$TESTTMP/out-normal" "key-absence sweep: passed on all six surfaces"
 expect_grep "evidence records the exact version" "$TESTTMP/out-normal" "tailscale version: 1.102.2"
 expect_grep "container removal is proven" "$TESTTMP/out-normal" "container removed (proof"
+expect_grep "auto-removed preflight scratch counts as already clean" "$TESTTMP/out-normal" "preflight container already absent (proof"
+expect_grep "auto-removed scanner scratch counts as already clean" "$TESTTMP/out-normal" "state-scanner container already absent (proof"
+expect_grep "preflight scratch run is named for tracking" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-preflight-"
+expect_grep "scanner scratch run is named for tracking" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-keyscan-"
 expect_grep "cleanup proof printed" "$TESTTMP/out-normal" "temporary key directory removed (proof"
 expect_grep "the fresh volume is created" "$TESTTMP/calls-normal" "volume create"
 expect_not_grep "key value never printed by the harness" "$TESTTMP/out-normal" "$KEY"
@@ -533,6 +609,72 @@ expect_grep "preflight failure is reported" "$TESTTMP/out-preflight" "FAIL: pref
 expect_grep "cleanup proof printed after preflight failure" "$TESTTMP/out-preflight" "temporary key directory removed (proof"
 assert_no_new_key_dirs "key directory gone after preflight failure" "$before"
 
+echo "== end-to-end: preflight docker run failure with a LINGERING scratch container"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-preflinger" DOCKER_STUB_PREFLIGHT_RC=125 \
+  DOCKER_STUB_PREFLIGHT_LINGER=1 DOCKER_STUB_CALLS="$TESTTMP/calls-preflinger" || rc=$?
+expect_nonzero "preflight docker failure exits non-zero" "$rc"
+expect_grep "the lingering preflight scratch is removed WITH proof" "$TESTTMP/out-preflinger" "preflight container removed (proof"
+expect_grep "key-dir proof still printed" "$TESTTMP/out-preflinger" "temporary key directory removed (proof"
+expect_not_grep "no key value in output" "$TESTTMP/out-preflinger" "$KEY"
+expect_not_grep "no key value in any docker argv (incl. scratch names)" "$TESTTMP/calls-preflinger" "$KEY"
+assert_no_new_key_dirs "key directory gone after lingering preflight" "$before"
+
+echo "== end-to-end: scanner docker run failure with a LINGERING scratch container"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-scanlinger" DOCKER_STUB_VOLSCAN_RC=125 \
+  DOCKER_STUB_VOLSCAN_LINGER=1 || rc=$?
+expect_nonzero "scanner docker failure exits non-zero (sweep fails closed)" "$rc"
+expect_grep "the sweep records the scanner error" "$TESTTMP/out-scanlinger" "state-volume scanner error (rc=125)"
+expect_grep "the lingering scanner scratch is removed WITH proof" "$TESTTMP/out-scanlinger" "state-scanner container removed (proof"
+expect_grep "the main container was still cleaned too" "$TESTTMP/out-scanlinger" "==> container removed (proof"
+expect_grep "key-dir proof still printed" "$TESTTMP/out-scanlinger" "temporary key directory removed (proof"
+assert_no_new_key_dirs "key directory gone after lingering scanner" "$before"
+
+echo "== end-to-end: docker rm failure on the preflight scratch container"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-prefrmfail" DOCKER_STUB_PREFLIGHT_LINGER=1 \
+  DOCKER_STUB_RM_FAIL_MATCH=preflight || rc=$?
+expect_nonzero "preflight-scratch rm failure turns a passing run non-zero" "$rc"
+expect_grep "the sweep itself had passed" "$TESTTMP/out-prefrmfail" "key-absence sweep: passed"
+expect_grep "the preflight rm failure is recorded" "$TESTTMP/out-prefrmfail" "CLEANUP FAIL: docker rm -f ozolith-ts-spike-preflight-"
+expect_grep "the surviving preflight scratch is loud" "$TESTTMP/out-prefrmfail" "STILL EXISTS after docker rm -f"
+expect_grep "unproven scratch removal demands revocation" "$TESTTMP/out-prefrmfail" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_grep "the scanner scratch step still ran after the failure" "$TESTTMP/out-prefrmfail" "state-scanner container already absent (proof"
+expect_grep "the key-dir step still ran after the failure" "$TESTTMP/out-prefrmfail" "temporary key directory removed (proof"
+expect_not_grep "the revoke warning stays value-free" "$TESTTMP/out-prefrmfail" "$KEY"
+assert_no_new_key_dirs "key directory gone despite preflight rm failure" "$before"
+
+echo "== end-to-end: docker rm failure on the scanner scratch container"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-scanrmfail" DOCKER_STUB_VOLSCAN_LINGER=1 \
+  DOCKER_STUB_RM_FAIL_MATCH=keyscan || rc=$?
+expect_nonzero "scanner-scratch rm failure turns a passing run non-zero" "$rc"
+expect_grep "the scanner rm failure is recorded" "$TESTTMP/out-scanrmfail" "CLEANUP FAIL: docker rm -f ozolith-ts-spike-keyscan-"
+expect_grep "the surviving scanner scratch is loud" "$TESTTMP/out-scanrmfail" "STILL EXISTS after docker rm -f"
+expect_grep "unproven scratch removal demands revocation" "$TESTTMP/out-scanrmfail" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_grep "the earlier main-container step had run" "$TESTTMP/out-scanrmfail" "==> container removed (proof"
+expect_grep "the key-dir step still ran after the failure" "$TESTTMP/out-scanrmfail" "temporary key directory removed (proof"
+assert_no_new_key_dirs "key directory gone despite scanner rm failure" "$before"
+
+echo "== end-to-end: stale key-bearing scratch containers are rejected before key intake"
+staledir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+printf 'ozolith-ts-spike-preflight-9999-42\n' >"$staledir/containers"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-stale" DOCKER_STUB_COUNTER_DIR="$staledir" || rc=$?
+expect_nonzero "a stale scratch container refuses the run" "$rc"
+expect_grep "the stale debris is named" "$TESTTMP/out-stale" "stale key-bearing scratch container"
+expect_grep "the operator is told to revoke the prior key" "$TESTTMP/out-stale" "REVOKE the key that run used"
+expect_not_grep "refusal happens before any key intake" "$TESTTMP/out-stale" "temporary key directory"
+assert_no_new_key_dirs "no key directory on stale-scratch refusal" "$before"
+
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-staleq" DOCKER_STUB_PS_PREFIX_RC=1 || rc=$?
+expect_nonzero "a failing stale-scratch query fails closed" "$rc"
+expect_grep "the stale-query failure is named" "$TESTTMP/out-staleq" "cannot check for stale key-bearing scratch containers"
+expect_not_grep "no key intake on a stale-query failure" "$TESTTMP/out-staleq" "temporary key directory"
+assert_no_new_key_dirs "no key directory on a stale-query failure" "$before"
+
 echo "== end-to-end: every promised docker top capture is required"
 rc=0
 printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-top1" DOCKER_STUB_TOP1_RC=1 || rc=$?
@@ -560,13 +702,15 @@ rc=0
 printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-psfail" DOCKER_STUB_PS_RC=1 || rc=$?
 expect_nonzero "unprovable container absence turns the run non-zero" "$rc"
 expect_grep "the unproven removal is named" "$TESTTMP/out-psfail" "removal is UNPROVEN"
+expect_grep "preflight scratch absence is UNPROVEN too" "$TESTTMP/out-psfail" "could not query docker for the preflight container"
+expect_grep "scanner scratch absence is UNPROVEN too" "$TESTTMP/out-psfail" "could not query docker for the state-scanner container"
 expect_grep "the operator is told to revoke the key" "$TESTTMP/out-psfail" "REVOKE THE AUTH KEY IMMEDIATELY"
 expect_grep "later cleanup steps still ran" "$TESTTMP/out-psfail" "temporary key directory removed (proof"
 expect_not_grep "the revoke warning stays value-free" "$TESTTMP/out-psfail" "$KEY"
 assert_no_new_key_dirs "key directory gone despite unproven container removal" "$before"
 
 rc=0
-printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-pslinger" DOCKER_STUB_PS_OUT=deadbeef || rc=$?
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-pslinger" DOCKER_STUB_RM_KEEP=1 || rc=$?
 expect_nonzero "a lingering container turns the run non-zero" "$rc"
 expect_grep "the lingering container is named" "$TESTTMP/out-pslinger" "STILL EXISTS after docker rm -f"
 expect_grep "the operator is told to revoke the key" "$TESTTMP/out-pslinger" "REVOKE THE AUTH KEY IMMEDIATELY"
@@ -580,24 +724,45 @@ expect_not_grep "no key was read before the build" "$TESTTMP/out-fail" "temporar
 assert_no_new_key_dirs "no key directory after a pre-key failure" "$before"
 
 for sig in INT TERM; do
-  echo "== end-to-end: cleanup on SIG$sig"
-  rc=0
-  # --default-signal: background jobs of a non-interactive shell get SIGINT
-  # ignored, and a signal ignored at shell entry cannot be trapped — reset it
-  # so the harness sees the interrupt exactly like an operator's Ctrl-C.
-  # The 3s preflight sleep parks the run AFTER the key is read, so the trap
-  # must clean up real key material.
-  printf '%s\n' "$KEY" | env --default-signal=SIGINT PATH="$STUB:$PATH" \
-    SPIKE_NONINTERACTIVE=1 SPIKE_SSH_WAIT_SECS=1 DOCKER_STUB_PREFLIGHT_SLEEP=3 \
-    ./run-spike.sh >"$TESTTMP/out-sig" 2>&1 &
-  pid=$!
-  sleep 1
-  kill "-$sig" "$pid"
-  wait "$pid" || rc=$?
   want=$([[ "$sig" == INT ]] && echo 130 || echo 143)
-  [[ "$rc" -eq "$want" ]] && pass "exits $want on SIG$sig" || fail "exits $want on SIG$sig (got $rc)"
-  expect_grep "cleanup proof printed on SIG$sig" "$TESTTMP/out-sig" "temporary key directory removed (proof"
-  assert_no_new_key_dirs "key directory gone after SIG$sig" "$before"
+  for phase in preflight keyscan; do
+    echo "== end-to-end: cleanup on SIG$sig during the $phase key-bearing scratch operation"
+    # --default-signal: background jobs of a non-interactive shell get SIGINT
+    # ignored, and a signal ignored at shell entry cannot be trapped — reset
+    # it so the harness sees the interrupt exactly like an operator's Ctrl-C.
+    # The marker file parks the kill INSIDE the key-bearing scratch operation
+    # (the stub touches it when that docker run starts, then sleeps), so the
+    # trap must prove scratch-container absence with real key material on
+    # disk.
+    cdir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+    marker=$TESTTMP/marker.$sig.$phase
+    rm -f "$marker"
+    if [[ "$phase" == preflight ]]; then
+      knobs=(DOCKER_STUB_PREFLIGHT_SLEEP=4 "DOCKER_STUB_PREFLIGHT_MARKER=$marker")
+    else
+      knobs=(DOCKER_STUB_VOLSCAN_SLEEP=4 "DOCKER_STUB_VOLSCAN_MARKER=$marker")
+    fi
+    out=$TESTTMP/out-sig-$sig-$phase
+    printf '%s\n' "$KEY" | env --default-signal=SIGINT PATH="$STUB:$PATH" \
+      SPIKE_NONINTERACTIVE=1 SPIKE_SSH_WAIT_SECS=1 DOCKER_STUB_COUNTER_DIR="$cdir" \
+      "${knobs[@]}" ./run-spike.sh >"$out" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 100); do [[ -e "$marker" ]] && break; sleep 0.1; done
+    [[ -e "$marker" ]] && pass "run parked inside the $phase scratch operation" \
+      || fail "run parked inside the $phase scratch operation"
+    kill "-$sig" "$pid"
+    rc=0
+    wait "$pid" || rc=$?
+    [[ "$rc" -eq "$want" ]] && pass "exits $want on SIG$sig ($phase)" || fail "exits $want on SIG$sig ($phase) (got $rc)"
+    expect_grep "preflight scratch absence proven on SIG$sig ($phase)" "$out" "preflight container already absent (proof"
+    if [[ "$phase" == keyscan ]]; then
+      expect_grep "scanner scratch absence proven on SIG$sig" "$out" "state-scanner container already absent (proof"
+      expect_grep "main-container removal proven on SIG$sig" "$out" "==> container removed (proof"
+    fi
+    expect_grep "cleanup proof printed on SIG$sig ($phase)" "$out" "temporary key directory removed (proof"
+    expect_not_grep "no key value in SIG$sig ($phase) output" "$out" "$KEY"
+    assert_no_new_key_dirs "key directory gone after SIG$sig ($phase)" "$before"
+  done
 done
 
 echo

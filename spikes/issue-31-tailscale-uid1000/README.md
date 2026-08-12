@@ -110,6 +110,20 @@ Auth-key hygiene, enforced by the script:
   scanner — without printing a byte of the value; if it fails (e.g. on an
   unsupported rootless/userns-remap daemon), the run stops before any
   enrollment is attempted;
+- **every container that receives the key mount is tracked, and its removal
+  is proven** — not only the main container: the preflight and
+  state-volume-scanner scratch containers get per-run, collision-safe names
+  recorded *before* their `docker run` is invoked, so even a partially
+  created container or a client-side docker failure stays cleanup-visible.
+  Their `--rm` is convenience cleanup, not proof — an interruption or a
+  daemon/client failure can leave the container behind, and a surviving
+  container keeps the key readable through its bind mount even after the
+  host copy is deleted. Cleanup queries, removes when present, and
+  re-queries each of the three names on every exit path; a scratch
+  container already gone through its normal `--rm` counts as clean. Stale
+  scratch containers from a previous interrupted run are **rejected before
+  any key intake** — nothing is deleted automatically; removing them, and
+  revoking the key that run used, is an operator action;
 - the key reaches the container only as a read-only mount of that leaf —
   `file:` form only, mirroring the production tmpfs → read-only `VAR_FILE`
   delivery; the value never enters argv, shell history, environment values,
@@ -184,7 +198,9 @@ value itself never enters argv or output), across:
 - the full container log;
 - **every file on the `spike-tailscale-state` volume**, scanned inside a
   scratch container (as uid 1000, through the same leaf mount) so the
-  pattern stays a path everywhere.
+  pattern stays a path everywhere — a key-bearing container in its own
+  right, so it runs under a tracked per-run name and its removal is proven
+  in cleanup like the rest.
 
 Every promised capture is itself **mandatory**: a failed `docker top`,
 `inspect`, `logs`, or `history` — or a capture that comes back unreadable
@@ -224,12 +240,20 @@ Shell-level regression coverage with stubbed `docker`, `tailscale`, and
 - both sweeps' **tri-state** behavior (grep rc 0 = hit fails, rc 1 = the
   only pass, rc ≥ 2 and docker-level failures fail closed;
   missing/unreadable/empty evidence fails closed);
-- **cleanup**: every step attempted regardless of earlier failures;
-  container and key-directory absence proven; `docker rm` failures and
-  unprovable removal turn even a passing run non-zero (with the value-free
-  revoke-now warning); an original non-zero status is preserved; exercised
-  on normal exit, ordinary failure, SIGINT, and SIGTERM;
-- the key value never appears in the harness's output or in any argv.
+- **cleanup**: every step attempted regardless of earlier failures; absence
+  proven for **every container that received the key mount** — the main
+  container plus the preflight and state-volume-scanner scratch containers,
+  tracked by per-run name before their `docker run` (auto-removed scratch
+  containers count as already clean; lingering ones are removed with
+  proof); per-container `docker rm` failures and unprovable removal turn
+  even a passing run non-zero (with the value-free revoke-now warning),
+  with later cleanup steps still executing; stale scratch containers from a
+  prior interrupted run are rejected before any key intake, and a failing
+  stale-check query fails closed; an original non-zero status is preserved;
+  exercised on normal exit, ordinary failure, and SIGINT/SIGTERM parked
+  inside each key-bearing scratch operation;
+- the key value never appears in the harness's output, in any argv, or in
+  any container name.
 
 Run it after any edit to `run-spike.sh` or `entrypoint.sh`; it exits
 non-zero on any regression.
@@ -254,16 +278,21 @@ but note it in #31 so nobody later assumes outbound works.
 
 Per-run cleanup is automatic, **failure-aware, and provable**: every exit
 path (success, failure, SIGINT, SIGTERM) attempts every teardown step —
-log follower, container, evidence directory, key directory — regardless of
-earlier failures, then verifies the container is absent (`docker ps -a`)
-and the key directory no longer exists. Any step that fails, or any absence
-the script cannot prove, makes the run exit **non-zero even if the gate
-checks themselves passed** — a run that cannot prove its own teardown is a
-failed run. If container removal cannot be proven on a run that mounted a
-key, the script prints a prominent (value-free) warning: the bind mount can
-keep the key readable inside a surviving container even after the host copy
-is deleted, so **revoke the key immediately** in that case instead of
-waiting for the end-of-gate cleanup below.
+log follower, **every container that received the key bind mount** (the
+main container plus the preflight and state-volume-scanner scratch
+containers, tracked under per-run names recorded before their
+`docker run`), evidence directory, key directory — regardless of earlier
+failures, then verifies each container is absent (query → remove when
+present → re-query via `docker ps -a`; a scratch container already gone
+through its normal `--rm` counts as clean) and the key directory no longer
+exists. Any step that fails, or any absence the script cannot prove, makes
+the run exit **non-zero even if the gate checks themselves passed** — a run
+that cannot prove its own teardown is a failed run. If the removal of *any*
+key-bearing container cannot be proven on a run that mounted a key, the
+script prints a prominent (value-free) warning: a bind mount can keep the
+key readable inside a surviving container even after the host copy is
+deleted, so **revoke the key immediately** in that case instead of waiting
+for the end-of-gate cleanup below.
 
 After the whole gate is done:
 

@@ -51,14 +51,24 @@
 # the full container log, and every file on the retained state volume.
 #
 # Cleanup is provable and failure-aware: every exit path — success, failure,
-# SIGINT, SIGTERM — attempts EVERY teardown step (log follower, container,
-# evidence directory, key directory) regardless of earlier failures, then
-# verifies the container is gone and the key directory no longer exists. Any
-# step that fails, or any absence that cannot be proven, turns the exit
-# status nonzero (an original failure status is preserved). If container
-# removal cannot be proven on a run that mounted a key, a prominent warning
-# tells the operator to REVOKE the key immediately — the bind mount can keep
-# the key readable inside a surviving container.
+# SIGINT, SIGTERM — attempts EVERY teardown step (log follower, ALL
+# key-bearing containers, evidence directory, key directory) regardless of
+# earlier failures, then verifies each container is gone and the key
+# directory no longer exists. "All key-bearing containers" means every
+# container that received the key bind mount: the main spike container AND
+# the two scratch containers (the uid-1000 readability preflight and the
+# state-volume scanner). The scratch runs use --rm, but --rm is convenience
+# cleanup, not proof — an interruption or a daemon/client failure can leave
+# the container behind — so each scratch container gets a per-run,
+# collision-safe name that is recorded BEFORE its docker run is invoked, and
+# cleanup queries, removes when present, and re-queries every recorded name
+# (a normally auto-removed scratch container is proven clean by that query,
+# never counted as an rm failure). Any step that fails, or any absence that
+# cannot be proven, turns the exit status nonzero (an original failure
+# status is preserved). If ANY key-bearing container's absence cannot be
+# proven on a run that mounted a key, a prominent warning tells the operator
+# to REVOKE the key immediately — a bind mount can keep the key readable
+# inside a surviving container.
 #
 # Self-test: ./test-run-spike.sh exercises mode selection, daemon-mode
 # rejection, the sweep tri-state, entrypoint failure propagation, and the
@@ -70,6 +80,20 @@ IMAGE=ozolith-ts-spike
 CONTAINER=ozolith-ts-spike
 VOLUME=spike-tailscale-state
 
+# The two key-bearing scratch operations (uid-1000 readability preflight,
+# state-volume scanner) run under per-run, collision-safe names: a fixed
+# name could collide with — or silently clear — the debris of another run,
+# while a per-run name can only ever denote THIS run's container. The names
+# carry no secret (prefix + pid + $RANDOM). Each tracking variable below is
+# assigned BEFORE the corresponding docker run is invoked, so a partially
+# created container or a client-side docker failure is still visible to
+# cleanup; "" means that operation was never attempted.
+SCRATCH_PREFLIGHT_PREFIX=ozolith-ts-spike-preflight-
+SCRATCH_SCAN_PREFIX=ozolith-ts-spike-keyscan-
+SCRATCH_RUN_TAG="$$-${RANDOM}"
+PREFLIGHT_CONTAINER=""
+SCAN_CONTAINER=""
+
 SPIKE_KEY_DIR=""
 SPIKE_KEY_FILE=""
 EVIDENCE_DIR=""
@@ -79,6 +103,46 @@ MODE=""
 MODE_DETAIL=""
 VOLUME_EXISTS=0
 sweep_hit=0
+
+# prove_container_gone <name> <label> — one container's provable teardown:
+# query whether it exists, remove it when present (or when the query itself
+# failed and existence cannot be ruled out), then query again and PROVE the
+# absence. A container that is already gone — the normal outcome for the
+# --rm scratch runs — counts as clean, not as an rm failure. Returns:
+#   0  absence proven, no step failed
+#   1  a step failed (rm, or the pre-removal query), but absence WAS proven
+#   2  absence UNPROVEN (still listed, or the proving query failed)
+prove_container_gone() {
+  local name=$1 label=$2 listed step_failed=0
+  if listed=$(docker ps -aq --filter "name=^${name}\$" 2>/dev/null); then
+    if [[ -z "$listed" ]]; then
+      echo "==> $label already absent (proof: 'docker ps -a' does not list $name)"
+      return 0
+    fi
+    if ! docker rm -f "$name" >/dev/null 2>&1; then
+      echo "CLEANUP FAIL: docker rm -f $name ($label) failed" >&2
+      step_failed=1
+    fi
+  else
+    # The existence query failed: removal is still attempted (best effort,
+    # its rc deliberately ignored — without the query there is no telling a
+    # real rm failure from 'no such container'), and the re-query below is
+    # the arbiter of proof.
+    echo "CLEANUP FAIL: could not query docker for the $label ($name) before removal" >&2
+    step_failed=1
+    docker rm -f "$name" >/dev/null 2>&1
+  fi
+  if listed=$(docker ps -aq --filter "name=^${name}\$" 2>/dev/null); then
+    if [[ -n "$listed" ]]; then
+      echo "CLEANUP FAIL: $label $name STILL EXISTS after docker rm -f" >&2
+      return 2
+    fi
+    echo "==> $label removed (proof: 'docker ps -a' no longer lists $name)"
+    return "$step_failed"
+  fi
+  echo "CLEANUP FAIL: could not query docker for the $label ($name) — removal is UNPROVEN" >&2
+  return 2
+}
 
 cleanup() {
   status=$?
@@ -110,39 +174,42 @@ cleanup() {
     wait "$LOG_PID" 2>/dev/null
   fi
 
-  # 2) the container: remove, then PROVE absence. An unproven removal of a
-  # container that bind-mounts the key is an emergency, not a shrug: the
-  # mount pins the inode, so the key can stay readable inside a surviving
-  # container even after the host copy below is deleted.
+  # 2) EVERY container that received the key bind mount: the main container
+  # and the two key-bearing scratch containers (uid-1000 preflight, state-
+  # volume scanner). Each one is queried, removed when present, and re-
+  # queried until its absence is PROVEN — --rm on the scratch runs is
+  # convenience cleanup, not proof, and an unproven removal of a container
+  # that bind-mounts the key is an emergency, not a shrug: the mount pins
+  # the inode, so the key can stay readable inside a surviving container
+  # even after the host copy below is deleted. Every container is processed
+  # regardless of earlier failures.
+  local prc unproven=0
   if [[ "$CONTAINER_STARTED" -eq 1 ]]; then
-    if ! docker rm -f "$CONTAINER" >/dev/null 2>&1; then
-      echo "CLEANUP FAIL: docker rm -f $CONTAINER failed" >&2
-      failed=1
-    fi
-    local remaining removal_unproven=0
-    if remaining=$(docker ps -aq --filter "name=^${CONTAINER}\$" 2>/dev/null); then
-      if [[ -n "$remaining" ]]; then
-        echo "CLEANUP FAIL: container $CONTAINER STILL EXISTS after docker rm -f" >&2
-        removal_unproven=1
-      else
-        echo "==> container removed (proof: 'docker ps -a' no longer lists $CONTAINER)"
-      fi
-    else
-      echo "CLEANUP FAIL: could not query docker for the container — removal is UNPROVEN" >&2
-      removal_unproven=1
-    fi
-    if [[ "$removal_unproven" -eq 1 ]]; then
-      failed=1
-      if [[ -n "$SPIKE_KEY_DIR" ]]; then
-        echo "!!! ------------------------------------------------------------------ !!!" >&2
-        echo "!!! WARNING: this run bind-mounted the auth key into the container and  !!!" >&2
-        echo "!!! the container's removal is UNPROVEN. The key value may still be     !!!" >&2
-        echo "!!! readable inside a surviving container even after the host copy is   !!!" >&2
-        echo "!!! deleted. REVOKE THE AUTH KEY IMMEDIATELY:                           !!!" >&2
-        echo "!!! tailscale admin console -> Settings -> Keys -> revoke.              !!!" >&2
-        echo "!!! ------------------------------------------------------------------ !!!" >&2
-      fi
-    fi
+    prove_container_gone "$CONTAINER" "container"
+    prc=$?
+    [[ "$prc" -ne 0 ]] && failed=1
+    [[ "$prc" -eq 2 ]] && unproven=1
+  fi
+  if [[ -n "$PREFLIGHT_CONTAINER" ]]; then
+    prove_container_gone "$PREFLIGHT_CONTAINER" "preflight container"
+    prc=$?
+    [[ "$prc" -ne 0 ]] && failed=1
+    [[ "$prc" -eq 2 ]] && unproven=1
+  fi
+  if [[ -n "$SCAN_CONTAINER" ]]; then
+    prove_container_gone "$SCAN_CONTAINER" "state-scanner container"
+    prc=$?
+    [[ "$prc" -ne 0 ]] && failed=1
+    [[ "$prc" -eq 2 ]] && unproven=1
+  fi
+  if [[ "$unproven" -eq 1 && -n "$SPIKE_KEY_DIR" ]]; then
+    echo "!!! ------------------------------------------------------------------ !!!" >&2
+    echo "!!! WARNING: this run bind-mounted the auth key and at least one        !!!" >&2
+    echo "!!! container that received that mount has UNPROVEN removal. The key    !!!" >&2
+    echo "!!! value may still be readable inside a surviving container even       !!!" >&2
+    echo "!!! after the host copy is deleted. REVOKE THE AUTH KEY IMMEDIATELY:    !!!" >&2
+    echo "!!! tailscale admin console -> Settings -> Keys -> revoke.              !!!" >&2
+    echo "!!! ------------------------------------------------------------------ !!!" >&2
   fi
 
   # 3) evidence directory (tmpfs; raw captures could hold the key only if a
@@ -204,6 +271,35 @@ require_supported_docker() {
     exit 1
   fi
   echo "==> docker daemon: ordinary root daemon (no rootless / userns-remap security option)"
+}
+
+reject_stale_scratch_containers() {
+  # Scratch names are per-run and collision-safe, so anything matching the
+  # scratch prefixes can only be debris from a run this script could not
+  # clean up (e.g. kill -9 mid-preflight) or from a concurrently live run —
+  # and the preflight/scanner containers are exactly the ones that bind-
+  # mount an auth key, so a stale one may still hold a PRIOR key readable.
+  # Refuse to proceed, before any secret intake. Nothing is removed here:
+  # deleting containers this run did not create is an operator decision,
+  # and an unrelated container that merely matches the prefix must never be
+  # silently destroyed.
+  local stale
+  if ! stale=$(docker ps -aq \
+    --filter "name=^${SCRATCH_PREFLIGHT_PREFIX}" \
+    --filter "name=^${SCRATCH_SCAN_PREFIX}" 2>&1); then
+    echo "FAIL: cannot check for stale key-bearing scratch containers (docker ps failed):" >&2
+    printf '%s\n' "$stale" | sed 's/^/      /' >&2
+    exit 1
+  fi
+  if [[ -n "$stale" ]]; then
+    echo "FAIL: stale key-bearing scratch container(s) exist (name prefix ${SCRATCH_PREFLIGHT_PREFIX}* / ${SCRATCH_SCAN_PREFIX}*):" >&2
+    printf '%s\n' "$stale" | sed 's/^/      /' >&2
+    echo "      Such containers bind-mounted an auth key when they were created; a prior run was" >&2
+    echo "      interrupted before it could prove their removal (or another run is live right now)." >&2
+    echo "      Inspect and remove them (docker rm -f <id>), REVOKE the key that run used, then" >&2
+    echo "      re-run. Refusing to continue — this check runs before any key intake." >&2
+    exit 1
+  fi
 }
 
 probe_mode() {
@@ -323,7 +419,13 @@ preflight_key_readable() {
   # exact mount enrollment will use — without printing a byte of the value.
   # This is a second, independent check of the delivery path; daemon mode was
   # already positively verified before the key was read.
-  if docker run --rm \
+  #
+  # This scratch container receives the key bind mount, so it is tracked:
+  # the per-run name is recorded BEFORE docker run so that a partial
+  # creation or a client-side failure is still cleanup-visible, and cleanup
+  # later PROVES its absence — --rm alone is convenience, not proof.
+  PREFLIGHT_CONTAINER="${SCRATCH_PREFLIGHT_PREFIX}${SCRATCH_RUN_TAG}"
+  if docker run --rm --name "$PREFLIGHT_CONTAINER" \
     --mount "type=bind,source=${SPIKE_KEY_FILE},target=/run/secrets/ts-authkey,readonly" \
     --entrypoint /bin/sh "$IMAGE" \
     -c '[ "$(id -u)" = 1000 ] && [ -r /run/secrets/ts-authkey ] && [ -s /run/secrets/ts-authkey ]'; then
@@ -381,9 +483,14 @@ scan_state_volume() {
   # everywhere; -l prints only matching FILENAMES. Tri-state: grep rc 0 is a
   # hit, 1 is the only pass, anything else (grep error, docker failure) is a
   # scanner failure and fails the gate.
+  #
+  # Like the preflight, this scratch container receives the key bind mount,
+  # so its per-run name is recorded BEFORE docker run and cleanup PROVES
+  # its absence — --rm alone is convenience, not proof.
   local rc=0 hits
+  SCAN_CONTAINER="${SCRATCH_SCAN_PREFIX}${SCRATCH_RUN_TAG}"
   set +e
-  hits=$(docker run --rm \
+  hits=$(docker run --rm --name "$SCAN_CONTAINER" \
     --mount "type=bind,source=${SPIKE_KEY_FILE},target=/run/secrets/ts-authkey,readonly" \
     -v "$VOLUME":/state:ro \
     --entrypoint /bin/sh "$IMAGE" \
@@ -408,8 +515,10 @@ main() {
   cd "$(dirname "${BASH_SOURCE[0]}")"
   CONTEXT_DIR=$(pwd -P)
 
-  # Docker availability and daemon mode are validated BEFORE any key intake.
+  # Docker availability, daemon mode, and the absence of stale key-bearing
+  # scratch containers are all validated BEFORE any key intake.
   require_supported_docker
+  reject_stale_scratch_containers
 
   echo "==> building the spike image (version- and sha256-pinned tailscale; see Dockerfile)"
   docker build -t "$IMAGE" .
