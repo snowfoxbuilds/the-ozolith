@@ -49,13 +49,18 @@ setup = [
     "apt-get update && apt-get install -y --no-install-recommends tmux curl && rm -rf /var/lib/apt/lists/*",
 
     # (2) Tailscale static binaries, pinned TWICE — by version in the URL AND by
-    #     sha256. FAIL-CLOSED: the placeholder checksum below does not match any
-    #     real download, so the build stops until you paste the value published
-    #     for your arch/version at https://pkgs.tailscale.com/stable/ (an
-    #     unverified binary is never installed). Userspace networking needs no
-    #     TUN device and no NET_ADMIN, so no devices/cap_add Stack passthrough
-    #     is added.
-    '''TS_VERSION=1.80.0; TS_ARCH=amd64; \
+    #     sha256. The pinned version is the exact release the #31 gate evidence
+    #     was produced with (the spikes/issue-31-tailscale-uid1000 harness runs
+    #     the IDENTICAL archive). Keep it a CURRENTLY SUPPORTED release and
+    #     never go below 1.98.9 (security floor); moving to a different release
+    #     means re-running the gate harness so the evidence still covers the
+    #     binary you ship. FAIL-CLOSED: the placeholder checksum below does not
+    #     match any real download, so the build stops until you paste the
+    #     official value published for your arch/version at
+    #     https://pkgs.tailscale.com/stable/ (an unverified binary is never
+    #     installed). Userspace networking needs no TUN device and no
+    #     NET_ADMIN, so no devices/cap_add Stack passthrough is added.
+    '''TS_VERSION=1.102.2; TS_ARCH=amd64; \
 TS_SHA256=0000000000000000000000000000000000000000000000000000000000000000; \
 curl -fsSL -o /tmp/ts.tgz "https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz" && \
 echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - && \

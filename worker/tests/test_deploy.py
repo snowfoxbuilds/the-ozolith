@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
 DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.claude"
@@ -257,6 +259,14 @@ def test_configs_example_flightdeck_tailscale_wiring():
     assert "TS_SHA256=0000000000000000000000000000000000000000000000000000000000000000" in setup
     assert setup.index("sha256sum -c") < setup.index("install -m 0755")
 
+    # The pinned release is the one the #31 gate evidence was produced with
+    # (the spikes/issue-31-tailscale-uid1000 harness runs the identical
+    # archive), and it may never regress below the 1.98.9 security floor.
+    version = re.search(r"TS_VERSION=(\d+)\.(\d+)\.(\d+)", setup)
+    assert version, "TS_VERSION must be pinned major.minor.patch in the setup step"
+    assert version.group(0) == "TS_VERSION=1.102.2"
+    assert tuple(map(int, version.groups())) >= (1, 98, 9)
+
     # Userspace daemon, uid-1000 statedir, no privilege words anywhere.
     assert "--tun=userspace-networking" in setup
     assert "chown ozolith:ozolith" in setup and "/var/lib/tailscale" in setup
@@ -269,6 +279,25 @@ def test_configs_example_flightdeck_tailscale_wiring():
     assert flightdeck.env["FLIGHTDECK_TS_HOSTNAME"] == "flightdeck-box1"
     # Only the file path is ever referenced — the value has no other route in.
     assert "TS_AUTHKEY_FILE" in setup
+
+
+def test_flightdeck_tailscale_version_matches_the_gate_harness():
+    """The version the example ships must be the version the #31 gate harness
+    (spikes/issue-31-tailscale-uid1000, PR #34) actually tested — gate evidence
+    for one binary says nothing about another. Both sides fetch the same
+    archive from the same URL; the harness additionally pins the real official
+    SHA-256 (the example's stays a fail-closed placeholder by design)."""
+    spike_dockerfile = REPO_ROOT / "spikes" / "issue-31-tailscale-uid1000" / "Dockerfile"
+    if not spike_dockerfile.exists():
+        pytest.skip("gate harness (PR #34) not present in this checkout yet")
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    setup = "\n".join(config.worker_types["flightdeck"].setup)
+    example = re.search(r"TS_VERSION=(\d+\.\d+\.\d+)", setup)
+    spike = re.search(r"TS_VERSION=(\d+\.\d+\.\d+)", spike_dockerfile.read_text())
+    assert example and spike, "both sides must pin TS_VERSION major.minor.patch"
+    assert example.group(1) == spike.group(1)
 
 
 # -- flightdeck-start: the generated script is EXECUTED, not just grepped ---------

@@ -45,6 +45,21 @@ deliberate scope: **inbound** Tailscale SSH is the use case; outbound dials
 from inside the container to the tailnet would need the userspace SOCKS5/HTTP
 proxy and are not wired.
 
+### Pin a supported binary
+
+`worker-types/flightdeck.toml` pins the static binaries twice: `TS_VERSION`
+(shipped at **1.102.2** — the exact release the #31 gate evidence was produced
+with, via the `spikes/issue-31-tailscale-uid1000/` harness) and a SHA-256 that
+ships as a FAIL-CLOSED placeholder. Before the first build:
+
+- confirm the pinned release is still **currently supported** by Tailscale and
+  pick current stable if it is not; never select a release below **1.98.9**
+  (security floor). If you move off the pinned version, the gate evidence no
+  longer covers the binary you ship — re-run the spike harness on it;
+- paste the official SHA-256 for your arch/version from
+  <https://pkgs.tailscale.com/stable/> over the placeholder. The build stops
+  until you do; an unverified binary is never installed.
+
 ### Mint the enrollment key
 
 In the Tailscale admin console, mint **one** auth key that is:
@@ -72,17 +87,30 @@ type has enrolled, remove the `TS_AUTHKEY` line from the worker type's
 
 ### Tailnet ACLs
 
-In your tailnet policy file:
+Two independent layers must BOTH allow the connection on a deny-by-default
+tailnet: a **network-layer grant** (may TCP/22 packets reach the machine at
+all?) and an **SSH authorization rule** (who may the session become?). A
+policy carrying only the `ssh` rule silently fails once the default
+allow-all grant is removed. In your tailnet policy file:
 
 ```jsonc
 {
   "tagOwners": {
     "tag:flightdeck": ["autogroup:admin"]   // who may mint tag:flightdeck keys
   },
+  // Layer 1 — network access: least-privilege grant, the SSH port only.
+  "grants": [
+    {
+      "src": ["autogroup:member"],          // tighten: a dedicated operator group
+      "dst": ["tag:flightdeck"],
+      "ip":  ["tcp:22"]
+    }
+  ],
+  // Layer 2 — SSH authorization: who lands, and as which user.
   "ssh": [
     {
-      "action": "accept",                    // accept, NOT check — see below
-      "src":    ["autogroup:member"],        // who may SSH in (tighten to taste)
+      "action": "accept",                    // the deliberate tradeoff — see below
+      "src":    ["autogroup:member"],        // keep in lockstep with the grant
       "dst":    ["tag:flightdeck"],
       "users":  ["ozolith"]                  // sessions land as the container's ozolith
     }
@@ -90,11 +118,22 @@ In your tailnet policy file:
 }
 ```
 
-Use `action: "accept"`, not `"check"`: `check` forces a periodic re-auth
-check-in, which a headless Flight Deck (no human at a browser) cannot satisfy,
-so an idle session would be dropped mid-flight. The tradeoff is deliberate —
-`accept` trades interactive re-verification for uninterrupted headless access;
-keep the blast radius small with a tight `src` and the `tag:flightdeck` ACLs.
+Narrow `src` in BOTH rules to the smallest set of identities that actually
+operate Flight Decks (a dedicated `group:flightdeck-operators` beats
+`autogroup:member`), and add `sshTests` for those identities so a policy edit
+that would revoke — or broaden — access fails at policy-check time instead of
+in production.
+
+On `action`: `check` asks nothing of the destination — it re-authenticates
+the **initiating** user (a browser prompt on the machine you SSH *from*) when
+a connection is new or its `checkPeriod` has lapsed, so a headless Flight
+Deck is fully compatible with it. `accept` is used here as a deliberate,
+weaker-verification choice: it avoids those interactive check-ins on
+new/check-expired connections (IDE remoting reconnects often), at the cost of
+never re-verifying the human behind the initiating device. If periodic
+re-verification matters more to you than uninterrupted reconnects, use
+`check` with a `checkPeriod` you can live with — either way, keep the blast
+radius small with a tight `src` and the `tag:flightdeck` ACLs.
 
 MagicDNS must be enabled for `ssh ozolith@flightdeck-<name>` to resolve; without
 it, use the tailnet IP.
