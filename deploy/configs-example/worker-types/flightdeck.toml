@@ -22,10 +22,13 @@
 # the same type after an agent-CLI restart. Promote = commit/push + re-pin +
 # rebuild (see deploy/README.md). The symlink carve-out is Flight-Deck-only.
 #
-# One-hop remote access (issue #20 §1) is NOT wired here yet: it is gated on
-# the issue #24 Step 0 privilege spike, which needs a Docker-capable box —
-# split out and tracked as issue #31. Until it lands, reach the Flight Deck
-# through the web terminal or the two-hop `attach` in stacks/flightdeck.toml.
+# One-hop remote access (issue #20 §1, landed via issue #31): each Flight Deck
+# runs a userspace `tailscaled` as the unprivileged ozolith uid and is its own
+# tailnet machine — `ssh ozolith@<FLIGHTDECK_TS_HOSTNAME>` lands inside the
+# container. No TUN device, no NET_ADMIN, no devices/cap_add passthrough:
+# the uid-1000 capability-free path is gate-verified (evidence on issue #31).
+# The web terminal and the two-hop `attach` in stacks/flightdeck.toml remain
+# as the audited fallback paths.
 
 # No `driver` -> Flight Deck. Driverless types may carry `command` and
 # `volumes`; both are rejected when a driver is set.
@@ -42,21 +45,59 @@ base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:000000000000000
 # gets its knowledge from the shared clone at start, never baked.
 
 setup = [
-    # (1) tmux: the named attach session.
-    "apt-get update && apt-get install -y --no-install-recommends tmux && rm -rf /var/lib/apt/lists/*",
+    # (1) tmux (the named attach session) + curl (fetch the tailscale binaries).
+    "apt-get update && apt-get install -y --no-install-recommends tmux curl && rm -rf /var/lib/apt/lists/*",
 
-    # (2) Seed the volume mountpoints ozolith-owned. setup runs as root;
+    # (2) Tailscale static binaries, pinned TWICE — by version in the URL AND by
+    #     sha256. FAIL-CLOSED: the placeholder checksum below does not match any
+    #     real download, so the build stops until you paste the value published
+    #     for your arch/version at https://pkgs.tailscale.com/stable/ (an
+    #     unverified binary is never installed). Userspace networking needs no
+    #     TUN device and no NET_ADMIN, so no devices/cap_add Stack passthrough
+    #     is added.
+    '''TS_VERSION=1.80.0; TS_ARCH=amd64; \
+TS_SHA256=0000000000000000000000000000000000000000000000000000000000000000; \
+curl -fsSL -o /tmp/ts.tgz "https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz" && \
+echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - && \
+tar -xzf /tmp/ts.tgz -C /tmp && \
+install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscale"  /usr/local/bin/tailscale && \
+install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscaled" /usr/local/bin/tailscaled && \
+rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
+
+    # (3) Seed the three volume mountpoints ozolith-owned. setup runs as root;
     #     an absent mountpoint would otherwise be created root-owned, and its
-    #     ownership is copied onto the volume on first mount.
-    "mkdir -p /home/ozolith/.claude /home/ozolith/knowledge && chown ozolith:ozolith /home/ozolith/.claude /home/ozolith/knowledge",
+    #     ownership is copied onto the volume on first mount. /var/lib/tailscale
+    #     ownership is what lets the uid-1000 daemon write its state.
+    "mkdir -p /home/ozolith/.claude /home/ozolith/knowledge /var/lib/tailscale && chown ozolith:ozolith /home/ozolith/.claude /home/ozolith/knowledge /var/lib/tailscale",
 
-    # (3) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
-    #     content baked by setup — never product source. The knowledge URL is a
+    # (4) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
+    #     content baked by setup — never product source — which is how the
+    #     no-tailscale-in-product constraint is honored. The knowledge URL is a
     #     LITERAL here: it is worker-type identity (it defines the shared clone
     #     all siblings mount), so changing it changes the instruction hash ->
-    #     deterministic-tag rebuild. `set -eu` makes every startup step
-    #     fail-fast: a failed clone-init exits the container non-zero and
-    #     Docker's restart policy owns the retry — never an in-container loop.
+    #     deterministic-tag rebuild. Runtime values ($FLIGHTDECK_TS_HOSTNAME,
+    #     $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at build — every script line is
+    #     a single-quoted printf argument — and expand only at container start.
+    #
+    #     The issue #31 lifecycle contract, in order:
+    #       - enrollment is decided BEFORE tailscaled launches (the state file
+    #         is the identity marker; the daemon must never race its creation);
+    #       - a fresh enrollment with the auth-key secret missing fails fast
+    #         with its own message (the operator applied the remove-the-mapping
+    #         hardening and later wiped the state volume — restore the mapping);
+    #       - readiness is a BOUNDED wait on the daemon LocalAPI answering
+    #         (which implies the socket exists), detecting an already-dead
+    #         daemon every tick;
+    #       - `tailscale up` gets ONE attempt: invalid/expired keys and
+    #         rejected flags are permanent, so the container fails promptly and
+    #         Docker restart policy owns any retry — never an in-container loop;
+    #       - after the session starts, a supervisor watches BOTH the daemon
+    #         pid and the tmux session: dead tailscaled fails the container
+    #         (dead one-hop access is an outage, not a healthy idle), a
+    #         finished session is a clean stop;
+    #       - the EXIT trap reaps the backgrounded tailscaled on every path;
+    #       - the key is read only via file:$TS_AUTHKEY_FILE, only on an empty
+    #         state volume, and is never copied anywhere.
     '''printf '%s\n' \
 '#!/bin/sh' \
 'set -eu' \
@@ -67,10 +108,45 @@ setup = [
 'ln -sfnT /home/ozolith/knowledge/agents/claude /home/ozolith/.claude/agents' \
 'ln -sfnT /home/ozolith/knowledge/workflows     /home/ozolith/.claude/workflows' \
 'ln -sfnT /home/ozolith/knowledge/AGENTS.md     /home/ozolith/.claude/CLAUDE.md' \
+'# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled' \
+': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
+'# Enrollment is decided BEFORE the daemon can touch the statedir.' \
+'if [ -s /var/lib/tailscale/tailscaled.state ]; then TS_ENROLL=no; else TS_ENROLL=yes; fi' \
+'if [ "$TS_ENROLL" = yes ] && [ ! -r "${TS_AUTHKEY_FILE:-/nonexistent}" ]; then' \
+'  echo "flightdeck-start: fresh tailscale enrollment needs the auth key, but TS_AUTHKEY_FILE is missing or unreadable" >&2' \
+'  echo "flightdeck-start: restore the TS_AUTHKEY mapping in the worker-type [secrets], restart, then re-apply the hardening (configs README)" >&2' \
+'  exit 1' \
+'fi' \
+'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale --socket=/tmp/tailscaled.sock &' \
+'TAILSCALED_PID=$!' \
+'trap "kill $TAILSCALED_PID 2>/dev/null || true" EXIT' \
+'trap "exit 143" TERM' \
+'trap "exit 130" INT' \
+'# Bounded readiness: an answering LocalAPI implies the socket exists; a dead' \
+'# daemon is detected every tick, never waited out.' \
+'TS_TRIES=0' \
+'until tailscale --socket=/tmp/tailscaled.sock status --json >/dev/null 2>&1; do' \
+'  kill -0 "$TAILSCALED_PID" 2>/dev/null || { echo "flightdeck-start: tailscaled exited before its LocalAPI answered" >&2; exit 1; }' \
+'  TS_TRIES=$((TS_TRIES + 1))' \
+'  [ "$TS_TRIES" -lt 30 ] || { echo "flightdeck-start: tailscaled LocalAPI not ready after 30 tries" >&2; exit 1; }' \
+'  sleep 1' \
+'done' \
+'# ONE attempt: bad/expired keys and rejected flags are permanent failures;' \
+'# exit non-zero promptly and let Docker restart policy own any retry.' \
+'if [ "$TS_ENROLL" = yes ]; then' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, or rejected flags)" >&2; exit 1; }' \
+'else' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" || { echo "flightdeck-start: tailscale up on existing state failed" >&2; exit 1; }' \
+'fi' \
 'mkdir -p /var/log/flightdeck' \
 'tmux new-session -d -s flightdeck claude' \
 'tmux pipe-pane -o -t flightdeck "cat >> /var/log/flightdeck/transcript.log"' \
-'exec tmux wait-for flightdeck-forever' \
+'# Supervise daemon AND session; the EXIT trap reaps tailscaled either way.' \
+'while kill -0 "$TAILSCALED_PID" 2>/dev/null && tmux has-session -t flightdeck 2>/dev/null; do' \
+'  sleep 5' \
+'done' \
+'kill -0 "$TAILSCALED_PID" 2>/dev/null || { echo "flightdeck-start: tailscaled exited; failing the container so restart recovers one-hop access" >&2; exit 1; }' \
+'exit 0' \
 > /usr/local/bin/flightdeck-start \
 && chmod 0755 /usr/local/bin/flightdeck-start''',
 ]
@@ -79,13 +155,14 @@ command = "/usr/local/bin/flightdeck-start"
 
 # Node-local named volumes (ADR-0043). `{stack}` is substituted control-side
 # with this Flight Deck Stack's name, so two same-type Flight Decks on one node
-# get distinct runtime-state volumes. The knowledge volume is deliberately NOT
-# `{stack}` — it is `knowledge-<worker-type>`, shared by all siblings of the
-# type on the node (edit a skill once, live everywhere).
+# get distinct runtime-state and tailnet-identity volumes. The knowledge volume
+# is deliberately NOT `{stack}` — it is `knowledge-<worker-type>`, shared by all
+# siblings of the type on the node (edit a skill once, live everywhere).
 volumes = [
     "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
     "{stack}-claude-state:/home/ozolith/.claude",    # per-instance runtime state (never shared)
     "knowledge-claude-dev:/home/ozolith/knowledge",  # SHARED: worker-type name, not {stack}
+    "{stack}-tailscale-state:/var/lib/tailscale",    # per-instance tailnet machine identity
 ]
 
 # Secret NAMES only — values live encrypted on the Control Node
@@ -95,6 +172,14 @@ volumes = [
 [secrets]
 GITHUB_TOKEN = "flightdeck-github-token"
 ANTHROPIC_API_KEY = "anthropic-api-key"
+# Tailscale enrollment key: mint a REUSABLE, TAGGED (tag:flightdeck),
+# ACL-bounded auth key once and store it as `flightdeck-tailscale-authkey`.
+# Consumed only on an empty tailscale-state volume; delivered as
+# TS_AUTHKEY_FILE. HARDENING: remove this line after every Flight Deck of this
+# type has enrolled (identity then lives on {stack}-tailscale-state). To
+# re-enroll after a deliberate state wipe, restore this line first — a fresh
+# start without it fails fast with a message saying exactly that.
+TS_AUTHKEY = "flightdeck-tailscale-authkey"
 # For a PRIVATE knowledge repo, uncomment and provide a git credential helper
 # in the base image that reads this token; clone-init auth is then ambient.
 # KNOWLEDGE_GIT_TOKEN = "knowledge-git-token"

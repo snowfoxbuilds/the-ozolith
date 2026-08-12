@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -178,23 +179,24 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
 
 
 def test_configs_example_flightdeck_knowledge_wiring():
-    """ADR-0043: the example Flight Deck wires per-instance runtime state and
-    ONE shared knowledge clone, bakes the knowledge symlinks into
-    flightdeck-start, and keeps the carve-out Flight-Deck-only. The one-hop
-    tailnet half was split out to issue #31 (gated on the #24 Step 0 spike):
-    until it lands with spike evidence, the example ships no tailscale content
-    at all."""
+    """ADR-0043 + issue #31: the example Flight Deck wires per-instance runtime
+    state, ONE shared knowledge clone, and a per-instance tailnet identity
+    volume; bakes the knowledge symlinks into flightdeck-start; and keeps the
+    carve-out Flight-Deck-only. The tailscale half is landed behind the #31
+    gate evidence (uid-1000, userspace networking, no added capabilities)."""
     from theozolith_control.configrepo import load_config
 
     config = load_config(REPO_ROOT / "deploy" / "configs-example")
     flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
 
-    # Per-instance state + logs (resolved from {stack}); exactly one SHARED
-    # knowledge-* clone that is deliberately NOT per-instance — and nothing else.
+    # Per-instance state + logs + tailnet identity (resolved from {stack});
+    # exactly one SHARED knowledge-* clone that is deliberately NOT
+    # per-instance — and nothing else.
     assert set(flightdeck.volumes) == {
         "flightdeck-logs:/var/log/flightdeck",
         "flightdeck-claude-state:/home/ozolith/.claude",
         "knowledge-claude-dev:/home/ozolith/knowledge",
+        "flightdeck-tailscale-state:/var/lib/tailscale",
     }
 
     wt = config.worker_types["flightdeck"]
@@ -219,25 +221,54 @@ def test_configs_example_flightdeck_knowledge_wiring():
         assert claude_dir in script, claude_dir
 
     # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts a
-    # knowledge-* clone or any .claude path.
+    # knowledge-* clone, any .claude path, or a tailnet identity.
     for stack in config.stacks:
         if stack.name == "flightdeck":
             continue
         for volume in stack.volumes:
             assert "knowledge-" not in volume and ".claude" not in volume, (stack.name, volume)
+            assert "tailscale" not in volume, (stack.name, volume)
     for name, other in config.worker_types.items():
         if name == "flightdeck":
             continue
         for volume in other.volumes:
             assert "knowledge-" not in volume and ".claude" not in volume, (name, volume)
+            assert "tailscale" not in volume, (name, volume)
 
-    # The split-out is complete: no tailscale content anywhere in the example
-    # (its sanctioned home once #31 lands behind the spike), no auth-key
-    # secret, no tailnet env on the Stack.
-    assert "TS_AUTHKEY" not in flightdeck.secrets
-    for path in (REPO_ROOT / "deploy" / "configs-example").rglob("*"):
-        if path.is_file():
-            assert "tailscale" not in path.read_text().lower(), path
+
+def test_configs_example_flightdeck_tailscale_wiring():
+    """Issue #31: the tailscale half of the example, landed behind the gate
+    evidence recorded on the issue. Static binaries are pinned by version AND
+    sha256 with a FAIL-CLOSED placeholder; the auth key enters as a named
+    secret only; the hostname is per-placement Stack env; no capability or
+    device passthrough exists anywhere to grant (the worker-type schema has no
+    such field — this test pins the example's side of that doctrine)."""
+    from theozolith_control.configrepo import load_config
+
+    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+    wt = config.worker_types["flightdeck"]
+    setup = "\n".join(wt.setup)
+
+    # Fail-closed binary pinning: the checksum is verified before install, and
+    # the shipped placeholder can never match a real download.
+    assert "pkgs.tailscale.com" in setup
+    assert "sha256sum -c" in setup
+    assert "TS_SHA256=0000000000000000000000000000000000000000000000000000000000000000" in setup
+    assert setup.index("sha256sum -c") < setup.index("install -m 0755")
+
+    # Userspace daemon, uid-1000 statedir, no privilege words anywhere.
+    assert "--tun=userspace-networking" in setup
+    assert "chown ozolith:ozolith" in setup and "/var/lib/tailscale" in setup
+    for forbidden in ("cap_add", "NET_ADMIN", "/dev/net/tun", "privileged", "sudo"):
+        assert forbidden not in setup, forbidden
+
+    # The key is a named secret delivered as TS_AUTHKEY_FILE; the hostname is
+    # per-placement Stack env, present on the example Stack.
+    assert flightdeck.secrets["TS_AUTHKEY"] == "flightdeck-tailscale-authkey"
+    assert flightdeck.env["FLIGHTDECK_TS_HOSTNAME"] == "flightdeck-box1"
+    # Only the file path is ever referenced — the value has no other route in.
+    assert "TS_AUTHKEY_FILE" in setup
 
 
 # -- flightdeck-start: the generated script is EXECUTED, not just grepped ---------
@@ -266,10 +297,12 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     content = script.read_text()
     content = content.replace("/home/ozolith", str(sandbox / "home"))
     content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
+    content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
     rewritten = sandbox / "start"
     rewritten.write_text(content)
     rewritten.chmod(0o755)
     (sandbox / "home" / ".claude").mkdir(parents=True)  # the state-volume mountpoint
+    (sandbox / "tsstate").mkdir()  # the tailscale-state volume mountpoint
     return rewritten
 
 
@@ -282,56 +315,201 @@ def _stub(bin_dir: Path, name: str, exit_code: int) -> Path:
     return calls
 
 
-def test_flightdeck_start_generation_expands_nothing_at_build_time(tmp_path):
+def _tailscale_stub(bin_dir: Path, *, status_code: int = 0, up_code: int = 0) -> Path:
+    """A `tailscale` CLI stand-in that distinguishes the readiness probe
+    (`status --json`) from `up`, so tests can drive each lifecycle branch."""
+    calls = bin_dir / "tailscale.calls"
+    stub = bin_dir / "tailscale"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls}"\n'
+        'case "$*" in\n'
+        f'*" up "*|*" up") exit {up_code} ;;\n'
+        f"*) exit {status_code} ;;\n"
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    return calls
+
+
+def _tailscaled_stub(bin_dir: Path, *, lifespan: str | None) -> tuple[Path, Path]:
+    """A `tailscaled` stand-in launched in the background by the script.
+    lifespan None = exit immediately (a daemon that dies on startup); a
+    duration = stay alive that long under /bin/sleep (immune to the test's
+    `sleep` stub), recording its pid so tests can verify the EXIT trap
+    reaped it."""
+    calls = bin_dir / "tailscaled.calls"
+    pid_file = bin_dir / "tailscaled.pid"
+    body = f'#!/bin/sh\necho "$@" >> "{calls}"\necho $$ > "{pid_file}"\n'
+    body += "exit 0\n" if lifespan is None else f"exec /bin/sleep {lifespan}\n"
+    stub = bin_dir / "tailscaled"
+    stub.write_text(body)
+    stub.chmod(0o755)
+    return calls, pid_file
+
+
+def _tmux_stub(bin_dir: Path, *, has_session_code: int) -> Path:
+    """A `tmux` stand-in; has-session's exit code drives the supervisor loop
+    (0 = session alive, 1 = session gone)."""
+    calls = bin_dir / "tmux.calls"
+    stub = bin_dir / "tmux"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls}"\n'
+        f'case "$1" in has-session) exit {has_session_code} ;; esac\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return calls
+
+
+def _instant_sleep(bin_dir: Path) -> None:
+    """Neutralize the script's wait/supervision intervals so bounded loops run
+    at test speed. Stub daemons dodge this by calling /bin/sleep directly."""
+    stub = bin_dir / "sleep"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+
+def _run_start(script: Path, bin_dir: Path, **extra_env: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    env.pop("TS_AUTHKEY_FILE", None)
+    env.update(extra_env)
+    return subprocess.run([str(script)], env=env, capture_output=True, text=True)
+
+
+def _assert_daemon_reaped(pid_file: Path) -> None:
+    """The EXIT trap must kill the backgrounded tailscaled on every path."""
+    pid = int(pid_file.read_text())
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(pid, 15)  # do not leak the stub past the test
+    raise AssertionError("tailscaled survived flightdeck-start exiting")
+
+
+def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
     """The generator is one classic-Dockerfile-safe printf; the script it emits
-    must carry no shell expansion the BUILD could have resolved — every command
-    line arrives literal, to run at container start."""
+    must carry every runtime expansion UNTOUCHED by the build — the hostname,
+    the key path, and the daemon pid expand at container start, never at image
+    build (an issue #31 test requirement)."""
     script = _generate_flightdeck_start(tmp_path).read_text()
     lines = script.splitlines()
     assert lines[0] == "#!/bin/sh"
     assert lines[1] == "set -eu"  # fail-fast: a failed step exits the container
-    assert "$" not in script  # nothing expanded at build; nothing left to expand
-    assert lines[-1] == "exec tmux wait-for flightdeck-forever"
-    # The sequence is clone -> symlinks -> tmux: knowledge must be live before
-    # the agent CLI starts.
-    assert script.index("clone-init") < script.index("ln -sfnT") < script.index("tmux")
+    # Runtime values survived generation literally — a build-time expansion
+    # would have resolved $! to nothing and the variables to empty strings.
+    assert "TAILSCALED_PID=$!" in lines
+    assert '--hostname="$FLIGHTDECK_TS_HOSTNAME"' in script
+    assert '--auth-key="file:${TS_AUTHKEY_FILE}"' in script
+    # ... and the only variables in the script are its own runtime ones.
+    assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
+        "FLIGHTDECK_TS_HOSTNAME",
+        "TS_AUTHKEY_FILE",
+        "TS_ENROLL",
+        "TS_TRIES",
+        "TAILSCALED_PID",
+    }
+    # Order is the issue #31 lifecycle: knowledge first, then the enrollment
+    # decision BEFORE the daemon launches, readiness before `up`, tmux last,
+    # and a supervisor — never the removed draft's `exec tmux wait-for`.
+    assert (
+        script.index("clone-init")
+        < script.index("ln -sfnT")
+        < script.index("tailscaled.state ]")
+        < script.index("tailscaled --tun=userspace-networking")
+        < script.index(" up --ssh")
+        < script.index("new-session")
+        < script.index("has-session")
+    )
+    assert "wait-for" not in script
+    assert lines[-1] == "exit 0"
+    # No unbounded loop anywhere: the readiness loop carries its bound, and
+    # `up` is never wrapped in a loop.
+    for line in lines:
+        if " up --ssh" in line:
+            assert not line.strip().startswith(("until", "while")), line
 
 
 def test_flightdeck_start_clone_failure_fails_the_container(tmp_path):
-    """A failed clone-init must exit the container non-zero BEFORE any symlink
-    or tmux step — Docker's restart policy owns the retry; there is no
-    in-container retry loop to hide the failure."""
+    """A failed clone-init must exit the container non-zero BEFORE any symlink,
+    tailscaled launch, or tmux step — Docker's restart policy owns the retry;
+    there is no in-container retry loop to hide the failure."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
     _stub(bin_dir, "theozolith-knowledge", exit_code=7)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
 
-    proc = subprocess.run(
-        [str(script)],
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
-        capture_output=True,
-        text=True,
-    )
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
     assert proc.returncode == 7
-    assert not tmux_calls.exists()  # tmux never launched over broken knowledge
+    assert not daemon_calls.exists()  # the daemon never launched over broken knowledge
+    assert not tmux_calls.exists()
     assert not (sandbox / "home" / ".claude" / "skills").is_symlink()
 
 
-def test_flightdeck_start_success_wires_symlinks_then_tmux(tmp_path):
+def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path):
+    """FLIGHTDECK_TS_HOSTNAME comes from the Stack [env]; without it the
+    container fails with a naming message before tailscaled ever launches."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
-    knowledge_calls = _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+
+    proc = _run_start(script, bin_dir)
+    assert proc.returncode != 0
+    assert "FLIGHTDECK_TS_HOSTNAME" in proc.stderr
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path):
+    """Issue #31 lifecycle point 2: fresh enrollment with the auth-key secret
+    absent (the remove-the-mapping hardening + a wiped state volume) fails
+    fast with a DISTINCT restore-the-mapping message — and the enrollment
+    decision demonstrably precedes the daemon launch (point 1)."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
 
-    proc = subprocess.run(
-        [str(script)],
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
-        capture_output=True,
-        text=True,
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 1
+    assert "restore the TS_AUTHKEY mapping" in proc.stderr
+    assert not daemon_calls.exists()  # decided before launching, not after
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_path):
+    """The success path end-to-end: knowledge symlinks, enrollment via
+    file:$TS_AUTHKEY_FILE (the VALUE never enters any argv), tmux session with
+    transcript piping — and on a clean session end, exit 0 with the EXIT trap
+    reaping the daemon (issue #31 lifecycle points 6 and 7)."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    knowledge_calls = _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    tmux_calls = _tmux_stub(bin_dir, has_session_code=1)  # session already over
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
     )
     assert proc.returncode == 0, proc.stderr
     home = sandbox / "home"
@@ -343,7 +521,136 @@ def test_flightdeck_start_success_wires_symlinks_then_tmux(tmp_path):
         (".claude/CLAUDE.md", "knowledge/AGENTS.md"),
     ):
         assert os.readlink(home / link) == str(home / target), link
-    calls = tmux_calls.read_text().splitlines()
-    assert calls[0].startswith("new-session -d -s flightdeck")
-    assert calls[1].startswith("pipe-pane -o -t flightdeck")
-    assert calls[2] == "wait-for flightdeck-forever"
+    up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
+    assert len(up_lines) == 1
+    assert "--ssh" in up_lines[0]
+    assert "--hostname=flightdeck-test" in up_lines[0]
+    assert f"--auth-key=file:{key_file}" in up_lines[0]
+    # The key VALUE never appears in any recorded argv — path form only.
+    for calls in (ts_calls, tmux_calls):
+        assert "SECRETVALUE" not in calls.read_text(), calls
+    tmux_lines = tmux_calls.read_text().splitlines()
+    assert tmux_lines[0].startswith("new-session -d -s flightdeck")
+    assert tmux_lines[1].startswith("pipe-pane -o -t flightdeck")
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_existing_state_reuses_identity_without_the_key(tmp_path):
+    """Issue #31 lifecycle point 1's other branch: a non-empty state file
+    routes to `up` WITHOUT the auth key — so the remove-the-mapping hardening
+    (no TS_AUTHKEY_FILE at all) keeps working for enrolled instances."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
+    assert len(up_lines) == 1
+    assert "--auth-key" not in up_lines[0]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path):
+    """Issue #31 lifecycle point 3: while waiting for the LocalAPI, a daemon
+    that already exited is detected and fails the container — the wait is
+    never served out against a corpse, and `up` is never attempted."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")  # reuse branch
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _tailscaled_stub(bin_dir, lifespan=None)  # dies immediately
+    ts_calls = _tailscale_stub(bin_dir, status_code=1)  # LocalAPI never answers
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    _instant_sleep(bin_dir)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 1
+    assert "exited before its LocalAPI answered" in proc.stderr
+    assert not any(" up " in c for c in ts_calls.read_text().splitlines())
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_start_readiness_wait_is_bounded(tmp_path):
+    """Issue #31 lifecycle point 3/4: a live daemon whose LocalAPI never
+    answers exhausts a BOUNDED wait and fails the container — no unbounded
+    loop, no `up` attempt against a dead socket."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")  # reuse branch
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_stub(bin_dir, status_code=1)  # never ready
+    _instant_sleep(bin_dir)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 1
+    assert "not ready after 30 tries" in proc.stderr
+    assert not any(" up " in c for c in ts_calls.read_text().splitlines())
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path):
+    """Issue #31 lifecycle point 4: a failing `tailscale up` (invalid/expired
+    key, rejected flags) gets exactly ONE attempt and fails the container
+    promptly — the removed draft's invisible `until ... sleep 5` loop must
+    never come back. Docker's restart policy owns any retry."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-EXPIRED\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=1)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    _instant_sleep(bin_dir)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "enrollment failed" in proc.stderr
+    assert sum(" up " in c for c in ts_calls.read_text().splitlines()) == 1
+    assert not tmux_calls.exists()
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_daemon_death_after_start_fails_the_container(tmp_path):
+    """Issue #31 lifecycle point 5: after the session is up, a dying tailscaled
+    must fail the container — never a nominally healthy container with dead
+    one-hop access (the removed draft's `exec tmux wait-for` defect)."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _tailscaled_stub(bin_dir, lifespan="1")  # dies shortly after startup
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=0)  # the session stays alive
+    _instant_sleep(bin_dir)  # the supervisor polls at test speed
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "tailscaled exited" in proc.stderr
