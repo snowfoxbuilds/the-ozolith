@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -41,6 +42,19 @@ def _docker(*args: str, timeout: float = 300) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["docker", *args], capture_output=True, text=True, timeout=timeout, check=False
     )
+
+
+def _logs_containing(container: str, marker: str, deadline_seconds: float = 30) -> str:
+    """The container's log once ``marker`` appears — polled, because a
+    detached start returns before pid 1 has written anything."""
+    deadline = time.monotonic() + deadline_seconds
+    logs = ""
+    while time.monotonic() < deadline:
+        logs = _docker("logs", container, timeout=60).stdout
+        if marker in logs:
+            return logs
+        time.sleep(0.5)
+    raise AssertionError(f"{marker!r} never appeared in {container} logs; got: {logs!r}")
 
 
 @pytest.fixture
@@ -85,10 +99,9 @@ def test_configured_command_replaces_a_real_inherited_entrypoint(entrypoint_imag
     path, _, args_json = inspect.stdout.strip().partition("\t")
     assert path == "/bin/sh"  # pid 1 is the configured command…
     assert "configured-command-ran" in args_json
-    logs = _docker("logs", container, timeout=60)
-    assert "configured-command-ran" in logs.stdout
+    logs = _logs_containing(container, "configured-command-ran")
     # …and the inherited entrypoint's marker never printed.
-    assert "inherited-harness-entrypoint" not in logs.stdout
+    assert "inherited-harness-entrypoint" not in logs
 
 
 def test_no_command_runs_the_inherited_entrypoint_unchanged(entrypoint_image, stack_name):
@@ -107,8 +120,7 @@ def test_no_command_runs_the_inherited_entrypoint_unchanged(entrypoint_image, st
     inspect = _docker("inspect", "--format", "{{.Path}}", container, timeout=60)
     assert inspect.returncode == 0, inspect.stderr
     assert inspect.stdout.strip() == "/bin/echo"
-    logs = _docker("logs", container, timeout=60)
-    assert "inherited-harness-entrypoint" in logs.stdout
+    _logs_containing(container, "inherited-harness-entrypoint")
 
 
 def test_materialized_secret_is_readable_by_uid_1000_through_a_ro_bind_mount(tmp_path):
