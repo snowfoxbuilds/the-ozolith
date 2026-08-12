@@ -6,13 +6,13 @@ Canonical terms for this project. Coding agents and specs use these terms exactl
 
 **Agent**
 
-The entire configuration for one coding tool — Claude, Codex, or Pi. Tool-scoped: one agent config per tool.
+The entire configuration for one coding tool — Claude, Codex, or Pi. Tool-scoped: one agent config per tool. A concept, not an artifact: it is realized by a worker-type definition's setup instructions, Knowledge Source, adapter selection, and model/effort fields — there is no standalone agent-config file in the Config Repo (grilling 2026-08-10).
 
-*Avoid*: confusing with "Claude agent" (a single subagent file, a much smaller unit).
+*Avoid*: confusing with "Claude agent" (a single subagent file, a much smaller unit); treating it as a Config Repo artifact.
 
 **Agent Adapter**
 
-The per-tool invocation layer the Agent Harness calls to run one headless session (Claude Code, Pi). Ships in the product distribution; the worker-type definition selects which adapter a worker uses (grilling 2026-08-09 — the "default harnesses" of early design talk are really default adapters).
+The per-tool invocation layer the Agent Harness calls to run one headless session (Claude Code, Pi). Ships in the product distribution; the worker-type definition selects which adapter a worker uses (grilling 2026-08-09 — the "default harnesses" of early design talk are really default adapters). Each adapter declares the models and reasoning-effort values it can map; the derived-image build fails on an undeclared value (grilling 2026-08-10).
 
 *Avoid*: "harness" (immutable product plumbing, never a per-type variable); "Agent" (an Agent is the whole tool config the adapter invokes).
 
@@ -168,9 +168,9 @@ The base abstraction for every automated pipeline actor (redefined 2026-07-21; A
 
 **Worker-Type Definition**
 
-The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source, driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, workspace (target repo), and secret names. Compiled into a derived image at config change; instantiated by a thin worker Stack (worker type + placement + desired state).
+The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source, driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, model + reasoning effort (typed fields; grilling 2026-08-10), workspace (target repo), and secret names. Compiled into a derived image at config change — the compiler materializes model and reasoning effort into the tool's native config at build (never hand-written in setup instructions, never selected at invocation), and the build fails on a model the adapter cannot map. Instantiated by a thin worker Stack (worker type + placement + desired state).
 
-*Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers); "harness" as a field (the adapter is the variable; the harness is product plumbing).
+*Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers); "harness" as a field (the adapter is the variable; the harness is product plumbing); setting the model via setup instructions, env vars, or invocation flags (it is a typed field, baked at build).
 
 **Workflow**
 
@@ -196,7 +196,7 @@ A configuration that involves multiple agents working together.
 - The Flight Deck is a human-driven, credentialed, interactive agent container Stack; it never claims issues and holds no transition authority.
 - The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
 - A worker-type definition names exactly one driver: `builtin:<name>` from the product distribution or `drivers/<name>` from the Config Distribution (ADR-0042).
-- A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09).
+- A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, model + reasoning effort, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09; model/effort fields added 2026-08-10).
 - The heartbeat/command channel carries desired state, references, and advisory telemetry (typed, size-capped, never coordination authority; ADR-0016); the only secret payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
 - Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision), failed + needs_human (on the issue: execution failure escalated with evidence; only the human removes failed, and failed overrides plan_ready at dispatch — ADR-0016). Issues and PRs carry separate label sets; each actor polls exactly one label.
 - TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content lives in one private config repo (ADR-0007) — declarations and knowledge as data, plus custom driver code under `drivers/` (ADR-0042).

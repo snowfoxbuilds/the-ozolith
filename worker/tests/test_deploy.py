@@ -364,6 +364,31 @@ def _tailscale_stub(bin_dir: Path, *, status_code: int = 0, up_code: int = 0) ->
     return calls
 
 
+def _tailscale_timeout_stub(bin_dir: Path) -> Path:
+    """A `tailscale` stand-in modelling the REAL CLI's contract on a tailnet
+    that never reaches Running state: `up` WITHOUT a --timeout flag blocks
+    indefinitely (the CLI default is an infinite wait), `up` WITH one returns
+    non-zero at the bound (emulated instantly for test speed). The readiness
+    probe answers ready. A script that drops the native flag therefore hangs
+    here and fails the test's OUTER deadline instead of passing."""
+    calls = bin_dir / "tailscale.calls"
+    stub = bin_dir / "tailscale"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls}"\n'
+        'case "$*" in\n'
+        '*" up "*|*" up")\n'
+        '  case "$*" in\n'
+        '  *--timeout=*) echo "timeout waiting for Tailscale service" >&2; exit 1 ;;\n'
+        "  *) exec /bin/sleep 60 ;;\n"
+        "  esac ;;\n"
+        "*) exit 0 ;;\n"
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    return calls
+
+
 def _tailscaled_stub(
     bin_dir: Path, *, lifespan: str | None, writes_state: Path | None = None
 ) -> tuple[Path, Path]:
@@ -409,11 +434,13 @@ def _instant_sleep(bin_dir: Path) -> None:
     stub.chmod(0o755)
 
 
-def _run_start(script: Path, bin_dir: Path, **extra_env: str) -> subprocess.CompletedProcess:
+def _run_start(
+    script: Path, bin_dir: Path, *, timeout: float | None = None, **extra_env: str
+) -> subprocess.CompletedProcess:
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     env.pop("TS_AUTHKEY_FILE", None)
     env.update(extra_env)
-    return subprocess.run([str(script)], env=env, capture_output=True, text=True)
+    return subprocess.run([str(script)], env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def _assert_daemon_reaped(pid_file: Path) -> None:
@@ -485,6 +512,26 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
     for line in lines:
         if " up --ssh" in line:
             assert not line.strip().startswith(("until", "while")), line
+
+
+def test_flightdeck_start_up_attempts_are_natively_bounded(tmp_path):
+    """`tailscale up` waits for Running state FOREVER by default, so "one
+    attempt" alone never guaranteed prompt failure. BOTH up commands — fresh
+    enrollment and marker-present reuse — must carry the CLI's NATIVE
+    --timeout=30s, and the bound must be that flag, never an external
+    `timeout` process wrapping the command."""
+    script = _generate_flightdeck_start(tmp_path).read_text()
+    up_commands = [
+        line
+        for line in script.splitlines()
+        if line.strip().startswith("tailscale ") and " up " in line
+    ]
+    assert len(up_commands) == 2
+    for line in up_commands:
+        assert "--timeout=30s" in line, line
+        # The filter above already proves `tailscale` is the command itself,
+        # not an argument to an external `timeout` wrapper.
+    assert not any(line.strip().startswith("timeout ") for line in script.splitlines())
 
 
 def test_flightdeck_start_clone_failure_fails_the_container(tmp_path):
@@ -775,6 +822,74 @@ def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path):
     assert proc.returncode == 1
     assert "enrollment failed" in proc.stderr
     assert sum(" up " in c for c in ts_calls.read_text().splitlines()) == 1
+    assert not tmux_calls.exists()
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_fresh_enrollment_timeout_fails_finitely(tmp_path):
+    """A tailnet that never reaches Running must not hang a fresh enrollment:
+    readiness succeeds, the single `up` attempt hits the CLI's native 30s
+    bound, and the container exits non-zero within a finite interval — the
+    stub blocks any `up` lacking a --timeout flag, so a script that drops the
+    bound fails this test's outer deadline. The timeout must prevent marker
+    promotion (no final marker, no promotion temp) and tmux startup, retain
+    the daemon's state debris for the Docker-owned retry, and reach the EXIT
+    trap so tailscaled is reaped."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60", writes_state=sandbox / "tsstate")
+    ts_calls = _tailscale_timeout_stub(bin_dir)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        timeout=20,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "enrollment failed" in proc.stderr
+    assert sum(" up " in c for c in ts_calls.read_text().splitlines()) == 1
+    # The daemon's machine-key debris is retained; neither the final marker
+    # nor the promotion temp may exist after a timed-out enrollment.
+    assert (sandbox / "tsstate" / "tailscaled.state").read_text()
+    assert not (sandbox / "tsstate" / ".theozolith-enrolled-v1").exists()
+    assert not (sandbox / "tsstate" / ".theozolith-enrolled-v1.tmp").exists()
+    assert not tmux_calls.exists()
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_reuse_timeout_fails_finitely_preserving_identity(tmp_path):
+    """The marker-present branch gets the same native bound: a stalled
+    tailnet fails the container within a finite interval after ONE keyless
+    `up` attempt, with no destructive recovery — the completion marker and
+    tailscaled.state are preserved unchanged for the Docker-owned retry,
+    tmux never starts, and the EXIT trap reaps the daemon."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_timeout_stub(bin_dir)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+
+    proc = _run_start(script, bin_dir, timeout=20, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 1
+    assert "up on existing state failed" in proc.stderr
+    up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
+    assert len(up_lines) == 1
+    assert "--auth-key" not in up_lines[0]
+    assert (sandbox / "tsstate" / "tailscaled.state").read_text() == "machine-key-material"
+    assert (sandbox / "tsstate" / ".theozolith-enrolled-v1").read_text() == "enrolled"
     assert not tmux_calls.exists()
     _assert_daemon_reaped(daemon_pid)
 

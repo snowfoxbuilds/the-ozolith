@@ -101,9 +101,13 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
     #       - readiness is a BOUNDED wait on the daemon LocalAPI answering
     #         (which implies the socket exists), detecting an already-dead
     #         daemon every tick;
-    #       - `tailscale up` gets ONE attempt: invalid/expired keys and
-    #         rejected flags are permanent, so the container fails promptly and
-    #         Docker restart policy owns any retry — never an in-container loop;
+    #       - `tailscale up` gets ONE BOUNDED attempt — bounded by the CLI's
+    #         own `--timeout=30s`, because its default is to wait for Running
+    #         FOREVER, so "one attempt" alone never guaranteed prompt failure:
+    #         invalid/expired keys and rejected flags fail immediately, a
+    #         tailnet that never reaches Running fails at the 30s bound, and
+    #         Docker restart policy owns any retry — never an in-container
+    #         loop, and never an external `timeout` process;
     #       - after the session starts, a supervisor watches BOTH the daemon
     #         pid and the tmux session: dead tailscaled fails the container
     #         (dead one-hop access is an outage, not a healthy idle), a
@@ -147,10 +151,11 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 '  [ "$TS_TRIES" -lt 30 ] || { echo "flightdeck-start: tailscaled LocalAPI not ready after 30 tries" >&2; exit 1; }' \
 '  sleep 1' \
 'done' \
-'# ONE attempt: bad/expired keys and rejected flags are permanent failures;' \
-'# exit non-zero promptly and let Docker restart policy own any retry.' \
+'# ONE BOUNDED attempt: --timeout=30s caps the wait for Running (the CLI' \
+'# default waits forever), so a stalled tailnet fails the container as' \
+'# promptly as a rejected key; Docker restart policy owns any retry.' \
 'if [ "$TS_ENROLL" = yes ]; then' \
-'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, or rejected flags)" >&2; exit 1; }' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" --timeout=30s || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, rejected flags, or 30s timeout)" >&2; exit 1; }' \
 '  # Success promotes the completion marker ATOMICALLY on the state volume' \
 '  # (tmp + same-filesystem mv): a leftover .tmp is never a marker, and an' \
 '  # interruption before promotion just re-enrolls with the reusable key on' \
@@ -158,7 +163,7 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 '  echo enrolled > /var/lib/tailscale/.theozolith-enrolled-v1.tmp' \
 '  mv /var/lib/tailscale/.theozolith-enrolled-v1.tmp /var/lib/tailscale/.theozolith-enrolled-v1' \
 'else' \
-'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" || { echo "flightdeck-start: tailscale up on existing state failed" >&2; exit 1; }' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --timeout=30s || { echo "flightdeck-start: tailscale up on existing state failed (error or 30s timeout)" >&2; exit 1; }' \
 'fi' \
 'mkdir -p /var/log/flightdeck' \
 'tmux new-session -d -s flightdeck claude' \

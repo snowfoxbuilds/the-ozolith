@@ -181,8 +181,10 @@ unreachable" state:
   message (see re-enrollment below);
 - the daemon gets a bounded readiness wait; a daemon that dies while starting
   is detected immediately;
-- `tailscale up` gets one attempt — an invalid or expired key fails the
-  container promptly instead of looping invisibly;
+- `tailscale up` gets one **bounded** attempt — bounded by the CLI's native
+  `--timeout=30s`, because its default is to wait for Running state forever:
+  an invalid or expired key fails immediately, and a tailnet that never
+  reaches Running fails at the 30-second bound instead of hanging the start;
 - after startup, a supervisor watches both `tailscaled` and the tmux session:
   if the daemon dies, the container fails (a restart restores one-hop access);
   if the session ends, the container stops cleanly.
