@@ -877,6 +877,10 @@ main() {
   LOG_PID=""
   capture_evidence "full container log" "$EVIDENCE_DIR/container.log" docker logs "$CONTAINER"
   capture_evidence "image history (docker history --no-trunc)" "$EVIDENCE_DIR/history.txt" docker history --no-trunc "$IMAGE"
+  # The evidence on #31 must pin the exact image the runs used, so the image
+  # id is a promised (mandatory) capture like the rest — an id cannot carry
+  # the key, so it is not a sweep surface, just a required record.
+  capture_evidence "image id (docker inspect)" "$EVIDENCE_DIR/image-id.txt" docker inspect -f '{{.Id}}' "$IMAGE"
 
   local sweep_result="not run (reuse run: no secret entered this run — item-5 evidence comes from the fresh runs)"
   if [[ "$MODE" == fresh ]]; then
@@ -918,6 +922,7 @@ main() {
   echo "==> sanitized evidence block — paste into issue #31:"
   echo "--------------------------------------------------------------------------"
   echo "harness: spikes/issue-31-tailscale-uid1000 @ $(ext git rev-parse --short HEAD 2>/dev/null || echo '<commit>')"
+  echo "image: $IMAGE ($(<"$EVIDENCE_DIR/image-id.txt"))"
   echo "run mode: $MODE_DETAIL"
   ext grep '^==> running as uid' "$EVIDENCE_DIR/container.log" || true
   ext sed -n '/^==> tailscale version/,/^==>/{/^==> tailscale version/d;/^==>/d;p;}' "$EVIDENCE_DIR/container.log" | ext sed 's/^/tailscale version: /'

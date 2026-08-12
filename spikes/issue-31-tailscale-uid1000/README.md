@@ -354,12 +354,26 @@ non-zero on any regression.
 
 ## Evidence
 
-Each run ends with a sanitized evidence block (uid line, exact
-`tailscale version`, branch taken, sweep result) to paste into #31. Include
-one block per phase — fresh enrollment, keyless reuse, re-enrollment — plus
-the outputs of the two SSH checks (`whoami`, `/spike-marker`) and your
-identity observations (same 100.x address and no new machine for check 3; a
-new machine + the stale prune for check 4).
+Each run ends with a sanitized evidence block (harness commit, image id,
+run mode, uid line, exact `tailscale version`, branch taken, sweep result)
+to paste into #31. The corrected-evidence comment on #31 must contain, in
+full:
+
+- the **harness commit** the runs used (printed in every block — all runs
+  must use the same commit) and the **image id** (also printed in every
+  block; a mandatory capture, so a run cannot end without recording it);
+- **one block per phase** — fresh enrollment (check 1), keyless reuse
+  (check 3), state-loss re-enrollment (check 4) — showing each run's
+  lifecycle: mode line, uid line, version, branch taken, and the proven
+  cleanup;
+- the outputs of the two **manual SSH checks** (`whoami`, `/spike-marker`
+  — check 2) from another tailnet machine;
+- your **identity observations** (same 100.x address and no new machine
+  for check 3; a new machine plus the stale prune for check 4);
+- the **exact-key sweep line from both fresh runs** (check 5 — printed in
+  those blocks as `key-absence sweep: passed on all six surfaces …`);
+- a closing confirmation that the **auth key was revoked** in the admin
+  console after the Cleanup steps below.
 
 ## Caveat worth recording
 

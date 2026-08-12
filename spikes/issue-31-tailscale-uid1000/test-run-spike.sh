@@ -240,6 +240,7 @@ EOF
   inspect)
     case "$*" in
       *State.Running*) echo "${DOCKER_STUB_RUNNING:-true}" ;;
+      *"{{.Id}}"*) echo "sha256:stubimageid" ;;
       *) echo '[{"Config":{"Env":["TS_AUTHKEY_FILE=/run/secrets/ts-authkey"]},"Mounts":[{"Destination":"/run/secrets/ts-authkey"}]}]' ;;
     esac
     exit 0 ;;
@@ -671,6 +672,7 @@ expect_grep "the ready-time excerpt is scan-gated" "$TESTTMP/out-normal" "scanne
 expect_grep "the scanned-clean log content is then shown" "$TESTTMP/out-normal" "100.64.0.9"
 expect_grep "sweep passed on all six surfaces" "$TESTTMP/out-normal" "key-absence sweep: passed on all six surfaces"
 expect_grep "evidence records the exact version" "$TESTTMP/out-normal" "tailscale version: 1.102.2"
+expect_grep "evidence records the image id" "$TESTTMP/out-normal" "image: ozolith-ts-spike (sha256:stubimageid)"
 expect_grep "main container runs under a per-run name" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-main-"
 expect_grep "main-container removal proven under the per-run name" "$TESTTMP/out-normal" "main container removed (proof"
 expect_grep "auto-removed preflight scratch counts as already clean" "$TESTTMP/out-normal" "preflight container already absent (proof"
