@@ -85,8 +85,16 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
     #     a single-quoted printf argument — and expand only at container start.
     #
     #     The issue #31 lifecycle contract, in order:
-    #       - enrollment is decided BEFORE tailscaled launches (the state file
-    #         is the identity marker; the daemon must never race its creation);
+    #       - enrollment is decided BEFORE tailscaled launches, from the
+    #         Ozolith-owned COMPLETION MARKER on the state volume — never from
+    #         tailscaled.state, which the daemon writes (machine key) before
+    #         auth-key registration completes, so a REJECTED enrollment leaves
+    #         a non-empty state file that must not masquerade as enrolled;
+    #       - the marker is promoted atomically (tmp + same-volume mv) only
+    #         after `tailscale up` succeeds; an interruption between up and
+    #         promotion is safe — the reusable key simply re-enrolls on the
+    #         next start (documented below); state-volume loss removes state
+    #         AND marker together, correctly returning to enrollment;
     #       - a fresh enrollment with the auth-key secret missing fails fast
     #         with its own message (the operator applied the remove-the-mapping
     #         hardening and later wiped the state volume — restore the mapping);
@@ -101,8 +109,8 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
     #         (dead one-hop access is an outage, not a healthy idle), a
     #         finished session is a clean stop;
     #       - the EXIT trap reaps the backgrounded tailscaled on every path;
-    #       - the key is read only via file:$TS_AUTHKEY_FILE, only on an empty
-    #         state volume, and is never copied anywhere.
+    #       - the key is read only via file:$TS_AUTHKEY_FILE, only when the
+    #         completion marker is absent, and is never copied anywhere.
     '''printf '%s\n' \
 '#!/bin/sh' \
 'set -eu' \
@@ -115,8 +123,11 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 'ln -sfnT /home/ozolith/knowledge/AGENTS.md     /home/ozolith/.claude/CLAUDE.md' \
 '# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled' \
 ': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
-'# Enrollment is decided BEFORE the daemon can touch the statedir.' \
-'if [ -s /var/lib/tailscale/tailscaled.state ]; then TS_ENROLL=no; else TS_ENROLL=yes; fi' \
+'# Enrollment is decided BEFORE the daemon can touch the statedir — from the' \
+'# Ozolith-owned completion marker, NOT from tailscaled.state: the daemon' \
+'# writes its machine key there before auth-key registration completes, so a' \
+'# rejected enrollment leaves a non-empty state file that must still retry.' \
+'if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]; then TS_ENROLL=no; else TS_ENROLL=yes; fi' \
 'if [ "$TS_ENROLL" = yes ] && [ ! -r "${TS_AUTHKEY_FILE:-/nonexistent}" ]; then' \
 '  echo "flightdeck-start: fresh tailscale enrollment needs the auth key, but TS_AUTHKEY_FILE is missing or unreadable" >&2' \
 '  echo "flightdeck-start: restore the TS_AUTHKEY mapping in the worker-type [secrets], restart, then re-apply the hardening (configs README)" >&2' \
@@ -140,6 +151,12 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 '# exit non-zero promptly and let Docker restart policy own any retry.' \
 'if [ "$TS_ENROLL" = yes ]; then' \
 '  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, or rejected flags)" >&2; exit 1; }' \
+'  # Success promotes the completion marker ATOMICALLY on the state volume' \
+'  # (tmp + same-filesystem mv): a leftover .tmp is never a marker, and an' \
+'  # interruption before promotion just re-enrolls with the reusable key on' \
+'  # the next start. tailscaled.state is never deleted or rewritten here.' \
+'  echo enrolled > /var/lib/tailscale/.theozolith-enrolled-v1.tmp' \
+'  mv /var/lib/tailscale/.theozolith-enrolled-v1.tmp /var/lib/tailscale/.theozolith-enrolled-v1' \
 'else' \
 '  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" || { echo "flightdeck-start: tailscale up on existing state failed" >&2; exit 1; }' \
 'fi' \
@@ -179,11 +196,14 @@ GITHUB_TOKEN = "flightdeck-github-token"
 ANTHROPIC_API_KEY = "anthropic-api-key"
 # Tailscale enrollment key: mint a REUSABLE, TAGGED (tag:flightdeck),
 # ACL-bounded auth key once and store it as `flightdeck-tailscale-authkey`.
-# Consumed only on an empty tailscale-state volume; delivered as
-# TS_AUTHKEY_FILE. HARDENING: remove this line after every Flight Deck of this
-# type has enrolled (identity then lives on {stack}-tailscale-state). To
-# re-enroll after a deliberate state wipe, restore this line first — a fresh
-# start without it fails fast with a message saying exactly that.
+# Consumed only while the enrollment completion marker is absent from the
+# state volume (first enrollment, a retry after a failed or interrupted
+# attempt, or after deliberate state loss); delivered as TS_AUTHKEY_FILE.
+# HARDENING: remove this line after every Flight Deck of this type has
+# ENROLLED SUCCESSFULLY (the marker, and with it the identity, then lives on
+# {stack}-tailscale-state). To re-enroll after a deliberate state wipe,
+# restore this line first — a fresh start without it fails fast with a
+# message saying exactly that.
 TS_AUTHKEY = "flightdeck-tailscale-authkey"
 # For a PRIVATE knowledge repo, uncomment and provide a git credential helper
 # in the base image that reads this token; clone-init auth is then ambient.

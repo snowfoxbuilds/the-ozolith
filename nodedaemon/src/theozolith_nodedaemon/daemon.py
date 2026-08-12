@@ -1821,8 +1821,11 @@ class NodeDaemon:
             env=stack.env,
             ports=list(stack.ports),
             volumes=list(stack.volumes),
-            # Optional docker-run command for the single-image form — how
-            # the Flight Deck starts its named tmux session (ADR-0019).
+            # Optional start command for the single-image form — how the
+            # Flight Deck starts its named tmux session (ADR-0019). Parsed
+            # with the same shlex argv semantics as process Stacks; DockerCtl
+            # executes it as the full start command (--entrypoint), replacing
+            # any ENTRYPOINT the image inherited from its base.
             command=shlex.split(stack.command) if stack.command else None,
             spec=want,
         )

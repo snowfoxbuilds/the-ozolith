@@ -147,7 +147,16 @@ class DockerCtl:
         command: list[str] | None = None,
         spec: str = "",
     ) -> None:
-        """Single-image container Stack: one long-running container."""
+        """Single-image container Stack: one long-running container.
+
+        A configured ``command`` is the FULL container start command, not an
+        argument list for the image's own entrypoint: its first token is
+        passed via ``--entrypoint`` (replacing any ENTRYPOINT the image
+        inherited — e.g. a derived run image's harness) and the remaining
+        tokens ride after the image as that entrypoint's arguments. Appending
+        the tokens after the image alone would hand them to the inherited
+        ENTRYPOINT as argv instead of executing them. With no ``command``,
+        nothing is passed and the image's own ENTRYPOINT/CMD run unchanged."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
         self.remove(name)
         args = [
@@ -162,6 +171,8 @@ class DockerCtl:
         ]
         if spec:
             args += ["--label", f"{LABEL_STACK_SPEC}={spec}"]
+        if command:
+            args += ["--entrypoint", command[0]]
         for key, value in sorted(env.items()):
             args += ["--env", f"{key}={value}"]
         for key, host_path in sorted(env_files.items()):
@@ -174,7 +185,8 @@ class DockerCtl:
         for volume in volumes:
             args += ["--volume", volume]
         args.append(image)
-        args.extend(command or [])
+        if command:
+            args.extend(command[1:])
         self._run(args)
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:

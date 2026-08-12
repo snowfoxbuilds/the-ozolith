@@ -121,7 +121,10 @@ def test_no_tailscale_anywhere_in_product_code_or_deploy():
     ``deploy/configs-example/**`` (and its README), which this scan
     deliberately does not touch. The product Dockerfiles are in scope: a
     tailscaled baked into a base image would violate the doctrine just as
-    surely as product source would."""
+    surely as product source would. PR #35's generic product corrections
+    (entrypoint-override container commands, cross-UID secret delivery) land
+    inside this scan's scope — this test staying green is what proves they
+    carry no Tailscale-specific behavior or strings."""
     for component in ("worker", "control", "nodedaemon", "knowledge"):
         for path in (REPO_ROOT / component / "src").rglob("*.py"):
             assert "tailscale" not in path.read_text().lower(), path
@@ -361,15 +364,21 @@ def _tailscale_stub(bin_dir: Path, *, status_code: int = 0, up_code: int = 0) ->
     return calls
 
 
-def _tailscaled_stub(bin_dir: Path, *, lifespan: str | None) -> tuple[Path, Path]:
+def _tailscaled_stub(
+    bin_dir: Path, *, lifespan: str | None, writes_state: Path | None = None
+) -> tuple[Path, Path]:
     """A `tailscaled` stand-in launched in the background by the script.
     lifespan None = exit immediately (a daemon that dies on startup); a
     duration = stay alive that long under /bin/sleep (immune to the test's
     `sleep` stub), recording its pid so tests can verify the EXIT trap
-    reaped it."""
+    reaped it. writes_state mimics the real daemon writing its machine key
+    into the statedir at launch — BEFORE auth-key registration completes —
+    which is exactly why a non-empty state file is not proof of enrollment."""
     calls = bin_dir / "tailscaled.calls"
     pid_file = bin_dir / "tailscaled.pid"
     body = f'#!/bin/sh\necho "$@" >> "{calls}"\necho $$ > "{pid_file}"\n'
+    if writes_state is not None:
+        body += f'echo machine-key-material > "{writes_state / "tailscaled.state"}"\n'
     body += "exit 0\n" if lifespan is None else f"exec /bin/sleep {lifespan}\n"
     stub = bin_dir / "tailscaled"
     stub.write_text(body)
@@ -443,16 +452,31 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
         "TAILSCALED_PID",
     }
     # Order is the issue #31 lifecycle: knowledge first, then the enrollment
-    # decision BEFORE the daemon launches, readiness before `up`, tmux last,
-    # and a supervisor — never the removed draft's `exec tmux wait-for`.
+    # decision — read from the Ozolith-owned COMPLETION MARKER, never from
+    # tailscaled.state — BEFORE the daemon launches, readiness before `up`,
+    # tmux last, and a supervisor — never the removed draft's `exec tmux
+    # wait-for`.
     assert (
         script.index("clone-init")
         < script.index("ln -sfnT")
-        < script.index("tailscaled.state ]")
+        < script.index(".theozolith-enrolled-v1 ]")
         < script.index("tailscaled --tun=userspace-networking")
         < script.index(" up --ssh")
         < script.index("new-session")
         < script.index("has-session")
+    )
+    # The decision predicate is the final marker name, never the state file or
+    # the promotion temp; promotion is atomic (tmp write, then same-volume mv)
+    # and strictly AFTER a successful `up` — so no interruption can leave a
+    # false success marker, and tailscaled.state is never deleted or rewritten.
+    assert "if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]" in script
+    assert "-s /var/lib/tailscale/tailscaled.state ]" not in script
+    assert "rm " not in script  # nothing on the state volume is ever deleted
+    assert (
+        script.index(" up --ssh")
+        < script.index("> /var/lib/tailscale/.theozolith-enrolled-v1.tmp")
+        < script.index("mv /var/lib/tailscale/.theozolith-enrolled-v1.tmp")
+        < script.index("new-session")
     )
     assert "wait-for" not in script
     assert lines[-1] == "exit 0"
@@ -499,14 +523,17 @@ def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path):
 
 
 def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path):
-    """Issue #31 lifecycle point 2: fresh enrollment with the auth-key secret
-    absent (the remove-the-mapping hardening + a wiped state volume) fails
-    fast with a DISTINCT restore-the-mapping message — and the enrollment
-    decision demonstrably precedes the daemon launch (point 1)."""
+    """Issue #31 lifecycle point 2: enrollment due (completion marker absent)
+    with the auth-key secret absent fails fast with a DISTINCT
+    restore-the-mapping message, BEFORE tailscaled launches (point 1) — and a
+    non-empty tailscaled.state left by a failed prior attempt must not dodge
+    that check: without the marker, the decision is still "enroll"."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    # Debris of a rejected first enrollment: state present, no marker.
+    (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
     _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
@@ -519,10 +546,12 @@ def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path)
 
 
 def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_path):
-    """The success path end-to-end: knowledge symlinks, enrollment via
-    file:$TS_AUTHKEY_FILE (the VALUE never enters any argv), tmux session with
-    transcript piping — and on a clean session end, exit 0 with the EXIT trap
-    reaping the daemon (issue #31 lifecycle points 6 and 7)."""
+    """The success path end-to-end over an empty state volume (a first start,
+    or the volume after deliberate state loss — both correctly route to
+    enrollment): knowledge symlinks, enrollment via file:$TS_AUTHKEY_FILE
+    (the VALUE never enters any argv), atomic completion-marker promotion,
+    tmux session with transcript piping — and on a clean session end, exit 0
+    with the EXIT trap reaping the daemon (issue #31 lifecycle points 6/7)."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
@@ -561,18 +590,24 @@ def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_pat
     tmux_lines = tmux_calls.read_text().splitlines()
     assert tmux_lines[0].startswith("new-session -d -s flightdeck")
     assert tmux_lines[1].startswith("pipe-pane -o -t flightdeck")
+    # Success promoted the completion marker atomically: the final name
+    # exists, the promotion temp does not survive.
+    assert (sandbox / "tsstate" / ".theozolith-enrolled-v1").is_file()
+    assert not (sandbox / "tsstate" / ".theozolith-enrolled-v1.tmp").exists()
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_existing_state_reuses_identity_without_the_key(tmp_path):
-    """Issue #31 lifecycle point 1's other branch: a non-empty state file
-    routes to `up` WITHOUT the auth key — so the remove-the-mapping hardening
-    (no TS_AUTHKEY_FILE at all) keeps working for enrolled instances."""
+def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_path):
+    """Issue #31 lifecycle point 1's other branch: a PROMOTED completion
+    marker (a successful prior enrollment) routes to `up` WITHOUT the auth
+    key — so the remove-the-mapping hardening (no TS_AUTHKEY_FILE at all)
+    keeps working for enrolled instances across restarts."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
     (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
     _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
@@ -586,6 +621,91 @@ def test_flightdeck_start_existing_state_reuses_identity_without_the_key(tmp_pat
     _assert_daemon_reaped(daemon_pid)
 
 
+def test_flightdeck_start_failed_enrollment_is_retried_with_the_key_not_reused(tmp_path):
+    """The defect the completion marker exists to fix: tailscaled writes its
+    machine key BEFORE auth-key registration completes, so a REJECTED first
+    enrollment leaves a non-empty tailscaled.state behind. The next start
+    over that same state volume must take the enrollment branch again
+    (file:$TS_AUTHKEY_FILE — the marker is absent), never the keyless reuse
+    branch it cannot recover from; a successful retry then promotes the
+    marker."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60", writes_state=sandbox / "tsstate")
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=1)  # rejected key
+    _stub(bin_dir, "tmux", exit_code=0)
+    _instant_sleep(bin_dir)
+
+    first = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert first.returncode == 1
+    assert "enrollment failed" in first.stderr
+    state = sandbox / "tsstate" / "tailscaled.state"
+    assert state.read_text()  # the failed attempt left a NON-EMPTY state file
+    assert not (sandbox / "tsstate" / ".theozolith-enrolled-v1").exists()
+    assert not (sandbox / "tsstate" / ".theozolith-enrolled-v1.tmp").exists()
+    _assert_daemon_reaped(daemon_pid)
+
+    # Second start, same state volume, corrected/working key: the absent
+    # marker routes to enrollment WITH the key, and success promotes it.
+    ts_calls.unlink()
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+    second = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert second.returncode == 0, second.stderr
+    up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
+    assert len(up_lines) == 1
+    assert f"--auth-key=file:{key_file}" in up_lines[0]
+    assert (sandbox / "tsstate" / ".theozolith-enrolled-v1").is_file()
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_interrupted_promotion_is_not_a_marker(tmp_path):
+    """A leftover promotion temp file — an interruption between `up` success
+    and the same-volume mv — must NOT count as enrolled: only the final
+    marker name flips the decision, so the next start re-enrolls with the
+    reusable key (documented as safe) and re-promotes."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1.tmp").write_text("enrolled")
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 0, proc.stderr
+    up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
+    assert len(up_lines) == 1
+    assert f"--auth-key=file:{key_file}" in up_lines[0]  # enrollment, not reuse
+    assert (sandbox / "tsstate" / ".theozolith-enrolled-v1").is_file()
+    _assert_daemon_reaped(daemon_pid)
+
+
 def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path):
     """Issue #31 lifecycle point 3: while waiting for the LocalAPI, a daemon
     that already exited is detected and fails the container — the wait is
@@ -594,7 +714,7 @@ def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
-    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")  # reuse branch
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")  # reuse branch
     _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _tailscaled_stub(bin_dir, lifespan=None)  # dies immediately
     ts_calls = _tailscale_stub(bin_dir, status_code=1)  # LocalAPI never answers
@@ -616,7 +736,7 @@ def test_flightdeck_start_readiness_wait_is_bounded(tmp_path):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
-    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")  # reuse branch
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")  # reuse branch
     _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=1)  # never ready

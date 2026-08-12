@@ -77,13 +77,40 @@ theozolith secret set flightdeck-tailscale-authkey   # paste the tskey-auth… v
 
 It is delivered by the standard machinery only: encrypted at rest → node-scoped
 TLS pull → host tmpfs → read-only mount at `/run/secrets/…`, referenced as
-`TS_AUTHKEY_FILE`. It is consumed **only when the tailscale-state volume is
-empty** (first enrollment, or after deliberate state loss); thereafter identity
-lives on `{stack}-tailscale-state` and survives image rebuilds. There is no
-durable copy of the key anywhere but the encrypted store and that tmpfs, which
-evaporates with the daemon/reboot. **Hardening:** once every Flight Deck of the
-type has enrolled, remove the `TS_AUTHKEY` line from the worker type's
-`[secrets]`.
+`TS_AUTHKEY_FILE`. It is consumed **only while the enrollment completion
+marker is absent** from the tailscale-state volume (first enrollment, a retry
+after a failed or interrupted attempt, or after deliberate state loss);
+thereafter identity lives on `{stack}-tailscale-state` and survives image
+rebuilds. There is no durable copy of the key anywhere but the encrypted store
+and that tmpfs, which evaporates with the daemon/reboot. **Hardening:** once
+every Flight Deck of the type has **enrolled successfully** (its container
+reached the running session at least once), remove the `TS_AUTHKEY` line from
+the worker type's `[secrets]`.
+
+### Enrollment completion is an explicit marker, not the state file
+
+A non-empty `tailscaled.state` is *not* proof of successful enrollment:
+`tailscaled` writes its machine key before auth-key registration completes, so
+a **rejected** enrollment (bad or expired key, rejected flags) leaves a
+non-empty state file behind. `flightdeck-start` therefore decides enrollment
+from an Ozolith-owned completion marker
+(`/var/lib/tailscale/.theozolith-enrolled-v1`, on the same state volume):
+
+- **marker present** → reuse the existing identity, no `TS_AUTHKEY_FILE`
+  needed (the remove-the-mapping hardening keeps working);
+- **marker absent** → require a readable `TS_AUTHKEY_FILE` and run the fresh
+  enrollment path — *even over a non-empty `tailscaled.state`* left by a prior
+  failed attempt, so Docker's restart policy (or a corrected key) retries
+  enrollment instead of dead-ending on keyless reuse. The state file itself is
+  never deleted or rewritten automatically.
+
+The marker is promoted **atomically** (temp file + same-volume rename), and
+only after `tailscale up` returns success — a crash mid-write can never leave
+a false success marker. If the container is interrupted *after* successful
+enrollment but *before* promotion, the next start simply re-enrolls: the key
+is reusable, so this is safe (at worst the admin console shows a machine
+re-registering). State-volume loss removes state and marker together, which
+correctly returns the instance to deliberate enrollment.
 
 ### Tailnet ACLs
 
@@ -146,8 +173,10 @@ tailnet access exits non-zero immediately, and Docker's restart policy owns
 any retry. There is no in-container retry loop and no "running but
 unreachable" state:
 
-- enrollment vs. reuse is decided from the state file **before** `tailscaled`
-  launches — the two branches cannot be misrouted by a startup race;
+- enrollment vs. reuse is decided from the completion marker (see above)
+  **before** `tailscaled` launches — the two branches cannot be misrouted by a
+  startup race, and a failed prior enrollment cannot be mistaken for a
+  reusable identity;
 - a fresh enrollment with the auth-key secret missing fails fast with its own
   message (see re-enrollment below);
 - the daemon gets a bounded readiness wait; a daemon that dies while starting

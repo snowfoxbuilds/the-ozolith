@@ -575,7 +575,12 @@ def test_secrets_materialize_in_tmpfs_only_and_wire_as_var_file(rig: Rig):
 
     secret_file = rig.config.secrets_dir / "github-implementer"
     assert secret_file.read_text() == "s3cr3t-value"
-    assert (secret_file.stat().st_mode & 0o777) == 0o600
+    # The 0700-directory/0444-leaf boundary (ADR-0015 amendment): the
+    # non-traversable directory is the host-side barrier; the leaf itself is
+    # world-readable so a container running as an arbitrary non-root uid can
+    # read the files bind-mounted into it.
+    assert (rig.config.secrets_dir.stat().st_mode & 0o777) == 0o700
+    assert (secret_file.stat().st_mode & 0o777) == 0o444
     env = rig.popen.spawned[0].env
     assert env["IMPLEMENTER_GITHUB_TOKEN_FILE"] == str(secret_file)
     assert "IMPLEMENTER_GITHUB_TOKEN" not in env  # the value itself never enters env
@@ -2117,6 +2122,91 @@ def test_dockerctl_compose_builds_valid_file_scoped_commands():
         "--remove-orphans",
     ]
     assert "--file" in down  # a down is never issued with an empty file set
+
+
+def test_dockerctl_configured_command_overrides_the_inherited_entrypoint():
+    """A configured single-image command is the FULL start command: its first
+    token rides as ``--entrypoint`` BEFORE the image — replacing an ENTRYPOINT
+    inherited from the base (the derived run image ships
+    ``ENTRYPOINT ["theozolith-harness"]``, which would otherwise receive the
+    Flight Deck's start script as a rejected argument) — and the remaining
+    tokens follow the image as that entrypoint's argv."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.run_stack_container(
+        "deck",
+        "ghcr.io/x/run:1",
+        env_files={},
+        env={"A": "1"},
+        ports=[],
+        volumes=["v:/data"],
+        command=["/usr/local/bin/flightdeck-start", "--verbose"],
+        spec="specdigest",
+    )
+    run = next(c for c in calls if c[1] == "run")
+    image_at = run.index("ghcr.io/x/run:1")
+    entrypoint_at = run.index("--entrypoint")
+    assert entrypoint_at < image_at
+    assert run[entrypoint_at + 1] == "/usr/local/bin/flightdeck-start"
+    # Only the REMAINING tokens ride after the image, as the entrypoint's argv.
+    assert run[image_at + 1 :] == ["--verbose"]
+    assert run.count("--entrypoint") == 1
+
+
+def test_dockerctl_single_token_command_runs_alone_after_entrypoint():
+    """The Flight Deck's real shape — one token — produces ``--entrypoint
+    <cmd>`` with NOTHING after the image (an appended duplicate would become
+    the entrypoint's first argument)."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.run_stack_container(
+        "deck",
+        "ghcr.io/x/run:1",
+        env_files={},
+        env={},
+        ports=[],
+        volumes=[],
+        command=["/usr/local/bin/flightdeck-start"],
+    )
+    run = next(c for c in calls if c[1] == "run")
+    assert run[run.index("--entrypoint") + 1] == "/usr/local/bin/flightdeck-start"
+    assert run[-1] == "ghcr.io/x/run:1"  # the image is the final argument
+
+
+def test_dockerctl_no_command_preserves_the_inherited_entrypoint_and_cmd():
+    """No configured command: no ``--entrypoint`` and nothing after the image
+    — the image's own ENTRYPOINT/CMD run exactly as built (regression: the
+    override must never fire for command-less container Stacks)."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.run_stack_container(
+        "svc",
+        "ghcr.io/x/svc:1",
+        env_files={},
+        env={},
+        ports=["80:80"],
+        volumes=[],
+        command=None,
+        spec="specdigest",
+    )
+    run = next(c for c in calls if c[1] == "run")
+    assert "--entrypoint" not in run
+    assert run[-1] == "ghcr.io/x/svc:1"
 
 
 # -- removed-runtime teardown failures are isolated (task 4) -----------------------

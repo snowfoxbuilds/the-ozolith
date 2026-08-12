@@ -13,8 +13,13 @@ SIGKILL — so a driver's subprocesses die with it, and the caller removes the
 Stack's labeled run containers in the same operation. Under systemd,
 KillMode=control-group guarantees the same at daemon death.
 
-Secrets are materialized to the runtime dir (tmpfs under /run) with 0600
-modes and wired via the VAR_FILE convention; they never touch node disk.
+Secrets are materialized to the runtime dir (tmpfs under /run) behind a
+0700-directory/0444-leaf boundary and wired via the VAR_FILE convention;
+they never touch node disk. The non-traversable directory is what isolates
+the leaves from other host users; the world-readable leaf mode is what lets
+a container running as an arbitrary non-root uid read the files bind-mounted
+into it (mounts preserve numeric ownership, so an owner-only leaf written by
+the daemon's service uid would be unreadable across the uid boundary).
 """
 
 from __future__ import annotations
@@ -71,16 +76,34 @@ class WireStack:
 
 
 def materialize_secrets(secrets_dir: Path, values: dict[str, str]) -> dict[str, Path]:
-    """Write values under the runtime dir (tmpfs), 0600, atomically."""
+    """Write values under the runtime dir (tmpfs), atomically, behind the
+    0700-directory/0444-leaf boundary.
+
+    The DIRECTORY is the host-side barrier: mode 0700, owned by the daemon's
+    service user, so no other host user can traverse to a leaf. Each LEAF is
+    exactly 0444 — ``fchmod``-pinned, because the ``os.open`` mode argument
+    is umask-masked and a restrictive service umask must not quietly produce
+    an owner-only file. Bind mounts hand a container the leaf INODE with its
+    numeric ownership preserved, so inside the container only the leaf's own
+    mode decides access: 0444 is what lets an arbitrary non-root container
+    uid (the Flight Deck's uid-1000 ozolith) read exactly the files mounted
+    into it, while every unmounted sibling stays sealed behind the directory.
+    Updates stay atomic (temp file + replace): a reader never observes a
+    partial value."""
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_dir.chmod(0o700)
     paths: dict[str, Path] = {}
     for name, value in values.items():
         target = secrets_dir / name
         tmp = secrets_dir / f".{name}.tmp"
+        # A crash between fchmod and replace can leave a read-only temp file
+        # behind; O_TRUNC alone would then fail EACCES, so clear it first.
+        tmp.unlink(missing_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(value)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
         os.replace(tmp, target)
         paths[name] = target
     return paths
