@@ -75,15 +75,23 @@ file): `pass show tailnet/spike | ./run-spike.sh`.
 ### One run at a time: the run lock and the debris audit
 
 Before anything else — before the image build, the volume probe, and any
-key intake — the script takes a **non-blocking exclusive `flock`** on
-`/dev/shm/ozolith-ts-spike.lock` and holds it until cleanup completes. A
-second invocation while a run is live fails immediately with a value-free
-message: it reads no key, runs no container, and cannot remove the live
-run's containers or tmpfs directories. The lock file carries no data and is
-deliberately never deleted (unlinking a lock file races a concurrent opener
-onto a dead inode). The lock is kernel-owned, so a run killed with `kill -9`
-releases it automatically — what protects the *next* run from that run's
-leftovers is the debris audit.
+key intake — the script takes a **non-blocking exclusive `flock(2)` on the
+`/dev/shm` directory inode itself**, opened read-only on fd 9, and holds
+that fd until cleanup completes. No lock *file* is ever created, opened, or
+chmodded: the legacy `/dev/shm/ozolith-ts-spike.lock` pathname is dead —
+anything planted there (a symlink included) is never touched, and a
+leftover from an older revision may simply be deleted. A second invocation
+while a run is live fails immediately with a value-free message: it reads
+no key, runs no container, and cannot remove the live run's containers or
+tmpfs directories.
+
+The lock is kernel-owned and dies **with the harness process alone**: every
+external command the script spawns after acquisition runs with fd 9 closed
+(one `ext` helper routes them all; the backgrounded log follower
+additionally drops the fd on the fork itself), so only the harness pins the
+lock. A run killed with `kill -9` therefore releases it the moment the
+process dies — even while children it started are still alive — and what
+protects the *next* run from that run's leftovers is the debris audit.
 
 With the lock held (still before any key intake), the script **audits for
 debris and refuses to proceed** — nothing is ever removed automatically —
@@ -245,11 +253,19 @@ value itself never enters argv or output), across:
   files** — live after ready, and again pre-stop — it uses the host's ps,
   so the slim image needs no tooling);
 - the full container log;
-- **every file on the `spike-tailscale-state` volume**, scanned inside a
-  scratch container (as uid 1000, through the same leaf mount) so the
-  pattern stays a path everywhere — a key-bearing container in its own
-  right, so it runs under a tracked per-run name and its removal is proven
-  in cleanup like the rest.
+- **the `spike-tailscale-state` volume, on every naming surface**: file
+  contents, pathnames, directory names, and symlink targets, all swept in
+  one pass by archiving the volume into an **ephemeral tar representation**
+  inside a scratch container (as uid 1000, through the same leaf mount, so
+  the pattern stays a path everywhere) and grepping that archive — tar
+  headers carry every name and link target, its data blocks every content
+  byte. The scanner **emits nothing**: its stdout and stderr are discarded
+  unread (a matching filename or a traversal error message could itself
+  carry the key), and only a fixed clean/hit/error status comes back — a
+  hit, or an archive/traversal/grep error, is reported without a byte of
+  scanner output. This scratch container is key-bearing in its own right,
+  so it runs under a tracked per-run name and its removal is proven in
+  cleanup like the rest.
 
 Every promised capture is itself **mandatory**: a failed `docker top`,
 `inspect`, `logs`, or `history` — or a capture that comes back unreadable
@@ -276,11 +292,15 @@ Shell-level regression coverage with stubbed `docker`, `tailscale`, and
 `tailscaled` binaries — CI runs it on every PR (the `spike-harness` job in
 `.github/workflows/ci.yml`), so the green check covers the harness itself:
 
-- **one run at a time**: the flock run lock is taken before anything else
-  and excludes a second run entirely (no key intake, no docker calls, no
-  removal of the first run's containers); released on success, ordinary
-  failure, SIGINT, and SIGTERM; after SIGKILL the kernel releases it and
-  the next run refuses the leftover debris instead;
+- **one run at a time**: the directory-inode flock run lock is taken before
+  anything else and excludes a second run entirely (no key intake, no
+  docker calls, no removal of the first run's containers); released on
+  success, ordinary failure, SIGINT, and SIGTERM; only the harness process
+  holds fd 9, so SIGKILLing *just the harness* while a spawned child is
+  still sleeping releases the lock promptly — the surviving child provably
+  has no fd 9, and the next run acquires the lock and is stopped only by
+  the debris audit; a symlink planted at the legacy lock-file path is
+  provably never opened, changed, or chmodded;
 - **the debris audit fails closed before any key intake**: stale containers
   of every name generation (the legacy fixed main name and per-run
   main/preflight/keyscan names), stale key directories, stale evidence
@@ -302,7 +322,12 @@ Shell-level regression coverage with stubbed `docker`, `tailscale`, and
   (live or pre-stop) fails the run;
 - both sweeps' **tri-state** behavior (grep rc 0 = hit fails, rc 1 = the
   only pass, rc ≥ 2 and docker-level failures fail closed;
-  missing/unreadable/empty evidence fails closed);
+  missing/unreadable/empty evidence fails closed); the state-volume
+  scanner's tar payload is exercised for real on every naming surface —
+  content hit, filename-only hit, directory-name hit, symlink-target hit,
+  clean volume, and traversal/archive/grep errors — asserting the fixed
+  statuses, zero payload output, and that no raw scanner byte (which could
+  itself carry the key) ever surfaces;
 - **no log-derived output before a clean scan**: a key planted in the
   container log is caught at the ready-time display gate (nothing shown,
   value-free failure, revoke-now warning); a key that arrives *after* the
@@ -387,5 +412,8 @@ the auth key** (admin console → Settings → Keys → revoke): the spike key
 was minted for this gate and its job is done. Nothing else persists — the
 tmpfs key directory was already removed (every exit path prints the proof),
 so after revocation no live or durable copy of the key exists anywhere.
-(The empty lock file `/dev/shm/ozolith-ts-spike.lock` may remain; it holds
-no data and vanishes on reboot with the tmpfs.)
+(The current harness creates no lock file — the run lock is an `flock(2)`
+on the `/dev/shm` directory inode, gone with the process. An empty
+`/dev/shm/ozolith-ts-spike.lock` left behind by an older revision holds no
+data, is never touched again, and may be deleted or left to vanish on
+reboot with the tmpfs.)

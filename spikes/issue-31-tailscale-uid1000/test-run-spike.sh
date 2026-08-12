@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Shell-level regression tests for run-spike.sh and entrypoint.sh — no Docker
 # engine, tailnet, or auth key needed (docker, tailscale, and tailscaled are
-# stubbed onto PATH; the run lock is the REAL flock on the real lock path).
-# Covers exactly what the gate's credibility rests on:
+# stubbed onto PATH; the run lock is the REAL flock(2) on the real /dev/shm
+# directory inode). Covers exactly what the gate's credibility rests on:
 #
-#   - ONE RUN AT A TIME: the flock run lock is taken before anything else and
-#     excludes a second run entirely — no key intake, no docker calls, no
-#     removal of the first run's containers; it is released on success,
-#     ordinary failure, SIGINT, and SIGTERM; after SIGKILL the kernel
-#     releases it and the next run refuses the leftover debris instead;
+#   - ONE RUN AT A TIME: the flock run lock — taken on the /dev/shm directory
+#     inode via fd 9, never through a lock file — is acquired before anything
+#     else and excludes a second run entirely: no key intake, no docker
+#     calls, no removal of the first run's containers. It is released on
+#     success, ordinary failure, SIGINT, and SIGTERM; only the harness
+#     process holds fd 9 (every spawned external child has it closed), so
+#     SIGKILLing just the harness releases the lock PROMPTLY even while its
+#     children survive, and the next run then refuses the leftover debris
+#     instead. The legacy /dev/shm/ozolith-ts-spike.lock pathname is dead:
+#     a symlink planted there is never opened, changed, or chmodded;
 #   - the DEBRIS AUDIT fails closed BEFORE any key intake: stale containers
 #     of every name generation (the legacy fixed main name and per-run
 #     main/preflight/keyscan names), stale key directories, stale evidence
@@ -28,6 +33,11 @@
 #   - both sweeps are tri-state and FAIL CLOSED: grep rc 0 = secret hit
 #     (fail), rc 1 = absent (the only pass), rc >= 2 / docker failure =
 #     scanner error (fail); missing, unreadable, or empty evidence fails;
+#     the state-volume scanner sweeps file CONTENTS, PATHNAMES, DIRECTORY
+#     NAMES, and SYMLINK TARGETS through an ephemeral tar representation and
+#     emits ONLY fixed clean/hit/error statuses — no filename, matched byte,
+#     or scanner stderr ever surfaces (exercised against the real payload
+#     for every naming surface, and against the stub for status plumbing);
 #   - NO LOG-DERIVED OUTPUT BEFORE A CLEAN EXACT-KEY SCAN: the container log
 #     is captured into tmpfs only (never streamed); the ready-time excerpt
 #     and early-failure diagnostics print only after a clean miss of the
@@ -63,8 +73,13 @@ trap 'rm -rf "$TESTTMP" ${SHM_DEBRIS[@]+"${SHM_DEBRIS[@]}"}' EXIT
 STUB=$TESTTMP/bin
 mkdir -p "$STUB"
 
-# The harness locks the REAL lock path — these tests exercise the real flock.
-LOCKFILE=/dev/shm/ozolith-ts-spike.lock
+# The harness locks the REAL /dev/shm directory inode — these tests exercise
+# the real flock(2). flock(1) with a directory operand opens that directory
+# itself, so the helpers below contend on exactly the inode the harness
+# locks. LEGACY_LOCKFILE is the retired lock-file pathname: nothing may ever
+# open, change, or chmod it (or anything planted at it) again.
+LOCKDIR=/dev/shm
+LEGACY_LOCKFILE=/dev/shm/ozolith-ts-spike.lock
 command -v flock >/dev/null || { echo "FATAL: these tests need util-linux flock (the harness does too)" >&2; exit 1; }
 
 # --- the docker stub -------------------------------------------------------
@@ -84,7 +99,10 @@ command -v flock >/dev/null || { echo "FATAL: these tests need util-linux flock 
 #   DOCKER_STUB_PREFLIGHT_RC / DOCKER_STUB_PREFLIGHT_SLEEP
 #   DOCKER_STUB_PREFLIGHT_MARKER  file touched when the preflight run starts
 #   DOCKER_STUB_PREFLIGHT_LINGER  1 = the preflight scratch container survives its --rm
-#   DOCKER_STUB_VOLSCAN_RC / DOCKER_STUB_VOLSCAN_OUT / DOCKER_STUB_VOLSCAN_SLEEP
+#   DOCKER_STUB_VOLSCAN_RC       state-volume scanner rc (0 hit, 1 clean, else error)
+#   DOCKER_STUB_VOLSCAN_OUT      raw bytes the scanner tries to emit on BOTH
+#                                stdout and stderr — must never surface
+#   DOCKER_STUB_VOLSCAN_SLEEP    seconds the scanner run stays parked
 #   DOCKER_STUB_VOLSCAN_MARKER    file touched when the scanner run starts
 #   DOCKER_STUB_VOLSCAN_LINGER    1 = the scanner scratch container survives its --rm
 #   DOCKER_STUB_TOP1_RC / DOCKER_STUB_TOP2_RC   first (live) / second (pre-stop) docker top
@@ -174,11 +192,14 @@ case "$cmd" in
     for a in "$@"; do [ "$prev" = "--name" ] && name=$a; prev=$a; done
     case "$*" in
       *"tailscaled.state"*) exit "${DOCKER_STUB_STATE_RC:-1}" ;;
-      *"grep -rlFf"*)
+      *"tar -cf"*)
         [ -n "${DOCKER_STUB_VOLSCAN_MARKER:-}" ] && : >"$DOCKER_STUB_VOLSCAN_MARKER"
         sleep "${DOCKER_STUB_VOLSCAN_SLEEP:-0}"
         [ "${DOCKER_STUB_VOLSCAN_LINGER:-0}" = 1 ] && [ -n "$name" ] && rec_add "$name"
-        [ -n "${DOCKER_STUB_VOLSCAN_OUT:-}" ] && printf '%s\n' "$DOCKER_STUB_VOLSCAN_OUT"
+        if [ -n "${DOCKER_STUB_VOLSCAN_OUT:-}" ]; then
+          printf '%s\n' "$DOCKER_STUB_VOLSCAN_OUT"
+          printf '%s\n' "$DOCKER_STUB_VOLSCAN_OUT" >&2
+        fi
         exit "${DOCKER_STUB_VOLSCAN_RC:-1}" ;;
       *"id -u"*)
         [ -n "${DOCKER_STUB_PREFLIGHT_MARKER:-}" ] && : >"$DOCKER_STUB_PREFLIGHT_MARKER"
@@ -339,10 +360,78 @@ out=$(run_scan_file "$TESTTMP/ev-dir")
 grep -q 'scanner error (grep rc=2)' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
   && pass "grep rc 2 (scanner error) fails closed" || fail "grep rc 2 (scanner error) fails closed"
 
-# --- scan_state_volume: tri-state, fail closed -------------------------------
+# --- state-volume scanner payload: every naming surface, statuses only ------
+# The payload (STATE_SCAN_SCRIPT) is exactly what /bin/sh runs inside the
+# scratch container; here it runs on the host against planted directories,
+# so the tar-representation semantics — contents, pathnames, directory
+# names, symlink targets — are tested for real, not through a stub. In every
+# case the payload must emit NOTHING (the verdict is the exit status alone),
+# and in particular never the key.
 
-echo "== scan_state_volume tri-state"
-run_scan_vol() { # $1: scanner rc, $2: scanner stdout
+echo "== state-volume scanner payload: naming surfaces, fixed statuses, silence"
+PAYDIR=$TESTTMP/payload
+mkdir -p "$PAYDIR"
+run_payload() { # $1: pattern file, $2: dir to scan — runs the container-side payload verbatim
+  (
+    source ./run-spike.sh
+    sh -c "$STATE_SCAN_SCRIPT" scan "$1" "$2" "$PAYDIR/scan.tar"
+  )
+}
+pay_case() { # $1: description, $2: pattern file, $3: dir, $4: expected rc
+  rm -f "$PAYDIR/scan.tar"
+  local rc=0 out
+  out=$(run_payload "$2" "$3" 2>&1) || rc=$?
+  [[ "$rc" -eq "$4" ]] && pass "$1 (rc=$4)" || fail "$1 (want rc=$4, got rc=$rc)"
+  [[ -z "$out" ]] && pass "$1: payload emits nothing" || fail "$1: payload emits nothing"
+  grep -qF -- 'tskey-auth-UNITSECRET' <<<"$out" \
+    && fail "$1: output is key-free" || pass "$1: output is key-free"
+}
+
+d=$PAYDIR/content-hit
+mkdir -p "$d"
+printf 'padding tskey-auth-UNITSECRET padding\n' >"$d/tailscaled.state"
+pay_case "content hit (key inside a file)" "$PATTERN" "$d" 0
+
+d=$PAYDIR/filename-hit
+mkdir -p "$d"
+: >"$d/leak-tskey-auth-UNITSECRET-leak" # zero bytes: the NAME is the only carrier
+pay_case "filename-only hit (empty file, key in the name)" "$PATTERN" "$d" 0
+
+d=$PAYDIR/dirname-hit
+mkdir -p "$d/dir-tskey-auth-UNITSECRET-dir" # empty dir: its NAME is the only carrier
+pay_case "directory-name hit (empty directory)" "$PATTERN" "$d" 0
+
+d=$PAYDIR/symlink-hit
+mkdir -p "$d"
+ln -s "dangling-tskey-auth-UNITSECRET-target" "$d/link" # the TARGET STRING is the only carrier
+pay_case "symlink-target hit (dangling target string)" "$PATTERN" "$d" 0
+
+d=$PAYDIR/clean
+mkdir -p "$d/sub"
+printf 'nothing secret here\n' >"$d/sub/tailscaled.state"
+ln -s innocent-target "$d/link"
+pay_case "clean volume (contents, names, dirs, targets all innocent)" "$PATTERN" "$d" 1
+
+pay_case "traversal error (nonexistent directory) fails closed" "$PATTERN" "$PAYDIR/does-not-exist" 3
+
+if [[ "$EUID" -ne 0 ]]; then # root traverses through chmod 000
+  d=$PAYDIR/unreadable
+  mkdir -p "$d/blocked"
+  : >"$d/blocked/f"
+  chmod 000 "$d/blocked"
+  pay_case "unreadable subdirectory (archive error) fails closed" "$PATTERN" "$d" 3
+  chmod 700 "$d/blocked"
+
+  cp "$PATTERN" "$PAYDIR/pattern-blocked"
+  chmod 000 "$PAYDIR/pattern-blocked"
+  pay_case "grep failure (unreadable pattern file) fails closed" "$PAYDIR/pattern-blocked" "$PAYDIR/clean" 3
+  chmod 600 "$PAYDIR/pattern-blocked"
+fi
+
+# --- scan_state_volume: tri-state, fail closed, raw output discarded ---------
+
+echo "== scan_state_volume: status plumbing (stubbed docker)"
+run_scan_vol() { # $1: scanner rc, $2: raw bytes the scanner tries to emit
   (
     source ./run-spike.sh
     SPIKE_KEY_FILE=$PATTERN
@@ -352,22 +441,29 @@ run_scan_vol() { # $1: scanner rc, $2: scanner stdout
   )
 }
 
-out=$(run_scan_vol 0 "/state/tailscaled.state")
-grep -q 'FAIL: key value found on the state volume' <<<"$out" \
-  && grep -q '/state/tailscaled.state' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
-  && pass "volume grep rc 0 (hit) fails, filenames only" || fail "volume grep rc 0 (hit) fails, filenames only"
+out=$(run_scan_vol 0 "/state/dir-tskey-auth-UNITSECRET/hit")
+grep -q 'FAIL: key value found on the state volume' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
+  && pass "scanner rc 0 (hit) fails the sweep" || fail "scanner rc 0 (hit) fails the sweep"
+grep -qF -- 'tskey-auth-UNITSECRET' <<<"$out" \
+  && fail "a hit prints no raw scanner data (a matching pathname can BE the key)" \
+  || pass "a hit prints no raw scanner data (a matching pathname can BE the key)"
 
 out=$(run_scan_vol 1)
-grep -q 'ok: key value absent from every file' <<<"$out" && grep -q 'sweep_hit=0' <<<"$out" \
-  && pass "volume grep rc 1 (absent) passes" || fail "volume grep rc 1 (absent) passes"
+grep -q 'ok: key value absent from the' <<<"$out" && grep -q 'sweep_hit=0' <<<"$out" \
+  && pass "scanner rc 1 (clean miss) is the only pass" || fail "scanner rc 1 (clean miss) is the only pass"
 
-out=$(run_scan_vol 2 "grep: /state: some error")
-grep -q 'state-volume scanner error (rc=2)' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
-  && pass "volume grep rc 2 fails closed" || fail "volume grep rc 2 fails closed"
+out=$(run_scan_vol 3 "tar: ./f-tskey-auth-UNITSECRET: Cannot open: Permission denied")
+grep -q 'state-volume scanner error (rc=3)' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
+  && pass "payload archive/grep error (rc=3) fails closed" || fail "payload archive/grep error (rc=3) fails closed"
+grep -qF -- 'tskey-auth-UNITSECRET' <<<"$out" \
+  && fail "scanner stderr is discarded (a traversal error can name a key-bearing path)" \
+  || pass "scanner stderr is discarded (a traversal error can name a key-bearing path)"
 
-out=$(run_scan_vol 125 "docker: daemon error")
+out=$(run_scan_vol 125 "docker: daemon error naming tskey-auth-UNITSECRET somehow")
 grep -q 'state-volume scanner error (rc=125)' <<<"$out" && grep -q 'sweep_hit=1' <<<"$out" \
   && pass "docker-level failure (rc=125) fails closed" || fail "docker-level failure (rc=125) fails closed"
+grep -qF -- 'tskey-auth-UNITSECRET' <<<"$out" \
+  && fail "docker-level stderr is discarded too" || pass "docker-level stderr is discarded too"
 
 # --- cleanup: failure-aware, order-preserving, status-preserving -------------
 
@@ -537,16 +633,17 @@ assert_no_new_key_dirs() { # $1: description, $2: dirs before
   [[ "$(key_dirs)" == "$2" ]] && pass "$1" || fail "$1"
 }
 assert_lock_free() { # $1: description — the run lock must not be held
-  flock -n "$LOCKFILE" true 2>/dev/null && pass "$1" || fail "$1"
+  flock -n "$LOCKDIR" true 2>/dev/null && pass "$1" || fail "$1"
 }
 lock_released_within() { # $1: seconds — poll until the run lock is free
   local i
   for ((i = 0; i < $1 * 10; i++)); do
-    flock -n "$LOCKFILE" true 2>/dev/null && return 0
+    flock -n "$LOCKDIR" true 2>/dev/null && return 0
     sleep 0.1
   done
   return 1
 }
+evidence_dirs() { compgen -G '/dev/shm/ozolith-ts-evidence.*' || true; }
 run_e2e() { # $1: out-file, then env overrides as NAME=VALUE...; stdin = key
   local out=$1
   shift
@@ -969,6 +1066,104 @@ for d in $(key_dirs); do
   printf '%s\n' "$before" | grep -qxF -- "$d" || rm -rf "$d"
 done
 assert_no_new_key_dirs "SIGKILL debris cleaned up by the test itself" "$before"
+
+echo "== end-to-end: SIGKILL during the SSH wait — the lock dies with the harness, not its children"
+# Park the harness in the ordinary non-docker SSH-wait sleep, then SIGKILL
+# ONLY the harness. Because every external child is spawned with fd 9
+# closed, the surviving sleep must (a) not hold fd 9 and (b) not pin the
+# lock: the kernel must release it the moment the harness dies, and the
+# very next run must get straight through lock acquisition (stopping only
+# at the debris audit, which is the designed protection for this case).
+ev_before=$(evidence_dirs)
+cdir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+printf '%s\n' "$KEY" | env PATH="$STUB:$PATH" SPIKE_NONINTERACTIVE=1 SPIKE_SSH_WAIT_SECS=31 \
+  DOCKER_STUB_COUNTER_DIR="$cdir" ./run-spike.sh >"$TESTTMP/out-killwait" 2>&1 &
+waitpid=$!
+sleeppid=""
+for _ in $(seq 1 200); do
+  sleeppid=$(pgrep -P "$waitpid" -f '^sleep 31$' || true)
+  [[ -n "$sleeppid" ]] && break
+  sleep 0.1
+done
+[[ -n "$sleeppid" ]] && pass "run parked in the ordinary (non-docker) SSH-wait sleep" \
+  || fail "run parked in the ordinary (non-docker) SSH-wait sleep"
+if [[ -n "$sleeppid" ]]; then
+  [[ "$(readlink "/proc/$waitpid/fd/9" 2>/dev/null)" == /dev/shm ]] \
+    && pass "the harness itself holds fd 9 open on /dev/shm" \
+    || fail "the harness itself holds fd 9 open on /dev/shm"
+  flock -n "$LOCKDIR" true 2>/dev/null \
+    && fail "the lock is held while the harness is parked" \
+    || pass "the lock is held while the harness is parked"
+  [[ ! -e "/proc/$sleeppid/fd/9" ]] \
+    && pass "the surviving child does NOT have fd 9" \
+    || fail "the surviving child does NOT have fd 9"
+fi
+kill -9 "$waitpid"
+rc=0
+wait "$waitpid" || rc=$?
+[[ "$rc" -eq 137 ]] && pass "SIGKILL leaves exit 137 (no trap could run)" \
+  || fail "SIGKILL leaves exit 137 (no trap could run) (got $rc)"
+if [[ -n "$sleeppid" ]] && kill -0 "$sleeppid" 2>/dev/null; then
+  pass "the sleep child is still alive after the harness died"
+else
+  fail "the sleep child is still alive after the harness died"
+fi
+lock_released_within 3 && pass "the lock was released promptly despite the surviving child" \
+  || fail "the lock was released promptly despite the surviving child"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-postkillwait" || rc=$?
+expect_nonzero "the next run is stopped by the debris audit, not the lock" "$rc"
+expect_grep "the next run acquired the lock promptly" "$TESTTMP/out-postkillwait" "run lock acquired"
+expect_grep "the stale tmpfs debris is what refused it" "$TESTTMP/out-postkillwait" "stale spike tmpfs debris"
+expect_not_grep "no key value in the killed run's output" "$TESTTMP/out-killwait" "$KEY"
+[[ -n "$sleeppid" ]] && kill -9 "$sleeppid" 2>/dev/null
+wait 2>/dev/null || true
+for d in $(key_dirs); do
+  printf '%s\n' "$before" | grep -qxF -- "$d" || rm -rf "$d"
+done
+for d in $(evidence_dirs); do
+  printf '%s\n' "$ev_before" | grep -qxF -- "$d" || rm -rf "$d"
+done
+assert_no_new_key_dirs "SSH-wait SIGKILL debris cleaned up by the test itself" "$before"
+
+echo "== the legacy lock path is dead: a planted symlink is never opened, changed, or chmodded"
+# Older harness revisions opened (O_APPEND|O_CREAT) and chmodded a lock FILE
+# at $LEGACY_LOCKFILE. The directory-inode lock must never touch that
+# pathname again: plant a symlink there to a read-only sentinel and run a
+# full normal run through it. The sentinel is mode 0404 (no write bit even
+# for the owner), so any attempt to open it for writing through the symlink
+# would fail the run — rc 0 alone proves no such open happened (under a
+# non-root test run); the stat comparison proves no change and no chmod
+# either way; and the old lstat precheck would have refused the symlink
+# outright, so a PASSING run also proves that precheck is gone.
+sentinel=$TESTTMP/lock-sentinel
+printf 'sentinel-do-not-touch\n' >"$sentinel"
+chmod 0404 "$sentinel"
+# A host that ever ran an old harness revision still has the retired lock
+# file (empty by design — the old header documented it as carrying no data
+# and never being deleted). Clear it so the symlink can be planted.
+rm -f "$LEGACY_LOCKFILE"
+ln -s "$sentinel" "$LEGACY_LOCKFILE"
+SHM_DEBRIS+=("$LEGACY_LOCKFILE")
+sent_before=$(stat -c '%a %u %g %s %Y %Z' "$sentinel")
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-legacylock" || rc=$?
+[[ "$rc" -eq 0 ]] && pass "a planted legacy-lock symlink does not affect the run at all" \
+  || fail "a planted legacy-lock symlink does not affect the run at all (rc=$rc)"
+expect_grep "the run still locks the directory inode" "$TESTTMP/out-legacylock" "run lock acquired"
+expect_grep "the run's sweep still passed" "$TESTTMP/out-legacylock" "key-absence sweep: passed"
+[[ -L "$LEGACY_LOCKFILE" && "$(readlink "$LEGACY_LOCKFILE")" == "$sentinel" ]] \
+  && pass "the planted symlink itself is untouched" || fail "the planted symlink itself is untouched"
+[[ "$(stat -c '%a %u %g %s %Y %Z' "$sentinel")" == "$sent_before" ]] \
+  && pass "the sentinel target is not changed or chmodded (mode/size/mtime/ctime identical)" \
+  || fail "the sentinel target is not changed or chmodded (mode/size/mtime/ctime identical)"
+grep -qxF 'sentinel-do-not-touch' "$sentinel" \
+  && pass "sentinel content intact" || fail "sentinel content intact"
+expect_not_grep "the harness never even names the legacy lock path" "$TESTTMP/out-legacylock" "$LEGACY_LOCKFILE"
+rm -f "$LEGACY_LOCKFILE"
+chmod 600 "$sentinel"
+assert_no_new_key_dirs "no key-directory debris after the legacy-lock test" "$before"
+assert_lock_free "the run lock is released after the legacy-lock test"
 
 echo
 if [[ "$fails" -ne 0 ]]; then
