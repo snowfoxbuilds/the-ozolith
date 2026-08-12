@@ -46,6 +46,8 @@ nothing about another, so:
   `name=rootless` / `name=userns`) and refuses to run — before any key is
   read. The uid-1000 readability preflight below stays as a second,
   independent check of the actual mount; it is not the daemon-mode detector.
+- `flock` from util-linux (present on any normal GNU/Linux) — the run lock
+  below refuses to run without it.
 - A second tailnet machine to ssh from.
 - A **reusable** auth key (`tskey-auth-...`). A plain reusable key is fine
   for the spike; the production key policy (tagged `tag:flightdeck`,
@@ -69,6 +71,38 @@ nothing about another, so:
 
 or pipe the key from a secret manager (never from a durable plaintext
 file): `pass show tailnet/spike | ./run-spike.sh`.
+
+### One run at a time: the run lock and the debris audit
+
+Before anything else — before the image build, the volume probe, and any
+key intake — the script takes a **non-blocking exclusive `flock`** on
+`/dev/shm/ozolith-ts-spike.lock` and holds it until cleanup completes. A
+second invocation while a run is live fails immediately with a value-free
+message: it reads no key, runs no container, and cannot remove the live
+run's containers or tmpfs directories. The lock file carries no data and is
+deliberately never deleted (unlinking a lock file races a concurrent opener
+onto a dead inode). The lock is kernel-owned, so a run killed with `kill -9`
+releases it automatically — what protects the *next* run from that run's
+leftovers is the debris audit.
+
+With the lock held (still before any key intake), the script **audits for
+debris and refuses to proceed** — nothing is ever removed automatically —
+if any of these exist:
+
+- a container whose name starts with `ozolith-ts-spike` — that covers the
+  **legacy fixed main name** (`ozolith-ts-spike`, used by older harness
+  revisions) and every per-run `ozolith-ts-spike-main-*` /
+  `-preflight-*` / `-keyscan-*` name;
+- a stale key directory (`/dev/shm/ozolith-ts-spike-key.*`);
+- a stale evidence directory (`/dev/shm/ozolith-ts-evidence.*`).
+
+Any of those means a prior run died before its provable cleanup finished —
+a surviving container may still hold a **prior** auth key readable through
+its bind mount, and a stale directory may hold one in plaintext. The
+guidance is always the same: inspect and remove the debris by hand
+(`docker rm -f <id>` / `rm -rf <dir>`), **revoke the key that run used**,
+then re-run. A failing audit query (e.g. `docker ps` erroring) also refuses
+the run: an unauditable field proves nothing.
 
 ### Fresh vs reuse is decided from actual state
 
@@ -111,19 +145,33 @@ Auth-key hygiene, enforced by the script:
   unsupported rootless/userns-remap daemon), the run stops before any
   enrollment is attempted;
 - **every container that receives the key mount is tracked, and its removal
-  is proven** — not only the main container: the preflight and
-  state-volume-scanner scratch containers get per-run, collision-safe names
-  recorded *before* their `docker run` is invoked, so even a partially
-  created container or a client-side docker failure stays cleanup-visible.
-  Their `--rm` is convenience cleanup, not proof — an interruption or a
-  daemon/client failure can leave the container behind, and a surviving
-  container keeps the key readable through its bind mount even after the
-  host copy is deleted. Cleanup queries, removes when present, and
-  re-queries each of the three names on every exit path; a scratch
-  container already gone through its normal `--rm` counts as clean. Stale
-  scratch containers from a previous interrupted run are **rejected before
-  any key intake** — nothing is deleted automatically; removing them, and
-  revoking the key that run used, is an operator action;
+  is proven** — and *all* of them run under **per-run, collision-safe
+  names** (`ozolith-ts-spike-main-<pid>-<rand>`, `-preflight-…`,
+  `-keyscan-…`): there is no fixed container name anywhere, so cleanup can
+  only ever remove names recorded for *this* run and can never consume
+  another run's container. Each name is recorded *before* its `docker run`
+  is invoked, so even a partially created container or a client-side docker
+  failure stays cleanup-visible. The scratch runs' `--rm` is convenience
+  cleanup, not proof — an interruption or a daemon/client failure can leave
+  the container behind, and a surviving container keeps the key readable
+  through its bind mount even after the host copy is deleted. Cleanup
+  queries, removes when present, and re-queries each of the three names on
+  every exit path; a scratch container already gone through its normal
+  `--rm` counts as clean. Stale containers from a previous interrupted run
+  are **rejected before any key intake** by the debris audit above —
+  nothing is deleted automatically; removing them, and revoking the key
+  that run used, is an operator action;
+- **no log-derived byte reaches output before it is scanned**: the
+  container log is followed into the tmpfs evidence directory only — never
+  streamed or `tee`'d through the terminal. On a fresh run the ready-time
+  excerpt is a snapshot that is exact-key-scanned first and displayed only
+  on a clean miss (the scanned bytes and the displayed bytes are the same
+  bytes); if the container dies early, its partial log is captured and
+  scanned the same way before any diagnostic is shown. A hit, a scanner
+  error, or an uncapturable log **withholds the content**, fails the run
+  with a value-free message, and demands immediate key revocation. Reuse
+  runs use the same capture-only path (they are keyless, so their log is
+  shown without a scan — no key entered the run to leak);
 - the key reaches the container only as a read-only mount of that leaf —
   `file:` form only, mirroring the production tmpfs → read-only `VAR_FILE`
   delivery; the value never enters argv, shell history, environment values,
@@ -165,9 +213,10 @@ ssh ozolith@spike cat /spike-marker   # expect: spike-container-fs
 
 ### 3. Identity survives container/image replacement
 
-Note the node's 100.x address (`tailscale status` output in the log). Press
-Enter to finish run 1, optionally `docker build` again (same pinned
-version), then re-run `./run-spike.sh`. The volume now holds a non-empty
+Note the node's 100.x address (`tailscale status` output in the ready-time
+log excerpt, which on a fresh run prints only after its exact-key scan came
+back clean). Press Enter to finish run 1, optionally `docker build` again
+(same pinned version), then re-run `./run-spike.sh`. The volume now holds a non-empty
 `tailscaled.state`, so the run is **keyless**: expect the log's "existing
 state found" branch, the same 100.x address, no new machine in the admin
 console, and ssh still landing.
@@ -209,9 +258,13 @@ or empty — fails the run before scanning starts; nothing is swallowed with
 secret hit (FAIL), rc 1 is a clean miss (the only pass), and anything
 else — a grep error, a docker failure, or a missing/unreadable/empty
 evidence capture — is a scanner failure and FAILs the gate too, because an
-unscannable surface proves nothing. Any `FAIL` fails the run. The script
-then prints proof the key directory is gone. Run the sweep on both fresh
-runs (checks 1 and 4) — those are exactly the runs where a key exists.
+unscannable surface proves nothing. Any `FAIL` fails the run — and it also
+**withholds the sanitized evidence block**, which quotes container-log
+lines: if any surface held the key (or could not be proven clean), no
+log-derived line is re-emitted, the failure stays value-free, and the
+script demands immediate key revocation. The script then prints proof the
+key directory is gone. Run the sweep on both fresh runs (checks 1 and 4) —
+those are exactly the runs where a key exists.
 
 ## Self-test (no Docker, tailnet, or key needed)
 
@@ -223,6 +276,16 @@ Shell-level regression coverage with stubbed `docker`, `tailscale`, and
 `tailscaled` binaries — CI runs it on every PR (the `spike-harness` job in
 `.github/workflows/ci.yml`), so the green check covers the harness itself:
 
+- **one run at a time**: the flock run lock is taken before anything else
+  and excludes a second run entirely (no key intake, no docker calls, no
+  removal of the first run's containers); released on success, ordinary
+  failure, SIGINT, and SIGTERM; after SIGKILL the kernel releases it and
+  the next run refuses the leftover debris instead;
+- **the debris audit fails closed before any key intake**: stale containers
+  of every name generation (the legacy fixed main name and per-run
+  main/preflight/keyscan names), stale key directories, stale evidence
+  directories, and a failing audit query all refuse the run — and none of
+  the debris is removed automatically;
 - **mode selection from actual state**: absent volume → fresh; non-empty
   `tailscaled.state` → keyless reuse; existing volume without usable
   state → fresh through the same volume (no deletion); probe errors fail
@@ -240,16 +303,22 @@ Shell-level regression coverage with stubbed `docker`, `tailscale`, and
 - both sweeps' **tri-state** behavior (grep rc 0 = hit fails, rc 1 = the
   only pass, rc ≥ 2 and docker-level failures fail closed;
   missing/unreadable/empty evidence fails closed);
+- **no log-derived output before a clean scan**: a key planted in the
+  container log is caught at the ready-time display gate (nothing shown,
+  value-free failure, revoke-now warning); a key that arrives *after* the
+  ready snapshot is caught by the final sweep, which withholds the evidence
+  block and every line it would have quoted; early-failure diagnostics are
+  displayed only after a clean scan, and a log that leaks or cannot be
+  captured/scanned stays withheld with the revoke-now warning;
 - **cleanup**: every step attempted regardless of earlier failures; absence
   proven for **every container that received the key mount** — the main
   container plus the preflight and state-volume-scanner scratch containers,
-  tracked by per-run name before their `docker run` (auto-removed scratch
-  containers count as already clean; lingering ones are removed with
-  proof); per-container `docker rm` failures and unprovable removal turn
-  even a passing run non-zero (with the value-free revoke-now warning),
-  with later cleanup steps still executing; stale scratch containers from a
-  prior interrupted run are rejected before any key intake, and a failing
-  stale-check query fails closed; an original non-zero status is preserved;
+  all tracked by per-run name recorded before their `docker run`
+  (auto-removed scratch containers count as already clean; lingering ones
+  are removed with proof), and **only current-run names are ever removed**;
+  per-container `docker rm` failures and unprovable removal turn even a
+  passing run non-zero (with the value-free revoke-now warning), with later
+  cleanup steps still executing; an original non-zero status is preserved;
   exercised on normal exit, ordinary failure, and SIGINT/SIGTERM parked
   inside each key-bearing scratch operation;
 - the key value never appears in the harness's output, in any argv, or in
@@ -276,34 +345,47 @@ but note it in #31 so nobody later assumes outbound works.
 
 ## Cleanup
 
-Per-run cleanup is automatic, **failure-aware, and provable**: every exit
-path (success, failure, SIGINT, SIGTERM) attempts every teardown step —
-log follower, **every container that received the key bind mount** (the
-main container plus the preflight and state-volume-scanner scratch
-containers, tracked under per-run names recorded before their
-`docker run`), evidence directory, key directory — regardless of earlier
-failures, then verifies each container is absent (query → remove when
-present → re-query via `docker ps -a`; a scratch container already gone
-through its normal `--rm` counts as clean) and the key directory no longer
-exists. Any step that fails, or any absence the script cannot prove, makes
-the run exit **non-zero even if the gate checks themselves passed** — a run
-that cannot prove its own teardown is a failed run. If the removal of *any*
-key-bearing container cannot be proven on a run that mounted a key, the
-script prints a prominent (value-free) warning: a bind mount can keep the
-key readable inside a surviving container even after the host copy is
-deleted, so **revoke the key immediately** in that case instead of waiting
-for the end-of-gate cleanup below.
+Per-run cleanup is automatic, **failure-aware, provable, and
+ownership-safe**: every exit path (success, failure, SIGINT, SIGTERM)
+attempts every teardown step — log follower, **every container that
+received the key bind mount** (the main container plus the preflight and
+state-volume-scanner scratch containers, all tracked under per-run names
+recorded before their `docker run`), evidence directory, key directory —
+regardless of earlier failures, then verifies each container is absent
+(query → remove when present → re-query via `docker ps -a`; a scratch
+container already gone through its normal `--rm` counts as clean) and the
+key directory no longer exists. Cleanup removes **only the names recorded
+for the current run** — it never deletes a container it did not create,
+and there is no unconditional `docker rm` of any fixed name. Any step that
+fails, or any absence the script cannot prove, makes the run exit
+**non-zero even if the gate checks themselves passed** — a run that cannot
+prove its own teardown is a failed run. If the removal of *any* key-bearing
+container cannot be proven on a run that mounted a key, the script prints a
+prominent (value-free) warning: a bind mount can keep the key readable
+inside a surviving container even after the host copy is deleted, so
+**revoke the key immediately** in that case instead of waiting for the
+end-of-gate cleanup below. The run lock is held until this cleanup
+completes, then released with the process.
 
-After the whole gate is done:
+Because every container is removed (with proof) by the run that created it,
+end-of-gate cleanup is only the volume and the image:
 
 ```sh
-docker rm -f ozolith-ts-spike 2>/dev/null
 docker volume rm spike-tailscale-state
 docker rmi ozolith-ts-spike
 ```
+
+If a container named `ozolith-ts-spike*` still exists at this point, it is
+debris a run could not clean up (the next run would refuse it): inspect and
+remove it by hand — `docker rm -f <id>` — and treat its key as burned. A
+plain `ozolith-ts-spike` container can only come from a **pre-lock harness
+revision** that used that fixed name; it bind-mounted a key too, so the
+same rule applies.
 
 Then delete the spike machine from the tailscale admin console and **revoke
 the auth key** (admin console → Settings → Keys → revoke): the spike key
 was minted for this gate and its job is done. Nothing else persists — the
 tmpfs key directory was already removed (every exit path prints the proof),
 so after revocation no live or durable copy of the key exists anywhere.
+(The empty lock file `/dev/shm/ozolith-ts-spike.lock` may remain; it holds
+no data and vanishes on reboot with the tmpfs.)

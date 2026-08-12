@@ -9,6 +9,19 @@
 # key is read; the uid-1000 readability preflight below stays as a second,
 # independent check of the actual mount.
 #
+# ONE RUN AT A TIME: an exclusive non-blocking flock(2) is taken on a fixed
+# tmpfs lock file BEFORE any image build, volume probe, or secret intake and
+# held until cleanup completes. A second invocation fails immediately —
+# before reading anything secret — instead of consuming the first run's
+# containers or tmpfs directories. The lock is kernel-owned: a SIGKILLed run
+# releases it automatically, and what protects the NEXT run from that run's
+# leftovers is the debris audit, which (also before any secret intake)
+# refuses to proceed while any prior-generation container name (the legacy
+# fixed name or any per-run main/preflight/keyscan name), stale key
+# directory, or stale evidence directory exists. Debris is NEVER removed
+# automatically — a stale container or directory may still hold a PRIOR auth
+# key, and deleting objects this run did not create is an operator decision.
+#
 # FRESH vs REUSE is decided from ACTUAL state, not the volume's mere
 # existence: only a spike-tailscale-state volume holding a NON-EMPTY
 # tailscaled.state is a reusable identity (keyless run — gate item 3). An
@@ -38,6 +51,17 @@
 # context; a path argument is accepted only if the file already lives on a
 # tmpfs, and never from inside the Docker build context.
 #
+# CAPTURED CONTENT NEVER REACHES OUTPUT UNSCANNED: the container log is
+# followed into the tmpfs evidence directory ONLY — it is never streamed or
+# tee'd through the terminal. On a fresh run, no raw or log-derived byte is
+# printed until an exact-key scan of those same bytes has returned a clean
+# miss: the ready-time excerpt is a scanned snapshot, early-failure
+# diagnostics are captured and scanned before display, and the sanitized
+# evidence block (which quotes log lines) prints only after the full sweep
+# below passed on every surface. A hit — or a scan that cannot be completed —
+# withholds the content, prints a value-free failure, and demands immediate
+# key revocation.
+#
 # After you finish the SSH checks (press Enter), the script stops the
 # container and sweeps every surface for the exact key value with grep -Ff,
 # using the key file as the PATTERN FILE — the value itself never enters
@@ -50,18 +74,17 @@
 # recorded process argv (docker top, live and pre-stop as separate files),
 # the full container log, and every file on the retained state volume.
 #
-# Cleanup is provable and failure-aware: every exit path — success, failure,
-# SIGINT, SIGTERM — attempts EVERY teardown step (log follower, ALL
-# key-bearing containers, evidence directory, key directory) regardless of
-# earlier failures, then verifies each container is gone and the key
-# directory no longer exists. "All key-bearing containers" means every
-# container that received the key bind mount: the main spike container AND
-# the two scratch containers (the uid-1000 readability preflight and the
-# state-volume scanner). The scratch runs use --rm, but --rm is convenience
-# cleanup, not proof — an interruption or a daemon/client failure can leave
-# the container behind — so each scratch container gets a per-run,
-# collision-safe name that is recorded BEFORE its docker run is invoked, and
-# cleanup queries, removes when present, and re-queries every recorded name
+# Cleanup is provable, failure-aware, and OWNERSHIP-SAFE: every exit path —
+# success, failure, SIGINT, SIGTERM — attempts EVERY teardown step (log
+# follower, ALL key-bearing containers, evidence directory, key directory)
+# regardless of earlier failures, then verifies each container is gone and
+# the key directory no longer exists. "All key-bearing containers" means
+# every container that received the key bind mount: the main spike container
+# AND the two scratch containers (the uid-1000 readability preflight and the
+# state-volume scanner). ALL THREE run under per-run, collision-safe names —
+# there is no fixed container name anywhere — recorded BEFORE their docker
+# run is invoked, and cleanup queries, removes, and re-queries ONLY those
+# recorded names, so it can never touch a container this run did not create
 # (a normally auto-removed scratch container is proven clean by that query,
 # never counted as an rm failure). Any step that fails, or any absence that
 # cannot be proven, turns the exit status nonzero (an original failure
@@ -77,20 +100,42 @@
 set -euo pipefail
 
 IMAGE=ozolith-ts-spike
-CONTAINER=ozolith-ts-spike
 VOLUME=spike-tailscale-state
 
-# The two key-bearing scratch operations (uid-1000 readability preflight,
-# state-volume scanner) run under per-run, collision-safe names: a fixed
-# name could collide with — or silently clear — the debris of another run,
-# while a per-run name can only ever denote THIS run's container. The names
-# carry no secret (prefix + pid + $RANDOM). Each tracking variable below is
+# One run at a time: an exclusive flock(2) is taken non-blocking on this
+# fixed tmpfs path (fd 9) before any image build, volume probe, or secret
+# intake, and held until cleanup completes. The lock is kernel-owned, so an
+# aborted run can never leave it stuck — on SIGKILL the OS releases it, and
+# the debris audit is what protects the next run. The file itself carries no
+# data and is deliberately never deleted: unlinking a lock file races a
+# concurrent opener onto a dead inode.
+RUN_LOCK_FILE=/dev/shm/ozolith-ts-spike.lock
+
+# Child processes must not inherit the run-lock fd: a docker client that can
+# outlive this process (a parked run, a slow build, the log follower) would
+# otherwise keep the lock held after this process died, making the lock lie
+# about whether a run is alive. Every docker invocation goes through this
+# wrapper, which closes fd 9 for the child (a no-op when the lock is not yet
+# held, e.g. under the sourced self-test).
+docker() { command docker "$@" 9>&-; }
+
+# EVERY container this harness creates gets a per-run, collision-safe name:
+# <prefix><pid>-<RANDOM>. A fixed name could collide with — or tempt the
+# script into silently deleting — the debris of another run, while a per-run
+# name can only ever denote THIS run's container; cleanup only ever removes
+# names recorded for this run. CONTAINER_NAME_PREFIX is shared by all of
+# them AND by the fixed name older harness revisions gave the main container
+# — the debris audit matches on it, so one query catches every generation of
+# leftover. The names carry no secret. Each tracking variable below is
 # assigned BEFORE the corresponding docker run is invoked, so a partially
 # created container or a client-side docker failure is still visible to
 # cleanup; "" means that operation was never attempted.
-SCRATCH_PREFLIGHT_PREFIX=ozolith-ts-spike-preflight-
-SCRATCH_SCAN_PREFIX=ozolith-ts-spike-keyscan-
-SCRATCH_RUN_TAG="$$-${RANDOM}"
+CONTAINER_NAME_PREFIX=ozolith-ts-spike
+MAIN_PREFIX=${CONTAINER_NAME_PREFIX}-main-
+SCRATCH_PREFLIGHT_PREFIX=${CONTAINER_NAME_PREFIX}-preflight-
+SCRATCH_SCAN_PREFIX=${CONTAINER_NAME_PREFIX}-keyscan-
+RUN_TAG="$$-${RANDOM}"
+CONTAINER=""
 PREFLIGHT_CONTAINER=""
 SCAN_CONTAINER=""
 
@@ -98,7 +143,6 @@ SPIKE_KEY_DIR=""
 SPIKE_KEY_FILE=""
 EVIDENCE_DIR=""
 LOG_PID=""
-CONTAINER_STARTED=0
 MODE=""
 MODE_DETAIL=""
 VOLUME_EXISTS=0
@@ -182,10 +226,11 @@ cleanup() {
   # that bind-mounts the key is an emergency, not a shrug: the mount pins
   # the inode, so the key can stay readable inside a surviving container
   # even after the host copy below is deleted. Every container is processed
-  # regardless of earlier failures.
+  # regardless of earlier failures — and ONLY these per-run recorded names
+  # are ever removed: nothing this run did not create is touched.
   local prc unproven=0
-  if [[ "$CONTAINER_STARTED" -eq 1 ]]; then
-    prove_container_gone "$CONTAINER" "container"
+  if [[ -n "$CONTAINER" ]]; then
+    prove_container_gone "$CONTAINER" "main container"
     prc=$?
     [[ "$prc" -ne 0 ]] && failed=1
     [[ "$prc" -eq 2 ]] && unproven=1
@@ -248,7 +293,9 @@ require_supported_docker() {
   # is POSITIVE detection from the daemon's own SecurityOptions; the uid-1000
   # readability preflight later is a second, independent check of the actual
   # mount — not the daemon-mode detector.
-  command -v docker >/dev/null 2>&1 || {
+  # type -P, not command -v: the docker() wrapper above would satisfy the
+  # latter even with no docker binary anywhere on PATH.
+  type -P docker >/dev/null 2>&1 || {
     echo "FAIL: docker not found on PATH — this harness needs an ordinary root-daemon Docker." >&2
     exit 1
   }
@@ -273,33 +320,156 @@ require_supported_docker() {
   echo "==> docker daemon: ordinary root daemon (no rootless / userns-remap security option)"
 }
 
-reject_stale_scratch_containers() {
-  # Scratch names are per-run and collision-safe, so anything matching the
-  # scratch prefixes can only be debris from a run this script could not
-  # clean up (e.g. kill -9 mid-preflight) or from a concurrently live run —
-  # and the preflight/scanner containers are exactly the ones that bind-
-  # mount an auth key, so a stale one may still hold a PRIOR key readable.
-  # Refuse to proceed, before any secret intake. Nothing is removed here:
-  # deleting containers this run did not create is an operator decision,
-  # and an unrelated container that merely matches the prefix must never be
-  # silently destroyed.
+acquire_run_lock() {
+  # Mutual exclusion FIRST — before the daemon is even queried: two
+  # interleaved runs could each pass the debris audit and then mistake the
+  # other's containers or tmpfs directories for their own debris (or their
+  # own property). Non-blocking: a held lock means a live concurrent run,
+  # and queueing silently behind it would start a surprise run later. The
+  # lock fd (9) stays open until this process exits, i.e. through cleanup;
+  # the docker() wrapper closes it in every docker child so only the harness
+  # itself pins it.
+  command -v flock >/dev/null 2>&1 || {
+    echo "FAIL: flock not found (util-linux) — refusing to run without mutual exclusion:" >&2
+    echo "      a concurrent run could consume this run's containers or key material." >&2
+    exit 1
+  }
+  if [[ -L "$RUN_LOCK_FILE" || (-e "$RUN_LOCK_FILE" && ! -f "$RUN_LOCK_FILE") ]]; then
+    echo "FAIL: $RUN_LOCK_FILE exists but is not a regular file — refusing to lock through it." >&2
+    echo "      Inspect and remove it by hand, then re-run." >&2
+    exit 1
+  fi
+  if ! exec 9>>"$RUN_LOCK_FILE"; then
+    echo "FAIL: cannot open the run lock file $RUN_LOCK_FILE — fix (or remove) it by hand;" >&2
+    echo "      refusing to run without mutual exclusion." >&2
+    exit 1
+  fi
+  chmod 0666 "$RUN_LOCK_FILE" 2>/dev/null || true # root and non-root runs share one lock path
+  if ! flock -n 9; then
+    echo "FAIL: another run of this harness holds the run lock ($RUN_LOCK_FILE)." >&2
+    echo "      Exactly one run may exist at a time — a second run could consume the first" >&2
+    echo "      run's containers or secret-bearing tmpfs directories. Wait for it to finish" >&2
+    echo "      (or stop it), then re-run. Refusing before any key intake." >&2
+    exit 1
+  fi
+  echo "==> run lock acquired ($RUN_LOCK_FILE) — held until cleanup completes; a SIGKILLed"
+  echo "    run releases it via the kernel, and the debris audit below protects the next run"
+}
+
+audit_stale_debris() {
+  # Runs with the lock held and BEFORE any secret intake. Anything matching
+  # the harness's container-name family or its tmpfs directory patterns can
+  # only be (a) debris of a run that died too hard to clean up after itself
+  # (SIGKILL, host crash — the lock excludes a live concurrent run) or (b)
+  # an unrelated object that happens to collide. Either way this run must
+  # not touch it: main/preflight/keyscan containers bind-mounted a PRIOR
+  # auth key (a surviving container keeps that key readable through the
+  # pinned mount), stale key/evidence directories may hold raw secret
+  # material, and deleting objects this run did not create is an operator
+  # decision. Fail closed with value-free guidance; nothing is removed
+  # automatically, and no failure here can name a key value.
   local stale
-  if ! stale=$(docker ps -aq \
-    --filter "name=^${SCRATCH_PREFLIGHT_PREFIX}" \
-    --filter "name=^${SCRATCH_SCAN_PREFIX}" 2>&1); then
-    echo "FAIL: cannot check for stale key-bearing scratch containers (docker ps failed):" >&2
+  if ! stale=$(docker ps -aq --filter "name=^${CONTAINER_NAME_PREFIX}" 2>&1); then
+    echo "FAIL: cannot audit for stale spike containers (docker ps failed):" >&2
     printf '%s\n' "$stale" | sed 's/^/      /' >&2
+    echo "      Refusing to continue — this audit runs before any key intake." >&2
     exit 1
   fi
   if [[ -n "$stale" ]]; then
-    echo "FAIL: stale key-bearing scratch container(s) exist (name prefix ${SCRATCH_PREFLIGHT_PREFIX}* / ${SCRATCH_SCAN_PREFIX}*):" >&2
+    echo "FAIL: stale spike container(s) exist — any name starting '${CONTAINER_NAME_PREFIX}':" >&2
+    echo "      the legacy fixed main name '${CONTAINER_NAME_PREFIX}' or a per-run ${MAIN_PREFIX}*," >&2
+    echo "      ${SCRATCH_PREFLIGHT_PREFIX}*, or ${SCRATCH_SCAN_PREFIX}* name:" >&2
     printf '%s\n' "$stale" | sed 's/^/      /' >&2
-    echo "      Such containers bind-mounted an auth key when they were created; a prior run was" >&2
-    echo "      interrupted before it could prove their removal (or another run is live right now)." >&2
-    echo "      Inspect and remove them (docker rm -f <id>), REVOKE the key that run used, then" >&2
-    echo "      re-run. Refusing to continue — this check runs before any key intake." >&2
+    echo "      A prior run was interrupted before it could prove their removal. Fresh-run main," >&2
+    echo "      preflight, and keyscan containers bind-mounted an auth key when created, so a" >&2
+    echo "      surviving one may still hold a PRIOR key readable. Nothing is removed" >&2
+    echo "      automatically — inspect and remove them by hand (docker rm -f <id>)," >&2
+    echo "      REVOKE the key that run used, then re-run. Refusing before any key intake." >&2
     exit 1
   fi
+  if [[ ! -d /dev/shm || ! -r /dev/shm || ! -x /dev/shm ]]; then
+    echo "FAIL: cannot audit /dev/shm for stale key/evidence directories — refusing before any key intake." >&2
+    exit 1
+  fi
+  local d found=""
+  for d in /dev/shm/ozolith-ts-spike-key.* /dev/shm/ozolith-ts-evidence.*; do
+    if [[ -e "$d" || -L "$d" ]]; then
+      found="$found$d"$'\n'
+    fi
+  done
+  if [[ -n "$found" ]]; then
+    echo "FAIL: stale spike tmpfs debris exists:" >&2
+    printf '%s' "$found" | sed 's/^/      /' >&2
+    echo "      A key directory may hold a PRIOR auth key in plaintext; an evidence directory" >&2
+    echo "      may hold raw, unswept captures of one. A prior run died before its provable" >&2
+    echo "      cleanup could remove them. Nothing is removed automatically — inspect and" >&2
+    echo "      remove them by hand (rm -rf <dir>), REVOKE the key that run used, then re-run." >&2
+    echo "      Refusing before any key intake." >&2
+    exit 1
+  fi
+  echo "==> debris audit clean: no stale spike containers, key directories, or evidence directories"
+}
+
+warn_revoke() { # $1: value-free reason — the key must be treated as burned
+  {
+    echo "!!! ------------------------------------------------------------------ !!!"
+    echo "!!! WARNING: $1"
+    echo "!!! REVOKE THE AUTH KEY IMMEDIATELY:"
+    echo "!!! tailscale admin console -> Settings -> Keys -> revoke."
+    echo "!!! ------------------------------------------------------------------ !!!"
+  } >&2
+}
+
+scan_for_display() { # $1: captured file. rc 0: proven clean miss (safe to
+  # display); rc 1: the key value IS in the file; rc 2: cannot prove either
+  # way (missing/empty pattern or capture, or a grep error) — as unsafe as a
+  # hit, because an unscannable capture proves nothing.
+  [[ -r "$SPIKE_KEY_FILE" && -s "$SPIKE_KEY_FILE" ]] || return 2
+  [[ -r "$1" && -s "$1" ]] || return 2
+  local rc=0
+  grep -qFf "$SPIKE_KEY_FILE" "$1" || rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+fail_before_ready() { # $1: value-free reason. Never returns.
+  # The container failed before ready and the operator needs diagnostics —
+  # but scan-before-show: the log is captured into tmpfs, tri-state scanned
+  # for the exact key value, and DISPLAYED ONLY after a clean miss. On a hit
+  # or a scanner error the log is withheld, the failure stays value-free,
+  # and the key is treated as burned. A reuse run is keyless (nothing secret
+  # entered this run and no pattern file exists), so its log is shown as-is.
+  local dlog="$EVIDENCE_DIR/container-death.log" verdict=0
+  echo "FAIL: $1" >&2
+  if ! docker logs "$CONTAINER" >"$dlog" 2>&1; then
+    echo "      The container log could not be captured, so no diagnostics can be shown." >&2
+    if [[ "$MODE" == fresh ]]; then
+      warn_revoke "the failed container's log could not be captured — key absence is UNPROVEN."
+    fi
+    exit 1
+  fi
+  if [[ "$MODE" == fresh ]]; then
+    scan_for_display "$dlog" || verdict=$?
+    if [[ "$verdict" -eq 1 ]]; then
+      echo "      The captured log is WITHHELD: it contains the exact auth-key value." >&2
+      warn_revoke "the failed container's log CONTAINS the auth-key value."
+      exit 1
+    elif [[ "$verdict" -ne 0 ]]; then
+      echo "      The captured log is WITHHELD: it could not be proven key-free (scanner" >&2
+      echo "      error, or an empty/unreadable capture)." >&2
+      warn_revoke "the failed container's log could not be proven key-free."
+      exit 1
+    fi
+    echo "      Partial container log (scanned for the exact key value first — clean miss):" >&2
+  else
+    echo "      Partial container log (keyless reuse run — nothing secret entered this run):" >&2
+  fi
+  sed 's/^/      | /' "$dlog" >&2
+  echo "      Do NOT retry with --cap-add/--device: per #31 the privileged fallback is a human/ADR decision." >&2
+  exit 1
 }
 
 probe_mode() {
@@ -424,7 +594,7 @@ preflight_key_readable() {
   # the per-run name is recorded BEFORE docker run so that a partial
   # creation or a client-side failure is still cleanup-visible, and cleanup
   # later PROVES its absence — --rm alone is convenience, not proof.
-  PREFLIGHT_CONTAINER="${SCRATCH_PREFLIGHT_PREFIX}${SCRATCH_RUN_TAG}"
+  PREFLIGHT_CONTAINER="${SCRATCH_PREFLIGHT_PREFIX}${RUN_TAG}"
   if docker run --rm --name "$PREFLIGHT_CONTAINER" \
     --mount "type=bind,source=${SPIKE_KEY_FILE},target=/run/secrets/ts-authkey,readonly" \
     --entrypoint /bin/sh "$IMAGE" \
@@ -488,7 +658,7 @@ scan_state_volume() {
   # so its per-run name is recorded BEFORE docker run and cleanup PROVES
   # its absence — --rm alone is convenience, not proof.
   local rc=0 hits
-  SCAN_CONTAINER="${SCRATCH_SCAN_PREFIX}${SCRATCH_RUN_TAG}"
+  SCAN_CONTAINER="${SCRATCH_SCAN_PREFIX}${RUN_TAG}"
   set +e
   hits=$(docker run --rm --name "$SCAN_CONTAINER" \
     --mount "type=bind,source=${SPIKE_KEY_FILE},target=/run/secrets/ts-authkey,readonly" \
@@ -515,10 +685,13 @@ main() {
   cd "$(dirname "${BASH_SOURCE[0]}")"
   CONTEXT_DIR=$(pwd -P)
 
-  # Docker availability, daemon mode, and the absence of stale key-bearing
-  # scratch containers are all validated BEFORE any key intake.
+  # Ordering is the contract: run lock -> daemon checks -> debris audit ->
+  # image build -> state probe -> key intake. Nothing secret is read until
+  # this run is provably the only run and the field is provably free of any
+  # prior run's debris.
+  acquire_run_lock
   require_supported_docker
-  reject_stale_scratch_containers
+  audit_stale_debris
 
   echo "==> building the spike image (version- and sha256-pinned tailscale; see Dockerfile)"
   docker build -t "$IMAGE" .
@@ -534,7 +707,6 @@ main() {
     echo "note: reuse run — the key argument is ignored and not read" >&2
   fi
 
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   EVIDENCE_DIR=$(mktemp -d /dev/shm/ozolith-ts-evidence.XXXXXX)
 
   # Deliberately absent: --cap-add, --device, --privileged. The container gets
@@ -542,7 +714,12 @@ main() {
   # IS the experiment. On a fresh run the key reaches the container only as a
   # read-only mount of the tmpfs leaf; only its PATH appears in env/argv
   # (gate item 5). On a reuse run nothing secret is mounted at all.
-  CONTAINER_STARTED=1
+  #
+  # The main container's per-run name is recorded BEFORE docker run, like the
+  # scratch containers': the debris audit proved no name in this family
+  # exists and the lock excludes a concurrent creator, so no pre-removal of
+  # anything is needed — or allowed.
+  CONTAINER="${MAIN_PREFIX}${RUN_TAG}"
   if [[ "$MODE" == fresh ]]; then
     if [[ "$VOLUME_EXISTS" -eq 0 ]]; then
       docker volume create "$VOLUME" >/dev/null
@@ -562,31 +739,60 @@ main() {
       "$IMAGE" >/dev/null
   fi
 
-  docker logs -f "$CONTAINER" 2>&1 | tee "$EVIDENCE_DIR/container.log" &
+  # CAPTURE-ONLY log follow: the raw stream goes into the tmpfs evidence
+  # directory and nowhere else — never through tee or the terminal. No
+  # log-derived byte is printed before an exact-key scan of that same
+  # content returns a clean miss. The docker() wrapper closes the run-lock
+  # fd, so a wedged follower cannot pin the lock past this process.
+  docker logs -f "$CONTAINER" >"$EVIDENCE_DIR/container.log" 2>&1 &
   LOG_PID=$!
 
   local i=0
   until grep -q '^==> ready' "$EVIDENCE_DIR/container.log" 2>/dev/null; do
     if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != true ]]; then
-      sleep 1 # let the final log lines flush through tee
-      echo "FAIL: container exited before reaching ready — the failure above is the finding." >&2
-      echo "      Do NOT retry with --cap-add/--device: per #31 the privileged fallback is a human/ADR decision." >&2
-      exit 1
+      fail_before_ready "container exited before reaching ready — its captured log holds the finding."
     fi
     i=$((i + 1))
-    [[ "$i" -le 120 ]] || {
-      echo "FAIL: container not ready after 120s" >&2
-      exit 1
-    }
+    [[ "$i" -le 120 ]] || fail_before_ready "container not ready after 120s."
     sleep 1
   done
 
   # Argv/metadata snapshots while the daemon is live (docker top uses the
   # host's ps — the transient `tailscale up` argv carried only the file: path,
-  # visible in the log above). Every promised capture is REQUIRED: a capture
-  # failure is a run failure, never a silently skipped surface.
+  # visible in the captured log). Every promised capture is REQUIRED: a
+  # capture failure is a run failure, never a silently skipped surface.
   capture_evidence "process argv, live (docker top)" "$EVIDENCE_DIR/top-live.txt" docker top "$CONTAINER"
   capture_evidence "container env + mount metadata (docker inspect)" "$EVIDENCE_DIR/inspect.json" docker inspect "$CONTAINER"
+
+  # First display gate. The operator needs the log (tailscale status, the
+  # node's 100.x address) for the SSH-check phase, but on a fresh run
+  # nothing log-derived may print unscanned: snapshot the follower's capture
+  # so the scanned bytes and the displayed bytes are the SAME bytes, scan
+  # the snapshot, and display only on a clean miss. A hit here means the key
+  # already escaped into the log — stop immediately (the sooner revoked the
+  # better) instead of proceeding to the SSH checks. The final sweep later
+  # re-scans the FULL log after stop. A reuse run is keyless: no pattern
+  # exists and nothing secret entered this run.
+  cp "$EVIDENCE_DIR/container.log" "$EVIDENCE_DIR/container-ready.log"
+  if [[ "$MODE" == fresh ]]; then
+    local ready_verdict=0
+    scan_for_display "$EVIDENCE_DIR/container-ready.log" || ready_verdict=$?
+    if [[ "$ready_verdict" -eq 1 ]]; then
+      echo "FAIL: the running container's log ALREADY contains the exact auth-key value —" >&2
+      echo "      the log is withheld and the run stops now." >&2
+      warn_revoke "the container log contains the auth-key value."
+      exit 1
+    elif [[ "$ready_verdict" -ne 0 ]]; then
+      echo "FAIL: the running container's log could not be proven key-free (scanner error," >&2
+      echo "      or an empty/unreadable capture) — the log is withheld and the run stops now." >&2
+      warn_revoke "the container log could not be proven key-free."
+      exit 1
+    fi
+    echo "==> container log so far (scanned for the exact key value first — clean miss):"
+  else
+    echo "==> container log so far (keyless reuse run — nothing secret entered this run):"
+  fi
+  sed 's/^/    | /' "$EVIDENCE_DIR/container-ready.log"
 
   echo
   echo "==> container is up. From ANOTHER tailnet machine run the SSH checks:"
@@ -628,12 +834,22 @@ main() {
       scan_state_volume
     fi
     if [[ "$sweep_hit" -ne 0 ]]; then
-      sweep_result="FAILED — a key hit or an unscannable surface; gate item 5 does NOT pass"
-    else
-      sweep_result="passed on all six surfaces (history, inspect, argv live, argv pre-stop, log, state volume)"
+      # The evidence block below quotes container-log lines; with any swept
+      # surface holding the key (or unprovable), NO log-derived byte may be
+      # re-emitted — not even the lines the block would have selected. Fail
+      # value-free and treat the key as burned.
+      echo "FAIL: key-absence sweep FAILED — a surface held the key value or could not be" >&2
+      echo "      proven clean. Gate item 5 does NOT pass; the evidence summary block and" >&2
+      echo "      every log-derived line are WITHHELD." >&2
+      warn_revoke "a swept surface held the key value or could not be proven clean."
+      exit 1
     fi
+    sweep_result="passed on all six surfaces (history, inspect, argv live, argv pre-stop, log, state volume)"
   fi
 
+  # Reached only when the run is keyless (reuse) or every surface — the full
+  # container log included — scanned as a proven clean miss, so quoting log
+  # lines here cannot re-emit a key.
   echo
   echo "==> sanitized evidence block — paste into issue #31:"
   echo "--------------------------------------------------------------------------"
@@ -644,9 +860,6 @@ main() {
   grep -E '^==> (existing state found|empty statedir)' "$EVIDENCE_DIR/container.log" || true
   echo "key-absence sweep: $sweep_result"
   echo "--------------------------------------------------------------------------"
-  if [[ "$MODE" == fresh && "$sweep_hit" -ne 0 ]]; then
-    exit 1
-  fi
 }
 
 # Guard so test-run-spike.sh can `source` the functions above without

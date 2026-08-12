@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Shell-level regression tests for run-spike.sh and entrypoint.sh — no Docker
 # engine, tailnet, or auth key needed (docker, tailscale, and tailscaled are
-# stubbed onto PATH). Covers exactly what the gate's credibility rests on:
+# stubbed onto PATH; the run lock is the REAL flock on the real lock path).
+# Covers exactly what the gate's credibility rests on:
 #
+#   - ONE RUN AT A TIME: the flock run lock is taken before anything else and
+#     excludes a second run entirely — no key intake, no docker calls, no
+#     removal of the first run's containers; it is released on success,
+#     ordinary failure, SIGINT, and SIGTERM; after SIGKILL the kernel
+#     releases it and the next run refuses the leftover debris instead;
+#   - the DEBRIS AUDIT fails closed BEFORE any key intake: stale containers
+#     of every name generation (the legacy fixed main name and per-run
+#     main/preflight/keyscan names), stale key directories, stale evidence
+#     directories, and a failing audit query all refuse the run — and none
+#     of the debris is removed automatically;
 #   - fresh-vs-reuse is decided from ACTUAL state: absent volume -> fresh;
 #     non-empty tailscaled.state -> keyless reuse; existing volume without
 #     usable state -> fresh through the same volume (recovery, no deletion);
@@ -17,21 +28,26 @@
 #   - both sweeps are tri-state and FAIL CLOSED: grep rc 0 = secret hit
 #     (fail), rc 1 = absent (the only pass), rc >= 2 / docker failure =
 #     scanner error (fail); missing, unreadable, or empty evidence fails;
+#   - NO LOG-DERIVED OUTPUT BEFORE A CLEAN EXACT-KEY SCAN: the container log
+#     is captured into tmpfs only (never streamed); the ready-time excerpt
+#     and early-failure diagnostics print only after a clean miss of the
+#     exact bytes shown; a hit, a scanner error, or an uncapturable log
+#     withholds them with a value-free failure and the revoke-now warning;
+#     a sweep failure withholds the sanitized evidence block and every log
+#     line it would have quoted (a leak parked in an evidence-selected line
+#     included);
 #   - cleanup attempts EVERY step regardless of earlier failures and proves
 #     the absence of EVERY container that received the key bind mount — the
 #     main container plus the uid-1000 preflight and state-volume scanner
-#     scratch containers, each tracked under a per-run collision-safe name
-#     recorded BEFORE its docker run (--rm is convenience, not proof). A
-#     normally auto-removed scratch container counts as already clean, a
-#     lingering one is removed with proof, per-container rm failures and
-#     unprovable queries turn the run nonzero with the value-free revoke-now
-#     warning, later cleanup steps still run after earlier failures, an
-#     original nonzero status is preserved — exercised on normal exit,
-#     ordinary failure, and SIGINT/SIGTERM parked inside each key-bearing
-#     scratch operation;
-#   - stale key-bearing scratch containers from a prior interrupted run are
-#     rejected before any key intake, and a failing stale-check query fails
-#     closed;
+#     scratch containers, ALL tracked under per-run collision-safe names
+#     recorded BEFORE their docker run (--rm is convenience, not proof), and
+#     ONLY current-run names are ever removed. A normally auto-removed
+#     scratch container counts as already clean, a lingering one is removed
+#     with proof, per-container rm failures and unprovable queries turn the
+#     run nonzero with the value-free revoke-now warning, later cleanup
+#     steps still run after earlier failures, an original nonzero status is
+#     preserved — exercised on normal exit, ordinary failure, and
+#     SIGINT/SIGTERM parked inside each key-bearing scratch operation;
 #   - the key value never appears in the harness's own output, in any argv
 #     it passes to docker or tailscale, or in any container name.
 #
@@ -40,9 +56,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 TESTTMP=$(mktemp -d)
-trap 'rm -rf "$TESTTMP"' EXIT
+# Some tests plant real debris under /dev/shm (the paths the harness audits);
+# track those separately so an aborted test run cannot leave them behind.
+SHM_DEBRIS=()
+trap 'rm -rf "$TESTTMP" ${SHM_DEBRIS[@]+"${SHM_DEBRIS[@]}"}' EXIT
 STUB=$TESTTMP/bin
 mkdir -p "$STUB"
+
+# The harness locks the REAL lock path — these tests exercise the real flock.
+LOCKFILE=/dev/shm/ozolith-ts-spike.lock
+command -v flock >/dev/null || { echo "FATAL: these tests need util-linux flock (the harness does too)" >&2; exit 1; }
 
 # --- the docker stub -------------------------------------------------------
 # Stateful when DOCKER_STUB_COUNTER_DIR is set: created containers are
@@ -69,8 +92,13 @@ mkdir -p "$STUB"
 #   DOCKER_STUB_RM_FAIL_MATCH    docker rm fails (rc 1) for names containing this substring
 #   DOCKER_STUB_RM_KEEP          1 = docker rm reports success but the container survives
 #   DOCKER_STUB_PS_RC            exact-name queries (name=^...$; the absence proofs) fail
-#   DOCKER_STUB_PS_PREFIX_RC     prefix-name queries (the stale-scratch check) fail
-#   DOCKER_STUB_LEAK             injected into the container log
+#   DOCKER_STUB_PS_PREFIX_RC     prefix-name queries (the debris audit) fail
+#   DOCKER_STUB_RUNNING          docker inspect .State.Running answer (default true)
+#   DOCKER_STUB_NO_READY         1 = the container log omits the "==> ready" line
+#   DOCKER_STUB_LOGS_RC          docker logs rc (the log cannot be captured)
+#   DOCKER_STUB_LEAK             injected into every container-log emission
+#   DOCKER_STUB_LEAK_LATE        injected only into NON-follow docker logs output —
+#                                simulates a leak arriving after the ready-time snapshot
 #   DOCKER_STUB_COUNTER_DIR      per-run scratch for stub state (top counter, container records)
 #   DOCKER_STUB_CALLS            file logging every stubbed docker argv
 cat >"$STUB/docker" <<'STUBEOF'
@@ -162,6 +190,12 @@ case "$cmd" in
         echo stub-container-id; exit 0 ;;
     esac ;;
   logs)
+    if [ "${DOCKER_STUB_LOGS_RC:-0}" != 0 ]; then
+      echo "stub: docker logs failed" >&2
+      exit "${DOCKER_STUB_LOGS_RC}"
+    fi
+    follow=0
+    for a in "$@"; do [ "$a" = "-f" ] && follow=1; done
     if [ "${DOCKER_STUB_STATE_RC:-1}" = 0 ]; then
       branch="==> existing state found: non-empty tailscaled.state — reusing identity, no auth key (gate item 3)"
     else
@@ -175,13 +209,16 @@ case "$cmd" in
 $branch
 ==> up; status:
 100.64.0.9 spike ozolith@ linux -
-==> ready — from another tailnet machine: ssh ozolith@spike
 ${DOCKER_STUB_LEAK:-}
 EOF
+    [ "${DOCKER_STUB_NO_READY:-0}" = 1 ] || echo "==> ready — from another tailnet machine: ssh ozolith@spike"
+    if [ "$follow" = 0 ] && [ -n "${DOCKER_STUB_LEAK_LATE:-}" ]; then
+      printf '%s\n' "$DOCKER_STUB_LEAK_LATE"
+    fi
     exit 0 ;;
   inspect)
     case "$*" in
-      *State.Running*) echo true ;;
+      *State.Running*) echo "${DOCKER_STUB_RUNNING:-true}" ;;
       *) echo '[{"Config":{"Env":["TS_AUTHKEY_FILE=/run/secrets/ts-authkey"]},"Mounts":[{"Destination":"/run/secrets/ts-authkey"}]}]' ;;
     esac
     exit 0 ;;
@@ -342,7 +379,7 @@ run_cleanup() { # $1: simulated exit status, $2: evidence dir or "", $3: key dir
     EVIDENCE_DIR=$2
     SPIKE_KEY_DIR=$3
     LOG_PID=""
-    CONTAINER_STARTED=0
+    CONTAINER=""
     (exit "$1")
     cleanup
   ) 2>&1
@@ -367,7 +404,7 @@ out=$(
     echo "logpid=$LOG_PID"
     EVIDENCE_DIR=""
     SPIKE_KEY_DIR=""
-    CONTAINER_STARTED=0
+    CONTAINER=""
     (exit 0)
     cleanup
   ) 2>&1
@@ -499,6 +536,17 @@ key_dirs() { compgen -G '/dev/shm/ozolith-ts-spike-key.*' || true; }
 assert_no_new_key_dirs() { # $1: description, $2: dirs before
   [[ "$(key_dirs)" == "$2" ]] && pass "$1" || fail "$1"
 }
+assert_lock_free() { # $1: description — the run lock must not be held
+  flock -n "$LOCKFILE" true 2>/dev/null && pass "$1" || fail "$1"
+}
+lock_released_within() { # $1: seconds — poll until the run lock is free
+  local i
+  for ((i = 0; i < $1 * 10; i++)); do
+    flock -n "$LOCKFILE" true 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
 run_e2e() { # $1: out-file, then env overrides as NAME=VALUE...; stdin = key
   local out=$1
   shift
@@ -517,29 +565,95 @@ before=$(key_dirs)
 rc=0
 printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-normal" DOCKER_STUB_CALLS="$TESTTMP/calls-normal" || rc=$?
 [[ "$rc" -eq 0 ]] && pass "exits 0" || fail "exits 0 (got $rc)"
+expect_grep "the run lock is taken first" "$TESTTMP/out-normal" "run lock acquired"
+expect_grep "the debris audit ran clean" "$TESTTMP/out-normal" "debris audit clean"
 expect_grep "daemon mode positively verified" "$TESTTMP/out-normal" "ordinary root daemon"
 expect_grep "absent volume selects the fresh path" "$TESTTMP/out-normal" "FRESH run"
 expect_grep "uid-1000 readability preflight ran" "$TESTTMP/out-normal" "readable as uid 1000"
+expect_grep "the ready-time excerpt is scan-gated" "$TESTTMP/out-normal" "scanned for the exact key value first — clean miss"
+expect_grep "the scanned-clean log content is then shown" "$TESTTMP/out-normal" "100.64.0.9"
 expect_grep "sweep passed on all six surfaces" "$TESTTMP/out-normal" "key-absence sweep: passed on all six surfaces"
 expect_grep "evidence records the exact version" "$TESTTMP/out-normal" "tailscale version: 1.102.2"
-expect_grep "container removal is proven" "$TESTTMP/out-normal" "container removed (proof"
+expect_grep "main container runs under a per-run name" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-main-"
+expect_grep "main-container removal proven under the per-run name" "$TESTTMP/out-normal" "main container removed (proof"
 expect_grep "auto-removed preflight scratch counts as already clean" "$TESTTMP/out-normal" "preflight container already absent (proof"
 expect_grep "auto-removed scanner scratch counts as already clean" "$TESTTMP/out-normal" "state-scanner container already absent (proof"
 expect_grep "preflight scratch run is named for tracking" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-preflight-"
 expect_grep "scanner scratch run is named for tracking" "$TESTTMP/calls-normal" "--name ozolith-ts-spike-keyscan-"
 expect_grep "cleanup proof printed" "$TESTTMP/out-normal" "temporary key directory removed (proof"
 expect_grep "the fresh volume is created" "$TESTTMP/calls-normal" "volume create"
+if grep -E 'docker rm -f ozolith-ts-spike($| )' "$TESTTMP/calls-normal" | grep -q .; then
+  fail "the legacy fixed name is never removed (no unconditional docker rm)"
+else
+  pass "the legacy fixed name is never removed (no unconditional docker rm)"
+fi
+if grep -E '^docker rm ' "$TESTTMP/calls-normal" \
+  | grep -Ev ' ozolith-ts-spike-(main|preflight|keyscan)-[0-9]+-[0-9]+$' | grep -q .; then
+  fail "every docker rm targets a current-run per-run name only"
+else
+  pass "every docker rm targets a current-run per-run name only"
+fi
 expect_not_grep "key value never printed by the harness" "$TESTTMP/out-normal" "$KEY"
 expect_not_grep "key value never enters any docker argv" "$TESTTMP/calls-normal" "$KEY"
 assert_no_new_key_dirs "key directory gone after normal exit" "$before"
+assert_lock_free "the run lock is released after a successful run"
 
-echo "== end-to-end: a leaked key is caught and fails the run"
+echo "== end-to-end: a key already in the log is caught at the FIRST display gate"
 rc=0
 printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-leak" DOCKER_STUB_LEAK="$KEY" || rc=$?
 expect_nonzero "exits non-zero on a hit" "$rc"
-expect_grep "the hit surface is named" "$TESTTMP/out-leak" "FAIL: key value found in full container log"
-expect_grep "sweep reported FAILED" "$TESTTMP/out-leak" "key-absence sweep: FAILED"
-assert_no_new_key_dirs "key directory gone after sweep failure" "$before"
+expect_grep "the hit is caught before anything log-derived prints" "$TESTTMP/out-leak" "ALREADY contains the exact auth-key value"
+expect_grep "immediate revocation is demanded" "$TESTTMP/out-leak" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_not_grep "the key value itself never prints" "$TESTTMP/out-leak" "$KEY"
+expect_not_grep "no log content is displayed at all" "$TESTTMP/out-leak" "100.64.0.9"
+expect_not_grep "no evidence block on a withheld log" "$TESTTMP/out-leak" "sanitized evidence block"
+expect_grep "cleanup proof still printed" "$TESTTMP/out-leak" "temporary key directory removed (proof"
+assert_no_new_key_dirs "key directory gone after ready-time hit" "$before"
+assert_lock_free "the run lock is released after a ready-time hit"
+
+echo "== end-to-end: a LATE leak in an evidence-selected line is withheld with the block"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-leaklate" \
+  DOCKER_STUB_LEAK_LATE="==> running as uid 1000 leaked $KEY" || rc=$?
+expect_nonzero "exits non-zero on a late hit" "$rc"
+expect_grep "the ready-time snapshot was still clean" "$TESTTMP/out-leaklate" "scanned for the exact key value first — clean miss"
+expect_grep "the sweep names the hit surface" "$TESTTMP/out-leaklate" "FAIL: key value found in full container log"
+expect_grep "the sweep failure withholds the block" "$TESTTMP/out-leaklate" "key-absence sweep FAILED"
+expect_grep "immediate revocation is demanded" "$TESTTMP/out-leaklate" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_not_grep "the evidence block is withheld" "$TESTTMP/out-leaklate" "sanitized evidence block"
+expect_not_grep "the selected uid line is withheld too" "$TESTTMP/out-leaklate" "leaked"
+expect_not_grep "the key value itself never prints" "$TESTTMP/out-leaklate" "$KEY"
+assert_no_new_key_dirs "key directory gone after late-leak failure" "$before"
+
+echo "== end-to-end: early container failure — diagnostics only after a clean scan"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-earlyclean" DOCKER_STUB_NO_READY=1 \
+  DOCKER_STUB_RUNNING=false || rc=$?
+expect_nonzero "early exit fails the run" "$rc"
+expect_grep "the early failure is named" "$TESTTMP/out-earlyclean" "container exited before reaching ready"
+expect_grep "the partial log is scanned before display" "$TESTTMP/out-earlyclean" "scanned for the exact key value first — clean miss"
+expect_grep "the clean partial log IS displayed" "$TESTTMP/out-earlyclean" "100.64.0.9"
+expect_grep "cleanup proof after early failure" "$TESTTMP/out-earlyclean" "temporary key directory removed (proof"
+
+echo "== end-to-end: early failure with a leaking log is withheld, value-free"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-earlyleak" DOCKER_STUB_NO_READY=1 \
+  DOCKER_STUB_RUNNING=false DOCKER_STUB_LEAK="$KEY" || rc=$?
+expect_nonzero "early exit with a leak fails the run" "$rc"
+expect_grep "the log is withheld on a hit" "$TESTTMP/out-earlyleak" "WITHHELD: it contains the exact auth-key value"
+expect_grep "immediate revocation is demanded" "$TESTTMP/out-earlyleak" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_not_grep "the key value itself never prints" "$TESTTMP/out-earlyleak" "$KEY"
+expect_not_grep "no log content is displayed" "$TESTTMP/out-earlyleak" "100.64.0.9"
+
+echo "== end-to-end: early failure whose log cannot be captured is withheld, value-free"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-earlynolog" DOCKER_STUB_NO_READY=1 \
+  DOCKER_STUB_RUNNING=false DOCKER_STUB_LOGS_RC=1 || rc=$?
+expect_nonzero "an uncapturable early-failure log fails the run" "$rc"
+expect_grep "the missing capture is named" "$TESTTMP/out-earlynolog" "could not be captured"
+expect_grep "immediate revocation is demanded" "$TESTTMP/out-earlynolog" "REVOKE THE AUTH KEY IMMEDIATELY"
+expect_not_grep "no log content is displayed" "$TESTTMP/out-earlynolog" "100.64.0.9"
+assert_no_new_key_dirs "key directory gone after the early-failure trio" "$before"
 
 echo "== end-to-end: valid retained state -> keyless reuse"
 rc=0
@@ -627,7 +741,7 @@ printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-scanlinger" DOCKER_STUB_VOLSCAN_RC=
 expect_nonzero "scanner docker failure exits non-zero (sweep fails closed)" "$rc"
 expect_grep "the sweep records the scanner error" "$TESTTMP/out-scanlinger" "state-volume scanner error (rc=125)"
 expect_grep "the lingering scanner scratch is removed WITH proof" "$TESTTMP/out-scanlinger" "state-scanner container removed (proof"
-expect_grep "the main container was still cleaned too" "$TESTTMP/out-scanlinger" "==> container removed (proof"
+expect_grep "the main container was still cleaned too" "$TESTTMP/out-scanlinger" "==> main container removed (proof"
 expect_grep "key-dir proof still printed" "$TESTTMP/out-scanlinger" "temporary key directory removed (proof"
 assert_no_new_key_dirs "key directory gone after lingering scanner" "$before"
 
@@ -653,27 +767,54 @@ expect_nonzero "scanner-scratch rm failure turns a passing run non-zero" "$rc"
 expect_grep "the scanner rm failure is recorded" "$TESTTMP/out-scanrmfail" "CLEANUP FAIL: docker rm -f ozolith-ts-spike-keyscan-"
 expect_grep "the surviving scanner scratch is loud" "$TESTTMP/out-scanrmfail" "STILL EXISTS after docker rm -f"
 expect_grep "unproven scratch removal demands revocation" "$TESTTMP/out-scanrmfail" "REVOKE THE AUTH KEY IMMEDIATELY"
-expect_grep "the earlier main-container step had run" "$TESTTMP/out-scanrmfail" "==> container removed (proof"
+expect_grep "the earlier main-container step had run" "$TESTTMP/out-scanrmfail" "==> main container removed (proof"
 expect_grep "the key-dir step still ran after the failure" "$TESTTMP/out-scanrmfail" "temporary key directory removed (proof"
 assert_no_new_key_dirs "key directory gone despite scanner rm failure" "$before"
 
-echo "== end-to-end: stale key-bearing scratch containers are rejected before key intake"
-staledir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
-printf 'ozolith-ts-spike-preflight-9999-42\n' >"$staledir/containers"
-rc=0
-printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-stale" DOCKER_STUB_COUNTER_DIR="$staledir" || rc=$?
-expect_nonzero "a stale scratch container refuses the run" "$rc"
-expect_grep "the stale debris is named" "$TESTTMP/out-stale" "stale key-bearing scratch container"
-expect_grep "the operator is told to revoke the prior key" "$TESTTMP/out-stale" "REVOKE the key that run used"
-expect_not_grep "refusal happens before any key intake" "$TESTTMP/out-stale" "temporary key directory"
-assert_no_new_key_dirs "no key directory on stale-scratch refusal" "$before"
+echo "== end-to-end: stale containers of EVERY name generation are rejected before key intake"
+for stalename in ozolith-ts-spike ozolith-ts-spike-main-9999-42 \
+  ozolith-ts-spike-preflight-9999-42 ozolith-ts-spike-keyscan-9999-42; do
+  staledir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+  printf '%s\n' "$stalename" >"$staledir/containers"
+  rc=0
+  printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-stale" DOCKER_STUB_COUNTER_DIR="$staledir" \
+    DOCKER_STUB_CALLS="$TESTTMP/calls-stale" || rc=$?
+  expect_nonzero "a stale $stalename container refuses the run" "$rc"
+  expect_grep "the stale debris is named ($stalename)" "$TESTTMP/out-stale" "stale spike container"
+  expect_grep "the operator is told to revoke the prior key ($stalename)" "$TESTTMP/out-stale" "REVOKE the key that run used"
+  expect_not_grep "refusal happens before any key intake ($stalename)" "$TESTTMP/out-stale" "temporary key directory"
+  expect_not_grep "the stale container is NOT auto-removed ($stalename)" "$TESTTMP/calls-stale" "docker rm"
+  grep -qxF "$stalename" "$staledir/containers" \
+    && pass "the debris still exists afterwards ($stalename)" \
+    || fail "the debris still exists afterwards ($stalename)"
+  rm -f "$TESTTMP/calls-stale"
+done
+assert_no_new_key_dirs "no key directory on stale-container refusal" "$before"
 
+echo "== end-to-end: a failing debris-audit query fails closed before key intake"
 rc=0
 printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-staleq" DOCKER_STUB_PS_PREFIX_RC=1 || rc=$?
-expect_nonzero "a failing stale-scratch query fails closed" "$rc"
-expect_grep "the stale-query failure is named" "$TESTTMP/out-staleq" "cannot check for stale key-bearing scratch containers"
-expect_not_grep "no key intake on a stale-query failure" "$TESTTMP/out-staleq" "temporary key directory"
-assert_no_new_key_dirs "no key directory on a stale-query failure" "$before"
+expect_nonzero "a failing debris query fails closed" "$rc"
+expect_grep "the audit-query failure is named" "$TESTTMP/out-staleq" "cannot audit for stale spike containers"
+expect_not_grep "no key intake on an audit-query failure" "$TESTTMP/out-staleq" "temporary key directory"
+assert_no_new_key_dirs "no key directory on an audit-query failure" "$before"
+
+echo "== end-to-end: stale tmpfs key/evidence directories are rejected before key intake"
+for pattern in /dev/shm/ozolith-ts-spike-key.XXXXXX /dev/shm/ozolith-ts-evidence.XXXXXX; do
+  fakedir=$(mktemp -d "$pattern")
+  SHM_DEBRIS+=("$fakedir")
+  rc=0
+  printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-shmdebris" \
+    DOCKER_STUB_CALLS="$TESTTMP/calls-shmdebris" || rc=$?
+  expect_nonzero "stale $pattern debris refuses the run" "$rc"
+  expect_grep "the tmpfs debris is named ($pattern)" "$TESTTMP/out-shmdebris" "stale spike tmpfs debris"
+  expect_grep "the operator is told to revoke the prior key ($pattern)" "$TESTTMP/out-shmdebris" "REVOKE the key that run used"
+  expect_not_grep "refusal happens before any key intake ($pattern)" "$TESTTMP/out-shmdebris" "temporary key directory"
+  expect_not_grep "no container is ever run or removed ($pattern)" "$TESTTMP/calls-shmdebris" "docker rm"
+  [[ -d "$fakedir" ]] && pass "the tmpfs debris was NOT auto-removed ($pattern)" \
+    || fail "the tmpfs debris was NOT auto-removed ($pattern)"
+  rm -rf "$fakedir" "$TESTTMP/calls-shmdebris"
+done
 
 echo "== end-to-end: every promised docker top capture is required"
 rc=0
@@ -722,6 +863,7 @@ printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-fail" DOCKER_STUB_BUILD_RC=1 || rc=
 expect_nonzero "exits non-zero" "$rc"
 expect_not_grep "no key was read before the build" "$TESTTMP/out-fail" "temporary key directory"
 assert_no_new_key_dirs "no key directory after a pre-key failure" "$before"
+assert_lock_free "the run lock is released after an ordinary failure"
 
 for sig in INT TERM; do
   want=$([[ "$sig" == INT ]] && echo 130 || echo 143)
@@ -757,13 +899,76 @@ for sig in INT TERM; do
     expect_grep "preflight scratch absence proven on SIG$sig ($phase)" "$out" "preflight container already absent (proof"
     if [[ "$phase" == keyscan ]]; then
       expect_grep "scanner scratch absence proven on SIG$sig" "$out" "state-scanner container already absent (proof"
-      expect_grep "main-container removal proven on SIG$sig" "$out" "==> container removed (proof"
+      expect_grep "main-container removal proven on SIG$sig" "$out" "==> main container removed (proof"
     fi
     expect_grep "cleanup proof printed on SIG$sig ($phase)" "$out" "temporary key directory removed (proof"
     expect_not_grep "no key value in SIG$sig ($phase) output" "$out" "$KEY"
     assert_no_new_key_dirs "key directory gone after SIG$sig ($phase)" "$before"
+    assert_lock_free "the run lock is released after SIG$sig ($phase)"
   done
 done
+
+echo "== end-to-end: a live run's lock excludes a second run entirely"
+cdir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+marker=$TESTTMP/marker.lock
+rm -f "$marker"
+printf '%s\n' "$KEY" | env PATH="$STUB:$PATH" SPIKE_NONINTERACTIVE=1 SPIKE_SSH_WAIT_SECS=1 \
+  DOCKER_STUB_COUNTER_DIR="$cdir" DOCKER_STUB_PREFLIGHT_SLEEP=4 \
+  DOCKER_STUB_PREFLIGHT_MARKER="$marker" ./run-spike.sh >"$TESTTMP/out-lock1" 2>&1 &
+lockpid=$!
+for _ in $(seq 1 100); do [[ -e "$marker" ]] && break; sleep 0.1; done
+[[ -e "$marker" ]] && pass "run 1 parked inside its preflight, lock held" \
+  || fail "run 1 parked inside its preflight, lock held"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-lock2" DOCKER_STUB_CALLS="$TESTTMP/calls-lock2" || rc=$?
+expect_nonzero "a second run is refused while the first is live" "$rc"
+expect_grep "the refusal names the held lock" "$TESTTMP/out-lock2" "another run of this harness holds the run lock"
+expect_not_grep "the second run never reached key intake" "$TESTTMP/out-lock2" "temporary key directory"
+if [[ -s "$TESTTMP/calls-lock2" ]]; then
+  fail "the second run made no docker calls at all (no run, no rm of run 1's containers)"
+else
+  pass "the second run made no docker calls at all (no run, no rm of run 1's containers)"
+fi
+rc=0
+wait "$lockpid" || rc=$?
+[[ "$rc" -eq 0 ]] && pass "run 1 completed normally after the refused second run" \
+  || fail "run 1 completed normally after the refused second run (got $rc)"
+expect_grep "run 1's sweep still passed" "$TESTTMP/out-lock1" "key-absence sweep: passed"
+assert_lock_free "the run lock is released after run 1 finished"
+assert_no_new_key_dirs "no key-directory debris after the concurrency test" "$before"
+
+echo "== end-to-end: SIGKILL releases the OS lock; the NEXT run refuses the debris"
+cdir=$(mktemp -d "$TESTTMP/stubstate.XXXXXX")
+marker=$TESTTMP/marker.sigkill
+rm -f "$marker"
+printf '%s\n' "$KEY" | env PATH="$STUB:$PATH" SPIKE_NONINTERACTIVE=1 SPIKE_SSH_WAIT_SECS=1 \
+  DOCKER_STUB_COUNTER_DIR="$cdir" DOCKER_STUB_PREFLIGHT_SLEEP=4 \
+  DOCKER_STUB_PREFLIGHT_MARKER="$marker" ./run-spike.sh >"$TESTTMP/out-sigkill" 2>&1 &
+killpid=$!
+for _ in $(seq 1 100); do [[ -e "$marker" ]] && break; sleep 0.1; done
+[[ -e "$marker" ]] && pass "run parked inside its preflight with real key material on disk" \
+  || fail "run parked inside its preflight with real key material on disk"
+kill -9 "$killpid"
+rc=0
+wait "$killpid" || rc=$?
+[[ "$rc" -eq 137 ]] && pass "SIGKILL leaves exit 137 (no trap could run)" \
+  || fail "SIGKILL leaves exit 137 (no trap could run) (got $rc)"
+lock_released_within 10 && pass "the kernel released the lock after SIGKILL" \
+  || fail "the kernel released the lock after SIGKILL"
+[[ "$(key_dirs)" != "$before" ]] && pass "SIGKILL left key-directory debris behind (cleanup never ran)" \
+  || fail "SIGKILL left key-directory debris behind (cleanup never ran)"
+rc=0
+printf '%s\n' "$KEY" | run_e2e "$TESTTMP/out-postkill" || rc=$?
+expect_nonzero "the next run refuses the SIGKILL debris" "$rc"
+expect_grep "the stale key directory is named" "$TESTTMP/out-postkill" "stale spike tmpfs debris"
+expect_grep "the operator is told to revoke the prior key" "$TESTTMP/out-postkill" "REVOKE the key that run used"
+expect_not_grep "no key intake with debris present" "$TESTTMP/out-postkill" "temporary key directory removed"
+[[ "$(key_dirs)" != "$before" ]] && pass "the debris was NOT auto-removed by the next run" \
+  || fail "the debris was NOT auto-removed by the next run"
+for d in $(key_dirs); do
+  printf '%s\n' "$before" | grep -qxF -- "$d" || rm -rf "$d"
+done
+assert_no_new_key_dirs "SIGKILL debris cleaned up by the test itself" "$before"
 
 echo
 if [[ "$fails" -ne 0 ]]; then
