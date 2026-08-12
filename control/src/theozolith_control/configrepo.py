@@ -172,7 +172,11 @@ class WorkerTypeDef:
     model: str = ""  # "" = the driver's shipped default
     workspace: str = ""  # target repo, owner/name (required with driver)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
-    command: str = ""  # driverless only: container start command
+    # driverless only: the container's FULL start command — the daemon runs
+    # it via --entrypoint, overriding any ENTRYPOINT the base image carries
+    # (a derived run image inherits the harness entrypoint; the Flight Deck
+    # must start its own script instead, never hand it to the harness as argv)
+    command: str = ""
     volumes: tuple[str, ...] = ()  # driverless only
 
     @property
@@ -243,8 +247,10 @@ class StackDef:
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
     # process kind: the supervised argv string. Container kind (single-image
-    # form only): an optional docker-run command — how the Flight Deck
-    # starts its named tmux session (ADR-0019).
+    # form only): an optional FULL start command — executed via --entrypoint,
+    # replacing any ENTRYPOINT the image inherited — which is how the Flight
+    # Deck starts its named tmux session (ADR-0019) despite the base run
+    # image's harness entrypoint.
     command: str = ""
     image: str = ""  # container kind, single-image form
     ports: tuple[str, ...] = ()

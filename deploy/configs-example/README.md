@@ -5,7 +5,7 @@ A complete, minimal Config Repo (ADR-0006): copy it to your Control Node's
 Reviewer) as process Stacks, one **Flight Deck** as an interactive container
 Stack, and one **custom driver** (`hello-logger`, staged at `state = "stopped"`)
 demonstrating ADR-0042. Everything with a placeholder — image digests, the
-knowledge URL, secret values — is yours to fill in.
+knowledge URL, the tailscale checksum, secret values — is yours to fill in.
 
 ## Custom drivers (`drivers/`, ADR-0042)
 
@@ -23,17 +23,182 @@ product never carries (the guardrail test enforces that boundary): network
 transports, site-specific wiring, and the Flight Deck's baked start sequence
 all live here, never in product code or images.
 
-## Reaching a Flight Deck
+## Flight Deck one-hop access (tailscale)
 
-Attach from the Control Node's **web terminal** (the Stack's `attach` argv in
-`stacks/flightdeck.toml`), or SSH to the node's host and `docker exec` into the
-container — two hops.
+SSH/VSCode into a Flight Deck normally takes two hops: into the node's host,
+then `docker exec` into the container. The Flight Deck bakes a userspace
+`tailscaled` so each instance is its **own tailnet machine** — reach it in ONE
+hop:
 
-**One-hop remote access** (SSH/VSCode straight into the container as
-`ozolith`, issue #20 §1) is not wired in this example yet: it is gated on the
-issue #24 Step 0 privilege spike (userspace networking as uid-1000 with no
-added capabilities), which needs a Docker-capable box to run. The split-out
-work — including the settled enrollment-key policy (a reusable, tagged,
-ACL-bounded key stored encrypted control-side, delivered read-only from tmpfs,
-never durable plaintext) and the required container start lifecycle — is
-tracked as **issue #31**.
+```sh
+ssh ozolith@flightdeck-box1          # Tailscale SSH; lands as ozolith in the container
+```
+
+and in VSCode: **Remote-SSH → Connect to Host → `ozolith@flightdeck-box1`**.
+The hostname is the Stack's `FLIGHTDECK_TS_HOSTNAME` (`stacks/flightdeck.toml`),
+convention `flightdeck-<name>`; MagicDNS resolves it on your tailnet. Userspace
+networking needs no TUN device, no `NET_ADMIN`, and no `devices`/`cap_add`
+passthrough — `tailscaled` itself runs as the unprivileged `ozolith` uid, so a
+tailnet ACL mistake can never yield more than an `ozolith` session. The
+uid-1000 capability-free path is gate-verified (issue #31 evidence). Note the
+deliberate scope: **inbound** Tailscale SSH is the use case; outbound dials
+from inside the container to the tailnet would need the userspace SOCKS5/HTTP
+proxy and are not wired.
+
+### Pin a supported binary
+
+`worker-types/flightdeck.toml` pins the static binaries twice: `TS_VERSION`
+(shipped at **1.102.2** — the exact release the #31 gate evidence was produced
+with, via the `spikes/issue-31-tailscale-uid1000/` harness) and a SHA-256 that
+ships as a FAIL-CLOSED placeholder. Before the first build:
+
+- confirm the pinned release is still **currently supported** by Tailscale and
+  pick current stable if it is not; never select a release below **1.98.9**
+  (security floor). If you move off the pinned version, the gate evidence no
+  longer covers the binary you ship — re-run the spike harness on it;
+- paste the official SHA-256 for your arch/version from
+  <https://pkgs.tailscale.com/stable/> over the placeholder. The build stops
+  until you do; an unverified binary is never installed.
+
+### Mint the enrollment key
+
+In the Tailscale admin console, mint **one** auth key that is:
+
+- **reusable** — the same key re-enrolls any Flight Deck of this type, and
+  re-enrolls one whose state volume was wiped;
+- **tagged** `tag:flightdeck` — identity comes from the tag, not a user;
+- **ACL-bounded** — the tag's ACLs are the whole blast radius.
+
+Store it once as the named secret the worker type references:
+
+```sh
+theozolith secret set flightdeck-tailscale-authkey   # paste the tskey-auth… value
+```
+
+It is delivered by the standard machinery only: encrypted at rest → node-scoped
+TLS pull → host tmpfs → read-only mount at `/run/secrets/…`, referenced as
+`TS_AUTHKEY_FILE`. It is consumed **only while the enrollment completion
+marker is absent** from the tailscale-state volume (first enrollment, a retry
+after a failed or interrupted attempt, or after deliberate state loss);
+thereafter identity lives on `{stack}-tailscale-state` and survives image
+rebuilds. There is no durable copy of the key anywhere but the encrypted store
+and that tmpfs, which evaporates with the daemon/reboot. **Hardening:** once
+every Flight Deck of the type has **enrolled successfully** (its container
+reached the running session at least once), remove the `TS_AUTHKEY` line from
+the worker type's `[secrets]`.
+
+### Enrollment completion is an explicit marker, not the state file
+
+A non-empty `tailscaled.state` is *not* proof of successful enrollment:
+`tailscaled` writes its machine key before auth-key registration completes, so
+a **rejected** enrollment (bad or expired key, rejected flags) leaves a
+non-empty state file behind. `flightdeck-start` therefore decides enrollment
+from an Ozolith-owned completion marker
+(`/var/lib/tailscale/.theozolith-enrolled-v1`, on the same state volume):
+
+- **marker present** → reuse the existing identity, no `TS_AUTHKEY_FILE`
+  needed (the remove-the-mapping hardening keeps working);
+- **marker absent** → require a readable `TS_AUTHKEY_FILE` and run the fresh
+  enrollment path — *even over a non-empty `tailscaled.state`* left by a prior
+  failed attempt, so Docker's restart policy (or a corrected key) retries
+  enrollment instead of dead-ending on keyless reuse. The state file itself is
+  never deleted or rewritten automatically.
+
+The marker is promoted **atomically** (temp file + same-volume rename), and
+only after `tailscale up` returns success — a crash mid-write can never leave
+a false success marker. If the container is interrupted *after* successful
+enrollment but *before* promotion, the next start simply re-enrolls: the key
+is reusable, so this is safe (at worst the admin console shows a machine
+re-registering). State-volume loss removes state and marker together, which
+correctly returns the instance to deliberate enrollment.
+
+### Tailnet ACLs
+
+Two independent layers must BOTH allow the connection on a deny-by-default
+tailnet: a **network-layer grant** (may TCP/22 packets reach the machine at
+all?) and an **SSH authorization rule** (who may the session become?). A
+policy carrying only the `ssh` rule silently fails once the default
+allow-all grant is removed. In your tailnet policy file:
+
+```jsonc
+{
+  "tagOwners": {
+    "tag:flightdeck": ["autogroup:admin"]   // who may mint tag:flightdeck keys
+  },
+  // Layer 1 — network access: least-privilege grant, the SSH port only.
+  "grants": [
+    {
+      "src": ["autogroup:member"],          // tighten: a dedicated operator group
+      "dst": ["tag:flightdeck"],
+      "ip":  ["tcp:22"]
+    }
+  ],
+  // Layer 2 — SSH authorization: who lands, and as which user.
+  "ssh": [
+    {
+      "action": "accept",                    // the deliberate tradeoff — see below
+      "src":    ["autogroup:member"],        // keep in lockstep with the grant
+      "dst":    ["tag:flightdeck"],
+      "users":  ["ozolith"]                  // sessions land as the container's ozolith
+    }
+  ]
+}
+```
+
+Narrow `src` in BOTH rules to the smallest set of identities that actually
+operate Flight Decks (a dedicated `group:flightdeck-operators` beats
+`autogroup:member`), and add `sshTests` for those identities so a policy edit
+that would revoke — or broaden — access fails at policy-check time instead of
+in production.
+
+On `action`: `check` asks nothing of the destination — it re-authenticates
+the **initiating** user (a browser prompt on the machine you SSH *from*) when
+a connection is new or its `checkPeriod` has lapsed, so a headless Flight
+Deck is fully compatible with it. `accept` is used here as a deliberate,
+weaker-verification choice: it avoids those interactive check-ins on
+new/check-expired connections (IDE remoting reconnects often), at the cost of
+never re-verifying the human behind the initiating device. If periodic
+re-verification matters more to you than uninterrupted reconnects, use
+`check` with a `checkPeriod` you can live with — either way, keep the blast
+radius small with a tight `src` and the `tag:flightdeck` ACLs.
+
+MagicDNS must be enabled for `ssh ozolith@flightdeck-<name>` to resolve; without
+it, use the tailnet IP.
+
+### Start lifecycle: every failure is a failed container
+
+`flightdeck-start` (baked by the worker type's setup) is deliberately
+fail-fast — a Flight Deck that cannot bring up its knowledge clone AND its
+tailnet access exits non-zero immediately, and Docker's restart policy owns
+any retry. There is no in-container retry loop and no "running but
+unreachable" state:
+
+- enrollment vs. reuse is decided from the completion marker (see above)
+  **before** `tailscaled` launches — the two branches cannot be misrouted by a
+  startup race, and a failed prior enrollment cannot be mistaken for a
+  reusable identity;
+- a fresh enrollment with the auth-key secret missing fails fast with its own
+  message (see re-enrollment below);
+- the daemon gets a bounded readiness wait; a daemon that dies while starting
+  is detected immediately;
+- `tailscale up` gets one **bounded** attempt — bounded by the CLI's native
+  `--timeout=30s`, because its default is to wait for Running state forever:
+  an invalid or expired key fails immediately, and a tailnet that never
+  reaches Running fails at the 30-second bound instead of hanging the start;
+- after startup, a supervisor watches both `tailscaled` and the tmux session:
+  if the daemon dies, the container fails (a restart restores one-hop access);
+  if the session ends, the container stops cleanly.
+
+### State-volume loss ⇒ new machine identity
+
+`{stack}-tailscale-state` (`/var/lib/tailscale`) IS the tailnet machine
+identity. Delete or recreate it and the Flight Deck re-enrolls with the stored
+reusable key on next start as a **new** tailnet machine — the old one lingers in
+the admin console as a stale, offline entry. Prune it there (Machines → the old
+`flightdeck-<name>` → Delete). This is expected after a deliberate state reset;
+it is not an error.
+
+If you applied the hardening (removed the `TS_AUTHKEY` mapping) **and** the
+state volume is gone, the fresh start fails fast with a distinct message:
+restore the `TS_AUTHKEY` line in the worker type's `[secrets]`, restart the
+Stack to re-enroll, then remove the line again.

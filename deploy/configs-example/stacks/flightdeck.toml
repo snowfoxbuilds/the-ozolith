@@ -12,7 +12,14 @@ state = "running"
 # a structured argv array ({host}/{container} only as complete arguments,
 # validated before launch). Attach and detach are audit-logged. `attach`
 # lives on the Stack (a per-placement operator concern), and is only valid
-# because the resolved kind is container. (One-hop remote access is tracked
-# as issue #31, gated on the issue #24 privilege spike; until it lands this
-# two-hop attach and the web terminal are the ways in.)
+# because the resolved kind is container. One-hop tailnet SSH (below) is the
+# direct path; this audited two-hop attach and the web terminal remain the
+# fallback ways in.
 attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]
+
+# One-hop target name on the tailnet (issue #31): with MagicDNS enabled,
+# `ssh ozolith@flightdeck-box1` (or VSCode Remote-SSH to the same host) lands
+# as ozolith inside THIS container. Per-placement by design — every Flight
+# Deck Stack picks a distinct name, convention flightdeck-<something>.
+[env]
+FLIGHTDECK_TS_HOSTNAME = "flightdeck-box1"
