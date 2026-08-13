@@ -5,9 +5,11 @@ worker type that sets ``model`` or ``effort`` (see
 ``adapters.materialize_instruction``); the node's ``docker build`` runs it here,
 inside the image being built. This script re-validates the values against the
 adapter registry shipped *in this same image* — version-matched to the agent
-CLI beside it, the backstop behind control's config-load validation — then
-writes the adapter's native configuration. An unmappable value exits non-zero,
-failing the build loudly through the daemon's existing error-event path.
+CLI beside it, the backstop behind control's config-load validation — proves
+the agent CLI beside it is new enough to ENFORCE the config (managed scope
+only), then writes the adapter's native configuration. An unmappable value or
+a pre-enforcement CLI exits non-zero, failing the build loudly through the
+daemon's existing error-event path.
 
 Scopes: ``managed`` (driver run images — config lands where a workspace
 checkout cannot override it) and ``interactive`` (driverless Flight Deck
@@ -24,6 +26,8 @@ from pathlib import Path
 from theozolith_worker.adapters import (
     MATERIALIZE_SCOPES,
     MODEL_UNMAPPABLE,
+    SCOPE_INTERACTIVE,
+    SCOPE_MANAGED,
     AgentAdapterError,
     make_agent_adapter,
 )
@@ -54,6 +58,23 @@ def _materialize(args) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.effort and args.scope == SCOPE_INTERACTIVE:
+        print(
+            "error: effort has no interactive-scope materialization — driverless"
+            " (Flight Deck) worker types reject 'effort' until a runtime consumer"
+            " exists (ADR-0045)",
+            file=sys.stderr,
+        )
+        return 2
+    if args.scope == SCOPE_MANAGED:
+        # The written config only binds if the agent CLI in THIS image
+        # enforces it; an allowlist a pre-enforcement CLI would silently
+        # ignore is a fake identity, so the build fails instead.
+        try:
+            print(f"agent CLI: {adapter.verify_enforceable()}", flush=True)
+        except AgentAdapterError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     try:
         written = adapter.materialize(
             args.model, args.effort, root=Path(args.root), scope=args.scope

@@ -10,9 +10,19 @@ import json
 import tomllib
 from pathlib import Path
 
+import pytest
 from theozolith_worker import adaptercli
+from theozolith_worker.adapters import ClaudeAdapter
 
 WORKER_PYPROJECT = Path(__file__).parents[1] / "pyproject.toml"
+
+
+@pytest.fixture(autouse=True)
+def enforcing_cli(monkeypatch):
+    """Stub the in-image CLI version probe: unit tests run where no claude
+    binary exists; the real probe is exercised by its own contract tests and
+    by the live-enforcement suite."""
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
 
 
 def test_console_script_registered():
@@ -40,9 +50,63 @@ def test_materialize_managed_writes_native_config(tmp_path, capsys):
     )
     assert rc == 0
     settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
-    assert settings == {"model": "claude-sonnet-5", "effortLevel": "high"}
+    assert settings == {
+        "model": "claude-sonnet-5",
+        "availableModels": ["claude-sonnet-5"],
+        "enforceAvailableModels": True,
+        "effortLevel": "high",
+        "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
+    }
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
-    assert "materialized" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "materialized" in out
+    # The build log records which CLI version the enforcement was verified
+    # against — the value the preflight probed, not an assumption.
+    assert "agent CLI: 2.1.231" in out
+
+
+def test_materialize_managed_fails_on_a_pre_enforcement_cli(tmp_path, capsys, monkeypatch):
+    """A base whose CLI predates availableModels would silently ignore the
+    baked restriction — the exact silent hole the preflight closes."""
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.100 (Claude Code)")
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "predates the model-enforcement settings" in err
+    assert not (tmp_path / "etc").exists()  # nothing written on failure
+
+
+def test_materialize_interactive_rejects_effort(tmp_path, capsys):
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-opus-5",
+            "--effort",
+            "high",
+            "--scope",
+            "interactive",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "no interactive-scope materialization" in capsys.readouterr().err
+    assert not (tmp_path / "etc").exists()
 
 
 def test_materialize_interactive_writes_only_well_known_files(tmp_path):
