@@ -483,6 +483,30 @@ partition, including `store.db`, which only exists once a node or secret does).
    `theozolith-control.service` there, which is the ADR-0034 production unit; from M3 on
    the deployment contract is the Node Daemon supervising the drivers as process Stacks.
 
+## Model & effort are baked into the run image (ADR-0045)
+
+`model` (required with a driver) and `effort` (optional) are typed fields on the
+worker-type definition, validated at config load against the Agent adapter and
+**baked into the derived image**: control appends one synthesized
+`theozolith-adapter materialize` setup step, which writes the model into the
+image's managed adapter config where nothing in a workspace checkout can
+override it. The instruction hash covers that step, so changing `model`/`effort`
+re-tags the image and rolls the affected workers — that is the only way a model
+ever changes.
+
+Removed with **no fallback** (a leftover export now fails the driver loudly):
+`IMPLEMENTER_MODEL` / `REVIEWER_MODEL` / `THEOZOLITH_MODEL`, the Stack `[env]`
+model override, and the `--model` invocation flag. Custom drivers (ADR-0042)
+no longer declare a `default_model` class attribute — delete it from your
+`drivers/*.py` when upgrading.
+
+Migration rule: when you first set (or next change) `model` on a worker type,
+**bump `base` to a release that ships `theozolith-adapter` in the same edit** —
+an older base fails the build loudly ("command not found"), and both edits
+change the tag anyway, so it costs one rebuild. Worker types with no
+`model`/`effort` keep byte-identical tags across this release and rebuild
+nothing.
+
 ## Job-dir ownership
 
 Run containers write into the bind-mounted job directory (`THEOZOLITH_JOBS_DIR`). Keep

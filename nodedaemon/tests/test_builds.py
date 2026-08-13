@@ -38,8 +38,7 @@ def test_materialize_instruction_rides_setup_verbatim():
     as an ordinary RUN — the daemon stays adapter-blind, and an un-upgraded
     daemon still builds the correct bytes under the new tag."""
     materialize = (
-        "theozolith-adapter materialize --adapter claude"
-        " --model claude-sonnet-5 --scope managed"
+        "theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed"
     )
     recipe = image_recipe(setup=["pip install uv", materialize])
     text = dockerfile_for(recipe, built_at="t")

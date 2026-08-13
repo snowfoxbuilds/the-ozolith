@@ -4,6 +4,8 @@ handshake with the Node Daemon."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from theozolith_control.configrepo import ConfigRepoError, load_config
 from theozolith_nodedaemon.stacks import WireStack
@@ -118,8 +120,7 @@ def test_stack_env_model_and_adapter_overrides_are_rejected(tmp_path):
         write(
             tmp_path,
             "stacks/implementer.toml",
-            'worker_type = "claude-dev"\nnode = "box1"\n'
-            f'[env]\n{key} = "claude-opus-5"\n',
+            f'worker_type = "claude-dev"\nnode = "box1"\n[env]\n{key} = "claude-opus-5"\n',
         )
         with pytest.raises(ConfigRepoError, match=f"{key} is gone.*ADR-0045"):
             load_config(tmp_path)
@@ -256,15 +257,14 @@ def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
     write(
         tmp_path,
         "worker-types/goldtype.toml",
-        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
+        'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
         + GOLDEN_IMAGE_FIELDS
-        + f'adapter = "claude"\nmodel = "claude-sonnet-5"\n'
-        f'[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+        + 'adapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        '[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
     )
     wt = load_config(tmp_path).worker_types["goldtype"]
     assert wt.materialized_setup[-1] == (
-        "theozolith-adapter materialize --adapter claude"
-        " --model claude-sonnet-5 --scope managed"
+        "theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed"
     )
     assert wt.tag == "theozolith/goldtype:0.3.0-8e28b92a4665"
     assert wt.instruction_hash == (
@@ -473,9 +473,7 @@ def test_unknown_adapter_is_rejected_at_load(tmp_path):
 
 def test_unmappable_model_is_rejected_with_the_mappable_shapes(tmp_path):
     driver_type(tmp_path, model='"gpt-5"')
-    with pytest.raises(
-        ConfigRepoError, match=r"cannot map model 'gpt-5'.*claude-\*.*ADR-0045"
-    ):
+    with pytest.raises(ConfigRepoError, match=r"cannot map model 'gpt-5'.*claude-\*.*ADR-0045"):
         load_config(tmp_path)
 
 
@@ -510,9 +508,7 @@ def test_alias_model_warns_but_loads(tmp_path):
     driver_type(tmp_path, model='"sonnet"')
     config = load_config(tmp_path)
     assert config.worker_types["claude-dev"].model == "sonnet"
-    assert any(
-        "floating" in warning and "sonnet" in warning for warning in config.warnings
-    )
+    assert any("floating" in warning and "sonnet" in warning for warning in config.warnings)
 
 
 def test_full_model_ids_produce_no_warnings(tmp_path):
@@ -557,8 +553,7 @@ def test_driverless_model_materializes_interactive_scope(tmp_path):
     thin_stack(tmp_path, "flightdeck", "flightdeck")
     recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
     assert recipe["setup"][-1] == (
-        "theozolith-adapter materialize --adapter claude"
-        " --model claude-opus-5 --scope interactive"
+        "theozolith-adapter materialize --adapter claude --model claude-opus-5 --scope interactive"
     )
 
 
@@ -629,6 +624,23 @@ def test_builtin_driver_map_matches_the_launcher_registry():
     # Each command routes through the one launcher with its own ref as argv.
     for ref, command in BUILTIN_DRIVERS.items():
         assert command == f"theozolith-driver {ref}"
+
+
+def test_materialize_instruction_invokes_the_shipped_console_script(tmp_path):
+    """The synthesized setup line control puts on the wire must invoke the
+    console script the worker wheel actually installs (ADR-0045) — otherwise
+    every model-bearing derived-image build dies on 'command not found'."""
+    import tomllib
+
+    driver_type(tmp_path)
+    thin_stack(tmp_path, "implementer", "claude-dev")
+    recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
+    command = recipe["setup"][-1].split()[0]
+    assert command == "theozolith-adapter"
+
+    worker_pyproject = Path(__file__).parents[2] / "worker" / "pyproject.toml"
+    scripts = tomllib.loads(worker_pyproject.read_text())["project"]["scripts"]
+    assert command in scripts
 
 
 def test_builtin_driver_as_plain_command_is_rejected(tmp_path):

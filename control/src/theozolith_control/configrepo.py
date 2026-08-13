@@ -46,8 +46,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from theozolith_control import configdist
-
 # The adapter capability registry (ADR-0045): control validates worker-type
 # model/effort values against the SAME code the derived image runs at build
 # time (theozolith-worker is a runtime dependency, ADR-0015 amendment), so an
@@ -63,6 +61,8 @@ from theozolith_worker.adapters import (
     make_agent_adapter,
     materialize_instruction,
 )
+
+from theozolith_control import configdist
 
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
@@ -232,9 +232,7 @@ class WorkerTypeDef:
         if not self.model and not self.effort:
             return self.setup
         scope = SCOPE_MANAGED if self.is_driver else SCOPE_INTERACTIVE
-        return self.setup + (
-            materialize_instruction(self.adapter, self.model, self.effort, scope),
-        )
+        return (*self.setup, materialize_instruction(self.adapter, self.model, self.effort, scope))
 
     @property
     def instruction_hash(self) -> str:

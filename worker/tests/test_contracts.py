@@ -368,14 +368,10 @@ def test_claude_adapter_efforts_are_the_settings_persistable_set():
 
 def test_claude_adapter_materialize_managed_scope(tmp_path):
     adapter = ClaudeAdapter()
-    written = adapter.materialize(
-        "claude-sonnet-5", "high", root=tmp_path, scope="managed"
-    )
+    written = adapter.materialize("claude-sonnet-5", "high", root=tmp_path, scope="managed")
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
     assert (tmp_path / "etc/theozolith/effort").read_text() == "high\n"
-    settings = json.loads(
-        (tmp_path / "etc/claude-code/managed-settings.json").read_text()
-    )
+    settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
     assert settings == {"model": "claude-sonnet-5", "effortLevel": "high"}
     assert set(written) == {
         tmp_path / "etc/theozolith/model",

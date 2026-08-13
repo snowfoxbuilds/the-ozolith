@@ -66,8 +66,17 @@ def test_materialize_interactive_writes_only_well_known_files(tmp_path):
 
 def test_unknown_adapter_exits_2(tmp_path, capsys):
     rc = adaptercli.main(
-        ["materialize", "--adapter", "pi", "--model", "x", "--scope", "managed",
-         "--root", str(tmp_path)]
+        [
+            "materialize",
+            "--adapter",
+            "pi",
+            "--model",
+            "x",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
     )
     assert rc == 2
     assert "unknown Agent adapter" in capsys.readouterr().err
@@ -75,8 +84,17 @@ def test_unknown_adapter_exits_2(tmp_path, capsys):
 
 def test_unmappable_model_exits_2_with_base_bump_hint(tmp_path, capsys):
     rc = adaptercli.main(
-        ["materialize", "--adapter", "claude", "--model", "gpt-5", "--scope", "managed",
-         "--root", str(tmp_path)]
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "gpt-5",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -88,8 +106,19 @@ def test_unmappable_model_exits_2_with_base_bump_hint(tmp_path, capsys):
 
 def test_unmappable_effort_exits_2_listing_the_mappable_set(tmp_path, capsys):
     rc = adaptercli.main(
-        ["materialize", "--adapter", "claude", "--model", "claude-sonnet-5",
-         "--effort", "max", "--scope", "managed", "--root", str(tmp_path)]
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--effort",
+            "max",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -110,8 +139,17 @@ def test_corrupt_existing_managed_settings_fails_the_build(tmp_path, capsys):
     target.parent.mkdir(parents=True)
     target.write_text("[]")
     rc = adaptercli.main(
-        ["materialize", "--adapter", "claude", "--model", "claude-sonnet-5",
-         "--scope", "managed", "--root", str(tmp_path)]
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
     )
     assert rc == 1
     assert "materialize failed" in capsys.readouterr().err

@@ -1382,9 +1382,7 @@ def test_jobs_dir_change_still_detects_a_run_under_the_old_path(rig: Rig, tmp_pa
     _plant_run(rig, old_jobs, "r1")  # Run under the OLD path
     new_jobs.mkdir(parents=True)  # the NEW desired path is empty
 
-    b = process_stack(
-        "worker", env={"THEOZOLITH_JOBS_DIR": str(new_jobs), "SOME_TUNABLE": "m2"}
-    )
+    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(new_jobs), "SOME_TUNABLE": "m2"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 1 and first.poll() is None  # deferred on the old path

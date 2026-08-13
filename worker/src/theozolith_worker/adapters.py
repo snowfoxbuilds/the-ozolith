@@ -149,8 +149,7 @@ class ClaudeAdapter:
     # baked model is not overridable from inside a run (ADR-0045).
     MANAGED_SETTINGS = "etc/claude-code/managed-settings.json"
     model_shapes = (
-        "full claude-* model IDs, or the aliases"
-        " default/fable/haiku/opus/opusplan/sonnet"
+        "full claude-* model IDs, or the aliases default/fable/haiku/opus/opusplan/sonnet"
     )
 
     def __init__(self, binary: str = "claude"):
@@ -309,7 +308,9 @@ def materialize_instruction(adapter: str, model: str, effort: str, scope: str) -
     derived image. Deliberate (the image bytes change), but never accidental —
     a golden test pins the format."""
     if scope not in MATERIALIZE_SCOPES:
-        raise AgentAdapterError(f"unknown materialize scope {scope!r} (known: managed, interactive)")
+        raise AgentAdapterError(
+            f"unknown materialize scope {scope!r} (known: managed, interactive)"
+        )
     if not model and not effort:
         raise AgentAdapterError("materialize instruction needs a model or an effort")
     parts = ["theozolith-adapter", "materialize", "--adapter", shlex.quote(adapter)]
