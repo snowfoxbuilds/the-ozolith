@@ -181,6 +181,24 @@ def _read_transcript(job: Path) -> str:
         return ""
 
 
+def _emit_review(
+    sink: EventSink,
+    config: DriverConfig,
+    pr: PullRequest,
+    issue_number: int,
+    result: verdict.Verdict,
+) -> None:
+    sink.emit(
+        review_event(
+            config,
+            pr=pr.number,
+            issue=issue_number,
+            round_number=result.round,
+            verdict=result.verdict,
+        )
+    )
+
+
 def review_pr(
     config: DriverConfig,
     client: GitHubClient,
@@ -213,15 +231,7 @@ def review_pr(
             bundle_url=bundle_url,
         )
         _apply(config, client, pr, issue_number, result, log, container="", sink=sink)
-        sink.emit(
-            review_event(
-                config,
-                pr=pr.number,
-                issue=issue_number,
-                round_number=result.round,
-                verdict=result.verdict,
-            )
-        )
+        _emit_review(sink, config, pr, issue_number, result)
         return result
 
     review_id = f"review-{pr.number}-round-{round_number}"
@@ -294,15 +304,7 @@ def review_pr(
                 log,
                 sink=sink,
             )
-            sink.emit(
-                review_event(
-                    config,
-                    pr=pr.number,
-                    issue=issue_number,
-                    round_number=escalated.round,
-                    verdict=escalated.verdict,
-                )
-            )
+            _emit_review(sink, config, pr, issue_number, escalated)
             return escalated
 
         _apply(
@@ -316,15 +318,7 @@ def review_pr(
             container=container,
             sink=sink,
         )
-        sink.emit(
-            review_event(
-                config,
-                pr=pr.number,
-                issue=issue_number,
-                round_number=result.round,
-                verdict=result.verdict,
-            )
-        )
+        _emit_review(sink, config, pr, issue_number, result)
         return result
     finally:
         shutil.rmtree(job, ignore_errors=True)

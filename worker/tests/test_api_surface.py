@@ -11,6 +11,7 @@ without importing anything private.
 
 from __future__ import annotations
 
+from fakegithub import FakeGitHub
 from theozolith_worker import api
 
 # Pinned surface: additions/removals are release-note events (ADR-0042). Update
@@ -127,3 +128,61 @@ def test_a_worker_subclass_built_only_from_api_names_runs(tmp_path):
 
     assert worker.run(once=True) == 2
     assert worker.executed == [1, 2]
+
+
+# -- GitHubClient compatibility (ADR-0042) -------------------------------------
+# GitHubClient is part of the stable surface, so its public read helpers are a
+# custom-driver contract even when nothing in this repo calls them. Private
+# Config Repo drivers are invisible to repo grep; these tests stand in for those
+# consumers and fail if a method — or the fake behavior it needs — is dropped.
+
+
+def _api_client(fake: FakeGitHub, token: str = "tok-a", login: str = "worker-a"):
+    """A client built from the stable ``api.GitHubClient`` export, on the fake."""
+    fake.register(token, login)
+    return api.GitHubClient(
+        fake.repo, token, transport=fake, sleep=lambda _s: None, clock=lambda: 0.0
+    )
+
+
+def test_github_client_exposes_default_branch_and_assign_order():
+    for name in ("default_branch", "assign_order"):
+        assert callable(getattr(api.GitHubClient, name)), f"api.GitHubClient.{name} is missing"
+
+
+def test_default_branch_is_fetched_once_then_cached():
+    fake = FakeGitHub()
+    client = _api_client(fake)
+    assert client.default_branch() == "main"
+    # A later change to the repo default must not be observed: the second call is
+    # served from the lazy cache rather than re-fetching repo metadata.
+    fake.default_branch = "trunk"
+    assert client.default_branch() == "main"
+
+
+def test_assign_order_orders_dedupes_and_ignores_other_events():
+    fake = FakeGitHub()
+    client = _api_client(fake)
+    number = fake.create_issue("t", "", set())
+    # Two workers self-assign, earliest first.
+    fake.force_assign(number, "worker-b")
+    fake.force_assign(number, "worker-a")
+    # A reassignment (unassign+reassign leaves a second "assigned" event) and an
+    # unrelated timeline entry the method must skip.
+    fake.events[number].append(
+        {"event": "assigned", "assignee": {"login": "worker-b"}, "created_at": "z"}
+    )
+    fake.events[number].append({"event": "labeled", "label": {"name": "x"}})
+    assert client.assign_order(number) == ["worker-b", "worker-a"]
+
+
+def test_assign_order_pages_through_the_event_timeline():
+    fake = FakeGitHub()
+    client = _api_client(fake)
+    number = fake.create_issue("t", "", set())
+    for i in range(150):  # crosses the 100-per-page boundary
+        fake.force_assign(number, f"worker-{i:03d}")
+    order = client.assign_order(number)
+    assert len(order) == 150
+    assert order[0] == "worker-000"
+    assert order[-1] == "worker-149"

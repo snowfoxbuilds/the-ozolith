@@ -53,7 +53,7 @@ class Implementer(Worker):
     role: ClassVar[str] = "implementer"
     default_model: ClassVar[str] = "claude-sonnet-5"
     sleep_after_work: ClassVar[bool] = False  # drain the queue between grants
-    pass_label: ClassVar[str] = "dispatch"
+    # pass_label inherits the base "dispatch" default.
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -49,8 +49,6 @@ NODE_STATE_DIR = Path("/var/lib/theozolith")
 SERVE_READY_TIMEOUT = 60.0
 HEARTBEAT_TIMEOUT = 90.0
 
-SCAFFOLD_FILES = ("stacks/implementer.toml", "worker-types/claude-dev.toml", "README.md")
-
 # The base ref of the example worker type. The digest is a deliberate
 # placeholder: fetching a real one at init would need a registry round-trip
 # on the setup path and would silently age — pinning it is the README's

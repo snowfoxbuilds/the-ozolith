@@ -36,6 +36,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from theozolith_control.controltoml import COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME
+
 # The components one product version covers (ADR-0013 §8: one versioned
 # distribution). Order matters only cosmetically.
 COMPONENTS = ("knowledge", "worker", "control", "nodedaemon")
@@ -139,9 +141,9 @@ def write_pin(config_repo: Path, version: str, *, runner=subprocess.run, log=_lo
         [
             "git",
             "-c",
-            "user.name=theozolith",
+            f"user.name={COMMIT_AUTHOR_NAME}",
             "-c",
-            "user.email=theozolith@invalid",
+            f"user.email={COMMIT_AUTHOR_EMAIL}",
             "commit",
             "-m",
             f"theozolith: pin product version {version}",
