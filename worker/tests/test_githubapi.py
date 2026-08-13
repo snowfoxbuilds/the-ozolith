@@ -170,6 +170,77 @@ def test_config_requires_repo_token_and_control_node():
         )
 
 
+def test_config_forwards_either_claude_credential():
+    """The Claude adapter authenticates with an API key OR an OAuth token (or
+    both) — whichever is supplied is forwarded into the run container; neither
+    is required at load time."""
+    base = {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x", **CONTROL_ENV}
+
+    api_only = load_config(
+        {**base, "ANTHROPIC_API_KEY": "sk-ant"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert api_only.agent_env == {"ANTHROPIC_API_KEY": "sk-ant"}
+
+    oauth_only = load_config(
+        {**base, "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert oauth_only.agent_env == {"CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"}
+
+    both = load_config(
+        {**base, "ANTHROPIC_API_KEY": "sk-ant", "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"},
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert both.agent_env == {
+        "ANTHROPIC_API_KEY": "sk-ant",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok",
+    }
+
+    neither = load_config(base, role="implementer", default_model="claude-sonnet-5")
+    assert neither.agent_env == {}
+
+
+def test_config_oauth_token_honors_var_file_convention(tmp_path):
+    """The OAuth token arrives like every other secret — via <NAME>_FILE from
+    tmpfs — never as a literal in the environment."""
+    token_file = tmp_path / "oauth"
+    token_file.write_text("oat-from-file\n")
+    config = load_config(
+        {
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "GITHUB_TOKEN": "x",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE": str(token_file),
+            **CONTROL_ENV,
+        },
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert config.agent_env == {"CLAUDE_CODE_OAUTH_TOKEN": "oat-from-file"}
+
+
+def test_config_forwards_no_credentials_for_a_non_claude_adapter():
+    """Only the resolved adapter's credentials are forwarded, so a non-Claude
+    worker never receives a Claude token even if one sits in the environment."""
+    config = load_config(
+        {
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "GITHUB_TOKEN": "x",
+            "THEOZOLITH_ADAPTER": "future",
+            "ANTHROPIC_API_KEY": "sk-ant",
+            "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok",
+            **CONTROL_ENV,
+        },
+        role="implementer",
+        default_model="claude-sonnet-5",
+    )
+    assert config.adapter == "future"
+    assert config.agent_env == {}
+
+
 def test_config_default_model_flows_from_the_worker_type():
     config = load_config(
         {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x", **CONTROL_ENV},

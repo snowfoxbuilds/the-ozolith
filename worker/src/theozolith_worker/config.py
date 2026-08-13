@@ -159,11 +159,26 @@ class DriverConfig:
     jobs_dir: Path  # where per-Run job directories live
     agent_timeout_seconds: float
     cache_volumes: tuple[tuple[str, str], ...]  # warm caches as named volumes
-    agent_env: dict[str, str]  # env the run container gets (model API key)
+    agent_env: dict[str, str]  # model credentials (API key and/or OAuth token)
     container_user: str | None  # uid:gid for run containers; None = image user
 
 
 DEFAULT_CACHE_VOLUMES = "theozolith-cache:/home/ozolith/.cache"
+
+
+# Model-credential env vars each Agent adapter forwards into the otherwise
+# credential-free run container (ADR-0013). For the Claude Code adapter the
+# workspace API key and the subscription OAuth token are ALTERNATIVES:
+#   ANTHROPIC_API_KEY        a workspace API key (the rotatable spend
+#                            credential ADR-0013 describes)
+#   CLAUDE_CODE_OAUTH_TOKEN  a subscription token from `claude setup-token`
+# Supply whichever you have (both may be set — the Claude CLI decides
+# precedence). A future adapter registers its own credential names here;
+# nothing outside this map is forwarded, so a non-Claude worker never
+# receives a Claude token.
+_ADAPTER_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "claude": ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+}
 
 
 def load_config(
@@ -187,10 +202,17 @@ def load_config(
 
     clone_url = env_value(environ, "THEOZOLITH_CLONE_URL") or f"https://github.com/{repo}.git"
 
+    adapter = env_value(environ, "THEOZOLITH_ADAPTER", "claude") or "claude"
+
+    # Forward whichever of the adapter's model credentials are supplied. For
+    # the Claude Code adapter the API key and the subscription OAuth token are
+    # alternatives — either authenticates the headless session, and both may be
+    # set. Only the resolved adapter's credentials are forwarded (ADR-0013).
     agent_env: dict[str, str] = {}
-    api_key = env_value(environ, "ANTHROPIC_API_KEY")
-    if api_key:
-        agent_env["ANTHROPIC_API_KEY"] = api_key
+    for cred in _ADAPTER_CREDENTIAL_ENV.get(adapter, ()):
+        value = env_value(environ, cred)
+        if value:
+            agent_env[cred] = value
 
     # ADR-0017: claims dispatch through the Control Node — there is no
     # second claim path, so a driver without one cannot run. The daemon-less
@@ -223,7 +245,7 @@ def load_config(
         api_url=api_url,
         clone_url=clone_url,
         model=model,
-        adapter=env_value(environ, "THEOZOLITH_ADAPTER", "claude") or "claude",
+        adapter=adapter,
         run_image=env_value(environ, "THEOZOLITH_RUN_IMAGE", "theozolith-run-claude:local")
         or "theozolith-run-claude:local",
         stack=stack,

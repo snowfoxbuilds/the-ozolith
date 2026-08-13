@@ -111,7 +111,7 @@ class DockerEngine:
         for volume, container in spec.volumes:
             args += ["--volume", f"{volume}:{container}"]
         # Bare -e NAME: docker reads the value from its own environment, so
-        # secrets (the model API key) never appear in a process listing.
+        # secrets (the model credential) never appear in a process listing.
         for key in sorted(spec.env):
             args += ["--env", key]
         if spec.user:

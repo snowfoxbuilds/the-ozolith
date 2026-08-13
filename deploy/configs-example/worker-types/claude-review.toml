@@ -21,4 +21,7 @@ knowledge_pin = "0000000000000000000000000000000000000000"
 
 [secrets]
 GITHUB_TOKEN = "github-reviewer"
+# EITHER a workspace API key or a `claude setup-token` OAuth token (either
+# authenticates the headless session; both may be set). Delete the unused line.
 ANTHROPIC_API_KEY = "anthropic-api-key"
+# CLAUDE_CODE_OAUTH_TOKEN = "anthropic-oauth-token"

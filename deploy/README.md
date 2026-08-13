@@ -166,6 +166,23 @@ Stacks and worker types on top, never below.
    (`/run/theozolith/secrets`, `/run/secrets/<name>` inside containers) and wired via
    `<ENV>_FILE`. Never on node disk.
 
+   A Claude worker authenticates the model with **either** a workspace API key
+   (`ANTHROPIC_API_KEY`) **or** a subscription OAuth token
+   (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`) — map whichever you have in
+   the worker type's `[secrets]`; either alone is enough, both may be set. The driver
+   forwards only the resolved adapter's credential into the (otherwise credential-free)
+   run container (ADR-0013).
+
+   **Rotating a credential** (replacing an API key or OAuth token): `theozolith secret
+   set <name>` stores the new value, but a running driver read its credential once at
+   startup and injects it into each Run container it launches — there is **no
+   hot-reload**. Recycle the affected driver Stack so its next Runs pick up the
+   replacement (in-flight Runs finish on the old value):
+
+   ```sh
+   theozolith command recycle --node <node> --target <stack>
+   ```
+
 5. **Operate**:
 
    ```sh
