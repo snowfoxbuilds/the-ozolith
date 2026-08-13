@@ -315,9 +315,7 @@ def review_pr(
             log,
             transcript=transcript,
             container=container,
-            observed_model=adapters.stream_stats(
-                config.adapter, job / jobdir.TRANSCRIPT_FILE
-            ).model,
+            observed=adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE),
             sink=sink,
         )
         _emit_review(sink, config, pr, issue_number, result)
@@ -343,6 +341,7 @@ def _escalate_invalid_verdict(
     """Apply the one-strike rule: evidence first (so the cited path
     resolves), then blocked + needs_human with the raw validation error."""
     prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-invalid"
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
     record = {
         "pr": pr.number,
         "issue": issue_number,
@@ -351,9 +350,11 @@ def _escalate_invalid_verdict(
         "error": reason,
         "head": pr.head_sha,
         # ADR-0045: image identity (its tag covers the baked model) plus the
-        # model the session stream actually reported.
+        # reconciled stream-observed model; model_note carries any
+        # disagreement between the stream's model signals.
         "run_image": config.run_image,
-        "model": adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE).model,
+        "model": stats.model,
+        "model_note": stats.model_note,
         "container": container,
     }
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
@@ -404,7 +405,7 @@ def _apply(
     *,
     transcript: str = "",
     container: str = "",
-    observed_model: str = "",
+    observed: adapters.StreamStats | None = None,
     sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
@@ -416,7 +417,7 @@ def _apply(
         transcript,
         container,
         log,
-        observed_model=observed_model,
+        observed=observed,
         sink=sink,
     )
 
@@ -486,7 +487,7 @@ def _push_review_evidence(
     transcript: str,
     container: str,
     log,
-    observed_model: str = "",
+    observed: adapters.StreamStats | None = None,
     sink: EventSink | None = None,
 ) -> None:
     record = {
@@ -499,10 +500,13 @@ def _push_review_evidence(
         "resume_commit": result.resume_commit,
         "evidence": result.evidence,
         "head": pr.head_sha,
-        # ADR-0045: image identity plus the stream-observed model; both empty
-        # of a config-time model on purpose — the driver no longer has one.
+        # ADR-0045: image identity plus the reconciled stream-observed model;
+        # both empty of a config-time model on purpose — the driver no longer
+        # has one. model_note carries any disagreement between the stream's
+        # model signals instead of flattening it away.
         "run_image": config.run_image,
-        "model": observed_model,
+        "model": observed.model if observed else "",
+        "model_note": observed.model_note if observed else "",
         # Empty when no review container ran (deterministic escalation).
         "container": container,
     }

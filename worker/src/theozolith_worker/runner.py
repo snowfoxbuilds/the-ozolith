@@ -703,6 +703,7 @@ def _push_run_evidence(
                 # model) and "model" is what the session stream reported.
                 "run_image": config.run_image,
                 "model": stats.model,
+                "model_note": stats.model_note,
                 "container": report.container,
                 "issue": issue.number,
                 "round": report.round,
