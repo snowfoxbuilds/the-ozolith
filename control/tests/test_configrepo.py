@@ -19,10 +19,12 @@ def write(tmp_path, relpath: str, text: str) -> None:
 
 
 def driver_type(tmp_path, name: str = "claude-dev", **fields) -> None:
-    """A minimal valid driver (pipeline) worker type."""
+    """A minimal valid driver (pipeline) worker type. ``model`` is required
+    with a driver (ADR-0045); pass ``model=None`` to omit it."""
     body = {
         "driver": '"builtin:implementer"',
         "adapter": '"claude"',
+        "model": '"claude-sonnet-5"',
         "workspace": '"acme/sandbox"',
         "base": f'"{BASE}"',
         **{k: v for k, v in fields.items()},
@@ -79,10 +81,11 @@ def test_driver_worker_type_and_thin_stack_resolve_end_to_end(tmp_path):
     assert stack.kind == "process"
     assert stack.worker_type == "claude-dev"  # kept for display
     assert stack.command == "theozolith-driver builtin:implementer"
+    # No THEOZOLITH_MODEL: the model is baked into the run image (ADR-0045),
+    # never delivered as env — a model change rolls the fleet via the tag.
     assert stack.env == {
         "THEOZOLITH_REPO": "acme/sandbox",
         "THEOZOLITH_ADAPTER": "claude",
-        "THEOZOLITH_MODEL": "claude-sonnet-5",
         "THEOZOLITH_RUN_IMAGE": config.worker_types["claude-dev"].tag,
     }
     assert stack.secrets == {
@@ -94,24 +97,51 @@ def test_driver_worker_type_and_thin_stack_resolve_end_to_end(tmp_path):
 
 
 def test_stack_env_overrides_injected_worker_type_env(tmp_path):
-    driver_type(tmp_path, model='"claude-sonnet-5"')
+    driver_type(tmp_path)
     write(
         tmp_path,
         "stacks/implementer.toml",
         'worker_type = "claude-dev"\nnode = "box1"\n'
-        '[env]\nTHEOZOLITH_MODEL = "claude-opus-5"\nWORKER_ID = "w1"\n',
+        '[env]\nWORKER_ID = "w1"\nTHEOZOLITH_REPO = "acme/other"\n',
     )
     stack = next(s for s in load_config(tmp_path).stacks if s.name == "implementer")
-    assert stack.env["THEOZOLITH_MODEL"] == "claude-opus-5"  # Stack wins
     assert stack.env["WORKER_ID"] == "w1"
-    assert stack.env["THEOZOLITH_REPO"] == "acme/sandbox"
+    assert stack.env["THEOZOLITH_REPO"] == "acme/other"  # Stack still wins
 
 
-def test_model_omitted_leaves_no_model_env(tmp_path):
-    driver_type(tmp_path)  # no model
-    thin_stack(tmp_path, "implementer", "claude-dev")
-    stack = next(s for s in load_config(tmp_path).stacks if s.name == "implementer")
-    assert "THEOZOLITH_MODEL" not in stack.env
+def test_stack_env_model_and_adapter_overrides_are_rejected(tmp_path):
+    """ADR-0045: with the model baked into the image, a Stack [env] override
+    would be silently inert — rejected by exact name instead. Other env stays
+    free (per-placement overrides are the point of Stack [env])."""
+    driver_type(tmp_path)
+    for key in ("THEOZOLITH_MODEL", "THEOZOLITH_ADAPTER"):
+        write(
+            tmp_path,
+            "stacks/implementer.toml",
+            'worker_type = "claude-dev"\nnode = "box1"\n'
+            f'[env]\n{key} = "claude-opus-5"\n',
+        )
+        with pytest.raises(ConfigRepoError, match=f"{key} is gone.*ADR-0045"):
+            load_config(tmp_path)
+
+
+def test_generic_stack_env_keeps_model_keys_free(tmp_path):
+    """The rejection is worker-type-Stack-only: a plain generic Stack's env
+    is workload-owned and the substrate does not police its names."""
+    write(
+        tmp_path,
+        "stacks/plainproc.toml",
+        'kind = "process"\nnode = "box1"\ncommand = "run-thing"\n'
+        '[env]\nTHEOZOLITH_MODEL = "whatever"\n',
+    )
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "plainproc")
+    assert stack.env["THEOZOLITH_MODEL"] == "whatever"
+
+
+def test_model_required_when_driver_is_set(tmp_path):
+    driver_type(tmp_path, model=None)
+    with pytest.raises(ConfigRepoError, match="'model' is required when a driver"):
+        load_config(tmp_path)
 
 
 def test_driverless_worker_type_resolves_to_a_flightdeck_container(tmp_path):
@@ -188,26 +218,28 @@ def test_stack_placeholder_is_not_substituted_on_generic_stack_volumes(tmp_path)
     assert stack.volumes == ("{stack}-data:/data",)  # literal, unresolved
 
 
-# -- CRITICAL: derived-image identity must not change (ADR-0044) -----------------
+# -- CRITICAL: derived-image identity (ADR-0044 as amended by ADR-0045) ----------
+
+GOLDEN_BASE = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:" + "a" * 64
+GOLDEN_IMAGE_FIELDS = (
+    f'base = "{GOLDEN_BASE}"\n'
+    f'setup = ["apt-get update && apt-get install -y ripgrep"]\n'
+    f'knowledge_source = "https://github.com/acme/my-knowledge.git"\n'
+    f'knowledge_pin = "{"b" * 40}"\n'
+)
 
 
-def test_tag_is_golden_stable_over_image_fields_only(tmp_path):
-    """A fixed set of image inputs must produce the EXACT tag today's formula
-    computes — driver/adapter/model/workspace/secrets excluded. Renaming an
-    images/<name>.toml into worker-types/ with unchanged image fields must
-    rebuild nothing. This is the easiest thing to get wrong."""
-    golden_base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:" + "a" * 64
+def test_tag_without_model_is_golden_stable_across_adr_0045(tmp_path):
+    """A type with NO model/effort has no materialize step, so its hash must
+    be BYTE-IDENTICAL to the pre-ADR-0045 value — this literal is the old
+    goldtype golden. It is what guarantees adopting this release rebuilds
+    nothing until a definition actually sets a model."""
     write(
         tmp_path,
         "worker-types/goldtype.toml",
-        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
-        f'base = "{golden_base}"\n'
-        f'setup = ["apt-get update && apt-get install -y ripgrep"]\n'
-        f'knowledge_source = "https://github.com/acme/my-knowledge.git"\n'
-        f'knowledge_pin = "{"b" * 40}"\n'
-        # These do NOT enter the hash:
-        f'adapter = "claude"\nmodel = "claude-sonnet-5"\n'
-        f'[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+        GOLDEN_IMAGE_FIELDS
+        # Per-type fields outside the identity: still excluded from the hash.
+        + 'workspace = "acme/sandbox"\n[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
     )
     wt = load_config(tmp_path).worker_types["goldtype"]
     assert wt.tag == "theozolith/goldtype:0.3.0-48a66bc6e009"
@@ -216,12 +248,44 @@ def test_tag_is_golden_stable_over_image_fields_only(tmp_path):
     )
 
 
-def test_per_type_fields_do_not_change_the_tag(tmp_path):
-    driver_type(tmp_path, name="a", model='"claude-sonnet-5"')
-    driver_type(tmp_path, name="b", model='"claude-opus-5"', adapter='"claude"')
+def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
+    """With a model set, the synthesized materialize instruction enters the
+    hash (ADR-0045): same image fields as the golden above, different tag.
+    GOLDEN: pins hash-over-materialized-setup end to end — it moves only when
+    the renderer format or the hash formula changes, both deliberate acts."""
+    write(
+        tmp_path,
+        "worker-types/goldtype.toml",
+        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
+        + GOLDEN_IMAGE_FIELDS
+        + f'adapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        f'[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+    )
+    wt = load_config(tmp_path).worker_types["goldtype"]
+    assert wt.materialized_setup[-1] == (
+        "theozolith-adapter materialize --adapter claude"
+        " --model claude-sonnet-5 --scope managed"
+    )
+    assert wt.tag == "theozolith/goldtype:0.3.0-8e28b92a4665"
+    assert wt.instruction_hash == (
+        "8e28b92a46657896d8a6f984dccfcabd9f4ee85cba539b0b56145bbd8d069280"
+    )
+
+
+def test_model_and_effort_change_the_tag(tmp_path):
+    driver_type(tmp_path, name="a")
+    driver_type(tmp_path, name="b", model='"claude-opus-5"')
+    driver_type(tmp_path, name="c", effort='"high"')
     types = load_config(tmp_path).worker_types
-    # Same image fields, different model -> identical instruction hash (only
-    # the name differs in the tag prefix).
+    hashes = {types[n].instruction_hash for n in ("a", "b", "c")}
+    assert len(hashes) == 3  # model and effort are identity-bearing (ADR-0045)
+
+
+def test_non_image_per_type_fields_still_do_not_change_the_tag(tmp_path):
+    driver_type(tmp_path, name="a", workspace='"acme/sandbox"')
+    driver_type(tmp_path, name="b", workspace='"acme/other"', driver='"builtin:reviewer"')
+    types = load_config(tmp_path).worker_types
+    # driver/workspace/secrets change no image bytes -> identical hash.
     assert types["a"].instruction_hash == types["b"].instruction_hash
 
 
@@ -273,7 +337,8 @@ def test_custom_driver_ref_resolves_to_the_launcher_command(tmp_path):
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+        f'driver = "drivers/custom"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "a/b"\nbase = "{BASE}"\n',
     )
     write(tmp_path, "drivers/custom.py", "from theozolith_worker import api\nDriver = api.Worker\n")
     thin_stack(tmp_path, "s", "i")
@@ -291,7 +356,8 @@ def test_custom_driver_package_form_resolves(tmp_path):
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+        f'driver = "drivers/custom"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "a/b"\nbase = "{BASE}"\n',
     )
     write(tmp_path, "drivers/custom/__init__.py", "Driver = object\n")
     thin_stack(tmp_path, "s", "i")
@@ -307,7 +373,8 @@ def test_custom_driver_dangling_reference_fails_at_load(tmp_path):
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+        f'driver = "drivers/custom"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "a/b"\nbase = "{BASE}"\n',
     )
     thin_stack(tmp_path, "s", "i")
     with pytest.raises(
@@ -323,7 +390,8 @@ def test_unused_custom_worker_type_with_missing_driver_fails_at_load(tmp_path):
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "drivers/missing"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+        f'driver = "drivers/missing"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "a/b"\nbase = "{BASE}"\n',
     )
     with pytest.raises(
         ConfigRepoError, match=r"custom driver 'drivers/missing' has no module.*ADR-0042"
@@ -339,7 +407,8 @@ def test_unused_custom_worker_type_with_present_driver_loads(tmp_path, module_pa
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "drivers/custom"\nworkspace = "a/b"\nbase = "{BASE}"\n',
+        f'driver = "drivers/custom"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "a/b"\nbase = "{BASE}"\n',
     )
     write(tmp_path, module_path, "Driver = object\n")
     config = load_config(tmp_path)
@@ -388,6 +457,120 @@ def test_driverless_fields_are_rejected_with_a_driver(tmp_path, field):
     )
     with pytest.raises(ConfigRepoError, match=rf"'{field}' is a driverless"):
         load_config(tmp_path)
+
+
+# -- adapter capability validation (ADR-0045) ------------------------------------
+
+
+def test_unknown_adapter_is_rejected_at_load(tmp_path):
+    """The adapter finally gets validated — against the worker package's
+    registry, the same code the image runs — so adapter = "pi" fails by
+    construction until a Pi adapter exists."""
+    driver_type(tmp_path, adapter='"pi"')
+    with pytest.raises(ConfigRepoError, match=r"unknown Agent adapter 'pi'"):
+        load_config(tmp_path)
+
+
+def test_unmappable_model_is_rejected_with_the_mappable_shapes(tmp_path):
+    driver_type(tmp_path, model='"gpt-5"')
+    with pytest.raises(
+        ConfigRepoError, match=r"cannot map model 'gpt-5'.*claude-\*.*ADR-0045"
+    ):
+        load_config(tmp_path)
+
+
+def test_unmappable_effort_is_rejected_listing_the_mappable_set(tmp_path):
+    driver_type(tmp_path, effort='"max"')
+    with pytest.raises(ConfigRepoError, match=r"cannot map effort 'max'.*low.*xhigh"):
+        load_config(tmp_path)
+
+
+def test_dormant_worker_type_model_is_validated_too(tmp_path):
+    """No Stack instantiates the type: it still breaks at configure time,
+    never later when a Stack first activates it (the dormant-driver rule)."""
+    driver_type(tmp_path, model='"gpt-5"')  # note: no stacks/ at all
+    with pytest.raises(ConfigRepoError, match="cannot map model"):
+        load_config(tmp_path)
+
+
+def test_driverless_model_is_validated_too(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\nmodel = "gpt-5"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="cannot map model"):
+        load_config(tmp_path)
+
+
+def test_alias_model_warns_but_loads(tmp_path):
+    """The pin-the-dated-ID convention is a lint, never an error: current-
+    generation provider IDs have no dated variant, so a warning is the
+    strongest honest signal (ADR-0045)."""
+    driver_type(tmp_path, model='"sonnet"')
+    config = load_config(tmp_path)
+    assert config.worker_types["claude-dev"].model == "sonnet"
+    assert any(
+        "floating" in warning and "sonnet" in warning for warning in config.warnings
+    )
+
+
+def test_full_model_ids_produce_no_warnings(tmp_path):
+    driver_type(tmp_path)  # claude-sonnet-5: a full ID, undated by the provider
+    assert load_config(tmp_path).warnings == ()
+
+
+# -- materialization on the wire (ADR-0045) ---------------------------------------
+
+
+def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
+    """The synthesized instruction rides the recipe's ``setup`` — same 8 wire
+    keys, daemon adapter-blind — with managed scope for driver run images."""
+    driver_type(tmp_path, effort='"high"')
+    thin_stack(tmp_path, "implementer", "claude-dev")
+    recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
+    assert recipe["setup"][-1] == (
+        "theozolith-adapter materialize --adapter claude"
+        " --model claude-sonnet-5 --effort high --scope managed"
+    )
+    assert set(recipe) == {
+        "name",
+        "base",
+        "setup",
+        "knowledge_source",
+        "knowledge_pin",
+        "tag",
+        "base_digest",
+        "instruction_hash",
+    }
+
+
+def test_driverless_model_materializes_interactive_scope(tmp_path):
+    """Flight Deck images get interactive scope: well-known files only, never
+    managed settings (which would lock /model) and never ~/.claude (which the
+    claude-state volume shadows, ADR-0043)."""
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\nmodel = "claude-opus-5"\n',
+    )
+    thin_stack(tmp_path, "flightdeck", "flightdeck")
+    recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
+    assert recipe["setup"][-1] == (
+        "theozolith-adapter materialize --adapter claude"
+        " --model claude-opus-5 --scope interactive"
+    )
+
+
+def test_no_model_or_effort_means_no_materialize_step(tmp_path):
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\nsetup = ["apt-get update"]\n',
+    )
+    thin_stack(tmp_path, "flightdeck", "flightdeck")
+    recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
+    assert recipe["setup"] == ["apt-get update"]  # exactly the operator setup
 
 
 # -- thin-Stack validation & hard-cutover rejections ----------------------------
@@ -718,12 +901,14 @@ def test_default_jobs_dirs_are_per_stack_and_unique_across_resolved_workers(tmp_
     write(
         tmp_path,
         "worker-types/claude-dev.toml",
-        f'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\nbase = "{BASE}"\n',
+        f'driver = "builtin:implementer"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{BASE}"\n',
     )
     write(
         tmp_path,
         "worker-types/claude-review.toml",
-        f'driver = "builtin:reviewer"\nworkspace = "acme/sandbox"\nbase = "{BASE}"\n',
+        f'driver = "builtin:reviewer"\nmodel = "claude-fable-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{BASE}"\n',
     )
     thin_stack(tmp_path, "implementer", "claude-dev")
     thin_stack(tmp_path, "reviewer", "claude-review")

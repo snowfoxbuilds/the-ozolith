@@ -83,6 +83,9 @@ class StreamStats:
 
 class AgentAdapter(Protocol):
     name: str
+    # One human-readable line describing what classify_model accepts — quoted
+    # in the "cannot map model" errors control and the build emit (ADR-0045).
+    model_shapes: str
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
         """The headless one-shot argv; ``prompt`` is the harness's
@@ -145,6 +148,10 @@ class ClaudeAdapter:
     # and above any .claude/settings.json a workspace checkout carries — the
     # baked model is not overridable from inside a run (ADR-0045).
     MANAGED_SETTINGS = "etc/claude-code/managed-settings.json"
+    model_shapes = (
+        "full claude-* model IDs, or the aliases"
+        " default/fable/haiku/opus/opusplan/sonnet"
+    )
 
     def __init__(self, binary: str = "claude"):
         self._binary = binary

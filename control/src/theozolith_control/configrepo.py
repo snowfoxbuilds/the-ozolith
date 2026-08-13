@@ -14,10 +14,12 @@ Layout::
                               (kind, node, state, env, secrets, command |
                               image/compose+overlays)
     worker-types/<name>.toml  the complete customization unit for one worker
-                              (ADR-0044): driver/adapter/model/workspace/secrets
-                              plus the derived-image recipe (digest-pinned base,
-                              setup, optional Knowledge Source). Driverless
-                              types are Flight Decks (interactive containers).
+                              (ADR-0044): driver/adapter/model/effort/workspace/
+                              secrets plus the derived-image recipe (digest-
+                              pinned base, setup, optional Knowledge Source).
+                              Driverless types are Flight Decks (interactive
+                              containers). model/effort are validated against
+                              the adapter and baked into the image (ADR-0045).
     product.toml              optional [product] version pin for the update command
 
 An empty or missing repo is a legal deployment (the deletion test): every
@@ -45,6 +47,22 @@ from pathlib import Path
 from typing import Any
 
 from theozolith_control import configdist
+
+# The adapter capability registry (ADR-0045): control validates worker-type
+# model/effort values against the SAME code the derived image runs at build
+# time (theozolith-worker is a runtime dependency, ADR-0015 amendment), so an
+# unmappable value fails here at config load — earlier than the in-image
+# ``theozolith-adapter`` backstop — and the synthesized setup instruction is
+# rendered by the one shared renderer.
+from theozolith_worker.adapters import (
+    MODEL_ALIAS,
+    MODEL_UNMAPPABLE,
+    SCOPE_INTERACTIVE,
+    SCOPE_MANAGED,
+    AgentAdapterError,
+    make_agent_adapter,
+    materialize_instruction,
+)
 
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
@@ -156,20 +174,27 @@ class WorkerTypeDef:
     and ``volumes``; a driver type is a pipeline worker (process kind).
 
     The derived-image identity (``instruction_hash`` and ``tag``) is computed
-    over the image fields ONLY — driver/adapter/model/workspace/secrets do
-    not change image bytes, so renaming images/<name>.toml into worker-types/
-    with unchanged image fields yields the identical tag and rebuilds nothing
-    (ADR-0044 CRITICAL)."""
+    over the bytes that build the image: the image fields plus the
+    materialized model/effort setup instruction (ADR-0045 amending ADR-0044).
+    driver/workspace/secrets still do not change image bytes and stay outside
+    the identity; a type with no model/effort has no materialize step, so its
+    hash is byte-identical to the pre-ADR-0045 value and rebuilds nothing."""
 
     name: str
     base: str  # full ref, pinned by digest
     setup: tuple[str, ...] = ()
     knowledge_source: str = ""
     knowledge_pin: str = ""
-    # -- per-type variables (excluded from the image identity) --
+    # -- per-type variables --
     driver: str = ""  # "" (Flight Deck) | "builtin:<name>" | "drivers/<name>"
     adapter: str = "claude"  # Agent adapter the harness invokes
-    model: str = ""  # "" = the driver's shipped default
+    # model/effort are identity-bearing (ADR-0045): validated against the
+    # adapter at parse time, baked into the image via the materialize step,
+    # never delivered as env vars or invocation flags. model is required when
+    # a driver is set (the drivers' shipped defaults are gone); effort "" =
+    # the model's own default.
+    model: str = ""
+    effort: str = ""
     workspace: str = ""  # target repo, owner/name (required with driver)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
     # driverless only: the container's FULL start command — the daemon runs
@@ -195,14 +220,37 @@ class WorkerTypeDef:
         return last.partition(":")[2] or "latest"
 
     @property
+    def materialized_setup(self) -> tuple[str, ...]:
+        """The setup instructions as they ride the wire and build the image:
+        the operator's setup plus, when model/effort is set, ONE synthesized
+        instruction invoking the in-image ``theozolith-adapter`` CLI
+        (ADR-0045). Managed scope for driver run images (native config where
+        a workspace checkout cannot override it); interactive scope for
+        driverless Flight Deck images (well-known files only — anything under
+        /home/ozolith/.claude would be shadowed by the claude-state volume,
+        ADR-0043). Appended, never written into the operator's TOML."""
+        if not self.model and not self.effort:
+            return self.setup
+        scope = SCOPE_MANAGED if self.is_driver else SCOPE_INTERACTIVE
+        return self.setup + (
+            materialize_instruction(self.adapter, self.model, self.effort, scope),
+        )
+
+    @property
     def instruction_hash(self) -> str:
-        # CRITICAL (ADR-0044): exactly these four image fields, canonical JSON
-        # with sort_keys. Adding driver/adapter/model/workspace/secrets here
-        # would rehash every fleet image and trigger a rebuild storm.
+        # CRITICAL (ADR-0044 as amended by ADR-0045): exactly these four
+        # keys, canonical JSON with sort_keys, over the MATERIALIZED setup —
+        # the hash covers the exact bytes that build the image, including the
+        # baked model/effort config, so candidate identity equals image
+        # identity. driver/workspace/secrets never enter (they change no
+        # image bytes; adding them would rebuild the fleet for nothing), and
+        # a type with no model/effort hashes byte-identically to pre-ADR-0045.
+        # The rendered materialize instruction is therefore identity-bearing:
+        # its format is frozen by golden tests here and in the worker package.
         canonical = json.dumps(
             {
                 "base": self.base,
-                "setup": list(self.setup),
+                "setup": list(self.materialized_setup),
                 "knowledge_source": self.knowledge_source,
                 "knowledge_pin": self.knowledge_pin,
             },
@@ -217,12 +265,15 @@ class WorkerTypeDef:
 
     def recipe_wire(self) -> dict[str, Any]:
         """The derived-image recipe as it rides in the ``images`` wire list —
-        byte-identical to the pre-ADR-0044 ImageDef.as_wire() so the daemon
-        needs no new keys and degraded-mode caches stay shape-compatible."""
+        the same 8 keys as the pre-ADR-0044 ImageDef.as_wire(), so the daemon
+        needs no new keys and degraded-mode caches stay shape-compatible.
+        ``setup`` is the MATERIALIZED setup (ADR-0045): the daemon renders one
+        RUN per entry exactly as before and stays adapter-blind — an
+        un-upgraded daemon still builds the correct bytes under the new tag."""
         return {
             "name": self.name,
             "base": self.base,
-            "setup": list(self.setup),
+            "setup": list(self.materialized_setup),
             "knowledge_source": self.knowledge_source,
             "knowledge_pin": self.knowledge_pin,
             "tag": self.tag,
@@ -294,6 +345,11 @@ class DeployConfig:
     # this reference rides the channel; the artifact is pulled by hash.
     drivers_hash: str = ""
     repo_dir: Path | None = None
+    # Non-fatal lint findings from load (ADR-0045: e.g. a floating model
+    # alias where a pinned ID is the convention). Logged once at the app's
+    # config boundary; surfaced to dashboards from here. Never an error — a
+    # warning must not take desired state down.
+    warnings: tuple[str, ...] = ()
 
     def stacks_for(self, node: str) -> list[StackDef]:
         return [stack for stack in self.stacks if stack.node == node]
@@ -490,13 +546,26 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
     state = _require_str(data, "state", context, default="running")
     if state not in DESIRED_STATES:
         raise ConfigRepoError(f"{context}: state must be one of {DESIRED_STATES}, got {state!r}")
+    env = _str_map(data, "env", context)
+    # Exact names, not a *_MODEL glob: a worker-type Stack's [env] was the
+    # last per-placement override of the type's identity fields; with model
+    # baked into the image (ADR-0045) an override here would be silently
+    # inert, so it is rejected by name. Generic Stacks and any other env
+    # stay free.
+    for key in ("THEOZOLITH_MODEL", "THEOZOLITH_ADAPTER"):
+        if key in env:
+            raise ConfigRepoError(
+                f"{context}: [env] {key} is gone — model and adapter are"
+                " worker-type fields baked into the derived image (ADR-0045);"
+                f" edit worker-types/{worker_type}.toml"
+            )
     return StackDef(
         name=name,
         kind="",  # derived at resolution: driver type -> process, else container
         node=_require_str(data, "node", context),
         state=state,
         worker_type=worker_type,
-        env=_str_map(data, "env", context),
+        env=env,
         attach=_parse_attach(data, context),
     )
 
@@ -544,7 +613,7 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
     else:
         argv = []
     # The built-in drivers only work with the environment a worker type
-    # injects (THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE): a plain Stack that
+    # injects (THEOZOLITH_REPO/ADAPTER/RUN_IMAGE): a plain Stack that
     # invokes the generic launcher directly — any ref, builtin:* or drivers/* —
     # is the old fat-Stack form and is rejected (ADR-0044/ADR-0020). Matching
     # the launcher (not the two-token resolved commands) keeps the guard firing
@@ -619,6 +688,10 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"
         )
+    adapter_name = _require_str(data, "adapter", context, default="claude")
+    model = _require_str(data, "model", context, default="")
+    effort = _require_str(data, "effort", context, default="")
+    _validate_model_effort(context, adapter_name, model, effort, is_driver=bool(driver))
     return WorkerTypeDef(
         name=name,
         base=base,
@@ -626,13 +699,44 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
         knowledge_source=_require_str(data, "knowledge_source", context, default=""),
         knowledge_pin=_require_str(data, "knowledge_pin", context, default=""),
         driver=driver,
-        adapter=_require_str(data, "adapter", context, default="claude"),
-        model=_require_str(data, "model", context, default=""),
+        adapter=adapter_name,
+        model=model,
+        effort=effort,
         workspace=workspace,
         secrets=_str_map(data, "secrets", context),
         command=command,
         volumes=volumes,
     )
+
+
+def _validate_model_effort(
+    context: str, adapter_name: str, model: str, effort: str, *, is_driver: bool
+) -> None:
+    """The adapter-capability gate (ADR-0045), at parse time so EVERY worker
+    type — dormant and driverless included — breaks at configure time, never
+    at build or dispatch (the dormant-driver precedent). The in-image
+    ``theozolith-adapter`` CLI re-validates as the build-time backstop."""
+    try:
+        adapter = make_agent_adapter(adapter_name)
+    except AgentAdapterError as exc:
+        raise ConfigRepoError(f"{context}: {exc}") from exc
+    if is_driver and not model:
+        raise ConfigRepoError(
+            f"{context}: 'model' is required when a driver is set (ADR-0045) —"
+            " the derived image bakes the model into the adapter's native"
+            " config; drivers no longer ship a default"
+        )
+    if model and adapter.classify_model(model) == MODEL_UNMAPPABLE:
+        raise ConfigRepoError(
+            f"{context}: adapter {adapter_name!r} cannot map model {model!r}"
+            f" (mappable: {adapter.model_shapes}) (ADR-0045)"
+        )
+    if effort and effort not in adapter.mappable_efforts():
+        known = ", ".join(sorted(adapter.mappable_efforts())) or "none"
+        raise ConfigRepoError(
+            f"{context}: adapter {adapter_name!r} cannot map effort {effort!r}"
+            f" (mappable: {known}) (ADR-0045)"
+        )
 
 
 def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ...]:
@@ -646,6 +750,20 @@ def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ..
         name, sep, rest = volume.partition(":")
         resolved.append(f"{name.replace(VOLUME_STACK, stack_name)}{sep}{rest}")
     return tuple(resolved)
+
+
+def _worker_type_warnings(wt: WorkerTypeDef) -> list[str]:
+    """Non-fatal lint (ADR-0045): warn — never fail — on a floating model
+    alias. Current-generation provider IDs ship without a dated variant, so
+    'pin the most-dated ID' can only ever be a convention nudge; the adapter
+    already classified the value as mappable."""
+    warnings: list[str] = []
+    if wt.model and make_agent_adapter(wt.adapter).classify_model(wt.model) == MODEL_ALIAS:
+        warnings.append(
+            f"worker-types/{wt.name}.toml: model {wt.model!r} is a floating"
+            " alias — pin the most-dated provider model ID (ADR-0045)"
+        )
+    return warnings
 
 
 def _custom_driver_exists(repo_dir: Path, name: str) -> bool:
@@ -680,10 +798,12 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
     """Turn a thin worker-type Stack into a concrete generic StackDef (ADR-0044).
 
     Env injection happens control-side (the daemon's run_image linkage is
-    gone): the type supplies THEOZOLITH_REPO/ADAPTER/MODEL/RUN_IMAGE, then the
-    Stack's own [env] overrides. The kind is derived from the type's driver;
-    the supervised command is resolved from the driver ref (builtin or a
-    verified drivers/<name>, ADR-0042)."""
+    gone): the type supplies THEOZOLITH_REPO/ADAPTER/RUN_IMAGE, then the
+    Stack's own [env] overrides. The model is deliberately NOT here: it is
+    baked into the run image (ADR-0045), and a model change rolls the fleet
+    through the changed RUN_IMAGE tag instead of a changed env var. The kind
+    is derived from the type's driver; the supervised command is resolved
+    from the driver ref (builtin or a verified drivers/<name>, ADR-0042)."""
     context = f"stacks/{stack.name}.toml"
     if wt.is_driver:
         if stack.attach:
@@ -698,8 +818,6 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
             "THEOZOLITH_ADAPTER": wt.adapter,
             "THEOZOLITH_RUN_IMAGE": wt.tag,
         }
-        if wt.model:
-            env["THEOZOLITH_MODEL"] = wt.model
         env.update(stack.env)
         return StackDef(
             name=stack.name,
@@ -790,12 +908,15 @@ def load_config(repo_dir: Path) -> DeployConfig:
         raise ConfigRepoError(
             "images/ is gone — rename each images/<name>.toml into"
             " worker-types/<name>.toml and add the worker-type fields"
-            " (driver/adapter/model/workspace/secrets) (ADR-0044)"
+            " (driver/adapter/model/effort/workspace/secrets) (ADR-0044)"
         )
     worker_types = {
         path.stem: _parse_worker_type(path.stem, _load_toml(path))
         for path in sorted((repo_dir / "worker-types").glob("*.toml"))
     }
+    warnings = tuple(
+        warning for wt in worker_types.values() for warning in _worker_type_warnings(wt)
+    )
     # Config Repo validity is independent of Stack placement (ADR-0042): every
     # driver-bearing worker type resolves its command here, so a dangling
     # drivers/<name> reference fails load_config() even when no Stack
@@ -838,4 +959,5 @@ def load_config(repo_dir: Path) -> DeployConfig:
         product_version=product_version,
         drivers_hash=drivers_hash,
         repo_dir=repo_dir,
+        warnings=warnings,
     )
