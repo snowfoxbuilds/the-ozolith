@@ -742,6 +742,17 @@ def _validate_model_effort(
             f"{context}: adapter {adapter_name!r} cannot map effort {effort!r}"
             f" (mappable: {known}) (ADR-0045)"
         )
+    # Pair-aware capability validation (ADR-0045 amendment): the effort must
+    # be provably honored by THIS model. Claude Code silently runs the
+    # highest supported level at or below an unsupported one (xhigh becomes
+    # high on the 4.6 generation) and silently ignores effort on models
+    # without the setting — a baked value the session would not actually run
+    # at is a fake identity, so the pair fails the load. An unknown future
+    # model paired with an effort fails too: enforceability must be
+    # positively known, never assumed.
+    pair = adapter.pair_error(model, effort)
+    if pair:
+        raise ConfigRepoError(f"{context}: {pair}")
 
 
 def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ...]:

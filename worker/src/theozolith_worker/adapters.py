@@ -32,6 +32,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from theozolith_worker import identity as identity_mod
+from theozolith_worker.identity import (
+    BakedIdentity,
+    ClaudeSessionGuard,
+    IdentityError,
+    PreflightReport,
+)
 from theozolith_worker.jobdir import MODE_REVIEW, VERDICT_FILE, Manifest
 
 
@@ -61,9 +68,10 @@ MATERIALIZE_SCOPES = (SCOPE_MANAGED, SCOPE_INTERACTIVE)
 # The adapter-independent inspection surface: what any derived image was
 # baked with, readable via ``docker run --rm <tag> cat /etc/theozolith/model``.
 # Root-owned on purpose — a session can read its baked default, never
-# rewrite it.
-WELL_KNOWN_MODEL_FILE = "etc/theozolith/model"
-WELL_KNOWN_EFFORT_FILE = "etc/theozolith/effort"
+# rewrite it. At runtime these same files are the harness's declaration of
+# the identity the preflight gate must prove effective (identity.py).
+WELL_KNOWN_MODEL_FILE = identity_mod.WELL_KNOWN_MODEL_FILE
+WELL_KNOWN_EFFORT_FILE = identity_mod.WELL_KNOWN_EFFORT_FILE
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,14 @@ class AgentAdapter(Protocol):
         native config (ADR-0045); empty when the agent CLI has none."""
         ...
 
+    def pair_error(self, model: str, effort: str) -> str:
+        """Why ``(model, effort)`` is not an enforceable pair, or "" when it
+        is (ADR-0045 pair validation): effort must be provably honored by the
+        specific model — a value the agent CLI silently clamps or ignores on
+        that model is rejected, as is any effort on a model whose capability
+        is unknown. effort "" (the model's own default) is always valid."""
+        ...
+
     def materialize(self, model: str, effort: str, *, root: Path, scope: str) -> list[Path]:
         """Write the native configuration for ``model``/``effort`` under
         ``root`` (the image filesystem; ``/`` in a real build) and return the
@@ -139,6 +155,31 @@ class AgentAdapter(Protocol):
         the build log. Raises ``AgentAdapterError`` when it cannot — a config
         the CLI would silently ignore is a baked identity that does not bind,
         so the build must fail, not proceed (ADR-0045)."""
+        ...
+
+    # -- the runtime gate (ADR-0045 fail-closed amendment) -------------------
+
+    def baked_identity(self, root: Path) -> BakedIdentity | None:
+        """The identity this filesystem was baked with, or None when it
+        carries none (a model-less worker type runs ungated). Raises
+        ``AgentAdapterError`` on an inconsistent or corrupt declaration."""
+        ...
+
+    def preflight(self, identity: BakedIdentity, *, root: Path, scratch: Path) -> PreflightReport:
+        """The pre-launch runtime gate, with the Run's own credential and
+        effective policy. A failed report means the real task prompt must
+        never be sent."""
+        ...
+
+    def guarded_command(self, manifest: Manifest, effort_capture: Path | None) -> list[str]:
+        """The gated session argv: input arrives over stdin so the harness
+        can withhold the real task prompt until the session's identity is
+        verified in-process."""
+        ...
+
+    def session_guard(self, identity: BakedIdentity, effort_capture: Path | None):
+        """The line-by-line gate + monitor for a gated session (see
+        ``identity.ClaudeSessionGuard`` for the contract)."""
         ...
 
 
@@ -179,13 +220,16 @@ class ClaudeAdapter:
     # CLAUDE_CODE_SUBAGENT_MODEL), and the managed "env" block, whose
     # CLAUDE_CODE_EFFORT_LEVEL overrides /effort, --effort, the process
     # environment, and any settings-file effortLevel (all verified live).
-    MANAGED_SETTINGS = "etc/claude-code/managed-settings.json"
-    # The oldest Claude Code the managed-scope config binds on:
-    # availableModels/enforceAvailableModels shipped in 2.1.175 and family-
-    # alias substitution completed in 2.1.222; behavior verified live on
-    # 2.1.231. An older CLI would silently ignore the allowlist — the exact
-    # hole verify_enforceable() exists to close.
-    MIN_ENFORCING_CLI = (2, 1, 222)
+    MANAGED_SETTINGS = identity_mod.MANAGED_SETTINGS_FILE
+    # The oldest Claude Code whose exact documented behavior this adapter
+    # relies on: availableModels/enforceAvailableModels shipped in 2.1.175,
+    # family-alias substitution completed in 2.1.222, and the per-key managed
+    # ``env`` merge — without which a server-managed org env block would
+    # silently displace the baked CLAUDE_CODE_EFFORT_LEVEL pin — shipped in
+    # 2.1.223. Behavior verified live on 2.1.231. An older CLI would silently
+    # ignore or lose parts of the baked identity — the exact hole
+    # verify_enforceable() and the runtime preflight exist to close.
+    MIN_ENFORCING_CLI = (2, 1, 223)
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
     def __init__(self, binary: str = "claude"):
@@ -200,6 +244,9 @@ class ClaudeAdapter:
 
     def mappable_efforts(self) -> frozenset[str]:
         return self.EFFORTS
+
+    def pair_error(self, model: str, effort: str) -> str:
+        return identity_mod.pair_error(model, effort)
 
     def _cli_version(self) -> str:
         """``claude --version`` output from the CLI beside this adapter."""
@@ -249,20 +296,25 @@ class ClaudeAdapter:
     def materialize(self, model: str, effort: str, *, root: Path, scope: str) -> list[Path]:
         """Bake ``model``/``effort`` into the image filesystem under ``root``.
 
-        ``managed`` (driver run images) writes the well-known files and
-        merges the enforcement keys into the managed settings JSON: ``model``
-        is only the session default, so the identity is held by a
+        ``managed`` (driver run images) first proves the managed tier under
+        ``root`` cannot supersede what it is about to write: the base
+        ``managed-settings.json`` and every ``managed-settings.d/*.json``
+        drop-in are inspected in Claude Code's documented merge order, and a
+        malformed document, a ``policyHelper``/``policyHelpers``, or any
+        identity-affecting key (model, availableModels,
+        enforceAvailableModels, fallbackModel, effortLevel, or a
+        model/effort-selecting ``env`` entry) FAILS THE BUILD naming the file
+        and key — operator policy is never silently deleted or overwritten
+        (ADR-0045 fail-closed amendment). It then writes the well-known files
+        and merges the enforcement keys into the base settings JSON:
+        ``model`` is only the session default, so the identity is held by a
         single-entry ``availableModels`` allowlist with
         ``enforceAvailableModels`` (constraining every model-selection
         surface) and, for effort, ``env.CLAUDE_CODE_EFFORT_LEVEL`` (which
         overrides /effort, --effort, the process environment, and any
         settings-file effortLevel) beside the ``effortLevel`` default.
-
-        The merge is deep and the identity keys are authoritative: unrelated
-        keys an operator setup step pre-wrote survive untouched, the keys
-        above are overwritten, and a malformed existing file — or an existing
-        ``env`` that is not an object — fails the build loudly instead of
-        being clobbered.
+        Unrelated operator keys — including foreign ``env`` entries — survive
+        the merge untouched.
 
         ``interactive`` (driverless Flight Deck images) writes ONLY
         ``/etc/theozolith/model``: no managed settings (the deck may switch
@@ -275,6 +327,20 @@ class ClaudeAdapter:
                 "effort is not materializable at interactive scope — driverless"
                 " (Flight Deck) worker types have no effort consumer (ADR-0045)"
             )
+        pair = identity_mod.pair_error(model, effort)
+        if pair:
+            raise AgentAdapterError(pair)
+        if scope == SCOPE_MANAGED:
+            try:
+                conflicts = identity_mod.scan_managed_conflicts(root, expected=None)
+            except IdentityError as exc:
+                raise AgentAdapterError(str(exc)) from exc
+            if conflicts:
+                raise AgentAdapterError(
+                    "existing managed settings would supersede the baked"
+                    " identity — refusing to overwrite operator policy;"
+                    " remove or relocate the conflicting keys: " + "; ".join(conflicts)
+                )
         written: list[Path] = []
         pairs = [(WELL_KNOWN_MODEL_FILE, model), (WELL_KNOWN_EFFORT_FILE, effort)]
         for relpath, value in pairs:
@@ -289,21 +355,9 @@ class ClaudeAdapter:
             settings.parent.mkdir(parents=True, exist_ok=True)
             existing: dict = {}
             if settings.exists():
-                text = settings.read_text(encoding="utf-8")
-                try:
-                    loaded = json.loads(text)
-                except json.JSONDecodeError as exc:
-                    raise AgentAdapterError(
-                        f"{settings} exists but is not valid JSON ({exc}) — fix the"
-                        " setup instruction that wrote it; refusing to guess at"
-                        " operator-written managed settings"
-                    ) from exc
-                if not isinstance(loaded, dict):
-                    raise AgentAdapterError(
-                        f"{settings} exists but is not a JSON object — refusing to"
-                        " overwrite operator-written managed settings"
-                    )
-                existing = loaded
+                # The conflict scan above already proved this parses to an
+                # identity-free object; the merge preserves it verbatim.
+                existing = json.loads(settings.read_text(encoding="utf-8"))
             if model:
                 existing["model"] = model
                 existing["availableModels"] = [model]
@@ -311,22 +365,80 @@ class ClaudeAdapter:
             if effort:
                 existing["effortLevel"] = effort
                 env = existing.setdefault("env", {})
-                if not isinstance(env, dict):
-                    raise AgentAdapterError(
-                        f"{settings} has an 'env' value of type"
-                        f" {type(env).__name__}, not an object — refusing to merge"
-                        " CLAUDE_CODE_EFFORT_LEVEL into it"
-                    )
                 env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
             settings.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", "utf-8")
             written.append(settings)
         return written
 
+    # -- the runtime gate (ADR-0045 fail-closed amendment) --------------------
+
+    def baked_identity(self, root: Path) -> BakedIdentity | None:
+        try:
+            return identity_mod.read_baked_identity(root)
+        except IdentityError as exc:
+            raise AgentAdapterError(str(exc)) from exc
+
+    def preflight(
+        self, identity: BakedIdentity, *, root: Path, scratch: Path, run=subprocess.run
+    ) -> PreflightReport:
+        scratch.mkdir(parents=True, exist_ok=True)
+        return identity_mod.run_preflight(
+            identity,
+            binary=self._binary,
+            root=root,
+            scratch=scratch,
+            min_cli=self.MIN_ENFORCING_CLI,
+            run=run,
+        )
+
+    def guarded_command(self, manifest: Manifest, effort_capture: Path | None) -> list[str]:
+        # The gated variant of command(): input arrives as stream-json user
+        # messages over stdin, so the harness can run the no-op probe turn and
+        # verify the session's identity before the real task prompt enters
+        # the process. When effort is baked, a PostToolUse hook (added via
+        # --settings, a source managed settings always outrank) captures the
+        # APPLIED effort — the one machine-readable observation of an
+        # organization effort cap, which clamps silently in stream-json.
+        argv = [
+            self._binary,
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+        if effort_capture is not None:
+            hook = {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"cat > {shlex.quote(str(effort_capture))}",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            argv += ["--settings", json.dumps(hook)]
+        return argv
+
+    def session_guard(
+        self, identity: BakedIdentity, effort_capture: Path | None
+    ) -> ClaudeSessionGuard:
+        return ClaudeSessionGuard(identity, effort_capture)
+
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
         # Headless on purpose: completion is process exit (ADR-0019), and
         # the structured stream is both transcript and usage source. No
         # --model (ADR-0045): the CLI reads the model/effort baked into the
-        # image's managed settings — nothing at invocation selects one.
+        # image's managed settings — nothing at invocation selects one. Used
+        # only when the image bakes no identity; a baked identity launches
+        # through guarded_command() so the prompt can be gated.
         return [
             self._binary,
             "-p",

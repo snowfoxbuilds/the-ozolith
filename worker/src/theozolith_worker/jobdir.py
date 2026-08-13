@@ -55,6 +55,10 @@ PROMPT_FILE = "input/prompt.md"
 STATUS_FILE = "output/status.json"
 TRANSCRIPT_FILE = "output/transcript.txt"
 VERDICT_FILE = "output/verdict.json"
+# The baked-identity verdict (ADR-0045): expected vs effective model/effort,
+# preflight status, and the gate outcome — written by the harness, embedded
+# into the driver's evidence bundle. Absent when the image bakes no identity.
+IDENTITY_FILE = "output/identity.json"
 JOBS_IN_DIR = "input/jobs"
 JOBS_OUT_DIR = "output/jobs"
 CHECKOUT_DIR = "checkout"
@@ -186,6 +190,15 @@ def read_status(job: Path) -> Status | None:
             exit_code=int(raw_code) if isinstance(raw_code, int) else None,
         )
     return Status(phase=data["phase"], agent=agent, error=str(data.get("error", "")))
+
+
+def write_identity(job: Path, data: dict) -> None:
+    """output/identity.json: the baked-identity verdict (ADR-0045)."""
+    atomic_write(job / IDENTITY_FILE, json.dumps(data, indent=2, sort_keys=True))
+
+
+def read_identity(job: Path) -> dict | None:
+    return _read_json(job / IDENTITY_FILE)
 
 
 @dataclass(frozen=True)

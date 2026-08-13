@@ -60,6 +60,7 @@ from theozolith_worker.containers import (
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.identity import IDENTITY_ERROR_PREFIX
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -170,7 +171,10 @@ class RunReport:
     gate_findings: int = 0
     reason: str = ""  # failed Runs: what broke
     # ADR-0016 uniform budget classes: timeout | session-died | harness |
-    # no-changes | infra ("" for completed Runs).
+    # no-changes | infra ("" for completed Runs). ADR-0045 adds identity:
+    # the baked model/effort could not be proven effective (preflight failed
+    # or the session drifted mid-run) — the task prompt was withheld or the
+    # session was killed, and the Run is invalid.
     failure_class: str = ""
     evidence_pushed: bool = False
     # True only on the compound failure: the push failed AND both parking
@@ -572,6 +576,12 @@ def _run_to_pr(
 
     if outcome is None or not outcome.completed:
         if harness_error:
+            # ADR-0045: the harness marks identity-gate failures (preflight,
+            # gate, mid-run drift) with a distinct prefix — a policy problem,
+            # not harness breakage, and retrying it burns the same budget
+            # against the same policy.
+            if IDENTITY_ERROR_PREFIX in harness_error:
+                raise _RunFailed(harness_error, "identity")
             raise _RunFailed(harness_error, "harness")
         if outcome is not None and outcome.timed_out:
             raise _RunFailed("agent session timed out", "timeout")
@@ -704,6 +714,12 @@ def _push_run_evidence(
                 "run_image": config.run_image,
                 "model": stats.model,
                 "model_note": stats.model_note,
+                # The harness's baked-identity verdict (ADR-0045): expected
+                # vs effective model/effort, preflight status, and whether
+                # the gate ever released the task prompt. None on an image
+                # that bakes no identity. Values are category strings and
+                # model/effort names only — never credentials or settings.
+                "identity": jobdir.read_identity(job),
                 "container": report.container,
                 "issue": issue.number,
                 "round": report.round,

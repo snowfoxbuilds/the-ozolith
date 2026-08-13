@@ -316,6 +316,7 @@ def review_pr(
             transcript=transcript,
             container=container,
             observed=adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE),
+            identity=jobdir.read_identity(job),
             sink=sink,
         )
         _emit_review(sink, config, pr, issue_number, result)
@@ -355,6 +356,9 @@ def _escalate_invalid_verdict(
         "run_image": config.run_image,
         "model": stats.model,
         "model_note": stats.model_note,
+        # The harness's baked-identity verdict (expected vs effective model/
+        # effort, preflight and gate status); None on a model-less image.
+        "identity": jobdir.read_identity(job),
         "container": container,
     }
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
@@ -406,6 +410,7 @@ def _apply(
     transcript: str = "",
     container: str = "",
     observed: adapters.StreamStats | None = None,
+    identity: dict | None = None,
     sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
@@ -418,6 +423,7 @@ def _apply(
         container,
         log,
         observed=observed,
+        identity=identity,
         sink=sink,
     )
 
@@ -488,6 +494,7 @@ def _push_review_evidence(
     container: str,
     log,
     observed: adapters.StreamStats | None = None,
+    identity: dict | None = None,
     sink: EventSink | None = None,
 ) -> None:
     record = {
@@ -507,6 +514,9 @@ def _push_review_evidence(
         "run_image": config.run_image,
         "model": observed.model if observed else "",
         "model_note": observed.model_note if observed else "",
+        # The harness's baked-identity verdict; None when no container ran
+        # (deterministic escalation) or the image bakes no identity.
+        "identity": identity,
         # Empty when no review container ran (deterministic escalation).
         "container": container,
     }

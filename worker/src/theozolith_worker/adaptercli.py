@@ -58,6 +58,15 @@ def _materialize(args) -> int:
             file=sys.stderr,
         )
         return 2
+    # Pair-aware capability validation (ADR-0045 amendment): a mappable
+    # effort value must also be provably honored by THIS model — a pair the
+    # agent CLI silently clamps (xhigh on a family without it) or ignores
+    # (any effort on a model with none), and any effort on a model unknown
+    # to this adapter build, fails here rather than baking a fake identity.
+    pair = adapter.pair_error(args.model, args.effort)
+    if pair:
+        print(f"error: {pair}", file=sys.stderr)
+        return 2
     if args.effort and args.scope == SCOPE_INTERACTIVE:
         print(
             "error: effort has no interactive-scope materialization — driverless"
