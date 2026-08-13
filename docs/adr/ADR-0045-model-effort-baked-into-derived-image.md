@@ -29,9 +29,8 @@ from it. The Claude adapter therefore pins the model with a single-entry
 `availableModels` allowlist plus `enforceAvailableModels` (constraining
 every selection surface: flags, env vars, settings files, in-session
 switching, subagent frontmatter) and pins effort with the managed-env
-`CLAUDE_CODE_EFFORT_LEVEL` (which overrides every effort surface),
-deep-merging into any operator-written managed settings with the
-identity keys authoritative. **Mappable means enforceable**: a value the
+`CLAUDE_CODE_EFFORT_LEVEL` (which overrides every effort surface).
+**Mappable means enforceable**: a value the
 CLI accepts but cannot be held to (Claude's `default`, `opusplan`) is
 unmappable; a driverless type's `effort` is rejected until a runtime
 consumer exists (interactive scope bakes only the well-known model
@@ -41,6 +40,69 @@ enforcement behavior itself is proven against a live CLI by an opt-in
 worker test suite. Evidence reports the **observed** model reconciled
 from all session-stream signals, surfacing remaps, fallbacks, and
 multi-model sessions instead of flattening them.
+
+### Amendment (2026-08-13): enforcement fails closed, at two gates
+
+The baked identity can be superseded by policy the original design never
+checked: Claude Code merges `managed-settings.d/*.json` drop-ins over
+the base file (arrays **concatenate** — one drop-in line widens the
+allowlist), a managed `policyHelper` preempts the entire managed tier,
+server-managed organization settings outrank the local managed file, an
+organization effort cap clamps silently in stream-json, the CLI
+substitutes an unavailable model with only a suppressed stderr warning,
+and an unsupported effort silently runs at the nearest supported level.
+The amendment's doctrine: **a Run never receives its real task prompt
+unless the effective model and effort are proven to match the baked
+identity; anything unverifiable fails closed; organization policy is
+never disabled, replaced, or weakened to make a Run pass.**
+
+- **Build gate** (conflicts knowable from the image filesystem): the
+  materialize step scans the base managed file and every drop-in in
+  merge order and fails the build — naming the file and key — on any
+  identity-affecting key (`model`, `availableModels`,
+  `enforceAvailableModels`, `fallbackModel`, `effortLevel`,
+  `policyHelper`/`policyHelpers`, or a model/effort-selecting `env`
+  entry), on a malformed document, and on a pre-existing managed
+  `effortLevel` even when the type bakes no effort (inherited settings
+  must not convert `effort = ""`, the model's own default, into an
+  enforced value). Conflicting operator policy is never deleted or
+  overwritten; unrelated operator settings still merge and survive.
+  The CLI floor rises to **2.1.223**: the per-key managed `env` merge
+  it introduced is what keeps the baked effort pin alive beside a
+  server-delivered org `env` block.
+- **Runtime gate** (the Run's own credential and effective policy;
+  there is no machine-readable effective-settings dump, so identity is
+  proven behaviorally): static re-checks of the image policy and the
+  managed pin's consistency with the well-known files; a **widen
+  canary** (an intruder `--model` must coerce back to the pin — catches
+  widened/replaced policy from any source, server-side included); then
+  a **gated task session** — stdin-driven, first turn a no-op probe,
+  the real pointer prompt released into the same process only after the
+  init announcement and an executed turn match the baked model (exact
+  for pinned IDs, family for aliases) and, when effort is baked, the
+  hook-captured *applied* effort equals it. After release the harness
+  monitors the stream and kills the agent on any identity drift — a
+  mid-run policy change invalidates the Run immediately. Failures carry
+  `failure_class: identity` and a category
+  (`policy-conflict`, `identity-inconsistent`, `pair-invalid`,
+  `cli-too-old`, `unavailable`, `substituted`, `policy-widened`,
+  `effort-clamped`, `unverifiable`, `preflight-timeout`); evidence
+  embeds the expected-vs-effective verdict (never credentials or
+  settings contents). Post-run stream reconciliation remains as
+  defense-in-depth, not as the gate.
+- **Pair validation** replaces the global effort allowlist: `(model,
+  effort)` validate together at config load, build, and preflight — an
+  effort the specific model silently clamps or ignores is rejected, as
+  is any effort on a model whose capability is not positively known.
+  `effort = ""` stays "model default" and pins nothing.
+
+Wire and identity are unchanged: the nodedaemon's eight-key recipe
+contract, the materialize-instruction format, the instruction hash, and
+model-less worker-type hashes are byte-identical; the credential
+contract (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`, no
+model-selection env vars) is untouched. The runtime gate costs a few
+hundred tokens per Run (canary + probe); model-less images skip it
+entirely.
 
 ## Consequences
 - **Positive**: the image is bound to the worker definition — for
