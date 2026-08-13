@@ -69,7 +69,8 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     wt_toml = tmp_path / "configs" / "worker-types" / "claude-dev.toml"
     wt_toml.parent.mkdir(parents=True)
     wt_toml.write_text(
-        'driver = "builtin:implementer"\nadapter = "claude"\nworkspace = "acme/sandbox"\n'
+        'driver = "builtin:implementer"\nadapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        'workspace = "acme/sandbox"\n'
         f'base = "ghcr.io/x/run:1.0@sha256:{"0" * 64}"\n'
         '[secrets]\nIMPLEMENTER_GITHUB_TOKEN = "github-implementer"\n',
         encoding="utf-8",
