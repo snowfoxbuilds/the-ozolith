@@ -501,6 +501,31 @@ def test_driverless_model_is_validated_too(tmp_path):
         load_config(tmp_path)
 
 
+def test_driverless_effort_is_rejected(tmp_path):
+    """Fail closed (ADR-0045): interactive scope bakes only the default-model
+    file and nothing at Flight Deck runtime consumes a baked effort — a field
+    that silently binds nothing would misrepresent the deck's identity."""
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\nmodel = "claude-opus-5"\neffort = "high"\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"'effort' is rejected on driverless"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("value", ["default", "opusplan"])
+def test_unenforceable_cli_selections_are_rejected(tmp_path, value):
+    """The Claude CLI accepts these as selections, but neither names the one
+    model the image bakes: "default" floats with the account tier and fails
+    outright under the allowlist; "opusplan" is a two-model mode that
+    degrades to plain Sonnet under enforcement (both verified live on
+    2.1.231). Unenforceable = unmappable = configure-time failure."""
+    driver_type(tmp_path, model=f'"{value}"')
+    with pytest.raises(ConfigRepoError, match=f"cannot map model '{value}'"):
+        load_config(tmp_path)
+
+
 def test_alias_model_warns_but_loads(tmp_path):
     """The pin-the-dated-ID convention is a lint, never an error: current-
     generation provider IDs have no dated variant, so a warning is the

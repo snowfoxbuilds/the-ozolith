@@ -724,6 +724,13 @@ def _validate_model_effort(
             " the derived image bakes the model into the adapter's native"
             " config; drivers no longer ship a default"
         )
+    if effort and not is_driver:
+        raise ConfigRepoError(
+            f"{context}: 'effort' is rejected on driverless (Flight Deck) worker"
+            " types (ADR-0045) — interactive scope bakes only the default-model"
+            " file, and nothing at runtime consumes a baked effort; set effort"
+            " when a consumer exists"
+        )
     if model and adapter.classify_model(model) == MODEL_UNMAPPABLE:
         raise ConfigRepoError(
             f"{context}: adapter {adapter_name!r} cannot map model {model!r}"
