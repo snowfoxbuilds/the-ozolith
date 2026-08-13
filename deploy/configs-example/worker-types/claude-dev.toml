@@ -5,19 +5,23 @@
 #
 # The derived-image identity (tag = base tag + instruction hash) covers the
 # bytes that build the image: base/setup/knowledge_* PLUS the materialized
-# model/effort config (ADR-0045) — the compiler bakes model and effort into
-# the image's managed settings, so changing either re-tags and rebuilds.
-# Nothing at invocation can select a model: no env var, no flag, no Stack
-# [env] override. driver/workspace/secrets still never trigger a rebuild.
-# When you change the model, bump `base` to a release that ships
-# theozolith-adapter in the same edit — both change the tag anyway.
+# model/effort config (ADR-0045) — the compiler bakes an enforced model
+# restriction (availableModels allowlist) and effort (managed env) into the
+# image's managed settings, so changing either re-tags and rebuilds, and no
+# selection surface inside a run — env var, flag, /model, checked-in
+# settings, subagent frontmatter — can leave the pin (see deploy/README.md).
+# driver/workspace/secrets still never trigger a rebuild. When you change
+# the model, bump `base` to a release that ships theozolith-adapter in the
+# same edit — both change the tag anyway.
 
 driver = "builtin:implementer"   # the staged pipeline Implementer (process kind)
 adapter = "claude"               # the Agent adapter the harness invokes
 # model is REQUIRED with a driver and validated against the adapter at
 # config load; a value the adapter cannot map refuses to load (ADR-0045).
-# Pin the most-dated provider ID the adapter offers; short aliases like
-# "sonnet" load but warn. effort is optional ("" = the model's default):
+# Pin the most-dated provider ID the adapter offers; family aliases
+# (fable/haiku/opus/sonnet) load but warn; "default"/"opusplan" refuse to
+# load (unenforceable as a single pinned model). effort is optional
+# ("" = the model's default) and driver types only:
 # effort = "high"
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works

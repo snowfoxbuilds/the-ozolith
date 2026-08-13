@@ -22,6 +22,26 @@ most-dated provider model ID over floating aliases. The Flight Deck
 bakes a default model; in-session switching is session state, not
 definition.
 
+Materialization must write **enforcement, not defaults**: a config key
+the agent CLI treats as a starting selection (Claude's managed `model` /
+`effortLevel`) does not bind the identity — the session can steer away
+from it. The Claude adapter therefore pins the model with a single-entry
+`availableModels` allowlist plus `enforceAvailableModels` (constraining
+every selection surface: flags, env vars, settings files, in-session
+switching, subagent frontmatter) and pins effort with the managed-env
+`CLAUDE_CODE_EFFORT_LEVEL` (which overrides every effort surface),
+deep-merging into any operator-written managed settings with the
+identity keys authoritative. **Mappable means enforceable**: a value the
+CLI accepts but cannot be held to (Claude's `default`, `opusplan`) is
+unmappable; a driverless type's `effort` is rejected until a runtime
+consumer exists (interactive scope bakes only the well-known model
+file); and the build fails when the in-image CLI predates the
+enforcement settings, verified by an in-image version preflight. The
+enforcement behavior itself is proven against a live CLI by an opt-in
+worker test suite. Evidence reports the **observed** model reconciled
+from all session-stream signals, surfacing remaps, fallbacks, and
+multi-model sessions instead of flattening them.
+
 ## Consequences
 - **Positive**: the image is bound to the worker definition — for
   benchmarking, candidate identity ≈ image identity; selecting an

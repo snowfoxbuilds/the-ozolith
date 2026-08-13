@@ -485,14 +485,48 @@ partition, including `store.db`, which only exists once a node or secret does).
 
 ## Model & effort are baked into the run image (ADR-0045)
 
-`model` (required with a driver) and `effort` (optional) are typed fields on the
-worker-type definition, validated at config load against the Agent adapter and
-**baked into the derived image**: control appends one synthesized
-`theozolith-adapter materialize` setup step, which writes the model into the
-image's managed adapter config where nothing in a workspace checkout can
-override it. The instruction hash covers that step, so changing `model`/`effort`
-re-tags the image and rolls the affected workers — that is the only way a model
-ever changes.
+`model` (required with a driver) and `effort` (optional, driver types only) are
+typed fields on the worker-type definition, validated at config load against
+the Agent adapter and **baked into the derived image**: control appends one
+synthesized `theozolith-adapter materialize` setup step to the recipe.
+
+For the Claude adapter that step writes `/etc/claude-code/managed-settings.json`
+with the actual enforcement keys — a bare managed `model` (or `effortLevel`) is
+only a session *default* the session can steer away from, so the identity is
+held by:
+
+- a single-entry `availableModels` allowlist plus `enforceAvailableModels`,
+  which constrains every model-selection surface (`--model`, `/model`,
+  `ANTHROPIC_MODEL`, checked-in `.claude/settings.json`, subagent frontmatter
+  `model:`, `CLAUDE_CODE_SUBAGENT_MODEL`) — blocked values substitute back to
+  the pin or hard-error, never run;
+- the managed `env` entry `CLAUDE_CODE_EFFORT_LEVEL`, which overrides
+  `/effort`, `--effort`, the process environment, and any settings-file
+  `effortLevel`.
+
+Unrelated managed-settings keys an operator setup step pre-wrote survive (deep
+merge); the identity keys above are overwritten; a malformed pre-existing file
+or a non-object `env` fails the build instead of being clobbered. This
+enforcement is verified live against **Claude Code 2.1.231** (the worker
+package ships an opt-in live suite, `THEOZOLITH_LIVE_CLAUDE=1`); the
+materialize step probes `claude --version` in-image and **fails the build** if
+the CLI predates the enforcement settings, so an old base can never bake a
+restriction it would silently ignore.
+
+Family aliases (`sonnet`, `opus`, `haiku`, `fable`) load with a pin-the-dated-ID
+warning and bind the image to the newest model of that family. `default` and
+`opusplan` are **refused at config load**: the CLI accepts them as selections,
+but neither names a single enforceable model (`default` floats with the account
+tier and fails under the allowlist; `opusplan` is a two-model mode that
+degrades under enforcement). `effort` on a driverless (Flight Deck) type is
+also refused — interactive scope bakes only `/etc/theozolith/model`, and no
+Flight Deck runtime consumes a baked effort yet.
+
+Run evidence records the run-image identity plus the **observed** model,
+reconciled from the session stream (init announcement, executed assistant
+turns, usage records); any drift — remap, fallback, multiple models, or
+contradictory signals — lands in the bundle's `model_note` instead of being
+flattened away.
 
 Removed with **no fallback** (a leftover export now fails the driver loudly):
 `IMPLEMENTER_MODEL` / `REVIEWER_MODEL` / `THEOZOLITH_MODEL`, the Stack `[env]`
@@ -502,10 +536,10 @@ no longer declare a `default_model` class attribute — delete it from your
 
 Migration rule: when you first set (or next change) `model` on a worker type,
 **bump `base` to a release that ships `theozolith-adapter` in the same edit** —
-an older base fails the build loudly ("command not found"), and both edits
-change the tag anyway, so it costs one rebuild. Worker types with no
-`model`/`effort` keep byte-identical tags across this release and rebuild
-nothing.
+an older base fails the build loudly ("command not found", or the CLI-version
+preflight above), and both edits change the tag anyway, so it costs one
+rebuild. Worker types with no `model`/`effort` keep byte-identical tags across
+this release and rebuild nothing.
 
 ## Job-dir ownership
 
