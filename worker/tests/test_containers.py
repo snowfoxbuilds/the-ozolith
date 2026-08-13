@@ -145,7 +145,9 @@ def test_docker_launch_flags_and_secret_env_handling(tmp_path):
         labels=container_labels("r1", "worker"),
         mounts=((str(job), "/job"),),
         volumes=(("theozolith-cache", "/home/ozolith/.cache"),),
-        env={"ANTHROPIC_API_KEY": "sk-ant-secret"},
+        # Both model credentials may ride together (either alone is enough):
+        # the API key and the Claude Code OAuth token travel the same path.
+        env={"ANTHROPIC_API_KEY": "sk-ant-secret", "CLAUDE_CODE_OAUTH_TOKEN": "oat-secret"},
         user="1000:1000",
     )
 
@@ -160,7 +162,12 @@ def test_docker_launch_flags_and_secret_env_handling(tmp_path):
     assert "theozolith-cache:/home/ozolith/.cache" in argv
     assert argv[argv.index("--user") + 1] == "1000:1000"
     assert argv[-1] == "theozolith-run-claude:local"
-    # The secret is passed by NAME only; the value rides the CLI's env.
-    assert "ANTHROPIC_API_KEY" in argv
-    assert all("sk-ant-secret" not in arg for arg in argv)
-    assert entry["env"]["ANTHROPIC_API_KEY"] == "sk-ant-secret"
+    # Every secret is passed by NAME only; the value rides the CLI's env and
+    # never appears in argv (labels, mounts, and the image ref included).
+    for name, value in (
+        ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "oat-secret"),
+    ):
+        assert name in argv
+        assert all(value not in arg for arg in argv)
+        assert entry["env"][name] == value

@@ -17,7 +17,8 @@
 #
 # No GitHub credential ever enters this image or its containers: the driver
 # holds the PAT and performs all GitHub I/O. The only secret a run container
-# sees is the model API key (a rotatable spend credential, ADR-0013).
+# sees is the model credential — an API key (a rotatable spend credential,
+# ADR-0013) or a `claude setup-token` OAuth token.
 
 FROM python:3.13-slim
 
