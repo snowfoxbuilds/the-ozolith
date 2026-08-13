@@ -209,7 +209,14 @@ def test_run_mode_full_cycle(tmp_path):
     stream = '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}\n'
     launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0), stream=stream)
 
-    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 0
     status = jobdir.read_status(job)
@@ -243,7 +250,14 @@ def test_review_mode_copies_verdict_and_serves_no_jobs(tmp_path):
     clock = ScriptedClock()
     launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0))
 
-    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 0
     assert json.loads((job / jobdir.VERDICT_FILE).read_text()) == verdict
@@ -256,7 +270,14 @@ def test_harness_survives_agent_timeout_and_reports_it(tmp_path):
     clock = ScriptedClock()
     launcher = FakeLauncher(FakeAgent(clock))
 
-    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 0  # a timed-out agent is an outcome, not a harness failure
     status = jobdir.read_status(job)
@@ -270,7 +291,14 @@ def test_missing_task_file_is_a_harness_failure(tmp_path):
     clock = ScriptedClock()
     launcher = FakeLauncher(FakeAgent(clock, exits_at=1.0))
 
-    code = run_harness(job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 1
     status = jobdir.read_status(job)
@@ -285,7 +313,14 @@ def test_agent_launch_failure_is_a_harness_failure(tmp_path):
     def broken_launcher(argv, cwd, env, transcript):
         raise OSError("no such binary: claude")
 
-    code = run_harness(job, broken_launcher, runner=_real_runner, clock=clock, sleep=clock.sleep)
+    code = run_harness(
+        job,
+        broken_launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 1
     status = jobdir.read_status(job)
@@ -319,7 +354,13 @@ def test_real_headless_invocation_streams_and_completes(tmp_path, monkeypatch):
     job, _manifest = make_job(tmp_path, timeout=30.0)
     jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
 
-    code = run_harness(job, launch_agent, runner=_real_runner, poll_seconds=0.05)
+    code = run_harness(
+        job,
+        launch_agent,
+        runner=_real_runner,
+        poll_seconds=0.05,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 0
     status = jobdir.read_status(job)
@@ -339,10 +380,355 @@ def test_real_hard_timeout_kills_the_overrunning_agent(tmp_path, monkeypatch):
     jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
 
     started = time.monotonic()
-    code = run_harness(job, launch_agent, runner=_real_runner, poll_seconds=0.05)
+    code = run_harness(
+        job,
+        launch_agent,
+        runner=_real_runner,
+        poll_seconds=0.05,
+        identity_root=tmp_path / "no-identity",
+    )
 
     assert code == 0
     assert time.monotonic() - started < 30  # killed, not waited out
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_DONE
     assert status.agent.timed_out and not status.agent.completed
+
+
+# -- the identity gate (ADR-0045, fail closed) --------------------------------
+#
+# The preflight itself is unit-tested in test_identity.py; here it is faked
+# so the tests exercise the HARNESS contract: no launch on a failed
+# preflight, the probe-then-release stdin protocol, the task prompt withheld
+# from unverified sessions, mid-run drift killing the Run, and the
+# identity.json verdict the driver embeds into evidence.
+
+from theozolith_worker.adapters import ClaudeAdapter  # noqa: E402
+from theozolith_worker.identity import PreflightReport  # noqa: E402
+
+PIN = "claude-sonnet-5"
+
+
+def _bake_root(tmp_path: Path, model: str = PIN, effort: str = "") -> Path:
+    root = tmp_path / "idroot"
+    (root / "etc/theozolith").mkdir(parents=True)
+    (root / "etc/theozolith/model").write_text(model + "\n")
+    settings: dict = {"model": model, "availableModels": [model], "enforceAvailableModels": True}
+    if effort:
+        (root / "etc/theozolith/effort").write_text(effort + "\n")
+        settings["effortLevel"] = effort
+        settings["env"] = {"CLAUDE_CODE_EFFORT_LEVEL": effort}
+    (root / "etc/claude-code").mkdir(parents=True)
+    (root / "etc/claude-code/managed-settings.json").write_text(json.dumps(settings))
+    return root
+
+
+def _pass_preflight(monkeypatch, model: str = PIN, effort: str = ""):
+    def fake_preflight(self, identity, *, root, scratch, run=None):
+        return PreflightReport(
+            ok=True, expected_model=model, expected_effort=effort, cli_version="2.1.231"
+        )
+
+    monkeypatch.setattr(ClaudeAdapter, "preflight", fake_preflight)
+
+
+class FakeGatedAgent(FakeAgent):
+    """A gated fake: records stdin deliveries and the input-close."""
+
+    def __init__(self, clock, **kwargs):
+        super().__init__(clock, **kwargs)
+        self.sent: list[str] = []
+        self.input_closed = False
+
+    def send(self, line: str) -> None:
+        self.sent.append(line)
+
+    def end_input(self) -> None:
+        self.input_closed = True
+
+    def exit_at(self, when: float, code: int = 0) -> None:
+        self._exits_at = when
+        self._exit_code = code
+
+
+class FakeGatedLauncher:
+    def __init__(self, agent: FakeGatedAgent):
+        self._agent = agent
+        self.calls: list[dict] = []
+
+    def __call__(self, argv, cwd, env, transcript, gated=False) -> FakeGatedAgent:
+        self.calls.append(
+            {"argv": argv, "cwd": cwd, "env": env, "transcript": transcript, "gated": gated}
+        )
+        return self._agent
+
+
+def _append_stream(job: Path, *events: dict) -> None:
+    with (job / jobdir.TRANSCRIPT_FILE).open("a") as handle:
+        for event in events:
+            handle.write(json.dumps(event) + "\n")
+
+
+def _init_event_line(model: str) -> dict:
+    return {"type": "system", "subtype": "init", "model": model}
+
+
+def _turn_event_line(model: str) -> dict:
+    return {"type": "assistant", "message": {"model": model, "content": []}}
+
+
+def test_gated_harness_releases_the_prompt_only_after_identity_verifies(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    fed = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and not fed:
+            fed.append(True)
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+        if agent.input_closed and agent._exits_at is None:
+            agent.exit_at(now + 1.0)
+
+    clock.on_tick.append(script)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 0
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_DONE and status.agent.completed
+    # The launch was gated: stdin-driven argv, and the task prompt is in NO
+    # argv element — it can only ever arrive over stdin, after verification.
+    call = launcher.calls[0]
+    assert call["gated"] is True
+    argv = call["argv"]
+    assert "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
+    assert all(str(job / jobdir.PROMPT_FILE) not in part for part in argv)
+    # The stdin protocol: the no-op probe first, the pointer prompt second
+    # (only after init + an executed turn matched), then end of input.
+    assert len(agent.sent) == 2
+    assert "Preflight check" in agent.sent[0]
+    assert str(job / jobdir.PROMPT_FILE) in agent.sent[1]
+    assert agent.input_closed
+    # The identity verdict the driver embeds into evidence.
+    ident = jobdir.read_identity(job)
+    assert ident["preflight"] == "passed"
+    assert ident["released"] is True and ident["violation"] == ""
+    assert ident["observed_model"] == PIN
+
+
+def test_gated_harness_withholds_the_prompt_from_a_substituted_session(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    fed = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and not fed:
+            fed.append(True)
+            _append_stream(job, _init_event_line("claude-opus-5"))
+
+    clock.on_tick.append(script)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert status.error.startswith("identity: ") and "substituted" in status.error
+    # THE assertion of the whole amendment: the real task prompt never
+    # entered the process — only the probe did.
+    assert len(agent.sent) == 1 and "Preflight check" in agent.sent[0]
+    assert agent.terminated_at is not None  # the session was killed
+    ident = jobdir.read_identity(job)
+    assert ident["released"] is False and "claude-opus-5" in ident["violation"]
+
+
+def test_gated_harness_gate_timeout_fails_closed_without_sending_the_task(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path, timeout=30.0)
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)  # never emits a stream, never exits
+    launcher = FakeGatedLauncher(agent)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert "could not be verified" in status.error and "never sent" in status.error
+    assert len(agent.sent) == 1  # the probe only
+    assert jobdir.read_identity(job)["released"] is False
+
+
+def test_gated_harness_kills_on_mid_run_identity_drift(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    stages = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and len(stages) == 0:
+            stages.append("probe")
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+        # After the release, a server-side policy change moves the session
+        # onto another model mid-run.
+        if agent.input_closed and now >= 3.0 and len(stages) == 1:
+            stages.append("drift")
+            _append_stream(job, _turn_event_line("claude-opus-5"))
+
+    clock.on_tick.append(script)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert status.error.startswith("identity: ") and "claude-opus-5" in status.error
+    assert agent.terminated_at is not None  # terminated immediately, mid-run
+    ident = jobdir.read_identity(job)
+    assert ident["released"] is True  # the task HAD been released...
+    assert "claude-opus-5" in ident["violation"]  # ...and the drift invalidated the Run
+    # The Run is invalid: no gate jobs were served after the kill.
+    assert jobdir.read_job_result(job, "001-shutdown") is None
+
+
+def test_gated_harness_failed_preflight_never_launches_the_agent(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path)
+
+    def failing_preflight(self, identity, *, root, scratch, run=None):
+        return PreflightReport(
+            ok=False,
+            expected_model=PIN,
+            expected_effort="",
+            category="policy-widened",
+            detail="the canary asked for 'claude-haiku-4-5' and executed claude-haiku-4-5",
+            cli_version="2.1.231",
+        )
+
+    monkeypatch.setattr(ClaudeAdapter, "preflight", failing_preflight)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    assert launcher.calls == []  # the agent process never existed
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert status.error.startswith("identity: ")
+    assert "policy-widened" in status.error
+    assert "the real task prompt was not sent" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["preflight"] == "failed:policy-widened"
+    assert ident["expected_model"] == PIN
+
+
+def test_gated_harness_corrupt_identity_declaration_fails_before_launch(tmp_path):
+    root = tmp_path / "idroot"
+    (root / "etc/theozolith").mkdir(parents=True)
+    (root / "etc/theozolith/model").write_text("")  # corrupt: empty declaration
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    assert launcher.calls == []
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED and status.error.startswith("identity: ")
+
+
+def test_gated_harness_effort_pin_uses_the_hook_capture(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path, effort="low")
+    _pass_preflight(monkeypatch, effort="low")
+    job, _manifest = make_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    capture = job / "preflight" / "effort.json"
+    fed = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and not fed:
+            fed.append(True)
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            capture.write_text(json.dumps({"effort": {"level": "low"}}))
+        if agent.input_closed and agent._exits_at is None:
+            agent.exit_at(now + 1.0)
+
+    clock.on_tick.append(script)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 0
+    # The gated argv carries the PostToolUse capture hook via --settings —
+    # a source managed settings outrank, so it cannot weaken enforcement.
+    argv = launcher.calls[0]["argv"]
+    settings_json = argv[argv.index("--settings") + 1]
+    assert "PostToolUse" in settings_json and str(capture) in settings_json
+    # The probe asks for the tool call that makes the hook fire.
+    assert "Bash tool" in agent.sent[0]
+    ident = jobdir.read_identity(job)
+    assert ident["observed_effort"] == "low" and ident["released"] is True
+
+
+def test_gated_harness_clamped_effort_withholds_the_task(tmp_path, monkeypatch):
+    root = _bake_root(tmp_path, effort="xhigh")
+    _pass_preflight(monkeypatch, effort="xhigh")
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    capture = job / "preflight" / "effort.json"
+    fed = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and not fed:
+            fed.append(True)
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            # An organization effort cap clamps silently; the hook capture is
+            # the only observation, and a clamp is a failure, not a downgrade.
+            capture.write_text(json.dumps({"effort": {"level": "high"}}))
+
+    clock.on_tick.append(script)
+
+    code = run_harness(
+        job, launcher, runner=_real_runner, clock=clock, sleep=clock.sleep, identity_root=root
+    )
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED and "'xhigh'" in status.error
+    assert len(agent.sent) == 1  # probe only; the task never entered the process
+    ident = jobdir.read_identity(job)
+    assert ident["observed_effort"] == "high" and ident["released"] is False

@@ -217,3 +217,134 @@ def test_corrupt_existing_managed_settings_fails_the_build(tmp_path, capsys):
     )
     assert rc == 1
     assert "materialize failed" in capsys.readouterr().err
+
+
+def test_pair_validation_rejects_a_silently_clamped_effort(tmp_path, capsys):
+    # Claude Code runs xhigh as high on the 4.6 generation (documented
+    # fallback-to-highest-supported) — a baked pair the session would not
+    # actually run at fails the build (ADR-0045 amendment C).
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-opus-4-6",
+            "--effort",
+            "xhigh",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "silently runs" in err and "claude-opus-4-6" in err
+    assert not (tmp_path / "etc").exists()
+
+
+def test_pair_validation_rejects_effort_on_an_effortless_model(tmp_path, capsys):
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-haiku-4-5",
+            "--effort",
+            "low",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "silently ignore" in capsys.readouterr().err
+
+
+def test_pair_validation_rejects_effort_on_an_unknown_model(tmp_path, capsys):
+    # Mappable shape (claude-*), but no positively-known effort capability:
+    # bake the model alone or upgrade the adapter — never assume.
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-newfamily-1",
+            "--effort",
+            "high",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "no known effort capability" in capsys.readouterr().err
+
+
+def test_pair_validation_rejects_effort_without_a_model(tmp_path, capsys):
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--effort",
+            "high",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "without a model" in capsys.readouterr().err
+
+
+def test_conflicting_dropin_fails_the_build_naming_file_and_key(tmp_path, capsys):
+    dropins = tmp_path / "etc/claude-code/managed-settings.d"
+    dropins.mkdir(parents=True)
+    (dropins / "50-widen.json").write_text(json.dumps({"availableModels": ["claude-opus-5"]}))
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "50-widen.json" in err and "availableModels" in err
+    # The conflicting operator policy was not deleted or overwritten.
+    assert (dropins / "50-widen.json").is_file()
+    assert not (tmp_path / "etc/theozolith").exists()
+
+
+def test_policy_helper_fails_the_build(tmp_path, capsys):
+    managed = tmp_path / "etc/claude-code/managed-settings.json"
+    managed.parent.mkdir(parents=True)
+    managed.write_text(json.dumps({"policyHelper": {"path": "/usr/local/bin/policy"}}))
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    assert "policyHelper" in capsys.readouterr().err

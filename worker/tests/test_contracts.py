@@ -401,20 +401,16 @@ def test_claude_adapter_materialize_managed_scope(tmp_path):
     }
 
 
-def test_claude_adapter_materialize_merges_existing_managed_settings(tmp_path):
+def test_claude_adapter_materialize_merges_unrelated_operator_settings(tmp_path):
     adapter = ClaudeAdapter()
     target = tmp_path / "etc/claude-code/managed-settings.json"
     target.parent.mkdir(parents=True)
-    target.write_text(
-        '{"permissions": {"deny": ["WebSearch"]}, "env": {"OTHER": "kept"},'
-        ' "availableModels": ["claude-old-1"], "enforceAvailableModels": false}'
-    )
+    target.write_text('{"permissions": {"deny": ["WebSearch"]}, "env": {"OTHER": "kept"}}')
 
     adapter.materialize("claude-fable-5", "low", root=tmp_path, scope="managed")
     settings = json.loads(target.read_text())
     # Deep merge: unrelated keys an operator setup step pre-wrote survive —
-    # including foreign entries inside "env" — while the identity keys are
-    # authoritative and overwrite whatever sat there.
+    # including foreign entries inside "env" — beside the identity keys.
     assert settings["permissions"] == {"deny": ["WebSearch"]}
     assert settings["env"] == {"OTHER": "kept", "CLAUDE_CODE_EFFORT_LEVEL": "low"}
     assert settings["model"] == "claude-fable-5"
@@ -423,20 +419,35 @@ def test_claude_adapter_materialize_merges_existing_managed_settings(tmp_path):
     assert settings["effortLevel"] == "low"
 
 
-def test_claude_adapter_materialize_without_effort_leaves_effort_keys_alone(tmp_path):
+def test_claude_adapter_materialize_rejects_conflicting_operator_identity(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    before = (
+        '{"permissions": {"deny": ["WebSearch"]},'
+        ' "availableModels": ["claude-old-1"], "enforceAvailableModels": false}'
+    )
+    target.write_text(before)
+    # Fail-closed doctrine (ADR-0045 amendment): a pre-existing identity key
+    # is a conflicting operator policy — the build fails naming the file and
+    # key, and nothing is silently deleted or overwritten.
+    with pytest.raises(AgentAdapterError, match="availableModels"):
+        adapter.materialize("claude-fable-5", "low", root=tmp_path, scope="managed")
+    assert target.read_text() == before  # never clobbered
+    assert not (tmp_path / "etc/theozolith").exists()  # nothing half-baked
+
+
+def test_claude_adapter_materialize_rejects_operator_effort_when_none_is_baked(tmp_path):
     adapter = ClaudeAdapter()
     target = tmp_path / "etc/claude-code/managed-settings.json"
     target.parent.mkdir(parents=True)
     target.write_text('{"effortLevel": "high"}')
-
-    adapter.materialize("claude-fable-5", "", root=tmp_path, scope="managed")
-    settings = json.loads(target.read_text())
-    # effort "" means "the model's own default" (WorkerTypeDef.effort): the
-    # type declares no effort identity, so an operator-written effort default
-    # is their business and survives.
-    assert settings["effortLevel"] == "high"
-    assert "env" not in settings
-    assert settings["availableModels"] == ["claude-fable-5"]
+    # effort "" means "the model's own default" (WorkerTypeDef.effort). A
+    # pre-existing managed effortLevel would silently convert that empty
+    # value into an enforced non-default effort — rejected, not inherited.
+    with pytest.raises(AgentAdapterError, match="effortLevel"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="managed")
+    assert json.loads(target.read_text()) == {"effortLevel": "high"}
 
 
 def test_claude_adapter_materialize_refuses_non_object_managed_settings(tmp_path):
@@ -463,7 +474,7 @@ def test_claude_adapter_materialize_refuses_non_object_env(tmp_path):
     target = tmp_path / "etc/claude-code/managed-settings.json"
     target.parent.mkdir(parents=True)
     target.write_text('{"env": ["NOT", "AN", "OBJECT"]}')
-    with pytest.raises(AgentAdapterError, match="'env' value of type list"):
+    with pytest.raises(AgentAdapterError, match="'env' is list, not an object"):
         adapter.materialize("claude-sonnet-5", "high", root=tmp_path, scope="managed")
 
 
@@ -528,6 +539,19 @@ def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch)
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
     assert adapter.verify_enforceable() == "2.1.231 (Claude Code)"
+
+    # The floor is 2.1.223 exactly: the newest behavior the adapter relies on
+    # is the per-key managed ``env`` merge (2.1.223) — before it, a
+    # server-managed org env block displaces the whole baked env, silently
+    # dropping the CLAUDE_CODE_EFFORT_LEVEL pin. 2.1.222 (alias substitution)
+    # and 2.1.175 (allowlist enforcement) are older and equally required.
+    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 223)
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.223 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.223 (Claude Code)"
+
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.222 (Claude Code)")
+    with pytest.raises(AgentAdapterError, match="predates the model-enforcement settings"):
+        adapter.verify_enforceable()
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.174 (Claude Code)")
     with pytest.raises(AgentAdapterError, match="predates the model-enforcement settings"):

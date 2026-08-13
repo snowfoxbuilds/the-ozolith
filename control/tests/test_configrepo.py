@@ -483,6 +483,50 @@ def test_unmappable_effort_is_rejected_listing_the_mappable_set(tmp_path):
         load_config(tmp_path)
 
 
+def test_pair_validation_rejects_a_silently_clamped_effort(tmp_path):
+    """Amendment C (ADR-0045): (model, effort) validate together. Claude Code
+    documents that an unsupported level silently runs as the highest
+    supported level at or below it — xhigh becomes high on the 4.6
+    generation — so the pair fails the load instead of baking an identity the
+    session would not run at."""
+    driver_type(tmp_path, model='"claude-opus-4-6"', effort='"xhigh"')
+    with pytest.raises(ConfigRepoError, match=r"claude-opus-4-6.*silently runs"):
+        load_config(tmp_path)
+
+
+def test_pair_validation_rejects_effort_on_an_effortless_model(tmp_path):
+    driver_type(tmp_path, model='"claude-haiku-4-5"', effort='"low"')
+    with pytest.raises(ConfigRepoError, match=r"silently ignore"):
+        load_config(tmp_path)
+
+
+def test_pair_validation_rejects_effort_on_an_unknown_model(tmp_path):
+    # Mappable shape, unknown capability: enforceability must be positively
+    # known — bake the model alone or upgrade theozolith.
+    driver_type(tmp_path, model='"claude-newfamily-1"', effort='"high"')
+    with pytest.raises(ConfigRepoError, match=r"no known effort capability"):
+        load_config(tmp_path)
+
+
+def test_pair_validation_accepts_supported_pairs_and_model_default(tmp_path):
+    driver_type(tmp_path, model='"claude-sonnet-5"', effort='"xhigh"')
+    load_config(tmp_path)  # supported pair
+    driver_type(tmp_path, model='"claude-opus-4-6"', effort='"high"')
+    load_config(tmp_path)  # supported on the 4.6 generation
+    driver_type(tmp_path, model='"claude-haiku-4-5"')  # effort "" = model default
+    load_config(tmp_path)
+    driver_type(tmp_path, model='"claude-newfamily-1"')  # unknown model, no effort
+    load_config(tmp_path)
+
+
+def test_pair_validation_alias_effort_follows_family_capability(tmp_path):
+    driver_type(tmp_path, model='"sonnet"', effort='"xhigh"')
+    load_config(tmp_path)  # the sonnet family has stable, proven support
+    driver_type(tmp_path, model='"haiku"', effort='"low"')
+    with pytest.raises(ConfigRepoError, match=r"silently ignore"):
+        load_config(tmp_path)
+
+
 def test_dormant_worker_type_model_is_validated_too(tmp_path):
     """No Stack instantiates the type: it still breaks at configure time,
     never later when a Stack first activates it (the dormant-driver rule)."""
