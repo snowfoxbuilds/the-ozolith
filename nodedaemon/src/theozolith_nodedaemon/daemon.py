@@ -182,11 +182,15 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def _atomic_json(path: Path, data: Any) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _atomic_json(path: Path, data: Any) -> None:
+    _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True))
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -522,9 +526,6 @@ class NodeDaemon:
             )
         except Exception as exc:
             self._log(f"error event not delivered ({error_class}): {exc}")
-
-    def _stack_by_name(self, name: str) -> WireStack | None:
-        return next((s for s in self._stacks() if s.name == name), None)
 
     def _live_jobs_dir(self, stack: WireStack) -> Path:
         """The jobs directory the currently running child was LAUNCHED with —
@@ -980,11 +981,7 @@ class NodeDaemon:
                 self._stop_process_child(name)
 
     def _write_current_pointer(self, drivers_hash: str) -> None:
-        path = self._config.config_dist_current
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(drivers_hash, encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_write_text(self._config.config_dist_current, drivers_hash)
 
     def _gc_config_dist(self, keep: set[str]) -> None:
         """Reclaim unpacked distributions not in ``keep`` (current + previous),
@@ -1332,6 +1329,14 @@ class NodeDaemon:
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
         return env
 
+    def _declared_but_unbuilt(self, tag: str) -> bool:
+        """True when ``tag`` is one our OWN recipes declare but Docker has not
+        built yet — the signal to defer rather than tear a working child down
+        onto a missing image. An external image reference (not one of our recipe
+        tags) is Docker's to pull normally, so it is not gated (ADR-0044)."""
+        declared_tags = {img.get("tag") for img in self._images().values()}
+        return tag in declared_tags and not self._docker.image_exists(tag)
+
     def _converge_process(self, stack: WireStack, want_running: bool) -> None:
         if not want_running:
             # Stopped/drained: tear down EVERY form under this name, not just a
@@ -1432,8 +1437,7 @@ class NodeDaemon:
         # next pass rather than tear a working driver down onto an unavailable
         # image (ADR-0044 amendment).
         image_tag = env.get("THEOZOLITH_RUN_IMAGE", "")
-        declared_tags = {img.get("tag") for img in self._images().values()}
-        if image_tag in declared_tags and not self._docker.image_exists(image_tag):
+        if self._declared_but_unbuilt(image_tag):
             self._log(
                 f"stack {stack.name}: deferring {'restart' if alive else 'start'} —"
                 f" run image {image_tag} not built yet"
@@ -1788,8 +1792,7 @@ class NodeDaemon:
         # and retry next pass — replacing exactly once the image appears. An
         # arbitrary external image reference (not one of our recipe tags) is
         # Docker's to pull normally, so it is not gated here (ADR-0044 amendment).
-        declared_tags = {img.get("tag") for img in self._images().values()}
-        if stack.image in declared_tags and not self._docker.image_exists(stack.image):
+        if self._declared_but_unbuilt(stack.image):
             self._log(
                 f"stack {stack.name}: deferring container "
                 f"{'replacement' if (running or compose_tracked) else 'create'} —"

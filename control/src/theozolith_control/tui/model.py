@@ -59,7 +59,6 @@ ATTACH_HOST = "{host}"
 ATTACH_CONTAINER = "{container}"
 
 # Run phases (ADR-0015/0016): claimed/gate are live, the rest terminal.
-LIVE_PHASES = ("claimed", "gate")
 TERMINAL_PHASES = ("pr-open", "failed", "escalated")
 
 
@@ -718,18 +717,15 @@ class Freshness:
     last_success_at: float | None = None
     error: str = ""
     dial_target: str = ""
-    consecutive_failures: int = field(default=0)
 
     def succeed(self, at: float) -> None:
         self.last_success_at = at
         self.error = ""
         self.dial_target = ""
-        self.consecutive_failures = 0
 
     def fail(self, dial_target: str, error_class: str) -> None:
         self.error = error_class
         self.dial_target = dial_target
-        self.consecutive_failures += 1
 
     @property
     def degraded(self) -> bool:

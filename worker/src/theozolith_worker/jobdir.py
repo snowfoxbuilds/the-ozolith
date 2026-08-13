@@ -49,9 +49,6 @@ PHASE_SERVING_JOBS = "serving-jobs"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
 
-# The job request that tells the harness to stop serving and exit.
-SHUTDOWN_JOB = "shutdown"
-
 MANIFEST_FILE = "input/manifest.json"
 PROMPT_FILE = "input/prompt.md"
 STATUS_FILE = "output/status.json"

@@ -289,7 +289,6 @@ EVENT_REVIEW = "theozolith.review"
 EVENT_PROGRESS = "theozolith.run.progress"
 EVENT_ERROR = "theozolith.error"
 
-RUN_PHASES = ("claimed", "gate", "pr-open", "failed", "escalated")
 # Phases meaning "the driver still holds the claim" — what the zombie
 # janitor watches. failed is live (ADR-0016): the driver keeps the claim
 # through the local retry, so only pr-open and escalated end its watch —
@@ -587,15 +586,12 @@ class Store:
                 return "escalated"
             return None
 
-    def container_record(self, node: str, name: str) -> dict[str, Any] | None:
-        """The live-container row a heartbeat last reported for (node, name):
-        the terminal's authority for target resolution (ADR-0019 — the
-        ``owner`` field is where the Stack is derived from, and
-        ``age_seconds`` is the heartbeat-freshness evidence, computed here
-        so callers share this store's clock)."""
+    def _container_record(self, table: str, node: str, name: str) -> dict[str, Any] | None:
+        # table is an internal literal ("containers"/"stack_containers"), never
+        # caller input — the f-string interpolation carries no injection risk.
         with self._lock:
             row = self._db.execute(
-                "SELECT * FROM containers WHERE node = ? AND name = ?", (node, name)
+                f"SELECT * FROM {table} WHERE node = ? AND name = ?", (node, name)
             ).fetchone()
         if row is None:
             return None
@@ -603,20 +599,20 @@ class Store:
         record["age_seconds"] = self._clock() - record["updated_at"]
         return record
 
+    def container_record(self, node: str, name: str) -> dict[str, Any] | None:
+        """The live-container row a heartbeat last reported for (node, name):
+        the terminal's authority for target resolution (ADR-0019 — the
+        ``owner`` field is where the Stack is derived from, and
+        ``age_seconds`` is the heartbeat-freshness evidence, computed here
+        so callers share this store's clock)."""
+        return self._container_record("containers", node, name)
+
     def stack_container_record(self, node: str, name: str) -> dict[str, Any] | None:
         """The live stack-container row a heartbeat last reported for
         (node, name): the terminal's target authority for container-kind
         Stacks (ADR-0019 — the Flight Deck attaches through this record;
         ``stack`` is where the owning Stack is derived from)."""
-        with self._lock:
-            row = self._db.execute(
-                "SELECT * FROM stack_containers WHERE node = ? AND name = ?", (node, name)
-            ).fetchone()
-        if row is None:
-            return None
-        record = dict(row)
-        record["age_seconds"] = self._clock() - record["updated_at"]
-        return record
+        return self._container_record("stack_containers", node, name)
 
     def record_status(
         self,

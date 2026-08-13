@@ -49,7 +49,6 @@ class FakeGitHub:
         self.tokens: dict[str, str] = {}
         self.issues: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[dict[str, Any]]] = {}
-        self.events: dict[int, list[dict[str, Any]]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
         self._next_number = 1
         self._next_id = 1
@@ -78,7 +77,6 @@ class FakeGitHub:
             "assignees": [],
         }
         self.comments[number] = []
-        self.events[number] = []
         return number
 
     def labels_of(self, number: int) -> set[str]:
@@ -107,13 +105,6 @@ class FakeGitHub:
         issue = self.issues[number]
         if login not in [a["login"] for a in issue["assignees"]]:
             issue["assignees"].append({"login": login})
-            self.events[number].append(
-                {
-                    "event": "assigned",
-                    "assignee": {"login": login},
-                    "created_at": self._timestamp(),
-                }
-            )
 
     def _git(self, args: list[str]) -> str:
         assert self.git_dir is not None
@@ -223,7 +214,6 @@ class FakeGitHub:
             (r"/issues/(\d+)/labels", self._h_labels),
             (r"/issues/(\d+)/labels/([^/]+)", self._h_label_one),
             (r"/issues/(\d+)/assignees", self._h_assignees),
-            (r"/issues/(\d+)/events", self._h_events),
             (r"/issues/(\d+)/comments", self._h_comments),
             (r"/pulls", self._h_pulls),
             (r"/pulls/(\d+)", self._h_pull),
@@ -294,10 +284,6 @@ class FakeGitHub:
             return _json_response(200, self._issue_payload(number))
         return _json_response(404, {"message": "Not Found"})
 
-    def _h_events(self, actor, method, match, params, payload) -> Response:
-        number = int(match.group(1))
-        return _json_response(200, self._page(self.events[number], params))
-
     def _h_comments(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
         if method == "POST":
@@ -331,7 +317,6 @@ class FakeGitHub:
                 "assignees": [],
             }
             self.comments[number] = []
-            self.events[number] = []
             self.pulls[number] = {"state": "open", "head": head, "base": payload["base"]}
             return _json_response(201, self._pr_payload(number))
         # GET /pulls?state=open&head=owner:branch
