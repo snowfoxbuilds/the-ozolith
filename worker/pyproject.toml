@@ -8,6 +8,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
+theozolith-adapter = "theozolith_worker.adaptercli:main"
 theozolith-bootstrap = "theozolith_worker.bootstrap.cli:main"
 theozolith-driver = "theozolith_worker.drivercli:main"
 theozolith-harness = "theozolith_worker.harness.main:main"

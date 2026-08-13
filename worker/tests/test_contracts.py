@@ -5,8 +5,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from theozolith_worker import decisions, jobdir, verdict
-from theozolith_worker.adapters import ClaudeAdapter
+from theozolith_worker.adapters import (
+    MODEL_ALIAS,
+    MODEL_PINNED,
+    MODEL_UNMAPPABLE,
+    AgentAdapterError,
+    ClaudeAdapter,
+    materialize_instruction,
+)
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
 from theozolith_worker.harness.validate import main as validate_main
@@ -333,6 +341,133 @@ def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
     assert adapter.stream_stats(stream).tokens == 130
     # An empty or missing stream reports no usage, never a crash.
     assert adapter.stream_stats(tmp_path / "absent.txt").tokens is None
+
+
+def test_claude_adapter_model_classification():
+    adapter = ClaudeAdapter()
+    # Shape-based (ADR-0045): full claude-* IDs pass through pinned — the CLI
+    # itself does no allowlisting, so a closed list here would need a product
+    # release per model launch. The unmappable class is the cross-adapter
+    # mistake the build must catch.
+    for pinned in ("claude-sonnet-5", "claude-fable-5", "claude-3-5-sonnet-20241022"):
+        assert adapter.classify_model(pinned) == MODEL_PINNED
+    for alias in ("default", "sonnet", "opus", "haiku", "fable", "opusplan"):
+        assert adapter.classify_model(alias) == MODEL_ALIAS
+    for bad in ("gpt-5", "", "claude", "claude-", "Claude-Sonnet-5", "claude sonnet"):
+        assert adapter.classify_model(bad) == MODEL_UNMAPPABLE
+
+
+def test_claude_adapter_efforts_are_the_settings_persistable_set():
+    adapter = ClaudeAdapter()
+    assert adapter.mappable_efforts() == frozenset({"low", "medium", "high", "xhigh"})
+    # max is session-only in the claude CLI — declaring it would bake a value
+    # the settings layer cannot hold, so a build asking for it must fail.
+    assert "max" not in adapter.mappable_efforts()
+
+
+def test_claude_adapter_materialize_managed_scope(tmp_path):
+    adapter = ClaudeAdapter()
+    written = adapter.materialize(
+        "claude-sonnet-5", "high", root=tmp_path, scope="managed"
+    )
+    assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
+    assert (tmp_path / "etc/theozolith/effort").read_text() == "high\n"
+    settings = json.loads(
+        (tmp_path / "etc/claude-code/managed-settings.json").read_text()
+    )
+    assert settings == {"model": "claude-sonnet-5", "effortLevel": "high"}
+    assert set(written) == {
+        tmp_path / "etc/theozolith/model",
+        tmp_path / "etc/theozolith/effort",
+        tmp_path / "etc/claude-code/managed-settings.json",
+    }
+
+
+def test_claude_adapter_materialize_merges_existing_managed_settings(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"permissions": {"deny": ["WebSearch"]}}')
+
+    adapter.materialize("claude-fable-5", "", root=tmp_path, scope="managed")
+    settings = json.loads(target.read_text())
+    # Merge, not overwrite: an operator setup step that pre-wrote managed
+    # settings survives the materialization.
+    assert settings["permissions"] == {"deny": ["WebSearch"]}
+    assert settings["model"] == "claude-fable-5"
+    assert "effortLevel" not in settings  # effort unset stays unset
+
+
+def test_claude_adapter_materialize_refuses_non_object_managed_settings(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("[]")
+    with pytest.raises(AgentAdapterError):
+        adapter.materialize("claude-sonnet-5", "", root=tmp_path, scope="managed")
+
+
+def test_claude_adapter_materialize_interactive_scope_never_touches_claude_config(tmp_path):
+    adapter = ClaudeAdapter()
+    written = adapter.materialize("claude-opus-5", "", root=tmp_path, scope="interactive")
+    # Interactive (Flight Deck) images bake ONLY the well-known files: anything
+    # under /home/ozolith/.claude would be shadowed by the claude-state volume
+    # on first mount (ADR-0043), and managed settings would lock the model
+    # against in-session /model switching (ADR-0045 §Flight Deck).
+    assert written == [tmp_path / "etc/theozolith/model"]
+    assert (tmp_path / "etc/theozolith/model").read_text() == "claude-opus-5\n"
+    assert not (tmp_path / "etc/claude-code").exists()
+    assert not (tmp_path / "home").exists()
+
+
+def test_materialize_instruction_golden():
+    # GOLDEN (ADR-0045): the rendered instruction enters the instruction hash,
+    # so this format is identity-bearing — editing it re-tags and rebuilds
+    # every model-bearing derived image in a fleet. Change it only on purpose.
+    assert (
+        materialize_instruction("claude", "claude-sonnet-5", "", "managed")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-sonnet-5 --scope managed"
+    )
+    assert (
+        materialize_instruction("claude", "claude-fable-5", "high", "managed")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-fable-5 --effort high --scope managed"
+    )
+    assert (
+        materialize_instruction("claude", "claude-opus-5", "", "interactive")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-opus-5 --scope interactive"
+    )
+    with pytest.raises(AgentAdapterError):
+        materialize_instruction("claude", "claude-sonnet-5", "", "global")
+    with pytest.raises(AgentAdapterError):
+        materialize_instruction("claude", "", "", "managed")
+
+
+def test_claude_adapter_stream_stats_reports_observed_model(tmp_path):
+    adapter = ClaudeAdapter()
+    stream = tmp_path / "transcript.txt"
+    stream.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"model": "claude-sonnet-5", "content": []},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {"model": "claude-opus-5", "content": []},
+            }
+        )
+        + "\n"
+    )
+    # Last one wins: the model the session actually ended up on — telemetry's
+    # model source now that selection is baked into the image (ADR-0045).
+    assert adapter.stream_stats(stream).model == "claude-opus-5"
+    assert adapter.stream_stats(tmp_path / "absent.txt").model == ""
 
 
 def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
