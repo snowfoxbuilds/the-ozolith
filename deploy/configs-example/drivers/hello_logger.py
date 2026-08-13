@@ -45,11 +45,10 @@ class Driver(api.Worker):
     never claims work. Replace the two seams below with real behavior — see the
     built-in Implementer/Reviewer for how a worker fetches and executes work."""
 
-    # `role` is this type's env prefix and dispatch role; `default_model` is the
-    # model it runs when neither <ROLE>_MODEL nor THEOZOLITH_MODEL is set. Both
-    # are required class attributes on every Worker.
+    # `role` is this type's env prefix and dispatch role — the one required
+    # class attribute on every Worker. There is no model attribute: the model
+    # is a worker-type-definition field baked into the run image (ADR-0045).
     role: ClassVar[str] = "hello_logger"
-    default_model: ClassVar[str] = "claude-sonnet-5"
 
     def fetch_work(self) -> list | None:
         """This pass's work-list. `[]` means "reachable, nothing to do" so the

@@ -205,13 +205,13 @@ class ClaudeAdapter:
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
         # Headless on purpose: completion is process exit (ADR-0019), and
-        # the structured stream is both transcript and usage source.
+        # the structured stream is both transcript and usage source. No
+        # --model (ADR-0045): the CLI reads the model/effort baked into the
+        # image's managed settings — nothing at invocation selects one.
         return [
             self._binary,
             "-p",
             prompt,
-            "--model",
-            manifest.model,
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",

@@ -381,16 +381,8 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         # credential); the GitHub PATs are not (ADR-0013).
         "ANTHROPIC_API_KEY": "model-key",
     }
-    worker_config = load_config(
-        {**base_env, "GITHUB_TOKEN": "tok-worker-a"},
-        role=Implementer.role,
-        default_model=Implementer.default_model,
-    )
-    reviewer_config = load_config(
-        {**base_env, "GITHUB_TOKEN": "tok-reviewer"},
-        role=Reviewer.role,
-        default_model=Reviewer.default_model,
-    )
+    worker_config = load_config({**base_env, "GITHUB_TOKEN": "tok-worker-a"}, role=Implementer.role)
+    reviewer_config = load_config({**base_env, "GITHUB_TOKEN": "tok-reviewer"}, role=Reviewer.role)
 
     harness = Harness(
         fake=fake,

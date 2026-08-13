@@ -38,7 +38,8 @@ class Worker:
     """One driver's poll-claim-run loop; subclasses fill the ADR-0020 seams."""
 
     role: ClassVar[str]  # env prefix + dispatch role ("implementer", "reviewer")
-    default_model: ClassVar[str]  # the type's shipped model when none is configured
+    # No default_model: the model is a worker-type-definition field baked into
+    # the run image at build time (ADR-0045); driver code never selects one.
 
     # The Implementer drains its queue one claim per pass (no sleep between
     # grants); the base default sleeps every pass. A type that fetches its
@@ -77,7 +78,7 @@ class Worker:
     @classmethod
     def load(cls, environ=None) -> Worker:
         """Build this worker type from the environment (VAR_FILE honored)."""
-        return cls(load_config(environ, role=cls.role, default_model=cls.default_model))
+        return cls(load_config(environ, role=cls.role))
 
     def run(self, *, once: bool = False, sleep=time.sleep) -> int:
         """The dispatch-run loop; returns the number of items executed.

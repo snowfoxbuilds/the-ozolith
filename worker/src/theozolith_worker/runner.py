@@ -244,10 +244,11 @@ def _read_output(job: Path, relpath: str) -> str:
         return ""
 
 
-def _run_tokens(config: DriverConfig, job: Path) -> int | None:
-    """Token usage from the structured output stream (ADR-0019); None when
-    the adapter's stream carries no usage."""
-    return adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE).tokens
+def _run_stats(config: DriverConfig, job: Path) -> adapters.StreamStats:
+    """Counters from the structured output stream (ADR-0019): token usage
+    (None when the stream carries none) and the observed model — telemetry's
+    model source now that selection is baked into the image (ADR-0045)."""
+    return adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
 
 
 def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:
@@ -496,7 +497,6 @@ def _run_to_pr(
         run_id=report.run_id,
         mode=jobdir.MODE_RUN,
         adapter=config.adapter,
-        model=config.model,
         workdir=jobdir.CHECKOUT_DIR,
         agent_timeout_seconds=config.agent_timeout_seconds,
     )
@@ -690,6 +690,7 @@ def _push_run_evidence(
     )
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
+    stats = _run_stats(config, job)
     files = {
         f"{prefix}/run.json": json.dumps(
             {
@@ -697,7 +698,11 @@ def _push_run_evidence(
                 "worker_id": config.worker_id,
                 "stack": config.stack,
                 "adapter": config.adapter,
-                "model": config.model,
+                # ADR-0045: the config-time model string is gone from the
+                # driver; identity is the run image (its tag covers the baked
+                # model) and "model" is what the session stream reported.
+                "run_image": config.run_image,
+                "model": stats.model,
                 "container": report.container,
                 "issue": issue.number,
                 "round": report.round,
@@ -706,7 +711,7 @@ def _push_run_evidence(
                 "head": report.head,
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
-                "tokens": _run_tokens(config, job),
+                "tokens": stats.tokens,
                 "reason": report.reason,
                 "failure_class": report.failure_class,
                 "notes": report.notes,

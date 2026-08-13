@@ -94,7 +94,6 @@ def test_a_worker_subclass_built_only_from_api_names_runs(tmp_path):
 
     class Smoke(api.Worker):
         role = "implementer"  # reuse a known env prefix for load_config
-        default_model = "claude-sonnet-5"
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -116,7 +115,6 @@ def test_a_worker_subclass_built_only_from_api_names_runs(tmp_path):
             "THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs"),
         },
         role=Smoke.role,
-        default_model=Smoke.default_model,
     )
     worker = Smoke(
         config,

@@ -102,7 +102,6 @@ def make_job(
         run_id="r1",
         mode=mode,
         adapter="claude",
-        model="claude-sonnet-5",
         workdir=workdir,
         agent_timeout_seconds=timeout,
         jobs_idle_timeout_seconds=30.0,
@@ -223,7 +222,7 @@ def test_run_mode_full_cycle(tmp_path):
     pointer = argv[argv.index("-p") + 1]
     assert str(job / jobdir.PROMPT_FILE) in pointer
     assert "do the thing" not in " ".join(argv)  # the task stays in the file
-    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    assert "--model" not in argv  # the model is baked into the image (ADR-0045)
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert call["cwd"] == workdir

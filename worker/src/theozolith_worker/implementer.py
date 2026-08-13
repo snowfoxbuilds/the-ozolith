@@ -51,7 +51,6 @@ class Implementer(Worker):
     """Requests claims from the Control Node and runs each in a container."""
 
     role: ClassVar[str] = "implementer"
-    default_model: ClassVar[str] = "claude-sonnet-5"
     sleep_after_work: ClassVar[bool] = False  # drain the queue between grants
     # pass_label inherits the base "dispatch" default.
 

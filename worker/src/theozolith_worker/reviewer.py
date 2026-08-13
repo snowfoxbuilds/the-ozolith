@@ -35,7 +35,7 @@ import shutil
 from pathlib import Path
 from typing import ClassVar
 
-from theozolith_worker import evidence, gitops, jobdir, runner, verdict
+from theozolith_worker import adapters, evidence, gitops, jobdir, runner, verdict
 from theozolith_worker.base import Worker
 from theozolith_worker.bootstrap.vocabulary import (
     BLOCKED,
@@ -255,7 +255,6 @@ def review_pr(
             run_id=review_id,
             mode=jobdir.MODE_REVIEW,
             adapter=config.adapter,
-            model=config.model,  # the Reviewer's stronger model (ADR-0008)
             workdir=jobdir.WORK_DIR,
             agent_timeout_seconds=config.agent_timeout_seconds,
             round=round_number,
@@ -316,6 +315,9 @@ def review_pr(
             log,
             transcript=transcript,
             container=container,
+            observed_model=adapters.stream_stats(
+                config.adapter, job / jobdir.TRANSCRIPT_FILE
+            ).model,
             sink=sink,
         )
         _emit_review(sink, config, pr, issue_number, result)
@@ -348,7 +350,10 @@ def _escalate_invalid_verdict(
         "verdict": None,
         "error": reason,
         "head": pr.head_sha,
-        "model": config.model,
+        # ADR-0045: image identity (its tag covers the baked model) plus the
+        # model the session stream actually reported.
+        "run_image": config.run_image,
+        "model": adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE).model,
         "container": container,
     }
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
@@ -399,10 +404,21 @@ def _apply(
     *,
     transcript: str = "",
     container: str = "",
+    observed_model: str = "",
     sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
-    _push_review_evidence(config, pr, issue_number, result, transcript, container, log, sink=sink)
+    _push_review_evidence(
+        config,
+        pr,
+        issue_number,
+        result,
+        transcript,
+        container,
+        log,
+        observed_model=observed_model,
+        sink=sink,
+    )
 
 
 def _publish(
@@ -470,6 +486,7 @@ def _push_review_evidence(
     transcript: str,
     container: str,
     log,
+    observed_model: str = "",
     sink: EventSink | None = None,
 ) -> None:
     record = {
@@ -482,7 +499,10 @@ def _push_review_evidence(
         "resume_commit": result.resume_commit,
         "evidence": result.evidence,
         "head": pr.head_sha,
-        "model": config.model,
+        # ADR-0045: image identity plus the stream-observed model; both empty
+        # of a config-time model on purpose — the driver no longer has one.
+        "run_image": config.run_image,
+        "model": observed_model,
         # Empty when no review container ran (deterministic escalation).
         "container": container,
     }
@@ -510,7 +530,9 @@ class Reviewer(Worker):
     loop sleeps out the poll interval after each (base default)."""
 
     role: ClassVar[str] = "reviewer"
-    default_model: ClassVar[str] = "claude-fable-5"  # the stronger model (ADR-0008)
+    # The ADR-0008 "stronger model for review" rule is now a deploy-time
+    # convention expressed in the worker-type definition's model field
+    # (ADR-0045); the driver ships no default.
     pass_label: ClassVar[str] = "review"
 
     def _startup_log(self) -> None:

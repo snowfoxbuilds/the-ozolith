@@ -12,7 +12,8 @@ Layout::
 
     jobs/<run-id>/
       input/
-        manifest.json    what to run: mode, adapter, model, timeouts
+        manifest.json    what to run: mode, adapter, timeouts (the model is
+                         baked into the run image, never here — ADR-0045)
         prompt.md        the driver-rendered task; the invocation argv
                          carries only a constant-size pointer to this file
         jobs/            driver-sequenced job requests (gate steps, shutdown)
@@ -95,7 +96,8 @@ class Manifest:
     run_id: str
     mode: str  # "run" | "review"
     adapter: str  # Agent adapter name (M2: "claude")
-    model: str
+    # No model field (ADR-0045): the model is baked into the run image's
+    # native adapter config at build time; nothing at invocation selects one.
     workdir: str = CHECKOUT_DIR  # job-dir-relative agent working directory
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT
     jobs_idle_timeout_seconds: float = DEFAULT_JOBS_IDLE_TIMEOUT

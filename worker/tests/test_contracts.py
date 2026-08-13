@@ -256,7 +256,6 @@ def test_claude_adapter_headless_command():
         run_id="r1",
         mode=jobdir.MODE_RUN,
         adapter="claude",
-        model="claude-sonnet-5",
     )
     pointer = "Work on the task specified in /job/input/prompt.md. Read that file first."
     argv = adapter.command(manifest, pointer)
@@ -265,7 +264,9 @@ def test_claude_adapter_headless_command():
     # transcript. --verbose is load-bearing: the claude CLI requires it for
     # -p with --output-format stream-json.
     assert argv[argv.index("-p") + 1] == pointer
-    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    # No --model (ADR-0045): the CLI reads the image's baked managed settings;
+    # nothing on the argv can select a model.
+    assert "--model" not in argv
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in argv
@@ -571,7 +572,6 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
             run_id=f"review-r{round_number}",
             mode=jobdir.MODE_REVIEW,
             adapter="claude",
-            model="m",
             workdir=jobdir.WORK_DIR,
             round=round_number,
             round_budget=budget,
@@ -705,7 +705,6 @@ def _driver_config():
             "ANTHROPIC_API_KEY": "key",
         },
         role="implementer",
-        default_model="claude-sonnet-5",
     )
 
 

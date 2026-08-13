@@ -10,7 +10,6 @@ def test_manifest_roundtrip(tmp_path):
         run_id="r1",
         mode=jobdir.MODE_RUN,
         adapter="claude",
-        model="claude-sonnet-5",
         agent_timeout_seconds=10.0,
     )
     jobdir.write_manifest(tmp_path, manifest)
@@ -23,7 +22,6 @@ def test_review_manifest_does_not_serve_jobs():
         run_id="review-7-round-1",
         mode=jobdir.MODE_REVIEW,
         adapter="claude",
-        model="claude-fable-5",
         workdir=jobdir.WORK_DIR,
     )
     assert not manifest.serve_jobs

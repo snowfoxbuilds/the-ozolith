@@ -32,14 +32,12 @@ def test_cache_volumes_reject_a_claude_target():
         load_config(
             {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude"},
             role="implementer",
-            default_model="claude-sonnet-5",
         )
     # A .claude segment anywhere in the path is refused, not only the leaf.
     with pytest.raises(ConfigError, match=r"\.claude path"):
         load_config(
             {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude/skills"},
             role="implementer",
-            default_model="claude-sonnet-5",
         )
 
 
@@ -80,7 +78,6 @@ def test_cache_volumes_reject_persistence_bypasses(path):
         load_config(
             {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": f"poison:{path}"},
             role="implementer",
-            default_model="claude-sonnet-5",
         )
 
 
@@ -88,7 +85,6 @@ def test_cache_volumes_are_stored_normalized():
     config = load_config(
         {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "c:/home//ozolith/./.cache/"},
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert config.cache_volumes == (("c", "/home/ozolith/.cache"),)
 
@@ -99,13 +95,11 @@ def test_cache_volumes_accept_the_default_cache_mount():
     config = load_config(
         {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "theozolith-cache:/home/ozolith/.cache"},
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert config.cache_volumes == (("theozolith-cache", "/home/ozolith/.cache"),)
     ok = load_config(
         {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "c:/home/ozolith/.claudex"},
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert ok.cache_volumes == (("c", "/home/ozolith/.claudex"),)
 
