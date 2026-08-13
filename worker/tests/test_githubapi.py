@@ -106,6 +106,15 @@ def test_remove_label_tolerates_absent_label():
     client.remove_label(number, "pr_ready")  # no raise
 
 
+def test_assign_order_reflects_event_timeline():
+    fake = FakeGitHub()
+    client = make_client(fake)
+    number = fake.create_issue("t", "", set())
+    fake.force_assign(number, "worker-b")
+    fake.force_assign(number, "worker-a")
+    assert client.assign_order(number) == ["worker-b", "worker-a"]
+
+
 CONTROL_ENV = {"CONTROL_NODE_URL": "https://control.invalid:8443"}
 
 

@@ -180,6 +180,7 @@ class GitHubClient:
         self._sleep = sleep
         self._clock = clock
         self._login: str | None = None
+        self._default_branch: str | None = None
         # Transcript of successful writes: (method, repo-relative path).
         self.writes: list[tuple[str, str]] = []
 
@@ -235,6 +236,11 @@ class GitHubClient:
             self._login = self._json("GET", "/user")["login"]
         return self._login
 
+    def default_branch(self) -> str:
+        if self._default_branch is None:
+            self._default_branch = self._json("GET", self._repo_path(""))["default_branch"]
+        return self._default_branch
+
     # -- issues (and PRs through the issues API) --------------------------
 
     def list_open_issues(self, label: str) -> list[Issue]:
@@ -272,6 +278,17 @@ class GitHubClient:
 
     def remove_assignee(self, number: int, login: str) -> None:
         self._json("DELETE", self._repo_path(f"/issues/{number}/assignees"), {"assignees": [login]})
+
+    def assign_order(self, number: int) -> list[str]:
+        """Logins in earliest-assigned order, from the issue event timeline."""
+        events = self._paged(self._repo_path(f"/issues/{number}/events"))
+        order: list[str] = []
+        for event in events:
+            if event.get("event") == "assigned" and event.get("assignee"):
+                login = event["assignee"]["login"]
+                if login not in order:
+                    order.append(login)
+        return order
 
     def add_comment(self, number: int, body: str) -> None:
         self._json("POST", self._repo_path(f"/issues/{number}/comments"), {"body": body})
