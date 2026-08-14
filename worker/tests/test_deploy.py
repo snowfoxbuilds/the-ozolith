@@ -330,6 +330,7 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     content = content.replace("/home/ozolith", str(sandbox / "home"))
     content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
     content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
+    content = content.replace("/etc/theozolith", str(sandbox / "etc"))
     rewritten = sandbox / "start"
     rewritten.write_text(content)
     rewritten.chmod(0o755)
@@ -413,17 +414,40 @@ def _tailscaled_stub(
 
 def _tmux_stub(bin_dir: Path, *, has_session_code: int) -> Path:
     """A `tmux` stand-in; has-session's exit code drives the supervisor loop
-    (0 = session alive, 1 = session gone)."""
+    (0 = session alive, 1 = session gone). Besides the flat `tmux.calls`
+    line, every invocation is recorded boundary-preserving into `tmux.argv`
+    (`argc N` then one `arg <value>` line each) — `echo "$@"` flattens a
+    multi-word command argument into indistinguishable words, and the baked
+    model contract is exactly about tmux receiving ONE command string."""
     calls = bin_dir / "tmux.calls"
+    argv = bin_dir / "tmux.argv"
     stub = bin_dir / "tmux"
     stub.write_text(
         "#!/bin/sh\n"
         f'echo "$@" >> "{calls}"\n'
+        f'echo "argc $#" >> "{argv}"\n'
+        f'for a in "$@"; do echo "arg $a" >> "{argv}"; done\n'
         f'case "$1" in has-session) exit {has_session_code} ;; esac\n'
         "exit 0\n"
     )
     stub.chmod(0o755)
     return calls
+
+
+def _tmux_invocations(bin_dir: Path) -> list[list[str]]:
+    """The argv of every recorded tmux invocation, boundaries intact."""
+    lines = (bin_dir / "tmux.argv").read_text().splitlines()
+    invocations: list[list[str]] = []
+    index = 0
+    while index < len(lines):
+        head = lines[index]
+        assert head.startswith("argc "), head
+        argc = int(head.split()[1])
+        args = lines[index + 1 : index + 1 + argc]
+        assert len(args) == argc and all(arg.startswith("arg ") for arg in args)
+        invocations.append([arg[len("arg ") :] for arg in args])
+        index += 1 + argc
+    return invocations
 
 
 def _instant_sleep(bin_dir: Path) -> None:
@@ -470,6 +494,15 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
     assert "TAILSCALED_PID=$!" in lines
     assert '--hostname="$FLIGHTDECK_TS_HOSTNAME"' in script
     assert '--auth-key="file:${TS_AUTHKEY_FILE}"' in script
+    # ADR-0045 §4: the baked-model command substitution also survives
+    # generation LITERALLY — the model file is read at container start, never
+    # expanded into the script at image build — and the whole launch command
+    # is one quoted tmux argument, guarded by the file's non-emptiness.
+    assert "if [ -s /etc/theozolith/model ]; then" in script
+    assert (
+        "tmux new-session -d -s flightdeck"
+        ' "claude --model \\"$(cat /etc/theozolith/model)\\""' in script
+    )
     # ... and the only variables in the script are its own runtime ones.
     assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
         "FLIGHTDECK_TS_HOSTNAME",
@@ -665,6 +698,93 @@ def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_pat
     up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
     assert len(up_lines) == 1
     assert "--auth-key" not in up_lines[0]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_path):
+    """ADR-0045 §4 end-to-end: with the image-baked model file present, the
+    generated script (produced by the REAL worker-type setup command) starts
+    the session as `claude --model "claude-fable-5"` — delivered to tmux as
+    exactly ONE shell-command argument, so the whole launch command runs in
+    the session instead of tmux misparsing the flag as its own — while the
+    rest of the lifecycle (enrollment by key path, transcript piping, clean
+    daemon reaping) behaves exactly as without a model."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "etc").mkdir()  # the sandboxed /etc/theozolith
+    (sandbox / "etc" / "model").write_text("claude-fable-5\n")
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-SECRETVALUE\n")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    tmux_calls = _tmux_stub(bin_dir, has_session_code=1)  # session already over
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 0, proc.stderr
+    invocations = _tmux_invocations(bin_dir)
+    assert invocations[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        'claude --model "claude-fable-5"',
+    ]
+    assert invocations[1][:4] == ["pipe-pane", "-o", "-t", "flightdeck"]
+    assert "transcript.log" in invocations[1][4]
+    # The key VALUE stays out of every recorded argv on this branch too.
+    assert "SECRETVALUE" not in tmux_calls.read_text()
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_absent_model_file_launches_bare_claude(tmp_path):
+    """The compatibility branch (ADR-0045 §4): NO model file in the image —
+    a model-less worker type, or a pre-§4 base — must launch exactly `claude`
+    as the session command, with no --model flag and no empty argument."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert _tmux_invocations(bin_dir)[0] == ["new-session", "-d", "-s", "flightdeck", "claude"]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_empty_model_file_launches_bare_claude(tmp_path):
+    """An EMPTY model file takes the same bare-`claude` branch as an absent
+    one (the guard is `-s`, non-empty): a build that materialized nothing
+    must never produce `claude --model ""`."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    (sandbox / "etc").mkdir()
+    (sandbox / "etc" / "model").write_text("")
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert _tmux_invocations(bin_dir)[0] == ["new-session", "-d", "-s", "flightdeck", "claude"]
     _assert_daemon_reaped(daemon_pid)
 
 

@@ -51,7 +51,9 @@ base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:000000000000000
 
 # The deck's DEFAULT model (ADR-0045 §4). Control appends an interactive-scope
 # materialize step for this field: the build validates the ID and writes it to
-# /etc/theozolith/model — root-owned, outside every volume — and nothing else.
+# /etc/theozolith/model — atomically, as a root-owned non-user-writable regular
+# file (a symlinked or irregular destination fails the build), outside every
+# volume — and nothing else.
 # flightdeck-start turns it into a guarded `claude --model "$(cat
 # /etc/theozolith/model)"`, and flag precedence makes every container start
 # begin at this definition while /model stays free WITHIN a session (the CLI

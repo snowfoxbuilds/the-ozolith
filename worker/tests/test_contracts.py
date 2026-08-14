@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -502,6 +504,154 @@ def test_claude_adapter_materialize_interactive_scope_never_touches_claude_confi
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-opus-5\n"
     assert not (tmp_path / "etc/claude-code").exists()
     assert not (tmp_path / "home").exists()
+
+
+# -- materialize write safety (the baked identity is image bytes) --------------
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def _no_temp_debris(tmp_path: Path) -> bool:
+    return not [p for p in tmp_path.rglob("*") if p.name.endswith(".tmp")]
+
+
+def test_claude_adapter_materialize_normalizes_writable_debris(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/theozolith/model"
+    target.parent.mkdir(parents=True)
+    target.parent.chmod(0o777)  # a sloppy base layer left the parent open
+    target.write_text("claude-old-1\n")
+    target.chmod(0o666)  # ...and the file group/world-writable
+
+    adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    # The replacement is a fresh REGULAR file at the well-known mode — never
+    # group/world-writable (root-owned in a real root build) — and the
+    # product-owned parent is normalized so the runtime user cannot unlink
+    # and swap the file either. Immutable-image identity, not advice.
+    assert target.read_text() == "claude-fable-5\n"
+    assert stat.S_ISREG(target.lstat().st_mode)
+    assert _mode(target) == 0o644
+    assert _mode(target.parent) == 0o755
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_never_writes_through_a_destination_symlink(tmp_path):
+    adapter = ClaudeAdapter()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("operator content")
+    well_known = tmp_path / "etc/theozolith"
+    well_known.mkdir(parents=True)
+    (well_known / "model").symlink_to(elsewhere)
+
+    with pytest.raises(AgentAdapterError, match="not a regular file"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    # The symlink's target was never overwritten, the symlink itself was not
+    # silently replaced (the build stops for a human), and no temp survives.
+    assert elsewhere.read_text() == "operator content"
+    assert (well_known / "model").is_symlink()
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_refuses_symlinked_settings_with_nothing_partial(tmp_path):
+    adapter = ClaudeAdapter()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"permissions": {"deny": ["WebSearch"]}}')  # identity-free
+    settings_dir = tmp_path / "etc/claude-code"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "managed-settings.json").symlink_to(elsewhere)
+
+    # The conflict scan passes (the linked document is identity-free), so the
+    # refusal is the WRITE path's — and because every destination is resolved
+    # before any write, the model/effort files must not exist either: a
+    # refused build leaves no partially materialized identity.
+    with pytest.raises(AgentAdapterError, match="not a regular file"):
+        adapter.materialize("claude-fable-5", "high", root=tmp_path, scope="managed")
+    assert elsewhere.read_text() == '{"permissions": {"deny": ["WebSearch"]}}'
+    assert (settings_dir / "managed-settings.json").is_symlink()
+    assert not (tmp_path / "etc/theozolith/model").exists()
+    assert not (tmp_path / "etc/theozolith/effort").exists()
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_refuses_a_non_regular_destination(tmp_path):
+    adapter = ClaudeAdapter()
+    well_known = tmp_path / "etc/theozolith"
+    well_known.mkdir(parents=True)
+    os.mkfifo(well_known / "model")  # a special file is never replaced
+
+    with pytest.raises(AgentAdapterError, match="not a regular file"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    assert stat.S_ISFIFO((well_known / "model").lstat().st_mode)
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_refuses_a_symlinked_parent(tmp_path):
+    adapter = ClaudeAdapter()
+    real_dir = tmp_path / "attacker-controlled"
+    real_dir.mkdir()
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc/theozolith").symlink_to(real_dir)
+
+    # A symlink at ANY component below the root refuses the traversal —
+    # O_NOFOLLOW, not lexical checking — so a planted parent cannot steer
+    # the write into an arbitrary tree.
+    with pytest.raises(AgentAdapterError, match="refusing to traverse"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    assert list(real_dir.iterdir()) == []  # nothing landed behind the link
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_refuses_a_non_directory_parent(tmp_path):
+    adapter = ClaudeAdapter()
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc/theozolith").write_text("a file where the dir belongs")
+
+    with pytest.raises(AgentAdapterError, match="refusing to traverse"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    assert (tmp_path / "etc/theozolith").read_text() == "a file where the dir belongs"
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_failure_orphans_no_temp(tmp_path, monkeypatch):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/theozolith/model"
+    target.parent.mkdir(parents=True)
+    target.write_text("claude-old-1\n")
+
+    def torn_replace(*args, **kwargs):
+        raise OSError("simulated: disk full at the replace")
+
+    monkeypatch.setattr("theozolith_worker.adapters.os.replace", torn_replace)
+    with pytest.raises(OSError, match="disk full"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="interactive")
+    # The atomic-replace contract on failure: destination holds the OLD bytes
+    # in full (never a torn write) and the temp was unlinked, not orphaned
+    # into the image layer.
+    assert target.read_text() == "claude-old-1\n"
+    assert _no_temp_debris(tmp_path)
+
+
+def test_claude_adapter_materialize_managed_settings_replacement_is_safe_and_merged(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"permissions": {"deny": ["WebSearch"]}}')
+    target.chmod(0o666)
+
+    adapter.materialize("claude-fable-5", "high", root=tmp_path, scope="managed")
+    # The managed settings get the same discipline as the well-known files:
+    # unrelated operator keys survive the ATOMIC replacement, and the result
+    # is a regular 0644 file the runtime user cannot rewrite.
+    settings = json.loads(target.read_text())
+    assert settings["permissions"] == {"deny": ["WebSearch"]}
+    assert settings["model"] == "claude-fable-5"
+    assert stat.S_ISREG(target.lstat().st_mode)
+    assert _mode(target) == 0o644
+    assert _mode(tmp_path / "etc/theozolith/model") == 0o644
+    assert _mode(tmp_path / "etc/theozolith/effort") == 0o644
+    assert _no_temp_debris(tmp_path)
 
 
 def test_materialize_instruction_golden():

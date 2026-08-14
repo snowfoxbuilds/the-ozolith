@@ -112,6 +112,23 @@ key (`model`, `availableModels`, `enforceAvailableModels`,
 model/effort/endpoint-selecting `env` entry) or a malformed document.
 Unrelated operator settings merge and survive.
 
+**Materialized artifacts are image bytes, written like it.** Both
+scopes land the well-known files and the managed settings through
+O_NOFOLLOW-verified directory descriptors with same-directory atomic
+replacement: a symlink or special file at any component below the
+materialize root — parent or destination — fails the build loudly (a
+planted link's target is never written through, and the link is never
+silently replaced), every destination is validated before anything is
+written (a refused build materializes nothing), and the files land as
+non-group/world-writable regular files (0644, in normalized 0755
+product-owned directories, root-owned when the build runs as root — a
+real image build does). A failed write leaves the previous bytes intact
+and unlinks its temp. The point is the immutable-image identity
+contract: these files are the declaration the static checks, the
+monitor, and the Flight Deck start script hold the container to, so
+nothing writable by the runtime user — and no pre-existing filesystem
+shape — may decide what they say.
+
 **Failures classify distinctly.** Identity failures carry
 `failure_class: "identity"` with a stable category (`policy-conflict`,
 `identity-inconsistent`, `pair-invalid`, `cli-too-old`, `unavailable`,

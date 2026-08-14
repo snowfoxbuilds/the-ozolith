@@ -692,9 +692,10 @@ the files owned by the driver user either by building the image with
   here; the human merge gate stays human by construction. Do not leave Flight Deck
   sessions running unattended.
 - **Flight Deck default model** (ADR-0045 §4): set `model` on the deck's worker type
-  and the derived image carries the validated ID at the root-owned well-known file
-  `/etc/theozolith/model` — never anything under `~/.claude`, which the claude-state
-  volume shadows (ADR-0043). The baked start script launches the session as
+  and the derived image carries the validated ID at the well-known file
+  `/etc/theozolith/model` — materialized atomically as a root-owned, non-user-writable
+  regular file (0644; symlinked or irregular destinations fail the build), never
+  anything under `~/.claude`, which the claude-state volume shadows (ADR-0043). The baked start script launches the session as
   `claude --model "$(cat /etc/theozolith/model)"` (bare `claude` when no model is
   baked), so every container start deterministically begins at the definition's
   default, while `/model` stays free within a session: the CLI persists a `/model`
