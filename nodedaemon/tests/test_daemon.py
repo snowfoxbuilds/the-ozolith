@@ -601,16 +601,50 @@ def test_denied_secret_pull_skips_the_stack(rig: Rig):
     assert any("secrets unavailable" in line for line in rig.logs)
 
 
-def test_secret_pull_refused_over_plain_http_without_dev_flag(tmp_path):
+def test_plain_http_control_url_refused_at_construction_without_dev_flag():
+    """The bearer token rides every request, not just secret pulls: a
+    plain-HTTP channel is refused before the first byte, unless the
+    operator explicitly opted into insecure dev mode — and the check is an
+    exact parse, so a scheme merely BEGINNING with https never passes."""
     from theozolith_nodedaemon.controlclient import ControlClient, ControlError
 
-    client = ControlClient("http://control.test", "tok", insecure_dev=False)
     try:
-        client.pull_secrets("box1", ["github-implementer"])
+        ControlClient("http://control.test", "tok", insecure_dev=False)
     except ControlError as exc:
         assert "TLS is mandatory" in str(exc)
     else:
-        raise AssertionError("plain-HTTP secret pull must be refused")
+        raise AssertionError("a plain-HTTP control URL must be refused")
+    # Exact scheme + usable hostname, never a prefix check; the dev flag
+    # excuses plain http, never a malformed URL.
+    for bad in ("httpsneak://control.test", "https://", "control.test", "https:worker"):
+        for dev in (False, True):
+            with pytest.raises(ControlError):
+                ControlClient(bad, "tok", insecure_dev=dev)
+    # Ordinary https constructs (no traffic happens at construction)…
+    ControlClient("https://control.test", "tok")
+    # …and the explicit dev opt-in still constructs (the test rigs depend on it).
+    ControlClient("http://control.test", "tok", insecure_dev=True)
+
+
+def test_malformed_control_urls_are_controlerror_never_valueerror():
+    """The constructor's parse is TOTAL: on unmatched IPv6 brackets and
+    NFKC-invalid netlocs urlsplit itself raises ValueError — before .port
+    is ever reached — and an explicit :0 names no dialable origin (the
+    scheme default fills in only when the port is OMITTED). Every one is
+    the documented ControlError, dev flag or not; a leaked ValueError
+    would fail the pytest.raises."""
+    from theozolith_nodedaemon.controlclient import ControlClient, ControlError
+
+    for bad in (
+        "https://[",  # unmatched IPv6 bracket: ValueError inside urlsplit
+        "https://[::1",  # same, with address content
+        "https://evil\uff0fslash.test",  # NFKC-invalid netloc (full-width slash)
+        "https://control.test:0",  # explicit :0 — never rewritten to 443
+        "http://control.test:0",  # …and never excused by the dev flag
+    ):
+        for dev in (False, True):
+            with pytest.raises(ControlError):
+                ControlClient(bad, "tok", insecure_dev=dev)
 
 
 def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):

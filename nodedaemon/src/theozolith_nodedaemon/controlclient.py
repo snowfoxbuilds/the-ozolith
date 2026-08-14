@@ -4,8 +4,15 @@ HTTPS with bearer-token auth at a configured URL; TLS via a pinned CA bundle
 (self-signed or install-provisioned — NODE-SUBSTRATE.md). Unreachability is
 an expected state, not an error: ``heartbeat`` answers None and the caller
 falls back to cached desired state (ADR-0006). The one hard rule is the
-channel invariant's TLS clause: secret values never transit plain HTTP
-unless the operator explicitly opted into insecure dev mode.
+channel invariant's TLS clause: secret values — the per-node bearer token
+included, and it rides EVERY request — never transit plain HTTP unless the
+operator explicitly opted into insecure dev mode. Construction therefore
+refuses anything but an exactly-parsed https URL (plain http only under the
+dev flag), and the transport refuses every redirect that would carry the
+token off that origin: a 3xx is followed only when its target parses to the
+SAME scheme://host:port — an HTTPS→HTTP downgrade or cross-origin hop is a
+``ControlError`` raised BEFORE the redirected request is issued, so the
+Authorization header never leaves the configured origin.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import json
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -30,21 +38,100 @@ class ControlUnreachable(RuntimeError):
     """No answer at all — degraded mode territory, never fatal."""
 
 
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """(scheme, host, effective port) of an exactly-parsed http(s) URL —
+    None for anything else. Exact parsing, never a prefix check: a scheme
+    like 'httpsevil' or a URL with no usable hostname must not pass for
+    https. Total over arbitrary input: urlsplit and the hostname property
+    raise ValueError themselves (unmatched IPv6 brackets, NFKC-invalid
+    netlocs) before .port is ever reached, so the whole parse sits inside
+    one boundary — every malformed URL is None here, never a leaked
+    ValueError. An explicit :0 is refused: the scheme default fills in only
+    when the port is omitted, and 0 names no dialable origin."""
+    try:
+        split = urllib.parse.urlsplit(url)
+        hostname = split.hostname
+        port = split.port
+    except ValueError:
+        return None
+    if split.scheme not in ("https", "http") or not hostname or port == 0:
+        return None
+    if port is None:
+        port = 443 if split.scheme == "https" else 80
+    return split.scheme, hostname, port
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface every 3xx to the transport instead of following it: urllib's
+    default handler re-sends the request — Authorization header included —
+    to whatever host Location names, cross-origin and plain-HTTP alike.
+    Declining must happen at http_error_3xx, not redirect_request: urllib
+    parses Location (urlparse, then urljoin) BEFORE consulting
+    redirect_request, so a malformed Location would raise ValueError inside
+    urllib's own machinery. Unhandled here, every 3xx bounces out as a
+    plain HTTPError with its Location untouched — the transport below owns
+    ALL Location parsing behind its ControlError boundary."""
+
+    def _decline(self, req, fp, code, msg, headers):
+        return None  # unhandled → the 3xx surfaces as an HTTPError
+
+    http_error_301 = http_error_302 = http_error_303 = _decline
+    http_error_307 = http_error_308 = _decline
+
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_REDIRECT_LIMIT = 5
+
+
 def _urllib_transport(ca: str | None) -> Transport:
     def transport(
         method: str, url: str, headers: dict[str, str], body: bytes | None
     ) -> tuple[int, bytes]:
-        context = None
-        if url.startswith("https"):
-            context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
-        request = urllib.request.Request(url, data=body, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=15, context=context) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ControlUnreachable(str(exc)) from exc
+        context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+        opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=context)
+        )
+        origin = _origin(url)
+        target = url
+        for _ in range(_REDIRECT_LIMIT):
+            request = urllib.request.Request(target, data=body, method=method, headers=headers)
+            try:
+                with opener.open(request, timeout=15) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _REDIRECT_STATUSES:
+                    return exc.code, exc.read()
+                location = exc.headers.get("Location")
+                exc.close()
+                if not location:
+                    raise ControlError(
+                        f"{method} {target}: HTTP {exc.code} redirect without a Location"
+                    ) from None
+                # The policy gate, applied BEFORE the redirected request is
+                # issued: only a hop that stays on the configured origin may
+                # carry the bearer token (same method and body re-sent — the
+                # control channel never wants a 303-style method switch).
+                # urljoin parses Location with urlsplit and inherits its
+                # ValueErrors (unmatched IPv6 brackets, NFKC-invalid
+                # netlocs): a Location the parser chokes on is the same
+                # refusal, through the same ControlError boundary.
+                try:
+                    target = urllib.parse.urljoin(target, location)
+                except ValueError:
+                    raise ControlError(
+                        f"refusing redirect: malformed Location {location!r}"
+                        " (the bearer token only rides an exactly-parsed"
+                        " same-origin target)"
+                    ) from None
+                if origin is None or _origin(target) != origin:
+                    raise ControlError(
+                        f"refusing redirect to {target!r}: it leaves the configured"
+                        " control origin (a cross-origin hop or HTTPS→HTTP downgrade"
+                        " would hand the bearer token to someone else)"
+                    ) from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise ControlUnreachable(str(exc)) from exc
+        raise ControlError(f"{method} {url}: too many redirects")
 
     return transport
 
@@ -59,9 +146,16 @@ class ControlClient:
         insecure_dev: bool = False,
         transport: Transport | None = None,
     ):
+        origin = _origin(url)
+        if origin is None or (origin[0] != "https" and not insecure_dev):
+            raise ControlError(
+                f"refusing control URL {url!r}: the per-node bearer token rides"
+                " every request, so the URL must parse as exactly https with a"
+                " hostname (TLS is mandatory; THEOZOLITH_INSECURE_DEV=1 allows"
+                " plain http for local dev only)"
+            )
         self._url = url.rstrip("/")
         self._token = token
-        self._insecure_dev = insecure_dev
         self._transport = transport or _urllib_transport(ca)
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -128,14 +222,11 @@ class ControlClient:
         return payload
 
     def pull_secrets(self, node: str, names: list[str]) -> dict[str, str]:
-        """Node-scoped secret pull — values transit TLS only (ADR-0006)."""
+        """Node-scoped secret pull — values transit TLS only (ADR-0006; the
+        constructor already refused a plain-HTTP channel without the
+        explicit dev opt-in)."""
         if not names:
             return {}
-        if not self._url.startswith("https") and not self._insecure_dev:
-            raise ControlError(
-                "refusing to pull secrets over plain HTTP (TLS is mandatory;"
-                " THEOZOLITH_INSECURE_DEV=1 for local dev only)"
-            )
         answer = self._post("/api/v1/secrets/pull", {"node": node, "names": names})
         secrets = answer.get("secrets")
         if not isinstance(secrets, dict):
