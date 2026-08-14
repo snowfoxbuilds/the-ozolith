@@ -5,14 +5,14 @@
 #
 # The derived-image identity (tag = base tag + instruction hash) covers the
 # bytes that build the image: base/setup/knowledge_* PLUS the materialized
-# model/effort config (ADR-0045) — the compiler bakes an enforced model
-# restriction (availableModels allowlist) and effort (managed env) into the
-# image's managed settings, so changing either re-tags and rebuilds, and no
-# selection surface inside a run — env var, flag, /model, checked-in
-# settings, subagent frontmatter — can leave the pin (see deploy/README.md).
-# driver/workspace/secrets still never trigger a rebuild. When you change
-# the model, bump `base` to a release that ships theozolith-adapter in the
-# same edit — both change the tag anyway.
+# model/effort config (ADR-0045) — the bake writes a managed model default
+# and effort pin into the image's managed settings, so changing either
+# re-tags and rebuilds the image. driver/workspace/secrets still never
+# trigger a rebuild. When you change the model, bump `base` to a release
+# that ships theozolith-adapter in the same edit — both change the tag
+# anyway. How the identity is held at runtime — best effort, main-agent
+# scope, the documented gaps — is the comment block below and
+# deploy/README.md.
 
 driver = "builtin:implementer"   # the staged pipeline Implementer (process kind)
 adapter = "claude"               # the Agent adapter the harness invokes

@@ -552,11 +552,11 @@ def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch)
     assert adapter.verify_enforceable() == "2.1.232 (Claude Code)"
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
-    with pytest.raises(AgentAdapterError, match="predates the model-enforcement settings"):
+    with pytest.raises(AgentAdapterError, match="predates the identity behavior"):
         adapter.verify_enforceable()
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.174 (Claude Code)")
-    with pytest.raises(AgentAdapterError, match="predates the model-enforcement settings"):
+    with pytest.raises(AgentAdapterError, match="predates the identity behavior"):
         adapter.verify_enforceable()
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "not a version")

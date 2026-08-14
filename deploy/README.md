@@ -546,9 +546,13 @@ session with the Run credential that must announce and execute the baked
 model and (when effort is baked) report the baked level as the *applied*
 effort via the Stop-hook payload. A broken image/credential/policy
 combination fails loud at setup, in seconds, without burning issues or
-claims — the driver fetches no work while the dry-run fails and retries it
-each pass. Model-less images pass trivially; the dot-prefixed dry-run job
-dir is invisible to the evidence sweep and queue-behind.
+claims — a dry-run verdict **latches** the driver: it fetches no work and
+never re-spends the probe, the reason is reported to the Control Node's
+error feed (`theozolith status` shows recent errors), and you retry by
+restarting the driver after fixing the cause. A dry-run that could not
+execute at all (container engine down) is retried with backoff. Model-less
+images pass trivially; the dot-prefixed dry-run job dir is invisible to the
+evidence sweep and queue-behind.
 
 **Runs are watched, never gated.** The task session launches exactly as an
 unbaked image would — pointer prompt in the argv, task file on disk, and the

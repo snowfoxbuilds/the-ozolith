@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from conftest import (
     REVIEWER_LOGIN,
     WORKER_LOGIN,
@@ -37,6 +39,7 @@ from theozolith_worker.bootstrap.vocabulary import (
 )
 from theozolith_worker.containers import EngineError
 from theozolith_worker.gitops import GitError
+from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.runner import branch_for
 from theozolith_worker.sessions import SessionError
@@ -1012,6 +1015,140 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
     assert [e["failure_class"] for e in run_events if e["phase"] == "failed"] == ["infra", "infra"]
     (escalated,) = (e for e in run_events if e["phase"] == "escalated")
     assert escalated["failure_class"] == "infra"
+
+
+# -- the setup dry-run latch (ADR-0045) ----------------------------------------
+# A dry-run VERDICT (the container ran and failed) latches the driver until a
+# manual restart: the probe is never re-spent, no work is fetched, and the
+# reason reaches the Control Node's error feed. Only a dry-run that could not
+# execute at all (engine breakage) is retried.
+
+LATCH_DETAIL = "[substituted] the identity probe ran on 'other', not the baked 'claude-sonnet-5'"
+
+
+def _dryrun_failing_factory(harness: Harness, dryruns: list[str]):
+    """The harness's real session seam, with every dry-run session dying the
+    way a real identity verdict does (anchored marker in the status error)."""
+    real_factory = harness.session_factory
+
+    def factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN:
+            dryruns.append(spec.name)
+
+            def die():
+                raise SessionError(f"harness failed: identity: {LATCH_DETAIL}")
+
+            session.wait_for_agent = die  # type: ignore[method-assign]
+        return session
+
+    return factory
+
+
+def _persistent_worker(harness: Harness, session_factory, sink=None) -> Implementer:
+    """One long-lived Implementer instance — the latch is process state, so
+    these tests drive repeated passes on the SAME driver (the acceptance
+    ``worker_once`` helper builds a fresh one per call)."""
+    return Implementer(
+        harness.worker_config,
+        client=harness.worker_client,
+        session_factory=session_factory,
+        dispatch=harness.dispatch,
+        log=harness.logs.append,
+        sink=sink or harness.sink,
+    )
+
+
+def test_dry_run_verdict_latches_until_restart(harness: Harness):
+    harness.file_issue("Never claimed", CRITERIA_BODY)
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns))
+
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == LATCH_DETAIL
+    assert len(dryruns) == 1
+
+    # Subsequent passes on the same process: no new dry-run container — the
+    # probe is never re-spent — and no work is fetched or claimed.
+    assert worker.run(once=True) == 0
+    assert len(dryruns) == 1
+    assert harness.record.work_launched == []
+
+    # Exactly one latch event landed on the Control Node's error feed,
+    # naming the verdict and the remedy; the local journal has both too.
+    errors = [e for e in harness.sink.events if e["type"] == "theozolith.error"]
+    assert len(errors) == 1
+    assert errors[0]["error_class"] == "IdentityDryRun"
+    assert LATCH_DETAIL in errors[0]["message"] and "restarted" in errors[0]["message"]
+    assert any("latched" in line and "restart" in line for line in harness.logs)
+
+
+def test_dry_run_latch_report_retries_until_control_hears_it(harness: Harness):
+    class DeafThenListening:
+        """Control down at latch time: the first emission is lost."""
+
+        def __init__(self):
+            self.events: list[dict] = []
+            self.deaf = 1
+
+        def emit(self, event: dict) -> bool:
+            if self.deaf:
+                self.deaf -= 1
+                return False
+            self.events.append(event)
+            return True
+
+    sink = DeafThenListening()
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns), sink=sink)
+
+    assert worker.run(once=True) == 0
+    assert sink.events == []  # lost — Control was down
+    assert worker.run(once=True) == 0  # a cheap re-send, never a new probe
+    assert len(dryruns) == 1
+    assert [e["error_class"] for e in sink.events] == ["IdentityDryRun"]
+    assert worker.run(once=True) == 0  # landed: not re-sent again
+    assert len(sink.events) == 1
+
+
+def test_dry_run_latch_loop_backs_off_without_respending_the_probe(harness: Harness):
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns))
+    # The acceptance harness polls at 0s; backoff only shows over a real base.
+    worker.config = replace(harness.worker_config, poll_seconds=60.0)
+    delays: list[float] = []
+
+    def sleeper(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= 6:
+            raise KeyboardInterrupt  # stop the loop (run() does not catch it)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(sleep=sleeper)
+    assert len(dryruns) == 1  # the probe was spent exactly once
+    assert delays == sorted(delays) and delays[-1] > delays[0]  # backing off
+
+
+def test_dry_run_infra_failure_is_retried_not_latched(harness: Harness):
+    """A dry-run that could not execute at all is plausibly transient: no
+    latch, and the next pass retries — here the engine recovers and work
+    flows without a driver restart."""
+    number = harness.file_issue("Claimed after recovery", CRITERIA_BODY)
+    real_factory = harness.session_factory
+    breakage = [EngineError("docker daemon down")]
+
+    def flaky_factory(spec, job, manifest):
+        if manifest.mode == jobdir_module.MODE_DRYRUN and breakage:
+            raise breakage.pop()
+        return real_factory(spec, job, manifest)
+
+    worker = _persistent_worker(harness, flaky_factory)
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == ""  # not a verdict: not latched
+    assert worker.run(once=True) == 1  # engine back: dry-run passes, work flows
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert harness.fake.pulls[pr_number]["head"] == branch_for(number)
+    assert PR_READY in harness.fake.labels_of(pr_number)
 
 
 # -- 9. headless sessions (ADR-0019) -------------------------------------------

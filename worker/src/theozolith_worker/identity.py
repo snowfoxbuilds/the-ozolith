@@ -401,8 +401,13 @@ def read_baked_identity(root: Path) -> BakedIdentity | None:
     half-declared identity must never silently run unchecked."""
     model_file = root / WELL_KNOWN_MODEL_FILE
     effort_file = root / WELL_KNOWN_EFFORT_FILE
-    model = model_file.read_text(encoding="utf-8").strip() if model_file.is_file() else ""
-    effort = effort_file.read_text(encoding="utf-8").strip() if effort_file.is_file() else ""
+    try:
+        model = model_file.read_text(encoding="utf-8").strip() if model_file.is_file() else ""
+        effort = effort_file.read_text(encoding="utf-8").strip() if effort_file.is_file() else ""
+    except OSError as exc:
+        # An unreadable declaration is an identity failure, not generic
+        # harness breakage — it must reach the identity-inconsistent lane.
+        raise IdentityError(f"unreadable baked-identity declaration: {exc}") from exc
     if model_file.is_file() and not model:
         raise IdentityError(f"{model_file} exists but is empty — corrupt baked identity")
     if effort and not model:
@@ -884,25 +889,67 @@ class MonitorHooks:
 # The ConfigChange hook helper (written by the harness into the scratch).
 # It NEVER blocks a settings change — organization policy is never resisted
 # (ADR-0045 doctrine); an identity-relevant change is recorded and the
-# harness kills the Run instead. project_settings changes are filtered by
-# content: the task may legitimately edit the checkout's settings, so only
-# identity-shaped keys (or an unreadable changed file — unknowable is
-# recorded) are noted. skills changes are ignored. Everything else
-# (policy/user/local settings, unknown future sources) is recorded
-# unconditionally. Records carry source, path, and matched key names only.
+# harness kills the Run instead. project_settings changes are filtered
+# STRUCTURALLY: the task may legitimately edit the checkout's settings, so
+# the changed file is parsed and only top-level identity keys or steering
+# ``env`` entries (or an unreadable/unparseable file — unknowable is
+# recorded) are noted; a nested "model" in an unrelated object or an env
+# credential must not kill a legitimate Run. skills changes are ignored.
+# Everything else (policy/user/local settings, unknown future sources) is
+# recorded unconditionally. Records carry source, path, and key names only.
 CONFIG_CHANGE_HOOK_SOURCE = '''\
 """theozolith ConfigChange hook (ADR-0045): record identity-relevant
 mid-session settings changes for the harness session monitor. Never blocks."""
 import json
-import re
 import sys
 
-IDENTITY_PATTERN = re.compile(
-    r\'"(model|availableModels|enforceAvailableModels|fallbackModel|effortLevel\'
-    r"|modelOverrides|policyHelper|policyHelpers|forceRemoteSettingsRefresh"
-    r"|ANTHROPIC_[A-Z_]+|CLAUDE_CODE_EFFORT_LEVEL|CLAUDE_CODE_SUBAGENT_MODEL"
-    r\'|CLAUDE_CODE_USE_BEDROCK|CLAUDE_CODE_USE_VERTEX)"\\s*:\'
-)
+# Mirrors identity.py's IDENTITY_SETTING_KEYS (plus forceRemoteSettingsRefresh,
+# which re-fetches remote policy mid-session) and its identity env predicate —
+# the hook is deliberately self-contained: nothing theozolith is importable
+# from inside the session.
+IDENTITY_KEYS = {
+    "availableModels",
+    "effortLevel",
+    "enforceAvailableModels",
+    "fallbackModel",
+    "forceRemoteSettingsRefresh",
+    "model",
+    "modelOverrides",
+    "policyHelper",
+    "policyHelpers",
+}
+IDENTITY_ENV_KEYS = {
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+}
+
+
+def identity_keys_in(document) -> list:
+    """The identity-shaped keys of one PARSED settings document: top-level
+    selection keys plus model/effort/endpoint-steering "env" entries. A
+    nested "model" in an unrelated object (a statusline block, an MCP server
+    config) or a credential env entry is not identity-shaped."""
+    keys = set()
+    for key in document:
+        if isinstance(key, str) and key in IDENTITY_KEYS:
+            keys.add(key)
+    env = document.get("env")
+    if isinstance(env, dict):
+        for name in env:
+            if not isinstance(name, str):
+                continue
+            if name in IDENTITY_ENV_KEYS or (
+                name.startswith("ANTHROPIC_DEFAULT_") and name.endswith("_MODEL")
+            ):
+                keys.add(name)
+    return sorted(keys)
 
 
 def main() -> int:
@@ -917,14 +964,15 @@ def main() -> int:
     path = event.get("file_path") if isinstance(event.get("file_path"), str) else ""
     if source == "skills":
         return 0
-    keys: list[str] = []
+    keys = []
     if source == "project_settings":
         try:
-            text = open(path, encoding="utf-8").read()
-        except OSError:
-            text = None
-        if text is not None:
-            keys = sorted({match.group(1) for match in IDENTITY_PATTERN.finditer(text)})
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except Exception:
+            document = None  # unreadable or unparseable: unknowable, record
+        if isinstance(document, dict):
+            keys = identity_keys_in(document)
             if not keys:
                 return 0
     with open(capture, "a", encoding="utf-8") as handle:

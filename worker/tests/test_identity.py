@@ -12,6 +12,7 @@ tests assume is test_live_enforcement.py.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -343,6 +344,20 @@ def test_read_baked_identity_fails_on_effort_without_model(tmp_path):
     _write(tmp_path, "etc/theozolith/effort", "high\n")
     with pytest.raises(IdentityError, match="effort without a model"):
         read_baked_identity(tmp_path)
+
+
+def test_read_baked_identity_unreadable_declaration_is_an_identity_error(tmp_path):
+    # An unreadable well-known file must take the identity-inconsistent lane
+    # (IdentityError), never escape as generic harness breakage.
+    if os.geteuid() == 0:
+        pytest.skip("permission-based failure injection is a no-op as root")
+    path = _write(tmp_path, "etc/theozolith/model", "claude-sonnet-5\n")
+    path.chmod(0o000)
+    try:
+        with pytest.raises(IdentityError, match="unreadable baked-identity"):
+            read_baked_identity(tmp_path)
+    finally:
+        path.chmod(0o644)
 
 
 def test_read_baked_identity_fails_on_selection_without_declaration(tmp_path):
@@ -760,8 +775,20 @@ def test_config_hook_records_policy_and_user_tier_changes(tmp_path):
 
 def test_config_hook_ignores_skills_and_benign_project_settings(tmp_path):
     assert _run_config_hook(tmp_path, {"source": "skills", "file_path": "/w/.claude/skills"}) == []
+    # Structurally benign (ADR-0045): a NESTED "model" key in an unrelated
+    # object and a credential env entry are not identity-shaped — the filter
+    # parses the document instead of pattern-matching its text, so a
+    # legitimate checkout-settings edit never kills the Run.
     benign = tmp_path / "benign.json"
-    benign.write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
+    benign.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Bash"]},
+                "statusLine": {"model": "irrelevant"},
+                "env": {"ANTHROPIC_API_KEY": "sk-redacted", "MY_FLAG": "1"},
+            }
+        )
+    )
     records = _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(benign)})
     assert records == []
 
@@ -780,6 +807,16 @@ def test_config_hook_records_unreadable_project_settings(tmp_path):
         tmp_path, {"source": "project_settings", "file_path": str(tmp_path / "gone.json")}
     )
     assert len(records) == 1  # unknowable is recorded
+
+
+def test_config_hook_records_unparseable_project_settings(tmp_path):
+    # A changed settings file that does not parse is unknowable policy —
+    # recorded (and the Run dies), exactly like an unreadable one.
+    garbled = tmp_path / "garbled.json"
+    garbled.write_text('{"model": "opus"')  # truncated JSON
+    records = _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(garbled)})
+    assert len(records) == 1
+    assert records[0]["keys"] == []  # nothing provable, no keys claimed
 
 
 def test_config_hook_survives_garbage_stdin(tmp_path):

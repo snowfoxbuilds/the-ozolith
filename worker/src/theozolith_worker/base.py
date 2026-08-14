@@ -28,7 +28,7 @@ from theozolith_worker import jobdir
 from theozolith_worker.config import DriverConfig, load_config
 from theozolith_worker.containers import ContainerSpec, DockerEngine, container_labels
 from theozolith_worker.dispatch import DispatchClient, WorkDispatch, backoff_delay
-from theozolith_worker.events import EventSink, emit_error, make_sink
+from theozolith_worker.events import EventSink, emit_error, error_event, make_sink
 from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory, container_session_factory
@@ -83,6 +83,15 @@ class Worker:
             ),
         )
         self.me = ""  # this driver's GitHub login; resolved in run()
+        # ADR-0045: a dry-run VERDICT failure — the container ran and said
+        # no — latches here until the driver process is restarted. Re-running
+        # the dry-run would spend another probe session against the same
+        # broken image/credential/policy combination every pass; the fix is
+        # always operator action, so the operator retries by restarting.
+        # "" = not latched. Only a dry-run that could not execute at all
+        # (engine/filesystem breakage, plausibly transient) is retried.
+        self.identity_block = ""
+        self._identity_block_reported = False  # the latch event landed on Control
 
     @classmethod
     def load(cls, environ=None) -> Worker:
@@ -93,8 +102,11 @@ class Worker:
         """The dispatch-run loop; returns the number of items executed.
 
         Boot evidence sweep, then the identity dry-run (once per driver
-        process — while it fails, no work is fetched and it is retried each
-        pass), then each pass: fetch work (None = Control unreachable),
+        process). A dry-run VERDICT failure latches: no work is fetched, the
+        probe is never re-spent, the reason is reported to the Control Node's
+        error feed, and the operator retries by restarting the driver after
+        the fix. A dry-run that could not execute at all is retried with
+        backoff. Then each pass: fetch work (None = Control unreachable),
         execute each item, surface any escaped exception as a
         theozolith.error, then idle-hook + unreachable-backoff. ``once`` runs a
         single pass. A reachable Control Node is required either way (ADR-0017):
@@ -107,14 +119,42 @@ class Worker:
         count = 0
         unreachable_streak = 0
         identity_verified = False
+        identity_streak = 0
         while True:
             if not identity_verified:
-                identity_verified = self._verify_image_identity()
+                latched_before = bool(self.identity_block)
+                if not latched_before:
+                    identity_verified = self._verify_image_identity()
                 if not identity_verified:
+                    identity_streak += 1
+                    if self.identity_block:
+                        # The latched reason must be visible from the Control
+                        # Node (ADR-0045): keep re-sending the one error event
+                        # until it demonstrably lands — a cheap POST, never a
+                        # probe — and keep the local journal loud.
+                        if not self._identity_block_reported:
+                            self._identity_block_reported = self.sink.emit(
+                                error_event(
+                                    self.config,
+                                    error_class="IdentityDryRun",
+                                    message=(
+                                        "identity dry-run failed for"
+                                        f" {self.config.run_image}: {self.identity_block}"
+                                        " — worker latched: no work until the driver is"
+                                        " restarted after a fix (ADR-0045)"
+                                    ),
+                                )
+                            )
+                        if latched_before:
+                            self.log(
+                                f"identity latched for {self.config.run_image}:"
+                                f" {self.identity_block} — fix, then restart the driver"
+                            )
                     if once:
                         return count
-                    sleep(backoff_delay(self.config.poll_seconds, 0))
+                    sleep(backoff_delay(self.config.poll_seconds, identity_streak))
                     continue
+                identity_streak = 0
             items: list | None = None
             try:
                 items = self.fetch_work()
@@ -149,10 +189,13 @@ class Worker:
         container per driver process, BEFORE any work is taken — the
         identity checks, the CLI floor, and the one-time probe session run
         with the real image and credential, so a broken combination fails
-        loud here in seconds instead of burning claims and Runs. While it
-        fails, the driver fetches no work and retries each pass. The
-        dot-prefixed job dir is invisible to the evidence sweep and to
-        queue-behind; model-less images pass trivially."""
+        loud here in seconds instead of burning claims and Runs. A dry-run
+        VERDICT (the container ran and failed) sets ``identity_block``: the
+        driver fetches no work and never re-spends the probe until it is
+        restarted after a fix. A dry-run that could not execute at all
+        (engine/filesystem breakage) is plausibly transient and is retried
+        with backoff. The dot-prefixed job dir is invisible to the evidence
+        sweep and to queue-behind; model-less images pass trivially."""
         jobs_root = Path(self.config.jobs_dir)
         jobs_root.mkdir(parents=True, exist_ok=True)
         name = f".identity-dryrun-{secrets.token_hex(4)}"
@@ -181,22 +224,22 @@ class Worker:
             finally:
                 session.finish()
         except SessionError as exc:
+            # The dry-run RAN and failed: a deterministic verdict about this
+            # image/credential/policy combination. Latch — run() reports the
+            # reason to the Control Node and no probe is spent again until
+            # the operator restarts the driver after fixing it.
             detail = identity_error_detail(str(exc)) or str(exc)
+            self.identity_block = detail
             self.log(
                 f"identity dry-run FAILED for {self.config.run_image}: {detail}"
-                " — no work will be fetched until it passes"
-            )
-            emit_error(
-                self.sink,
-                self.config,
-                error_class="IdentityDryRun",
-                message=f"identity dry-run failed for {self.config.run_image}: {detail}",
+                " — latched: no work will be fetched until the driver is"
+                " restarted after a fix (ADR-0045)"
             )
             return False
         except Exception as exc:  # container-engine or filesystem breakage
             self.log(
                 f"identity dry-run could not execute ({exc})"
-                " — no work will be fetched until it passes"
+                " — no work will be fetched until it passes; retrying with backoff"
             )
             emit_error(
                 self.sink,

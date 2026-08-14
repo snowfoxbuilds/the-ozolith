@@ -291,6 +291,13 @@ def await_monitored(
                 poll_seconds=poll_seconds,
                 kill_grace_seconds=kill_grace_seconds,
             )
+            # Lines flushed between the last feed and the kill can carry the
+            # detection; an identity verdict outranks the timeout class (it
+            # routes the deterministic-failure lanes, ADR-0045).
+            feed()
+            reason, category = monitor.violation()
+            if reason:
+                return AgentOutcome(), reason, category
             return AgentOutcome(timed_out=True), "", ""
         sleep(poll_seconds)
 
@@ -363,7 +370,8 @@ def _run_identity_dryrun(job: Path, adapter, identity_root: Path, scratch_root: 
     if identity is None:
         # A model-less worker type: nothing declared, nothing to check.
         record.update(dry_run="passed")
-        write_identity(job, record)
+        with contextlib.suppress(OSError):  # the status verdict outranks the record
+            write_identity(job, record)
         write_status(job, Status(phase=PHASE_DONE))
         return 0
     record.update(expected_model=identity.model, expected_effort=identity.effort)
@@ -385,7 +393,8 @@ def _run_identity_dryrun(job: Path, adapter, identity_root: Path, scratch_root: 
         probe_model=report.probe_model,
         probe_effort=report.probe_effort,
     )
-    write_identity(job, record)
+    with contextlib.suppress(OSError):  # the status verdict outranks the record
+        write_identity(job, record)
     if not report.ok:
         write_status(
             job, Status(phase=PHASE_FAILED, error=IDENTITY_ERROR_PREFIX + report.describe())

@@ -84,7 +84,7 @@ def test_materialize_managed_fails_on_a_pre_enforcement_cli(tmp_path, capsys, mo
     )
     assert rc == 2
     err = capsys.readouterr().err
-    assert "predates the model-enforcement settings" in err
+    assert "predates the identity behavior" in err
     assert not (tmp_path / "etc").exists()  # nothing written on failure
 
 

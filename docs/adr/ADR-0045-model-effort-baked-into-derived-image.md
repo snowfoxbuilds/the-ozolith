@@ -80,8 +80,13 @@ The identity is held **by best effort, failing loud on detection**:
   ConfigChange hook are all verified live there), and ONE neutral
   no-tool probe session that must announce and execute the baked model
   and report the baked applied effort. A broken image/credential/policy
-  combination fails loud at setup in seconds — no work is fetched
-  while the dry-run fails; it retries each pass. The dry-run is strict
+  combination fails loud at setup in seconds — a dry-run VERDICT
+  **latches** the driver: no work is fetched and the probe is never
+  re-spent, the reason is reported to the Control Node's error feed
+  (re-sent until it lands), and the operator retries by restarting the
+  driver after the fix. Only a dry-run that could not execute at all
+  (container-engine or filesystem breakage, plausibly transient) is
+  retried, with backoff. The dry-run is strict
   (a probe with no signal is a broken observation channel); the per-Run
   monitor is lenient (gaps recorded). Its dot-prefixed job dir is
   invisible to the evidence sweep and queue-behind.

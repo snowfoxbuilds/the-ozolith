@@ -286,11 +286,12 @@ class ClaudeAdapter:
         return probe.stdout.strip()
 
     def verify_enforceable(self) -> str:
-        """Fail unless the in-image CLI is new enough to ENFORCE the managed
-        config materialize() writes. availableModels/enforceAvailableModels
-        are ignored by CLIs older than MIN_ENFORCING_CLI — the baked identity
-        would look pinned and bind nothing, the one failure mode worse than a
-        failed build."""
+        """Fail unless the in-image CLI is new enough for every behavior the
+        identity machinery relies on (MIN_ENFORCING_CLI): the managed
+        model-default precedence over checkout settings, the per-key managed
+        ``env`` merge, and the Stop/ConfigChange hook payloads. An older CLI
+        would let the baked identity look pinned while binding nothing — the
+        one failure mode worse than a failed build."""
         raw = self._cli_version()
         match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
         if not match:
@@ -301,10 +302,12 @@ class ClaudeAdapter:
         if version < self.MIN_ENFORCING_CLI:
             floor = ".".join(str(part) for part in self.MIN_ENFORCING_CLI)
             raise AgentAdapterError(
-                f"Claude Code {raw} predates the model-enforcement settings"
-                f" (availableModels/enforceAvailableModels, CLI >= {floor}) — it"
-                " would silently ignore the baked restriction; bump the worker"
-                " type's base to a release with a newer CLI (ADR-0045)"
+                f"Claude Code {raw} predates the identity behavior this"
+                " machinery relies on (managed model-default precedence,"
+                " per-key managed env merge, Stop/ConfigChange hook payloads;"
+                f" CLI >= {floor}) — the baked identity would not bind; bump"
+                " the worker type's base to a release with a newer CLI"
+                " (ADR-0045)"
             )
         return raw
 

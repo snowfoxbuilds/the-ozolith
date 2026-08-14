@@ -770,6 +770,37 @@ def test_monitored_harness_timeout_keeps_ordinary_semantics(tmp_path):
     assert jobdir.read_identity(job)["violation"] == ""
 
 
+def test_monitored_harness_timeout_flush_still_detects_drift(tmp_path):
+    # A detection flushed to the transcript only during the timeout kill is
+    # still an identity verdict: the identity class outranks the timeout
+    # class (it routes the deterministic-failure lanes, ADR-0045).
+    root = _bake_root(tmp_path)
+    job, _manifest = make_job(tmp_path, timeout=30.0)
+    clock = ScriptedClock()
+    agent = FakeAgent(clock, term_reaps=False)  # survives SIGTERM, dies to SIGKILL
+    launcher = FakeLauncher(agent)
+    stages = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and len(stages) == 0:
+            stages.append("clean")
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+        if now >= 30.5 and len(stages) == 1:  # lands during the kill grace
+            stages.append("drift")
+            _append_stream(job, _turn_event_line("claude-opus-5"))
+
+    clock.on_tick.append(script)
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert status.error.startswith("identity: ") and "[substituted]" in status.error
+    assert agent.killed_at is not None
+    assert jobdir.read_identity(job)["category"] == "substituted"
+
+
 def test_model_less_image_launches_exactly_as_before(tmp_path):
     job, _manifest = make_job(tmp_path)
     jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
