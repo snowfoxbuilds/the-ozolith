@@ -21,13 +21,13 @@ from __future__ import annotations
 
 import json
 import os
-import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
+from theozolith_control import bearerhttp
 from theozolith_control.origin import OriginError, derive_origin
 from theozolith_control.settings import ControlSettings, load_settings
 
@@ -108,12 +108,9 @@ def _fetch(url: str, path: str, token: str, ca: str | None) -> Any:
         url.rstrip("/") + path,
         headers={"Authorization": f"Bearer {token}", "User-Agent": "theozolith-status"},
     )
-    context = None
-    if url.startswith("https"):
-        context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
     try:
-        with urllib.request.urlopen(request, timeout=15, context=context) as resp:
-            return json.loads(resp.read() or b"{}")
+        _status, raw = bearerhttp.open_bearer(request, ca=ca, timeout=15)
+        return json.loads(raw or b"{}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:200]
         raise Unreachable(url, f"HTTP {exc.code}", detail) from exc
@@ -121,7 +118,7 @@ def _fetch(url: str, path: str, token: str, ca: str | None) -> Any:
         reason = exc.reason
         error_class = type(reason).__name__ if isinstance(reason, Exception) else type(exc).__name__
         raise Unreachable(url, error_class, str(reason)) from exc
-    except (OSError, ValueError) as exc:
+    except (bearerhttp.BearerTransportError, OSError, ValueError) as exc:
         raise Unreachable(url, type(exc).__name__, str(exc)) from exc
 
 

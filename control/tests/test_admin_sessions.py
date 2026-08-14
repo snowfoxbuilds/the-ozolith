@@ -131,7 +131,7 @@ def test_settings_form_renders_control_fields_read_only_and_rejects_writes(contr
 
 
 def test_join_page_mints_and_revokes(control: ControlRig):
-    provision(control.settings.tls_dir, ["127.0.0.1"])
+    provision(control.settings.tls_dir, ["127.0.0.1"], trust_root=control.settings.data_dir)
     _login(control)
     page = control.client.post("/join", data={"ttl_seconds": "3600", "uses": "1"}).text
     assert "ozjoin1:" in page and "curl -fsSL" in page

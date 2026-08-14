@@ -139,6 +139,15 @@ def test_origin_init_enables_the_browser_surface(home, monkeypatch, capsys):
     assert "re-minted" in out
     # CA-trust instructions live here now (moved out of init; ADR-0036).
     assert "OPTIONAL" in out and "security add-trusted-cert" in out
+    # OZ-01: the trust instructions carry the CA's real SHA-256 to verify out
+    # of band, and the openssl command that reproduces it — an unverified
+    # plaintext install is no longer presented as safe.
+    from theozolith_control.tls import ca_fingerprint_sha256
+
+    digest = ca_fingerprint_sha256((home / "secrets" / "tls" / "ca.pem").read_bytes())
+    colon_fp = ":".join(digest[i : i + 2] for i in range(0, len(digest), 2)).upper()
+    assert colon_fp in out
+    assert "openssl x509 -in ca.pem -noout -fingerprint -sha256" in out
 
     assert controltoml.read_browser_origin(home / "configs") == "https://127.0.0.1"
     record = settings.admin_password_path.read_text()

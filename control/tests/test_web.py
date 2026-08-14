@@ -140,6 +140,74 @@ def test_logout_ends_the_session(control: ControlRig):
     assert control.client.get("/", follow_redirects=False).status_code == 303
 
 
+# -- OZ-07: baseline browser security headers ------------------------------------
+
+
+def test_security_headers_present_and_static_stays_cacheable(control: ControlRig):
+    resp = control.client.get("/login")
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    csp = resp.headers["Content-Security-Policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "base-uri 'none'" in csp
+    assert "form-action 'self'" in csp
+    assert "script-src 'self' 'nonce-" in csp  # no 'unsafe-inline' for scripts
+    assert "'unsafe-inline'" not in csp.split("script-src")[1].split(";")[0]
+    assert resp.headers["Cache-Control"] == "no-store"
+
+    # Static assets carry the blanket headers but stay cacheable (no no-store).
+    asset = control.client.get("/static/htmx.min.js")
+    assert asset.status_code == 200
+    assert asset.headers.get("Cache-Control", "") != "no-store"
+
+
+def test_csp_nonce_is_per_response(control: ControlRig):
+    def _nonce() -> str:
+        csp = control.client.get("/login").headers["Content-Security-Policy"]
+        return csp.split("'nonce-")[1].split("'")[0]
+
+    assert _nonce() != _nonce()
+
+
+def test_join_token_page_is_never_cached(control: ControlRig):
+    """The join page renders a live join string — a browser or proxy must not
+    retain it (OZ-07)."""
+    login(control)
+    resp = control.client.get("/join")
+    assert resp.status_code == 200
+    assert resp.headers["Cache-Control"] == "no-store"
+
+
+def test_terminal_inline_script_carries_the_csp_nonce(control: ControlRig):
+    """The terminal's inline bootstrap must carry the per-response CSP nonce,
+    or a production browser blocks it under our nonce-only script-src (OZ-07).
+    Render the REAL ok-branch (a live attach-capable container) and assert the
+    inline <script>'s nonce equals the response's CSP nonce — the wiring that
+    happy-path header tests never exercise."""
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    login(control)
+    control.heartbeat(
+        node="box1",
+        stacks=[{"name": "flightdeck", "kind": "container", "state": "running", "detail": ""}],
+        stack_containers=[
+            {
+                "name": FLIGHTDECK_CONTAINER,
+                "stack": "flightdeck",
+                "state": "running",
+                "status": "Up",
+            }
+        ],
+    )
+    resp = control.client.get(
+        "/terminal", params={"node": "box1", "container": FLIGHTDECK_CONTAINER}
+    )
+    assert resp.status_code == 200
+    assert 'id="terminal"' in resp.text  # the ok-branch actually rendered
+    nonce = resp.headers["Content-Security-Policy"].split("'nonce-")[1].split("'")[0]
+    assert nonce and f'<script nonce="{nonce}">' in resp.text
+
+
 # -- the fleet fragment (acceptances 1 and 4) ------------------------------------
 
 

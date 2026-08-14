@@ -33,6 +33,40 @@ CA_PATH = "/ca.pem"
 ORIGIN_PATH = "/origin"
 CONTROL_URL_PATH = "/control-url"
 
+# The listener shares the Control Node process with the authenticated HTTPS
+# app, so an unauthenticated flood must not exhaust it (OZ-04). A short read
+# timeout kills slowloris-style partial requests, every response closes its
+# connection (no keep-alive thread parking), a bounded pool caps concurrent
+# handler threads, and the accept backlog is small.
+BOOTSTRAP_READ_TIMEOUT = 10.0
+BOOTSTRAP_MAX_WORKERS = 16
+BOOTSTRAP_BACKLOG = 32
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard ceiling on concurrent handler threads:
+    beyond BOOTSTRAP_MAX_WORKERS in flight, a new connection is dropped rather
+    than allowed to spawn another thread and file descriptor."""
+
+    daemon_threads = True
+    request_queue_size = BOOTSTRAP_BACKLOG
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(BOOTSTRAP_MAX_WORKERS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)  # at capacity: drop, do not spawn
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
 
 def detect_host_ip() -> str:
     """The host's outbound IPv4 address — what init puts in the server-cert
@@ -60,25 +94,28 @@ class BootstrapServer:
         class Handler(BaseHTTPRequestHandler):
             server_version = "theozolith-bootstrap"
             protocol_version = "HTTP/1.1"
+            # A partial/slow request holds a pool slot and an fd; time it out.
+            timeout = BOOTSTRAP_READ_TIMEOUT
+
+            def _emit(self, status: int, body: bytes, content_type: str, send_body: bool) -> None:
+                # Every response closes its connection: no keep-alive means no
+                # idle client can park a handler thread (OZ-04).
+                self.close_connection = True
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(body)
 
             def _answer(self, *, send_body: bool) -> None:
                 entry = routes.get(self.path)
                 if entry is None:
-                    body = b"not found\n"
-                    self.send_response(404)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    if send_body:
-                        self.wfile.write(body)
+                    self._emit(404, b"not found\n", "text/plain; charset=utf-8", send_body)
                     return
                 body, content_type = entry
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                if send_body:
-                    self.wfile.write(body)
+                self._emit(200, body, content_type, send_body)
 
             def do_GET(self):
                 self._answer(send_body=True)
@@ -92,17 +129,12 @@ class BootstrapServer:
                 if code == 501:
                     code = 405
                 body = b"method not allowed\n" if code == 405 else b"not found\n"
-                self.send_response(code)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._emit(code, body, "text/plain; charset=utf-8", send_body=True)
 
             def log_message(self, format, *args):
                 pass  # three public values need no access log
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
-        self._server.daemon_threads = True
+        self._server = _BoundedThreadingHTTPServer((host, port), Handler)
         self._thread: threading.Thread | None = None
 
     @property

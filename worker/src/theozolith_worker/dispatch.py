@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
-from theozolith_worker.events import control_request, ssl_context_for
+from theozolith_worker.events import BearerTransportError, control_request, open_bearer
 
 # Unreachable-Control-Node backoff cap (ADR-0015 revision): driver polling
 # doubles its delay per consecutive failure up to this, then snaps back to
@@ -90,10 +90,9 @@ class DispatchClient:
 
     def _post(self, body: dict[str, Any]) -> dict[str, Any] | None:
         request = control_request(self._url, self._token, body)
-        context = ssl_context_for(self._url, self._ca)
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout, context=context) as resp:
-                answer = json.loads(resp.read() or b"{}")
+            _status, raw = open_bearer(request, ca=self._ca, timeout=self._timeout)
+            answer = json.loads(raw or b"{}")
         except urllib.error.HTTPError as exc:
             self.last_unreachable = False  # it answered; it refused
             detail = exc.read().decode(errors="replace")[:200]
@@ -102,6 +101,13 @@ class DispatchClient:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             self.last_unreachable = True
             self._error("control-unreachable", f"control node unreachable; dispatch paused ({exc})")
+            return None
+        except BearerTransportError as exc:
+            # A misconfigured CONTROL_NODE_URL (e.g. off-box http): pause
+            # rather than hand the node token over. Not transient, but the
+            # driver pausing + surfacing beats crashing or leaking.
+            self.last_unreachable = True
+            self._error("control-url-refused", f"dispatch paused: {exc}")
             return None
         self.last_unreachable = False
         return answer if isinstance(answer, dict) else None

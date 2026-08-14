@@ -100,7 +100,9 @@ class LiveControl:
 
     def __init__(self, tmp_path: Path):
         self.tls_dir = tmp_path / "data" / "secrets" / "tls"
-        self.ca_path, cert, key = tls.provision(self.tls_dir, ["127.0.0.1"])
+        self.ca_path, cert, key = tls.provision(
+            self.tls_dir, ["127.0.0.1"], trust_root=tmp_path / "data"
+        )
         settings = ControlSettings(
             data_dir=tmp_path / "data",
             config_repo=tmp_path / "configs",
@@ -312,7 +314,7 @@ def test_fingerprint_mismatch_aborts_with_zero_bytes_to_the_target(tmp_path):
     aborts BEFORE any transmission — the instrumented control channel sees
     no connection, no byte, and nothing is persisted."""
     trap = TrapListener()
-    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"])
+    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"], trust_root=tmp_path)
     bootstrap = BootstrapServer(
         ca_pem=evil_ca.read_bytes(),  # NOT the CA the join string pins
         origin="",
@@ -346,8 +348,8 @@ def test_appended_ca_bundle_is_refused_before_fingerprinting(tmp_path):
     riding behind it) is refused before fingerprinting — zero bytes
     transmitted, nothing persisted."""
     trap = TrapListener()
-    real_ca, _, _ = tls.provision(tmp_path / "real-tls", ["127.0.0.1"])
-    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"])
+    real_ca, _, _ = tls.provision(tmp_path / "real-tls", ["127.0.0.1"], trust_root=tmp_path)
+    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"], trust_root=tmp_path)
     bootstrap = BootstrapServer(
         ca_pem=real_ca.read_bytes() + evil_ca.read_bytes(),
         origin="",
@@ -380,7 +382,7 @@ def test_pem_canonicalization_keeps_only_the_verified_certificate(tmp_path):
     round-trip re-encodes exactly the fingerprinted DER, byte-identical to
     control's cryptography PEM output (the happy path pins the same via
     its persisted-ca equality)."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
     der = provisioning.pem_to_der(b"# preamble\n" + pem + b"trailing noise\n")
     assert provisioning.der_to_pem(der) == pem
@@ -398,7 +400,7 @@ def test_non_https_control_url_is_never_persisted(tmp_path):
     TOTAL: input that makes urlsplit itself raise ValueError (unmatched
     IPv6 brackets, NFKC-invalid netlocs) dies through the same
     ProvisionError, never as a leaked ValueError."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fail_post(url, body, ca):
@@ -442,7 +444,7 @@ def test_non_https_exchange_answer_is_never_persisted(tmp_path):
     answer whose control URL is not exactly https is refused before
     anything is persisted locally — and the error owns up that the
     exchange itself already ran (the join token is spent)."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fake_get(url):
@@ -478,7 +480,7 @@ def test_malformed_exchange_answer_url_is_provisionerror_never_valueerror(tmp_pa
     documented ProvisionError — whose message owns up that the exchange
     already ran and the join token is spent — never a leaked ValueError,
     and never persisted state."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fake_get(url):
@@ -600,7 +602,9 @@ def _redirector(location: str) -> type[_Quiet]:
 
 def _tls_server(tmp_path: Path, handler: type[_Quiet]):
     """`handler` on a real TLS socket under the repository's test CA."""
-    ca_path, cert, key = tls.provision(tmp_path / "redirect-tls", ["127.0.0.1"])
+    ca_path, cert, key = tls.provision(
+        tmp_path / "redirect-tls", ["127.0.0.1"], trust_root=tmp_path
+    )
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
@@ -722,6 +726,79 @@ def test_same_origin_https_redirect_still_works_and_loops_are_bounded(tmp_path):
             client.emit_event({"kind": "probe"})
     finally:
         _stop_server(server, thread)
+
+
+# -- OZ-02: privileged state writes are symlink-safe and perms-tightening --------
+
+
+def test_persist_refuses_a_planted_symlink_and_spares_its_target(tmp_path):
+    """A compromised service account owns the state dir, so it can pre-plant
+    a symlink where a credential file will land. The root-run reprovision must
+    refuse it loudly and leave the symlink's external target untouched — never
+    follow-and-truncate an arbitrary file (OZ-02)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "outside-secret"
+    target.write_text("do-not-clobber\n")
+    (state / provisioning.NODE_TOKEN_FILE).symlink_to(target)
+
+    with pytest.raises(ProvisionError, match="not a regular file"):
+        provisioning._persist(
+            state,
+            {
+                provisioning.CA_FILE: "ca",
+                provisioning.CONTROL_URL_FILE: "https://c.test",
+                provisioning.NODE_NAME_FILE: "n",
+                provisioning.NODE_TOKEN_FILE: "tok",
+            },
+        )
+    assert target.read_text() == "do-not-clobber\n"  # the external file is intact
+
+
+def test_persist_rewrite_tightens_loose_permissions(tmp_path):
+    """A rewrite over a pre-existing 0644 token no longer keeps the loose
+    mode: the atomic replace lands a fresh 0600 file regardless of what was
+    there (the old O_TRUNC path left the wider mode in place — issue #46)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    token = state / provisioning.NODE_TOKEN_FILE
+    token.write_text("stale\n")
+    token.chmod(0o644)
+
+    provisioning._persist(
+        state,
+        {
+            provisioning.CA_FILE: "ca",
+            provisioning.CONTROL_URL_FILE: "https://c.test",
+            provisioning.NODE_NAME_FILE: "n",
+            provisioning.NODE_TOKEN_FILE: "fresh",
+        },
+    )
+    assert token.read_text() == "fresh\n"
+    assert token.stat().st_mode & 0o777 == 0o600
+    assert not token.is_symlink()
+
+
+def test_planted_symlink_survives_a_real_provision_exchange(tmp_path):
+    """The refusal holds through the FULL provision() flow — a real join
+    exchange against a live Control Node, not just _persist in isolation
+    (OZ-02). The external target is spared; the token symlink is never
+    replaced. The exchange did run (its token is spent), so recovery is a
+    fresh join string — the documented reprovision path, not a silent
+    arbitrary-file overwrite."""
+    state = tmp_path / "state"
+    state.mkdir()
+    victim = tmp_path / "outside-secret"
+    victim.write_text("SENSITIVE-UNTOUCHED\n")
+    (state / provisioning.NODE_TOKEN_FILE).symlink_to(victim)
+
+    with LiveControl(tmp_path) as live:
+        join = live.join_string()
+        with pytest.raises(ProvisionError, match="not a regular file"):
+            provisioning.provision(join, state_dir=state, node_name="victim", enable_systemd=False)
+
+    assert victim.read_text() == "SENSITIVE-UNTOUCHED\n"  # the external file is intact
+    assert (state / provisioning.NODE_TOKEN_FILE).is_symlink()  # never replaced by our write
 
 
 # -- acceptance 14: the node distribution stays stdlib-only ----------------------

@@ -21,6 +21,7 @@ sessions are capped; a refused session launches no process.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from pathlib import Path
 
@@ -146,6 +147,35 @@ def mount_web(
     )
     app.state.browser_guard = guard  # tests assert the derived expectations
 
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next):
+        """Baseline browser hardening (OZ-07): anti-framing/clickjacking, no
+        MIME sniffing, no referrer leakage, and a CSP that keeps scripts to
+        our own static files plus one per-response nonce (the terminal's
+        inline bootstrap) — no 'unsafe-inline' for scripts. Sensitive
+        responses (everything but cacheable /static assets) are no-store, so a
+        browser or proxy never retains an authenticated page or a join token
+        after logout. Values are set with setdefault so a handler that already
+        chose one (a 429's Retry-After, say) wins."""
+        nonce = secrets.token_urlsafe(16)
+        request.state.csp_nonce = nonce
+        response = await call_next(request)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            f"script-src 'self' 'nonce-{nonce}'; "
+            "style-src 'self' 'unsafe-inline'; "  # xterm injects styles at runtime
+            "img-src 'self' data:; "
+            "connect-src 'self'; "  # htmx + the same-origin terminal websocket
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        )
+        if not request.url.path.startswith("/static"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
     cached_config: list = [0.0, None]  # [expires_at, DeployConfig]
 
     def _config():
@@ -157,7 +187,13 @@ def mount_web(
 
     def _page(request: Request, name: str, context: dict) -> HTMLResponse:
         return templates.TemplateResponse(
-            request, name, {"poll_seconds": FRAGMENT_POLL_SECONDS, **context}
+            request,
+            name,
+            {
+                "poll_seconds": FRAGMENT_POLL_SECONDS,
+                "csp_nonce": getattr(request.state, "csp_nonce", ""),
+                **context,
+            },
         )
 
     def _login_redirect() -> RedirectResponse:
