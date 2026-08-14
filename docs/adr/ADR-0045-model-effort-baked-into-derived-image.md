@@ -104,6 +104,84 @@ model-selection env vars) is untouched. The runtime gate costs a few
 hundred tokens per Run (canary + probe); model-less images skip it
 entirely.
 
+### Amendment (2026-08-14): the gate runs behind a real boundary
+
+The 2026-08-13 gate had holes an adversary (a substituted model, a
+booby-trapped checkout) could walk through: the gated probe turn ran in
+the task checkout with full tools and `--dangerously-skip-permissions`
+(only a prompt asked it not to use them), the effort proof required a
+tool execution in that same environment, project hooks/CLAUDE.md loaded
+before any verification, the task file sat readable on disk throughout,
+a swallowed `BrokenPipe` during release could yield a "completed" Run
+that never saw its task, and the identity-key scan missed
+`modelOverrides` and provider-endpoint redirects. This amendment closes
+them:
+
+- **Pre-verification boundary.** The harness removes `input/prompt.md`
+  from disk (held in memory) before any verification subprocess exists,
+  and every verification session — widen canary, a new **same-family
+  canary** for full-ID pins (family-granular enforcement would pass a
+  different-family canary and still run the wrong model; aliases skip
+  it), and a **neutral identity probe** — runs in a scratch directory
+  outside the job mount with `--tools ""`, `--permission-mode dontAsk`,
+  `--setting-sources ""` (managed policy always applies — it is what is
+  under test), and `--strict-mcp-config`. The applied effort is read
+  from the **`Stop` hook payload**, which reports the post-clamp value
+  after a plain no-tool turn (verified live), so no tool ever executes
+  for the effort proof. A **process-environment audit** fails the Run
+  on any identity or provider-endpoint variable (`ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`, `ANTHROPIC_DEFAULT_*_MODEL`, …) —
+  behind a foreign endpoint the stream is unfalsifiable. The identity
+  key scan adds `modelOverrides` (it remaps what *serves* a model ID
+  while the allowlist sees the Anthropic ID).
+- **Fresh server policy.** `materialize` now writes
+  `forceRemoteSettingsRefresh: true` (documented: block startup until
+  server-managed settings are freshly fetched, exit on failure), so
+  canaries, probe, and task all start on fresh organization policy;
+  the scan type-validates it and rejects any non-`true` value anywhere
+  in the managed tier, and the preflight fails `identity-inconsistent`
+  on images that predate the key (rebuild required). The
+  refusal-on-fetch-failure half rests on documented behavior — it
+  cannot be isolated locally, but a dead settings endpoint also kills
+  the model endpoint, which fails closed regardless (no executed turn,
+  no release; verified by hand).
+- **The task session exists only after the proof**, so project hooks,
+  CLAUDE.md, settings, skills, and MCP load strictly post-gate. It is
+  still stdin-gated on its own announced + executed identity, and its
+  tools are structurally denied by a `--settings` PreToolUse hook until
+  the harness writes a release marker — the denial binds under
+  `--dangerously-skip-permissions` (verified live). A `ConfigChange`
+  hook records identity-relevant mid-session settings changes (never
+  blocking them — organization policy is never resisted) and the guard
+  kills on any record; the `Stop` capture monitors effort drift.
+  Capture files are same-user state and therefore a fail-closed channel
+  only; the release decision itself rides on CLI-authored transcript
+  events plus the neutral preflight.
+- **Atomic, observable release.** Release = open the tool gate, write
+  the task file back, deliver the pointer, close stdin — in that order;
+  `released` is recorded only after delivery succeeds, a broken pipe is
+  `task-delivery`, a failing close is `stdin-close`, and probe/task
+  turns are counted separately: any exit (even 0) with no post-release
+  task turn fails as `task-unprocessed`. New categories:
+  `config-changed`, `task-delivery`, `stdin-close`, `task-unprocessed`;
+  `GuardDecision` carries the category end to end (identity.json,
+  status, evidence).
+- **CLI floor 2.1.232** (was 2.1.223): the gate now also relies on the
+  Stop-payload effort field, the ConfigChange hook, the isolation
+  flags, dontAsk, the PreToolUse-under-skip-permissions denial, and the
+  freshness key — all verified live on 2.1.232; an older CLI ignoring
+  the freshness key would silently void a guarantee, so the floor turns
+  that into `cli-too-old`.
+
+What a passing gate does NOT prove, stated plainly: the canaries do not
+prove the absence of conditional fallback or of server-side overrides
+that trigger only later (the in-session monitor is the answer there),
+and post-release capture-file monitoring is best-effort against checkout
+code that tampers with same-user files (the pre-release proof and the
+transcript-based kill remain intact). Wire, hashes, and the credential
+contract remain unchanged; derived images must be rebuilt once so their
+artifact carries the freshness key.
+
 ## Consequences
 - **Positive**: the image is bound to the worker definition — for
   benchmarking, candidate identity ≈ image identity; selecting an

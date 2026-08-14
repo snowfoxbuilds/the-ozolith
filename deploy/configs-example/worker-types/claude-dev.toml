@@ -25,12 +25,16 @@ adapter = "claude"               # the Agent adapter the harness invokes
 # with the model: a level this model silently clamps or ignores (e.g.
 # xhigh on the 4.6 generation, anything on haiku) refuses to load, as does
 # any effort on a model whose capability the adapter does not positively
-# know. Enforcement fails closed end to end (ADR-0045 amendment): the
+# know. Enforcement fails closed end to end (ADR-0045 amendments): the
 # build rejects conflicting managed settings/drop-ins/policyHelper in the
-# base image, and at runtime the harness proves the effective identity
-# with the Run's own credential BEFORE the task prompt is sent — a
+# base image and bakes forceRemoteSettingsRefresh (fresh org policy at
+# every session start), and at runtime the harness proves the effective
+# identity with the Run's own credential behind a real boundary — the
+# task file leaves the disk, canaries and a no-tool probe run in a
+# neutral scratch with tools and project sources removed, and the task
+# session (tools denied until release) starts only after the proof — a
 # substituted, widened, clamped, or unverifiable identity fails the Run
-# as failure_class "identity" (see deploy/README.md).
+# as failure_class "identity" with a stable category (deploy/README.md).
 # effort = "high"
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works
