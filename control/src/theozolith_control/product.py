@@ -27,7 +27,6 @@ import json
 import os
 import re
 import shutil
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -36,6 +35,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from theozolith_control import bearerhttp
 from theozolith_control.controltoml import COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME
 
 # The components one product version covers (ADR-0013 §8: one versioned
@@ -315,12 +315,8 @@ def _upload_artifact(url: str, token: str, ca: str | None, version: str, path: P
             "User-Agent": "theozolith-cli",
         },
     )
-    context = None
-    if url.startswith("https"):
-        context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
     try:
-        with urllib.request.urlopen(request, timeout=120, context=context) as resp:
-            resp.read()
+        bearerhttp.open_bearer(request, ca=ca, timeout=120)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
         raise SystemExit(
@@ -328,6 +324,8 @@ def _upload_artifact(url: str, token: str, ca: str | None, version: str, path: P
         ) from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"error: cannot reach {url}: {exc.reason}") from exc
+    except bearerhttp.BearerTransportError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def _cmd_update(args) -> int:
@@ -397,6 +395,14 @@ def _cmd_join_token(args) -> int:
         _log(f"  {answer.get('provision_command')}")
         _log("fresh box — installer over GitHub HTTPS, then provision:")
         _log(f"  {answer.get('install_command')}")
+        digest = str(answer.get("ca_sha256") or "")
+        if digest:
+            colon_fp = ":".join(digest[i : i + 2] for i in range(0, len(digest), 2)).upper()
+            _log("")
+            _log(f"CA SHA-256:        {colon_fp}")
+            _log("  (the fingerprint this deployment's nodes pin — use it to verify a")
+            _log("  browser ca.pem before trusting it: openssl x509 -in ca.pem -noout")
+            _log("  -fingerprint -sha256)")
         return 0
     if args.join_cmd == "revoke":
         answer = _call(url, f"/api/v1/join-tokens/{args.id}", token=token, method="DELETE", ca=ca)

@@ -724,6 +724,57 @@ def test_same_origin_https_redirect_still_works_and_loops_are_bounded(tmp_path):
         _stop_server(server, thread)
 
 
+# -- OZ-02: privileged state writes are symlink-safe and perms-tightening --------
+
+
+def test_persist_refuses_a_planted_symlink_and_spares_its_target(tmp_path):
+    """A compromised service account owns the state dir, so it can pre-plant
+    a symlink where a credential file will land. The root-run reprovision must
+    refuse it loudly and leave the symlink's external target untouched — never
+    follow-and-truncate an arbitrary file (OZ-02)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "outside-secret"
+    target.write_text("do-not-clobber\n")
+    (state / provisioning.NODE_TOKEN_FILE).symlink_to(target)
+
+    with pytest.raises(ProvisionError, match="not a regular file"):
+        provisioning._persist(
+            state,
+            {
+                provisioning.CA_FILE: "ca",
+                provisioning.CONTROL_URL_FILE: "https://c.test",
+                provisioning.NODE_NAME_FILE: "n",
+                provisioning.NODE_TOKEN_FILE: "tok",
+            },
+        )
+    assert target.read_text() == "do-not-clobber\n"  # the external file is intact
+
+
+def test_persist_rewrite_tightens_loose_permissions(tmp_path):
+    """A rewrite over a pre-existing 0644 token no longer keeps the loose
+    mode: the atomic replace lands a fresh 0600 file regardless of what was
+    there (the old O_TRUNC path left the wider mode in place — issue #46)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    token = state / provisioning.NODE_TOKEN_FILE
+    token.write_text("stale\n")
+    token.chmod(0o644)
+
+    provisioning._persist(
+        state,
+        {
+            provisioning.CA_FILE: "ca",
+            provisioning.CONTROL_URL_FILE: "https://c.test",
+            provisioning.NODE_NAME_FILE: "n",
+            provisioning.NODE_TOKEN_FILE: "fresh",
+        },
+    )
+    assert token.read_text() == "fresh\n"
+    assert token.stat().st_mode & 0o777 == 0o600
+    assert not token.is_symlink()
+
+
 # -- acceptance 14: the node distribution stays stdlib-only ----------------------
 
 

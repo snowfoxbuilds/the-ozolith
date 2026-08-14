@@ -14,11 +14,13 @@ events; the pipeline itself never does.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
@@ -56,12 +58,13 @@ class EventSink(Protocol):
         ...
 
 
-def ssl_context_for(url: str, ca: str | None) -> ssl.SSLContext | None:
-    """The TLS context for a Control Node URL (shared by every stdlib
-    client on the channel: sink, dispatch)."""
-    if not url.startswith("https"):
-        return None
-    return ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_REDIRECT_LIMIT = 5
+
+
+class BearerTransportError(RuntimeError):
+    """The target or a redirect would put the worker's node token on a
+    plaintext non-loopback wire or across a cross-origin/downgrade hop."""
 
 
 def control_request(url: str, token: str, payload: dict[str, Any]) -> urllib.request.Request:
@@ -76,6 +79,100 @@ def control_request(url: str, token: str, payload: dict[str, Any]) -> urllib.req
             **({"Authorization": f"Bearer {token}"} if token else {}),
         },
     )
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """(scheme, host, effective port) of an exactly-parsed http(s) URL, or
+    None — a total parse (a urlsplit ValueError becomes None, never a leak)
+    and never a prefix check, so ``httpsevil`` cannot pass for https."""
+    try:
+        split = urllib.parse.urlsplit(url)
+        hostname = split.hostname
+        port = split.port
+    except ValueError:
+        return None
+    if split.scheme not in ("https", "http") or not hostname or port == 0:
+        return None
+    if port is None:
+        port = 443 if split.scheme == "https" else 80
+    return split.scheme, hostname, port
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface every 3xx as an HTTPError; the loop in open_bearer owns the
+    same-origin gate before any redirect carries the node token."""
+
+    def _decline(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_302 = http_error_303 = _decline
+    http_error_307 = http_error_308 = _decline
+
+
+def open_bearer(
+    request: urllib.request.Request, *, ca: str | None, timeout: float
+) -> tuple[int, bytes]:
+    """Issue one bearer request under the https-or-loopback floor, following
+    only same-origin redirects (bounded). Returns ``(status, body)``.
+
+    Mirrors, stdlib-only, ``ControlClient``'s transport and the control-side
+    ``bearerhttp`` (kept in step by parallel invariant tests, not a shared
+    import — the components install independently). The node token rides the
+    Authorization header on every call, so a non-loopback http target or any
+    cross-origin/downgrade redirect is refused rather than handed the token —
+    including a Stack-authored ``CONTROL_NODE_URL`` pointing off-box.
+    Re-raises HTTPError/URLError like urlopen; a policy refusal is
+    ``BearerTransportError``."""
+    origin = _origin(request.full_url)
+    if origin is None:
+        raise BearerTransportError(f"refusing bearer request to {request.full_url!r}: not http(s)")
+    if origin[0] != "https" and not _is_loopback(origin[1]):
+        raise BearerTransportError(
+            f"refusing bearer request to {request.full_url!r}: the node token must ride"
+            " https (plain http is allowed only to a loopback address)"
+        )
+    context = None
+    if origin[0] == "https":
+        context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+    handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    opener = urllib.request.build_opener(*handlers)
+
+    method, body = request.get_method(), request.data
+    headers = dict(request.header_items())
+    target = request.full_url
+    for _ in range(_REDIRECT_LIMIT):
+        req = urllib.request.Request(target, data=body, method=method, headers=headers)
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _REDIRECT_STATUSES:
+                raise
+            location = exc.headers.get("Location")
+            exc.close()
+            try:
+                target = urllib.parse.urljoin(target, location) if location else ""
+            except ValueError:
+                raise BearerTransportError(
+                    f"refusing redirect: malformed Location {location!r}"
+                ) from None
+            if _origin(target) != origin:
+                raise BearerTransportError(
+                    f"refusing redirect to {target!r}: it leaves the node-token origin"
+                    " (cross-origin or downgrade would hand the token to someone else)"
+                ) from None
+    raise BearerTransportError(f"{method} {request.full_url}: too many redirects")
 
 
 class ControlNodeSink:
@@ -98,11 +195,15 @@ class ControlNodeSink:
 
     def emit(self, event: dict[str, Any]) -> bool:
         request = control_request(self._url, self._token, event)
-        context = ssl_context_for(self._url, self._ca)
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout, context=context) as resp:
-                resp.read()
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            open_bearer(request, ca=self._ca, timeout=self._timeout)
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            BearerTransportError,
+        ) as exc:
             if self._log:
                 self._log(f"event emission skipped ({event.get('type')}): {exc}")
             return False

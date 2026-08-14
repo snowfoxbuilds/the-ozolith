@@ -124,3 +124,36 @@ def test_wildcard_hosts_are_refused(tmp_path):
     will never mint a shareable wildcard key."""
     with pytest.raises(ValueError, match="wildcard"):
         provision(tmp_path / "tls", ["*.theozolith.com"])
+
+
+def test_write_refuses_a_planted_symlink_and_spares_its_target(tmp_path: Path):
+    """A key writer that owns the secrets partition could pre-plant a symlink
+    where ca.key/server.key lands; the root-run mint must refuse it and leave
+    the external target untouched, never follow-and-truncate it (OZ-02)."""
+    from theozolith_control.tls import _write
+
+    tls_dir = tmp_path / "tls"
+    tls_dir.mkdir()
+    target = tmp_path / "outside-key"
+    target.write_bytes(b"do-not-clobber\n")
+    (tls_dir / "server.key").symlink_to(target)
+
+    with pytest.raises(OSError, match="not a regular file"):
+        _write(tls_dir / "server.key", b"fresh-key", private=True)
+    assert target.read_bytes() == b"do-not-clobber\n"
+
+
+def test_write_rewrite_tightens_loose_permissions(tmp_path: Path):
+    """Re-minting over a pre-existing 0644 key lands a fresh 0600 file — the
+    old O_TRUNC path kept the wider mode (issue #46)."""
+    from theozolith_control.tls import _write
+
+    tls_dir = tmp_path / "tls"
+    tls_dir.mkdir()
+    key = tls_dir / "server.key"
+    key.write_bytes(b"stale")
+    key.chmod(0o644)
+
+    _write(key, b"fresh-key", private=True)
+    assert key.read_bytes() == b"fresh-key"
+    assert key.stat().st_mode & 0o777 == 0o600

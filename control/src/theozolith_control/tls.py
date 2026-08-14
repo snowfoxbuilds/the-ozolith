@@ -9,10 +9,12 @@ binary needed — the ``cryptography`` package is already a control/ dependency.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import ipaddress
 import os
+import tempfile
 from pathlib import Path
 
 from cryptography import x509
@@ -29,11 +31,32 @@ _VALID_DAYS = 3650  # home-lab CA: rotation story is re-running tls-init
 
 
 def _write(path: Path, data: bytes, *, private: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(path, flags, 0o600 if private else 0o644)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
+    """Write one TLS artifact atomically and symlink-safely.
+
+    mkstemp makes a fresh regular file, its mode is set on the fd, and
+    ``os.replace`` swaps it onto ``path`` — a symlink pre-planted at the
+    destination is *replaced*, never written through, so a compromised
+    service account that owns the secrets partition cannot steer a root-run
+    ``tls-init``/re-mint onto an arbitrary file (OZ-02). There is no
+    path-based ``open`` of the destination and no ``O_TRUNC`` through a
+    symlink. Ownership is left to the caller's partition repair, matching
+    the previous behaviour."""
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise OSError(f"refusing to write {path}: destination is not a regular file")
+    fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(fd, 0o600 if private else 0o644)
+            handle.write(data)
+            handle.flush()
+            os.fsync(fd)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _pem_key(key: ec.EllipticCurvePrivateKey) -> bytes:

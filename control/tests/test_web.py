@@ -140,6 +140,45 @@ def test_logout_ends_the_session(control: ControlRig):
     assert control.client.get("/", follow_redirects=False).status_code == 303
 
 
+# -- OZ-07: baseline browser security headers ------------------------------------
+
+
+def test_security_headers_present_and_static_stays_cacheable(control: ControlRig):
+    resp = control.client.get("/login")
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    csp = resp.headers["Content-Security-Policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "base-uri 'none'" in csp
+    assert "form-action 'self'" in csp
+    assert "script-src 'self' 'nonce-" in csp  # no 'unsafe-inline' for scripts
+    assert "'unsafe-inline'" not in csp.split("script-src")[1].split(";")[0]
+    assert resp.headers["Cache-Control"] == "no-store"
+
+    # Static assets carry the blanket headers but stay cacheable (no no-store).
+    asset = control.client.get("/static/htmx.min.js")
+    assert asset.status_code == 200
+    assert asset.headers.get("Cache-Control", "") != "no-store"
+
+
+def test_csp_nonce_is_per_response(control: ControlRig):
+    def _nonce() -> str:
+        csp = control.client.get("/login").headers["Content-Security-Policy"]
+        return csp.split("'nonce-")[1].split("'")[0]
+
+    assert _nonce() != _nonce()
+
+
+def test_join_token_page_is_never_cached(control: ControlRig):
+    """The join page renders a live join string — a browser or proxy must not
+    retain it (OZ-07)."""
+    login(control)
+    resp = control.client.get("/join")
+    assert resp.status_code == 200
+    assert resp.headers["Cache-Control"] == "no-store"
+
+
 # -- the fleet fragment (acceptances 1 and 4) ------------------------------------
 
 

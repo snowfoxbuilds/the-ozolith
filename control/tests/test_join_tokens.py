@@ -56,6 +56,20 @@ def test_join_token_create_answers_the_complete_paste(control: ControlRig):
     assert "| sudo bash -s -- 'ozjoin1:" in minted["install_command"]
 
 
+def test_join_token_create_surfaces_the_ca_fingerprint(control: ControlRig):
+    """The mint answer carries the CA's SHA-256 (OZ-01): the operator gets one
+    trusted print to verify a browser-downloaded ca.pem against. It equals the
+    deployment CA's fingerprint and the digest pinned inside the join string."""
+    from theozolith_control.tls import CA_FILE, ca_fingerprint_sha256
+
+    control = _with_ca(control)
+    minted = _mint(control)
+    expected = ca_fingerprint_sha256((control.settings.tls_dir / CA_FILE).read_bytes())
+    assert minted["ca_sha256"] == expected
+    # ...and it is the very digest carried in the opaque join string.
+    assert _payload_of(minted["join_string"])[4 : 4 + 32].hex() == expected
+
+
 def test_join_token_create_requires_a_ca(control: ControlRig):
     refused = control.admin("POST", "/api/v1/join-tokens", {})
     assert refused.status_code == 409 and "init" in refused.json()["detail"]

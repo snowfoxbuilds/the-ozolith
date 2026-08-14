@@ -18,6 +18,11 @@ ExecStart=/usr/local/bin/theozolith serve --port 443
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
+# OS backstop for the unauthenticated bootstrap listener (OZ-04): the
+# in-process pool already caps handler threads, but a thread/fd ceiling
+# keeps any flood from starving the box even if that cap regresses.
+TasksMax=256
+LimitNOFILE=4096
 Restart=on-failure
 RestartSec=5
 

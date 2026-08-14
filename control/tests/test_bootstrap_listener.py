@@ -57,6 +57,23 @@ def test_non_get_methods_are_refused(listener):
         assert resp.status == 200 and resp.read() == b""
 
 
+def test_every_response_closes_its_connection(listener):
+    """No keep-alive on the unauthenticated listener (OZ-04): an idle client
+    cannot park a handler thread, since every response says Connection: close
+    — on the served value, the 404, and the 405 alike."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{listener.port}/ca.pem") as resp:
+        assert resp.headers.get("Connection", "").lower() == "close"
+    with pytest.raises(urllib.error.HTTPError) as missing:
+        urllib.request.urlopen(f"http://127.0.0.1:{listener.port}/nope")
+    assert missing.value.headers.get("Connection", "").lower() == "close"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{listener.port}/ca.pem", data=b"x", method="POST"
+    )
+    with pytest.raises(urllib.error.HTTPError) as refused:
+        urllib.request.urlopen(request)
+    assert refused.value.headers.get("Connection", "").lower() == "close"
+
+
 def test_detect_host_ip_answers_a_dialable_address():
     ip = detect_host_ip()
     assert ip.count(".") == 3 and all(part.isdigit() for part in ip.split("."))

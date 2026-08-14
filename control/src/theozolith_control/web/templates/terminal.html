@@ -12,7 +12,7 @@ log; in-session keystrokes land in the Run's evidence transcript).</p>
 <div id="terminal"></div>
 <script src="/static/xterm.js"></script>
 <script src="/static/xterm-addon-fit.js"></script>
-<script>
+<script nonce="{{ csp_nonce }}">
   (function () {
     var term = new Terminal({ fontSize: 14, cursorBlink: true, scrollback: 5000 });
     var fit = new FitAddon.FitAddon();

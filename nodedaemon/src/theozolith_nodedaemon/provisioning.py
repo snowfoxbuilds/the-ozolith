@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import os
@@ -60,6 +61,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -388,21 +390,44 @@ def provision(
 
 def _persist(state_dir: Path, files: dict[str, str]) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
+    # The installer runs provision as root before the unit ever starts: hand
+    # each file to whoever owns the state dir (the service user). The chown
+    # rides the temp fd (fchown), never a path, and its result is surfaced —
+    # a file the service user cannot read is a provisioning failure, not a
+    # silence to swallow.
+    stat = state_dir.stat()
+    owner = (stat.st_uid, stat.st_gid) if os.geteuid() == 0 and stat.st_uid != 0 else None
     for name, content in files.items():
-        path = state_dir / name
-        private = name == NODE_TOKEN_FILE
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content.rstrip("\n") + "\n")
+        _persist_one(state_dir / name, content, private=name == NODE_TOKEN_FILE, owner=owner)
+
+
+def _persist_one(
+    path: Path, content: str, *, private: bool, owner: tuple[int, int] | None
+) -> None:
+    """Write one state file atomically and symlink-safely.
+
+    mkstemp creates a fresh regular file (no destination symlink to follow),
+    ``fchmod``/``fchown`` set mode and owner on the fd, then ``os.replace``
+    swaps it in — a symlink pre-planted at ``path`` is *replaced*, never
+    written through, so a compromised service account that owns the state dir
+    cannot steer a root-run reprovision onto an arbitrary file (OZ-02). A
+    non-regular destination is refused loudly as a tamper signal."""
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ProvisionError(f"refusing to write {path}: destination is not a regular file")
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
-        # The installer runs provision as root before the unit ever starts:
-        # hand the files to whoever owns the state dir (the service user).
-        stat = state_dir.stat()
-        if os.getuid() == 0 and stat.st_uid != 0:
-            for name in files:
-                os.chown(state_dir / name, stat.st_uid, stat.st_gid)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(fd, 0o600 if private else 0o644)
+            if owner is not None:
+                os.fchown(fd, owner[0], owner[1])
+            handle.write(content.rstrip("\n") + "\n")
+            handle.flush()
+            os.fsync(fd)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:

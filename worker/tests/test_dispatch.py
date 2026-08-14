@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from theozolith_worker import events
 from theozolith_worker.dispatch import DispatchClient
 
 
@@ -123,6 +126,82 @@ def test_unreachability_flag_tracks_the_last_pass(control_node):
     answers.append((503, {"detail": "no PAT"}))
     client.request_work("w", "n", "l")
     assert client.last_unreachable is False  # a refusal is not unreachability
+
+
+# -- OZ-03: the node token stays off a plaintext non-loopback wire ---------------
+
+
+def test_off_box_http_url_is_refused_without_dialing():
+    """A Stack-authored off-box http CONTROL_NODE_URL never gets the node
+    token: the transport refuses it structurally (no DNS, no dial), the
+    driver pauses and surfaces control-url-refused."""
+    errors: list[tuple[str, str]] = []
+    client = DispatchClient(
+        "http://elsewhere.test", "node-token", on_error=lambda c, m: errors.append((c, m))
+    )
+    assert client.request_work("w", "n", "l") is None
+    assert client.last_unreachable is True
+    assert errors and errors[0][0] == "control-url-refused"
+
+
+def test_cross_origin_redirect_never_hands_the_token_to_the_trap():
+    """A control endpoint 302-ing to another origin: events.open_bearer (the
+    shared worker transport) refuses the hop before issuing it, so a trap on
+    the other port sees zero connections and zero Authorization."""
+    trap_sock = socket.socket()
+    trap_sock.bind(("127.0.0.1", 0))
+    trap_sock.listen(4)
+    trap_sock.settimeout(0.1)
+    trap_port = trap_sock.getsockname()[1]
+    seen = bytearray()
+    stop = threading.Event()
+
+    def _trap():
+        while not stop.is_set():
+            try:
+                conn, _ = trap_sock.accept()
+            except TimeoutError:
+                continue
+            conn.settimeout(0.2)
+            try:
+                while data := conn.recv(4096):
+                    seen.extend(data)
+            except (TimeoutError, OSError):
+                pass
+            finally:
+                conn.close()
+
+    trap_thread = threading.Thread(target=_trap, daemon=True)
+    trap_thread.start()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{trap_port}/loot")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = events.control_request(
+            f"http://127.0.0.1:{server.server_port}/api/v1/dispatch", "node-token", {"x": 1}
+        )
+        with pytest.raises(events.BearerTransportError, match="leaves the node-token origin"):
+            events.open_bearer(request, ca=None, timeout=2)
+        time.sleep(0.2)
+        assert b"Authorization" not in seen and len(seen) == 0
+    finally:
+        server.shutdown()
+        stop.set()
+        trap_thread.join(2)
+        trap_sock.close()
 
 
 def test_dispatch_failures_fire_the_error_hook(control_node):

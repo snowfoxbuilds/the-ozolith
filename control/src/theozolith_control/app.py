@@ -507,6 +507,10 @@ def create_app(
             "install_command": (f"curl -fsSL {settings.installer_url} | sudo bash -s -- '{join}'"),
             "expires_at": expires_at,
             "uses": uses,
+            # The CA fingerprint the node verifies (it is inside the opaque
+            # join string too). Surfaced so an operator has one trusted print
+            # to check a browser-downloaded ca.pem against (OZ-01).
+            "ca_sha256": fingerprint,
         }
 
     @app.get("/api/v1/join-tokens")

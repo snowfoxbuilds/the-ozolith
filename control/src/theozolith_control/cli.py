@@ -40,7 +40,6 @@ import os
 import re
 import secrets as _secrets
 import socket
-import ssl
 import sys
 import threading
 import urllib.error
@@ -51,6 +50,7 @@ from typing import Any
 from theozolith_worker.config import ConfigError, env_value
 
 from theozolith_control import (
+    bearerhttp,
     bootstrap,
     controltoml,
     janitor,
@@ -76,12 +76,6 @@ def _log(message: str) -> None:
 # -- HTTP plumbing for the operator subcommands --------------------------------
 
 
-def _ssl_context(ca: str | None) -> ssl.SSLContext:
-    if ca:
-        return ssl.create_default_context(cafile=ca)
-    return ssl.create_default_context()
-
-
 def _call(
     url: str,
     path: str,
@@ -101,15 +95,16 @@ def _call(
             "User-Agent": "theozolith-cli",
         },
     )
-    context = _ssl_context(ca) if url.startswith("https") else None
     try:
-        with urllib.request.urlopen(request, timeout=30, context=context) as resp:
-            return json.loads(resp.read() or b"{}")
+        _status, raw = bearerhttp.open_bearer(request, ca=ca, timeout=30)
+        return json.loads(raw or b"{}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
         raise SystemExit(f"error: HTTP {exc.code} from {path}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"error: cannot reach {url}: {exc.reason}") from exc
+    except bearerhttp.BearerTransportError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def _admin_env(args) -> tuple[str, str, str | None]:
@@ -389,6 +384,11 @@ ExecStart={exec_path} serve --port {port}
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
+# OS backstop for the unauthenticated bootstrap listener (OZ-04): the
+# in-process pool already caps handler threads, but a thread/fd ceiling
+# keeps any flood from starving the box even if that cap regresses.
+TasksMax=256
+LimitNOFILE=4096
 Restart=on-failure
 RestartSec=5
 
@@ -530,12 +530,29 @@ def _install_systemd_unit(settings: ControlSettings, port: int) -> bool:
 
 
 def _print_trust_upgrade(settings: ControlSettings, ip: str) -> None:
-    """The optional green-lock upgrade (ADR-0034): exact per-OS CA-trust
-    instructions, printed by origin-init — the step exists only once a
-    browser is wanted."""
+    """The optional CA-trust step (ADR-0034): per-OS instructions to trust the
+    per-deployment CA on a browser device — the step exists only once a
+    browser is wanted. The CA is fetched over the PLAINTEXT bootstrap
+    listener, so the operator must verify its SHA-256 fingerprint out of band
+    before installing it as a system root; an unverified install trusts
+    whatever a LAN man-in-the-middle substitutes (OZ-01). The node path
+    already pins this exact fingerprint from the join string — the browser
+    path makes the human do the same compare."""
     ca_url = f"http://{ip}:{settings.bootstrap_port}/ca.pem"
-    _log("OPTIONAL green-lock upgrade — trust the per-deployment CA on a device:")
-    _log(f"  download {ca_url} (served while serve runs), then:")
+    try:
+        digest = tls.ca_fingerprint_sha256((settings.tls_dir / CA_FILE).read_bytes())
+        colon_fp = ":".join(digest[i : i + 2] for i in range(0, len(digest), 2)).upper()
+    except OSError:
+        colon_fp = None
+    _log("OPTIONAL — trust the per-deployment CA on a browser device (removes the cert")
+    _log("warning). The CA is served over PLAINTEXT http, so an unverified install would")
+    _log("trust whatever a LAN attacker substitutes — verify the fingerprint FIRST:")
+    if colon_fp is not None:
+        _log(f"  expected CA SHA-256: {colon_fp}")
+    _log(f"  1) download {ca_url} (served while serve runs)")
+    _log("  2) verify out of band — this must print the fingerprint above:")
+    _log("       openssl x509 -in ca.pem -noout -fingerprint -sha256")
+    _log("  3) only on a match, install it:")
     _log(
         "  macOS:   sudo security add-trusted-cert -d -k /Library/Keychains/System.keychain ca.pem"
     )

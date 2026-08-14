@@ -925,9 +925,11 @@ def test_dead_drivers_run_dir_never_blocks_node_wide_update(rig: Rig, tmp_path):
 
 
 def test_channel_env_is_injected_into_process_stacks(rig: Rig):
-    """Node-resident drivers authenticate as their node: the daemon hands
-    its control URL, per-node token, and pinned CA down — Stack env wins
-    (the daemon-less dev override)."""
+    """Node-resident drivers authenticate as their node: the daemon hands its
+    control URL, per-node token, and pinned CA down. The provisioned identity
+    OVERRIDES Stack env (OZ-03): a Stack cannot point the node token at
+    another endpoint by setting only CONTROL_NODE_URL — that would exfiltrate
+    the real token."""
     pinned = process_stack("reviewer", env={"CONTROL_NODE_URL": "http://elsewhere.test"})
     rig.control.heartbeat_answers.append(heartbeat_response([process_stack("worker"), pinned]))
     rig.daemon.once()
@@ -935,7 +937,9 @@ def test_channel_env_is_injected_into_process_stacks(rig: Rig):
     by_name = {p.args[0]: p.env for p in rig.popen.spawned}
     assert by_name["worker-driver"]["CONTROL_NODE_URL"] == "http://control.test"
     assert by_name["worker-driver"]["THEOZOLITH_NODE_TOKEN"] == "node-token"
-    assert by_name["reviewer-driver"]["CONTROL_NODE_URL"] == "http://elsewhere.test"
+    # The Stack's off-box CONTROL_NODE_URL is overridden by the provisioned one.
+    assert by_name["reviewer-driver"]["CONTROL_NODE_URL"] == "http://control.test"
+    assert by_name["reviewer-driver"]["THEOZOLITH_NODE_TOKEN"] == "node-token"
 
 
 def test_wire_cadences_apply_unless_locally_overridden(rig: Rig):

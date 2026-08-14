@@ -1298,14 +1298,21 @@ class NodeDaemon:
             **stack.env,
         }
         # The control channel for node-resident drivers (ADR-0023): they
-        # authenticate as the node that supervises them — the daemon hands
-        # its own per-node token down instead of a hand-configured shared
-        # token. Stack env wins (daemon-less dev keeps its own settings).
+        # authenticate as the node that supervises them — the daemon hands its
+        # own per-node token down instead of a hand-configured shared token.
+        # Once the daemon is provisioned its identity triple OVERRIDES Stack
+        # env: a (control-authored) Stack must not be able to point the node
+        # token at another endpoint — CONTROL_NODE_URL, the token, and the
+        # pinned CA travel together, so a Stack setting only CONTROL_NODE_URL
+        # would otherwise exfiltrate the real node token to that host (the
+        # transport's https floor stops plaintext, not an https attacker).
+        # Daemon-less dev is unaffected: control_url is empty there, so the
+        # Stack's own settings stand (OZ-03).
         if self._config.control_url:
-            env.setdefault("CONTROL_NODE_URL", self._config.control_url)
-            env.setdefault("THEOZOLITH_NODE_TOKEN", self._config.node_token)
+            env["CONTROL_NODE_URL"] = self._config.control_url
+            env["THEOZOLITH_NODE_TOKEN"] = self._config.node_token
             if self._config.tls_ca:
-                env.setdefault("THEOZOLITH_TLS_CA", self._config.tls_ca)
+                env["THEOZOLITH_TLS_CA"] = self._config.tls_ca
         # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
         # (resolved from the worker type, ADR-0044); the daemon no longer maps a
         # removed wire field to a built tag.

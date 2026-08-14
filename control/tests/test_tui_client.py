@@ -104,3 +104,73 @@ def test_connection_refused_folds_into_control_unreachable():
         client.state()
     assert caught.value.error_class == "ConnectionRefusedError"
     assert caught.value.dial_target == f"http://127.0.0.1:{port}"
+
+
+def test_non_loopback_http_url_is_refused_before_dialing():
+    """The forwarded-socket shape is loopback; a non-loopback http URL would
+    put the admin token on a cleartext wire, so it is refused structurally
+    (OZ-03) — folded into ControlUnreachable like any other failure."""
+    with pytest.raises(ControlUnreachable) as caught:
+        ControlClient("http://elsewhere.test", "admin-token", None, timeout=2.0).state()
+    assert caught.value.error_class == "_BearerRefused"
+
+
+def test_cross_origin_redirect_never_forwards_the_admin_token(server):
+    """A 302 toward another origin is refused before the redirected request:
+    a trap on the other port sees zero connections, zero Authorization."""
+    import socket
+
+    trap = socket.socket()
+    trap.bind(("127.0.0.1", 0))
+    trap.listen(4)
+    trap.settimeout(0.1)
+    trap_port = trap.getsockname()[1]
+    seen = bytearray()
+    stop = threading.Event()
+
+    def _serve_trap():
+        while not stop.is_set():
+            try:
+                conn, _ = trap.accept()
+            except TimeoutError:
+                continue
+            try:
+                while data := conn.recv(4096):
+                    seen.extend(data)
+            except (TimeoutError, OSError):
+                pass
+            finally:
+                conn.close()
+
+    trap_thread = threading.Thread(target=_serve_trap, daemon=True)
+    trap_thread.start()
+    _Recorder.responses["/api/v1/state"] = (200, {"ok": True})  # unused; redirect wins below
+
+    class _Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{trap_port}/loot")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    redirect = HTTPServer(("127.0.0.1", 0), _Redirect)
+    rthread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    rthread.start()
+    try:
+        client = ControlClient(f"http://127.0.0.1:{redirect.server_port}", "admin-token", None)
+        with pytest.raises(ControlUnreachable) as caught:
+            client.state()
+        assert caught.value.error_class == "_BearerRefused"
+        import time
+
+        time.sleep(0.2)
+        assert len(seen) == 0 and b"Authorization" not in seen
+    finally:
+        redirect.shutdown()
+        rthread.join(timeout=5)
+        stop.set()
+        trap_thread.join(2)
+        trap.close()
