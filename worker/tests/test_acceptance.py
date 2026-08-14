@@ -18,6 +18,7 @@ from conftest import (
     REVIEWER_LOGIN,
     WORKER_LOGIN,
     Harness,
+    IdentityFailure,
     behavior_write,
     make_harness,
     write_decisions,
@@ -323,6 +324,63 @@ def test_escalation_and_human_decision_round(harness: Harness):
     harness.reviewer_replies.append(approve_reply())
     harness.reviewer_once()
     assert {PR_READY, NEEDS_HUMAN} <= harness.fake.labels_of(pr_number)
+
+
+def test_reviewer_identity_failure_blocks_the_pr_once(harness: Harness):
+    """ADR-0045 Reviewer lifecycle: a review session killed by the identity
+    gate escalates through the one-strike lane — evidence (identity.json +
+    transcript) survives with failure_class identity, the PR turns blocked +
+    needs_human in the same pass, and the next poll launches NO new review
+    instead of spinning against the same policy forever."""
+    harness.file_issue("Feature", CRITERIA_BODY)
+    harness.worker_once()
+    (pr_number,) = harness.fake.open_pr_numbers()
+
+    harness.reviewer_replies.append(IdentityFailure())
+    assert harness.reviewer_once() == 1  # the escalation verdict was applied
+
+    labels = harness.fake.labels_of(pr_number)
+    assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
+    comment = harness.fake.comments[pr_number][-1]["body"]
+    parsed = verdict.parse_comment(comment)
+    assert parsed is not None and parsed.verdict == verdict.ESCALATE
+    assert "identity" in comment.lower()
+
+    # Evidence first, and it survives the job dir cleanup: the record
+    # carries the Implementer lane's failure-class vocabulary plus the
+    # harness's own identity verdict; the transcript rode along.
+    paths = harness.evidence_paths()
+    (record_path,) = [p for p in paths if p.endswith("-identity.json")]
+    record = json.loads(harness.evidence_file(record_path))
+    assert record["failure_class"] == "identity"
+    assert record["verdict"] is None
+    assert record["identity"]["category"] == "substituted"
+    assert record["identity"]["released"] is True
+    assert "[substituted]" in record["error"]
+    assert any(p.endswith("-identity-transcript.txt") for p in paths)
+
+    # The next poll: the PR is out of the reviewable pool — no session
+    # starts (an unscripted review round would assert inside FakeSession).
+    assert harness.reviewer_once() == 0
+    assert {BLOCKED, NEEDS_HUMAN} <= harness.fake.labels_of(pr_number)
+
+
+def test_reviewer_non_identity_harness_failure_keeps_current_behavior(harness: Harness):
+    """A SessionError WITHOUT the anchored identity marker keeps the existing
+    lane: the pass-level error summary, no verdict, no label changes — the
+    one-strike identity path never widens into a general escalation path."""
+    harness.file_issue("Feature", CRITERIA_BODY)
+    harness.worker_once()
+    (pr_number,) = harness.fake.open_pr_numbers()
+
+    def broken_session(prompt: str, cwd: Path):
+        raise SessionError("run container exited before the agent phase completed")
+
+    harness.reviewer_replies.append(broken_session)
+    assert harness.reviewer_once() == 0
+    assert any("review pass failed" in line for line in harness.logs)
+    labels = harness.fake.labels_of(pr_number)
+    assert PR_READY in labels and BLOCKED not in labels  # unchanged behavior
 
 
 # -- 5. round budget and the final-round rule ---------------------------------

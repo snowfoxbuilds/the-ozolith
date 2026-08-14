@@ -27,6 +27,7 @@ from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome, Manifest
 from theozolith_worker.reviewer import Reviewer
+from theozolith_worker.sessions import SessionError
 from theozolith_worker.shell import run_shell
 
 WORKER_LOGIN = "ozolith-worker-a"
@@ -59,6 +60,31 @@ def write_decisions(cwd: Path, **kwargs) -> None:
 
 # A Run behavior: (prompt, checkout) -> AgentOutcome | None (None = completed).
 RunBehavior = Callable[[str, Path], AgentOutcome | None]
+
+
+@dataclass
+class IdentityFailure:
+    """A scripted reviewer reply that makes the session die the way a real
+    identity-gate kill does (ADR-0045): the harness wrote its redacted
+    identity.json, status.json carries the anchored ``identity:`` marker, and
+    the driver sees it as a SessionError from wait_for_agent."""
+
+    detail: str = (
+        "[substituted] a turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
+    )
+    record: dict = field(
+        default_factory=lambda: {
+            "expected_model": "claude-sonnet-5",
+            "expected_effort": "",
+            "preflight": "passed",
+            "category": "substituted",
+            "released": True,
+            "violation": "a turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'",
+            "observed_model": "claude-opus-5",
+            "probe_turns": 1,
+            "task_turns": 0,
+        }
+    )
 
 
 class RecordingSink:
@@ -221,6 +247,9 @@ class FakeSession:
         self.harness.reviewer_prompts.append(prompt)
         assert self.harness.reviewer_replies, "review round started without a scripted reply"
         reply = self.harness.reviewer_replies.pop(0)
+        if isinstance(reply, IdentityFailure):
+            jobdir.write_identity(self.job, reply.record)
+            raise SessionError(f"harness failed: identity: {reply.detail}")
         if callable(reply):
             reply = reply(prompt, self.workdir)
         if reply is not None:

@@ -433,7 +433,7 @@ def _bake_root(tmp_path: Path, model: str = PIN, effort: str = "") -> Path:
 
 
 def _pass_preflight(monkeypatch, model: str = PIN, effort: str = ""):
-    def fake_preflight(self, identity, *, root, scratch, run=None):
+    def fake_preflight(self, identity, *, root, scratch, run=None, deadline=None, clock=None):
         return PreflightReport(
             ok=True,
             expected_model=model,
@@ -512,6 +512,15 @@ def _turn_event_line(model: str) -> dict:
     return {"type": "assistant", "message": {"model": model, "content": []}}
 
 
+def _stop_record(tmp_path: Path, effort: str = "") -> None:
+    """What the materialized Stop hook helper does: append one completed-turn
+    record to the boundary journal in the gate scratch."""
+    journal = tmp_path / "scratch" / "gate" / "stop.jsonl"
+    record: dict = {"effort": effort} if effort else {}
+    with journal.open("a") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
 def test_gated_harness_releases_the_prompt_only_after_identity_verifies(tmp_path, monkeypatch):
     root = _bake_root(tmp_path)
     _pass_preflight(monkeypatch)
@@ -526,10 +535,13 @@ def test_gated_harness_releases_the_prompt_only_after_identity_verifies(tmp_path
         if now >= 1.0 and len(stages) == 0:
             stages.append("probe")
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)  # the probe turn completely stopped
         if agent.input_closed and len(stages) == 1:
-            # The released task observably processed: one post-release turn.
+            # The released task observably processed: one post-release
+            # COMPLETED turn (its boundary record), not merely an event.
             stages.append("task")
             _append_stream(job, _turn_event_line(PIN))
+            _stop_record(tmp_path)
             agent.exit_at(now + 1.0)
 
     clock.on_tick.append(script)
@@ -546,16 +558,23 @@ def test_gated_harness_releases_the_prompt_only_after_identity_verifies(tmp_path
     argv = call["argv"]
     assert "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
     assert all(str(job / jobdir.PROMPT_FILE) not in part for part in argv)
+    # No user/project/local settings source loads into the task session —
+    # nothing a checkout or home directory declares can steer it (ADR-0045).
+    assert argv[argv.index("--setting-sources") + 1] == ""
     # The task session's --settings carry the gate hooks: the PreToolUse
-    # release-marker denial, and the ConfigChange recorder (helper written).
+    # release-marker denial, the Stop turn-boundary recorder (registered
+    # even with no effort baked), and the ConfigChange recorder.
     settings_json = argv[argv.index("--settings") + 1]
     marker = tmp_path / "scratch" / "gate" / "released"
     hook_script = tmp_path / "scratch" / "gate" / "configchange_hook.py"
+    stop_script = tmp_path / "scratch" / "gate" / "stop_hook.py"
     assert "PreToolUse" in settings_json and str(marker) in settings_json
     assert "ConfigChange" in settings_json and str(hook_script) in settings_json
-    assert hook_script.is_file()
+    assert "Stop" in settings_json and str(stop_script) in settings_json
+    assert hook_script.is_file() and stop_script.is_file()
     # The stdin protocol: the no-op probe first, the pointer prompt second
-    # (only after init + an executed turn matched), then end of input.
+    # (only after init + an executed turn matched AND the probe stopped),
+    # then end of input.
     assert len(agent.sent) == 2
     assert "Preflight check" in agent.sent[0]
     assert str(job / jobdir.PROMPT_FILE) in agent.sent[1]
@@ -564,12 +583,13 @@ def test_gated_harness_releases_the_prompt_only_after_identity_verifies(tmp_path
     # back on disk with its original content.
     assert marker.is_file()
     assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT
-    # The identity verdict the driver embeds into evidence.
+    # The identity verdict the driver embeds into evidence: exact completed-
+    # turn counts from the boundary journal.
     ident = jobdir.read_identity(job)
     assert ident["preflight"] == "passed"
     assert ident["released"] is True and ident["violation"] == "" and ident["category"] == ""
     assert ident["observed_model"] == PIN
-    assert ident["probe_turns"] >= 1 and ident["task_turns"] >= 1
+    assert ident["probe_turns"] == 1 and ident["task_turns"] == 1
 
 
 def test_gated_harness_withholds_the_task_file_until_release(tmp_path, monkeypatch):
@@ -579,7 +599,7 @@ def test_gated_harness_withholds_the_task_file_until_release(tmp_path, monkeypat
     task_file = job / jobdir.PROMPT_FILE
     seen = {}
 
-    def fake_preflight(self, identity, *, root, scratch, run=None):
+    def fake_preflight(self, identity, *, root, scratch, run=None, deadline=None, clock=None):
         # THE boundary assertion: while verification subprocesses run, the
         # task input does not exist anywhere a process could read it, and
         # the scratch is outside the job directory.
@@ -602,9 +622,11 @@ def test_gated_harness_withholds_the_task_file_until_release(tmp_path, monkeypat
         if now >= 1.0 and len(stages) == 1:
             stages.append("probe")
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
         if agent.input_closed and len(stages) == 2:
             stages.append(("post-release", task_file.exists()))
             _append_stream(job, _turn_event_line(PIN))
+            _stop_record(tmp_path)
             agent.exit_at(now + 1.0)
 
     clock.on_tick.append(script)
@@ -687,6 +709,7 @@ def test_gated_harness_kills_on_mid_run_identity_drift(tmp_path, monkeypatch):
         if now >= 1.0 and len(stages) == 0:
             stages.append("probe")
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
         # After the release, a server-side policy change moves the session
         # onto another model mid-run.
         if agent.input_closed and now >= 3.0 and len(stages) == 1:
@@ -706,7 +729,9 @@ def test_gated_harness_kills_on_mid_run_identity_drift(tmp_path, monkeypatch):
     ident = jobdir.read_identity(job)
     assert ident["released"] is True  # the task HAD been released...
     assert "claude-opus-5" in ident["violation"]  # ...and the drift invalidated the Run
-    assert ident["task_turns"] == 1  # the drift turn is a counted task turn
+    # The drifted turn was killed mid-flight: it never completed, so the
+    # journal shows no post-release turn — counters stay truthful.
+    assert ident["task_turns"] == 0
     # The Run is invalid: no gate jobs were served after the kill.
     assert jobdir.read_job_result(job, "001-shutdown") is None
 
@@ -728,6 +753,7 @@ def test_gated_harness_kills_on_a_mid_run_config_change(tmp_path, monkeypatch):
         if now >= 1.0 and len(stages) == 0:
             stages.append("probe")
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
         if agent.input_closed and len(stages) == 1:
             stages.append("config-change")
             capture.write_text(
@@ -762,6 +788,7 @@ def test_gated_harness_broken_pipe_during_task_send_fails_the_run(tmp_path, monk
         if now >= 1.0 and not fed:
             fed.append(True)
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
 
     clock.on_tick.append(script)
 
@@ -793,6 +820,7 @@ def test_gated_harness_stdin_close_failure_is_classified_explicitly(tmp_path, mo
         if now >= 1.0 and not fed:
             fed.append(True)
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
 
     clock.on_tick.append(script)
 
@@ -826,6 +854,7 @@ def test_gated_harness_exit_zero_after_only_the_probe_fails(tmp_path, monkeypatc
         if now >= 1.0 and not fed:
             fed.append(True)
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)
         if agent.input_closed and agent._exits_at is None:
             agent.exit_at(now + 1.0)  # exits clean — but no task turn ever
 
@@ -843,10 +872,54 @@ def test_gated_harness_exit_zero_after_only_the_probe_fails(tmp_path, monkeypatc
     assert jobdir.read_job_result(job, "001-shutdown") is None
 
 
+def test_gated_harness_residual_probe_events_never_count_as_the_task(tmp_path, monkeypatch):
+    # A probe that emitted multiple assistant events (denied-tool
+    # continuations) whose tail the transcript pump delivers only AFTER the
+    # release: without the boundary journal those residuals would read as
+    # "the task was processed". They must not — exit 0 with no post-release
+    # COMPLETED turn is task-unprocessed.
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+    stages = []
+
+    def script(now: float) -> None:
+        if now >= 1.0 and len(stages) == 0:
+            stages.append("probe")
+            _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
+            _stop_record(tmp_path)  # the probe stopped; release follows
+        if agent.input_closed and len(stages) == 1:
+            stages.append("residuals")
+            # Late-read probe continuations: assistant events and a per-turn
+            # result, but NO second boundary record — nothing completed
+            # post-release.
+            _append_stream(
+                job,
+                _turn_event_line(PIN),
+                _turn_event_line(PIN),
+                {"type": "result", "subtype": "success", "is_error": False},
+            )
+            agent.exit_at(now + 1.0)
+
+    clock.on_tick.append(script)
+
+    code = _run_gated(job, launcher, clock, root, tmp_path)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert "[task-unprocessed]" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["released"] is True
+    assert ident["probe_turns"] == 1 and ident["task_turns"] == 0
+
+
 def test_gated_harness_failed_preflight_never_launches_the_agent(tmp_path, monkeypatch):
     root = _bake_root(tmp_path)
 
-    def failing_preflight(self, identity, *, root, scratch, run=None):
+    def failing_preflight(self, identity, *, root, scratch, run=None, deadline=None, clock=None):
         return PreflightReport(
             ok=False,
             expected_model=PIN,
@@ -891,9 +964,174 @@ def test_gated_harness_corrupt_identity_declaration_fails_before_launch(tmp_path
     assert launcher.calls == []
     status = jobdir.read_status(job)
     assert status.phase == jobdir.PHASE_FAILED and status.error.startswith("identity: ")
+    # A corrupt declaration is a first-class identity failure: the stable
+    # category rides the status error AND a redacted identity.json exists
+    # for evidence — not only failures that reached a PreflightReport.
+    assert "[identity-inconsistent]" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["category"] == "identity-inconsistent"
+    assert ident["preflight"] == "failed:identity-inconsistent"
+    assert ident["released"] is False and ident["violation"] == ""
+    assert ident["probe_turns"] == 0 and ident["task_turns"] == 0
 
 
-def test_gated_harness_effort_pin_uses_the_stop_hook_capture(tmp_path, monkeypatch):
+def test_gated_harness_missing_managed_pin_is_identity_inconsistent(tmp_path):
+    # The well-known file declares an identity the managed settings do not
+    # enforce: the REAL preflight fails statically (no subprocess, no agent)
+    # and the redacted identity.json carries the stable category.
+    root = tmp_path / "idroot"
+    (root / "etc/theozolith").mkdir(parents=True)
+    (root / "etc/theozolith/model").write_text(PIN + "\n")  # no managed file
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+
+    code = _run_gated(job, launcher, clock, root, tmp_path)
+
+    assert code == 1
+    assert launcher.calls == []
+    status = jobdir.read_status(job)
+    assert "[identity-inconsistent]" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["category"] == "identity-inconsistent"
+    assert ident["preflight"] == "failed:identity-inconsistent"
+    assert ident["released"] is False
+    assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT  # evidence restore
+
+
+def test_gated_harness_boundary_setup_failure_is_an_identity_category(tmp_path, monkeypatch):
+    # The pre-verification boundary could not even be established (the
+    # scratch is unwritable): a stable identity category with the task
+    # withheld and identity evidence written — never a generic harness crash.
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+    fence = tmp_path / "fence"
+    fence.mkdir()
+    fence.chmod(0o500)  # scratch_root cannot be created under it
+    try:
+        code = run_harness(
+            job,
+            launcher,
+            runner=_real_runner,
+            clock=clock,
+            sleep=clock.sleep,
+            identity_root=root,
+            scratch_root=fence / "scratch",
+        )
+    finally:
+        fence.chmod(0o700)
+
+    assert code == 1
+    assert launcher.calls == []  # the task session never existed
+    status = jobdir.read_status(job)
+    assert "[unverifiable]" in status.error
+    assert "boundary could not be established" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["category"] == "unverifiable"
+    assert ident["expected_model"] == PIN and ident["released"] is False
+    assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT  # never left disk
+
+
+def test_gated_harness_task_withhold_failure_is_an_identity_category(tmp_path, monkeypatch):
+    # The task file can be read but not removed (unwritable input dir): the
+    # boundary cannot be established, so the Run fails with the stable
+    # category and the task still on disk — it was never sent anywhere.
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+    input_dir = (job / jobdir.PROMPT_FILE).parent
+    input_dir.chmod(0o500)  # unlink of the task file will fail
+    try:
+        code = _run_gated(job, launcher, clock, root, tmp_path)
+    finally:
+        input_dir.chmod(0o700)
+
+    assert code == 1
+    assert launcher.calls == []
+    status = jobdir.read_status(job)
+    assert "[unverifiable]" in status.error
+    assert "boundary could not be established" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["category"] == "unverifiable"
+    assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT
+
+
+def test_gated_harness_hook_materialization_failure_is_an_identity_category(tmp_path, monkeypatch):
+    # Preflight passed but the gate hooks cannot be materialized: the task
+    # session must never launch on an ungated argv — the failure is an
+    # identity category with the preflight verdict preserved in evidence.
+    root = _bake_root(tmp_path)
+    _pass_preflight(monkeypatch)
+    job, _manifest = make_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeGatedLauncher(FakeGatedAgent(clock))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "gate").write_text("not a directory")  # gate dir creation fails
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=root,
+        scratch_root=scratch,
+    )
+
+    assert code == 1
+    assert launcher.calls == []
+    status = jobdir.read_status(job)
+    assert "[unverifiable]" in status.error and "gate hooks" in status.error
+    ident = jobdir.read_identity(job)
+    assert ident["preflight"] == "failed:unverifiable"
+    assert ident["category"] == "unverifiable"
+    assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT  # evidence restore
+
+
+def test_gated_harness_one_deadline_covers_preflight_and_task(tmp_path, monkeypatch):
+    # The end-to-end budget starts BEFORE the preflight: a preflight that
+    # eats the whole agent timeout leaves nothing for the gate, and the
+    # harness emits its own timeout category well inside the driver's wait
+    # budget (agent timeout + WAIT_GRACE) instead of silently extending the
+    # task's time by the preflight's duration.
+    from theozolith_worker.sessions import WAIT_GRACE_SECONDS
+
+    root = _bake_root(tmp_path)
+    job, _manifest = make_job(tmp_path, timeout=30.0)
+    clock = ScriptedClock()
+
+    def slow_preflight(self, identity, *, root, scratch, run=None, deadline=None, clock=None):
+        while clock() < deadline - 1.0:  # canaries ate all but 1s of the budget
+            sleep(0.5)
+        return PreflightReport(
+            ok=True, expected_model=PIN, expected_effort="", cli_version="2.1.232"
+        )
+
+    sleep = clock.sleep
+    monkeypatch.setattr(ClaudeAdapter, "preflight", slow_preflight)
+    agent = FakeGatedAgent(clock)
+    launcher = FakeGatedLauncher(agent)
+
+    code = _run_gated(job, launcher, clock, root, tmp_path)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    # The ~1s remaining budget expired before the session verified: the
+    # harness's own timeout category, task withheld.
+    assert "[preflight-timeout]" in status.error and "never sent" in status.error
+    assert jobdir.read_identity(job)["released"] is False
+    assert (job / jobdir.PROMPT_FILE).read_text() == TASK_TEXT
+    # And it all happened comfortably before the driver-side wait would
+    # expire — the container-session budget can never fire first.
+    assert clock.now < 30.0 + WAIT_GRACE_SECONDS
+
+
+def test_gated_harness_effort_pin_uses_the_stop_journal(tmp_path, monkeypatch):
     root = _bake_root(tmp_path, effort="low")
     _pass_preflight(monkeypatch, effort="low")
     job, _manifest = make_job(tmp_path)
@@ -901,17 +1139,17 @@ def test_gated_harness_effort_pin_uses_the_stop_hook_capture(tmp_path, monkeypat
     clock = ScriptedClock()
     agent = FakeGatedAgent(clock)
     launcher = FakeGatedLauncher(agent)
-    capture = tmp_path / "scratch" / "gate" / "effort.json"
     stages = []
 
     def script(now: float) -> None:
         if now >= 1.0 and len(stages) == 0:
             stages.append("probe")
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
-            capture.write_text(json.dumps({"effort": {"level": "low"}}))
+            _stop_record(tmp_path, effort="low")
         if agent.input_closed and len(stages) == 1:
             stages.append("task")
             _append_stream(job, _turn_event_line(PIN))
+            _stop_record(tmp_path, effort="low")
             agent.exit_at(now + 1.0)
 
     clock.on_tick.append(script)
@@ -919,13 +1157,14 @@ def test_gated_harness_effort_pin_uses_the_stop_hook_capture(tmp_path, monkeypat
     code = _run_gated(job, launcher, clock, root, tmp_path)
 
     assert code == 0
-    # The gated argv carries the Stop capture hook via --settings — a source
+    # The gated argv carries the Stop journal hook via --settings — a source
     # managed settings outrank, so it cannot weaken enforcement — and the
     # probe turn needs NO tool: the Stop payload reports the applied effort
     # after a plain turn (verified live), so tools stay denied pre-release.
     argv = launcher.calls[0]["argv"]
     settings_json = argv[argv.index("--settings") + 1]
-    assert "Stop" in settings_json and str(capture) in settings_json
+    journal = tmp_path / "scratch" / "gate" / "stop.jsonl"
+    assert "Stop" in settings_json and str(journal) in settings_json
     assert "PostToolUse" not in settings_json
     assert "Do not use any tools" in agent.sent[0]
     ident = jobdir.read_identity(job)
@@ -939,16 +1178,16 @@ def test_gated_harness_clamped_effort_withholds_the_task(tmp_path, monkeypatch):
     clock = ScriptedClock()
     agent = FakeGatedAgent(clock)
     launcher = FakeGatedLauncher(agent)
-    capture = tmp_path / "scratch" / "gate" / "effort.json"
     fed = []
 
     def script(now: float) -> None:
         if now >= 1.0 and not fed:
             fed.append(True)
             _append_stream(job, _init_event_line(PIN), _turn_event_line(PIN))
-            # An organization effort cap clamps silently; the hook capture is
-            # the only observation, and a clamp is a failure, not a downgrade.
-            capture.write_text(json.dumps({"effort": {"level": "high"}}))
+            # An organization effort cap clamps silently; the probe turn's
+            # boundary record is the only observation, and a clamp is a
+            # failure, not a downgrade.
+            _stop_record(tmp_path, effort="high")
 
     clock.on_tick.append(script)
 

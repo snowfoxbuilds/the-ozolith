@@ -34,12 +34,15 @@ from theozolith_worker.identity import (
     GUARD_RELEASE,
     GUARD_WAIT,
     PROBE_PROMPT,
+    STOP_HOOK_SOURCE,
     BakedIdentity,
     ClaudeSessionGuard,
     IdentityError,
     TaskGate,
     effort_capability,
+    identity_error_detail,
     model_matches,
+    normalize_model,
     pair_error,
     read_baked_identity,
     run_preflight,
@@ -767,6 +770,215 @@ def test_sibling_for_full_id_pins():
     assert sibling_for("haiku") == ""
 
 
+def test_sibling_for_dated_pins_never_uses_the_undated_prefix():
+    # The provider resolves an undated ID to its newest dated variant, so
+    # bare claude-sonnet-4-6 can resolve to a dated 4.6 pin — a canary asking
+    # for it would execute the pin and prove nothing. The genuinely distinct
+    # family member is chosen instead.
+    assert sibling_for("claude-sonnet-4-6-20250929") == "claude-sonnet-5"
+    assert sibling_for("claude-opus-4-6-20260101") == "claude-opus-5"
+    assert sibling_for("claude-haiku-4-5-20251001") == "claude-3-5-haiku-20241022"
+
+
+def test_sibling_exhausted_family_is_none_and_fails_the_preflight(tmp_path, monkeypatch):
+    # A known multi-member family where every candidate could resolve to the
+    # pin: the same-family proof cannot run — unverifiable, never a vacuous
+    # pass and never a silent skip.
+    from theozolith_worker import identity as identity_mod
+
+    monkeypatch.setattr(identity_mod, "_FAMILY_SIBLINGS", {"sonnet": ("claude-sonnet-4-6",)})
+    assert sibling_for("claude-sonnet-4-6-20250929") is None
+    _bake(tmp_path, "claude-sonnet-4-6-20250929")
+    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-4-6-20250929"))
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-4-6-20250929"), runner)
+    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
+    assert "same-family" in report.detail
+    assert runner.canary_calls == []  # failed before spending session tokens
+
+
+def test_normalize_model_strips_the_context_decoration():
+    # The CLI announces long-context variants with a bracketed tag (observed
+    # live: init and modelUsage say claude-opus-5[1m] while the executed
+    # turns say claude-opus-5) — the same model, not a substitution.
+    assert normalize_model("claude-opus-5[1m]") == "claude-opus-5"
+    assert normalize_model("claude-opus-5") == "claude-opus-5"
+    assert model_matches("claude-opus-5", "claude-opus-5[1m]")
+    assert model_matches("opus", "claude-opus-5[1m]")
+    assert not model_matches("claude-opus-5", "claude-opus-4-6[1m]")
+
+
+def test_preflight_accepts_a_decorated_init_announcement(tmp_path):
+    _bake(tmp_path, "claude-opus-5")
+    stdout = _stream_json(
+        {"type": "system", "subtype": "init", "model": "claude-opus-5[1m]"},
+        {"type": "assistant", "message": {"model": "claude-opus-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(canary_stdout=stdout)
+    report = _preflight(tmp_path, BakedIdentity("claude-opus-5"), runner)
+    assert report.ok, f"{report.category}: {report.detail}"
+
+
+def test_preflight_requires_the_init_announcement(tmp_path):
+    # Announced AND executed identity must both be present and match — for
+    # the canaries and the probe alike. A stream with an executed turn but
+    # no init event is not a verifiable session.
+    _bake(tmp_path, "claude-sonnet-5")
+    no_init = _stream_json(
+        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(canary_stdout=no_init)
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
+    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
+    assert "announced no identity" in report.detail
+
+    # Probe side: canaries fine, the probe's own stream carries no init.
+    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"), probe_stdout=no_init)
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
+    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
+    assert "announced no identity" in report.detail
+
+
+def test_preflight_canary_init_off_the_pin_fails(tmp_path):
+    # The canary session ANNOUNCED an off-pin identity even though its
+    # executed turn coerced back: announcement and execution must both hold.
+    _bake(tmp_path, "claude-sonnet-5")
+    drifted_init = _stream_json(
+        {"type": "system", "subtype": "init", "model": "claude-haiku-4-5"},
+        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(canary_stdout=drifted_init)
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
+    assert not report.ok and report.category == CATEGORY_SUBSTITUTED
+    assert "announced" in report.detail
+
+
+# -- the end-to-end verification budget ---------------------------------------
+
+
+class FakeClock:
+    def __init__(self, now: float = 0.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_preflight_deadline_caps_every_subprocess_timeout(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5", "low")
+    clock = FakeClock(100.0)
+    runner = ScriptedRunner(
+        canary_stdout=_session_ok("claude-sonnet-5"),
+        on_probe=lambda: _write(
+            tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
+        ),
+    )
+    report = _preflight(
+        tmp_path,
+        BakedIdentity("claude-sonnet-5", "low"),
+        runner,
+        deadline=100.0 + 45.0,
+        clock=clock,
+    )
+    assert report.ok, report.detail
+    # Every subprocess ran under the REMAINING budget (45s), not the 240s
+    # per-session cap — the driver-side wait can never expire first.
+    for call in runner.calls:
+        assert call["timeout"] <= 45.0
+
+
+def test_preflight_exhausted_deadline_is_the_timeout_category(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5")
+    clock = FakeClock(100.0)
+    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
+    report = _preflight(
+        tmp_path,
+        BakedIdentity("claude-sonnet-5"),
+        runner,
+        deadline=100.0,  # nothing left before the first subprocess
+        clock=clock,
+    )
+    assert not report.ok and report.category == CATEGORY_TIMEOUT
+    assert "budget was exhausted" in report.detail
+    assert runner.calls == []  # no subprocess ran on a spent budget
+
+
+def test_preflight_mid_run_exhaustion_is_the_timeout_category(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5")
+    clock = FakeClock(0.0)
+
+    def runner(argv, **kwargs):
+        runner.calls.append({"argv": list(argv), **kwargs})
+        clock.now += 30.0  # each step eats 30s of a 40s budget
+        if "--version" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="2.1.232", stderr="")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=_session_ok("claude-sonnet-5"), stderr=""
+        )
+
+    runner.calls = []
+    report = _preflight(
+        tmp_path, BakedIdentity("claude-sonnet-5"), runner, deadline=40.0, clock=clock
+    )
+    assert not report.ok and report.category == CATEGORY_TIMEOUT
+    assert len(runner.calls) == 2  # version + first canary; then the budget died
+
+
+# -- the identity marker (status.json channel) ---------------------------------
+
+
+def test_identity_error_detail_is_anchored():
+    assert identity_error_detail("identity: [substituted] a turn drifted") == (
+        "[substituted] a turn drifted"
+    )
+    assert (
+        identity_error_detail("harness failed: identity: [preflight-timeout] budget spent")
+        == "[preflight-timeout] budget spent"
+    )
+    # Merely CONTAINING the marker is not an identity verdict.
+    assert identity_error_detail("gate step echoed 'identity: [substituted]'") is None
+    assert identity_error_detail("harness crashed: identity: nested") is None
+    assert identity_error_detail("") is None
+
+
+def test_stop_hook_appends_one_redacted_record_per_firing(tmp_path):
+    script = tmp_path / "stop_hook.py"
+    script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
+    capture = tmp_path / "stop.jsonl"
+    payload = {
+        "effort": {"level": "low", "source": "managed"},
+        "session_id": "s-1",
+        "transcript_path": "/home/u/.claude/t.jsonl",
+    }
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, str(script), str(capture)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+    lines = capture.read_text().splitlines()
+    assert len(lines) == 2  # one record per firing: the line count IS the turn count
+    for line in lines:
+        assert json.loads(line) == {"effort": "low"}  # value-redacted: level only
+
+    # Garbage stdin still journals the boundary (a completed turn happened);
+    # the guard then fails closed on the missing effort when one is baked.
+    proc = subprocess.run(
+        [sys.executable, str(script), str(capture)],
+        input="not json",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(capture.read_text().splitlines()[-1]) == {}
+
+
 # -- the ConfigChange hook helper ---------------------------------------------
 
 
@@ -860,18 +1072,32 @@ def _gate(tmp_path: Path, effort: bool = False) -> TaskGate:
     gate_dir.mkdir(exist_ok=True)
     return TaskGate(
         release_marker=gate_dir / "released",
-        effort_capture=(gate_dir / "effort.json") if effort else None,
+        stop_capture=gate_dir / "stop.jsonl",
         config_capture=gate_dir / "config-change.jsonl",
         config_hook_script=gate_dir / "configchange_hook.py",
+        stop_hook_script=gate_dir / "stop_hook.py",
     )
 
 
-def test_guard_releases_only_after_init_and_an_executed_turn(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
+def _stop(gate: TaskGate, effort: str = "", raw: str | None = None) -> None:
+    """Append one turn-boundary record the way the Stop hook helper does."""
+    line = raw if raw is not None else json.dumps({"effort": effort} if effort else {})
+    with gate.stop_capture.open("a") as handle:
+        handle.write(line + "\n")
+
+
+def test_guard_releases_only_after_init_turn_and_a_completed_probe(tmp_path):
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
     assert guard.decision().action == GUARD_WAIT
     guard.observe(_init_line("claude-sonnet-5"))
     assert guard.decision().action == GUARD_WAIT  # announced is not executed
     guard.observe(_turn_line("claude-sonnet-5"))
+    # An executed assistant event is still not a COMPLETED probe: the
+    # release waits for the turn's boundary record, never merely the first
+    # matching assistant event.
+    assert guard.decision().action == GUARD_WAIT
+    _stop(gate)
     assert guard.decision().action == GUARD_RELEASE
     assert guard.observed_model == "claude-sonnet-5"
     assert guard.probe_turns == 1 and guard.task_turns == 0
@@ -886,22 +1112,61 @@ def test_guard_kills_on_a_substituted_init(tmp_path):
     assert "claude-opus-5" in decision.reason and "substituted" in decision.reason
 
 
-def test_guard_counts_probe_and_task_turns_separately(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
+def test_guard_counts_probe_and_task_turns_from_the_journal(tmp_path):
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
+    _stop(gate)
     assert guard.decision().action == GUARD_RELEASE
     guard.mark_released()
     assert guard.probe_turns == 1 and guard.task_turns == 0
+    # Assistant events alone never count: only the completed turn's boundary
+    # record attributes a task turn.
     guard.observe(_turn_line("claude-sonnet-5"))
-    assert guard.probe_turns == 1 and guard.task_turns == 1
     assert guard.decision().action == GUARD_WAIT  # released: monitor only
+    assert guard.probe_turns == 1 and guard.task_turns == 0
+    _stop(gate)
+    assert guard.decision().action == GUARD_WAIT
+    assert guard.probe_turns == 1 and guard.task_turns == 1
+
+
+def test_guard_residual_probe_events_never_become_task_turns(tmp_path):
+    # The probe emitted several assistant events (denied-tool continuations)
+    # that the transcript pump delivers only after the release: the journal,
+    # written in turn order by the session's own hook, keeps them out of the
+    # task count.
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
+    guard.observe(_init_line("claude-sonnet-5"))
+    guard.observe(_turn_line("claude-sonnet-5"))
+    _stop(gate)
+    assert guard.decision().action == GUARD_RELEASE
+    guard.mark_released()
+    guard.observe(_turn_line("claude-sonnet-5"))  # residual probe events,
+    guard.observe(_turn_line("claude-sonnet-5"))  # read late
+    guard.decision()
+    assert guard.task_turns == 0  # no post-release turn ever completed
+
+
+def test_guard_malformed_journal_record_fails_closed(tmp_path):
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
+    guard.observe(_init_line("claude-sonnet-5"))
+    guard.observe(_turn_line("claude-sonnet-5"))
+    _stop(gate, raw="not json at all")
+    decision = guard.decision()
+    assert decision.action == GUARD_KILL
+    assert decision.category == CATEGORY_UNVERIFIABLE
+    assert "boundary" in decision.reason
 
 
 def test_guard_kills_on_model_drift_after_release(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
+    _stop(gate)
     assert guard.decision().action == GUARD_RELEASE
     guard.mark_released()
     guard.observe(_turn_line("claude-opus-5"))  # mid-run policy change
@@ -928,26 +1193,27 @@ def test_guard_probe_error_before_a_turn_is_unavailable(tmp_path):
     assert decision.category == CATEGORY_UNAVAILABLE
 
 
-def test_guard_waits_for_the_effort_capture_then_releases(tmp_path):
+def test_guard_waits_for_the_effort_journal_then_releases(tmp_path):
     gate = _gate(tmp_path, effort=True)
     guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
-    assert guard.decision().action == GUARD_WAIT  # effort not yet observed
-    gate.effort_capture.write_text(json.dumps({"effort": {"level": "low"}}))
+    assert guard.decision().action == GUARD_WAIT  # probe not completed yet
+    _stop(gate, effort="low")
     assert guard.decision().action == GUARD_RELEASE
     assert guard.observed_effort == "low"
 
 
 def test_guard_kills_on_a_clamped_effort_with_the_exact_category(tmp_path):
     # An organization effort cap clamps silently in stream-json output — the
-    # Stop-hook capture is the observation, and a clamp is GUARD_KILL with
-    # the effort-clamped category, never merely "not release".
+    # probe turn's boundary record is the observation, and a clamp is
+    # GUARD_KILL with the effort-clamped category, never merely "not
+    # release".
     gate = _gate(tmp_path, effort=True)
     guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "xhigh"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
-    gate.effort_capture.write_text(json.dumps({"effort": {"level": "high"}}))
+    _stop(gate, effort="high")
     decision = guard.decision()
     assert decision.action == GUARD_KILL
     assert decision.category == CATEGORY_EFFORT_CLAMPED
@@ -959,28 +1225,45 @@ def test_guard_kills_on_effort_drift_after_release(tmp_path):
     guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
-    gate.effort_capture.write_text(json.dumps({"effort": {"level": "low"}}))
+    _stop(gate, effort="low")
     assert guard.decision().action == GUARD_RELEASE
     guard.mark_released()
-    gate.effort_capture.write_text(json.dumps({"effort": {"level": "high"}}))  # mid-run change
+    _stop(gate, effort="high")  # the task turn completed under a changed effort
     decision = guard.decision()
     assert decision.action == GUARD_KILL
     assert decision.category == CATEGORY_EFFORT_CLAMPED
 
 
-def test_guard_partial_capture_file_is_wait_not_kill(tmp_path):
+def test_guard_effortless_record_with_effort_baked_fails_closed(tmp_path):
+    # A turn completed but its record carries no applied effort while an
+    # effort is baked: the proof channel is gone — unverifiable, not a pass.
     gate = _gate(tmp_path, effort=True)
     guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
-    gate.effort_capture.write_text('{"effort": {"le')  # hook mid-write
+    _stop(gate)  # record without an effort field
+    decision = guard.decision()
+    assert decision.action == GUARD_KILL
+    assert decision.category == CATEGORY_UNVERIFIABLE
+    assert "applied-effort" in decision.reason
+
+
+def test_guard_partial_journal_line_is_wait_not_kill(tmp_path):
+    gate = _gate(tmp_path, effort=True)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
+    guard.observe(_init_line("claude-sonnet-5"))
+    guard.observe(_turn_line("claude-sonnet-5"))
+    gate.stop_capture.write_text('{"effort": "lo')  # hook mid-append, no newline
     assert guard.decision().action == GUARD_WAIT
 
 
-def test_guard_no_effort_baked_ignores_the_capture_channel(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
+def test_guard_no_effort_baked_still_requires_the_probe_record(tmp_path):
+    gate = _gate(tmp_path)
+    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
     guard.observe(_init_line("claude-sonnet-5"))
     guard.observe(_turn_line("claude-sonnet-5"))
+    assert guard.decision().action == GUARD_WAIT  # boundary still required
+    _stop(gate)  # no effort field — fine, none is baked
     assert guard.decision().action == GUARD_RELEASE
 
 
