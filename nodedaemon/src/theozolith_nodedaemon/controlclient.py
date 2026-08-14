@@ -42,24 +42,41 @@ def _origin(url: str) -> tuple[str, str, int] | None:
     """(scheme, host, effective port) of an exactly-parsed http(s) URL —
     None for anything else. Exact parsing, never a prefix check: a scheme
     like 'httpsevil' or a URL with no usable hostname must not pass for
-    https."""
-    split = urllib.parse.urlsplit(url)
-    if split.scheme not in ("https", "http") or not split.hostname:
-        return None
+    https. Total over arbitrary input: urlsplit and the hostname property
+    raise ValueError themselves (unmatched IPv6 brackets, NFKC-invalid
+    netlocs) before .port is ever reached, so the whole parse sits inside
+    one boundary — every malformed URL is None here, never a leaked
+    ValueError. An explicit :0 is refused: the scheme default fills in only
+    when the port is omitted, and 0 names no dialable origin."""
     try:
+        split = urllib.parse.urlsplit(url)
+        hostname = split.hostname
         port = split.port
     except ValueError:
         return None
-    return split.scheme, split.hostname, port or (443 if split.scheme == "https" else 80)
+    if split.scheme not in ("https", "http") or not hostname or port == 0:
+        return None
+    if port is None:
+        port = 443 if split.scheme == "https" else 80
+    return split.scheme, hostname, port
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Surface every 3xx to the transport instead of following it: urllib's
     default handler re-sends the request — Authorization header included —
-    to whatever host Location names, cross-origin and plain-HTTP alike."""
+    to whatever host Location names, cross-origin and plain-HTTP alike.
+    Declining must happen at http_error_3xx, not redirect_request: urllib
+    parses Location (urlparse, then urljoin) BEFORE consulting
+    redirect_request, so a malformed Location would raise ValueError inside
+    urllib's own machinery. Unhandled here, every 3xx bounces out as a
+    plain HTTPError with its Location untouched — the transport below owns
+    ALL Location parsing behind its ControlError boundary."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    def _decline(self, req, fp, code, msg, headers):
+        return None  # unhandled → the 3xx surfaces as an HTTPError
+
+    http_error_301 = http_error_302 = http_error_303 = _decline
+    http_error_307 = http_error_308 = _decline
 
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -94,7 +111,18 @@ def _urllib_transport(ca: str | None) -> Transport:
                 # issued: only a hop that stays on the configured origin may
                 # carry the bearer token (same method and body re-sent — the
                 # control channel never wants a 303-style method switch).
-                target = urllib.parse.urljoin(target, location)
+                # urljoin parses Location with urlsplit and inherits its
+                # ValueErrors (unmatched IPv6 brackets, NFKC-invalid
+                # netlocs): a Location the parser chokes on is the same
+                # refusal, through the same ControlError boundary.
+                try:
+                    target = urllib.parse.urljoin(target, location)
+                except ValueError:
+                    raise ControlError(
+                        f"refusing redirect: malformed Location {location!r}"
+                        " (the bearer token only rides an exactly-parsed"
+                        " same-origin target)"
+                    ) from None
                 if origin is None or _origin(target) != origin:
                     raise ControlError(
                         f"refusing redirect to {target!r}: it leaves the configured"

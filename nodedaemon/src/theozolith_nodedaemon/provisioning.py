@@ -267,15 +267,22 @@ def _https_parts(url: str) -> tuple[str, int] | None:
     """(hostname, effective port) of an exactly-parsed https URL — None for
     anything else (non-https scheme, missing hostname, garbled port). Exact
     parsing, never a prefix check: a scheme like 'httpsneak' must not pass
-    for https."""
-    split = urllib.parse.urlsplit(url)
+    for https. Total over arbitrary input: urlsplit and the hostname
+    property raise ValueError themselves (unmatched IPv6 brackets,
+    NFKC-invalid netlocs) before .port is ever reached, so the whole parse
+    sits inside one boundary — every malformed URL is None here, never a
+    leaked ValueError that would bypass the ProvisionError the flow
+    documents. An explicit :0 is refused: 443 fills in only when the port
+    is omitted, and 0 names no dialable origin."""
     try:
+        split = urllib.parse.urlsplit(url)
+        hostname = split.hostname
         port = split.port
     except ValueError:
         return None
-    if split.scheme != "https" or not split.hostname:
+    if split.scheme != "https" or not hostname or port == 0:
         return None
-    return split.hostname, port or 443
+    return hostname, 443 if port is None else port
 
 
 def provision(

@@ -626,6 +626,27 @@ def test_plain_http_control_url_refused_at_construction_without_dev_flag():
     ControlClient("http://control.test", "tok", insecure_dev=True)
 
 
+def test_malformed_control_urls_are_controlerror_never_valueerror():
+    """The constructor's parse is TOTAL: on unmatched IPv6 brackets and
+    NFKC-invalid netlocs urlsplit itself raises ValueError — before .port
+    is ever reached — and an explicit :0 names no dialable origin (the
+    scheme default fills in only when the port is OMITTED). Every one is
+    the documented ControlError, dev flag or not; a leaked ValueError
+    would fail the pytest.raises."""
+    from theozolith_nodedaemon.controlclient import ControlClient, ControlError
+
+    for bad in (
+        "https://[",  # unmatched IPv6 bracket: ValueError inside urlsplit
+        "https://[::1",  # same, with address content
+        "https://evil\uff0fslash.test",  # NFKC-invalid netloc (full-width slash)
+        "https://control.test:0",  # explicit :0 — never rewritten to 443
+        "http://control.test:0",  # …and never excused by the dev flag
+    ):
+        for dev in (False, True):
+            with pytest.raises(ControlError):
+                ControlClient(bad, "tok", insecure_dev=dev)
+
+
 def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
     rig.control.secrets["admin-token"] = "the-admin-value"
     stack = container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})

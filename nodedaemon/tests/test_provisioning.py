@@ -394,7 +394,10 @@ def test_non_https_control_url_is_never_persisted(tmp_path):
     the join exchange: the exchange callable failing the test pins that
     nothing — the single-use join token included — went to the control
     channel, and no local state exists. Exact parsing, not a prefix check:
-    a scheme merely beginning with https is refused too."""
+    a scheme merely beginning with https is refused too — and the parse is
+    TOTAL: input that makes urlsplit itself raise ValueError (unmatched
+    IPv6 brackets, NFKC-invalid netlocs) dies through the same
+    ProvisionError, never as a leaked ValueError."""
     ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
     pem = ca_path.read_bytes()
 
@@ -413,6 +416,10 @@ def test_non_https_control_url_is_never_persisted(tmp_path):
         b"httpsneak://198.51.100.9\n",  # prefix trick: startswith('https')
         b"https://\n",  # no usable hostname
         b"https://198.51.100.9:no-port\n",  # unparsable port
+        b"https://[\n",  # unmatched IPv6 bracket: ValueError inside urlsplit
+        b"https://[::1\n",  # same, with address content
+        "https://evil\uff0fslash.test\n".encode(),  # NFKC-invalid netloc (full-width slash)
+        b"https://198.51.100.9:0\n",  # explicit :0 — never rewritten to the default 443
     ):
 
         def fake_get(url, answer=hostile):
@@ -462,6 +469,48 @@ def test_non_https_exchange_answer_is_never_persisted(tmp_path):
             https_post=fake_post,
         )
     assert not state.exists()
+
+
+def test_malformed_exchange_answer_url_is_provisionerror_never_valueerror(tmp_path):
+    """The exchange-answer gate is TOTAL like the bootstrap one: a control
+    URL that makes urlsplit itself raise ValueError (unmatched IPv6
+    bracket, NFKC-invalid netloc) or names the undialable :0 becomes the
+    documented ProvisionError — whose message owns up that the exchange
+    already ran and the join token is spent — never a leaked ValueError,
+    and never persisted state."""
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    pem = ca_path.read_bytes()
+
+    def fake_get(url):
+        return pem if url.endswith("/ca.pem") else b""
+
+    join = joinstring.compose(
+        addr="127.0.0.1:6965",
+        ca_sha256=tls.ca_fingerprint_sha256(pem),
+        token=b"t" * 16,
+        expires_at=int(time.time()) + 3600,
+    )
+    state = tmp_path / "state"
+    for hostile in (
+        "https://[",
+        "https://[::1",
+        "https://evil\uff0fslash.test",
+        "https://127.0.0.1:0",
+    ):
+
+        def fake_post(url, body, ca, answer=hostile):
+            return 200, json.dumps({"node_token": "tok-value", "control_url": answer}).encode()
+
+        with pytest.raises(ProvisionError, match="the exchange itself already ran"):
+            provisioning.provision(
+                join,
+                state_dir=state,
+                node_name="victim",
+                enable_systemd=False,
+                http_get=fake_get,
+                https_post=fake_post,
+            )
+        assert not state.exists()
 
 
 def test_expired_token_rejects_after_tls_with_nothing_persisted(tmp_path):
@@ -607,6 +656,39 @@ def test_cross_origin_https_redirect_is_refused_before_dialing(tmp_path):
     try:
         with pytest.raises(ControlError, match="refusing redirect"):
             client.heartbeat({"node": "box1", "stacks": []})
+    finally:
+        _stop_server(server, thread)
+
+
+def test_malformed_redirect_location_is_controlerror_before_any_dial(tmp_path):
+    """A Location that urljoin itself raises ValueError on (unmatched IPv6
+    bracket) and one whose target parses to the undialable :0 both die as
+    ControlError BEFORE any redirected request. The origin server sees
+    exactly the one original request per call — so the Authorization header
+    rode only the configured origin — and the asserted error type does the
+    rest: a dial attempt at either target could only surface as
+    ControlUnreachable, never these ControlErrors."""
+    served: list[str] = []
+
+    class Handler(_Quiet):
+        def do_POST(self):
+            served.append(self.path)
+            self._drain()
+            if self.path == "/api/v1/heartbeats":
+                self._answer(302, {"Location": "https://[::1"})  # unmatched bracket
+            else:
+                self._answer(302, {"Location": "https://127.0.0.1:0/loot"})  # explicit :0
+
+    server, thread, ca_path = _tls_server(tmp_path, Handler)
+    client = ControlClient(
+        f"https://127.0.0.1:{server.server_address[1]}", "bearer-secret", ca=str(ca_path)
+    )
+    try:
+        with pytest.raises(ControlError, match="malformed Location"):
+            client.heartbeat({"node": "box1"})
+        with pytest.raises(ControlError, match="leaves the configured"):
+            client.emit_event({"kind": "probe"})
+        assert served == ["/api/v1/heartbeats", "/api/v1/events"]
     finally:
         _stop_server(server, thread)
 
