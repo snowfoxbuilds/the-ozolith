@@ -84,9 +84,10 @@ The identity is held **by best effort, failing loud on detection**:
   **latches** the driver: no work is fetched and the probe is never
   re-spent, the reason is reported to the Control Node's error feed
   (re-sent until it lands), and the operator retries by restarting the
-  driver after the fix. Only a dry-run that could not execute at all
-  (container-engine or filesystem breakage, plausibly transient) is
-  retried, with backoff. The dry-run is strict
+  driver after the fix. Only a dry-run that delivered no verdict — it
+  could not execute at all, or the session broke without the anchored
+  identity marker (plausibly transient either way) — is retried, with
+  backoff. The dry-run is strict
   (a probe with no signal is a broken observation channel); the per-Run
   monitor is lenient (gaps recorded). Its dot-prefixed job dir is
   invisible to the evidence sweep and queue-behind.

@@ -549,8 +549,9 @@ combination fails loud at setup, in seconds, without burning issues or
 claims — a dry-run verdict **latches** the driver: it fetches no work and
 never re-spends the probe, the reason is reported to the Control Node's
 error feed (`theozolith status` shows recent errors), and you retry by
-restarting the driver after fixing the cause. A dry-run that could not
-execute at all (container engine down) is retried with backoff. Model-less
+restarting the driver after fixing the cause. A dry-run that delivered no
+verdict (container engine down, or the session broke before answering) is
+retried with backoff. Model-less
 images pass trivially; the dot-prefixed dry-run job dir is invisible to the
 evidence sweep and queue-behind.
 

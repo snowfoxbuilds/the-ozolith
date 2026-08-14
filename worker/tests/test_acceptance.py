@@ -1117,6 +1117,8 @@ def test_dry_run_latch_loop_backs_off_without_respending_the_probe(harness: Harn
     # The acceptance harness polls at 0s; backoff only shows over a real base.
     worker.config = replace(harness.worker_config, poll_seconds=60.0)
     delays: list[float] = []
+    idles: list[int] = []
+    worker.on_idle = lambda: idles.append(1)  # type: ignore[method-assign]
 
     def sleeper(seconds: float) -> None:
         delays.append(seconds)
@@ -1127,6 +1129,50 @@ def test_dry_run_latch_loop_backs_off_without_respending_the_probe(harness: Harn
         worker.run(sleep=sleeper)
     assert len(dryruns) == 1  # the probe was spent exactly once
     assert delays == sorted(delays) and delays[-1] > delays[0]  # backing off
+    # The idle hook keeps running while latched: parked evidence from a
+    # predecessor crash retries its publication (ADR-0016) regardless of the
+    # identity gate.
+    assert len(idles) == len(delays)
+
+
+def test_dry_run_session_breakage_without_a_verdict_is_not_latched(harness: Harness):
+    """A SessionError WITHOUT the anchored identity marker (container died
+    early, wait timeout) decided nothing about the identity: plausibly
+    transient, retried — never latched."""
+    number = harness.file_issue("Recovered", CRITERIA_BODY)
+    real_factory = harness.session_factory
+    breakage = ["run container exited before the agent phase completed"]
+
+    def flaky_factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN and breakage:
+            message = breakage.pop()
+
+            def die():
+                raise SessionError(message)
+
+            session.wait_for_agent = die  # type: ignore[method-assign]
+        return session
+
+    worker = _persistent_worker(harness, flaky_factory)
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == ""  # no verdict: no latch
+    assert worker.run(once=True) == 1  # next pass retries the dry-run; work flows
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert harness.fake.pulls[pr_number]["head"] == branch_for(number)
+
+
+def test_dry_run_sweeps_a_predecessors_stale_dot_dir(harness: Harness):
+    """A driver killed mid-dry-run runs no finally block and the evidence
+    sweep skips dot-prefixed dirs by design — the next dry-run clears the
+    leavings (the jobs dir is per-Stack: they are always ours)."""
+    stale = Path(harness.worker_config.jobs_dir) / ".identity-dryrun-deadbeef"
+    (stale / "output").mkdir(parents=True)
+    (stale / "output" / "status.json").write_text("{}")
+    harness.file_issue("Cleaned", CRITERIA_BODY)
+
+    assert harness.worker_once() == 1
+    assert not stale.exists()
 
 
 def test_dry_run_infra_failure_is_retried_not_latched(harness: Harness):

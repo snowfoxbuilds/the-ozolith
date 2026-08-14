@@ -557,6 +557,18 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
                 " worker-type fields baked into the derived image (ADR-0045);"
                 f" edit worker-types/{worker_type}.toml"
             )
+    if "THEOZOLITH_RUN_IMAGE" in env:
+        # Not inert — the opposite: after ADR-0045 the run-image tag IS the
+        # model, so a per-placement override here would silently run a
+        # different identity than the worker-type definition declares (and
+        # the dry-run would validate the substituted image's own identity,
+        # happily). The type owns the image (ADR-0044 thin Stacks).
+        raise ConfigRepoError(
+            f"{context}: [env] THEOZOLITH_RUN_IMAGE cannot be overridden on a"
+            " worker-type Stack — the run-image tag carries the baked"
+            " model/effort identity (ADR-0045); change"
+            f" worker-types/{worker_type}.toml instead"
+        )
     return StackDef(
         name=name,
         kind="",  # derived at resolution: driver type -> process, else container

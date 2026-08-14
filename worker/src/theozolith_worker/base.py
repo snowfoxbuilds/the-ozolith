@@ -152,6 +152,10 @@ class Worker:
                             )
                     if once:
                         return count
+                    # The idle hook still runs while the gate fails: parked
+                    # evidence from a predecessor crash must keep retrying its
+                    # publication (ADR-0016) — identity says nothing about it.
+                    self.on_idle()
                     sleep(backoff_delay(self.config.poll_seconds, identity_streak))
                     continue
                 identity_streak = 0
@@ -198,6 +202,12 @@ class Worker:
         sweep and to queue-behind; model-less images pass trivially."""
         jobs_root = Path(self.config.jobs_dir)
         jobs_root.mkdir(parents=True, exist_ok=True)
+        # A predecessor killed mid-dry-run (daemon SIGTERM/SIGKILL) runs no
+        # finally block, and the evidence sweep skips every dot-prefixed dir
+        # by design — so each attempt clears its predecessors' leavings (the
+        # jobs dir is per-Stack, ADR-0022: they are always ours, never live).
+        for stale in jobs_root.glob(".identity-dryrun-*"):
+            shutil.rmtree(stale, ignore_errors=True)
         name = f".identity-dryrun-{secrets.token_hex(4)}"
         job = jobdir.create_job_dir(jobs_root, name)
         try:
@@ -224,11 +234,28 @@ class Worker:
             finally:
                 session.finish()
         except SessionError as exc:
-            # The dry-run RAN and failed: a deterministic verdict about this
+            detail = identity_error_detail(str(exc))
+            if detail is None:
+                # Session breakage WITHOUT an identity verdict (the container
+                # died before the harness answered, the wait timed out): the
+                # anchored marker is absent, so nothing was decided about the
+                # identity — plausibly transient, retry with backoff like any
+                # could-not-execute failure.
+                self.log(
+                    f"identity dry-run could not complete ({exc})"
+                    " — no work will be fetched until it passes; retrying with backoff"
+                )
+                emit_error(
+                    self.sink,
+                    self.config,
+                    error_class="IdentityDryRun",
+                    message=f"identity dry-run could not complete: {exc}",
+                )
+                return False
+            # The dry-run RAN and delivered a verdict: deterministic for this
             # image/credential/policy combination. Latch — run() reports the
             # reason to the Control Node and no probe is spent again until
             # the operator restarts the driver after fixing it.
-            detail = identity_error_detail(str(exc)) or str(exc)
             self.identity_block = detail
             self.log(
                 f"identity dry-run FAILED for {self.config.run_image}: {detail}"
