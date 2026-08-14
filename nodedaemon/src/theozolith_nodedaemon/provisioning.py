@@ -401,9 +401,7 @@ def _persist(state_dir: Path, files: dict[str, str]) -> None:
         _persist_one(state_dir / name, content, private=name == NODE_TOKEN_FILE, owner=owner)
 
 
-def _persist_one(
-    path: Path, content: str, *, private: bool, owner: tuple[int, int] | None
-) -> None:
+def _persist_one(path: Path, content: str, *, private: bool, owner: tuple[int, int] | None) -> None:
     """Write one state file atomically and symlink-safely.
 
     mkstemp creates a fresh regular file (no destination symlink to follow),
