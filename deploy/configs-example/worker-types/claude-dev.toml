@@ -20,28 +20,25 @@ adapter = "claude"               # the Agent adapter the harness invokes
 # config load; a value the adapter cannot map refuses to load (ADR-0045).
 # Pin the most-dated provider ID the adapter offers; family aliases
 # (fable/haiku/opus/sonnet) load but warn; "default"/"opusplan" refuse to
-# load (unenforceable as a single pinned model). effort is optional
+# load (neither names a single checkable model). effort is optional
 # ("" = the model's default), driver types only, and validated as a PAIR
 # with the model: a level this model silently clamps or ignores (e.g.
 # xhigh on the 4.6 generation, anything on haiku) refuses to load, as does
 # any effort on a model whose capability the adapter does not positively
-# know. Enforcement fails closed end to end (ADR-0045 amendments): the
-# build rejects conflicting managed settings/drop-ins/policyHelper in the
-# base image and bakes forceRemoteSettingsRefresh (fresh org policy at
-# every session start), and at runtime the harness proves the effective
-# identity with the Run's own credential behind a real boundary — the
-# task file leaves the disk, canaries and a no-tool probe run in a
-# neutral scratch with tools and project sources removed, and the task
-# session (tools denied until release, task delivered only after its
-# probe turn completely stopped) starts only after the proof — a
-# substituted, widened, clamped, or unverifiable identity fails the Run
-# as failure_class "identity" with a stable category, and one deadline
-# (agent_timeout_seconds) budgets verification and task together
-# (deploy/README.md). NOTE the gated task session loads NO user/project/
-# local settings source: nothing a checkout's .claude/settings.json
-# declares can steer it — and the checkout's CLAUDE.md, skills, and
-# slash commands do not load either; the pipeline's rendered task file
-# is the session's complete assignment.
+# know. The identity is held BY BEST EFFORT (ADR-0045): the bake writes a
+# managed model DEFAULT for the MAIN agent (it outranks checkout/user
+# settings; the harness passes no --model) plus a managed-env effort pin;
+# subagents, skills routed through subagents, and background helpers stay
+# FREE to use other models — enforcement is main-agent-only. The driver
+# runs one identity dry-run container per boot (fails loud at setup, not
+# per Run), each Run gets free static checks plus a fail-loud monitor
+# that kills the session on a DETECTED off-identity main-agent turn or an
+# identity-shaped mid-run settings change (failure_class "identity" with
+# a stable category), and detection gaps are recorded in evidence, never
+# blocking. The task session runs NORMALLY: the checkout's CLAUDE.md,
+# skills, slash commands, settings, and hooks all load (deploy/README.md
+# lists the accepted gaps, e.g. --model beats the default — nothing in
+# the pipeline passes it).
 # effort = "high"
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works

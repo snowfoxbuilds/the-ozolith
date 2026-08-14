@@ -488,256 +488,161 @@ partition, including `store.db`, which only exists once a node or secret does).
 `model` (required with a driver) and `effort` (optional, driver types only) are
 typed fields on the worker-type definition, validated at config load against
 the Agent adapter and **baked into the derived image**: control appends one
-synthesized `theozolith-adapter materialize` setup step to the recipe.
+synthesized `theozolith-adapter materialize` setup step to the recipe. The
+identity is held **by best effort, failing loud on detection** — selection
+makes the right model happen; a detected wrong identity fails the Run with
+evidence; a gap that prevents detection is recorded, never silently ignored
+and never blocking.
 
-For the Claude adapter that step writes `/etc/claude-code/managed-settings.json`
-with the actual enforcement keys — a bare managed `model` (or `effortLevel`) is
-only a session *default* the session can steer away from, so the identity is
-held by:
+For the Claude adapter the materialize step writes
+`/etc/claude-code/managed-settings.json` with:
 
-- a single-entry `availableModels` allowlist plus `enforceAvailableModels`,
-  which constrains every model-selection surface (`--model`, `/model`,
-  `ANTHROPIC_MODEL`, checked-in `.claude/settings.json`, subagent frontmatter
-  `model:`, `CLAUDE_CODE_SUBAGENT_MODEL`) — blocked values substitute back to
-  the pin or hard-error, never run;
-- the managed `env` entry `CLAUDE_CODE_EFFORT_LEVEL`, which overrides
-  `/effort`, `--effort`, the process environment, and any settings-file
-  `effortLevel`.
+- a managed `model` **session default** for the MAIN agent — the managed tier
+  outranks the checkout's `.claude/settings.json`/`settings.local.json` and
+  the user tier for the same key (verified live), and the harness passes no
+  `--model`;
+- for effort, the managed `env` entry `CLAUDE_CODE_EFFORT_LEVEL`, which
+  overrides `/effort`, `--effort`, the process environment, and any
+  settings-file `effortLevel` (verified live, including survival of the
+  per-key managed env merge beside foreign drop-in env blocks).
+
+**Enforcement is main-agent-only — deliberately.** There is NO
+`availableModels` allowlist: subagents run their declared frontmatter models,
+skills route freely, and the CLI's background helpers use their own small
+models (all verified live as capabilities, not escapes). Every identity check
+scopes to main-agent stream events. One documented edge: a skill that
+switches the MAIN thread's model will fail the Run — route cheap/heavy work
+through subagents instead.
 
 **The build fails closed on conflicting policy.** Claude Code merges the base
 managed file with every `/etc/claude-code/managed-settings.d/*.json` drop-in
-(base first, then alphabetical; scalars override, arrays **concatenate**,
-objects deep-merge), and a managed `policyHelper`/`policyHelpers` preempts the
-entire managed tier. The materialize step therefore inspects all of those
-sources in merge order and **fails the build naming the file and key** when
-any carries an identity-affecting key: `model`, `availableModels`,
-`enforceAvailableModels`, `fallbackModel`, `effortLevel`, a policy helper, or
-a model/effort-selecting `env` entry (`ANTHROPIC_MODEL`,
-`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`,
-`CLAUDE_CODE_EFFORT_LEVEL`), `modelOverrides` (it remaps what actually
-*serves* a model ID — provider inference profiles/deployments — while the
-allowlist still sees the Anthropic ID), or a provider/endpoint redirect
-(`ANTHROPIC_BASE_URL`, `ANTHROPIC_*_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`/
-`VERTEX`, `ANTHROPIC_SMALL_FAST_MODEL`) — behind a foreign endpoint the
-stream's model names are whatever that endpoint claims, so the identity is
-unprovable. Conflicting operator policy is never silently deleted or
-overwritten — remove or relocate it, or drop the worker type's model/effort.
-Unrelated managed keys (permissions, hooks, foreign `env` entries, drop-ins
-without identity keys) survive untouched. A malformed managed document also
-fails the build: unknowable policy is not policy.
+(base first, then alphabetical; scalars override, arrays concatenate,
+objects deep-merge), and a managed `policyHelper`/`policyHelpers` preempts
+the entire managed tier. The materialize step inspects all of those sources
+in merge order and **fails the build naming the file and key** when any
+carries an identity-affecting key: `model`, `availableModels`,
+`enforceAvailableModels`, `fallbackModel`, `effortLevel`, a policy helper,
+`modelOverrides`, or a model/effort/endpoint-selecting `env` entry
+(`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_EFFORT_LEVEL`,
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_*_BASE_URL`,
+`CLAUDE_CODE_USE_BEDROCK`/`VERTEX`, `ANTHROPIC_SMALL_FAST_MODEL`).
+Conflicting operator policy is never silently deleted or overwritten —
+remove or relocate it, or drop the worker type's model/effort. Unrelated
+managed keys survive untouched. A malformed managed document also fails the
+build: unknowable policy is not policy.
 
-The materialized artifact also sets **`forceRemoteSettingsRefresh: true`**:
-Claude Code documents it as "block startup until server-managed settings are
-freshly fetched; exit on fetch failure", so every session the gate runs —
-canaries, probe, and the task itself — starts on fresh organization policy,
-never a stale cache or a first-launch async fetch. An operator already
-setting it to `true` merges cleanly; any other value (including `false` in a
-drop-in) fails the scan. **Images built before this amendment fail the
-runtime preflight** (`identity-inconsistent`, naming the missing key) —
-rebuild derived images after upgrading.
+The minimum in-image CLI is **Claude Code 2.1.232**: the
+managed-over-checkout model-default precedence, the per-key managed `env`
+merge (2.1.223), the Stop-hook applied-effort payload, and the ConfigChange
+hook were all verified live there. The materialize step probes
+`claude --version` in-image and fails the build below that floor; the setup
+dry-run enforces the same floor at runtime.
 
-The minimum in-image CLI is **Claude Code 2.1.232**: the enforcement
-settings are older (allowlist enforcement 2.1.175, family-alias substitution
-2.1.222, per-key managed `env` merge 2.1.223), but the fail-closed gate also
-relies on the Stop-hook applied-effort payload, the ConfigChange hook, the
-`--setting-sources`/`--tools` isolation flags, `--permission-mode dontAsk`,
-the PreToolUse deny hook binding under `--dangerously-skip-permissions`, and
-the freshness key — the whole set verified live on 2.1.232. The materialize
-step probes `claude --version` in-image and fails the build below that
-floor; the runtime preflight enforces the same floor per Run.
+**One setup dry-run per driver boot — never a per-Run probe.** Before a
+driver takes any work it commissions one `identity-dryrun` container: the
+zero-cost static checks, the CLI floor, and ONE neutral no-tool probe
+session with the Run credential that must announce and execute the baked
+model and (when effort is baked) report the baked level as the *applied*
+effort via the Stop-hook payload. A broken image/credential/policy
+combination fails loud at setup, in seconds, without burning issues or
+claims — the driver fetches no work while the dry-run fails and retries it
+each pass. Model-less images pass trivially; the dot-prefixed dry-run job
+dir is invisible to the evidence sweep and queue-behind.
 
-**Runs are gated at runtime, behind a real pre-verification boundary.**
-Server-managed organization settings outrank the baked file inside the
-managed tier, and the CLI exposes no machine-readable dump of the effective
-policy — so the harness proves the identity *behaviorally*, with the Run's
-own credential, and nothing unverified ever gets task capability:
-
-1. **The task leaves the disk first** — the harness reads `input/prompt.md`
-   into memory and removes it before any verification subprocess exists. No
-   pre-verification process can read the task, because there is no task to
-   read.
-2. **Static re-checks** — the conflict scan again (catches anything mounted
-   over the image), the managed pin's consistency with the well-known
-   `/etc/theozolith/model` / `effort` files (including the freshness key),
-   pair validity, and a **process-environment audit**: an identity or
-   endpoint variable in the container environment fails the Run, name
-   printed, value redacted.
-3. **Neutral canaries and probe** — every verification session runs in a
-   scratch directory *outside the job mount* with all built-in tools removed
-   (`--tools ""`), permission prompts auto-denied (`--permission-mode
-   dontAsk`), no user/project/local settings (`--setting-sources ""` — the
-   managed tier always applies; that is the policy under test), and no
-   non-managed MCP servers (`--strict-mcp-config`). A substituted model that
-   emits a tool call gets a denial, not an execution, and there is no
-   project CLAUDE.md, settings file, hook, or skill anywhere to load:
-   - a **widen canary** asking for an intruder `--model` of a different
-     family — under an intact single-entry allowlist every selection surface
-     coerces back to the pin;
-   - a **same-family canary** for full-ID pins (enforcement that quietly
-     matched at family granularity would pass the first canary and still run
-     the wrong model). The sibling is always **genuinely distinct**: never
-     an undated prefix of the pin (the provider resolves undated IDs to
-     their newest dated variant, so bare `claude-sonnet-4-6` could resolve
-     to a dated 4.6 pin and prove nothing); a known multi-member family with
-     no usable distinct sibling fails the preflight `unverifiable` rather
-     than running a vacuous canary. Aliases skip it — family members are
-     their contract — and single-member families (fable, mythos) have no
-     sibling to ask for: there the widen canary and the in-session monitor
-     remain the proof (a documented, deliberate difference);
-   - an **identity probe** with no `--model` at all: the session the
-     effective policy picks by itself must **announce AND execute** the
-     baked model — both signals present and matching, for the canaries and
-     the probe alike; a stream with no init announcement is `unverifiable` —
-     and, when effort is baked, a `Stop`-hook capture must report the baked
-     level as the *applied* effort (the Stop payload carries the post-clamp
-     value after a plain no-tool turn — verified live — so an organization
-     cap is observed without executing any tool). Matching strips the CLI's
-     context-window decoration (`claude-opus-5[1m]` announces the same
-     model `claude-opus-5` executes).
-   Neither canary proves the *absence* of conditional fallback or of
-   server-side overrides that only trigger later — that residual is exactly
-   what the in-session monitor below exists for.
-4. **A gated task session, launched only after that proof** — stdin-driven,
-   and itself loading **no user, project, or local settings source**
-   (`--setting-sources ""`): an initial checkout or home-directory settings
-   key — `env.ANTHROPIC_BASE_URL`, a Bedrock/Vertex switch,
-   `modelOverrides`, a model/effort selector, a policy helper, or an
-   identity surface not yet invented — can never enter the one session that
-   will hold the task, because the sources it would ride simply never load
-   (verified live with a booby-trapped checkout, plus a positive control
-   proving the same trap fires without the flag). The documented cost: the
-   checkout's CLAUDE.md, skills, and slash commands ride the project
-   settings source and do not load either — the driver-rendered task file
-   is the session's complete assignment. `--settings` hooks stay active
-   under the flag (verified live): a PreToolUse hook **denies every tool
-   call until a release marker exists** (binding even under
-   `--dangerously-skip-permissions` — verified live), a `Stop` hook —
-   registered for every gated session, effort baked or not — appends one
-   value-redacted record per **completed turn** (the turn-boundary
-   journal), and a `ConfigChange` hook records identity-relevant
-   mid-session settings changes (it never *blocks* a change — organization
-   policy is never resisted; a recorded change kills the Run instead). The
-   first turn is a no-op probe; only after this session's own init
-   announcement and executed turn match, the probe's boundary record exists
-   (the probe has **completely stopped** — release never rides the first
-   matching assistant event), and the applied effort matches (when baked)
-   does the harness run the **atomic release**: open the tool gate, write
-   the task file back, deliver the pointer prompt, close stdin. `released`
-   is recorded only once the prompt has actually entered the process; a
-   broken pipe during delivery fails the Run as `task-delivery`, a failing
-   stdin close as `stdin-close` — never a silent pass.
-5. **A live monitor with a completion bar** — after release the harness
-   keeps reading the stream: a turn executing on another model, a completed
-   turn with a drifted applied effort, or a recorded identity-affecting
-   ConfigChange kills the agent immediately and invalidates the Run. Probe
-   and task turns are counted **from the boundary journal** — completed
-   turns attributed by release state, so a residual probe event the
-   transcript pump delivers late can never read as the task being processed
-   — and an exit — even exit 0 — with **no completed post-release turn** is
-   a failed Run (`task-unprocessed`): a stdin EOF race or leftover probe
-   output can never become a completed Run that did nothing.
-
-**One deadline budgets the whole Run.** The end-to-end clock starts before
-the preflight and covers everything: the CLI version probe, every canary,
-the identity probe, the gated release wait, and the task itself all run
-under what remains of the worker type's `agent_timeout_seconds` (each
-verification step additionally capped by a per-session safety maximum).
-Verification never silently extends the task budget, exhausting the budget
-before release fails `preflight-timeout` with the task still withheld, and
-the driver's own container wait (agent timeout + grace) can never expire
-before the harness's own verdict is on disk.
+**Runs are watched, never gated.** The task session launches exactly as an
+unbaked image would — pointer prompt in the argv, task file on disk, and the
+checkout's CLAUDE.md, skills, slash commands, settings, and hooks loading
+normally (they belong to the work). Two observation hooks ride `--settings`:
+a Stop hook journaling one value-redacted applied-effort record per
+completed turn, and a ConfigChange hook recording identity-relevant
+mid-session settings changes (it never *blocks* a change — organization
+policy is never resisted). The harness reads the stream as it grows and
+**kills the session on a positive detection only**: a main-agent turn
+executing off the baked model, an off-identity init announcement, or a
+recorded ConfigChange. After exit the last applied-effort observation is
+checked — a detected clamp fails the Run as `effort-clamped`. Missing
+observations (no init, no turn signal, no Stop record) are **gaps recorded
+in evidence, not failures**. Identity comparisons strip the CLI's
+context-window decoration (`claude-opus-5[1m]` announces the same model
+`claude-opus-5` executes).
 
 Identity failures carry a distinct `failure_class: identity` (the local-retry
-budget still applies uniformly, ADR-0016) and a diagnostic naming the
-expected model/effort, the mismatch category (`policy-conflict`,
-`identity-inconsistent`, `pair-invalid`, `cli-too-old`, `unavailable`,
-`substituted`, `policy-widened`, `effort-clamped`, `unverifiable`,
-`preflight-timeout`, `config-changed`, `task-delivery`, `stdin-close`,
-`task-unprocessed`), and the confirmation the task was not started. **Every**
-identity failure writes the redacted `output/identity.json` record — a
-corrupt or half-declared identity is `identity-inconsistent`, and a boundary
-that cannot even be established (scratch, task-withholding, or hook-script
-I/O failure) is `unverifiable` with the failing step named — never a generic
-harness crash without evidence. The evidence bundle embeds the same verdict
-as an `identity` object (expected vs observed model/effort, preflight/gate
-status and category, completed probe/task turn counts, CLI version) —
-categories and model names only, never credentials or settings contents.
-The preflight and probe turns spend a few hundred tokens per Run; that is
-the price of proof. A worker type with no `model`/`effort` bakes no identity
-and launches exactly as before — no gate, no probe, no extra cost.
+budget still applies uniformly for now — the carve-out is #42) and a
+diagnostic naming the expected model/effort and the category
+(`policy-conflict`, `identity-inconsistent`, `pair-invalid`, `cli-too-old`,
+`unavailable`, `substituted`, `effort-clamped`, `unverifiable`,
+`preflight-timeout`, `config-changed`). Every identity failure writes the
+redacted `output/identity.json` record — corrupt or half-declared identity
+declarations are `identity-inconsistent`; an unwritable hook scratch is
+`unverifiable` — and evidence embeds it as an `identity` object (expected vs
+observed model/effort, check status, violation, gap notes): categories and
+names only, never credentials or settings contents.
 
 **Reviewer identity failures terminate visibly.** A review session killed by
-the identity gate takes the Reviewer's one-strike lane (ADR-0014's shape):
-the harness's identity.json and the available transcript are published to
-the evidence bundle with `failure_class: identity`, then the PR turns
-`blocked` + `needs_human` (losing `pr_ready`) in the same pass — the PR
-leaves the reviewable pool instead of relaunching an identical doomed review
-on every poll. The identity marker is matched **anchored** (it must begin
-the harness's status error), in the Reviewer and the Implementer alike; any
-other session breakage keeps its existing behavior.
+the identity monitor takes the Reviewer's one-strike lane: identity.json and
+the available transcript are published to the evidence bundle with
+`failure_class: identity`, then the PR turns `blocked` + `needs_human`
+(losing `pr_ready`) in the same pass — it leaves the reviewable pool instead
+of relaunching an identical doomed review every poll. The identity marker is
+matched **anchored** in both drivers; other session breakage keeps its
+existing behavior.
 
-Trust boundaries, stated honestly: the release gate rides on transcript
-events (authored by the CLI) and on the neutral preflight; the Stop/
-ConfigChange capture files are same-user filesystem state, so post-release
-they are a fail-closed channel only — checkout code that forges a "matching"
-capture changes nothing (release still required the transcript proof and the
-preflight), and a forged mismatch only fails that Run. Project hooks,
-CLAUDE.md, settings, and skills never load in any gated session at all —
-the checkout influences the Run only through the task file and the code the
-released session chooses to read.
+**Known, accepted gaps** (ADR-0045, stated plainly): a checkout-committed
+`env.ANTHROPIC_BASE_URL` could make the stream's self-reported identity
+unfalsifiable (ruled out of the threat model — checkouts are your own
+repositories and run containers are credential-limited, ADR-0013);
+`--model` beats the managed default (the harness never passes it; anything
+else that does is killed at its first main-agent turn); org-policy drift
+between dry-run and Run is caught at the Run's own turn stamps; a
+wrong-identity Run spends tokens until its first detected turn.
 
 **Model/effort pairs validate together.** An effort is accepted only when the
 *specific* model provably honors it: Claude Code silently runs an unsupported
 level as the highest supported level at or below it (`xhigh` runs as `high`
 on the 4.6 generation) and silently ignores effort on models without the
 setting (haiku-family, sonnet-4-5 and older), so those pairs are refused at
-config load, at build, and at preflight. An unknown future model paired with
-an effort is refused too — bake the model alone (`effort = ""`, the model's
-own default) or upgrade to a release that knows it. An organization effort
-cap that would clamp the baked value is a preflight failure, never an
-accepted downgrade.
+config load, at build, and at the static checks. An unknown future model
+paired with an effort is refused too — bake the model alone (`effort = ""`,
+the model's own default) or upgrade to a release that knows it. An
+organization effort cap that would clamp the baked value fails the dry-run
+(and, if it appears later, the post-exit effort check) — never an accepted
+downgrade.
 
-Family aliases (`sonnet`, `opus`, `haiku`, `fable`) load with a pin-the-dated-ID
-warning and bind the image to the newest model of that family; at the runtime
-gate an alias accepts any executed model of exactly that family, while a
-pinned/full ID requires an exact resolved match (an undated pin the provider
-resolves to a dated ID fails — pin the dated ID). `default` and
-`opusplan` are **refused at config load**: the CLI accepts them as selections,
-but neither names a single enforceable model (`default` floats with the account
-tier and fails under the allowlist; `opusplan` is a two-model mode that
-degrades under enforcement). `effort` on a driverless (Flight Deck) type is
-also refused — interactive scope bakes only `/etc/theozolith/model`, and no
-Flight Deck runtime consumes a baked effort yet.
+Family aliases (`sonnet`, `opus`, `haiku`, `fable`) load with a
+pin-the-dated-ID warning and resolve the default to the newest model of that
+family; at the identity checks an alias accepts any executed model of
+exactly that family, while a pinned/full ID requires an exact resolved match
+(an undated pin the provider resolves to a dated ID fails — pin the dated
+ID). `default` and `opusplan` are **refused at config load**: neither names
+a single checkable model (`default` floats with the account tier;
+`opusplan` is a two-model mode). `effort` on a driverless (Flight Deck)
+type is also refused — interactive scope bakes only `/etc/theozolith/model`,
+and no Flight Deck runtime consumes a baked effort yet.
 
-Run evidence keeps the post-run reconciliation as defense-in-depth: the
-**observed** model from the session stream (init announcement, executed
-assistant turns, usage records), with any drift in the bundle's `model_note`
-— but the runtime gate above, not the post-run record, is the enforcement.
+Run evidence reports the **observed** model reconciled from the session
+stream's MAIN-agent signals (init announcement, executed main-agent turns,
+usage records), with any drift in the bundle's `model_note`; subagent and
+helper models are legitimate and excluded from identity reconciliation.
 
-The enforcement behavior is verified live against **Claude Code 2.1.232** by
+The identity behavior is verified live against **Claude Code 2.1.232** by
 the worker package's opt-in suite (`THEOZOLITH_LIVE_CLAUDE=1
-uv run pytest worker/tests/test_live_enforcement.py`), including the whole
-gated harness driven end to end through the real `run_harness` (withheld
-task → neutral preflight → gated session → release → task turn, with
-exactly one probe and one task record in the turn journal), its
-failed-preflight twin proving the task session — project hooks included —
-never exists when the gate fails, and the task-session isolation pair: a
-checkout booby-trapped with `env.ANTHROPIC_BASE_URL`, a model selector, a
-SessionStart hook, and a CLAUDE.md never reaches the gated task session,
-while the positive control proves the same trap fires without
-`--setting-sources ""`. The suite installs and removes real
-`/etc/claude-code` (and `/etc/theozolith`) policy — **run it only in an
-isolated Linux container**, never on a workstation with real managed
-settings. Two cases stay outside it: a real organization effort cap is
-server-side Enterprise policy no local fixture can create
-(`test_org_effort_cap_is_a_preflight_failure`, opt-in via
+uv run pytest worker/tests/test_live_enforcement.py`), including: the
+managed default binding the main session and outranking checkout
+project/local settings; `--model` escaping by design (the documented gap);
+subagent frontmatter running its own model while the main agent holds the
+default; every effort surface losing to the managed env pin; the Stop-hook
+applied/clamped-effort payloads; the dry-run passing on a healthy image and
+failing loud on a bogus model; and the monitored `run_harness` end to end —
+checkout CLAUDE.md reaching the task session, checkout hooks firing, and a
+clean identity record with the journaled applied effort. The suite installs
+and removes real `/etc/claude-code` (and `/etc/theozolith`) policy — **run
+it only in an isolated Linux container**. One case stays outside it: a real
+organization effort cap is server-side Enterprise policy no local fixture
+can create (`test_org_effort_cap_fails_the_dry_run`, opt-in via
 `THEOZOLITH_LIVE_CLAUDE_ORG_CAP=1` against a capped credential; the clamp
-*observation* it relies on is proven live by the Stop-hook clamp test and
-the guard verdict by the unit suite), and `forceRemoteSettingsRefresh`'s
-refusal-on-fetch-failure cannot be isolated locally — blackholing the
-settings endpoint also kills the model endpoint, which fails closed anyway
-(no turn executes, nothing releases; verified by hand) — so that half rests
-on Claude Code's documented behavior.
+observation it relies on is proven live by the Stop-hook clamp test and in
+units by the journal tests).
 
 Removed with **no fallback** (a leftover export now fails the driver loudly):
 `IMPLEMENTER_MODEL` / `REVIEWER_MODEL` / `THEOZOLITH_MODEL`, the Stack `[env]`
@@ -745,12 +650,16 @@ model override, and the `--model` invocation flag. Custom drivers (ADR-0042)
 no longer declare a `default_model` class attribute — delete it from your
 `drivers/*.py` when upgrading.
 
-Migration rule: when you first set (or next change) `model` on a worker type,
+Migration notes: when you first set (or next change) `model` on a worker type,
 **bump `base` to a release that ships `theozolith-adapter` in the same edit** —
 an older base fails the build loudly ("command not found", or the CLI-version
 preflight above), and both edits change the tag anyway, so it costs one
 rebuild. Worker types with no `model`/`effort` keep byte-identical tags across
-this release and rebuild nothing.
+this release and rebuild nothing. Images built by the earlier fail-closed
+revision (with the `availableModels` allowlist and
+`forceRemoteSettingsRefresh`) keep working — they are tolerated as *stricter*
+(subagents stay pinned to the model there) until their next rebuild picks up
+the default-only artifact.
 
 ## Job-dir ownership
 
