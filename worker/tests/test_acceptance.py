@@ -1380,46 +1380,42 @@ def test_stale_branch_from_crashed_run_is_overwritten(harness: Harness):
 
 
 def test_identity_gate_failures_are_a_distinct_class_with_identity_evidence(harness: Harness):
-    """ADR-0045 fail-closed amendment: a harness identity failure (preflight,
-    gate, or mid-run drift) classifies as failure_class "identity" — distinct
-    from plain harness breakage — and the evidence bundle embeds the
-    harness's identity verdict (expected vs effective, category, and the
-    confirmation the task prompt was withheld) without any new wire key."""
+    """ADR-0045: a harness identity failure (static checks or a monitor
+    kill) classifies as failure_class "identity" — distinct from plain
+    harness breakage — and the evidence bundle embeds the harness's identity
+    record (expected vs observed, the stable category, the violation)
+    without any new wire key. The record here is exactly the shape
+    harness/main.py writes."""
     from theozolith_worker import jobdir as jd
 
     number = harness.file_issue("Pinned", CRITERIA_BODY)
+    violation = "a main-agent turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
 
-    def gate_refuses(prompt: str, cwd: Path) -> None:
-        # What the real harness leaves behind when the gate fails: the
-        # identity verdict in the job dir, and a PHASE_FAILED status whose
+    def monitor_kills(prompt: str, cwd: Path) -> None:
+        # What the real harness leaves behind after a monitor kill: the
+        # identity record in the job dir, and a PHASE_FAILED status whose
         # error carries the identity marker (surfaced as a SessionError).
         jd.write_identity(
             cwd.parent,
             {
                 "expected_model": "claude-sonnet-5",
                 "expected_effort": "low",
-                "preflight": "failed:policy-widened",
-                "detail": "the canary asked for 'claude-haiku-4-5' and executed claude-haiku-4-5",
-                "cli_version": "2.1.231 (Claude Code)",
-                "canary_model": "claude-haiku-4-5",
-                "released": False,
-                "violation": "",
+                "checks": "passed",
+                "category": "substituted",
+                "detail": "",
                 "observed_model": "",
                 "observed_effort": "",
+                "violation": violation,
+                "notes": [],
             },
         )
-        raise SessionError(
-            "harness failed: identity: preflight failed [policy-widened] for"
-            " model 'claude-sonnet-5', effort low: the effective policy does"
-            " not coerce every selection to the baked model (the real task"
-            " prompt was not sent)"
-        )
+        raise SessionError(f"harness failed: identity: [substituted] {violation}")
 
-    harness.worker_behaviors.extend([gate_refuses, gate_refuses])
+    harness.worker_behaviors.extend([monitor_kills, monitor_kills])
     assert harness.worker_once() == 2  # the original and the one local retry
-    _assert_escalated(harness, number, "identity", "policy-widened")
+    _assert_escalated(harness, number, "identity", "substituted")
 
-    # The evidence bundle carries the identity verdict verbatim — category
+    # The evidence bundle carries the identity record verbatim — category
     # strings and model/effort names only, never settings or credentials.
     (comment,) = harness.fake.comments[number]
     run_ids = re.findall(r"Run `([^`]+)`", comment["body"])
@@ -1428,6 +1424,6 @@ def test_identity_gate_failures_are_a_distinct_class_with_identity_evidence(harn
         identity = record["identity"]
         assert identity["expected_model"] == "claude-sonnet-5"
         assert identity["expected_effort"] == "low"
-        assert identity["preflight"] == "failed:policy-widened"
-        assert identity["released"] is False
+        assert identity["category"] == "substituted"
+        assert identity["violation"] == violation
         assert "model-key" not in json.dumps(record)  # the credential never leaks

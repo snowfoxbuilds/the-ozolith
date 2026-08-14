@@ -393,8 +393,8 @@ def _escalate_invalid_verdict(
         "run_image": config.run_image,
         "model": stats.model,
         "model_note": stats.model_note,
-        # The harness's baked-identity verdict (expected vs effective model/
-        # effort, preflight and gate status); None on a model-less image.
+        # The harness's identity record (expected vs observed model/effort,
+        # check status, category, gap notes); None on a model-less image.
         "identity": jobdir.read_identity(job),
         "container": container,
     }
@@ -468,9 +468,8 @@ def _escalate_identity_failure(
         "failure_class": "identity",
         "head": pr.head_sha,
         # ADR-0045: image identity (its tag covers the baked model) plus the
-        # reconciled stream-observed model and the harness's baked-identity
-        # verdict — expected vs observed, category, and whether the task
-        # (here: the review prompt) was ever released.
+        # reconciled stream-observed model and the harness's identity record
+        # — expected vs observed, the stable category, the violation.
         "run_image": config.run_image,
         "model": stats.model,
         "model_note": stats.model_note,

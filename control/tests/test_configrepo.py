@@ -132,14 +132,15 @@ def test_stack_env_run_image_override_is_rejected(tmp_path):
     than the worker-type definition declares (the dry-run would validate the
     substituted image's own baked identity and pass)."""
     driver_type(tmp_path)
-    write(
-        tmp_path,
-        "stacks/implementer.toml",
-        'worker_type = "claude-dev"\nnode = "box1"\n'
-        '[env]\nTHEOZOLITH_RUN_IMAGE = "theozolith/claude-dev:0.3.0-oldhash"\n',
-    )
-    with pytest.raises(ConfigRepoError, match="THEOZOLITH_RUN_IMAGE cannot be overridden"):
-        load_config(tmp_path)
+    for key in ("THEOZOLITH_RUN_IMAGE", "THEOZOLITH_RUN_IMAGE_FILE"):
+        write(
+            tmp_path,
+            "stacks/implementer.toml",
+            f'worker_type = "claude-dev"\nnode = "box1"\n'
+            f'[env]\n{key} = "theozolith/claude-dev:0.3.0-oldhash"\n',
+        )
+        with pytest.raises(ConfigRepoError, match=f"{key} cannot be overridden"):
+            load_config(tmp_path)
 
 
 def test_generic_stack_env_keeps_model_keys_free(tmp_path):

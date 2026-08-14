@@ -373,6 +373,29 @@ def scan_managed_conflicts(root: Path, expected: BakedIdentity | None = None) ->
     return conflicts
 
 
+# The keys the ConfigChange helper treats as identity-shaped in a PROJECT
+# settings document: the managed-tier selection keys plus
+# forceRemoteSettingsRefresh (a re-fetch of remote policy mid-session).
+PROJECT_IDENTITY_KEYS = frozenset(IDENTITY_SETTING_KEYS) | {"forceRemoteSettingsRefresh"}
+
+
+def project_identity_keys(document: object) -> list[str]:
+    """The identity-shaped keys of one PARSED project-settings document —
+    the same predicate the materialized ConfigChange hook applies (top-level
+    selection keys plus steering ``env`` entries). The harness uses this to
+    snapshot the checkout's LAUNCH-TIME keys, so the hook reports only keys
+    a mid-session change ADDED: a checkout that legitimately ships an inert
+    ``model`` key (the managed tier outranks it — verified live) must not
+    have its Run killed by a benign edit to the same file."""
+    if not isinstance(document, dict):
+        return []
+    keys = {key for key in document if isinstance(key, str) and key in PROJECT_IDENTITY_KEYS}
+    env = document.get("env")
+    if isinstance(env, dict):
+        keys.update(name for name in env if isinstance(name, str) and _is_identity_env_key(name))
+    return sorted(keys)
+
+
 def scan_process_environment(environ: Mapping[str, str]) -> list[str]:
     """Identity-affecting variables in the RUN CONTAINER's own process
     environment, as conflict strings naming the variable (never the value).
@@ -610,21 +633,6 @@ def scan_stream_signals(text: str) -> StreamSignals:
     )
 
 
-def read_effort_capture(capture: Path) -> str:
-    """The applied effort from a single Stop-hook payload capture; "" when
-    the file is absent, partial, or carries no effort field (a hook
-    mid-write is not an observation). Used by the dry-run probe."""
-    try:
-        data = json.loads(capture.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
-    if isinstance(data, dict):
-        effort = data.get("effort")
-        if isinstance(effort, dict) and isinstance(effort.get("level"), str):
-            return effort["level"]
-    return ""
-
-
 def read_last_journal_effort(capture: Path) -> str:
     """The most recent applied-effort observation in a Stop-hook journal
     (one JSON record per completed turn, appended by the materialized
@@ -756,12 +764,27 @@ def run_preflight(
         )
 
     probe_args: list[str] = []
-    effort_capture = scratch / "preflight-effort.json"
+    effort_capture = scratch / "preflight-stop.jsonl"
     if identity.effort:
+        # The SAME observation channel every Run rides: the python3 Stop-hook
+        # helper appending one journal record per turn. The dry-run thereby
+        # proves the channel itself — python3 reachable from the hook shell,
+        # the materialized script, the journal shape — not a lookalike a
+        # custom base image could pass while every Run's hooks die.
+        hook_script = scratch / "stop_hook.py"
+        hook_script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
         hook = {
             "hooks": {
                 "Stop": [
-                    {"hooks": [{"type": "command", "command": f"cat > {_shquote(effort_capture)}"}]}
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python3 "
+                                f"{_shquote(hook_script)} {_shquote(effort_capture)}",
+                            }
+                        ]
+                    }
                 ]
             }
         }
@@ -825,7 +848,7 @@ def run_preflight(
         )
     probe_effort = ""
     if identity.effort:
-        probe_effort = read_effort_capture(effort_capture)
+        probe_effort = read_last_journal_effort(effort_capture)
         if not probe_effort:
             return failed(
                 CATEGORY_UNVERIFIABLE,
@@ -876,12 +899,18 @@ class MonitorHooks:
     - ``config_capture``: the ConfigChange hook helper appends one
       value-redacted JSON line per identity-relevant mid-session settings
       change; any line kills the Run.
+    - ``config_baseline``: the launch-time snapshot of identity-shaped keys
+      per project-settings file ({absolute path: [keys]}), written by the
+      harness so the hook reports only keys a change ADDED — a checkout
+      that legitimately ships an inert identity key is not killed for a
+      benign edit to the same file.
     - ``config_hook_script`` / ``stop_hook_script``: the helpers the
       harness materializes (``CONFIG_CHANGE_HOOK_SOURCE`` /
       ``STOP_HOOK_SOURCE``)."""
 
     stop_capture: Path
     config_capture: Path
+    config_baseline: Path
     config_hook_script: Path
     stop_hook_script: Path
 
@@ -894,9 +923,11 @@ class MonitorHooks:
 # the changed file is parsed and only top-level identity keys or steering
 # ``env`` entries (or an unreadable/unparseable file — unknowable is
 # recorded) are noted; a nested "model" in an unrelated object or an env
-# credential must not kill a legitimate Run. skills changes are ignored.
-# Everything else (policy/user/local settings, unknown future sources) is
-# recorded unconditionally. Records carry source, path, and key names only.
+# credential must not kill a legitimate Run, and keys already present at
+# LAUNCH (the harness's baseline snapshot, argv[2]) are not a change —
+# only newly appearing keys are. skills changes are ignored. Everything
+# else (policy/user/local settings, unknown future sources) is recorded
+# unconditionally. Records carry source, path, and key names only.
 CONFIG_CHANGE_HOOK_SOURCE = '''\
 """theozolith ConfigChange hook (ADR-0045): record identity-relevant
 mid-session settings changes for the harness session monitor. Never blocks."""
@@ -952,8 +983,20 @@ def identity_keys_in(document) -> list:
     return sorted(keys)
 
 
+def baseline_keys(path):
+    """The launch-time identity keys per project-settings file, from the
+    harness's snapshot (argv[2]); {} when absent or unreadable."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+    except Exception:
+        return {}
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
 def main() -> int:
     capture = sys.argv[1]
+    baseline = baseline_keys(sys.argv[2]) if len(sys.argv) > 2 else {}
     try:
         event = json.load(sys.stdin)
     except Exception:
@@ -972,7 +1015,11 @@ def main() -> int:
         except Exception:
             document = None  # unreadable or unparseable: unknowable, record
         if isinstance(document, dict):
-            keys = identity_keys_in(document)
+            launch = baseline.get(path)
+            launch = set(launch) if isinstance(launch, list) else set()
+            # Only keys the change ADDED: a key already present at launch
+            # was part of the checked configuration, not a change.
+            keys = [key for key in identity_keys_in(document) if key not in launch]
             if not keys:
                 return 0
     with open(capture, "a", encoding="utf-8") as handle:

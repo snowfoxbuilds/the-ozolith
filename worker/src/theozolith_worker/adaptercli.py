@@ -77,8 +77,9 @@ def _materialize(args) -> int:
         return 2
     if args.scope == SCOPE_MANAGED:
         # The written config only binds if the agent CLI in THIS image
-        # enforces it; an allowlist a pre-enforcement CLI would silently
-        # ignore is a fake identity, so the build fails instead.
+        # honors it (managed-default precedence, managed env merge, hook
+        # payloads); a config a pre-floor CLI would silently ignore is a
+        # fake identity, so the build fails instead.
         try:
             print(f"agent CLI: {adapter.verify_enforceable()}", flush=True)
         except AgentAdapterError as exc:

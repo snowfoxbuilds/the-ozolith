@@ -495,12 +495,10 @@ def _preflight(tmp_path, identity_obj, runner, **kwargs):
 
 def test_preflight_passes_and_asks_for_no_model(tmp_path):
     _bake(tmp_path, "claude-sonnet-5", "low")
-    capture = tmp_path / "scratch" / "preflight-effort.json"
+    capture = tmp_path / "scratch" / "preflight-stop.jsonl"
     runner = ScriptedRunner(
         probe_stdout=_session_ok("claude-sonnet-5"),
-        on_probe=lambda: _write(
-            tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
-        ),
+        on_probe=lambda: _write(tmp_path, "scratch/preflight-stop.jsonl", '{"effort": "low"}\n'),
     )
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), runner)
     assert report.ok, report.detail
@@ -639,9 +637,7 @@ def test_preflight_effort_clamp_is_detected_by_the_probe(tmp_path):
     _bake(tmp_path, "claude-sonnet-5", "xhigh")
     runner = ScriptedRunner(
         probe_stdout=_session_ok("claude-sonnet-5"),
-        on_probe=lambda: _write(
-            tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "high"}}
-        ),
+        on_probe=lambda: _write(tmp_path, "scratch/preflight-stop.jsonl", '{"effort": "high"}\n'),
     )
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "xhigh"), runner)
     assert not report.ok and report.category == CATEGORY_EFFORT_CLAMPED
@@ -661,15 +657,18 @@ def test_preflight_effort_probe_carries_the_stop_hook(tmp_path):
     _bake(tmp_path, "claude-sonnet-5", "low")
     runner = ScriptedRunner(
         probe_stdout=_session_ok("claude-sonnet-5"),
-        on_probe=lambda: _write(
-            tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
-        ),
+        on_probe=lambda: _write(tmp_path, "scratch/preflight-stop.jsonl", '{"effort": "low"}\n'),
     )
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), runner)
     assert report.ok, report.detail
     (probe,) = runner.probe_calls
     settings_json = probe[probe.index("--settings") + 1]
-    assert "Stop" in settings_json and "preflight-effort.json" in settings_json
+    # The SAME channel every Run rides: the python3 Stop-hook helper writing
+    # the journal — the dry-run proves python3-in-hook-shell + script +
+    # journal shape, not a lookalike capture.
+    assert "Stop" in settings_json and "preflight-stop.jsonl" in settings_json
+    assert "python3" in settings_json and "stop_hook.py" in settings_json
+    assert (tmp_path / "scratch" / "stop_hook.py").is_file()
     assert "PostToolUse" not in settings_json
     assert PROBE_PROMPT in probe
     assert "tool" in PROBE_PROMPT  # the prompt itself forbids tool use
@@ -745,12 +744,17 @@ def test_identity_error_detail_is_anchored():
 # -- the ConfigChange hook helper ---------------------------------------------
 
 
-def _run_config_hook(tmp_path: Path, event: dict) -> list[dict]:
+def _run_config_hook(tmp_path: Path, event: dict, baseline: dict | None = None) -> list[dict]:
     script = tmp_path / "configchange_hook.py"
     script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
     capture = tmp_path / "config-change.jsonl"
+    argv = [sys.executable, str(script), str(capture)]
+    if baseline is not None:
+        baseline_path = tmp_path / "config-baseline.json"
+        baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+        argv.append(str(baseline_path))
     proc = subprocess.run(
-        [sys.executable, str(script), str(capture)],
+        argv,
         input=json.dumps(event),
         capture_output=True,
         text=True,
@@ -800,6 +804,29 @@ def test_config_hook_records_identity_keys_in_project_settings(tmp_path):
     assert len(records) == 1
     assert "ANTHROPIC_BASE_URL" in records[0]["keys"] and "model" in records[0]["keys"]
     assert "http://x" not in json.dumps(records)  # values never recorded
+
+
+def test_config_hook_subtracts_the_launch_baseline(tmp_path):
+    """A checkout that legitimately SHIPS an identity key (inert — the
+    managed tier outranks it, verified live) is not killed for a benign
+    mid-session edit to the same file: only keys the change ADDED count."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"model": "sonnet", "permissions": {"allow": ["Bash"]}}))
+    baseline = {str(settings): ["model"]}
+    # The same keys as launch: not a change, nothing recorded.
+    assert (
+        _run_config_hook(
+            tmp_path, {"source": "project_settings", "file_path": str(settings)}, baseline
+        )
+        == []
+    )
+    # A NEW identity key appears mid-session: recorded, only the new key.
+    settings.write_text(json.dumps({"model": "sonnet", "env": {"ANTHROPIC_BASE_URL": "http://x"}}))
+    records = _run_config_hook(
+        tmp_path, {"source": "project_settings", "file_path": str(settings)}, baseline
+    )
+    assert len(records) == 1
+    assert records[0]["keys"] == ["ANTHROPIC_BASE_URL"]
 
 
 def test_config_hook_records_unreadable_project_settings(tmp_path):
@@ -907,6 +934,7 @@ def _hooks(tmp_path: Path) -> MonitorHooks:
     return MonitorHooks(
         stop_capture=scratch / "stop.jsonl",
         config_capture=scratch / "config-change.jsonl",
+        config_baseline=scratch / "config-baseline.json",
         config_hook_script=scratch / "configchange_hook.py",
         stop_hook_script=scratch / "stop_hook.py",
     )

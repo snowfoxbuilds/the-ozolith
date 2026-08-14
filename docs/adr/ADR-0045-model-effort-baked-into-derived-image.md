@@ -147,6 +147,12 @@ Stated plainly, per the operator ruling:
   Run's own turn stamps (fail loud), not preflighted.
 - A wrong-identity Run spends tokens until its first detected
   main-agent turn (normally the first turn).
+- A model-less image (no baked identity) runs unmonitored: the harness
+  passes no ``--model`` and nothing checks the session's model, so a
+  checkout-committed settings key selects it. Production driver types
+  always bake a model (required with a driver); this shape exists only
+  for the daemon-less dev flow, where the observed model still lands in
+  evidence.
 
 ## Consequences
 - **Positive**: the image is bound to the worker definition — model

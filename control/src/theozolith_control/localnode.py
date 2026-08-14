@@ -699,7 +699,8 @@ driver = "builtin:implementer"   # the staged pipeline Implementer
 adapter = "claude"               # the Agent adapter the harness invokes
 # Required with a driver, validated against the adapter, and BAKED into the
 # derived image at build time (ADR-0045) — changing it rebuilds the image;
-# nothing at invocation can override it. Optional: effort = "high"
+# the pipeline passes no model at invocation, and a detected off-model Run
+# fails loud (held by best effort). Optional: effort = "high"
 model = "claude-sonnet-5"
 workspace = "you/your-repo"      # step 2: the repository (owner/name) it works
 

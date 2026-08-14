@@ -172,9 +172,9 @@ class RunReport:
     reason: str = ""  # failed Runs: what broke
     # ADR-0016 uniform budget classes: timeout | session-died | harness |
     # no-changes | infra ("" for completed Runs). ADR-0045 adds identity:
-    # the baked model/effort could not be proven effective (preflight failed
-    # or the session drifted mid-run) — the task prompt was withheld or the
-    # session was killed, and the Run is invalid.
+    # the static checks failed before launch or the fail-loud monitor
+    # detected an off-identity session (killed mid-run) — the Run is
+    # invalid.
     failure_class: str = ""
     evidence_pushed: bool = False
     # True only on the compound failure: the push failed AND both parking
@@ -715,11 +715,11 @@ def _push_run_evidence(
                 "run_image": config.run_image,
                 "model": stats.model,
                 "model_note": stats.model_note,
-                # The harness's baked-identity verdict (ADR-0045): expected
-                # vs effective model/effort, preflight status, and whether
-                # the gate ever released the task prompt. None on an image
-                # that bakes no identity. Values are category strings and
-                # model/effort names only — never credentials or settings.
+                # The harness's identity record (ADR-0045): expected vs
+                # observed model/effort, check status, category, violation,
+                # gap notes. None on an image that bakes no identity. Values
+                # are category strings and model/effort names only — never
+                # credentials or settings.
                 "identity": jobdir.read_identity(job),
                 "container": report.container,
                 "issue": issue.number,

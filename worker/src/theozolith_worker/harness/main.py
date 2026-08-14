@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -56,6 +57,7 @@ from theozolith_worker.identity import (
     IDENTITY_ERROR_PREFIX,
     STOP_HOOK_SOURCE,
     MonitorHooks,
+    project_identity_keys,
     read_last_journal_effort,
 )
 from theozolith_worker.jobdir import (
@@ -260,6 +262,17 @@ def await_monitored(
         for line in lines:
             monitor.observe(line)
 
+    def flush() -> None:
+        # After the process is gone, a final event flushed complete but
+        # without a trailing newline sits in the carry-over buffer — feed it
+        # too, or the monitor misses what stream_stats will later report
+        # (a truncated mid-write tail just fails to parse and is ignored).
+        nonlocal buffer
+        feed()
+        if buffer.strip():
+            monitor.observe(buffer)
+            buffer = ""
+
     while True:
         feed()
         reason, category = monitor.violation()
@@ -274,7 +287,7 @@ def await_monitored(
             return AgentOutcome(), reason, category
         code = process.poll()
         if code is not None:
-            feed()
+            flush()
             reason, category = monitor.violation()
             if reason:
                 return AgentOutcome(), reason, category
@@ -294,7 +307,7 @@ def await_monitored(
             # Lines flushed between the last feed and the kill can carry the
             # detection; an identity verdict outranks the timeout class (it
             # routes the deterministic-failure lanes, ADR-0045).
-            feed()
+            flush()
             reason, category = monitor.violation()
             if reason:
                 return AgentOutcome(), reason, category
@@ -334,6 +347,26 @@ def serve_jobs(
             ok, code, output = runner(request.command, workdir, request.timeout_seconds)
             write_job_result(job, JobResult(request.name, ok, code, output))
         last_activity = clock()
+
+
+def _project_settings_baseline(workdir: Path) -> dict[str, list[str]]:
+    """The launch-time identity-shaped keys of the checkout's settings files
+    ({absolute path: [keys]}) — the ConfigChange hook subtracts these, so
+    only keys a mid-session change ADDED can kill the Run (a checkout that
+    ships an inert identity key is not killed for a benign edit). A file
+    absent or unparseable at launch contributes nothing; a later change to
+    it is judged on its own content."""
+    baseline: dict[str, list[str]] = {}
+    for name in ("settings.json", "settings.local.json"):
+        path = workdir / ".claude" / name
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        keys = project_identity_keys(document)
+        if keys:
+            baseline[str(path)] = keys
+    return baseline
 
 
 def _run_identity_dryrun(job: Path, adapter, identity_root: Path, scratch_root: Path | None) -> int:
@@ -484,7 +517,8 @@ def run_harness(
         if not report.ok:
             return fail_identity(report.category, report.detail)
         identity_record.update(checks="passed")
-        write_identity(job, identity_record)
+        with contextlib.suppress(OSError):  # the status verdict outranks the record
+            write_identity(job, identity_record)
         # The observation hooks live in a scratch OUTSIDE the job mount. A
         # scratch that cannot be materialized is an identity failure (the
         # observation channel would be silently absent), never a generic
@@ -499,11 +533,15 @@ def run_harness(
             hooks = MonitorHooks(
                 stop_capture=scratch / "stop.jsonl",
                 config_capture=scratch / "config-change.jsonl",
+                config_baseline=scratch / "config-baseline.json",
                 config_hook_script=scratch / "configchange_hook.py",
                 stop_hook_script=scratch / "stop_hook.py",
             )
             hooks.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
             hooks.stop_hook_script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
+            hooks.config_baseline.write_text(
+                json.dumps(_project_settings_baseline(workdir)), encoding="utf-8"
+            )
         except OSError as exc:
             return fail_identity(
                 CATEGORY_UNVERIFIABLE,
@@ -569,7 +607,11 @@ def run_harness(
             )
             if violation:
                 identity_record["category"] = category
-            write_identity(job, identity_record)
+            # Never let a failed record write erase a DETECTED violation's
+            # classification: the identity-marked status below must land
+            # even when the evidence write cannot (ENOSPC on the job mount).
+            with contextlib.suppress(OSError):
+                write_identity(job, identity_record)
         if not violation:
             adapter.collect(workdir, job, manifest.mode)
             if manifest.serve_jobs:

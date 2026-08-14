@@ -679,6 +679,23 @@ def test_claude_adapter_observed_model_multiple_models_are_surfaced(tmp_path):
     assert "multiple models executed turns: claude-sonnet-5, claude-opus-5" in stats.model_note
 
 
+def test_claude_adapter_observed_model_drift_and_recovery_ends_where_it_ended(tmp_path):
+    adapter = ClaudeAdapter()
+    # sonnet -> opus -> sonnet: the headline observed model is the turn the
+    # session actually ENDED on, not the most-recently-first-seen one.
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            _turn("claude-opus-5"),
+            _turn("claude-sonnet-5"),
+        )
+    )
+    assert stats.model == "claude-sonnet-5"
+    assert "multiple models executed turns: claude-sonnet-5, claude-opus-5" in stats.model_note
+
+
 def test_claude_adapter_observed_model_conflicting_signals_are_surfaced(tmp_path):
     adapter = ClaudeAdapter()
     # Turns and usage records disagree outright — a malformed or tampered

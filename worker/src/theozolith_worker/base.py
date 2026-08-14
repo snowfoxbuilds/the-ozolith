@@ -17,6 +17,7 @@ Custom worker types extend this class through ``theozolith_worker.api``
 
 from __future__ import annotations
 
+import json
 import secrets
 import shutil
 import time
@@ -262,6 +263,12 @@ class Worker:
                 " — latched: no work will be fetched until the driver is"
                 " restarted after a fix (ADR-0045)"
             )
+            # The dot-prefixed job dir is about to be removed and is invisible
+            # to the evidence sweep by design — the journal is the durable
+            # home of the structured (redacted) record.
+            record = jobdir.read_identity(job) or {}
+            if record:
+                self.log(f"identity dry-run record: {json.dumps(record, sort_keys=True)}")
             return False
         except Exception as exc:  # container-engine or filesystem breakage
             self.log(

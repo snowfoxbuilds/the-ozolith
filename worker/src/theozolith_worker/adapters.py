@@ -70,7 +70,8 @@ MATERIALIZE_SCOPES = (SCOPE_MANAGED, SCOPE_INTERACTIVE)
 # baked with, readable via ``docker run --rm <tag> cat /etc/theozolith/model``.
 # Root-owned on purpose — a session can read its baked default, never
 # rewrite it. At runtime these same files are the harness's declaration of
-# the identity the preflight gate must prove effective (identity.py).
+# the identity the static checks and the fail-loud monitor hold the Run
+# to, by best effort (identity.py).
 WELL_KNOWN_MODEL_FILE = identity_mod.WELL_KNOWN_MODEL_FILE
 WELL_KNOWN_EFFORT_FILE = identity_mod.WELL_KNOWN_EFFORT_FILE
 
@@ -446,7 +447,8 @@ class ClaudeAdapter:
                                 "type": "command",
                                 "command": "python3 "
                                 f"{shlex.quote(str(hooks.config_hook_script))} "
-                                f"{shlex.quote(str(hooks.config_capture))}",
+                                f"{shlex.quote(str(hooks.config_capture))} "
+                                f"{shlex.quote(str(hooks.config_baseline))}",
                             }
                         ]
                     }
@@ -511,7 +513,7 @@ class ClaudeAdapter:
         summed: int | None = None
         final: int | None = None
         init_model = ""
-        turn_models: list[str] = []  # unique, in first-seen order; main agent only
+        turn_models: list[str] = []  # every main-agent turn, in stream order
         usage_models: list[str] = []
         try:
             with transcript.open(encoding="utf-8", errors="replace") as handle:
@@ -538,7 +540,6 @@ class ClaudeAdapter:
                                 and isinstance(seen, str)
                                 and seen
                                 and seen != "<synthetic>"
-                                and seen not in turn_models
                             ):
                                 turn_models.append(seen)
                             content = message.get("content")
@@ -598,10 +599,13 @@ def _reconcile_models(
             )
         return "", "the stream carried no model signal"
     notes = []
-    if len(turn_models) > 1:
-        # Multiple models executed turns: report the one the session ended on,
-        # but never as the whole story.
-        notes.append(f"multiple models executed turns: {', '.join(turn_models)}")
+    unique = list(dict.fromkeys(turn_models))  # first-seen order, for the note
+    if len(unique) > 1:
+        # Multiple models executed turns: report the one the session ended on
+        # (turn_models carries EVERY turn in stream order, so [-1] really is
+        # the last executed — a drift-and-recovery session ends where it
+        # ended), but never as the whole story.
+        notes.append(f"multiple models executed turns: {', '.join(unique)}")
     model = turn_models[-1]
     normalized_turns = {normalize(turn) for turn in turn_models}
     if init_model and normalize(init_model) not in normalized_turns:
