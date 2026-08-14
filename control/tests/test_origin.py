@@ -143,7 +143,7 @@ def cli_env(tmp_path, monkeypatch):
 def test_production_serve_requires_the_control_address(cli_env):
     """With TLS material present but no persisted control address,
     production startup refuses with instructions."""
-    provision(cli_env / "secrets" / "tls", [CONTROL_IP])
+    provision(cli_env / "secrets" / "tls", [CONTROL_IP], trust_root=cli_env)
     with pytest.raises(SystemExit, match="theozolith init"):
         cli_main(["serve"])
 
@@ -151,7 +151,7 @@ def test_production_serve_requires_the_control_address(cli_env):
 def test_production_serve_fails_closed_on_a_malformed_persisted_port(cli_env, capsys):
     """A present-but-invalid control_port is a configuration error at
     startup — never a silent redirect of browsers and nodes to 443."""
-    provision(cli_env / "secrets" / "tls", [CONTROL_IP])
+    provision(cli_env / "secrets" / "tls", [CONTROL_IP], trust_root=cli_env)
     configs = cli_env / "configs"
     configs.mkdir(parents=True, exist_ok=True)
     (configs / "control.toml").write_text(

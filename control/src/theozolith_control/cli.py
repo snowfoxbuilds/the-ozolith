@@ -704,7 +704,7 @@ def _init(args) -> int:
             hosts.append(origin.san_host(origin.parse_browser_origin(persisted_origin)))
     hosts = list(dict.fromkeys(hosts + extra_hosts))
     try:
-        provision(settings.tls_dir, hosts)
+        provision(settings.tls_dir, hosts, trust_root=settings.data_dir)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
@@ -876,7 +876,9 @@ def _origin_init(args) -> int:
     hosts = list(dict.fromkeys([settings.control_ip, LOOPBACK_IP, origin.san_host(parsed)]))
     try:
         try:
-            cert, _key = tls.remint_server_cert(settings.tls_dir, hosts)
+            cert, _key = tls.remint_server_cert(
+                settings.tls_dir, hosts, trust_root=settings.data_dir
+            )
         except ValueError as exc:
             raise SystemExit(f"error: {exc}") from exc
         _log(f"re-minted {cert.name} from the existing CA (SAN: {', '.join(hosts)}) — nodes")
@@ -1016,7 +1018,7 @@ def _recover(args) -> int:
         hosts.append(origin.san_host(origin.parse_browser_origin(settings.browser_origin)))
     hosts = list(dict.fromkeys(hosts))
     try:
-        cert, key = tls.remint_server_cert(settings.tls_dir, hosts)
+        cert, key = tls.remint_server_cert(settings.tls_dir, hosts, trust_root=settings.data_dir)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
     _log(f"re-minted {cert} and {key} from the restored CA (SAN: {', '.join(hosts)})")
@@ -1096,7 +1098,7 @@ def _tls_init(args) -> int:
         raise SystemExit("error: pass --host, or run 'theozolith init' first (ADR-0031)")
     try:
         try:
-            ca, cert, key = provision(settings.tls_dir, hosts)
+            ca, cert, key = provision(settings.tls_dir, hosts, trust_root=settings.data_dir)
         except ValueError as exc:
             raise SystemExit(f"error: {exc}") from exc
     finally:

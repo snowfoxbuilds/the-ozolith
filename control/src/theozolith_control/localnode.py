@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import re
-import ssl
 import subprocess
 import time
 import urllib.error
@@ -36,6 +35,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from theozolith_control.bearerhttp import BearerTransportError, open_bearer
 from theozolith_control.bootstrap import BootstrapServer
 from theozolith_control.controltoml import COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME
 from theozolith_control.settings import ControlSettings
@@ -216,8 +216,15 @@ def _loopback_api(settings: ControlSettings) -> str:
 
 
 def _http(method: str, url: str, *, token: str, ca: str, body: dict | None = None):
-    """(status, parsed JSON). The default fetch — loopback TLS verified
-    against the freshly minted CA (the loopback IP SAN covers it)."""
+    """(status, parsed JSON). The default fetch, through the ONE reviewed
+    bearer transport (``bearerhttp.open_bearer``, OZ-03): loopback TLS is
+    verified against the freshly minted CA (the loopback IP SAN covers it),
+    and the admin token can never be re-sent through a cross-origin or
+    downgrade redirect — only same-origin hops are followed. A transport
+    policy refusal is deliberately mapped to SystemExit: it means the local
+    control endpoint tried to steer the token off the pinned loopback
+    origin, which no retry fixes. ``BearerTransportError`` messages carry
+    URLs only — never the token — so surfacing them is disclosure-free."""
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode() if body is not None else None,
@@ -228,12 +235,13 @@ def _http(method: str, url: str, *, token: str, ca: str, body: dict | None = Non
             "User-Agent": "theozolith-init-local-node",
         },
     )
-    context = ssl.create_default_context(cafile=ca)
     try:
-        with urllib.request.urlopen(request, timeout=10, context=context) as resp:
-            return resp.status, json.loads(resp.read() or b"{}")
+        status, raw = open_bearer(request, ca=ca, timeout=10)
+        return status, json.loads(raw or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, {"detail": exc.read().decode(errors="replace")[:300]}
+    except BearerTransportError as exc:
+        raise SystemExit(f"error: the local control channel refused a request: {exc}") from exc
 
 
 # The safe-retry contract (ADR-0037): every phase is idempotent or
@@ -406,12 +414,14 @@ def _revoke_join_token(fetch, api: str, token: str, ca: str, token_id: str, log)
     """Best-effort revocation of an unconsumed machine-only token on a
     failed or interrupted join: the token was never shown to anyone, so
     nothing should remain outstanding. Failures are swallowed — the token
-    also dies on its own one-hour TTL."""
+    also dies on its own one-hour TTL. SystemExit is swallowed here too:
+    ``_http`` maps a transport policy refusal to SystemExit, and a refusal
+    during CLEANUP must not replace the original failure being unwound."""
     try:
         status, _ = fetch("DELETE", f"{api}/api/v1/join-tokens/{token_id}", token=token, ca=ca)
         if status == 200:
             log("local node [join]: revoked the unconsumed join token")
-    except Exception:  # best-effort by design
+    except (Exception, SystemExit):  # best-effort by design
         pass
 
 

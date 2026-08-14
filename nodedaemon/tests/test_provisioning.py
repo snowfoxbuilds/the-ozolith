@@ -100,7 +100,9 @@ class LiveControl:
 
     def __init__(self, tmp_path: Path):
         self.tls_dir = tmp_path / "data" / "secrets" / "tls"
-        self.ca_path, cert, key = tls.provision(self.tls_dir, ["127.0.0.1"])
+        self.ca_path, cert, key = tls.provision(
+            self.tls_dir, ["127.0.0.1"], trust_root=tmp_path / "data"
+        )
         settings = ControlSettings(
             data_dir=tmp_path / "data",
             config_repo=tmp_path / "configs",
@@ -312,7 +314,7 @@ def test_fingerprint_mismatch_aborts_with_zero_bytes_to_the_target(tmp_path):
     aborts BEFORE any transmission — the instrumented control channel sees
     no connection, no byte, and nothing is persisted."""
     trap = TrapListener()
-    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"])
+    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"], trust_root=tmp_path)
     bootstrap = BootstrapServer(
         ca_pem=evil_ca.read_bytes(),  # NOT the CA the join string pins
         origin="",
@@ -346,8 +348,8 @@ def test_appended_ca_bundle_is_refused_before_fingerprinting(tmp_path):
     riding behind it) is refused before fingerprinting — zero bytes
     transmitted, nothing persisted."""
     trap = TrapListener()
-    real_ca, _, _ = tls.provision(tmp_path / "real-tls", ["127.0.0.1"])
-    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"])
+    real_ca, _, _ = tls.provision(tmp_path / "real-tls", ["127.0.0.1"], trust_root=tmp_path)
+    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"], trust_root=tmp_path)
     bootstrap = BootstrapServer(
         ca_pem=real_ca.read_bytes() + evil_ca.read_bytes(),
         origin="",
@@ -380,7 +382,7 @@ def test_pem_canonicalization_keeps_only_the_verified_certificate(tmp_path):
     round-trip re-encodes exactly the fingerprinted DER, byte-identical to
     control's cryptography PEM output (the happy path pins the same via
     its persisted-ca equality)."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
     der = provisioning.pem_to_der(b"# preamble\n" + pem + b"trailing noise\n")
     assert provisioning.der_to_pem(der) == pem
@@ -398,7 +400,7 @@ def test_non_https_control_url_is_never_persisted(tmp_path):
     TOTAL: input that makes urlsplit itself raise ValueError (unmatched
     IPv6 brackets, NFKC-invalid netlocs) dies through the same
     ProvisionError, never as a leaked ValueError."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fail_post(url, body, ca):
@@ -442,7 +444,7 @@ def test_non_https_exchange_answer_is_never_persisted(tmp_path):
     answer whose control URL is not exactly https is refused before
     anything is persisted locally — and the error owns up that the
     exchange itself already ran (the join token is spent)."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fake_get(url):
@@ -478,7 +480,7 @@ def test_malformed_exchange_answer_url_is_provisionerror_never_valueerror(tmp_pa
     documented ProvisionError — whose message owns up that the exchange
     already ran and the join token is spent — never a leaked ValueError,
     and never persisted state."""
-    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"], trust_root=tmp_path)
     pem = ca_path.read_bytes()
 
     def fake_get(url):
@@ -600,7 +602,9 @@ def _redirector(location: str) -> type[_Quiet]:
 
 def _tls_server(tmp_path: Path, handler: type[_Quiet]):
     """`handler` on a real TLS socket under the repository's test CA."""
-    ca_path, cert, key = tls.provision(tmp_path / "redirect-tls", ["127.0.0.1"])
+    ca_path, cert, key = tls.provision(
+        tmp_path / "redirect-tls", ["127.0.0.1"], trust_root=tmp_path
+    )
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)

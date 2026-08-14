@@ -44,6 +44,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from theozolith_nodedaemon import configdist
 from theozolith_nodedaemon.builds import ensure_image, image_status
@@ -100,6 +101,21 @@ BACKOFF_CAP_SECONDS = 300.0
 # (ADR-0019). Must match control's configrepo.DEFAULT_JOBS_BASE, where
 # duplicate resolved paths are rejected at parse time.
 DEFAULT_JOBS_BASE = "/var/tmp/theozolith/jobs"
+
+# The provisioned channel identity is ONE value (ADR-0023): the control URL,
+# the per-node bearer token, and the pinned CA travel together, because any
+# single overridden component redirects or re-anchors the other two — a Stack
+# steering only the URL exfiltrates the real token; a Stack steering only the
+# CA lets an on-path https endpoint impersonate the Control Node. On a
+# provisioned daemon these six names are therefore RESERVED in every process
+# Stack's environment: the direct names AND their VAR_FILE forms (the worker's
+# env_value gives <NAME>_FILE precedence, so a leftover _FILE entry — whether
+# Stack-authored or generated from a [secrets] mapping — would silently beat
+# the injected direct value).
+CHANNEL_IDENTITY_ENV = ("CONTROL_NODE_URL", "THEOZOLITH_NODE_TOKEN", "THEOZOLITH_TLS_CA")
+RESERVED_CHANNEL_ENV = tuple(
+    name for base in CHANNEL_IDENTITY_ENV for name in (base, f"{base}_FILE")
+)
 
 
 def stack_jobs_dir(stack: WireStack) -> Path:
@@ -1297,22 +1313,6 @@ class NodeDaemon:
             "THEOZOLITH_JOBS_DIR": str(stack_jobs_dir(stack)),
             **stack.env,
         }
-        # The control channel for node-resident drivers (ADR-0023): they
-        # authenticate as the node that supervises them — the daemon hands its
-        # own per-node token down instead of a hand-configured shared token.
-        # Once the daemon is provisioned its identity triple OVERRIDES Stack
-        # env: a (control-authored) Stack must not be able to point the node
-        # token at another endpoint — CONTROL_NODE_URL, the token, and the
-        # pinned CA travel together, so a Stack setting only CONTROL_NODE_URL
-        # would otherwise exfiltrate the real node token to that host (the
-        # transport's https floor stops plaintext, not an https attacker).
-        # Daemon-less dev is unaffected: control_url is empty there, so the
-        # Stack's own settings stand (OZ-03).
-        if self._config.control_url:
-            env["CONTROL_NODE_URL"] = self._config.control_url
-            env["THEOZOLITH_NODE_TOKEN"] = self._config.node_token
-            if self._config.tls_ca:
-                env["THEOZOLITH_TLS_CA"] = self._config.tls_ca
         # THEOZOLITH_RUN_IMAGE now arrives in the control-authored Stack env
         # (resolved from the worker type, ADR-0044); the daemon no longer maps a
         # removed wire field to a built tag.
@@ -1334,6 +1334,35 @@ class NodeDaemon:
                 )
         env_files = secret_env_files(stack, self._config.secrets_dir)
         env.update({f"{name}_FILE": path for name, path in env_files.items()})
+        # The control channel for node-resident drivers (ADR-0023): they
+        # authenticate as the node that supervises them — the daemon hands its
+        # own per-node token down instead of a hand-configured shared token.
+        # On a provisioned daemon the identity triple is injected LAST, after
+        # every Stack-controlled merge (env AND the secret <ENV>_FILE mapping),
+        # with all six RESERVED_CHANNEL_ENV names removed first: no Stack
+        # entry, direct or _FILE-shaped, may override any component of the
+        # channel identity (OZ-03; the transport's https floor stops
+        # plaintext, not an https attacker holding a steered URL or CA).
+        # Daemon-less dev is unaffected: control_url is empty there, so the
+        # Stack's own settings stand.
+        if self._config.control_url:
+            for name in RESERVED_CHANNEL_ENV:
+                env.pop(name, None)
+            if urlsplit(self._config.control_url).scheme == "https" and not self._config.tls_ca:
+                # Fail closed, per Stack (surfaced by _reconcile's isolation):
+                # an https channel without its pinned CA is an incomplete
+                # identity, and a Stack-supplied CA must never fill the gap.
+                raise RuntimeError(
+                    f"stack {stack.name}: the provisioned control URL is https but no"
+                    " pinned CA is present (state-dir ca.pem missing?) — refusing to"
+                    " hand the channel identity to a driver without its CA; the URL,"
+                    " per-node token, and CA are one inseparable identity, and a"
+                    " Stack-supplied CA is never accepted (re-provision this node)"
+                )
+            env["CONTROL_NODE_URL"] = self._config.control_url
+            env["THEOZOLITH_NODE_TOKEN"] = self._config.node_token
+            if self._config.tls_ca:
+                env["THEOZOLITH_TLS_CA"] = self._config.tls_ca
         return env
 
     def _declared_but_unbuilt(self, tag: str) -> bool:

@@ -942,6 +942,133 @@ def test_channel_env_is_injected_into_process_stacks(rig: Rig):
     assert by_name["reviewer-driver"]["THEOZOLITH_NODE_TOKEN"] == "node-token"
 
 
+def _rebuilt_daemon(rig: Rig, **overrides):
+    """The rig's fakes under a modified DaemonConfig (frozen dataclass)."""
+    import dataclasses
+
+    from theozolith_nodedaemon.controlclient import ControlClient
+    from theozolith_nodedaemon.daemon import NodeDaemon
+    from theozolith_nodedaemon.stacks import ProcessSupervisor
+
+    config = dataclasses.replace(rig.config, **overrides)
+    client = None
+    if config.control_url:
+        client = ControlClient(
+            config.control_url, config.node_token, insecure_dev=True, transport=rig.control
+        )
+    daemon = NodeDaemon(
+        config,
+        docker=rig.docker,  # type: ignore[arg-type]
+        client=client,
+        supervisor=ProcessSupervisor(popen=rig.popen, log=rig.logs.append),
+        log=rig.logs.append,
+    )
+    return config, daemon
+
+
+def _channel_stealing_stack(tmp_path: Path) -> dict:
+    """A Stack trying every override shape at once: the three direct names,
+    their three _FILE forms, and a [secrets] mapping whose materialization
+    would generate the _FILE forms again after the daemon's merge."""
+    lure = tmp_path / "lure"
+    lure.write_text("https://lure.test", encoding="utf-8")
+    return process_stack(
+        "worker",
+        env={
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "GITHUB_TOKEN": "gh-secret",
+            "CONTROL_NODE_URL": "https://elsewhere.test",
+            "CONTROL_NODE_URL_FILE": str(lure),
+            "THEOZOLITH_NODE_TOKEN": "forged-token",
+            "THEOZOLITH_NODE_TOKEN_FILE": str(lure),
+            "THEOZOLITH_TLS_CA": "/evil/ca.pem",
+            "THEOZOLITH_TLS_CA_FILE": str(lure),
+        },
+        secrets={
+            "CONTROL_NODE_URL": "evil-url",
+            "THEOZOLITH_NODE_TOKEN": "evil-token",
+            "THEOZOLITH_TLS_CA": "evil-ca",
+        },
+    )
+
+
+def test_all_six_reserved_names_are_stripped_and_the_daemon_identity_wins(rig: Rig, tmp_path):
+    """The channel identity is ONE value: URL, token, and CA. The reservation
+    covers the direct names AND their _FILE forms, from Stack env and from the
+    [secrets]-generated <ENV>_FILE mapping alike — the worker's env_value
+    gives _FILE precedence, so a surviving _FILE entry would silently outrank
+    the injected direct value. The spawned environment is fed through the
+    ACTUAL worker load_config path to prove all three components win."""
+    from theozolith_worker.config import load_config
+
+    ca = tmp_path / "pinned-ca.pem"
+    ca.write_text("pinned", encoding="utf-8")
+    _config, daemon = _rebuilt_daemon(rig, tls_ca=str(ca))
+    rig.control.secrets.update(
+        {"evil-url": "https://evil.test", "evil-token": "stolen", "evil-ca": "evil-ca-pem"}
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([_channel_stealing_stack(tmp_path)]))
+    daemon.once()
+
+    env = rig.popen.spawned[-1].env
+    assert env["CONTROL_NODE_URL"] == "http://control.test"
+    assert env["THEOZOLITH_NODE_TOKEN"] == "node-token"
+    assert env["THEOZOLITH_TLS_CA"] == str(ca)
+    for name in ("CONTROL_NODE_URL", "THEOZOLITH_NODE_TOKEN", "THEOZOLITH_TLS_CA"):
+        assert f"{name}_FILE" not in env
+    # Non-reserved secret mappings still materialize normally elsewhere; the
+    # worker sees exactly the daemon's channel identity.
+    config = load_config(env, role="implementer")
+    assert config.control_node_url == "http://control.test"
+    assert config.control_token == "node-token"
+    assert config.control_ca == str(ca)
+
+
+def test_https_channel_without_its_pinned_ca_fails_the_stack_closed(rig: Rig, tmp_path):
+    """A provisioned https URL with no pinned CA is an INCOMPLETE identity:
+    the Stack is refused (error surfaced, nothing spawned) rather than let a
+    Stack-supplied CA fill the gap and re-anchor the channel."""
+    _config, daemon = _rebuilt_daemon(rig, control_url="https://control.test", tls_ca=None)
+    stack = process_stack("worker", env={"THEOZOLITH_TLS_CA": "/stack/ca.pem"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    daemon.once()
+
+    assert rig.popen.spawned == []
+    assert any("one inseparable identity" in line for line in rig.logs)
+    # …and the refusal rides the normal error-event channel.
+    assert any("inseparable" in json.dumps(event) for event in rig.control.events)
+
+
+def test_daemonless_dev_keeps_the_stacks_own_channel_settings(rig: Rig, tmp_path):
+    """No provisioned control URL (permanent degraded / daemon-less dev,
+    ADR-0023): nothing is reserved and nothing injected — the Stack's own
+    channel settings, _FILE forms included, reach the worker unchanged and
+    still satisfy load_config."""
+    from theozolith_nodedaemon.stacks import WireStack as Wire
+    from theozolith_worker.config import load_config
+
+    url_file = tmp_path / "dev-url"
+    url_file.write_text("http://127.0.0.1:8000", encoding="utf-8")
+    _config, daemon = _rebuilt_daemon(rig, control_url=None, node_token="")
+    stack = Wire.from_wire(
+        process_stack(
+            "worker",
+            env={
+                "THEOZOLITH_REPO": "acme/sandbox",
+                "GITHUB_TOKEN": "gh-secret",
+                "CONTROL_NODE_URL_FILE": str(url_file),
+                "THEOZOLITH_NODE_TOKEN": "dev-token",
+            },
+        )
+    )
+    env = daemon._process_env(stack)
+    assert env["CONTROL_NODE_URL_FILE"] == str(url_file)
+    assert env["THEOZOLITH_NODE_TOKEN"] == "dev-token"
+    config = load_config(env, role="implementer")
+    assert config.control_node_url == "http://127.0.0.1:8000"
+    assert config.control_token == "dev-token"
+
+
 def test_wire_cadences_apply_unless_locally_overridden(rig: Rig):
     """control.toml cadences ride desired state (ADR-0023): the wire value
     drives the heartbeat delay when the local config sits on its shipped

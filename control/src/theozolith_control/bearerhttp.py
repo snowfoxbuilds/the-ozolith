@@ -1,8 +1,9 @@
 """One reviewed bearer-token HTTP transport for the control-side clients.
 
 The admin (or per-node) bearer token rides the ``Authorization`` header of
-every request the CLI, status CLI, TUI, and artifact upload make, so the
-transport must refuse to put it on a plaintext wire and must never let
+every request the CLI, status CLI, TUI, artifact upload, and local-node
+bootstrap (``localnode._http``) make, so the transport must refuse to put
+it on a plaintext wire and must never let
 urllib's default redirect handler re-send it to another origin or downgrade
 it to http. Python's default handler copies every request header — the bearer
 token included — onto the redirected request for whatever host ``Location``

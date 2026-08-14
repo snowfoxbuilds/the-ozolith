@@ -20,7 +20,7 @@ def _mint(control: ControlRig, **overrides) -> dict:
 
 
 def _with_ca(control: ControlRig) -> ControlRig:
-    provision(control.settings.tls_dir, ["127.0.0.1"])
+    provision(control.settings.tls_dir, ["127.0.0.1"], trust_root=control.settings.data_dir)
     return control
 
 
@@ -105,7 +105,7 @@ def test_mints_refuse_without_a_persisted_ip(tmp_path, monkeypatch):
     """A pre-init deployment cannot mint a guessed address: 409 with
     instructions, never a silent detect_host_ip() fallback."""
     rig = make_rig(tmp_path, control_ip="")
-    provision(rig.settings.tls_dir, ["127.0.0.1"])
+    provision(rig.settings.tls_dir, ["127.0.0.1"], trust_root=rig.settings.data_dir)
     monkeypatch.setattr(
         "theozolith_control.bootstrap.detect_host_ip",
         lambda: pytest.fail("detection at mint time"),

@@ -546,6 +546,176 @@ def test_interrupt_stops_the_listener_and_revokes(tmp_path, monkeypatch):
     assert any(url.endswith("/api/v1/join-tokens/tok-1") for url in harness.revokes())
 
 
+# -- the live transport: local bootstrap rides the ONE bearer client (OZ-03) ------
+
+
+class _PlaintextTrap:
+    """An instrumented plaintext TCP listener on its own port: a leaked
+    redirect hop is provable — zero connections, zero bytes, and therefore
+    zero Authorization headers."""
+
+    def __init__(self):
+        import socket
+        import threading
+
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.1)
+        self.port = self._sock.getsockname()[1]
+        self.connections = 0
+        self.data = bytearray()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except TimeoutError:
+                continue
+            self.connections += 1
+            conn.settimeout(0.2)
+            try:
+                while data := conn.recv(4096):
+                    self.data += data
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(2)
+        self._sock.close()
+
+
+def _quiet_handler(answers):
+    """A BaseHTTPRequestHandler answering GET from ``answers`` —
+    (status, headers, body) keyed by path, with a default."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            status, headers, body = answers.get(self.path, answers["*"])
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+    return Handler
+
+
+def _tls_loopback_server(tmp_path, answers):
+    """``answers`` served on a REAL loopback TLS socket whose certificate is
+    minted by the same ``tls.provision`` the init flow runs — the pinned
+    loopback HTTPS origin the local bootstrap dials. Returns
+    (server, thread, port, ca_path)."""
+    import http.server
+    import ssl
+    import threading
+
+    from theozolith_control import tls
+
+    ca, cert, key = tls.provision(tmp_path / "live-tls", ["127.0.0.1"], trust_root=tmp_path)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _quiet_handler(answers))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, server.server_address[1], str(ca)
+
+
+def _stop_server(server, thread):
+    server.shutdown()
+    thread.join(2)
+    server.server_close()
+
+
+def test_local_bootstrap_redirect_trap_gets_zero_bytes_and_no_authorization(tmp_path):
+    """LIVE: a hostile answer on the pinned loopback HTTPS origin redirects
+    toward a different-port PLAINTEXT trap. The shared transport refuses the
+    hop BEFORE any redirected request, the refusal surfaces as the mapped
+    clean SystemExit (no token in the message), and the trap records zero
+    connections, zero bytes, zero Authorization headers."""
+    import time
+
+    trap = _PlaintextTrap()
+    answers = {"*": (302, {"Location": f"http://127.0.0.1:{trap.port}/steal"}, b"")}
+    server, thread, port, ca = _tls_loopback_server(tmp_path, answers)
+    try:
+        with pytest.raises(SystemExit, match="local control channel refused") as excinfo:
+            localnode._http(
+                "GET", f"https://127.0.0.1:{port}/api/v1/state", token="admin-secret", ca=ca
+            )
+        assert "admin-secret" not in str(excinfo.value)
+        time.sleep(0.2)  # anything in flight would have landed
+        assert trap.connections == 0
+        assert bytes(trap.data) == b""
+    finally:
+        _stop_server(server, thread)
+        trap.stop()
+
+
+def test_local_bootstrap_same_origin_https_requests_still_succeed(tmp_path):
+    """LIVE: the happy path through the shared transport — loopback TLS
+    verified against the minted CA, status and parsed JSON preserved, and an
+    HTTP error answer mapped to (code, detail) exactly as before."""
+    answers = {
+        "/api/v1/state": (
+            200,
+            {"Content-Type": "application/json"},
+            b'{"now": 1.0, "nodes": []}',
+        ),
+        "*": (404, {"Content-Type": "text/plain"}, b"nope"),
+    }
+    server, thread, port, ca = _tls_loopback_server(tmp_path, answers)
+    try:
+        status, answer = localnode._http(
+            "GET", f"https://127.0.0.1:{port}/api/v1/state", token="admin-secret", ca=ca
+        )
+        assert status == 200 and answer == {"now": 1.0, "nodes": []}
+        status, answer = localnode._http(
+            "GET", f"https://127.0.0.1:{port}/api/v1/missing", token="admin-secret", ca=ca
+        )
+        assert status == 404 and answer == {"detail": "nope"}
+    finally:
+        _stop_server(server, thread)
+
+
+def test_revocation_swallows_a_transport_refusal_and_keeps_the_original_error(
+    tmp_path, monkeypatch
+):
+    """``_http`` maps a transport policy refusal to SystemExit; when that
+    happens during BEST-EFFORT revocation the original failure must keep
+    unwinding — cleanup never replaces the error being reported (the token's
+    one-hour TTL is the backstop)."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    harness = Harness(tmp_path)
+    original_fetch = harness.fetch
+
+    def refusing_cleanup_fetch(method, url, *, token, ca, body=None):
+        if method == "DELETE":
+            raise SystemExit("error: the local control channel refused a request: redirect trap")
+        if method == "GET" and url.endswith("/api/v1/join-tokens"):
+            raise KeyboardInterrupt  # the original failure, mid-join
+        return original_fetch(method, url, token=token, ca=ca, body=body)
+
+    harness.fetch = refusing_cleanup_fetch
+    with pytest.raises(KeyboardInterrupt):  # NOT the cleanup SystemExit
+        harness.bootstrap(tmp_path)
+
+
 def test_heartbeat_timeout_keeps_the_provisioned_node(tmp_path, monkeypatch):
     """A first-heartbeat timeout deletes nothing: the message says so and
     names the resume command; the consumed token is not revoked."""
