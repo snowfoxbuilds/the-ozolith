@@ -575,38 +575,77 @@ own credential, and nothing unverified ever gets task capability:
      coerces back to the pin;
    - a **same-family canary** for full-ID pins (enforcement that quietly
      matched at family granularity would pass the first canary and still run
-     the wrong model); aliases skip it — family members are their contract;
+     the wrong model). The sibling is always **genuinely distinct**: never
+     an undated prefix of the pin (the provider resolves undated IDs to
+     their newest dated variant, so bare `claude-sonnet-4-6` could resolve
+     to a dated 4.6 pin and prove nothing); a known multi-member family with
+     no usable distinct sibling fails the preflight `unverifiable` rather
+     than running a vacuous canary. Aliases skip it — family members are
+     their contract — and single-member families (fable, mythos) have no
+     sibling to ask for: there the widen canary and the in-session monitor
+     remain the proof (a documented, deliberate difference);
    - an **identity probe** with no `--model` at all: the session the
-     effective policy picks by itself must announce AND execute the baked
-     model, and, when effort is baked, a `Stop`-hook capture must report the
-     baked level as the *applied* effort (the Stop payload carries the
-     post-clamp value after a plain no-tool turn — verified live — so an
-     organization cap is observed without executing any tool).
+     effective policy picks by itself must **announce AND execute** the
+     baked model — both signals present and matching, for the canaries and
+     the probe alike; a stream with no init announcement is `unverifiable` —
+     and, when effort is baked, a `Stop`-hook capture must report the baked
+     level as the *applied* effort (the Stop payload carries the post-clamp
+     value after a plain no-tool turn — verified live — so an organization
+     cap is observed without executing any tool). Matching strips the CLI's
+     context-window decoration (`claude-opus-5[1m]` announces the same
+     model `claude-opus-5` executes).
    Neither canary proves the *absence* of conditional fallback or of
    server-side overrides that only trigger later — that residual is exactly
    what the in-session monitor below exists for.
 4. **A gated task session, launched only after that proof** — stdin-driven,
-   with a `--settings` PreToolUse hook that **denies every tool call until a
-   release marker exists** (the denial binds even under
-   `--dangerously-skip-permissions` — verified live), a `Stop` hook as the
-   effort drift monitor, and a `ConfigChange` hook that records
-   identity-relevant mid-session settings changes (it never *blocks* a
-   change — organization policy is never resisted; a recorded change kills
-   the Run instead). The first turn is a no-op probe; only after this
-   session's own init announcement and executed turn match (and the applied
-   effort, when baked) does the harness run the **atomic release**: open the
-   tool gate, write the task file back, deliver the pointer prompt, close
-   stdin. `released` is recorded only once the prompt has actually entered
-   the process; a broken pipe during delivery fails the Run as
-   `task-delivery`, a failing stdin close as `stdin-close` — never a silent
-   pass.
+   and itself loading **no user, project, or local settings source**
+   (`--setting-sources ""`): an initial checkout or home-directory settings
+   key — `env.ANTHROPIC_BASE_URL`, a Bedrock/Vertex switch,
+   `modelOverrides`, a model/effort selector, a policy helper, or an
+   identity surface not yet invented — can never enter the one session that
+   will hold the task, because the sources it would ride simply never load
+   (verified live with a booby-trapped checkout, plus a positive control
+   proving the same trap fires without the flag). The documented cost: the
+   checkout's CLAUDE.md, skills, and slash commands ride the project
+   settings source and do not load either — the driver-rendered task file
+   is the session's complete assignment. `--settings` hooks stay active
+   under the flag (verified live): a PreToolUse hook **denies every tool
+   call until a release marker exists** (binding even under
+   `--dangerously-skip-permissions` — verified live), a `Stop` hook —
+   registered for every gated session, effort baked or not — appends one
+   value-redacted record per **completed turn** (the turn-boundary
+   journal), and a `ConfigChange` hook records identity-relevant
+   mid-session settings changes (it never *blocks* a change — organization
+   policy is never resisted; a recorded change kills the Run instead). The
+   first turn is a no-op probe; only after this session's own init
+   announcement and executed turn match, the probe's boundary record exists
+   (the probe has **completely stopped** — release never rides the first
+   matching assistant event), and the applied effort matches (when baked)
+   does the harness run the **atomic release**: open the tool gate, write
+   the task file back, deliver the pointer prompt, close stdin. `released`
+   is recorded only once the prompt has actually entered the process; a
+   broken pipe during delivery fails the Run as `task-delivery`, a failing
+   stdin close as `stdin-close` — never a silent pass.
 5. **A live monitor with a completion bar** — after release the harness
-   keeps reading the stream: a turn executing on another model, a drifted
-   applied effort, or a recorded identity-affecting ConfigChange kills the
-   agent immediately and invalidates the Run. Probe and task turns are
-   counted separately, and an exit — even exit 0 — with **no post-release
-   task turn** is a failed Run (`task-unprocessed`), so a stdin EOF race can
-   never become a completed Run that did nothing.
+   keeps reading the stream: a turn executing on another model, a completed
+   turn with a drifted applied effort, or a recorded identity-affecting
+   ConfigChange kills the agent immediately and invalidates the Run. Probe
+   and task turns are counted **from the boundary journal** — completed
+   turns attributed by release state, so a residual probe event the
+   transcript pump delivers late can never read as the task being processed
+   — and an exit — even exit 0 — with **no completed post-release turn** is
+   a failed Run (`task-unprocessed`): a stdin EOF race or leftover probe
+   output can never become a completed Run that did nothing.
+
+**One deadline budgets the whole Run.** The end-to-end clock starts before
+the preflight and covers everything: the CLI version probe, every canary,
+the identity probe, the gated release wait, and the task itself all run
+under what remains of the worker type's `agent_timeout_seconds` (each
+verification step additionally capped by a per-session safety maximum).
+Verification never silently extends the task budget, exhausting the budget
+before release fails `preflight-timeout` with the task still withheld, and
+the driver's own container wait (agent timeout + grace) can never expire
+before the harness's own verdict is on disk.
 
 Identity failures carry a distinct `failure_class: identity` (the local-retry
 budget still applies uniformly, ADR-0016) and a diagnostic naming the
@@ -614,14 +653,28 @@ expected model/effort, the mismatch category (`policy-conflict`,
 `identity-inconsistent`, `pair-invalid`, `cli-too-old`, `unavailable`,
 `substituted`, `policy-widened`, `effort-clamped`, `unverifiable`,
 `preflight-timeout`, `config-changed`, `task-delivery`, `stdin-close`,
-`task-unprocessed`), and the confirmation the task was not started. The
-evidence bundle embeds the same verdict as an `identity` object (expected vs
-observed model/effort, preflight/gate status and category, probe/task turn
-counts, CLI version) — categories and model names only, never credentials or
-settings contents. The preflight and probe turns spend a few hundred tokens
-per Run; that is the price of proof. A worker type with no `model`/`effort`
-bakes no identity and launches exactly as before — no gate, no probe, no
-extra cost.
+`task-unprocessed`), and the confirmation the task was not started. **Every**
+identity failure writes the redacted `output/identity.json` record — a
+corrupt or half-declared identity is `identity-inconsistent`, and a boundary
+that cannot even be established (scratch, task-withholding, or hook-script
+I/O failure) is `unverifiable` with the failing step named — never a generic
+harness crash without evidence. The evidence bundle embeds the same verdict
+as an `identity` object (expected vs observed model/effort, preflight/gate
+status and category, completed probe/task turn counts, CLI version) —
+categories and model names only, never credentials or settings contents.
+The preflight and probe turns spend a few hundred tokens per Run; that is
+the price of proof. A worker type with no `model`/`effort` bakes no identity
+and launches exactly as before — no gate, no probe, no extra cost.
+
+**Reviewer identity failures terminate visibly.** A review session killed by
+the identity gate takes the Reviewer's one-strike lane (ADR-0014's shape):
+the harness's identity.json and the available transcript are published to
+the evidence bundle with `failure_class: identity`, then the PR turns
+`blocked` + `needs_human` (losing `pr_ready`) in the same pass — the PR
+leaves the reviewable pool instead of relaunching an identical doomed review
+on every poll. The identity marker is matched **anchored** (it must begin
+the harness's status error), in the Reviewer and the Implementer alike; any
+other session breakage keeps its existing behavior.
 
 Trust boundaries, stated honestly: the release gate rides on transcript
 events (authored by the CLI) and on the neutral preflight; the Stop/
@@ -629,8 +682,9 @@ ConfigChange capture files are same-user filesystem state, so post-release
 they are a fail-closed channel only — checkout code that forges a "matching"
 capture changes nothing (release still required the transcript proof and the
 preflight), and a forged mismatch only fails that Run. Project hooks,
-CLAUDE.md, and skills load exclusively in the task session, which exists
-only after the gate has passed.
+CLAUDE.md, settings, and skills never load in any gated session at all —
+the checkout influences the Run only through the task file and the code the
+released session chooses to read.
 
 **Model/effort pairs validate together.** An effort is accepted only when the
 *specific* model provably honors it: Claude Code silently runs an unsupported
@@ -664,9 +718,14 @@ The enforcement behavior is verified live against **Claude Code 2.1.232** by
 the worker package's opt-in suite (`THEOZOLITH_LIVE_CLAUDE=1
 uv run pytest worker/tests/test_live_enforcement.py`), including the whole
 gated harness driven end to end through the real `run_harness` (withheld
-task → neutral preflight → gated session → release → task turn) and its
+task → neutral preflight → gated session → release → task turn, with
+exactly one probe and one task record in the turn journal), its
 failed-preflight twin proving the task session — project hooks included —
-never exists when the gate fails. The suite installs and removes real
+never exists when the gate fails, and the task-session isolation pair: a
+checkout booby-trapped with `env.ANTHROPIC_BASE_URL`, a model selector, a
+SessionStart hook, and a CLAUDE.md never reaches the gated task session,
+while the positive control proves the same trap fires without
+`--setting-sources ""`. The suite installs and removes real
 `/etc/claude-code` (and `/etc/theozolith`) policy — **run it only in an
 isolated Linux container**, never on a workstation with real managed
 settings. Two cases stay outside it: a real organization effort cap is

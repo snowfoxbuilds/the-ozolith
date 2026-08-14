@@ -32,9 +32,16 @@ adapter = "claude"               # the Agent adapter the harness invokes
 # identity with the Run's own credential behind a real boundary — the
 # task file leaves the disk, canaries and a no-tool probe run in a
 # neutral scratch with tools and project sources removed, and the task
-# session (tools denied until release) starts only after the proof — a
+# session (tools denied until release, task delivered only after its
+# probe turn completely stopped) starts only after the proof — a
 # substituted, widened, clamped, or unverifiable identity fails the Run
-# as failure_class "identity" with a stable category (deploy/README.md).
+# as failure_class "identity" with a stable category, and one deadline
+# (agent_timeout_seconds) budgets verification and task together
+# (deploy/README.md). NOTE the gated task session loads NO user/project/
+# local settings source: nothing a checkout's .claude/settings.json
+# declares can steer it — and the checkout's CLAUDE.md, skills, and
+# slash commands do not load either; the pipeline's rendered task file
+# is the session's complete assignment.
 # effort = "high"
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works
