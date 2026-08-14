@@ -1,79 +1,31 @@
 # TheOzolith
 
-An open-source agent-orchestration monorepo with three separable concerns:
+An open-source agent-orchestration platform that addresses the pain points of running coding agents today:
 
-- **Agent-knowledge machinery** (`knowledge/`) — a tool-agnostic config format for skills,
-  subagents, and workflows; per-tool compilers (`AGENTS.md` → `CLAUDE.md`, skill placement);
-  a one-way sync engine into local tool config dirs; and a bake CLI for installing a pinned
-  Knowledge Source into a container image at build time.
-- **Agentic coding pipeline** (`worker/`) — staged autonomous development on GitHub issues
-  and PRs: Implementer and Reviewer drivers, per-Run containers with the agent harness as
-  PID 1 running the agent **headless** (one-shot invocation, exit-is-completion, the
-  structured output stream as the evidence transcript — ADR-0019), the Claim Protocol
-  (Control Node write-through dispatch, ADR-0017), a first-party gate, best-effort PRs
-  with Decisions Sections (including advisory `process_issues`), and verdict-file review
-  rounds. Plus the repo bootstrap tool from M1.
-- **Cluster substrate** (`control/`, `nodedaemon/`, `deploy/`) — Control Node, Node Daemons,
-  and Stacks (ADR-0015). The Control Node serves the heartbeat/command channel, claim
-  dispatch, typed events (Run progress and `theozolith.error` summaries), the zombie-claim
-  janitor, the encrypted node-scoped secret store, the dashboard + web terminal (the
-  Flight Deck is the terminal's primary target; run containers are never attachable), and
-  the two product-update paths (`theozolith update` / `theozolith build`, ADR-0015 as
-  amended). The Node Daemon registers a box as a Container-Host: declarative Stacks
-  (container + supervised driver processes, kill-the-tree), local derived-image builds,
-  tmpfs secrets, orphan reaping. `deploy/` carries the installer, the control compose
-  file, and a starter Config Repo (including a Flight Deck example); the daemon-less
-  one-box dev shape runs `theozolith serve` beside the drivers (claims dispatch
-  through the Control Node — ADR-0017).
+- **Containerization and security** — long-running agents run in containers with zero
+  credentials, so autonomous agents can safely run with full permissions.
+- **Autonomous workflows** — workers are triggered automatically by tags on GitHub issues and
+  PRs. Built-in workers handle tasks such as implementation and code review on their own.
+- **Agent-knowledge library** (`knowledge/`) — a tool-agnostic config format for managing
+  skills, subagents, and workflows; knowledge survives container rebuilds.
+- **Agent-agnostic** — models and harnesses are built to be easily swappable.
+- **Benchmark integration (WIP)** — autonomous implementers can be benchmarked with
+  SilverquiLLM-bench to evaluate effectiveness and cost.
+- **Cluster management (WIP)** — deploy nodes across multiple machines and manage them centrally.
 
-Every top-level component is independently installable. A laptop-only user of the knowledge
-machinery never installs the cluster manager.
 
-The project is governed by anchor docs authored in Notion and synced one-way into this repo
-([AGENTS.md](AGENTS.md) index, [CONTEXT.md](CONTEXT.md) glossary, [docs/specs/](docs/specs),
-[docs/adr/](docs/adr)); see ADR-0001. Synced docs are never hand-edited here.
-
-## Domain vocabulary (read this first)
-
-The substrate has three nouns, and the operational recipes below turn on the distinction:
-
-- **Node** — a physical/virtual box running the Node Daemon. Nodes are **capacity**.
-- **Worker type** — the complete customization unit for one automated actor (ADR-0044): its
-  driver (built-in or custom), Agent adapter + model, target workspace repo, run-image
-  recipe, knowledge pin, and the secret **names** it needs. Lives in `worker-types/` in the
-  Config Repo. The Implementer, the Reviewer, the (driverless) Flight Deck, and any custom
-  worker are all worker types (ADR-0020).
-- **Stack** — a **thin placement**: `worker type + node + desired state (running/stopped)`,
-  plus optional per-placement env/attach. A "worker in the fleet" is a Stack. The Control
-  Node resolves the thin Stack against its worker type into the full container/process spec.
-
-So **adding a worker = declare a worker type + place it with a Stack + enter its secrets**,
-and **starting/stopping a worker = flip that Stack's `state` (or queue a `command`)**.
-
-## Quick start (knowledge machinery, laptop-only)
-
-No cluster required — this is the standalone knowledge compiler/sync.
-
-```sh
-uv pip install ./knowledge          # or: pip install ./knowledge
-
-# Sync a knowledge repo into your global Claude config dir
-theozolith-knowledge sync --source /path/to/knowledge-repo --scope global
-
-# Generate a project's CLAUDE.md (+ .claude assets) from its AGENTS.md
-theozolith-knowledge sync --source . --scope project --target .
-
-# Inside a Dockerfile: bake a pinned Knowledge Source into the image
-theozolith-knowledge bake --source https://example.com/knowledge.git --pin <commit> --target /root/.claude
-```
-
-## Setup (full substrate)
+## Setup
 
 One Control Node, plus a Node Daemon on every box that should run Stacks. The per-box
 footprint is docker + the TheOzolith package + `theozolith init` output — there is no `.env`
 (the deletion test as restated by ADR-0023/0034). Operations, backup/recovery, the
 daemon-less one-box dev shape, and cleanup live in [deploy/README.md](deploy/README.md); this
 is the orientation path.
+
+> **No published releases yet — everything builds from a checkout of this repo.** Bootstrap the
+> CLI with `sudo python3 build.py`, and push updates to the fleet with `theozolith build` from a
+> clean source checkout. The release-based paths (`theozolith update`'s version pin and the
+> fresh-box `curl … | sudo bash` installer) activate once releases are cut.
 
 Prerequisites:
 
@@ -95,8 +47,9 @@ docker compose -f deploy/compose/control.yml run --rm control init --ip <this-bo
 docker compose -f deploy/compose/control.yml up -d
 ```
 
-Or bare metal (root-mediated; the `theozolith` CLI must already be at a system path — see
-*Build / rebuild from the repo* in [deploy/README.md](deploy/README.md)):
+Or bare metal (root-mediated). First bootstrap the CLI from the checkout — `sudo python3
+build.py` puts `theozolith` at a system path (full sequence: *Build / rebuild from the repo* in
+[deploy/README.md](deploy/README.md)) — then:
 
 ```sh
 sudo theozolith init                         # auto-detects the IP; --ip to correct it
@@ -124,21 +77,26 @@ string), then seeds the Config Repo with a complete worker Stack staged at `stat
 and a README naming the finish line. Nothing deploys until you pin the image, enter secrets,
 and flip to `running`.
 
-### 2. Add nodes to the fleet (capacity) — one paste each
+### 2. Add nodes to the fleet (capacity) — one paste each *(experimental)*
+
+Multi-node is still experimental. Mint a join token on the Control Node:
 
 ```sh
 theozolith join-token create      # on the Control Node (sudo on a root install), or the dashboard
 ```
 
-Paste the printed line on the box. A fresh box's line fetches the installer over GitHub-release
-HTTPS and hands off to `theozolith-nodedaemon provision`, which verifies the CA against the
-join string's pinned fingerprint **before transmitting anything**, exchanges the single-use join
-token for the node's own non-expiring per-node token, persists everything under
-`/var/lib/theozolith`, and enables the systemd unit (`KillMode=control-group`: every TheOzolith
-process on the node dies with the daemon). Provisioning **is** registration (ADR-0023): the node
-exists the moment the exchange succeeds and heartbeats within the interval (60 s default). Join
-tokens default to 1 hour / single use; `--ttl`/`--uses` widen them for batches,
-`theozolith join-token revoke <id>` is the backstop.
+The printed fresh-box installer line (`curl … | sudo bash`) pulls from GitHub releases, which
+don't exist yet — so for now, clone this repo on each node and bootstrap the CLI first
+(`sudo python3 build.py`, exactly as on the Control Node), then run the printed
+`sudo theozolith-nodedaemon provision 'ozjoin1:…'` line alone.
+
+`provision` verifies the CA against the join string's pinned fingerprint **before transmitting
+anything**, exchanges the single-use join token for the node's own non-expiring per-node token,
+persists everything under `/var/lib/theozolith`, and enables the systemd unit
+(`KillMode=control-group`: every TheOzolith process on the node dies with the daemon).
+Provisioning **is** registration (ADR-0023): the node exists the moment the exchange succeeds and
+heartbeats within the interval (60 s default). Join tokens default to 1 hour / single use;
+`--ttl`/`--uses` widen them for batches, `theozolith join-token revoke <id>` is the backstop.
 
 ### 3. Add a worker to the fleet
 
@@ -182,7 +140,10 @@ driverless worker type — see step 4.
 
 ### 4. Manage knowledge & custom workers
 
-**Knowledge on a laptop** — use the `sync`/`bake` quick start above.
+**Knowledge on a laptop** — the knowledge machinery is standalone (no cluster required):
+`pip install ./knowledge`, then `theozolith-knowledge sync` a knowledge repo into your
+`~/.claude`, or `bake` a pinned Knowledge Source into a container image at build time. See
+[knowledge/README.md](knowledge/README.md).
 
 **Knowledge on the fleet (Flight Deck, ADR-0043)** — the Flight Deck is a driverless worker type
 (`deploy/configs-example/worker-types/flightdeck.toml`) whose `~/.claude` knowledge dirs are a
@@ -274,8 +235,25 @@ web terminal. Its GitHub credential is a dedicated **no-merge** machine identity
 (`flightdeck-github-token`) — never a driver or personal PAT — so the human merge gate stays human
 by construction. Don't leave Flight Deck sessions running unattended.
 
-Updating the product across the fleet (`theozolith update` / `theozolith build`), backup and
-recovery, and the daemon-less dev shape are covered in [deploy/README.md](deploy/README.md).
+Updating the product across the fleet (with no releases yet, `theozolith build` from a clean
+source checkout; `theozolith update`'s release-pin path activates once releases exist), backup
+and recovery, and the daemon-less dev shape are covered in [deploy/README.md](deploy/README.md).
+
+## Further Reading
+
+- [AGENTS.md](AGENTS.md) — project index, conventions, and the spec/ADR map.
+- [CONTEXT.md](CONTEXT.md) — domain glossary; every spec, driver, and agent instruction uses
+  these terms exactly.
+- Component READMEs — [knowledge/](knowledge/README.md) (knowledge machinery),
+  [worker/](worker/README.md) (the coding pipeline and drivers),
+  [control/](control/README.md) (Control Node), [nodedaemon/](nodedaemon/README.md) (Node
+  Daemon), and [deploy/](deploy/README.md) (substrate operations: install, backup/recovery,
+  the daemon-less dev shape, and cleanup).
+- Specs — [ARCHITECTURE.md](docs/specs/ARCHITECTURE.md),
+  [AGENTIC-CODING-PIPELINE.md](docs/specs/AGENTIC-CODING-PIPELINE.md), and
+  [NODE-SUBSTRATE.md](docs/specs/NODE-SUBSTRATE.md).
+- [Architecture Decision Records](docs/adr/) — the numbered ADRs referenced throughout this
+  document.
 
 ## Development
 
