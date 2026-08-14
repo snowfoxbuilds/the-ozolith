@@ -65,24 +65,27 @@ RunBehavior = Callable[[str, Path], AgentOutcome | None]
 @dataclass
 class IdentityFailure:
     """A scripted reviewer reply that makes the session die the way a real
-    identity-gate kill does (ADR-0045): the harness wrote its redacted
+    identity-monitor kill does (ADR-0045): the harness wrote its redacted
     identity.json, status.json carries the anchored ``identity:`` marker, and
     the driver sees it as a SessionError from wait_for_agent."""
 
     detail: str = (
-        "[substituted] a turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
+        "[substituted] a main-agent turn executed on 'claude-opus-5',"
+        " not the baked 'claude-sonnet-5'"
     )
     record: dict = field(
         default_factory=lambda: {
             "expected_model": "claude-sonnet-5",
             "expected_effort": "",
-            "preflight": "passed",
+            "checks": "passed",
             "category": "substituted",
-            "released": True,
-            "violation": "a turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'",
+            "detail": "",
             "observed_model": "claude-opus-5",
-            "probe_turns": 1,
-            "task_turns": 0,
+            "observed_effort": "",
+            "violation": (
+                "a main-agent turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
+            ),
+            "notes": [],
         }
     )
 
@@ -177,6 +180,12 @@ class SessionRecord:
     def alive(self) -> set[str]:
         return set(self.launched) - set(self.removed)
 
+    @property
+    def work_launched(self) -> list[str]:
+        """Run/review containers only — the per-boot identity dry-run
+        container (ADR-0045) is setup, not work."""
+        return [name for name in self.launched if not name.startswith("ozolith-identity-")]
+
 
 class FakeSession:
     """In-process stand-in for ContainerSession: same seam, same job dir.
@@ -230,6 +239,11 @@ class FakeSession:
         transcript.write_text("\n".join(lines) + "\n")
 
     def wait_for_agent(self) -> AgentOutcome:
+        if self.manifest.mode == jobdir.MODE_DRYRUN:
+            # The setup dry-run (ADR-0045): no task file, no workdir — the
+            # fake passes it the way a healthy image does.
+            jobdir.write_identity(self.job, {"dry_run": "passed", "expected_model": ""})
+            return AgentOutcome(completed=True)
         prompt = (self.job / jobdir.PROMPT_FILE).read_text()
         self._write_transcript(prompt)
         if self.manifest.mode == jobdir.MODE_RUN:

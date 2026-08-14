@@ -116,12 +116,29 @@ def test_a_worker_subclass_built_only_from_api_names_runs(tmp_path):
         },
         role=Smoke.role,
     )
+
+    class _DryrunSession:
+        # The base loop's setup dry-run (ADR-0045) commissions one session
+        # per driver process; a custom worker's fakes serve it like any
+        # other session seam.
+        def __init__(self, job):
+            self._job = job
+
+        def launch(self):
+            pass
+
+        def wait_for_agent(self):
+            return None  # a passing dry-run: no identity error raised
+
+        def finish(self):
+            pass
+
     worker = Smoke(
         config,
         client=_Login(),
         dispatch=_Dispatch(),
         sink=_Sink(),
-        session_factory=lambda spec, job, manifest: None,
+        session_factory=lambda spec, job, manifest: _DryrunSession(job),
     )
 
     assert worker.run(once=True) == 2

@@ -25,6 +25,7 @@ from conftest import (
 )
 from fakegithub import rate_limited_response
 from theozolith_worker import decisions, verdict
+from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
     BLOCKED,
@@ -195,7 +196,7 @@ def test_no_grant_means_no_run(harness: Harness):
     number = harness.file_issue("Busy", CRITERIA_BODY)
     harness.fake.force_assign(number, "ozolith-worker-b")  # someone else owns it
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert harness.fake.assignees_of(number) == ["ozolith-worker-b"]
 
 
@@ -204,7 +205,7 @@ def test_failed_label_is_refused_at_dispatch(harness: Harness):
     number = harness.file_issue("Broken state", CRITERIA_BODY)
     harness.fake.issues[number]["labels"].append({"name": FAILED})
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert PLAN_READY in harness.fake.labels_of(number)  # never laundered
 
 
@@ -355,7 +356,8 @@ def test_reviewer_identity_failure_blocks_the_pr_once(harness: Harness):
     assert record["failure_class"] == "identity"
     assert record["verdict"] is None
     assert record["identity"]["category"] == "substituted"
-    assert record["identity"]["released"] is True
+    assert record["identity"]["checks"] == "passed"
+    assert record["identity"]["violation"]
     assert "[substituted]" in record["error"]
     assert any(p.endswith("-identity-transcript.txt") for p in paths)
 
@@ -437,11 +439,11 @@ def test_exhausted_attempt_labels_escalate_deterministically(harness: Harness):
     harness.fake.issues[pr_number]["labels"] += [
         {"name": f"{ATTEMPT_PREFIX}{n}"} for n in (1, 2, 3)
     ]
-    containers_before = len(harness.record.launched)
+    containers_before = len(harness.record.work_launched)
 
     assert harness.reviewer_once() == 1  # no scripted reply: no container ran
 
-    assert len(harness.record.launched) == containers_before  # no review container
+    assert len(harness.record.work_launched) == containers_before  # no review container
     labels = harness.fake.labels_of(pr_number)
     assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
     parsed = verdict.parse_comment(harness.fake.comments[pr_number][-1]["body"])
@@ -467,7 +469,7 @@ def test_statelessness_between_runs(harness: Harness):
     # Each Run got a fresh checkout in a fresh job dir, in a fresh container.
     (_, cwd_one), (_, cwd_two) = harness.worker_calls
     assert cwd_one != cwd_two
-    assert len(set(harness.record.launched)) == 2
+    assert len(set(harness.record.work_launched)) == 2
     assert harness.record.alive == set()  # no ozolith-run-* containers remain
     # The agent-side decisions file never lands on the branch.
     for number in (first, second):
@@ -984,6 +986,8 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
 
     def broken_factory(spec, job, manifest):
         session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN:
+            return session  # setup dry-run works; only RUN containers break
 
         def broken_launch():
             raise EngineError("docker run failed: no such image")
@@ -1103,7 +1107,7 @@ def test_control_node_down_pauses_new_claims_and_reviews(harness: Harness):
     harness.dispatch.paused = True
 
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert PLAN_READY in harness.fake.labels_of(number)  # untouched
     assert harness.reviewer_once() == 0
     assert any("paused" in line for line in harness.logs)
@@ -1131,7 +1135,7 @@ def test_unacknowledged_claimed_event_abandons_the_grant(harness: Harness):
     window, and running anyway would fork ownership (ADR-0017)."""
     harness.file_issue("Lost handshake", CRITERIA_BODY)
     assert harness.worker_once(sink=_DeadSink()) == 0
-    assert harness.record.launched == []  # no Run was started
+    assert harness.record.work_launched == []  # no Run was started
     assert harness.fake.open_pr_numbers() == []
     assert any("abandoning the grant" in line for line in harness.logs)
 

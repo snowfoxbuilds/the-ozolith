@@ -1,11 +1,11 @@
-"""The baked-identity enforcement machinery (ADR-0045, fail closed).
+"""The baked-identity machinery (ADR-0045, best effort).
 
-Unit tests for identity.py: the managed-tier conflict scan both gates run
-(build and runtime), the freshness-key validation, the process-environment
-audit, the pair-aware (model, effort) capability table, the baked-identity
-reader, the subprocess preflight (canaries + neutral identity probe) with a
-scripted runner, the ConfigChange hook helper, and the session guard's
-gate/monitor state machine. Live proof that the real CLI behaves as these
+Unit tests for identity.py: the managed-tier conflict scan the build gate
+runs (and its runtime re-check with legacy-image tolerance), the
+process-environment audit, the pair-aware (model, effort) capability table,
+the baked-identity reader, the free per-Run static checks, the setup
+dry-run with a scripted subprocess runner, the hook helpers, and the
+fail-loud session monitor. Live proof that the real CLI behaves as these
 tests assume is test_live_enforcement.py.
 """
 
@@ -28,27 +28,24 @@ from theozolith_worker.identity import (
     CATEGORY_TIMEOUT,
     CATEGORY_UNAVAILABLE,
     CATEGORY_UNVERIFIABLE,
-    CATEGORY_WIDENED,
     CONFIG_CHANGE_HOOK_SOURCE,
-    GUARD_KILL,
-    GUARD_RELEASE,
-    GUARD_WAIT,
     PROBE_PROMPT,
     STOP_HOOK_SOURCE,
     BakedIdentity,
-    ClaudeSessionGuard,
+    ClaudeSessionMonitor,
     IdentityError,
-    TaskGate,
+    MonitorHooks,
     effort_capability,
     identity_error_detail,
     model_matches,
     normalize_model,
     pair_error,
     read_baked_identity,
+    read_last_journal_effort,
     run_preflight,
     scan_managed_conflicts,
     scan_process_environment,
-    sibling_for,
+    static_identity_report,
 )
 
 MANAGED = "etc/claude-code/managed-settings.json"
@@ -64,19 +61,27 @@ def _write(root: Path, relpath: str, data) -> Path:
 
 
 def _bake(root: Path, model: str, effort: str = "") -> None:
-    """The exact artifact materialize() writes for (model, effort)."""
+    """The exact artifact materialize() writes for (model, effort): a
+    managed model DEFAULT (main-agent selection), no allowlist."""
     _write(root, "etc/theozolith/model", model + "\n")
-    settings: dict = {
-        "model": model,
-        "availableModels": [model],
-        "enforceAvailableModels": True,
-        "forceRemoteSettingsRefresh": True,
-    }
+    settings: dict = {"model": model}
     if effort:
         _write(root, "etc/theozolith/effort", effort + "\n")
         settings["effortLevel"] = effort
         settings["env"] = {"CLAUDE_CODE_EFFORT_LEVEL": effort}
     _write(root, MANAGED, settings)
+
+
+def _bake_legacy(root: Path, model: str, effort: str = "") -> None:
+    """The artifact PRE-consolidation builds wrote: the single-entry
+    allowlist plus the freshness key. Tolerated (stricter, not conflicting)
+    until the image is rebuilt."""
+    _bake(root, model, effort)
+    document = json.loads((root / MANAGED).read_text())
+    document["availableModels"] = [model]
+    document["enforceAvailableModels"] = True
+    document["forceRemoteSettingsRefresh"] = True
+    _write(root, MANAGED, document)
 
 
 # -- the managed-tier conflict scan (build gate) ------------------------------
@@ -130,9 +135,9 @@ def test_scan_flags_every_identity_key_in_the_base_file(tmp_path, key, value):
     ],
 )
 def test_scan_flags_identity_env_keys(tmp_path, name):
-    # Model/effort selectors AND provider/endpoint redirects: behind a
-    # foreign base URL or provider switch, the stream's model names are
-    # whatever the endpoint claims — unprovable, so flagged.
+    # Model/effort selectors AND provider/endpoint redirects in the MANAGED
+    # tier would steer every session in the image — the build refuses to
+    # bake an identity on top of them.
     _write(tmp_path, f"{DROPINS}/50-ops.json", {"env": {name: "anything", "UNRELATED": "ok"}})
     conflicts = scan_managed_conflicts(tmp_path)
     assert len(conflicts) == 1
@@ -141,10 +146,9 @@ def test_scan_flags_identity_env_keys(tmp_path, name):
 
 
 def test_scan_covers_dropins_in_merge_order(tmp_path):
-    # Claude Code merges the base file first, then *.json alphabetically —
-    # arrays CONCATENATE across the merge, so a single-entry drop-in widens
-    # the baked allowlist. Every fragment is scanned; conflicts come back in
-    # merge order so the first-named file is the first the CLI would apply.
+    # Claude Code merges the base file first, then *.json alphabetically.
+    # Every fragment is scanned; conflicts come back in merge order so the
+    # first-named file is the first the CLI would apply.
     _write(tmp_path, MANAGED, {"model": "claude-opus-5"})
     _write(tmp_path, f"{DROPINS}/20-widen.json", {"availableModels": ["claude-sonnet-5"]})
     _write(tmp_path, f"{DROPINS}/10-effort.json", {"effortLevel": "low"})
@@ -173,44 +177,40 @@ def test_scan_flags_non_object_env(tmp_path):
     assert len(conflicts) == 1 and "'env' is str" in conflicts[0]
 
 
-def test_scan_freshness_key_true_is_tolerated_everywhere(tmp_path):
-    # An operator already forcing fresh policy agrees with the artifact —
-    # at the build gate and in drop-ins alike.
+def test_scan_ignores_the_freshness_key(tmp_path):
+    # forceRemoteSettingsRefresh is no longer part of the artifact (the
+    # best-effort doctrine dropped it: it added per-session startup latency
+    # and a hard availability coupling to the settings endpoint). Whatever
+    # an operator sets it to is their business — it does not select an
+    # identity.
     _write(tmp_path, MANAGED, {"forceRemoteSettingsRefresh": True})
-    _write(tmp_path, f"{DROPINS}/10-fresh.json", {"forceRemoteSettingsRefresh": True})
+    _write(tmp_path, f"{DROPINS}/50-stale.json", {"forceRemoteSettingsRefresh": False})
     assert scan_managed_conflicts(tmp_path) == []
 
 
-@pytest.mark.parametrize("value", [False, "true", 1, None])
-def test_scan_freshness_key_non_true_is_a_conflict(tmp_path, value):
-    # Type-validated: only the literal boolean true guarantees fresh policy;
-    # false disables it and any other type is an unknowable configuration.
-    _write(tmp_path, f"{DROPINS}/50-stale.json", {"forceRemoteSettingsRefresh": value})
-    conflicts = scan_managed_conflicts(tmp_path)
-    assert len(conflicts) == 1
-    assert "'forceRemoteSettingsRefresh'" in conflicts[0] and "50-stale.json" in conflicts[0]
-    expected = BakedIdentity(model="claude-sonnet-5")
-    _bake(tmp_path, "claude-sonnet-5")
-    conflicts = scan_managed_conflicts(tmp_path, expected)
-    assert any("'forceRemoteSettingsRefresh'" in c for c in conflicts)
-
-
-def test_scan_with_expected_identity_tolerates_only_our_exact_pin(tmp_path):
+def test_scan_with_expected_identity_tolerates_the_materialized_shape(tmp_path):
     # The runtime re-check: the base file may carry exactly what materialize
-    # wrote — anything else is still a conflict, and a drop-in never gets the
-    # exemption even with matching values.
+    # wrote — anything else is still a conflict, and a drop-in never gets
+    # the exemption even with matching values.
     expected = BakedIdentity(model="claude-sonnet-5", effort="low")
     _bake(tmp_path, "claude-sonnet-5", "low")
     assert scan_managed_conflicts(tmp_path, expected) == []
-    # A drop-in repeating the same values is NOT ours: arrays concatenate on
-    # merge, so even an identical availableModels entry doubles the list.
-    _write(tmp_path, f"{DROPINS}/90-copy.json", {"availableModels": ["claude-sonnet-5"]})
+    _write(tmp_path, f"{DROPINS}/90-copy.json", {"effortLevel": "low"})
     conflicts = scan_managed_conflicts(tmp_path, expected)
     assert len(conflicts) == 1 and "90-copy.json" in conflicts[0]
 
 
+def test_scan_with_expected_identity_tolerates_the_legacy_allowlist(tmp_path):
+    # Images built before the consolidation carry the single-entry
+    # allowlist and the freshness key: stricter (they still pin subagents),
+    # not conflicting — they keep running until rebuilt.
+    expected = BakedIdentity(model="claude-sonnet-5", effort="low")
+    _bake_legacy(tmp_path, "claude-sonnet-5", "low")
+    assert scan_managed_conflicts(tmp_path, expected) == []
+
+
 def test_scan_with_expected_identity_flags_a_different_pin(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5", "low")
+    _bake_legacy(tmp_path, "claude-sonnet-5", "low")
     expected = BakedIdentity(model="claude-opus-5", effort="low")
     conflicts = scan_managed_conflicts(tmp_path, expected)
     assert any("'model'" in c for c in conflicts)
@@ -219,7 +219,7 @@ def test_scan_with_expected_identity_flags_a_different_pin(tmp_path):
 
 def test_scan_with_expected_identity_flags_a_local_modeloverrides(tmp_path):
     # modelOverrides remaps what actually SERVES a model ID while the
-    # allowlist still sees the Anthropic ID — never tolerable, base file or
+    # stream still shows the Anthropic ID — never tolerable, base file or
     # drop-in, even when the identity otherwise matches.
     _bake(tmp_path, "claude-sonnet-5")
     document = json.loads((tmp_path / MANAGED).read_text())
@@ -258,7 +258,7 @@ def test_process_environment_scan_passes_the_credential_contract():
     assert scan_process_environment({"CLAUDE_CODE_OAUTH_TOKEN": "x"}) == []
 
 
-# -- pair-aware capability (amendment C) --------------------------------------
+# -- pair-aware capability ------------------------------------------------------
 
 
 def test_effort_capability_current_generation_supports_all_four():
@@ -345,15 +345,79 @@ def test_read_baked_identity_fails_on_effort_without_model(tmp_path):
         read_baked_identity(tmp_path)
 
 
-def test_read_baked_identity_fails_on_enforcement_without_declaration(tmp_path):
-    # Managed identity keys with no well-known model file: an enforcement
-    # config nothing declares or verifies — never silently run under it.
+def test_read_baked_identity_fails_on_selection_without_declaration(tmp_path):
+    # Managed identity keys with no well-known model file: a selection
+    # config nothing declares — never silently run under it.
     _write(tmp_path, MANAGED, {"availableModels": ["claude-opus-5"]})
     with pytest.raises(IdentityError, match="no baked identity"):
         read_baked_identity(tmp_path)
 
 
-# -- the preflight (scripted subprocess runner) -------------------------------
+# -- the free per-Run static checks --------------------------------------------
+
+
+def test_static_checks_pass_on_the_materialized_shapes(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5", "low")
+    identity = BakedIdentity("claude-sonnet-5", "low")
+    report = static_identity_report(identity, root=tmp_path, environ={})
+    assert report.ok, report.detail
+
+    legacy = tmp_path / "legacy"
+    _bake_legacy(legacy, "claude-sonnet-5", "low")
+    report = static_identity_report(identity, root=legacy, environ={})
+    assert report.ok, report.detail
+
+
+def test_static_checks_fail_on_a_missing_or_drifted_managed_selection(tmp_path):
+    _write(tmp_path, "etc/theozolith/model", "claude-sonnet-5\n")  # no managed file
+    identity = BakedIdentity("claude-sonnet-5")
+    report = static_identity_report(identity, root=tmp_path, environ={})
+    assert not report.ok and report.category == CATEGORY_INCONSISTENT
+    assert "no selection configuration" in report.detail
+
+    _bake(tmp_path, "claude-sonnet-5", "low")
+    document = json.loads((tmp_path / MANAGED).read_text())
+    document["env"] = {"CLAUDE_CODE_EFFORT_LEVEL": "high"}  # drifted pin
+    _write(tmp_path, MANAGED, document)
+    report = static_identity_report(
+        BakedIdentity("claude-sonnet-5", "low"), root=tmp_path, environ={}
+    )
+    # A PRESENT-but-different value is caught by the conflict scan (it is
+    # policy that would supersede the identity); a MISSING key is the
+    # inconsistent case above.
+    assert not report.ok and report.category == CATEGORY_POLICY_CONFLICT
+    assert "CLAUDE_CODE_EFFORT_LEVEL" in report.detail
+
+
+def test_static_checks_fail_on_superseding_policy(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5")
+    _write(tmp_path, f"{DROPINS}/50-steer.json", {"model": "claude-opus-5"})
+    report = static_identity_report(BakedIdentity("claude-sonnet-5"), root=tmp_path, environ={})
+    assert not report.ok and report.category == CATEGORY_POLICY_CONFLICT
+    assert "50-steer.json" in report.detail
+
+
+def test_static_checks_fail_on_an_invalid_pair(tmp_path):
+    _bake(tmp_path, "claude-sonnet-4-6", "xhigh")  # silently clamped pair
+    report = static_identity_report(
+        BakedIdentity("claude-sonnet-4-6", "xhigh"), root=tmp_path, environ={}
+    )
+    assert not report.ok and report.category == CATEGORY_PAIR_INVALID
+
+
+def test_static_checks_fail_on_a_process_environment_conflict(tmp_path):
+    _bake(tmp_path, "claude-sonnet-5")
+    report = static_identity_report(
+        BakedIdentity("claude-sonnet-5"),
+        root=tmp_path,
+        environ={"ANTHROPIC_BASE_URL": "https://proxy.example"},
+    )
+    assert not report.ok and report.category == CATEGORY_POLICY_CONFLICT
+    assert "'ANTHROPIC_BASE_URL'" in report.detail
+    assert "proxy.example" not in report.detail  # value redacted
+
+
+# -- the setup dry-run (scripted subprocess runner) -----------------------------
 
 
 def _stream_json(*events) -> str:
@@ -369,24 +433,19 @@ def _session_ok(model: str) -> str:
 
 
 class ScriptedRunner:
-    """Answers ``claude --version``, the canary invocations (they carry
-    ``--model``), and the neutral identity probe (it does not) from a
+    """Answers ``claude --version`` and the neutral identity probe from a
     script. ``on_probe`` runs when the probe is invoked — tests use it to
     simulate the Stop hook writing the effort capture."""
 
     def __init__(
         self,
         version="2.1.232 (Claude Code)",
-        canary_stdout="",
-        canary_rc=0,
-        probe_stdout=None,
+        probe_stdout="",
         probe_rc=0,
         on_probe=None,
     ):
         self.version = version
-        self.canary_stdout = canary_stdout
-        self.canary_rc = canary_rc
-        self.probe_stdout = canary_stdout if probe_stdout is None else probe_stdout
+        self.probe_stdout = probe_stdout
         self.probe_rc = probe_rc
         self.on_probe = on_probe
         self.calls: list[dict] = []
@@ -395,25 +454,13 @@ class ScriptedRunner:
         self.calls.append({"argv": list(argv), **kwargs})
         if "--version" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout=self.version, stderr="")
-        if "--model" in argv:
-            return subprocess.CompletedProcess(
-                argv, self.canary_rc, stdout=self.canary_stdout, stderr=""
-            )
         if self.on_probe is not None:
             self.on_probe()
         return subprocess.CompletedProcess(argv, self.probe_rc, stdout=self.probe_stdout, stderr="")
 
     @property
-    def canary_calls(self) -> list[list[str]]:
-        return [call["argv"] for call in self.calls if "--model" in call["argv"]]
-
-    @property
     def probe_calls(self) -> list[list[str]]:
-        return [
-            call["argv"]
-            for call in self.calls
-            if "--model" not in call["argv"] and "--version" not in call["argv"]
-        ]
+        return [call["argv"] for call in self.calls if "--version" not in call["argv"]]
 
 
 def _preflight(tmp_path, identity_obj, runner, **kwargs):
@@ -431,11 +478,11 @@ def _preflight(tmp_path, identity_obj, runner, **kwargs):
     )
 
 
-def test_preflight_passes_on_a_bound_identity(tmp_path):
+def test_preflight_passes_and_asks_for_no_model(tmp_path):
     _bake(tmp_path, "claude-sonnet-5", "low")
     capture = tmp_path / "scratch" / "preflight-effort.json"
     runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"),
+        probe_stdout=_session_ok("claude-sonnet-5"),
         on_probe=lambda: _write(
             tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
         ),
@@ -443,191 +490,119 @@ def test_preflight_passes_on_a_bound_identity(tmp_path):
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), runner)
     assert report.ok, report.detail
     assert report.cli_version.startswith("2.1.232")
-    assert report.canary_model == "claude-sonnet-5"
     assert report.probe_model == "claude-sonnet-5"
     assert report.probe_effort == "low"
     assert capture.is_file()
-    # A full-ID pin runs BOTH canaries: a different-family intruder and a
-    # same-family sibling (family-granular enforcement would pass the first
-    # and still run the wrong model) — then the no---model identity probe.
-    assert len(runner.canary_calls) == 2
-    first, second = runner.canary_calls
-    assert first[first.index("--model") + 1] == "claude-haiku-4-5"
-    assert second[second.index("--model") + 1] == "claude-sonnet-4-6"
-    assert len(runner.probe_calls) == 1
+    # ONE probe session, no canaries, and no --model anywhere: the session
+    # the effective configuration picks by itself is the observation.
+    (probe,) = runner.probe_calls
+    assert "--model" not in probe
+    assert len(runner.calls) == 2  # version + probe, nothing else
 
 
-def test_preflight_sessions_run_inside_the_boundary(tmp_path):
-    """Every verification session carries the isolation argv — no tools, no
-    permission prompts, no user/project/local settings, no non-managed MCP —
-    and runs cwd-neutral in the scratch, where no task input exists."""
+def test_preflight_probe_runs_hermetic(tmp_path):
+    """The dry-run probe is a throwaway diagnostic: no tools, no permission
+    prompts, no user/project/local settings, no non-managed MCP, cwd in the
+    scratch. (The TASK session shares none of this — it keeps its full
+    normal capabilities, checkout CLAUDE.md and skills included.)"""
     _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
+    runner = ScriptedRunner(probe_stdout=_session_ok("claude-sonnet-5"))
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert report.ok, report.detail
-    sessions = [call for call in runner.calls if "--version" not in call["argv"]]
-    assert sessions
-    for call in sessions:
-        argv = call["argv"]
-        assert argv[argv.index("--tools") + 1] == ""
-        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-        assert argv[argv.index("--setting-sources") + 1] == ""
-        assert "--strict-mcp-config" in argv
-        assert "--dangerously-skip-permissions" not in argv
-        assert call["cwd"] == str(tmp_path / "scratch")
+    (probe,) = runner.probe_calls
+    assert probe[probe.index("--tools") + 1] == ""
+    assert probe[probe.index("--permission-mode") + 1] == "dontAsk"
+    assert probe[probe.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in probe
+    assert "--dangerously-skip-permissions" not in probe
+    (call,) = [c for c in runner.calls if "--version" not in c["argv"]]
+    assert call["cwd"] == str(tmp_path / "scratch")
 
 
-def test_preflight_alias_pin_skips_the_same_family_canary(tmp_path):
-    # An alias pin legitimately accepts its whole family — a same-family
-    # canary would fail it for working as designed.
-    _bake(tmp_path, "sonnet")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
-    report = _preflight(tmp_path, BakedIdentity("sonnet"), runner)
-    assert report.ok, report.detail
-    assert len(runner.canary_calls) == 1
-
-
-def test_preflight_fails_on_policy_conflict_before_spending_tokens(tmp_path):
+def test_preflight_static_failure_spends_no_subprocess(tmp_path):
     _bake(tmp_path, "claude-sonnet-5")
-    _write(tmp_path, f"{DROPINS}/50-widen.json", {"availableModels": ["claude-opus-5"]})
+    _write(tmp_path, f"{DROPINS}/50-steer.json", {"model": "claude-opus-5"})
     runner = ScriptedRunner()
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert not report.ok and report.category == CATEGORY_POLICY_CONFLICT
-    assert "50-widen.json" in report.detail
-    assert runner.calls == []  # static failure: no subprocess ever ran
-
-
-def test_preflight_fails_on_a_process_environment_conflict(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner()
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(exist_ok=True)
-    report = run_preflight(
-        BakedIdentity("claude-sonnet-5"),
-        binary="claude",
-        root=tmp_path,
-        scratch=scratch,
-        min_cli=MIN_CLI,
-        run=runner,
-        environ={"ANTHROPIC_BASE_URL": "https://proxy.example"},
-    )
-    assert not report.ok and report.category == CATEGORY_POLICY_CONFLICT
-    assert "'ANTHROPIC_BASE_URL'" in report.detail
-    assert "proxy.example" not in report.detail  # value redacted
     assert runner.calls == []
-
-
-def test_preflight_fails_on_a_missing_or_mismatched_managed_pin(tmp_path):
-    _write(tmp_path, "etc/theozolith/model", "claude-sonnet-5\n")  # no managed file
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), ScriptedRunner())
-    assert not report.ok and report.category == CATEGORY_INCONSISTENT
-    assert "no enforcement configuration" in report.detail
-
-    _bake(tmp_path, "claude-sonnet-5", "low")
-    (tmp_path / MANAGED).write_text(
-        json.dumps(
-            {
-                "model": "claude-sonnet-5",
-                "availableModels": ["claude-sonnet-5"],
-                "enforceAvailableModels": True,
-                "forceRemoteSettingsRefresh": True,
-                "effortLevel": "low",
-                "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},  # drifted pin
-            }
-        )
-    )
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), ScriptedRunner())
-    assert not report.ok
-    # The drifted env pin is both a conflict (env identity key with a foreign
-    # value) and an inconsistency — either category names the real problem.
-    assert report.category in (CATEGORY_POLICY_CONFLICT, CATEGORY_INCONSISTENT)
-
-
-def test_preflight_fails_on_an_image_without_the_freshness_key(tmp_path):
-    # An image built by the previous toolchain: correct pin, no
-    # forceRemoteSettingsRefresh — its sessions may start on stale server
-    # policy, so nothing it proves counts. The named key says "rebuild".
-    _bake(tmp_path, "claude-sonnet-5")
-    document = json.loads((tmp_path / MANAGED).read_text())
-    del document["forceRemoteSettingsRefresh"]
-    _write(tmp_path, MANAGED, document)
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), ScriptedRunner())
-    assert not report.ok and report.category == CATEGORY_INCONSISTENT
-    assert "'forceRemoteSettingsRefresh'" in report.detail
-
-
-def test_preflight_fails_on_an_invalid_pair(tmp_path):
-    # An image baked by an older toolchain can carry a pair the new table
-    # rejects: the runtime gate re-validates rather than trusting the build.
-    _bake(tmp_path, "claude-opus-4-6", "xhigh")
-    report = _preflight(tmp_path, BakedIdentity("claude-opus-4-6", "xhigh"), ScriptedRunner())
-    assert not report.ok and report.category == CATEGORY_PAIR_INVALID
 
 
 def test_preflight_fails_on_a_pre_enforcement_cli(tmp_path):
     _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(version="2.1.231 (Claude Code)")
+    runner = ScriptedRunner(version="2.1.222 (Claude Code)")
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert not report.ok and report.category == CATEGORY_CLI_TOO_OLD
     assert "2.1.232" in report.detail
-    assert len(runner.calls) == 1  # version probe only; no canary tokens
 
 
-def test_preflight_widened_policy_is_detected_by_the_canary(tmp_path):
+def test_preflight_probe_substitution_fails(tmp_path):
     _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-haiku-4-5"))
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_WIDENED
-    assert "claude-haiku-4-5" in report.detail
-
-
-def test_preflight_same_family_widening_fails_a_full_id_pin(tmp_path):
-    """Enforcement that quietly matched at FAMILY granularity: the
-    different-family canary coerces correctly, but the same-family sibling
-    executes — a full-ID pin must reject its own family too."""
-    _bake(tmp_path, "claude-sonnet-5")
-
-    def runner(argv, **kwargs):
-        runner.calls.append({"argv": list(argv), **kwargs})
-        if "--version" in argv:
-            return subprocess.CompletedProcess(argv, 0, stdout="2.1.232", stderr="")
-        if "--model" in argv:
-            asked = argv[argv.index("--model") + 1]
-            executed = "claude-sonnet-5" if asked == "claude-haiku-4-5" else asked
-            return subprocess.CompletedProcess(argv, 0, stdout=_session_ok(executed), stderr="")
-        return subprocess.CompletedProcess(
-            argv, 0, stdout=_session_ok("claude-sonnet-5"), stderr=""
-        )
-
-    runner.calls = []
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_WIDENED
-    assert "same-family" in report.detail and "claude-sonnet-4-6" in report.detail
-
-
-def test_preflight_substitution_is_detected_by_the_canary(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-opus-5"))
+    runner = ScriptedRunner(probe_stdout=_session_ok("claude-opus-5"))
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert not report.ok and report.category == CATEGORY_SUBSTITUTED
+    assert "claude-opus-5" in report.detail
 
 
-def test_preflight_canary_error_means_unavailable(tmp_path):
+def test_preflight_probe_error_means_unavailable(tmp_path):
     _bake(tmp_path, "claude-nonexistent-9")
     stdout = _stream_json(
         {"type": "system", "subtype": "init", "model": "claude-nonexistent-9"},
         {"type": "result", "subtype": "error_during_execution", "is_error": True},
     )
-    runner = ScriptedRunner(canary_stdout=stdout, canary_rc=1)
+    runner = ScriptedRunner(probe_stdout=stdout, probe_rc=1)
     report = _preflight(tmp_path, BakedIdentity("claude-nonexistent-9"), runner)
     assert not report.ok and report.category == CATEGORY_UNAVAILABLE
 
 
 def test_preflight_no_signal_is_unverifiable(tmp_path):
+    # The dry-run is strict where the per-Run monitor is lenient: a probe
+    # with no signal means the observation channel itself is broken, and
+    # setup is the time to learn that.
     _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(canary_stdout="")
+    runner = ScriptedRunner(probe_stdout="")
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
+
+    no_init = _stream_json(
+        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(probe_stdout=no_init)
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
+    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
+    assert "no init event" in report.detail
+
+
+def test_preflight_accepts_a_decorated_init_announcement(tmp_path):
+    _bake(tmp_path, "claude-opus-5")
+    stdout = _stream_json(
+        {"type": "system", "subtype": "init", "model": "claude-opus-5[1m]"},
+        {"type": "assistant", "message": {"model": "claude-opus-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(probe_stdout=stdout)
+    report = _preflight(tmp_path, BakedIdentity("claude-opus-5"), runner)
+    assert report.ok, f"{report.category}: {report.detail}"
+
+
+def test_preflight_ignores_subagent_turns(tmp_path):
+    # Subagent events carry parent_tool_use_id and are free to run other
+    # models — main-agent-only enforcement (ADR-0045).
+    _bake(tmp_path, "claude-sonnet-5")
+    stdout = _stream_json(
+        {"type": "system", "subtype": "init", "model": "claude-sonnet-5"},
+        {
+            "type": "assistant",
+            "message": {"model": "claude-haiku-4-5", "content": []},
+            "parent_tool_use_id": "toolu_01",
+        },
+        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    )
+    runner = ScriptedRunner(probe_stdout=stdout)
+    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
+    assert report.ok, f"{report.category}: {report.detail}"
 
 
 def test_preflight_timeout_fails_closed(tmp_path):
@@ -642,36 +617,13 @@ def test_preflight_timeout_fails_closed(tmp_path):
     assert not report.ok and report.category == CATEGORY_TIMEOUT
 
 
-def test_preflight_probe_substitution_fails(tmp_path):
-    # Canaries coerce (enforcement binds) but the probe's OWN session — the
-    # one the effective policy picks with no --model at all — runs elsewhere.
-    _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"),
-        probe_stdout=_session_ok("claude-opus-5"),
-    )
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_SUBSTITUTED
-    assert "identity probe" in report.detail and "claude-opus-5" in report.detail
-
-
-def test_preflight_probe_error_means_unavailable(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5")
-    runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"), probe_stdout="", probe_rc=1
-    )
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_UNAVAILABLE
-    assert "identity probe" in report.detail
-
-
 def test_preflight_effort_clamp_is_detected_by_the_probe(tmp_path):
     # An organization effort cap clamps silently in the stream — the Stop
-    # hook capture is the observation, and a clamp is a preflight failure,
+    # hook capture is the observation, and a clamp is a dry-run failure,
     # never an accepted downgrade.
     _bake(tmp_path, "claude-sonnet-5", "xhigh")
     runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"),
+        probe_stdout=_session_ok("claude-sonnet-5"),
         on_probe=lambda: _write(
             tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "high"}}
         ),
@@ -683,11 +635,8 @@ def test_preflight_effort_clamp_is_detected_by_the_probe(tmp_path):
 
 
 def test_preflight_missing_effort_signal_is_unverifiable(tmp_path):
-    # A CLI whose Stop payload carries no effort (or a hook that never ran):
-    # the baked effort cannot be proven, so the gate fails closed instead of
-    # assuming the pin held.
     _bake(tmp_path, "claude-sonnet-5", "low")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
+    runner = ScriptedRunner(probe_stdout=_session_ok("claude-sonnet-5"))
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), runner)
     assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
     assert "applied effort" in report.detail
@@ -696,7 +645,7 @@ def test_preflight_missing_effort_signal_is_unverifiable(tmp_path):
 def test_preflight_effort_probe_carries_the_stop_hook(tmp_path):
     _bake(tmp_path, "claude-sonnet-5", "low")
     runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"),
+        probe_stdout=_session_ok("claude-sonnet-5"),
         on_probe=lambda: _write(
             tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
         ),
@@ -706,35 +655,30 @@ def test_preflight_effort_probe_carries_the_stop_hook(tmp_path):
     (probe,) = runner.probe_calls
     settings_json = probe[probe.index("--settings") + 1]
     assert "Stop" in settings_json and "preflight-effort.json" in settings_json
-    # No tool-carrying probe anywhere: the Stop hook fires after a plain
-    # no-tool turn (verified live), so the boundary stays intact.
     assert "PostToolUse" not in settings_json
     assert PROBE_PROMPT in probe
     assert "tool" in PROBE_PROMPT  # the prompt itself forbids tool use
 
 
-def test_preflight_alias_pin_accepts_family_and_rejects_foreigners(tmp_path):
+def test_preflight_alias_pin_accepts_its_family(tmp_path):
     _bake(tmp_path, "sonnet")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
+    runner = ScriptedRunner(probe_stdout=_session_ok("claude-sonnet-5"))
     report = _preflight(tmp_path, BakedIdentity("sonnet"), runner)
     assert report.ok, report.detail
-    # The intruder for a sonnet-family pin is haiku; a haiku execution is a
-    # widened policy, not a family member.
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-haiku-4-5"))
+    runner = ScriptedRunner(probe_stdout=_session_ok("claude-haiku-4-5"))
     report = _preflight(tmp_path, BakedIdentity("sonnet"), runner)
-    assert not report.ok and report.category == CATEGORY_WIDENED
+    assert not report.ok and report.category == CATEGORY_SUBSTITUTED
 
 
-def test_preflight_report_describe_confirms_the_prompt_was_withheld(tmp_path):
+def test_preflight_report_describe_names_the_category(tmp_path):
     _bake(tmp_path, "claude-sonnet-5")
     report = _preflight(
         tmp_path,
         BakedIdentity("claude-sonnet-5"),
-        ScriptedRunner(canary_stdout=_session_ok("claude-opus-5")),
+        ScriptedRunner(probe_stdout=_session_ok("claude-opus-5")),
     )
     text = report.describe()
     assert "claude-sonnet-5" in text and report.category in text
-    assert "the real task prompt was not sent" in text
 
 
 # -- expectation matching -----------------------------------------------------
@@ -755,47 +699,6 @@ def test_model_matches_alias_is_family_bound():
     assert not model_matches("fable", "claude-sonnet-5")
 
 
-def test_sibling_for_full_id_pins():
-    # Never a candidate the provider would merely resolve TO the pin.
-    assert sibling_for("claude-sonnet-5") == "claude-sonnet-4-6"
-    assert sibling_for("claude-sonnet-4-6") == "claude-sonnet-5"
-    assert sibling_for("claude-opus-5") == "claude-opus-4-6"
-    assert sibling_for("claude-haiku-4-5-20251001") == "claude-3-5-haiku-20241022"
-    # Single-member families have no sibling: the same-family canary is
-    # skipped, the different-family canary and the in-session guard remain.
-    assert sibling_for("claude-fable-5") == ""
-    assert sibling_for("claude-mythos-5") == ""
-    # Aliases legitimately accept their family — no sibling canary.
-    assert sibling_for("sonnet") == ""
-    assert sibling_for("haiku") == ""
-
-
-def test_sibling_for_dated_pins_never_uses_the_undated_prefix():
-    # The provider resolves an undated ID to its newest dated variant, so
-    # bare claude-sonnet-4-6 can resolve to a dated 4.6 pin — a canary asking
-    # for it would execute the pin and prove nothing. The genuinely distinct
-    # family member is chosen instead.
-    assert sibling_for("claude-sonnet-4-6-20250929") == "claude-sonnet-5"
-    assert sibling_for("claude-opus-4-6-20260101") == "claude-opus-5"
-    assert sibling_for("claude-haiku-4-5-20251001") == "claude-3-5-haiku-20241022"
-
-
-def test_sibling_exhausted_family_is_none_and_fails_the_preflight(tmp_path, monkeypatch):
-    # A known multi-member family where every candidate could resolve to the
-    # pin: the same-family proof cannot run — unverifiable, never a vacuous
-    # pass and never a silent skip.
-    from theozolith_worker import identity as identity_mod
-
-    monkeypatch.setattr(identity_mod, "_FAMILY_SIBLINGS", {"sonnet": ("claude-sonnet-4-6",)})
-    assert sibling_for("claude-sonnet-4-6-20250929") is None
-    _bake(tmp_path, "claude-sonnet-4-6-20250929")
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-4-6-20250929"))
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-4-6-20250929"), runner)
-    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
-    assert "same-family" in report.detail
-    assert runner.canary_calls == []  # failed before spending session tokens
-
-
 def test_normalize_model_strips_the_context_decoration():
     # The CLI announces long-context variants with a bracketed tag (observed
     # live: init and modelUsage say claude-opus-5[1m] while the executed
@@ -807,126 +710,7 @@ def test_normalize_model_strips_the_context_decoration():
     assert not model_matches("claude-opus-5", "claude-opus-4-6[1m]")
 
 
-def test_preflight_accepts_a_decorated_init_announcement(tmp_path):
-    _bake(tmp_path, "claude-opus-5")
-    stdout = _stream_json(
-        {"type": "system", "subtype": "init", "model": "claude-opus-5[1m]"},
-        {"type": "assistant", "message": {"model": "claude-opus-5", "content": []}},
-        {"type": "result", "subtype": "success", "is_error": False},
-    )
-    runner = ScriptedRunner(canary_stdout=stdout)
-    report = _preflight(tmp_path, BakedIdentity("claude-opus-5"), runner)
-    assert report.ok, f"{report.category}: {report.detail}"
-
-
-def test_preflight_requires_the_init_announcement(tmp_path):
-    # Announced AND executed identity must both be present and match — for
-    # the canaries and the probe alike. A stream with an executed turn but
-    # no init event is not a verifiable session.
-    _bake(tmp_path, "claude-sonnet-5")
-    no_init = _stream_json(
-        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
-        {"type": "result", "subtype": "success", "is_error": False},
-    )
-    runner = ScriptedRunner(canary_stdout=no_init)
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
-    assert "announced no identity" in report.detail
-
-    # Probe side: canaries fine, the probe's own stream carries no init.
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"), probe_stdout=no_init)
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_UNVERIFIABLE
-    assert "announced no identity" in report.detail
-
-
-def test_preflight_canary_init_off_the_pin_fails(tmp_path):
-    # The canary session ANNOUNCED an off-pin identity even though its
-    # executed turn coerced back: announcement and execution must both hold.
-    _bake(tmp_path, "claude-sonnet-5")
-    drifted_init = _stream_json(
-        {"type": "system", "subtype": "init", "model": "claude-haiku-4-5"},
-        {"type": "assistant", "message": {"model": "claude-sonnet-5", "content": []}},
-        {"type": "result", "subtype": "success", "is_error": False},
-    )
-    runner = ScriptedRunner(canary_stdout=drifted_init)
-    report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
-    assert not report.ok and report.category == CATEGORY_SUBSTITUTED
-    assert "announced" in report.detail
-
-
-# -- the end-to-end verification budget ---------------------------------------
-
-
-class FakeClock:
-    def __init__(self, now: float = 0.0):
-        self.now = now
-
-    def __call__(self) -> float:
-        return self.now
-
-
-def test_preflight_deadline_caps_every_subprocess_timeout(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5", "low")
-    clock = FakeClock(100.0)
-    runner = ScriptedRunner(
-        canary_stdout=_session_ok("claude-sonnet-5"),
-        on_probe=lambda: _write(
-            tmp_path, "scratch/preflight-effort.json", {"effort": {"level": "low"}}
-        ),
-    )
-    report = _preflight(
-        tmp_path,
-        BakedIdentity("claude-sonnet-5", "low"),
-        runner,
-        deadline=100.0 + 45.0,
-        clock=clock,
-    )
-    assert report.ok, report.detail
-    # Every subprocess ran under the REMAINING budget (45s), not the 240s
-    # per-session cap — the driver-side wait can never expire first.
-    for call in runner.calls:
-        assert call["timeout"] <= 45.0
-
-
-def test_preflight_exhausted_deadline_is_the_timeout_category(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5")
-    clock = FakeClock(100.0)
-    runner = ScriptedRunner(canary_stdout=_session_ok("claude-sonnet-5"))
-    report = _preflight(
-        tmp_path,
-        BakedIdentity("claude-sonnet-5"),
-        runner,
-        deadline=100.0,  # nothing left before the first subprocess
-        clock=clock,
-    )
-    assert not report.ok and report.category == CATEGORY_TIMEOUT
-    assert "budget was exhausted" in report.detail
-    assert runner.calls == []  # no subprocess ran on a spent budget
-
-
-def test_preflight_mid_run_exhaustion_is_the_timeout_category(tmp_path):
-    _bake(tmp_path, "claude-sonnet-5")
-    clock = FakeClock(0.0)
-
-    def runner(argv, **kwargs):
-        runner.calls.append({"argv": list(argv), **kwargs})
-        clock.now += 30.0  # each step eats 30s of a 40s budget
-        if "--version" in argv:
-            return subprocess.CompletedProcess(argv, 0, stdout="2.1.232", stderr="")
-        return subprocess.CompletedProcess(
-            argv, 0, stdout=_session_ok("claude-sonnet-5"), stderr=""
-        )
-
-    runner.calls = []
-    report = _preflight(
-        tmp_path, BakedIdentity("claude-sonnet-5"), runner, deadline=40.0, clock=clock
-    )
-    assert not report.ok and report.category == CATEGORY_TIMEOUT
-    assert len(runner.calls) == 2  # version + first canary; then the budget died
-
-
-# -- the identity marker (status.json channel) ---------------------------------
+# -- the identity marker (status.json channel) ----------------------------------
 
 
 def test_identity_error_detail_is_anchored():
@@ -941,42 +725,6 @@ def test_identity_error_detail_is_anchored():
     assert identity_error_detail("gate step echoed 'identity: [substituted]'") is None
     assert identity_error_detail("harness crashed: identity: nested") is None
     assert identity_error_detail("") is None
-
-
-def test_stop_hook_appends_one_redacted_record_per_firing(tmp_path):
-    script = tmp_path / "stop_hook.py"
-    script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
-    capture = tmp_path / "stop.jsonl"
-    payload = {
-        "effort": {"level": "low", "source": "managed"},
-        "session_id": "s-1",
-        "transcript_path": "/home/u/.claude/t.jsonl",
-    }
-    for _ in range(2):
-        proc = subprocess.run(
-            [sys.executable, str(script), str(capture)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        assert proc.returncode == 0, proc.stderr
-    lines = capture.read_text().splitlines()
-    assert len(lines) == 2  # one record per firing: the line count IS the turn count
-    for line in lines:
-        assert json.loads(line) == {"effort": "low"}  # value-redacted: level only
-
-    # Garbage stdin still journals the boundary (a completed turn happened);
-    # the guard then fails closed on the missing effort when one is baked.
-    proc = subprocess.run(
-        [sys.executable, str(script), str(capture)],
-        input="not json",
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(capture.read_text().splitlines()[-1]) == {}
 
 
 # -- the ConfigChange hook helper ---------------------------------------------
@@ -1007,37 +755,31 @@ def test_config_hook_records_policy_and_user_tier_changes(tmp_path):
     for source in ("policy_settings", "user_settings", "local_settings", "future_source", ""):
         records = _run_config_hook(tmp_path, {"source": source, "file_path": "/etc/x.json"})
         assert len(records) == 1
-        assert records[0]["source"] == source and records[0]["file_path"] == "/etc/x.json"
+        assert records[0]["source"] == source
 
 
 def test_config_hook_ignores_skills_and_benign_project_settings(tmp_path):
-    # The task legitimately edits the checkout: a skills change or a
-    # project-settings change with no identity-shaped key is task work, and
-    # skill model frontmatter is bound by the enforced allowlist anyway.
     assert _run_config_hook(tmp_path, {"source": "skills", "file_path": "/w/.claude/skills"}) == []
-    benign = tmp_path / "settings.json"
-    benign.write_text(json.dumps({"permissions": {"allow": ["Bash(npm test:*)"]}}))
-    assert (
-        _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(benign)}) == []
-    )
+    benign = tmp_path / "benign.json"
+    benign.write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
+    records = _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(benign)})
+    assert records == []
 
 
 def test_config_hook_records_identity_keys_in_project_settings(tmp_path):
-    changed = tmp_path / "settings.json"
-    changed.write_text(json.dumps({"model": "claude-opus-5", "env": {"ANTHROPIC_MODEL": "x"}}))
-    records = _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(changed)})
+    hostile = tmp_path / "hostile.json"
+    hostile.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://x"}, "model": "opus"}))
+    records = _run_config_hook(tmp_path, {"source": "project_settings", "file_path": str(hostile)})
     assert len(records) == 1
-    assert records[0]["keys"] == ["ANTHROPIC_MODEL", "model"]
-    # Key names only — never the values.
-    assert "claude-opus-5" not in json.dumps(records)
+    assert "ANTHROPIC_BASE_URL" in records[0]["keys"] and "model" in records[0]["keys"]
+    assert "http://x" not in json.dumps(records)  # values never recorded
 
 
 def test_config_hook_records_unreadable_project_settings(tmp_path):
-    # A changed file the helper cannot read back is unknowable → recorded.
     records = _run_config_hook(
         tmp_path, {"source": "project_settings", "file_path": str(tmp_path / "gone.json")}
     )
-    assert len(records) == 1 and records[0]["keys"] == []
+    assert len(records) == 1  # unknowable is recorded
 
 
 def test_config_hook_survives_garbage_stdin(tmp_path):
@@ -1051,258 +793,173 @@ def test_config_hook_survives_garbage_stdin(tmp_path):
         text=True,
         timeout=30,
     )
-    # Garbage input is an unknown source → recorded, fail closed.
+    # Garbage input is an unknown source → recorded, fail loud.
     assert proc.returncode == 0, proc.stderr
     assert capture.exists()
 
 
-# -- the session guard --------------------------------------------------------
+# -- the Stop hook helper and the effort journal --------------------------------
+
+
+def test_stop_hook_appends_one_redacted_record_per_firing(tmp_path):
+    script = tmp_path / "stop_hook.py"
+    script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
+    capture = tmp_path / "stop.jsonl"
+    payload = {
+        "effort": {"level": "low", "source": "managed"},
+        "session_id": "s-1",
+        "transcript_path": "/home/u/.claude/t.jsonl",
+    }
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, str(script), str(capture)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+    lines = capture.read_text().splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        assert json.loads(line) == {"effort": "low"}  # value-redacted: level only
+
+    # Garbage stdin still journals a record (no effort field) — the harness
+    # records the missing observation as a gap.
+    proc = subprocess.run(
+        [sys.executable, str(script), str(capture)],
+        input="not json",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(capture.read_text().splitlines()[-1]) == {}
+
+
+def test_read_last_journal_effort_takes_the_latest_observation(tmp_path):
+    journal = tmp_path / "stop.jsonl"
+    assert read_last_journal_effort(journal) == ""  # absent file: a gap
+    journal.write_text('{"effort": "low"}\n{"effort": "high"}\n')
+    assert read_last_journal_effort(journal) == "high"
+    journal.write_text('{"effort": "low"}\n{}\n')
+    assert read_last_journal_effort(journal) == "low"  # latest OBSERVATION
+    journal.write_text('{"effort": "low"}\n{"effort": "hi')  # mid-append tail
+    assert read_last_journal_effort(journal) == "low"
+    journal.write_text("junk\n")
+    assert read_last_journal_effort(journal) == ""
+
+
+# -- the fail-loud session monitor ----------------------------------------------
 
 
 def _init_line(model: str) -> str:
     return json.dumps({"type": "system", "subtype": "init", "model": model})
 
 
-def _turn_line(model: str) -> str:
-    return json.dumps({"type": "assistant", "message": {"model": model, "content": []}})
+def _turn_line(model: str, parent: str | None = None) -> str:
+    event: dict = {"type": "assistant", "message": {"model": model, "content": []}}
+    if parent is not None:
+        event["parent_tool_use_id"] = parent
+    return json.dumps(event)
 
 
-def _gate(tmp_path: Path, effort: bool = False) -> TaskGate:
-    gate_dir = tmp_path / "gate"
-    gate_dir.mkdir(exist_ok=True)
-    return TaskGate(
-        release_marker=gate_dir / "released",
-        stop_capture=gate_dir / "stop.jsonl",
-        config_capture=gate_dir / "config-change.jsonl",
-        config_hook_script=gate_dir / "configchange_hook.py",
-        stop_hook_script=gate_dir / "stop_hook.py",
+def _hooks(tmp_path: Path) -> MonitorHooks:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(exist_ok=True)
+    return MonitorHooks(
+        stop_capture=scratch / "stop.jsonl",
+        config_capture=scratch / "config-change.jsonl",
+        config_hook_script=scratch / "configchange_hook.py",
+        stop_hook_script=scratch / "stop_hook.py",
     )
 
 
-def _stop(gate: TaskGate, effort: str = "", raw: str | None = None) -> None:
-    """Append one turn-boundary record the way the Stop hook helper does."""
-    line = raw if raw is not None else json.dumps({"effort": effort} if effort else {})
-    with gate.stop_capture.open("a") as handle:
-        handle.write(line + "\n")
+def test_monitor_stays_quiet_on_a_clean_stream(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-sonnet-5"))
+    monitor.observe(_turn_line("claude-sonnet-5"))
+    assert monitor.violation() == ("", "")
+    assert monitor.observed_model == "claude-sonnet-5"
 
 
-def test_guard_releases_only_after_init_turn_and_a_completed_probe(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    assert guard.decision().action == GUARD_WAIT
-    guard.observe(_init_line("claude-sonnet-5"))
-    assert guard.decision().action == GUARD_WAIT  # announced is not executed
-    guard.observe(_turn_line("claude-sonnet-5"))
-    # An executed assistant event is still not a COMPLETED probe: the
-    # release waits for the turn's boundary record, never merely the first
-    # matching assistant event.
-    assert guard.decision().action == GUARD_WAIT
-    _stop(gate)
-    assert guard.decision().action == GUARD_RELEASE
-    assert guard.observed_model == "claude-sonnet-5"
-    assert guard.probe_turns == 1 and guard.task_turns == 0
+def test_monitor_kills_on_an_off_identity_main_turn(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-sonnet-5"))
+    monitor.observe(_turn_line("claude-opus-5"))
+    reason, category = monitor.violation()
+    assert "claude-opus-5" in reason and category == CATEGORY_SUBSTITUTED
 
 
-def test_guard_kills_on_a_substituted_init(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
-    guard.observe(_init_line("claude-opus-5"))
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_SUBSTITUTED
-    assert "claude-opus-5" in decision.reason and "substituted" in decision.reason
+def test_monitor_kills_on_an_off_identity_init(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-opus-5"))
+    reason, category = monitor.violation()
+    assert "initialized on" in reason and category == CATEGORY_SUBSTITUTED
 
 
-def test_guard_counts_probe_and_task_turns_from_the_journal(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate)
-    assert guard.decision().action == GUARD_RELEASE
-    guard.mark_released()
-    assert guard.probe_turns == 1 and guard.task_turns == 0
-    # Assistant events alone never count: only the completed turn's boundary
-    # record attributes a task turn.
-    guard.observe(_turn_line("claude-sonnet-5"))
-    assert guard.decision().action == GUARD_WAIT  # released: monitor only
-    assert guard.probe_turns == 1 and guard.task_turns == 0
-    _stop(gate)
-    assert guard.decision().action == GUARD_WAIT
-    assert guard.probe_turns == 1 and guard.task_turns == 1
+def test_monitor_leaves_subagents_free(tmp_path):
+    # Main-agent-only enforcement (ADR-0045): a subagent turn on another
+    # model is a legitimate capability, never a violation.
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-sonnet-5"))
+    monitor.observe(_turn_line("claude-haiku-4-5", parent="toolu_01"))
+    monitor.observe(_turn_line("claude-opus-5", parent="toolu_02"))
+    monitor.observe(_turn_line("claude-sonnet-5"))
+    assert monitor.violation() == ("", "")
+    assert monitor.observed_model == "claude-sonnet-5"
 
 
-def test_guard_residual_probe_events_never_become_task_turns(tmp_path):
-    # The probe emitted several assistant events (denied-tool continuations)
-    # that the transcript pump delivers only after the release: the journal,
-    # written in turn order by the session's own hook, keeps them out of the
-    # task count.
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate)
-    assert guard.decision().action == GUARD_RELEASE
-    guard.mark_released()
-    guard.observe(_turn_line("claude-sonnet-5"))  # residual probe events,
-    guard.observe(_turn_line("claude-sonnet-5"))  # read late
-    guard.decision()
-    assert guard.task_turns == 0  # no post-release turn ever completed
+def test_monitor_accepts_decorated_announcements(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-opus-5"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-opus-5[1m]"))
+    monitor.observe(_turn_line("claude-opus-5"))
+    assert monitor.violation() == ("", "")
 
 
-def test_guard_malformed_journal_record_fails_closed(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate, raw="not json at all")
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_UNVERIFIABLE
-    assert "boundary" in decision.reason
+def test_monitor_alias_accepts_the_family(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("sonnet"), _hooks(tmp_path))
+    monitor.observe(_init_line("claude-sonnet-5"))
+    monitor.observe(_turn_line("claude-sonnet-5"))
+    assert monitor.violation() == ("", "")
+    monitor.observe(_turn_line("claude-haiku-4-5"))
+    reason, category = monitor.violation()
+    assert reason and category == CATEGORY_SUBSTITUTED
 
 
-def test_guard_kills_on_model_drift_after_release(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate)
-    assert guard.decision().action == GUARD_RELEASE
-    guard.mark_released()
-    guard.observe(_turn_line("claude-opus-5"))  # mid-run policy change
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL and "claude-opus-5" in decision.reason
-    assert decision.category == CATEGORY_SUBSTITUTED
+def test_monitor_ignores_synthetic_turns_and_junk(tmp_path):
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    monitor.observe("not json at all")
+    monitor.observe(json.dumps(["not", "an", "object"]))
+    monitor.observe(_turn_line("<synthetic>"))
+    assert monitor.violation() == ("", "")
 
 
-def test_guard_ignores_synthetic_turns_and_junk_lines(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
-    guard.observe("not json at all")
-    guard.observe(json.dumps(["not", "an", "object"]))
-    guard.observe(_turn_line("<synthetic>"))
-    assert guard.decision().action == GUARD_WAIT
-    assert guard.probe_turns == 0
+def test_monitor_absence_is_a_gap_not_a_violation(tmp_path):
+    # Best-effort doctrine: a stream with no signal at all detects nothing —
+    # the harness records the gap in evidence; the monitor stays quiet.
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), _hooks(tmp_path))
+    assert monitor.violation() == ("", "")
+    assert monitor.observed_model == ""
 
 
-def test_guard_probe_error_before_a_turn_is_unavailable(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(json.dumps({"type": "result", "subtype": "error", "is_error": True}))
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL and "available" in decision.reason
-    assert decision.category == CATEGORY_UNAVAILABLE
-
-
-def test_guard_waits_for_the_effort_journal_then_releases(tmp_path):
-    gate = _gate(tmp_path, effort=True)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    assert guard.decision().action == GUARD_WAIT  # probe not completed yet
-    _stop(gate, effort="low")
-    assert guard.decision().action == GUARD_RELEASE
-    assert guard.observed_effort == "low"
-
-
-def test_guard_kills_on_a_clamped_effort_with_the_exact_category(tmp_path):
-    # An organization effort cap clamps silently in stream-json output — the
-    # probe turn's boundary record is the observation, and a clamp is
-    # GUARD_KILL with the effort-clamped category, never merely "not
-    # release".
-    gate = _gate(tmp_path, effort=True)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "xhigh"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate, effort="high")
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_EFFORT_CLAMPED
-    assert "'high'" in decision.reason and "'xhigh'" in decision.reason
-
-
-def test_guard_kills_on_effort_drift_after_release(tmp_path):
-    gate = _gate(tmp_path, effort=True)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate, effort="low")
-    assert guard.decision().action == GUARD_RELEASE
-    guard.mark_released()
-    _stop(gate, effort="high")  # the task turn completed under a changed effort
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_EFFORT_CLAMPED
-
-
-def test_guard_effortless_record_with_effort_baked_fails_closed(tmp_path):
-    # A turn completed but its record carries no applied effort while an
-    # effort is baked: the proof channel is gone — unverifiable, not a pass.
-    gate = _gate(tmp_path, effort=True)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    _stop(gate)  # record without an effort field
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_UNVERIFIABLE
-    assert "applied-effort" in decision.reason
-
-
-def test_guard_partial_journal_line_is_wait_not_kill(tmp_path):
-    gate = _gate(tmp_path, effort=True)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5", "low"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    gate.stop_capture.write_text('{"effort": "lo')  # hook mid-append, no newline
-    assert guard.decision().action == GUARD_WAIT
-
-
-def test_guard_no_effort_baked_still_requires_the_probe_record(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    assert guard.decision().action == GUARD_WAIT  # boundary still required
-    _stop(gate)  # no effort field — fine, none is baked
-    assert guard.decision().action == GUARD_RELEASE
-
-
-def test_guard_kills_on_a_recorded_config_change(tmp_path):
-    # The ConfigChange helper recorded an identity-relevant mid-session
-    # settings change: the session no longer runs under the proven
-    # configuration — kill before further task work, pre- or post-release.
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    guard.mark_released()
-    gate.config_capture.write_text(
+def test_monitor_kills_on_a_recorded_config_change(tmp_path):
+    hooks = _hooks(tmp_path)
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), hooks)
+    monitor.observe(_init_line("claude-sonnet-5"))
+    monitor.observe(_turn_line("claude-sonnet-5"))
+    hooks.config_capture.write_text(
         json.dumps({"source": "policy_settings", "file_path": "/etc/x.json", "keys": []}) + "\n"
     )
-    decision = guard.decision()
-    assert decision.action == GUARD_KILL
-    assert decision.category == CATEGORY_CONFIG_CHANGED
-    assert "policy_settings" in decision.reason
+    reason, category = monitor.violation()
+    assert "policy_settings" in reason and category == CATEGORY_CONFIG_CHANGED
 
 
-def test_guard_config_change_blocks_release_too(tmp_path):
-    gate = _gate(tmp_path)
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), gate)
-    guard.observe(_init_line("claude-sonnet-5"))
-    guard.observe(_turn_line("claude-sonnet-5"))
-    gate.config_capture.write_text(
-        json.dumps({"source": "user_settings", "file_path": "/h/.claude/settings.json"}) + "\n"
-    )
-    assert guard.decision().action == GUARD_KILL
-
-
-def test_guard_input_lines_are_the_stream_json_user_shape(tmp_path):
-    guard = ClaudeSessionGuard(BakedIdentity("claude-sonnet-5"), _gate(tmp_path))
-    line = guard.render_input("do the task")
-    event = json.loads(line)
-    assert event["type"] == "user"
-    assert event["message"]["role"] == "user"
-    assert event["message"]["content"] == [{"type": "text", "text": "do the task"}]
-    assert "\n" not in line
-    probe = json.loads(guard.probe_input())
-    assert "Preflight check" in probe["message"]["content"][0]["text"]
+def test_monitor_config_kill_survives_a_malformed_record(tmp_path):
+    # A capture line that does not parse is still a recorded change from an
+    # unknown source — fail loud, never quietly ignore the channel.
+    hooks = _hooks(tmp_path)
+    monitor = ClaudeSessionMonitor(BakedIdentity("claude-sonnet-5"), hooks)
+    hooks.config_capture.write_text("garbage\n")
+    reason, category = monitor.violation()
+    assert reason and category == CATEGORY_CONFIG_CHANGED

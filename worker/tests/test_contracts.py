@@ -352,8 +352,8 @@ def test_claude_adapter_model_classification():
     # mistake the build must catch.
     for pinned in ("claude-sonnet-5", "claude-fable-5", "claude-3-5-sonnet-20241022"):
         assert adapter.classify_model(pinned) == MODEL_PINNED
-    # Exactly the model-family aliases the availableModels allowlist expands
-    # (each to the newest model of one family — verified live on 2.1.231).
+    # Exactly the model-family aliases the managed model default accepts
+    # (each expands to the newest model of one family — verified live).
     for alias in ("sonnet", "opus", "haiku", "fable"):
         assert adapter.classify_model(alias) == MODEL_ALIAS
     for bad in ("gpt-5", "", "claude", "claude-", "Claude-Sonnet-5", "claude sonnet"):
@@ -381,19 +381,16 @@ def test_claude_adapter_materialize_managed_scope(tmp_path):
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
     assert (tmp_path / "etc/theozolith/effort").read_text() == "high\n"
     settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
-    # The enforcement contract (verified live on Claude Code 2.1.232):
-    # "model" alone is only the session default — the identity is held by the
-    # single-entry allowlist (constraining --model, /model, ANTHROPIC_MODEL,
-    # settings files, and subagent frontmatter) and by the managed env's
-    # CLAUDE_CODE_EFFORT_LEVEL (which overrides /effort, --effort, the
-    # process environment, and any settings-file effortLevel).
-    # forceRemoteSettingsRefresh makes every session start on freshly fetched
-    # server-managed policy — a stale cache must not count as proof.
+    # The selection contract (ADR-0045, best-effort doctrine): a managed
+    # "model" session DEFAULT for the main agent — the managed tier outranks
+    # checkout/user settings for the same key, and the harness passes no
+    # --model — plus the managed env's CLAUDE_CODE_EFFORT_LEVEL (which
+    # overrides /effort, --effort, the process environment, and any
+    # settings-file effortLevel). Deliberately NO availableModels allowlist:
+    # enforcement is main-agent-only — subagents, skills routed through
+    # subagents, and background helpers stay free to run other models.
     assert settings == {
         "model": "claude-sonnet-5",
-        "availableModels": ["claude-sonnet-5"],
-        "enforceAvailableModels": True,
-        "forceRemoteSettingsRefresh": True,
         "effortLevel": "high",
         "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
     }
@@ -417,10 +414,12 @@ def test_claude_adapter_materialize_merges_unrelated_operator_settings(tmp_path)
     assert settings["permissions"] == {"deny": ["WebSearch"]}
     assert settings["env"] == {"OTHER": "kept", "CLAUDE_CODE_EFFORT_LEVEL": "low"}
     assert settings["model"] == "claude-fable-5"
-    assert settings["availableModels"] == ["claude-fable-5"]
-    assert settings["enforceAvailableModels"] is True
-    assert settings["forceRemoteSettingsRefresh"] is True
     assert settings["effortLevel"] == "low"
+    # And nothing beyond the selection keys: no allowlist, no freshness key
+    # (main-agent-only enforcement, best-effort doctrine).
+    assert "availableModels" not in settings
+    assert "enforceAvailableModels" not in settings
+    assert "forceRemoteSettingsRefresh" not in settings
 
 
 def test_claude_adapter_materialize_rejects_conflicting_operator_identity(tmp_path):
@@ -535,24 +534,19 @@ def test_materialize_instruction_golden():
 
 
 def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch):
-    """The managed config only binds on a CLI new enough to enforce it
-    (availableModels/enforceAvailableModels): an older CLI silently ignores
-    the allowlist, so managed-scope materialization must refuse to proceed —
-    a fake pin is worse than a failed build (ADR-0045)."""
+    """The managed config only means anything on a CLI whose behavior the
+    identity machinery was verified against — an older CLI could silently
+    void an observation channel, and a fake selection is worse than a
+    failed build (ADR-0045)."""
     adapter = ClaudeAdapter()
 
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.240 (Claude Code)")
     assert adapter.verify_enforceable() == "2.1.240 (Claude Code)"
 
-    # The floor is 2.1.232 exactly: the enforcement settings are older
-    # (allowlist 2.1.175, alias substitution 2.1.222, per-key managed env
-    # merge 2.1.223), but the fail-closed gate additionally relies on the
-    # Stop-hook applied-effort payload, the ConfigChange hook, the
-    # --setting-sources/--tools isolation flags, dontAsk, the PreToolUse
-    # deny hook binding under skip-permissions, and the managed
-    # forceRemoteSettingsRefresh key — the whole set verified live on
-    # 2.1.232. On an older CLI an ignored freshness key would silently void
-    # a guarantee; the floor turns that into the clear cli-too-old failure.
+    # The floor is 2.1.232 exactly: the managed-over-project model-default
+    # precedence, the per-key managed env merge (2.1.223), the Stop-hook
+    # applied-effort payload, the ConfigChange hook, and the dry-run probe's
+    # isolation flags were all verified live there.
     assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 232)
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
     assert adapter.verify_enforceable() == "2.1.232 (Claude Code)"

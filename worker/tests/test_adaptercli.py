@@ -53,9 +53,6 @@ def test_materialize_managed_writes_native_config(tmp_path, capsys):
     settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
     assert settings == {
         "model": "claude-sonnet-5",
-        "availableModels": ["claude-sonnet-5"],
-        "enforceAvailableModels": True,
-        "forceRemoteSettingsRefresh": True,
         "effortLevel": "high",
         "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
     }
