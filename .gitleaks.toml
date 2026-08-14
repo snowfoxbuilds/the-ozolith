@@ -1,0 +1,20 @@
+# gitleaks configuration for TheOzolith.
+#
+# The repo is public: no credential may ever land in history. This config
+# inherits gitleaks' full built-in ruleset and only adds a narrow allowlist
+# for vendored, minified third-party assets whose high-entropy JavaScript
+# trips the generic-api-key rule (e.g. `t.TwoKeyMap=void` inside xterm.js).
+# Project-authored files are never allowlisted.
+
+title = "TheOzolith gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Vendored, minified third-party web assets (no project secrets)"
+paths = [
+  '''control/src/theozolith_control/web/static/htmx\.min\.js''',
+  '''control/src/theozolith_control/web/static/xterm\.js''',
+  '''control/src/theozolith_control/web/static/xterm-addon-fit\.js''',
+]
