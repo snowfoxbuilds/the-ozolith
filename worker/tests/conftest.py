@@ -27,6 +27,7 @@ from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome, Manifest
 from theozolith_worker.reviewer import Reviewer
+from theozolith_worker.sessions import SessionError
 from theozolith_worker.shell import run_shell
 
 WORKER_LOGIN = "ozolith-worker-a"
@@ -59,6 +60,34 @@ def write_decisions(cwd: Path, **kwargs) -> None:
 
 # A Run behavior: (prompt, checkout) -> AgentOutcome | None (None = completed).
 RunBehavior = Callable[[str, Path], AgentOutcome | None]
+
+
+@dataclass
+class IdentityFailure:
+    """A scripted reviewer reply that makes the session die the way a real
+    identity-monitor kill does (ADR-0045): the harness wrote its redacted
+    identity.json, status.json carries the anchored ``identity:`` marker, and
+    the driver sees it as a SessionError from wait_for_agent."""
+
+    detail: str = (
+        "[substituted] a main-agent turn executed on 'claude-opus-5',"
+        " not the baked 'claude-sonnet-5'"
+    )
+    record: dict = field(
+        default_factory=lambda: {
+            "expected_model": "claude-sonnet-5",
+            "expected_effort": "",
+            "checks": "passed",
+            "category": "substituted",
+            "detail": "",
+            "observed_model": "claude-opus-5",
+            "observed_effort": "",
+            "violation": (
+                "a main-agent turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
+            ),
+            "notes": [],
+        }
+    )
 
 
 class RecordingSink:
@@ -151,6 +180,12 @@ class SessionRecord:
     def alive(self) -> set[str]:
         return set(self.launched) - set(self.removed)
 
+    @property
+    def work_launched(self) -> list[str]:
+        """Run/review containers only — the per-boot identity dry-run
+        container (ADR-0045) is setup, not work."""
+        return [name for name in self.launched if not name.startswith("ozolith-identity-")]
+
 
 class FakeSession:
     """In-process stand-in for ContainerSession: same seam, same job dir.
@@ -204,6 +239,11 @@ class FakeSession:
         transcript.write_text("\n".join(lines) + "\n")
 
     def wait_for_agent(self) -> AgentOutcome:
+        if self.manifest.mode == jobdir.MODE_DRYRUN:
+            # The setup dry-run (ADR-0045): no task file, no workdir — the
+            # fake passes it the way a healthy image does.
+            jobdir.write_identity(self.job, {"dry_run": "passed", "expected_model": ""})
+            return AgentOutcome(completed=True)
         prompt = (self.job / jobdir.PROMPT_FILE).read_text()
         self._write_transcript(prompt)
         if self.manifest.mode == jobdir.MODE_RUN:
@@ -221,6 +261,9 @@ class FakeSession:
         self.harness.reviewer_prompts.append(prompt)
         assert self.harness.reviewer_replies, "review round started without a scripted reply"
         reply = self.harness.reviewer_replies.pop(0)
+        if isinstance(reply, IdentityFailure):
+            jobdir.write_identity(self.job, reply.record)
+            raise SessionError(f"harness failed: identity: {reply.detail}")
         if callable(reply):
             reply = reply(prompt, self.workdir)
         if reply is not None:
@@ -381,16 +424,8 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         # credential); the GitHub PATs are not (ADR-0013).
         "ANTHROPIC_API_KEY": "model-key",
     }
-    worker_config = load_config(
-        {**base_env, "GITHUB_TOKEN": "tok-worker-a"},
-        role=Implementer.role,
-        default_model=Implementer.default_model,
-    )
-    reviewer_config = load_config(
-        {**base_env, "GITHUB_TOKEN": "tok-reviewer"},
-        role=Reviewer.role,
-        default_model=Reviewer.default_model,
-    )
+    worker_config = load_config({**base_env, "GITHUB_TOKEN": "tok-worker-a"}, role=Implementer.role)
+    reviewer_config = load_config({**base_env, "GITHUB_TOKEN": "tok-reviewer"}, role=Reviewer.role)
 
     harness = Harness(
         fake=fake,

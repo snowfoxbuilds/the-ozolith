@@ -43,7 +43,7 @@ def _first(environ: Mapping[str, str], *names: str, default: str | None = None) 
     """The first of ``names`` present in the environment (VAR_FILE honored).
 
     Lookup chains let one shared environment configure both drivers: role-prefixed
-    variables (IMPLEMENTER_GITHUB_TOKEN, REVIEWER_MODEL, …) win over the generic
+    variables (IMPLEMENTER_GITHUB_TOKEN, REVIEWER_STACK, …) win over the generic
     THEOZOLITH_* names.
     """
     for name in names:
@@ -145,7 +145,9 @@ class DriverConfig:
     token: str  # this driver's machine-user PAT (never enters containers)
     api_url: str
     clone_url: str  # tokenless git remote for the target repo
-    model: str  # model the run-container agent runs
+    # No model field: the model is baked into the run image (ADR-0045); the
+    # driver neither knows nor selects it. Telemetry reports the observed
+    # model from the session stream and the run-image identity.
     adapter: str  # Agent adapter name (M2: "claude")
     run_image: str  # the run-container image the driver launches
     stack: str  # theozolith.owner label on containers this driver creates
@@ -181,24 +183,25 @@ _ADAPTER_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
 }
 
 
-def load_config(
-    environ: Mapping[str, str] | None = None, *, role: str, default_model: str
-) -> DriverConfig:
-    """Build the driver config for worker type ``role`` (its env prefix).
-
-    ``default_model`` is the type's shipped model, used when neither
-    ``<ROLE>_MODEL`` nor ``THEOZOLITH_MODEL`` is set; each worker type passes
-    its ``default_model`` class attribute (ADR-0020).
-    """
+def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> DriverConfig:
+    """Build the driver config for worker type ``role`` (its env prefix)."""
     environ = os.environ if environ is None else environ
     prefix = role.upper()  # IMPLEMENTER_* / REVIEWER_* win over the generic names
+    # Loud rejection, not a silent no-op (ADR-0045): the model env chain is
+    # gone — a daemon-less dev environment still exporting one would
+    # otherwise run a different model than the operator believes.
+    for name in (f"{prefix}_MODEL", "THEOZOLITH_MODEL"):
+        if env_value(environ, name):
+            raise ConfigError(
+                f"{name} is removed (ADR-0045): the worker-type definition bakes"
+                " the model into the run image — set 'model' in"
+                " worker-types/<name>.toml"
+            )
     repo = _required(environ, "THEOZOLITH_REPO")
     if "/" not in repo:
         raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
     token = _required(environ, f"{prefix}_GITHUB_TOKEN", "GITHUB_TOKEN")
     api_url = env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or ""
-
-    model = _first(environ, f"{prefix}_MODEL", "THEOZOLITH_MODEL", default=default_model) or ""
 
     clone_url = env_value(environ, "THEOZOLITH_CLONE_URL") or f"https://github.com/{repo}.git"
 
@@ -244,7 +247,6 @@ def load_config(
         token=token,
         api_url=api_url,
         clone_url=clone_url,
-        model=model,
         adapter=adapter,
         run_image=env_value(environ, "THEOZOLITH_RUN_IMAGE", "theozolith-run-claude:local")
         or "theozolith-run-claude:local",

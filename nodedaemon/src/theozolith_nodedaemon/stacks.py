@@ -129,10 +129,12 @@ _FINGERPRINT_REDACT = ("THEOZOLITH_NODE_TOKEN",)
 def spec_fingerprint(command: str, env: dict[str, str]) -> str:
     """A deterministic digest of a process Stack's effective launch spec —
     the argv command plus its full environment (which already carries the
-    resolved worker-type env: repository, adapter, model, run-image tag, and
-    the secret <ENV>_FILE mappings). Dictionary ordering is irrelevant
-    (sort_keys), so a mere reordering never forces a restart; a change to any
-    effective input does."""
+    resolved worker-type env: repository, adapter, run-image tag, and the
+    secret <ENV>_FILE mappings). The model is not in env (ADR-0045: it is
+    baked into the run image), but a model change still restarts the driver —
+    it re-tags the image, and THEOZOLITH_RUN_IMAGE is fingerprinted here.
+    Dictionary ordering is irrelevant (sort_keys), so a mere reordering never
+    forces a restart; a change to any effective input does."""
     safe_env = {
         key: ("<redacted>" if key in _FINGERPRINT_REDACT else value) for key, value in env.items()
     }

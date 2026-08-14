@@ -103,6 +103,10 @@ def test_backoff_delay_doubles_to_the_cap_and_recovers():
     ]
     assert backoff_delay(15, 3) == 60
     assert backoff_delay(0, 5) == 0  # a zero poll interval stays zero (tests)
+    # An unbounded streak (a driver latched or unreachable for days) must
+    # never overflow the int-to-float conversion and crash the loop it paces.
+    assert backoff_delay(60, 100_000) == 300
+    assert backoff_delay(60.0, 2_000) == 300.0
 
 
 def test_unreachability_flag_tracks_the_last_pass(control_node):

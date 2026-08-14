@@ -12,18 +12,22 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from conftest import (
     REVIEWER_LOGIN,
     WORKER_LOGIN,
     Harness,
+    IdentityFailure,
     behavior_write,
     make_harness,
     write_decisions,
 )
 from fakegithub import rate_limited_response
 from theozolith_worker import decisions, verdict
+from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
     BLOCKED,
@@ -35,6 +39,7 @@ from theozolith_worker.bootstrap.vocabulary import (
 )
 from theozolith_worker.containers import EngineError
 from theozolith_worker.gitops import GitError
+from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome
 from theozolith_worker.runner import branch_for
 from theozolith_worker.sessions import SessionError
@@ -194,7 +199,7 @@ def test_no_grant_means_no_run(harness: Harness):
     number = harness.file_issue("Busy", CRITERIA_BODY)
     harness.fake.force_assign(number, "ozolith-worker-b")  # someone else owns it
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert harness.fake.assignees_of(number) == ["ozolith-worker-b"]
 
 
@@ -203,7 +208,7 @@ def test_failed_label_is_refused_at_dispatch(harness: Harness):
     number = harness.file_issue("Broken state", CRITERIA_BODY)
     harness.fake.issues[number]["labels"].append({"name": FAILED})
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert PLAN_READY in harness.fake.labels_of(number)  # never laundered
 
 
@@ -325,6 +330,64 @@ def test_escalation_and_human_decision_round(harness: Harness):
     assert {PR_READY, NEEDS_HUMAN} <= harness.fake.labels_of(pr_number)
 
 
+def test_reviewer_identity_failure_blocks_the_pr_once(harness: Harness):
+    """ADR-0045 Reviewer lifecycle: a review session killed by the identity
+    gate escalates through the one-strike lane — evidence (identity.json +
+    transcript) survives with failure_class identity, the PR turns blocked +
+    needs_human in the same pass, and the next poll launches NO new review
+    instead of spinning against the same policy forever."""
+    harness.file_issue("Feature", CRITERIA_BODY)
+    harness.worker_once()
+    (pr_number,) = harness.fake.open_pr_numbers()
+
+    harness.reviewer_replies.append(IdentityFailure())
+    assert harness.reviewer_once() == 1  # the escalation verdict was applied
+
+    labels = harness.fake.labels_of(pr_number)
+    assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
+    comment = harness.fake.comments[pr_number][-1]["body"]
+    parsed = verdict.parse_comment(comment)
+    assert parsed is not None and parsed.verdict == verdict.ESCALATE
+    assert "identity" in comment.lower()
+
+    # Evidence first, and it survives the job dir cleanup: the record
+    # carries the Implementer lane's failure-class vocabulary plus the
+    # harness's own identity verdict; the transcript rode along.
+    paths = harness.evidence_paths()
+    (record_path,) = [p for p in paths if p.endswith("-identity.json")]
+    record = json.loads(harness.evidence_file(record_path))
+    assert record["failure_class"] == "identity"
+    assert record["verdict"] is None
+    assert record["identity"]["category"] == "substituted"
+    assert record["identity"]["checks"] == "passed"
+    assert record["identity"]["violation"]
+    assert "[substituted]" in record["error"]
+    assert any(p.endswith("-identity-transcript.txt") for p in paths)
+
+    # The next poll: the PR is out of the reviewable pool — no session
+    # starts (an unscripted review round would assert inside FakeSession).
+    assert harness.reviewer_once() == 0
+    assert {BLOCKED, NEEDS_HUMAN} <= harness.fake.labels_of(pr_number)
+
+
+def test_reviewer_non_identity_harness_failure_keeps_current_behavior(harness: Harness):
+    """A SessionError WITHOUT the anchored identity marker keeps the existing
+    lane: the pass-level error summary, no verdict, no label changes — the
+    one-strike identity path never widens into a general escalation path."""
+    harness.file_issue("Feature", CRITERIA_BODY)
+    harness.worker_once()
+    (pr_number,) = harness.fake.open_pr_numbers()
+
+    def broken_session(prompt: str, cwd: Path):
+        raise SessionError("run container exited before the agent phase completed")
+
+    harness.reviewer_replies.append(broken_session)
+    assert harness.reviewer_once() == 0
+    assert any("review pass failed" in line for line in harness.logs)
+    labels = harness.fake.labels_of(pr_number)
+    assert PR_READY in labels and BLOCKED not in labels  # unchanged behavior
+
+
 # -- 5. round budget and the final-round rule ---------------------------------
 
 
@@ -379,11 +442,11 @@ def test_exhausted_attempt_labels_escalate_deterministically(harness: Harness):
     harness.fake.issues[pr_number]["labels"] += [
         {"name": f"{ATTEMPT_PREFIX}{n}"} for n in (1, 2, 3)
     ]
-    containers_before = len(harness.record.launched)
+    containers_before = len(harness.record.work_launched)
 
     assert harness.reviewer_once() == 1  # no scripted reply: no container ran
 
-    assert len(harness.record.launched) == containers_before  # no review container
+    assert len(harness.record.work_launched) == containers_before  # no review container
     labels = harness.fake.labels_of(pr_number)
     assert {BLOCKED, NEEDS_HUMAN} <= labels and PR_READY not in labels
     parsed = verdict.parse_comment(harness.fake.comments[pr_number][-1]["body"])
@@ -409,7 +472,7 @@ def test_statelessness_between_runs(harness: Harness):
     # Each Run got a fresh checkout in a fresh job dir, in a fresh container.
     (_, cwd_one), (_, cwd_two) = harness.worker_calls
     assert cwd_one != cwd_two
-    assert len(set(harness.record.launched)) == 2
+    assert len(set(harness.record.work_launched)) == 2
     assert harness.record.alive == set()  # no ozolith-run-* containers remain
     # The agent-side decisions file never lands on the branch.
     for number in (first, second):
@@ -926,6 +989,8 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
 
     def broken_factory(spec, job, manifest):
         session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN:
+            return session  # setup dry-run works; only RUN containers break
 
         def broken_launch():
             raise EngineError("docker run failed: no such image")
@@ -950,6 +1015,186 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
     assert [e["failure_class"] for e in run_events if e["phase"] == "failed"] == ["infra", "infra"]
     (escalated,) = (e for e in run_events if e["phase"] == "escalated")
     assert escalated["failure_class"] == "infra"
+
+
+# -- the setup dry-run latch (ADR-0045) ----------------------------------------
+# A dry-run VERDICT (the container ran and failed) latches the driver until a
+# manual restart: the probe is never re-spent, no work is fetched, and the
+# reason reaches the Control Node's error feed. Only a dry-run that could not
+# execute at all (engine breakage) is retried.
+
+LATCH_DETAIL = "[substituted] the identity probe ran on 'other', not the baked 'claude-sonnet-5'"
+
+
+def _dryrun_failing_factory(harness: Harness, dryruns: list[str]):
+    """The harness's real session seam, with every dry-run session dying the
+    way a real identity verdict does (anchored marker in the status error)."""
+    real_factory = harness.session_factory
+
+    def factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN:
+            dryruns.append(spec.name)
+
+            def die():
+                raise SessionError(f"harness failed: identity: {LATCH_DETAIL}")
+
+            session.wait_for_agent = die  # type: ignore[method-assign]
+        return session
+
+    return factory
+
+
+def _persistent_worker(harness: Harness, session_factory, sink=None) -> Implementer:
+    """One long-lived Implementer instance — the latch is process state, so
+    these tests drive repeated passes on the SAME driver (the acceptance
+    ``worker_once`` helper builds a fresh one per call)."""
+    return Implementer(
+        harness.worker_config,
+        client=harness.worker_client,
+        session_factory=session_factory,
+        dispatch=harness.dispatch,
+        log=harness.logs.append,
+        sink=sink or harness.sink,
+    )
+
+
+def test_dry_run_verdict_latches_until_restart(harness: Harness):
+    harness.file_issue("Never claimed", CRITERIA_BODY)
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns))
+
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == LATCH_DETAIL
+    assert len(dryruns) == 1
+
+    # Subsequent passes on the same process: no new dry-run container — the
+    # probe is never re-spent — and no work is fetched or claimed.
+    assert worker.run(once=True) == 0
+    assert len(dryruns) == 1
+    assert harness.record.work_launched == []
+
+    # Exactly one latch event landed on the Control Node's error feed,
+    # naming the verdict and the remedy; the local journal has both too.
+    errors = [e for e in harness.sink.events if e["type"] == "theozolith.error"]
+    assert len(errors) == 1
+    assert errors[0]["error_class"] == "IdentityDryRun"
+    assert LATCH_DETAIL in errors[0]["message"] and "restarted" in errors[0]["message"]
+    assert any("latched" in line and "restart" in line for line in harness.logs)
+
+
+def test_dry_run_latch_report_retries_until_control_hears_it(harness: Harness):
+    class DeafThenListening:
+        """Control down at latch time: the first emission is lost."""
+
+        def __init__(self):
+            self.events: list[dict] = []
+            self.deaf = 1
+
+        def emit(self, event: dict) -> bool:
+            if self.deaf:
+                self.deaf -= 1
+                return False
+            self.events.append(event)
+            return True
+
+    sink = DeafThenListening()
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns), sink=sink)
+
+    assert worker.run(once=True) == 0
+    assert sink.events == []  # lost — Control was down
+    assert worker.run(once=True) == 0  # a cheap re-send, never a new probe
+    assert len(dryruns) == 1
+    assert [e["error_class"] for e in sink.events] == ["IdentityDryRun"]
+    assert worker.run(once=True) == 0  # landed: not re-sent again
+    assert len(sink.events) == 1
+
+
+def test_dry_run_latch_loop_backs_off_without_respending_the_probe(harness: Harness):
+    dryruns: list[str] = []
+    worker = _persistent_worker(harness, _dryrun_failing_factory(harness, dryruns))
+    # The acceptance harness polls at 0s; backoff only shows over a real base.
+    worker.config = replace(harness.worker_config, poll_seconds=60.0)
+    delays: list[float] = []
+    idles: list[int] = []
+    worker.on_idle = lambda: idles.append(1)  # type: ignore[method-assign]
+
+    def sleeper(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= 6:
+            raise KeyboardInterrupt  # stop the loop (run() does not catch it)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(sleep=sleeper)
+    assert len(dryruns) == 1  # the probe was spent exactly once
+    assert delays == sorted(delays) and delays[-1] > delays[0]  # backing off
+    # The idle hook keeps running while latched: parked evidence from a
+    # predecessor crash retries its publication (ADR-0016) regardless of the
+    # identity gate.
+    assert len(idles) == len(delays)
+
+
+def test_dry_run_session_breakage_without_a_verdict_is_not_latched(harness: Harness):
+    """A SessionError WITHOUT the anchored identity marker (container died
+    early, wait timeout) decided nothing about the identity: plausibly
+    transient, retried — never latched."""
+    number = harness.file_issue("Recovered", CRITERIA_BODY)
+    real_factory = harness.session_factory
+    breakage = ["run container exited before the agent phase completed"]
+
+    def flaky_factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN and breakage:
+            message = breakage.pop()
+
+            def die():
+                raise SessionError(message)
+
+            session.wait_for_agent = die  # type: ignore[method-assign]
+        return session
+
+    worker = _persistent_worker(harness, flaky_factory)
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == ""  # no verdict: no latch
+    assert worker.run(once=True) == 1  # next pass retries the dry-run; work flows
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert harness.fake.pulls[pr_number]["head"] == branch_for(number)
+
+
+def test_dry_run_sweeps_a_predecessors_stale_dot_dir(harness: Harness):
+    """A driver killed mid-dry-run runs no finally block and the evidence
+    sweep skips dot-prefixed dirs by design — the next dry-run clears the
+    leavings (the jobs dir is per-Stack: they are always ours)."""
+    stale = Path(harness.worker_config.jobs_dir) / ".identity-dryrun-deadbeef"
+    (stale / "output").mkdir(parents=True)
+    (stale / "output" / "status.json").write_text("{}")
+    harness.file_issue("Cleaned", CRITERIA_BODY)
+
+    assert harness.worker_once() == 1
+    assert not stale.exists()
+
+
+def test_dry_run_infra_failure_is_retried_not_latched(harness: Harness):
+    """A dry-run that could not execute at all is plausibly transient: no
+    latch, and the next pass retries — here the engine recovers and work
+    flows without a driver restart."""
+    number = harness.file_issue("Claimed after recovery", CRITERIA_BODY)
+    real_factory = harness.session_factory
+    breakage = [EngineError("docker daemon down")]
+
+    def flaky_factory(spec, job, manifest):
+        if manifest.mode == jobdir_module.MODE_DRYRUN and breakage:
+            raise breakage.pop()
+        return real_factory(spec, job, manifest)
+
+    worker = _persistent_worker(harness, flaky_factory)
+    assert worker.run(once=True) == 0
+    assert worker.identity_block == ""  # not a verdict: not latched
+    assert worker.run(once=True) == 1  # engine back: dry-run passes, work flows
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert harness.fake.pulls[pr_number]["head"] == branch_for(number)
+    assert PR_READY in harness.fake.labels_of(pr_number)
 
 
 # -- 9. headless sessions (ADR-0019) -------------------------------------------
@@ -1045,7 +1290,7 @@ def test_control_node_down_pauses_new_claims_and_reviews(harness: Harness):
     harness.dispatch.paused = True
 
     assert harness.worker_once() == 0
-    assert harness.record.launched == []
+    assert harness.record.work_launched == []
     assert PLAN_READY in harness.fake.labels_of(number)  # untouched
     assert harness.reviewer_once() == 0
     assert any("paused" in line for line in harness.logs)
@@ -1073,7 +1318,7 @@ def test_unacknowledged_claimed_event_abandons_the_grant(harness: Harness):
     window, and running anyway would fork ownership (ADR-0017)."""
     harness.file_issue("Lost handshake", CRITERIA_BODY)
     assert harness.worker_once(sink=_DeadSink()) == 0
-    assert harness.record.launched == []  # no Run was started
+    assert harness.record.work_launched == []  # no Run was started
     assert harness.fake.open_pr_numbers() == []
     assert any("abandoning the grant" in line for line in harness.logs)
 
@@ -1132,3 +1377,53 @@ def test_stale_branch_from_crashed_run_is_overwritten(harness: Harness):
     assert PR_READY in harness.fake.labels_of(pr_number)
     paths = harness.remote_paths(branch)
     assert "change.txt" in paths and "junk.txt" not in paths
+
+
+def test_identity_gate_failures_are_a_distinct_class_with_identity_evidence(harness: Harness):
+    """ADR-0045: a harness identity failure (static checks or a monitor
+    kill) classifies as failure_class "identity" — distinct from plain
+    harness breakage — and the evidence bundle embeds the harness's identity
+    record (expected vs observed, the stable category, the violation)
+    without any new wire key. The record here is exactly the shape
+    harness/main.py writes."""
+    from theozolith_worker import jobdir as jd
+
+    number = harness.file_issue("Pinned", CRITERIA_BODY)
+    violation = "a main-agent turn executed on 'claude-opus-5', not the baked 'claude-sonnet-5'"
+
+    def monitor_kills(prompt: str, cwd: Path) -> None:
+        # What the real harness leaves behind after a monitor kill: the
+        # identity record in the job dir, and a PHASE_FAILED status whose
+        # error carries the identity marker (surfaced as a SessionError).
+        jd.write_identity(
+            cwd.parent,
+            {
+                "expected_model": "claude-sonnet-5",
+                "expected_effort": "low",
+                "checks": "passed",
+                "category": "substituted",
+                "detail": "",
+                "observed_model": "",
+                "observed_effort": "",
+                "violation": violation,
+                "notes": [],
+            },
+        )
+        raise SessionError(f"harness failed: identity: [substituted] {violation}")
+
+    harness.worker_behaviors.extend([monitor_kills, monitor_kills])
+    assert harness.worker_once() == 2  # the original and the one local retry
+    _assert_escalated(harness, number, "identity", "substituted")
+
+    # The evidence bundle carries the identity record verbatim — category
+    # strings and model/effort names only, never settings or credentials.
+    (comment,) = harness.fake.comments[number]
+    run_ids = re.findall(r"Run `([^`]+)`", comment["body"])
+    for run_id in run_ids:
+        record = json.loads(harness.evidence_file(f"runs/issue-{number}/{run_id}/run.json"))
+        identity = record["identity"]
+        assert identity["expected_model"] == "claude-sonnet-5"
+        assert identity["expected_effort"] == "low"
+        assert identity["category"] == "substituted"
+        assert identity["violation"] == violation
+        assert "model-key" not in json.dumps(record)  # the credential never leaks

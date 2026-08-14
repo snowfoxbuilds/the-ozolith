@@ -124,13 +124,11 @@ def test_config_reads_var_file_convention(tmp_path):
     config = load_config(
         {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN_FILE": str(token_file), **CONTROL_ENV},
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert config.token == "s3cret"
     # Tokenless by design: the PAT never lands in a checkout's .git/config.
     assert config.clone_url == "https://github.com/acme/sandbox.git"
     assert "s3cret" not in config.clone_url
-    assert config.model == "claude-sonnet-5"
 
 
 def test_config_role_prefixed_variables_route_one_shared_env():
@@ -139,16 +137,13 @@ def test_config_role_prefixed_variables_route_one_shared_env():
         "THEOZOLITH_REPO": "acme/sandbox",
         "IMPLEMENTER_GITHUB_TOKEN": "tok-w",
         "REVIEWER_GITHUB_TOKEN": "tok-r",
-        "REVIEWER_MODEL": "claude-fable-5",
-        "IMPLEMENTER_MODEL": "claude-sonnet-5",
         "WORKER_ID": "worker-9",
         "POLL_SECONDS": "5",
         **CONTROL_ENV,
     }
-    worker = load_config(env, role="implementer", default_model="claude-sonnet-5")
-    reviewer = load_config(env, role="reviewer", default_model="claude-fable-5")
+    worker = load_config(env, role="implementer")
+    reviewer = load_config(env, role="reviewer")
     assert worker.token == "tok-w" and reviewer.token == "tok-r"
-    assert worker.model == "claude-sonnet-5" and reviewer.model == "claude-fable-5"
     assert worker.stack == "implementer" and reviewer.stack == "reviewer"
     assert worker.worker_id == "worker-9"
     assert worker.poll_seconds == 5.0
@@ -156,17 +151,14 @@ def test_config_role_prefixed_variables_route_one_shared_env():
 
 def test_config_requires_repo_token_and_control_node():
     with pytest.raises(ConfigError):
-        load_config({}, role="implementer", default_model="claude-sonnet-5")
+        load_config({}, role="implementer")
     with pytest.raises(ConfigError):
-        load_config(
-            {"THEOZOLITH_REPO": "acme/sandbox"}, role="implementer", default_model="claude-sonnet-5"
-        )
+        load_config({"THEOZOLITH_REPO": "acme/sandbox"}, role="implementer")
     # ADR-0017: no Control Node = no claim path = not a runnable driver.
     with pytest.raises(ConfigError, match="CONTROL_NODE_URL"):
         load_config(
             {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x"},
             role="implementer",
-            default_model="claude-sonnet-5",
         )
 
 
@@ -176,31 +168,22 @@ def test_config_forwards_either_claude_credential():
     is required at load time."""
     base = {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x", **CONTROL_ENV}
 
-    api_only = load_config(
-        {**base, "ANTHROPIC_API_KEY": "sk-ant"},
-        role="implementer",
-        default_model="claude-sonnet-5",
-    )
+    api_only = load_config({**base, "ANTHROPIC_API_KEY": "sk-ant"}, role="implementer")
     assert api_only.agent_env == {"ANTHROPIC_API_KEY": "sk-ant"}
 
-    oauth_only = load_config(
-        {**base, "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"},
-        role="implementer",
-        default_model="claude-sonnet-5",
-    )
+    oauth_only = load_config({**base, "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"}, role="implementer")
     assert oauth_only.agent_env == {"CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"}
 
     both = load_config(
         {**base, "ANTHROPIC_API_KEY": "sk-ant", "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok"},
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert both.agent_env == {
         "ANTHROPIC_API_KEY": "sk-ant",
         "CLAUDE_CODE_OAUTH_TOKEN": "oat-tok",
     }
 
-    neither = load_config(base, role="implementer", default_model="claude-sonnet-5")
+    neither = load_config(base, role="implementer")
     assert neither.agent_env == {}
 
 
@@ -217,7 +200,6 @@ def test_config_oauth_token_honors_var_file_convention(tmp_path):
             **CONTROL_ENV,
         },
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert config.agent_env == {"CLAUDE_CODE_OAUTH_TOKEN": "oat-from-file"}
 
@@ -235,19 +217,42 @@ def test_config_forwards_no_credentials_for_a_non_claude_adapter():
             **CONTROL_ENV,
         },
         role="implementer",
-        default_model="claude-sonnet-5",
     )
     assert config.adapter == "future"
     assert config.agent_env == {}
 
 
-def test_config_default_model_flows_from_the_worker_type():
+def test_agent_env_never_carries_a_model_selection():
+    """The last loophole (ADR-0045): the run container's env is exactly the
+    supplied spend credentials — no ANTHROPIC_MODEL, no THEOZOLITH_MODEL —
+    so nothing in the container's environment can steer the CLI off the
+    image's baked model."""
     config = load_config(
-        {"THEOZOLITH_REPO": "acme/sandbox", "GITHUB_TOKEN": "x", **CONTROL_ENV},
-        role="reviewer",
-        default_model="claude-fable-5",
+        {
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "GITHUB_TOKEN": "x",
+            "ANTHROPIC_API_KEY": "spend-key",
+            **CONTROL_ENV,
+        },
+        role="implementer",
     )
-    assert config.model == "claude-fable-5"
+    assert config.agent_env == {"ANTHROPIC_API_KEY": "spend-key"}
+
+
+@pytest.mark.parametrize("name", ["IMPLEMENTER_MODEL", "THEOZOLITH_MODEL"])
+def test_config_rejects_the_removed_model_env_loudly(name):
+    """ADR-0045: the model env chain is gone — a leftover export must fail
+    loudly, not silently run a model the operator no longer controls."""
+    with pytest.raises(ConfigError, match=rf"{name} is removed \(ADR-0045\)"):
+        load_config(
+            {
+                "THEOZOLITH_REPO": "acme/sandbox",
+                "GITHUB_TOKEN": "x",
+                name: "claude-opus-5",
+                **CONTROL_ENV,
+            },
+            role="implementer",
+        )
 
 
 def test_fake_rejects_unknown_token():

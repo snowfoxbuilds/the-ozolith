@@ -32,6 +32,22 @@ def test_no_knowledge_source_means_no_bake_line():
     assert "theozolith-knowledge bake" not in text
 
 
+def test_materialize_instruction_rides_setup_verbatim():
+    """ADR-0045 needs NO daemon change: control appends the synthesized
+    theozolith-adapter line to the recipe's setup, and this renderer emits it
+    as an ordinary RUN — the daemon stays adapter-blind, and an un-upgraded
+    daemon still builds the correct bytes under the new tag."""
+    materialize = (
+        "theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed"
+    )
+    recipe = image_recipe(setup=["pip install uv", materialize])
+    text = dockerfile_for(recipe, built_at="t")
+    assert f"RUN {materialize}" in text
+    # Ordered like any setup: after the operator line, before the privilege drop.
+    assert text.index("RUN pip install uv") < text.index(f"RUN {materialize}")
+    assert text.index(f"RUN {materialize}") < text.index("USER ozolith")
+
+
 def test_ensure_image_builds_skips_and_forces():
     docker = FakeDocker()
     recipe = image_recipe()

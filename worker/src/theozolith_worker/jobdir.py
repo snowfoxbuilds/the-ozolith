@@ -12,7 +12,8 @@ Layout::
 
     jobs/<run-id>/
       input/
-        manifest.json    what to run: mode, adapter, model, timeouts
+        manifest.json    what to run: mode, adapter, timeouts (the model is
+                         baked into the run image, never here — ADR-0045)
         prompt.md        the driver-rendered task; the invocation argv
                          carries only a constant-size pointer to this file
         jobs/            driver-sequenced job requests (gate steps, shutdown)
@@ -41,6 +42,12 @@ CONTAINER_JOB_PATH = "/job"
 
 MODE_RUN = "run"
 MODE_REVIEW = "review"
+# The setup dry-run (ADR-0045): the harness runs the identity checks and
+# the one-time probe session, writes identity.json + status, and exits —
+# no task file, no workdir, no agent process. Driven once per driver
+# process per run image, from a dot-prefixed job dir the evidence sweep
+# and queue-behind ignore.
+MODE_DRYRUN = "identity-dryrun"
 
 # Harness phases, in order of appearance in output/status.json.
 PHASE_STARTING = "starting"
@@ -54,6 +61,10 @@ PROMPT_FILE = "input/prompt.md"
 STATUS_FILE = "output/status.json"
 TRANSCRIPT_FILE = "output/transcript.txt"
 VERDICT_FILE = "output/verdict.json"
+# The baked-identity verdict (ADR-0045): expected vs effective model/effort,
+# preflight status, and the gate outcome — written by the harness, embedded
+# into the driver's evidence bundle. Absent when the image bakes no identity.
+IDENTITY_FILE = "output/identity.json"
 JOBS_IN_DIR = "input/jobs"
 JOBS_OUT_DIR = "output/jobs"
 CHECKOUT_DIR = "checkout"
@@ -95,7 +106,8 @@ class Manifest:
     run_id: str
     mode: str  # "run" | "review"
     adapter: str  # Agent adapter name (M2: "claude")
-    model: str
+    # No model field (ADR-0045): the model is baked into the run image's
+    # native adapter config at build time; nothing at invocation selects one.
     workdir: str = CHECKOUT_DIR  # job-dir-relative agent working directory
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT
     jobs_idle_timeout_seconds: float = DEFAULT_JOBS_IDLE_TIMEOUT
@@ -184,6 +196,15 @@ def read_status(job: Path) -> Status | None:
             exit_code=int(raw_code) if isinstance(raw_code, int) else None,
         )
     return Status(phase=data["phase"], agent=agent, error=str(data.get("error", "")))
+
+
+def write_identity(job: Path, data: dict) -> None:
+    """output/identity.json: the baked-identity verdict (ADR-0045)."""
+    atomic_write(job / IDENTITY_FILE, json.dumps(data, indent=2, sort_keys=True))
+
+
+def read_identity(job: Path) -> dict | None:
+    return _read_json(job / IDENTITY_FILE)
 
 
 @dataclass(frozen=True)

@@ -88,13 +88,12 @@ import sys  # noqa: E402
 from theozolith_worker import api  # noqa: E402
 
 # A minimal, valid custom Driver: exports a top-level Driver subclassing
-# api.Worker with the two required class attributes.
+# api.Worker with the required role attribute.
 DRIVER_SRC = (
     "from theozolith_worker import api\n"
     "\n"
     "class Driver(api.Worker):\n"
     "    role = 'demo'\n"
-    "    default_model = 'claude-sonnet-5'\n"
     "    def fetch_work(self):\n"
     "        return []\n"
     "    def execute(self, item):\n"
@@ -318,7 +317,6 @@ def test_example_driver_runs_a_pass_against_fakes(tmp_path, clean_import):
             "THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs"),
         },
         role=Driver.role,
-        default_model=Driver.default_model,
     )
     logs: list[str] = []
 

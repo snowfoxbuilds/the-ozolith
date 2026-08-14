@@ -60,6 +60,7 @@ from theozolith_worker.containers import (
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -170,7 +171,10 @@ class RunReport:
     gate_findings: int = 0
     reason: str = ""  # failed Runs: what broke
     # ADR-0016 uniform budget classes: timeout | session-died | harness |
-    # no-changes | infra ("" for completed Runs).
+    # no-changes | infra ("" for completed Runs). ADR-0045 adds identity:
+    # the static checks failed before launch or the fail-loud monitor
+    # detected an off-identity session (killed mid-run) — the Run is
+    # invalid.
     failure_class: str = ""
     evidence_pushed: bool = False
     # True only on the compound failure: the push failed AND both parking
@@ -244,10 +248,11 @@ def _read_output(job: Path, relpath: str) -> str:
         return ""
 
 
-def _run_tokens(config: DriverConfig, job: Path) -> int | None:
-    """Token usage from the structured output stream (ADR-0019); None when
-    the adapter's stream carries no usage."""
-    return adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE).tokens
+def _run_stats(config: DriverConfig, job: Path) -> adapters.StreamStats:
+    """Counters from the structured output stream (ADR-0019): token usage
+    (None when the stream carries none) and the observed model — telemetry's
+    model source now that selection is baked into the image (ADR-0045)."""
+    return adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
 
 
 def _write_issue_metadata(job: Path, issue: Issue, *, round_number: int) -> None:
@@ -496,7 +501,6 @@ def _run_to_pr(
         run_id=report.run_id,
         mode=jobdir.MODE_RUN,
         adapter=config.adapter,
-        model=config.model,
         workdir=jobdir.CHECKOUT_DIR,
         agent_timeout_seconds=config.agent_timeout_seconds,
     )
@@ -572,6 +576,13 @@ def _run_to_pr(
 
     if outcome is None or not outcome.completed:
         if harness_error:
+            # ADR-0045: the harness marks identity-gate failures (preflight,
+            # gate, mid-run drift) with a distinct prefix — a policy problem,
+            # not harness breakage, and retrying it burns the same budget
+            # against the same policy. Anchored, never substring: an error
+            # merely quoting the marker is not an identity verdict.
+            if identity_error_detail(harness_error) is not None:
+                raise _RunFailed(harness_error, "identity")
             raise _RunFailed(harness_error, "harness")
         if outcome is not None and outcome.timed_out:
             raise _RunFailed("agent session timed out", "timeout")
@@ -690,6 +701,7 @@ def _push_run_evidence(
     )
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
+    stats = _run_stats(config, job)
     files = {
         f"{prefix}/run.json": json.dumps(
             {
@@ -697,7 +709,18 @@ def _push_run_evidence(
                 "worker_id": config.worker_id,
                 "stack": config.stack,
                 "adapter": config.adapter,
-                "model": config.model,
+                # ADR-0045: the config-time model string is gone from the
+                # driver; identity is the run image (its tag covers the baked
+                # model) and "model" is what the session stream reported.
+                "run_image": config.run_image,
+                "model": stats.model,
+                "model_note": stats.model_note,
+                # The harness's identity record (ADR-0045): expected vs
+                # observed model/effort, check status, category, violation,
+                # gap notes. None on an image that bakes no identity. Values
+                # are category strings and model/effort names only — never
+                # credentials or settings.
+                "identity": jobdir.read_identity(job),
                 "container": report.container,
                 "issue": issue.number,
                 "round": report.round,
@@ -706,7 +729,7 @@ def _push_run_evidence(
                 "head": report.head,
                 "phase": report.phase,
                 "agent_outcome": report.agent_outcome,
-                "tokens": _run_tokens(config, job),
+                "tokens": stats.tokens,
                 "reason": report.reason,
                 "failure_class": report.failure_class,
                 "notes": report.notes,

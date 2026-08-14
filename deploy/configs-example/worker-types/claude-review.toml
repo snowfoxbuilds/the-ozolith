@@ -6,6 +6,9 @@
 
 driver = "builtin:reviewer"      # the staged pipeline Reviewer (process kind)
 adapter = "claude"
+# The ADR-0008 "stronger model for review" rule lives HERE now: the model is
+# a definition field baked into the derived image (ADR-0045) — the Reviewer
+# driver itself ships no default and cannot select one at run time.
 model = "claude-fable-5"
 workspace = "acme/sandbox"
 

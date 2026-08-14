@@ -26,6 +26,14 @@ validation error, the bundle link, and the evidence path of the offending
 verdict file. One strike; there is no driver-side retry — the judging
 agent's second chances live inside its own session via the validate-verdict
 harness job.
+
+A review session that fails its baked-identity gate (ADR-0045; the harness
+status carries the anchored ``identity:`` marker) takes the same one-strike
+lane: identity.json and the transcript are published as evidence with
+``failure_class: identity``, then blocked + needs_human — the PR leaves the
+reviewable pool instead of relaunching an identical doomed review every
+poll. Other harness breakage keeps its existing behavior (the pass-level
+error summary).
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ import shutil
 from pathlib import Path
 from typing import ClassVar
 
-from theozolith_worker import evidence, gitops, jobdir, runner, verdict
+from theozolith_worker import adapters, evidence, gitops, jobdir, runner, verdict
 from theozolith_worker.base import Worker
 from theozolith_worker.bootstrap.vocabulary import (
     BLOCKED,
@@ -59,7 +67,8 @@ from theozolith_worker.containers import (
 from theozolith_worker.decisions import section_text
 from theozolith_worker.events import EventSink, emit_error, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
-from theozolith_worker.sessions import SessionFactory
+from theozolith_worker.identity import identity_error_detail
+from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.signals import compute_signals
 
 DIFF_LIMIT = 200_000
@@ -255,7 +264,6 @@ def review_pr(
             run_id=review_id,
             mode=jobdir.MODE_REVIEW,
             adapter=config.adapter,
-            model=config.model,  # the Reviewer's stronger model (ADR-0008)
             workdir=jobdir.WORK_DIR,
             agent_timeout_seconds=config.agent_timeout_seconds,
             round=round_number,
@@ -275,7 +283,35 @@ def review_pr(
         session = session_factory(spec, job, manifest)
         session.launch()
         try:
-            session.wait_for_agent()
+            try:
+                session.wait_for_agent()
+            except SessionError as exc:
+                # ADR-0045: an identity-gate failure (anchored marker, never
+                # substring) means the review session's baked model/effort
+                # could not be proven — no verdict exists and every re-poll
+                # would replay the same failure against the same policy. It
+                # takes the one-strike escalation lane; any other session
+                # breakage keeps its current behavior (the pass-level error
+                # summary) unchanged.
+                detail = identity_error_detail(str(exc))
+                if detail is None:
+                    raise
+                escalated = _escalate_identity_failure(
+                    config,
+                    client,
+                    pr,
+                    issue_number,
+                    round_number,
+                    detail,
+                    job,
+                    bundle_url,
+                    _read_transcript(job),
+                    container,
+                    log,
+                    sink=sink,
+                )
+                _emit_review(sink, config, pr, issue_number, escalated)
+                return escalated
         finally:
             session.finish()
 
@@ -316,6 +352,8 @@ def review_pr(
             log,
             transcript=transcript,
             container=container,
+            observed=adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE),
+            identity=jobdir.read_identity(job),
             sink=sink,
         )
         _emit_review(sink, config, pr, issue_number, result)
@@ -341,6 +379,7 @@ def _escalate_invalid_verdict(
     """Apply the one-strike rule: evidence first (so the cited path
     resolves), then blocked + needs_human with the raw validation error."""
     prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-invalid"
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
     record = {
         "pr": pr.number,
         "issue": issue_number,
@@ -348,7 +387,15 @@ def _escalate_invalid_verdict(
         "verdict": None,
         "error": reason,
         "head": pr.head_sha,
-        "model": config.model,
+        # ADR-0045: image identity (its tag covers the baked model) plus the
+        # reconciled stream-observed model; model_note carries any
+        # disagreement between the stream's model signals.
+        "run_image": config.run_image,
+        "model": stats.model,
+        "model_note": stats.model_note,
+        # The harness's identity record (expected vs observed model/effort,
+        # check status, category, gap notes); None on a model-less image.
+        "identity": jobdir.read_identity(job),
         "container": container,
     }
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
@@ -389,6 +436,72 @@ def _escalate_invalid_verdict(
     return result
 
 
+def _escalate_identity_failure(
+    config: DriverConfig,
+    client: GitHubClient,
+    pr: PullRequest,
+    issue_number: int,
+    round_number: int,
+    reason: str,
+    job: Path,
+    bundle_url: str,
+    transcript: str,
+    container: str,
+    log,
+    sink: EventSink | None = None,
+) -> verdict.Verdict:
+    """The one-strike lane for a review session that failed its baked
+    identity gate (ADR-0045): evidence first — the harness's redacted
+    identity.json and whatever transcript exists survive the job dir — then
+    blocked + needs_human, so the PR leaves the reviewable pool instead of
+    relaunching an identical doomed review on every poll. The record carries
+    ``failure_class: identity``, the same class the Implementer lane uses,
+    so evidence queries see one vocabulary."""
+    prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-identity"
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
+    record = {
+        "pr": pr.number,
+        "issue": issue_number,
+        "round": round_number,
+        "verdict": None,
+        "error": reason,
+        "failure_class": "identity",
+        "head": pr.head_sha,
+        # ADR-0045: image identity (its tag covers the baked model) plus the
+        # reconciled stream-observed model and the harness's identity record
+        # — expected vs observed, the stable category, the violation.
+        "run_image": config.run_image,
+        "model": stats.model,
+        "model_note": stats.model_note,
+        "identity": jobdir.read_identity(job),
+        "container": container,
+    }
+    files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
+    if transcript:
+        files[f"{prefix}-transcript.txt"] = transcript
+    _push_evidence_files(
+        config,
+        files,
+        message=f"Evidence: identity failure, review round {round_number} (issue #{issue_number})",
+        log=log,
+        context=f"PR #{pr.number}",
+        sink=sink,
+    )
+
+    result = verdict.Verdict(
+        verdict=verdict.ESCALATE,
+        round=round_number,
+        evidence=(
+            "The review session failed its baked-identity gate before any"
+            " verdict existed; escalating to a human (one strike, no retry —"
+            f" ADR-0045). Identity failure: {reason}"
+        ),
+        bundle_url=bundle_url,
+    )
+    _publish(client, pr, issue_number, result, log)
+    return result
+
+
 def _apply(
     config: DriverConfig,
     client: GitHubClient,
@@ -399,10 +512,23 @@ def _apply(
     *,
     transcript: str = "",
     container: str = "",
+    observed: adapters.StreamStats | None = None,
+    identity: dict | None = None,
     sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
-    _push_review_evidence(config, pr, issue_number, result, transcript, container, log, sink=sink)
+    _push_review_evidence(
+        config,
+        pr,
+        issue_number,
+        result,
+        transcript,
+        container,
+        log,
+        observed=observed,
+        identity=identity,
+        sink=sink,
+    )
 
 
 def _publish(
@@ -470,6 +596,8 @@ def _push_review_evidence(
     transcript: str,
     container: str,
     log,
+    observed: adapters.StreamStats | None = None,
+    identity: dict | None = None,
     sink: EventSink | None = None,
 ) -> None:
     record = {
@@ -482,7 +610,16 @@ def _push_review_evidence(
         "resume_commit": result.resume_commit,
         "evidence": result.evidence,
         "head": pr.head_sha,
-        "model": config.model,
+        # ADR-0045: image identity plus the reconciled stream-observed model;
+        # both empty of a config-time model on purpose — the driver no longer
+        # has one. model_note carries any disagreement between the stream's
+        # model signals instead of flattening it away.
+        "run_image": config.run_image,
+        "model": observed.model if observed else "",
+        "model_note": observed.model_note if observed else "",
+        # The harness's baked-identity verdict; None when no container ran
+        # (deterministic escalation) or the image bakes no identity.
+        "identity": identity,
         # Empty when no review container ran (deterministic escalation).
         "container": container,
     }
@@ -510,7 +647,9 @@ class Reviewer(Worker):
     loop sleeps out the poll interval after each (base default)."""
 
     role: ClassVar[str] = "reviewer"
-    default_model: ClassVar[str] = "claude-fable-5"  # the stronger model (ADR-0008)
+    # The ADR-0008 "stronger model for review" rule is now a deploy-time
+    # convention expressed in the worker-type definition's model field
+    # (ADR-0045); the driver ships no default.
     pass_label: ClassVar[str] = "review"
 
     def _startup_log(self) -> None:

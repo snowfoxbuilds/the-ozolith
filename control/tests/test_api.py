@@ -17,6 +17,7 @@ from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
 WORKER_TYPE_TOML = """\
 driver = "builtin:implementer"
 adapter = "claude"
+model = "claude-sonnet-5"
 workspace = "acme/sandbox"
 base = "ghcr.io/x/run:1.0@sha256:{digest}"
 setup = ["pip install uv"]

@@ -922,8 +922,9 @@ def test_wire_cadences_apply_unless_locally_overridden(rig: Rig):
 # -- effective-spec convergence: process Stacks (ADR-0044 amendment) --------------
 #
 # A worker-type change now resolves primarily into the process env (repository,
-# adapter, model, run-image tag) and the secret mapping, so a live driver must
-# restart when any of those change — and must NOT churn when nothing does.
+# adapter, run-image tag — the model rides inside the image tag, ADR-0045) and
+# the secret mapping, so a live driver must restart when any of those change —
+# and must NOT churn when nothing does.
 
 
 def test_unchanged_process_spec_does_not_restart(rig: Rig):
@@ -947,18 +948,19 @@ def test_dictionary_order_only_change_does_not_restart(rig: Rig):
     assert len(rig.popen.spawned) == 1  # reordering is not a spec change
 
 
-def test_changed_model_restarts_the_driver(rig: Rig):
-    a = process_stack(
-        "worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-sonnet-5"}
-    )
+def test_changed_env_value_restarts_the_driver(rig: Rig):
+    """The daemon is name-agnostic: ANY effective env change restarts the
+    child. (A model change no longer arrives as env at all — ADR-0045 bakes
+    it into the run image, so it lands as the changed RUN_IMAGE tag below.)"""
+    a = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "SOME_TUNABLE": "one"})
     rig.control.heartbeat_answers.append(heartbeat_response([a]))
     rig.daemon.once()
     first = rig.popen.spawned[0]
-    b = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "THEOZOLITH_MODEL": "claude-opus-5"})
+    b = process_stack("worker", env={"THEOZOLITH_REPO": "a/x", "SOME_TUNABLE": "two"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 2
-    assert rig.popen.spawned[1].env["THEOZOLITH_MODEL"] == "claude-opus-5"
+    assert rig.popen.spawned[1].env["SOME_TUNABLE"] == "two"
     assert first.poll() is not None  # kill-the-tree took the old child down
 
 
@@ -1045,10 +1047,10 @@ def test_changed_secret_mapping_restarts_and_exposes_the_new_file(rig: Rig):
 
 
 def test_stopped_stack_with_a_config_change_stays_stopped(rig: Rig):
-    a = process_stack("worker", state="stopped", env={"THEOZOLITH_MODEL": "a"})
+    a = process_stack("worker", state="stopped", env={"SOME_TUNABLE": "a"})
     rig.control.heartbeat_answers.append(heartbeat_response([a]))
     rig.daemon.once()
-    b = process_stack("worker", state="stopped", env={"THEOZOLITH_MODEL": "b"})
+    b = process_stack("worker", state="stopped", env={"SOME_TUNABLE": "b"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert not rig.daemon._supervisor.alive("worker")
@@ -1266,11 +1268,11 @@ def _plant_run(rig: Rig, jobs: Path, run_id: str, owner: str = "worker") -> None
 
 def test_desired_model_change_during_a_run_is_deferred(rig: Rig, tmp_path):
     jobs = tmp_path / "jobs"
-    first = _launch_driver(rig, jobs, THEOZOLITH_MODEL="claude-sonnet-5")
+    first = _launch_driver(rig, jobs, SOME_TUNABLE="claude-sonnet-5")
     _plant_run(rig, jobs, "r1")
 
     b = process_stack(
-        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_MODEL": "claude-opus-5"}
+        "worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "SOME_TUNABLE": "claude-opus-5"}
     )
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
@@ -1350,10 +1352,10 @@ def test_desired_secret_mapping_change_during_a_run_is_deferred(rig: Rig, tmp_pa
 
 def test_deferred_desired_change_restarts_exactly_once_after_the_run(rig: Rig, tmp_path):
     jobs = tmp_path / "jobs"
-    first = _launch_driver(rig, jobs, THEOZOLITH_MODEL="m1")
+    first = _launch_driver(rig, jobs, SOME_TUNABLE="m1")
     _plant_run(rig, jobs, "r1")
 
-    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "THEOZOLITH_MODEL": "m2"})
+    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(jobs), "SOME_TUNABLE": "m2"})
     for _ in range(2):  # two deferred passes while the Run is in flight
         rig.control.heartbeat_answers.append(heartbeat_response([b]))
         rig.daemon.once()
@@ -1363,7 +1365,7 @@ def test_deferred_desired_change_restarts_exactly_once_after_the_run(rig: Rig, t
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 2 and first.poll() is not None
-    assert rig.popen.spawned[1].env["THEOZOLITH_MODEL"] == "m2"
+    assert rig.popen.spawned[1].env["SOME_TUNABLE"] == "m2"
 
     rig.control.heartbeat_answers.append(heartbeat_response([b]))  # and no second restart
     rig.daemon.once()
@@ -1376,13 +1378,11 @@ def test_jobs_dir_change_still_detects_a_run_under_the_old_path(rig: Rig, tmp_pa
     would wrongly restart mid-Run."""
     old_jobs = tmp_path / "old-jobs"
     new_jobs = tmp_path / "new-jobs"
-    first = _launch_driver(rig, old_jobs, THEOZOLITH_MODEL="m1")
+    first = _launch_driver(rig, old_jobs, SOME_TUNABLE="m1")
     _plant_run(rig, old_jobs, "r1")  # Run under the OLD path
     new_jobs.mkdir(parents=True)  # the NEW desired path is empty
 
-    b = process_stack(
-        "worker", env={"THEOZOLITH_JOBS_DIR": str(new_jobs), "THEOZOLITH_MODEL": "m2"}
-    )
+    b = process_stack("worker", env={"THEOZOLITH_JOBS_DIR": str(new_jobs), "SOME_TUNABLE": "m2"})
     rig.control.heartbeat_answers.append(heartbeat_response([b]))
     rig.daemon.once()
     assert len(rig.popen.spawned) == 1 and first.poll() is None  # deferred on the old path

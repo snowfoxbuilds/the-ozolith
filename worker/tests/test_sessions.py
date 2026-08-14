@@ -79,7 +79,6 @@ def make_run_job(tmp_path: Path) -> tuple[Path, jobdir.Manifest, ContainerSpec]:
         run_id="r1",
         mode=jobdir.MODE_RUN,
         adapter="claude",
-        model="m",
         agent_timeout_seconds=20.0,
     )
     jobdir.write_manifest(job, manifest)

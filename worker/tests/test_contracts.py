@@ -5,8 +5,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from theozolith_worker import decisions, jobdir, verdict
-from theozolith_worker.adapters import ClaudeAdapter
+from theozolith_worker.adapters import (
+    MODEL_ALIAS,
+    MODEL_PINNED,
+    MODEL_UNMAPPABLE,
+    AgentAdapterError,
+    ClaudeAdapter,
+    materialize_instruction,
+)
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
 from theozolith_worker.harness.validate import main as validate_main
@@ -248,7 +256,6 @@ def test_claude_adapter_headless_command():
         run_id="r1",
         mode=jobdir.MODE_RUN,
         adapter="claude",
-        model="claude-sonnet-5",
     )
     pointer = "Work on the task specified in /job/input/prompt.md. Read that file first."
     argv = adapter.command(manifest, pointer)
@@ -257,7 +264,9 @@ def test_claude_adapter_headless_command():
     # transcript. --verbose is load-bearing: the claude CLI requires it for
     # -p with --output-format stream-json.
     assert argv[argv.index("-p") + 1] == pointer
-    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+    # No --model (ADR-0045): the CLI reads the image's baked managed settings;
+    # nothing on the argv can select a model.
+    assert "--model" not in argv
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in argv
@@ -333,6 +342,375 @@ def test_claude_adapter_stream_stats_survives_killed_sessions(tmp_path):
     assert adapter.stream_stats(stream).tokens == 130
     # An empty or missing stream reports no usage, never a crash.
     assert adapter.stream_stats(tmp_path / "absent.txt").tokens is None
+
+
+def test_claude_adapter_model_classification():
+    adapter = ClaudeAdapter()
+    # Shape-based (ADR-0045): full claude-* IDs pass through pinned — the CLI
+    # itself does no allowlisting, so a closed list here would need a product
+    # release per model launch. The unmappable class is the cross-adapter
+    # mistake the build must catch.
+    for pinned in ("claude-sonnet-5", "claude-fable-5", "claude-3-5-sonnet-20241022"):
+        assert adapter.classify_model(pinned) == MODEL_PINNED
+    # Exactly the model-family aliases the managed model default accepts
+    # (each expands to the newest model of one family — verified live).
+    for alias in ("sonnet", "opus", "haiku", "fable"):
+        assert adapter.classify_model(alias) == MODEL_ALIAS
+    for bad in ("gpt-5", "", "claude", "claude-", "Claude-Sonnet-5", "claude sonnet"):
+        assert adapter.classify_model(bad) == MODEL_UNMAPPABLE
+    # The CLI accepts these as selections, but neither names the single model
+    # ADR-0045 bakes: "default" floats with the account tier and a session
+    # pinned to it FAILS under an allowlist; "opusplan" is a two-model mode
+    # that silently degrades to plain Sonnet under enforcement (both verified
+    # live). Unenforceable = unmappable = the build fails.
+    for unenforceable in ("default", "opusplan"):
+        assert adapter.classify_model(unenforceable) == MODEL_UNMAPPABLE
+
+
+def test_claude_adapter_efforts_are_the_settings_persistable_set():
+    adapter = ClaudeAdapter()
+    assert adapter.mappable_efforts() == frozenset({"low", "medium", "high", "xhigh"})
+    # max is session-only in the claude CLI — declaring it would bake a value
+    # the settings layer cannot hold, so a build asking for it must fail.
+    assert "max" not in adapter.mappable_efforts()
+
+
+def test_claude_adapter_materialize_managed_scope(tmp_path):
+    adapter = ClaudeAdapter()
+    written = adapter.materialize("claude-sonnet-5", "high", root=tmp_path, scope="managed")
+    assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
+    assert (tmp_path / "etc/theozolith/effort").read_text() == "high\n"
+    settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
+    # The selection contract (ADR-0045, best-effort doctrine): a managed
+    # "model" session DEFAULT for the main agent — the managed tier outranks
+    # checkout/user settings for the same key, and the harness passes no
+    # --model — plus the managed env's CLAUDE_CODE_EFFORT_LEVEL (which
+    # overrides /effort, --effort, the process environment, and any
+    # settings-file effortLevel). Deliberately NO availableModels allowlist:
+    # enforcement is main-agent-only — subagents, skills routed through
+    # subagents, and background helpers stay free to run other models.
+    assert settings == {
+        "model": "claude-sonnet-5",
+        "effortLevel": "high",
+        "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
+    }
+    assert set(written) == {
+        tmp_path / "etc/theozolith/model",
+        tmp_path / "etc/theozolith/effort",
+        tmp_path / "etc/claude-code/managed-settings.json",
+    }
+
+
+def test_claude_adapter_materialize_merges_unrelated_operator_settings(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"permissions": {"deny": ["WebSearch"]}, "env": {"OTHER": "kept"}}')
+
+    adapter.materialize("claude-fable-5", "low", root=tmp_path, scope="managed")
+    settings = json.loads(target.read_text())
+    # Deep merge: unrelated keys an operator setup step pre-wrote survive —
+    # including foreign entries inside "env" — beside the identity keys.
+    assert settings["permissions"] == {"deny": ["WebSearch"]}
+    assert settings["env"] == {"OTHER": "kept", "CLAUDE_CODE_EFFORT_LEVEL": "low"}
+    assert settings["model"] == "claude-fable-5"
+    assert settings["effortLevel"] == "low"
+    # And nothing beyond the selection keys: no allowlist, no freshness key
+    # (main-agent-only enforcement, best-effort doctrine).
+    assert "availableModels" not in settings
+    assert "enforceAvailableModels" not in settings
+    assert "forceRemoteSettingsRefresh" not in settings
+
+
+def test_claude_adapter_materialize_rejects_conflicting_operator_identity(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    before = (
+        '{"permissions": {"deny": ["WebSearch"]},'
+        ' "availableModels": ["claude-old-1"], "enforceAvailableModels": false}'
+    )
+    target.write_text(before)
+    # Fail-closed doctrine (ADR-0045 amendment): a pre-existing identity key
+    # is a conflicting operator policy — the build fails naming the file and
+    # key, and nothing is silently deleted or overwritten.
+    with pytest.raises(AgentAdapterError, match="availableModels"):
+        adapter.materialize("claude-fable-5", "low", root=tmp_path, scope="managed")
+    assert target.read_text() == before  # never clobbered
+    assert not (tmp_path / "etc/theozolith").exists()  # nothing half-baked
+
+
+def test_claude_adapter_materialize_rejects_operator_effort_when_none_is_baked(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"effortLevel": "high"}')
+    # effort "" means "the model's own default" (WorkerTypeDef.effort). A
+    # pre-existing managed effortLevel would silently convert that empty
+    # value into an enforced non-default effort — rejected, not inherited.
+    with pytest.raises(AgentAdapterError, match="effortLevel"):
+        adapter.materialize("claude-fable-5", "", root=tmp_path, scope="managed")
+    assert json.loads(target.read_text()) == {"effortLevel": "high"}
+
+
+def test_claude_adapter_materialize_refuses_non_object_managed_settings(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("[]")
+    with pytest.raises(AgentAdapterError):
+        adapter.materialize("claude-sonnet-5", "", root=tmp_path, scope="managed")
+
+
+def test_claude_adapter_materialize_refuses_malformed_managed_settings(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"permissions": ')  # truncated by a broken setup step
+    with pytest.raises(AgentAdapterError, match="not valid JSON"):
+        adapter.materialize("claude-sonnet-5", "", root=tmp_path, scope="managed")
+    assert target.read_text() == '{"permissions": '  # never clobbered
+
+
+def test_claude_adapter_materialize_refuses_non_object_env(tmp_path):
+    adapter = ClaudeAdapter()
+    target = tmp_path / "etc/claude-code/managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"env": ["NOT", "AN", "OBJECT"]}')
+    with pytest.raises(AgentAdapterError, match="'env' is list, not an object"):
+        adapter.materialize("claude-sonnet-5", "high", root=tmp_path, scope="managed")
+
+
+def test_claude_adapter_materialize_interactive_rejects_effort(tmp_path):
+    adapter = ClaudeAdapter()
+    # Driverless effort fails closed end to end: config load rejects it,
+    # materialize_instruction refuses to render it, and the adapter refuses
+    # to write it even if invoked by hand.
+    with pytest.raises(AgentAdapterError, match="interactive scope"):
+        adapter.materialize("claude-opus-5", "high", root=tmp_path, scope="interactive")
+    assert not (tmp_path / "etc").exists()
+
+
+def test_claude_adapter_materialize_interactive_scope_never_touches_claude_config(tmp_path):
+    adapter = ClaudeAdapter()
+    written = adapter.materialize("claude-opus-5", "", root=tmp_path, scope="interactive")
+    # Interactive (Flight Deck) images bake ONLY the well-known files: anything
+    # under /home/ozolith/.claude would be shadowed by the claude-state volume
+    # on first mount (ADR-0043), and managed settings would lock the model
+    # against in-session /model switching (ADR-0045 §Flight Deck).
+    assert written == [tmp_path / "etc/theozolith/model"]
+    assert (tmp_path / "etc/theozolith/model").read_text() == "claude-opus-5\n"
+    assert not (tmp_path / "etc/claude-code").exists()
+    assert not (tmp_path / "home").exists()
+
+
+def test_materialize_instruction_golden():
+    # GOLDEN (ADR-0045): the rendered instruction enters the instruction hash,
+    # so this format is identity-bearing — editing it re-tags and rebuilds
+    # every model-bearing derived image in a fleet. Change it only on purpose.
+    assert (
+        materialize_instruction("claude", "claude-sonnet-5", "", "managed")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-sonnet-5 --scope managed"
+    )
+    assert (
+        materialize_instruction("claude", "claude-fable-5", "high", "managed")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-fable-5 --effort high --scope managed"
+    )
+    assert (
+        materialize_instruction("claude", "claude-opus-5", "", "interactive")
+        == "theozolith-adapter materialize --adapter claude"
+        " --model claude-opus-5 --scope interactive"
+    )
+    with pytest.raises(AgentAdapterError):
+        materialize_instruction("claude", "claude-sonnet-5", "", "global")
+    with pytest.raises(AgentAdapterError):
+        materialize_instruction("claude", "", "", "managed")
+    # Driverless effort is rejected at config load; refuse to even render an
+    # instruction the in-image CLI would refuse to run.
+    with pytest.raises(AgentAdapterError):
+        materialize_instruction("claude", "claude-opus-5", "high", "interactive")
+
+
+def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch):
+    """The managed config only means anything on a CLI whose behavior the
+    identity machinery was verified against — an older CLI could silently
+    void an observation channel, and a fake selection is worse than a
+    failed build (ADR-0045)."""
+    adapter = ClaudeAdapter()
+
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.240 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.240 (Claude Code)"
+
+    # The floor is 2.1.232 exactly: the managed-over-project model-default
+    # precedence, the per-key managed env merge (2.1.223), the Stop-hook
+    # applied-effort payload, the ConfigChange hook, and the dry-run probe's
+    # isolation flags were all verified live there.
+    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 232)
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.232 (Claude Code)"
+
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
+    with pytest.raises(AgentAdapterError, match="predates the identity behavior"):
+        adapter.verify_enforceable()
+
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.174 (Claude Code)")
+    with pytest.raises(AgentAdapterError, match="predates the identity behavior"):
+        adapter.verify_enforceable()
+
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "not a version")
+    with pytest.raises(AgentAdapterError, match="cannot parse a version"):
+        adapter.verify_enforceable()
+
+
+def test_claude_adapter_verify_enforceable_fails_without_the_cli():
+    # A base image without the Claude CLI beside the adapter cannot enforce
+    # anything — the build must fail, not bake a config nothing reads.
+    adapter = ClaudeAdapter(binary="/nonexistent/claude")
+    with pytest.raises(AgentAdapterError, match="must ship the Claude Code CLI"):
+        adapter.verify_enforceable()
+
+
+def _stream(tmp_path, *events) -> Path:
+    path = tmp_path / "transcript.txt"
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    return path
+
+
+def _init_event(model):
+    return {"type": "system", "subtype": "init", "model": model}
+
+
+def _turn(model):
+    return {"type": "assistant", "message": {"model": model, "content": []}}
+
+
+def _result(*models):
+    return {"type": "result", "modelUsage": {model: {"inputTokens": 1} for model in models}}
+
+
+def test_claude_adapter_observed_model_all_signals_agree(tmp_path):
+    adapter = ClaudeAdapter()
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            # Background helper models bill into modelUsage on every real
+            # session (verified live) — corroboration must not read the
+            # helper as a second executed model.
+            _result("claude-sonnet-5", "claude-haiku-4-5-20251001"),
+        )
+    )
+    assert stats.model == "claude-sonnet-5"
+    assert stats.model_note == ""
+
+
+def test_claude_adapter_observed_model_synthetic_turns_are_not_executions(tmp_path):
+    adapter = ClaudeAdapter()
+    # The CLI stamps synthetic error notices with model "<synthetic>" — the
+    # old last-one-wins scan would have recorded that literal as the
+    # session's model whenever the last event was an error notice.
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            _turn("<synthetic>"),
+        )
+    )
+    assert stats.model == "claude-sonnet-5"
+    assert stats.model_note == ""
+
+
+def test_claude_adapter_observed_model_no_assistant_turns(tmp_path):
+    adapter = ClaudeAdapter()
+    # A session killed before its first turn: the init announcement is the
+    # only signal — reported, but flagged as unconfirmed by any execution.
+    stats = adapter.stream_stats(_stream(tmp_path, _init_event("claude-sonnet-5")))
+    assert stats.model == "claude-sonnet-5"
+    assert "no assistant turns" in stats.model_note
+
+    # Usage records alone attribute no turn — naming a model as "the" model
+    # from billing alone would be guessing, so the note names them instead.
+    stats = adapter.stream_stats(
+        _stream(tmp_path, _result("claude-haiku-4-5-20251001", "claude-sonnet-5"))
+    )
+    assert stats.model == ""
+    assert "usage records name" in stats.model_note
+    assert "claude-haiku-4-5-20251001, claude-sonnet-5" in stats.model_note
+
+    empty = adapter.stream_stats(_stream(tmp_path))
+    assert empty.model == ""
+    assert empty.model_note == "the stream carried no model signal"
+    assert adapter.stream_stats(tmp_path / "absent.txt").model_note == ""
+
+
+def test_claude_adapter_observed_model_remap_is_surfaced(tmp_path):
+    adapter = ClaudeAdapter()
+    # The session announced one model and executed another (provider-side
+    # remap or fallback): telemetry reports what ran and says so.
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-4-5-20250929"),
+            _result("claude-sonnet-4-5-20250929"),
+        )
+    )
+    assert stats.model == "claude-sonnet-4-5-20250929"
+    assert "initialized as claude-sonnet-5" in stats.model_note
+    assert "executed claude-sonnet-4-5-20250929" in stats.model_note
+
+
+def test_claude_adapter_observed_model_multiple_models_are_surfaced(tmp_path):
+    adapter = ClaudeAdapter()
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            _turn("claude-opus-5"),
+        )
+    )
+    # The model the session ended on, never presented as the whole story.
+    assert stats.model == "claude-opus-5"
+    assert "multiple models executed turns: claude-sonnet-5, claude-opus-5" in stats.model_note
+
+
+def test_claude_adapter_observed_model_drift_and_recovery_ends_where_it_ended(tmp_path):
+    adapter = ClaudeAdapter()
+    # sonnet -> opus -> sonnet: the headline observed model is the turn the
+    # session actually ENDED on, not the most-recently-first-seen one.
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            _turn("claude-opus-5"),
+            _turn("claude-sonnet-5"),
+        )
+    )
+    assert stats.model == "claude-sonnet-5"
+    assert "multiple models executed turns: claude-sonnet-5, claude-opus-5" in stats.model_note
+
+
+def test_claude_adapter_observed_model_conflicting_signals_are_surfaced(tmp_path):
+    adapter = ClaudeAdapter()
+    # Turns and usage records disagree outright — a malformed or tampered
+    # stream. Never silently trust either half.
+    stats = adapter.stream_stats(
+        _stream(
+            tmp_path,
+            _init_event("claude-sonnet-5"),
+            _turn("claude-sonnet-5"),
+            _result("claude-haiku-4-5-20251001"),
+        )
+    )
+    assert stats.model == "claude-sonnet-5"
+    assert "usage records" in stats.model_note
+    assert "do not include any executed model" in stats.model_note
 
 
 def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
@@ -436,7 +814,6 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
             run_id=f"review-r{round_number}",
             mode=jobdir.MODE_REVIEW,
             adapter="claude",
-            model="m",
             workdir=jobdir.WORK_DIR,
             round=round_number,
             round_budget=budget,
@@ -570,7 +947,6 @@ def _driver_config():
             "ANTHROPIC_API_KEY": "key",
         },
         role="implementer",
-        default_model="claude-sonnet-5",
     )
 
 

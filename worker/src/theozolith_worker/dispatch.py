@@ -29,10 +29,15 @@ BACKOFF_CAP_SECONDS = 300.0
 
 
 def backoff_delay(base: float, streak: int, cap: float = BACKOFF_CAP_SECONDS) -> float:
-    """The poll delay after ``streak`` consecutive unreachable passes."""
+    """The poll delay after ``streak`` consecutive unreachable passes.
+
+    The exponent is clamped: the cap dominates long before 2**32 for any
+    plausible base, and an unbounded streak (a driver latched or unreachable
+    for days) must never overflow the int-to-float conversion and crash the
+    loop it paces."""
     if streak <= 1:
         return base
-    return min(cap, base * 2 ** (streak - 1))
+    return min(cap, base * 2 ** min(streak - 1, 32))
 
 
 class WorkDispatch(Protocol):

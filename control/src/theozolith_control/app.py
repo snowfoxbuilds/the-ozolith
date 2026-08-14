@@ -150,13 +150,23 @@ def create_app(
     dispatcher = Dispatcher(store, github_client) if github_client is not None else None
     app.state.github_client = github_client
 
+    # Lint warnings are printed once per distinct config commit, not on every
+    # heartbeat — the journal stays readable and a repo edit re-surfaces them.
+    warned_commit = ""
+
     def _config() -> DeployConfig:
+        nonlocal warned_commit
         try:
-            return load()
+            config = load()
         except ConfigRepoError as exc:
             # A broken Config Repo must not take heartbeats down with it:
             # nodes keep their cached desired state (ADR-0006 degraded mode).
             raise HTTPException(status_code=500, detail=f"config repo error: {exc}") from exc
+        if config.warnings and config.commit != warned_commit:
+            for warning in config.warnings:
+                print(f"config warning: {warning}", flush=True)
+            warned_commit = config.commit
+        return config
 
     def _secrets_channel_guard() -> None:
         if not settings.secrets_channel_ok:

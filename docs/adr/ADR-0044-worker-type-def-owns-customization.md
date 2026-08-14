@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0045 (2026-08-10): model and reasoning effort are typed, identity-bearing fields on the definition — the instruction hash covers the materialized model/effort config, so changing them DOES re-tag and rebuild the derived image (this ADR's "per-type variables never trigger a rebuild" clause now applies only to driver/workspace/secrets).
 Date: 2026-08-09
 
 # ADR-0044: Worker-type definition owns the customization tuple
