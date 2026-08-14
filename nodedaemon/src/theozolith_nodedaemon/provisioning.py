@@ -23,7 +23,10 @@ Flow, failing closed and loud at every step:
    string after a CA rotation (re-inits are not attacks — the error says
    which to suspect). The PEM that goes forward is re-encoded from the
    verified DER, so the trust store can never hold a byte the fingerprint
-   did not cover;
+   did not cover. A nonempty control URL from the same unauthenticated
+   listener must parse as exactly https with a hostname — anything else
+   aborts HERE, before the exchange, so a hostile bootstrap value can
+   never consume the join token or register a node;
 4. exchange the join token for this node's own non-expiring bearer token
    over TLS verified against the fetched-and-verified CA (the server cert
    carries the Control Node's IP in its SAN, so dialing by IP verifies);
@@ -59,6 +62,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,9 +93,18 @@ BUNDLE = (
     " first block while trusting the rest would let an appended CA into the"
     " trust store. Nothing was transmitted to the control channel."
 )
+INSECURE_BOOTSTRAP = (
+    "the bootstrap listener served a non-HTTPS or malformed control URL —"
+    " refusing before the join exchange: nothing was transmitted to the"
+    " control channel, the join token was not consumed, and nothing was"
+    " persisted"
+)
 INSECURE_URL = (
-    "refusing to persist a non-HTTPS control URL — the daemon attaches this"
-    " node's bearer token to every request on it; nothing was persisted"
+    "refusing to persist the non-HTTPS control URL the exchange answered —"
+    " the daemon attaches this node's bearer token to every request on it."
+    " Nothing was persisted on this node, but the exchange itself already ran:"
+    " the join token is consumed and the node may be registered — mint a fresh"
+    " join string to retry"
 )
 
 # What provisioning persists under the state dir; the daemon's config reads
@@ -250,6 +263,21 @@ def der_to_pem(der: bytes) -> bytes:
     return f"-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n".encode("ascii")
 
 
+def _https_parts(url: str) -> tuple[str, int] | None:
+    """(hostname, effective port) of an exactly-parsed https URL — None for
+    anything else (non-https scheme, missing hostname, garbled port). Exact
+    parsing, never a prefix check: a scheme like 'httpsneak' must not pass
+    for https."""
+    split = urllib.parse.urlsplit(url)
+    try:
+        port = split.port
+    except ValueError:
+        return None
+    if split.scheme != "https" or not split.hostname:
+        return None
+    return split.hostname, port or 443
+
+
 def provision(
     join: str,
     *,
@@ -277,15 +305,18 @@ def provision(
     ca_pem = der_to_pem(ca_der)
     control_url = http_get(f"{bootstrap}/control-url").decode("utf-8", errors="replace").strip()
     exchange_port = 443
-    if control_url.startswith("https://"):
-        hostpart = control_url[len("https://") :].split("/")[0]
-        if ":" in hostpart:
-            try:
-                exchange_port = int(hostpart.rsplit(":", 1)[1])
-            except ValueError as exc:
-                raise ProvisionError(
-                    f"bad control URL from the bootstrap listener: {exc}"
-                ) from None
+    if control_url:
+        # The same unauthenticated listener an attacker would own: a nonempty
+        # value must parse as exactly https with a hostname BEFORE the
+        # exchange runs — the join token is single-use and the exchange
+        # mutates Control Node state, so a hostile value has to die while
+        # both are still intact. (Empty stays allowed: a dev Control Node
+        # with no public origin; the exchange answer or its fallback fills
+        # the canonical URL below.)
+        parts = _https_parts(control_url)
+        if parts is None:
+            raise ProvisionError(f"{INSECURE_BOOTSTRAP} (got {control_url!r})")
+        exchange_port = parts[1]
 
     # The exchange dials the join-string host (DNS for the canonical name
     # may not exist yet); the server cert's IP SAN makes verification pass.
@@ -311,10 +342,11 @@ def provision(
         # A dev Control Node with no public origin: heartbeat where the
         # exchange happened.
         canonical = f"https://{payload.host}:{exchange_port}"
-    if not canonical.startswith("https://"):
-        # The exchange answer rides verified TLS, but the fallback above it
-        # is the unauthenticated bootstrap value — neither may ever park
-        # the bearer token on a plaintext channel.
+    if _https_parts(canonical) is None:
+        # The exchange answer rides verified TLS, but a garbled or hostile
+        # server answer must still fail closed before the URL the daemon
+        # dials with its bearer token is persisted (the unauthenticated
+        # bootstrap value was already gated before the exchange).
         raise ProvisionError(f"{INSECURE_URL} (got {canonical!r})")
 
     _persist(

@@ -2,8 +2,9 @@
 
 The happy path runs the REAL flow over real sockets: a genuine TLS Control
 Node (uvicorn), the plaintext bootstrap listener, and `provision` with its
-default stdlib fetchers. The MITM case asserts ZERO bytes reach the control
-channel with an instrumented listener. The parser is pinned byte-for-byte
+default stdlib fetchers. The MITM cases assert ZERO bytes reach the control
+channel with an instrumented listener — the same trap the ControlClient
+redirect-policy rigs point a TLS 3xx at. The parser is pinned byte-for-byte
 to control's composer by round-trip (no shared import crosses the
 component boundary).
 """
@@ -11,8 +12,10 @@ component boundary).
 from __future__ import annotations
 
 import ast
+import http.server
 import json
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -29,7 +32,7 @@ from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
 from theozolith_nodedaemon import provisioning
 from theozolith_nodedaemon.config import load_daemon_config
-from theozolith_nodedaemon.controlclient import ControlClient
+from theozolith_nodedaemon.controlclient import ControlClient, ControlError
 from theozolith_nodedaemon.provisioning import ProvisionError, parse_join_string
 
 FINGERPRINT = "ab" * 32
@@ -172,6 +175,7 @@ class TrapListener:
         self.port = self._sock.getsockname()[1]
         self.connections = 0
         self.bytes_received = 0
+        self.data = bytearray()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -187,6 +191,7 @@ class TrapListener:
             try:
                 while data := conn.recv(4096):
                     self.bytes_received += len(data)
+                    self.data += data
             except (TimeoutError, OSError):
                 pass
             finally:
@@ -385,18 +390,16 @@ def test_pem_canonicalization_keeps_only_the_verified_certificate(tmp_path):
 
 
 def test_non_https_control_url_is_never_persisted(tmp_path):
-    """The canonical URL the daemon dials with its bearer token must be
-    https: a hostile plaintext bootstrap value falling through the
-    exchange-answer fallback (or a garbled answer) can never park the
-    token on an unencrypted channel."""
+    """A hostile (or merely malformed) bootstrap /control-url dies BEFORE
+    the join exchange: the exchange callable failing the test pins that
+    nothing — the single-use join token included — went to the control
+    channel, and no local state exists. Exact parsing, not a prefix check:
+    a scheme merely beginning with https is refused too."""
     ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
     pem = ca_path.read_bytes()
 
-    def fake_get(url):
-        return pem if url.endswith("/ca.pem") else b"http://198.51.100.9:6966\n"
-
-    def fake_post(url, body, ca):
-        return 200, json.dumps({"node_token": "tok-value", "control_url": ""}).encode()
+    def fail_post(url, body, ca):
+        raise AssertionError("the join exchange must never run after a bad bootstrap URL")
 
     join = joinstring.compose(
         addr="127.0.0.1:6965",
@@ -405,7 +408,51 @@ def test_non_https_control_url_is_never_persisted(tmp_path):
         expires_at=int(time.time()) + 3600,
     )
     state = tmp_path / "state"
-    with pytest.raises(ProvisionError, match="non-HTTPS control URL"):
+    for hostile in (
+        b"http://198.51.100.9:6966\n",  # the plaintext downgrade
+        b"httpsneak://198.51.100.9\n",  # prefix trick: startswith('https')
+        b"https://\n",  # no usable hostname
+        b"https://198.51.100.9:no-port\n",  # unparsable port
+    ):
+
+        def fake_get(url, answer=hostile):
+            return pem if url.endswith("/ca.pem") else answer
+
+        with pytest.raises(ProvisionError, match="before the join exchange"):
+            provisioning.provision(
+                join,
+                state_dir=state,
+                node_name="victim",
+                enable_systemd=False,
+                http_get=fake_get,
+                https_post=fail_post,
+            )
+        assert not state.exists()
+
+
+def test_non_https_exchange_answer_is_never_persisted(tmp_path):
+    """Malformed server output still fails closed AFTER the exchange: an
+    answer whose control URL is not exactly https is refused before
+    anything is persisted locally — and the error owns up that the
+    exchange itself already ran (the join token is spent)."""
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    pem = ca_path.read_bytes()
+
+    def fake_get(url):
+        return pem if url.endswith("/ca.pem") else b""
+
+    def fake_post(url, body, ca):
+        answer = {"node_token": "tok-value", "control_url": "http://198.51.100.9:6966"}
+        return 200, json.dumps(answer).encode()
+
+    join = joinstring.compose(
+        addr="127.0.0.1:6965",
+        ca_sha256=tls.ca_fingerprint_sha256(pem),
+        token=b"t" * 16,
+        expires_at=int(time.time()) + 3600,
+    )
+    state = tmp_path / "state"
+    with pytest.raises(ProvisionError, match="the exchange answered"):
         provisioning.provision(
             join,
             state_dir=state,
@@ -426,6 +473,173 @@ def test_expired_token_rejects_after_tls_with_nothing_persisted(tmp_path):
             provisioning.provision(join, state_dir=state, node_name="late", enable_systemd=False)
         assert not state.exists()
         assert live.secret_store.provisioned_nodes() == []
+
+
+def test_hostile_bootstrap_url_cannot_consume_the_join_token(tmp_path):
+    """The early rejection costs nothing: after a hostile bootstrap served a
+    plaintext control URL (behind the GENUINE CA, so the fingerprint pin
+    alone would not catch it), the SAME join string still provisions
+    through the genuine bootstrap — the single-use token was never consumed
+    and the failed attempt registered no node."""
+    state = tmp_path / "state"
+    with LiveControl(tmp_path) as live:
+        join = live.join_string()  # single-use
+        payload = parse_join_string(join)
+        hostile = BootstrapServer(
+            ca_pem=live.ca_path.read_bytes(),  # the genuine CA: the pin passes
+            origin="",
+            control_url=f"http://127.0.0.1:{live.https_port}",  # the downgrade
+            port=0,
+            host="127.0.0.1",
+        )
+        hostile.start()
+        try:
+            hostile_join = joinstring.compose(
+                addr=f"127.0.0.1:{hostile.port}",
+                ca_sha256=payload.ca_sha256,
+                token=payload.token,
+                expires_at=payload.expires_at,
+            )
+            with pytest.raises(ProvisionError, match="before the join exchange"):
+                provisioning.provision(
+                    hostile_join, state_dir=state, node_name="victim", enable_systemd=False
+                )
+        finally:
+            hostile.stop()
+        assert not state.exists()
+        assert live.secret_store.provisioned_nodes() == []  # nothing created remotely
+
+        provisioning.provision(join, state_dir=state, node_name="survivor", enable_systemd=False)
+        token = (state / "node-token").read_text().strip()
+        assert live.secret_store.node_for_token(token) == "survivor"
+
+
+# -- the bearer token's redirect policy (ControlClient, live sockets) ------------
+
+
+class _Quiet(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def _drain(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _answer(self, status: int, headers: dict[str, str], body: bytes = b"") -> None:
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+def _redirector(location: str) -> type[_Quiet]:
+    """Every request answered with a 302 to `location` — the cheapest shape
+    a redirect attacker (or a misconfigured reverse proxy) can take."""
+
+    class Handler(_Quiet):
+        def do_GET(self):
+            self._drain()
+            self._answer(302, {"Location": location})
+
+        do_POST = do_GET
+
+    return Handler
+
+
+def _tls_server(tmp_path: Path, handler: type[_Quiet]):
+    """`handler` on a real TLS socket under the repository's test CA."""
+    ca_path, cert, key = tls.provision(tmp_path / "redirect-tls", ["127.0.0.1"])
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, ca_path
+
+
+def _stop_server(server, thread) -> None:
+    server.shutdown()
+    thread.join(2)
+    server.server_close()
+
+
+def test_authenticated_redirect_to_plaintext_target_gets_zero_bytes(tmp_path):
+    """An HTTPS control endpoint answering 3xx toward a plaintext target:
+    the transport refuses the hop BEFORE issuing the redirected request —
+    on the bearer-authenticated POST and both authenticated GETs alike, the
+    trap sees zero connections, zero bytes, and therefore zero
+    Authorization headers."""
+    trap = TrapListener()
+    server, thread, ca_path = _tls_server(
+        tmp_path, _redirector(f"http://127.0.0.1:{trap.port}/loot")
+    )
+    client = ControlClient(
+        f"https://127.0.0.1:{server.server_address[1]}", "bearer-secret", ca=str(ca_path)
+    )
+    try:
+        with pytest.raises(ControlError, match="refusing redirect"):
+            client.emit_event({"kind": "probe"})  # POST
+        with pytest.raises(ControlError, match="refusing redirect"):
+            client.fetch_artifact("1.2.3", "wheel.whl")  # authenticated GET
+        with pytest.raises(ControlError, match="refusing redirect"):
+            client.fetch_config_artifact("c" * 64)  # the other authenticated GET
+        time.sleep(0.2)  # anything in flight would land by now
+        assert trap.connections == 0
+        assert trap.bytes_received == 0
+        assert b"Authorization" not in trap.data
+    finally:
+        _stop_server(server, thread)
+        trap.stop()
+
+
+def test_cross_origin_https_redirect_is_refused_before_dialing(tmp_path):
+    """Same scheme, different origin: refused BEFORE the redirected request
+    is issued. The target here does not even exist — a dial attempt would
+    surface as ControlUnreachable, never this ControlError."""
+    server, thread, ca_path = _tls_server(tmp_path, _redirector("https://127.0.0.1:1/elsewhere"))
+    client = ControlClient(
+        f"https://127.0.0.1:{server.server_address[1]}", "bearer-secret", ca=str(ca_path)
+    )
+    try:
+        with pytest.raises(ControlError, match="refusing redirect"):
+            client.heartbeat({"node": "box1", "stacks": []})
+    finally:
+        _stop_server(server, thread)
+
+
+def test_same_origin_https_redirect_still_works_and_loops_are_bounded(tmp_path):
+    """The policy refuses hops that LEAVE the origin, not redirects per se:
+    a same-origin HTTPS relocation is followed with method and body intact,
+    and a same-origin redirect loop dies on the hop budget instead of
+    spinning."""
+
+    class Handler(_Quiet):
+        def do_POST(self):
+            body = self._drain()
+            if self.path == "/api/v1/heartbeats":
+                self._answer(307, {"Location": "/api/v1/heartbeats-moved"})
+            elif self.path == "/api/v1/events":
+                self._answer(302, {"Location": "/api/v1/events"})  # loops forever
+            else:
+                answer = {"config": {"relocated": True}, "echo": json.loads(body)}
+                self._answer(200, {"Content-Type": "application/json"}, json.dumps(answer).encode())
+
+    server, thread, ca_path = _tls_server(tmp_path, Handler)
+    client = ControlClient(
+        f"https://127.0.0.1:{server.server_address[1]}", "bearer-secret", ca=str(ca_path)
+    )
+    try:
+        answer = client.heartbeat({"node": "box1"})
+        assert answer["config"] == {"relocated": True}
+        assert answer["echo"] == {"node": "box1"}  # the 307 re-sent the body
+        with pytest.raises(ControlError, match="too many redirects"):
+            client.emit_event({"kind": "probe"})
+    finally:
+        _stop_server(server, thread)
 
 
 # -- acceptance 14: the node distribution stays stdlib-only ----------------------

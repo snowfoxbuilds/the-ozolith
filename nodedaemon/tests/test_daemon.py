@@ -604,7 +604,8 @@ def test_denied_secret_pull_skips_the_stack(rig: Rig):
 def test_plain_http_control_url_refused_at_construction_without_dev_flag():
     """The bearer token rides every request, not just secret pulls: a
     plain-HTTP channel is refused before the first byte, unless the
-    operator explicitly opted into insecure dev mode."""
+    operator explicitly opted into insecure dev mode — and the check is an
+    exact parse, so a scheme merely BEGINNING with https never passes."""
     from theozolith_nodedaemon.controlclient import ControlClient, ControlError
 
     try:
@@ -613,7 +614,15 @@ def test_plain_http_control_url_refused_at_construction_without_dev_flag():
         assert "TLS is mandatory" in str(exc)
     else:
         raise AssertionError("a plain-HTTP control URL must be refused")
-    # The explicit dev opt-in still constructs (the test rigs depend on it).
+    # Exact scheme + usable hostname, never a prefix check; the dev flag
+    # excuses plain http, never a malformed URL.
+    for bad in ("httpsneak://control.test", "https://", "control.test", "https:worker"):
+        for dev in (False, True):
+            with pytest.raises(ControlError):
+                ControlClient(bad, "tok", insecure_dev=dev)
+    # Ordinary https constructs (no traffic happens at construction)…
+    ControlClient("https://control.test", "tok")
+    # …and the explicit dev opt-in still constructs (the test rigs depend on it).
     ControlClient("http://control.test", "tok", insecure_dev=True)
 
 
