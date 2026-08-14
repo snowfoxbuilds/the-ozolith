@@ -17,15 +17,19 @@ Flow, failing closed and loud at every step:
 2. fetch the CA certificate and canonical control URL from the plaintext
    bootstrap listener at ``addr`` (three public values; code never rides
    this channel);
-3. hash the CA against the pinned fingerprint — on mismatch, abort with
-   ZERO bytes transmitted to the control channel: possible MITM, or a stale
-   join string after a CA rotation (re-inits are not attacks — the error
-   says which to suspect);
+3. require exactly ONE certificate in the answer and hash it against the
+   pinned fingerprint — on a bundle or a mismatch, abort with ZERO bytes
+   transmitted to the control channel: possible MITM, or a stale join
+   string after a CA rotation (re-inits are not attacks — the error says
+   which to suspect). The PEM that goes forward is re-encoded from the
+   verified DER, so the trust store can never hold a byte the fingerprint
+   did not cover;
 4. exchange the join token for this node's own non-expiring bearer token
    over TLS verified against the fetched-and-verified CA (the server cert
    carries the Control Node's IP in its SAN, so dialing by IP verifies);
-5. persist CA, control URL, node name, and node token under the daemon
-   state dir; enable the systemd unit; the daemon's first heartbeat
+5. persist CA, control URL (https only — the daemon attaches its bearer
+   token to every request on it), node name, and node token under the
+   daemon state dir; enable the systemd unit; the daemon's first heartbeat
    completes enrollment (provisioning IS registration).
 
 The node channel is IP-only (ADR-0023 as amended 2026-07-28): the persisted
@@ -78,6 +82,16 @@ MISMATCH = (
 REJECTED = (
     "join token rejected (expired, consumed, or revoked) — nothing was persisted"
     " on this node; mint a fresh join string with 'theozolith join-token create'"
+)
+BUNDLE = (
+    "the bootstrap listener served more than one certificate where exactly one"
+    " CA belongs — refusing the bundle (possible MITM): fingerprinting only the"
+    " first block while trusting the rest would let an appended CA into the"
+    " trust store. Nothing was transmitted to the control channel."
+)
+INSECURE_URL = (
+    "refusing to persist a non-HTTPS control URL — the daemon attaches this"
+    " node's bearer token to every request on it; nothing was persisted"
 )
 
 # What provisioning persists under the state dir; the daemon's config reads
@@ -202,20 +216,38 @@ def _https_post_json(url: str, body: dict, ca_pem: bytes) -> tuple[int, bytes]:
 
 
 def pem_to_der(pem: bytes) -> bytes:
-    """The first CERTIFICATE block, base64-decoded — the DER bytes the
+    """The single CERTIFICATE block, base64-decoded — the DER bytes the
     fingerprint is computed over (matches control's cryptography-based
-    fingerprint; this side stays stdlib-only)."""
+    fingerprint; this side stays stdlib-only). Exactly one block, refused
+    BEFORE fingerprinting: everything in the answer becomes the exchange's
+    trust store, so a block the fingerprint does not cover must never
+    exist in the first place."""
     text = pem.decode("ascii", errors="replace")
     begin, end = "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----"
+    if text.count(begin) == 0 or text.count(end) == 0:
+        raise ProvisionError("the bootstrap listener answered no PEM certificate")
+    if text.count(begin) != 1 or text.count(end) != 1:
+        raise ProvisionError(BUNDLE)
     start = text.find(begin)
     stop = text.find(end)
-    if start < 0 or stop < 0:
+    if stop < start:
         raise ProvisionError("the bootstrap listener answered no PEM certificate")
     body = "".join(text[start + len(begin) : stop].split())
     try:
         return base64.b64decode(body, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ProvisionError(f"the served CA certificate does not decode: {exc}") from None
+
+
+def der_to_pem(der: bytes) -> bytes:
+    """One canonical PEM block re-encoded from the verified DER — what the
+    exchange trusts and provisioning persists. Rebuilding from the checked
+    bytes guarantees the trust store holds exactly the certificate the
+    fingerprint covered, nothing around it (64-char lines: byte-identical
+    to control's cryptography PEM output)."""
+    encoded = base64.b64encode(der).decode("ascii")
+    lines = "\n".join(encoded[i : i + 64] for i in range(0, len(encoded), 64))
+    return f"-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n".encode("ascii")
 
 
 def provision(
@@ -235,10 +267,14 @@ def provision(
     # Fetch, then VERIFY BEFORE ANY TRANSMISSION to the control channel:
     # nothing — not the token, not the node name, not a TCP SYN — goes to
     # the HTTPS endpoint until the fetched CA hashes to the pinned value.
-    ca_pem = http_get(f"{bootstrap}/ca.pem")
-    fingerprint = hashlib.sha256(pem_to_der(ca_pem)).hexdigest()
+    ca_der = pem_to_der(http_get(f"{bootstrap}/ca.pem"))
+    fingerprint = hashlib.sha256(ca_der).hexdigest()
     if fingerprint != payload.ca_sha256:
         raise ProvisionError(MISMATCH)
+    # Trust EXACTLY what was verified: the PEM the exchange dials with and
+    # provisioning persists is re-encoded from the checked DER, never the
+    # fetched bytes.
+    ca_pem = der_to_pem(ca_der)
     control_url = http_get(f"{bootstrap}/control-url").decode("utf-8", errors="replace").strip()
     exchange_port = 443
     if control_url.startswith("https://"):
@@ -275,11 +311,16 @@ def provision(
         # A dev Control Node with no public origin: heartbeat where the
         # exchange happened.
         canonical = f"https://{payload.host}:{exchange_port}"
+    if not canonical.startswith("https://"):
+        # The exchange answer rides verified TLS, but the fallback above it
+        # is the unauthenticated bootstrap value — neither may ever park
+        # the bearer token on a plaintext channel.
+        raise ProvisionError(f"{INSECURE_URL} (got {canonical!r})")
 
     _persist(
         state_dir,
         {
-            CA_FILE: ca_pem.decode("ascii", errors="replace"),
+            CA_FILE: ca_pem.decode("ascii"),
             CONTROL_URL_FILE: canonical,
             NODE_NAME_FILE: node_name,
             NODE_TOKEN_FILE: node_token,

@@ -4,8 +4,10 @@ HTTPS with bearer-token auth at a configured URL; TLS via a pinned CA bundle
 (self-signed or install-provisioned — NODE-SUBSTRATE.md). Unreachability is
 an expected state, not an error: ``heartbeat`` answers None and the caller
 falls back to cached desired state (ADR-0006). The one hard rule is the
-channel invariant's TLS clause: secret values never transit plain HTTP
-unless the operator explicitly opted into insecure dev mode.
+channel invariant's TLS clause: secret values — the per-node bearer token
+included, and it rides EVERY request — never transit plain HTTP unless the
+operator explicitly opted into insecure dev mode, so construction refuses a
+plain-HTTP URL outright rather than leaking the token once per heartbeat.
 """
 
 from __future__ import annotations
@@ -59,9 +61,14 @@ class ControlClient:
         insecure_dev: bool = False,
         transport: Transport | None = None,
     ):
+        if not url.startswith("https") and not insecure_dev:
+            raise ControlError(
+                "refusing a plain-HTTP control URL: the per-node bearer token rides"
+                " every request (TLS is mandatory; THEOZOLITH_INSECURE_DEV=1 for"
+                " local dev only)"
+            )
         self._url = url.rstrip("/")
         self._token = token
-        self._insecure_dev = insecure_dev
         self._transport = transport or _urllib_transport(ca)
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -128,14 +135,11 @@ class ControlClient:
         return payload
 
     def pull_secrets(self, node: str, names: list[str]) -> dict[str, str]:
-        """Node-scoped secret pull — values transit TLS only (ADR-0006)."""
+        """Node-scoped secret pull — values transit TLS only (ADR-0006; the
+        constructor already refused a plain-HTTP channel without the
+        explicit dev opt-in)."""
         if not names:
             return {}
-        if not self._url.startswith("https") and not self._insecure_dev:
-            raise ControlError(
-                "refusing to pull secrets over plain HTTP (TLS is mandatory;"
-                " THEOZOLITH_INSECURE_DEV=1 for local dev only)"
-            )
         answer = self._post("/api/v1/secrets/pull", {"node": node, "names": names})
         secrets = answer.get("secrets")
         if not isinstance(secrets, dict):

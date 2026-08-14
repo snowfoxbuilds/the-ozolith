@@ -601,16 +601,20 @@ def test_denied_secret_pull_skips_the_stack(rig: Rig):
     assert any("secrets unavailable" in line for line in rig.logs)
 
 
-def test_secret_pull_refused_over_plain_http_without_dev_flag(tmp_path):
+def test_plain_http_control_url_refused_at_construction_without_dev_flag():
+    """The bearer token rides every request, not just secret pulls: a
+    plain-HTTP channel is refused before the first byte, unless the
+    operator explicitly opted into insecure dev mode."""
     from theozolith_nodedaemon.controlclient import ControlClient, ControlError
 
-    client = ControlClient("http://control.test", "tok", insecure_dev=False)
     try:
-        client.pull_secrets("box1", ["github-implementer"])
+        ControlClient("http://control.test", "tok", insecure_dev=False)
     except ControlError as exc:
         assert "TLS is mandatory" in str(exc)
     else:
-        raise AssertionError("plain-HTTP secret pull must be refused")
+        raise AssertionError("a plain-HTTP control URL must be refused")
+    # The explicit dev opt-in still constructs (the test rigs depend on it).
+    ControlClient("http://control.test", "tok", insecure_dev=True)
 
 
 def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):

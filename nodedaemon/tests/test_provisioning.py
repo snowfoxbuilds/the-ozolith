@@ -11,6 +11,7 @@ component boundary).
 from __future__ import annotations
 
 import ast
+import json
 import socket
 import sys
 import threading
@@ -332,6 +333,88 @@ def test_fingerprint_mismatch_aborts_with_zero_bytes_to_the_target(tmp_path):
     finally:
         bootstrap.stop()
         trap.stop()
+
+
+def test_appended_ca_bundle_is_refused_before_fingerprinting(tmp_path):
+    """The pin covers ONE certificate: a MITM that appends its own CA after
+    the genuine one (fingerprint-matching first block, hostile trust anchor
+    riding behind it) is refused before fingerprinting — zero bytes
+    transmitted, nothing persisted."""
+    trap = TrapListener()
+    real_ca, _, _ = tls.provision(tmp_path / "real-tls", ["127.0.0.1"])
+    evil_ca, _, _ = tls.provision(tmp_path / "evil-tls", ["127.0.0.1"])
+    bootstrap = BootstrapServer(
+        ca_pem=real_ca.read_bytes() + evil_ca.read_bytes(),
+        origin="",
+        control_url=f"https://127.0.0.1:{trap.port}",
+        port=0,
+        host="127.0.0.1",
+    )
+    bootstrap.start()
+    join = joinstring.compose(
+        addr=f"127.0.0.1:{bootstrap.port}",
+        ca_sha256=tls.ca_fingerprint_sha256(real_ca.read_bytes()),  # the genuine pin
+        token=b"t" * 16,
+        expires_at=int(time.time()) + 3600,
+    )
+    state = tmp_path / "state"
+    try:
+        with pytest.raises(ProvisionError, match="refusing the bundle"):
+            provisioning.provision(join, state_dir=state, node_name="victim", enable_systemd=False)
+        time.sleep(0.2)  # anything in flight would land by now
+        assert trap.connections == 0
+        assert trap.bytes_received == 0
+        assert not state.exists()
+    finally:
+        bootstrap.stop()
+        trap.stop()
+
+
+def test_pem_canonicalization_keeps_only_the_verified_certificate(tmp_path):
+    """Bytes around the single block are tolerated but never trusted: the
+    round-trip re-encodes exactly the fingerprinted DER, byte-identical to
+    control's cryptography PEM output (the happy path pins the same via
+    its persisted-ca equality)."""
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    pem = ca_path.read_bytes()
+    der = provisioning.pem_to_der(b"# preamble\n" + pem + b"trailing noise\n")
+    assert provisioning.der_to_pem(der) == pem
+    # A second block — even a copy of the same certificate — is a bundle.
+    with pytest.raises(ProvisionError, match="refusing the bundle"):
+        provisioning.pem_to_der(pem + pem)
+
+
+def test_non_https_control_url_is_never_persisted(tmp_path):
+    """The canonical URL the daemon dials with its bearer token must be
+    https: a hostile plaintext bootstrap value falling through the
+    exchange-answer fallback (or a garbled answer) can never park the
+    token on an unencrypted channel."""
+    ca_path, _, _ = tls.provision(tmp_path / "tls", ["127.0.0.1"])
+    pem = ca_path.read_bytes()
+
+    def fake_get(url):
+        return pem if url.endswith("/ca.pem") else b"http://198.51.100.9:6966\n"
+
+    def fake_post(url, body, ca):
+        return 200, json.dumps({"node_token": "tok-value", "control_url": ""}).encode()
+
+    join = joinstring.compose(
+        addr="127.0.0.1:6965",
+        ca_sha256=tls.ca_fingerprint_sha256(pem),
+        token=b"t" * 16,
+        expires_at=int(time.time()) + 3600,
+    )
+    state = tmp_path / "state"
+    with pytest.raises(ProvisionError, match="non-HTTPS control URL"):
+        provisioning.provision(
+            join,
+            state_dir=state,
+            node_name="victim",
+            enable_systemd=False,
+            http_get=fake_get,
+            https_post=fake_post,
+        )
+    assert not state.exists()
 
 
 def test_expired_token_rejects_after_tls_with_nothing_persisted(tmp_path):
