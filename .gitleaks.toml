@@ -1,20 +1,29 @@
 # gitleaks configuration for TheOzolith.
 #
-# The repo is public: no credential may ever land in history. This config
-# inherits gitleaks' full built-in ruleset and only adds a narrow allowlist
-# for vendored, minified third-party assets whose high-entropy JavaScript
-# trips the generic-api-key rule (e.g. `t.TwoKeyMap=void` inside xterm.js).
-# Project-authored files are never allowlisted.
+# The repo is public. The secret-scan CI job is post-push DETECTION and a
+# merge gate — by the time a scan fails, the credential has already reached
+# GitHub (recovery: rotate first, then purge history; see ci.yml).
+#
+# This config inherits gitleaks' full built-in ruleset and adds exactly one
+# rule-scoped exemption: the generic-api-key rule's false positive on the
+# minifier artifact `t.TwoKeyMap=void` in the vendored xterm.js. The
+# exemption is exact on (rule, path, extracted secret) — no file is ever
+# globally exempt, every other rule (github-pat, private-key, ...) still
+# applies to xterm.js, and any other generic-api-key match inside xterm.js
+# still fails the scan. .github/scripts/test-gitleaks.sh proves all of this
+# on every CI run.
 
 title = "TheOzolith gitleaks config"
 
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Vendored, minified third-party web assets (no project secrets)"
-paths = [
-  '''control/src/theozolith_control/web/static/htmx\.min\.js''',
-  '''control/src/theozolith_control/web/static/xterm\.js''',
-  '''control/src/theozolith_control/web/static/xterm-addon-fit\.js''',
-]
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Exact xterm.js minifier false positive"
+  condition = "AND"
+  regexTarget = "secret"
+  regexes = ['''^t\.TwoKeyMap=void$''']
+  paths = ['''^control/src/theozolith_control/web/static/xterm\.js$''']

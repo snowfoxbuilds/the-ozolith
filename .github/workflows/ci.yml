@@ -1,8 +1,10 @@
 name: CI
 
+# push is deliberately unfiltered: the secret-scan job must run on every
+# branch and tag push (a credential on any ref is a leak), so no branch or
+# path filter may narrow it.
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -50,11 +52,20 @@ jobs:
       - run: sh -n spikes/issue-31-tailscale-uid1000/entrypoint.sh
       - run: spikes/issue-31-tailscale-uid1000/test-run-spike.sh
 
-  # Secret scanning (the repo is public): no credential may ever land in
-  # history. gitleaks scans the full history across all refs on every push/PR.
-  # The pinned binary is used directly (gitleaks-action requires a license for
-  # organization accounts) and checksum-verified in the repo's hash-pinning
-  # spirit; the narrow vendored-asset allowlist lives in .gitleaks.toml.
+  # Secret scanning (the repo is public). This is post-push DETECTION and a
+  # merge gate, not prevention: a credential a failed scan reports has
+  # already reached GitHub. Recovery for a real leak is rotate the
+  # credential immediately, THEN purge/rewrite history — rewriting alone is
+  # not remediation. gitleaks runs on every branch/tag push and pull request
+  # over every commit reachable from any ref (--all), including
+  # merge-commit patches (--diff-merges=first-parent covers merge-resolution
+  # content plain --all never diffs, without duplicating every parent's
+  # patch). The pinned binary is used directly (gitleaks-action requires a
+  # license for organization accounts) and checksum-verified in the repo's
+  # hash-pinning spirit. The single rule-scoped exemption (the xterm.js
+  # generic-api-key minifier false positive) lives in .gitleaks.toml;
+  # .github/scripts/test-gitleaks.sh re-proves detection, the exemption's
+  # exactness, and merge-commit coverage before the real scan runs.
   secret-scan:
     runs-on: ubuntu-latest
     env:
@@ -71,8 +82,10 @@ jobs:
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar -xzf gitleaks.tar.gz gitleaks
           sudo mv gitleaks /usr/local/bin/
-      - name: Scan full git history
-        run: gitleaks git . --log-opts="--all" --redact --no-banner
+      - name: Regression-test the scanner and exemption
+        run: .github/scripts/test-gitleaks.sh
+      - name: Scan history of all refs, merge diffs included
+        run: gitleaks git . --log-opts="--all --diff-merges=first-parent" --redact --no-banner
 
   # The laptop-only user path (ADR-0007): knowledge/ must install and run
   # with zero dependencies on cluster components.
