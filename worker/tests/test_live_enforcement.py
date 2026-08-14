@@ -1,30 +1,41 @@
 """Live proof that the baked model/effort BIND on a real Claude Code CLI
 (ADR-0045). Each test materializes managed settings through the adapter's own
-``materialize()`` — the same artifact a derived-image build writes — installs
-them at the CLI's managed path, runs a real ``claude -p`` session, and asserts
-the executed model/effort from the stream (the same signals ``stream_stats``
-reconciles). The fail-closed amendment adds live proof of the drop-in merge
-behavior the build gate rejects, the policyHelper preemption, the widen
-canary, the unavailable-model path, the silently-clamped effort pair, and the
-full gated harness (probe → release → task) against the real CLI.
+``materialize()`` — the same artifact a derived-image build writes (including
+``forceRemoteSettingsRefresh``, so every session here also proves the
+freshness key does not break startup) — installs them at the CLI's managed
+path, runs a real ``claude -p`` session, and asserts the executed
+model/effort from the stream (the same signals ``stream_stats`` reconciles).
+The fail-closed amendment adds live proof of the drop-in merge behavior the
+build gate rejects, the policyHelper preemption, the widen and same-family
+canaries, the unavailable-model path, the silently-clamped effort pair, the
+Stop-hook applied-effort payload the gate's effort proof rides on, the
+PreToolUse release-marker denial binding under skip-permissions, and the
+whole gated harness (withheld task → neutral preflight → gated session →
+release → task turn) driven through the REAL ``run_harness`` against the
+real CLI.
 
 Deliberately opt-in (``THEOZOLITH_LIVE_CLAUDE=1``): the suite spends real
-tokens (~25 one-line sessions, mostly Haiku; the alias sweep runs one tiny
-session per family including Opus and Fable) and must own the whole
-``/etc/claude-code`` policy tier (base file AND managed-settings.d drop-ins)
-for its duration. RUN IT ONLY IN AN ISOLATED LINUX CONTAINER: it installs and
-removes admin policy (written directly or via passwordless sudo; anything
-pre-existing is backed up and restored, but a developer workstation's real
-/etc policy is not the suite's to gamble with). Run it whenever the adapter's
-enforcement contract, ``MIN_ENFORCING_CLI``, or the base image's CLI version
-changes.
+tokens (~35 one-line sessions, mostly Haiku; the alias sweep runs one tiny
+session per family including Opus and Fable, and the preflight-based tests
+each run canaries plus a probe) and must own the whole ``/etc/claude-code``
+policy tier (base file AND managed-settings.d drop-ins) plus
+``/etc/theozolith`` for its duration. RUN IT ONLY IN AN ISOLATED LINUX
+CONTAINER: it installs and removes admin policy (written directly or via
+passwordless sudo; anything pre-existing is backed up and restored, but a
+developer workstation's real /etc policy is not the suite's to gamble with).
+Run it whenever the adapter's enforcement contract, ``MIN_ENFORCING_CLI``,
+or the base image's CLI version changes.
 
-One case cannot run here: an ORGANIZATION effort cap is server-side Enterprise
-policy that no local fixture can create — it stays a protected/manual test
-(see test_org_effort_cap_is_a_preflight_failure) and is exercised in units by
-simulating the clamp observation.
+Two cases cannot run here: an ORGANIZATION effort cap is server-side
+Enterprise policy that no local fixture can create — it stays a
+protected/manual test (see test_org_effort_cap_is_a_preflight_failure) and
+is exercised in units by simulating the clamp observation — and
+``forceRemoteSettingsRefresh``'s refusal-on-fetch-failure cannot be isolated
+locally (blackholing the settings endpoint also kills the model endpoint,
+which fails closed anyway: no turn executes, nothing releases — verified by
+hand on 2.1.232).
 
-Verified against Claude Code 2.1.231.
+Verified against Claude Code 2.1.232.
 """
 
 from __future__ import annotations
@@ -159,6 +170,30 @@ def managed_policy(managed_settings):
             _remove_path(path)
     for name, content in dropin_backup.items():
         _install_file(DROPIN_DIR / name, content)
+
+
+WELL_KNOWN_DIR = Path("/etc/theozolith")
+
+
+@pytest.fixture
+def baked_identity_files():
+    """Install the well-known ``/etc/theozolith`` identity files for one
+    test — ``run_harness`` reads the baked identity from the root filesystem
+    — restoring whatever the machine had there."""
+    backup: dict[str, str] | None = None
+    if WELL_KNOWN_DIR.is_dir():
+        backup = {p.name: p.read_text() for p in sorted(WELL_KNOWN_DIR.iterdir()) if p.is_file()}
+
+    def install(model: str, effort: str = "") -> None:
+        _install_file(WELL_KNOWN_DIR / "model", model + "\n")
+        if effort:
+            _install_file(WELL_KNOWN_DIR / "effort", effort + "\n")
+
+    yield install
+    _remove_path(WELL_KNOWN_DIR)
+    if backup is not None:
+        for name, content in backup.items():
+            _install_file(WELL_KNOWN_DIR / name, content)
 
 
 @pytest.fixture
@@ -517,48 +552,198 @@ def test_skill_frontmatter_cannot_escape_the_pin(managed_settings, workspace):
     assert INTRUDER not in usage
 
 
-def test_gated_session_releases_only_into_a_verified_session(managed_policy, workspace, tmp_path):
-    """The harness's gated launch against the real CLI: stdin-driven session,
-    the no-op probe first, the guard verifying init + an executed turn (+ the
-    hook-captured effort), and only then the real prompt — all on the wire
-    shapes the real Claude Code speaks."""
-    import time
+def test_same_family_sibling_cannot_escape_a_full_id_pin(managed_settings, workspace):
+    """Allowlist enforcement must reject even the pin's own family: a
+    same-family sibling request is substituted back to the pinned default at
+    startup — the live behavior behind the preflight's same-family canary."""
+    managed_settings(PIN)
+    rc, init_model, turns, _, _ = _run(workspace, PROMPT, "--model=claude-3-5-haiku-20241022")
+    assert rc == 0
+    assert init_model == PIN
+    assert turns == [PIN]
 
-    from theozolith_worker.harness.main import await_guarded, launch_agent
+
+def _stop_capture_settings(capture: Path) -> str:
+    return json.dumps(
+        {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": f"cat > {capture}"}]}]}}
+    )
+
+
+def test_stop_hook_reports_the_applied_effort_without_any_tool(managed_settings, workspace):
+    """The gate's effort proof: the Stop hook fires after a plain no-tool
+    turn and its payload carries the APPLIED effort — so the neutral probe
+    never needs to execute a tool to observe an organization clamp."""
+    capture = workspace / "stop.json"
+    managed_settings(EFFORT_PIN, "low")
+    rc, _, turns, _, _ = _run(
+        workspace,
+        PROMPT,
+        "--tools",
+        "",
+        "--settings",
+        _stop_capture_settings(capture),
+    )
+    assert rc == 0
+    assert turns == [EFFORT_PIN]
+    payload = json.loads(capture.read_text())
+    assert payload["effort"]["level"] == "low"
+
+
+def test_stop_hook_reports_the_clamped_effort(managed_policy, workspace):
+    """The Stop payload shows the POST-clamp value (xhigh silently runs as
+    high on the 4.6 generation): the observation the effort-clamped category
+    is built on, with no tool execution anywhere."""
+    capture = workspace / "stop.json"
+    managed_policy.base_raw(
+        {
+            "model": "claude-sonnet-4-6",
+            "availableModels": ["claude-sonnet-4-6"],
+            "enforceAvailableModels": True,
+            "forceRemoteSettingsRefresh": True,
+            "effortLevel": "xhigh",
+            "env": {"CLAUDE_CODE_EFFORT_LEVEL": "xhigh"},
+        }
+    )
+    rc, _, _, _, _ = _run(
+        workspace, PROMPT, "--tools", "", "--settings", _stop_capture_settings(capture)
+    )
+    assert rc == 0
+    payload = json.loads(capture.read_text())
+    assert payload["effort"]["level"] == "high"  # the silent clamp, observed pre-task
+
+
+def test_pretooluse_gate_denies_tools_until_the_release_marker(
+    managed_settings, workspace, tmp_path
+):
+    """The task session's tool gate, live: the --settings PreToolUse hook
+    denies EVERY tool call while the release marker is absent — even under
+    --dangerously-skip-permissions — and opens once the marker exists."""
+    from theozolith_worker.identity import TaskGate
     from theozolith_worker.jobdir import Manifest
 
-    managed_policy.base(EFFORT_PIN, "low")
-    identity = BakedIdentity(EFFORT_PIN, "low")
-    adapter = ClaudeAdapter()
-    capture = tmp_path / "effort-capture.json"
-    guard = adapter.session_guard(identity, capture)
-    manifest = Manifest(run_id="live-gate", mode="run", adapter="claude", agent_timeout_seconds=180)
-    transcript = tmp_path / "transcript.txt"
-    transcript.touch()
-    task_file = tmp_path / "task.md"
-    task_file.write_text("Reply with exactly: DONE\n")
+    managed_settings(PIN)
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    gate = TaskGate(
+        release_marker=gate_dir / "released",
+        effort_capture=None,
+        config_capture=gate_dir / "config-change.jsonl",
+        config_hook_script=gate_dir / "configchange_hook.py",
+    )
+    from theozolith_worker.identity import CONFIG_CHANGE_HOOK_SOURCE
 
-    process = launch_agent(
-        adapter.guarded_command(manifest, capture), workspace, {}, transcript, True
+    gate.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE)
+    argv = ClaudeAdapter().guarded_command(Manifest(run_id="x", mode="run", adapter="claude"), gate)
+    settings_json = argv[argv.index("--settings") + 1]
+    witness = workspace / "gate-check.txt"
+    prompt = (
+        "Setup check: use the Bash tool to run the exact command"
+        f" 'touch {witness}', then reply with exactly: OK"
     )
-    process.send(guard.probe_input())
-    outcome, violation, released = await_guarded(
-        process,
-        manifest,
-        guard,
-        transcript,
-        f"Read the file {task_file} and follow it exactly.",
-        clock=time.monotonic,
-        sleep=time.sleep,
+
+    proc = subprocess.run(
+        [
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+            "--settings",
+            settings_json,
+        ],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        stdin=subprocess.DEVNULL,
     )
-    assert violation == "", violation
-    assert released and outcome.completed
-    assert guard.observed_model == EFFORT_PIN
-    assert guard.observed_effort == "low"
-    # Every executed turn in the transcript — probe and task alike — ran on
-    # the pin, and the task turn actually happened after the release.
+    assert proc.returncode == 0
+    # The attempt was made AND denied (the hook's message reaches the
+    # stream), so the file's absence is the gate holding — not the model
+    # declining to try.
+    assert "theozolith: tools are denied" in proc.stdout
+    assert not witness.exists()
+
+    gate.release_marker.write_text("released\n")
+    rc, _, _, _, _ = _run(
+        workspace, prompt, "--dangerously-skip-permissions", "--settings", settings_json
+    )
+    assert rc == 0
+    assert witness.exists()  # released: the same session shape can work
+
+
+def _gated_job(tmp_path, task_text: str, hook_marker: Path):
+    """A real job directory whose checkout is booby-trapped with a project
+    SessionStart hook that records if/when it ever runs."""
+    from theozolith_worker import jobdir
+
+    job = jobdir.create_job_dir(tmp_path / "jobs", "live-gate")
+    work = job / jobdir.WORK_DIR
+    (work / ".claude").mkdir(parents=True)
+    (work / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": f"touch {hook_marker}"}]}
+                    ]
+                }
+            }
+        )
+    )
+    manifest = jobdir.Manifest(
+        run_id="live-gate",
+        mode=jobdir.MODE_REVIEW,  # review mode: no gate-job serving needed
+        adapter="claude",
+        workdir=jobdir.WORK_DIR,
+        agent_timeout_seconds=300,
+    )
+    jobdir.write_manifest(job, manifest)
+    (job / jobdir.PROMPT_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (job / jobdir.PROMPT_FILE).write_text(task_text)
+    return job
+
+
+def test_gated_harness_end_to_end_releases_only_after_proof(
+    managed_policy, baked_identity_files, tmp_path
+):
+    """THE live integration: the real ``run_harness`` against the real CLI —
+    task withheld from disk, neutral preflight (canaries + probe with the
+    Run's own credential), gated stdin session with denied tools, release
+    only after the session's own announced and executed identity match, and
+    a real post-release task turn required for completion."""
+    from theozolith_worker import jobdir
+    from theozolith_worker.harness.main import run_harness
+
+    managed_policy.base(EFFORT_PIN, "low")
+    baked_identity_files(EFFORT_PIN, "low")
+    hook_marker = tmp_path / "project-hook-ran"
+    task = "Reply with exactly: DONE. Do not modify any files.\n"
+    job = _gated_job(tmp_path, task, hook_marker)
+
+    code = run_harness(
+        job,
+        identity_root=Path("/"),
+        scratch_root=tmp_path / "scratch",
+    )
+
+    assert code == 0
+    ident = jobdir.read_identity(job)
+    assert ident["preflight"] == "passed"
+    assert ident["released"] is True and ident["violation"] == ""
+    assert ident["observed_model"] == EFFORT_PIN
+    assert ident["observed_effort"] == "low"
+    assert ident["probe_model"] == EFFORT_PIN and ident["probe_effort"] == "low"
+    assert ident["probe_turns"] >= 1 and ident["task_turns"] >= 1
+    # The task input survived the withhold/release round trip.
+    assert (job / jobdir.PROMPT_FILE).read_text() == task
+    # Every executed turn — probe and task alike — ran on the pin, and the
+    # task actually happened.
+    transcript = (job / jobdir.TRANSCRIPT_FILE).read_text()
     turns = []
-    for line in transcript.read_text().splitlines():
+    for line in transcript.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -568,7 +753,45 @@ def test_gated_session_releases_only_into_a_verified_session(managed_policy, wor
             if model and model != "<synthetic>":
                 turns.append(model)
     assert turns and set(turns) == {EFFORT_PIN}
-    assert "DONE" in transcript.read_text()
+    assert "DONE" in transcript
+    # The checkout's project hooks belong to the TASK session (post-gate):
+    # fine that they ran — the failed-preflight twin below proves they can
+    # never run before the gate.
+    assert hook_marker.exists()
+
+
+def test_gated_harness_failed_preflight_never_launches_the_task_session(managed_policy, tmp_path):
+    """The boundary, live: the harness reads a CLEAN fake image root while
+    the EFFECTIVE managed tier carries a widening drop-in — the same
+    observable shape as a server-managed override. Only the canary can catch
+    it, the preflight fails policy-widened, and the task session — project
+    hooks, CLAUDE.md, tools, everything — never exists. The task file
+    returns for evidence, untouched and unread."""
+    from theozolith_worker import jobdir
+    from theozolith_worker.harness.main import run_harness
+
+    managed_policy.base(PIN)
+    managed_policy.dropin("50-widen.json", {"availableModels": [INTRUDER]})
+    fake_root = _fake_image_root(tmp_path, PIN)
+    hook_marker = tmp_path / "project-hook-ran"
+    task = "SECRET-TASK: reply with exactly: DONE.\n"
+    job = _gated_job(tmp_path, task, hook_marker)
+
+    code = run_harness(
+        job,
+        identity_root=fake_root,
+        scratch_root=tmp_path / "scratch",
+    )
+
+    assert code == 1
+    ident = jobdir.read_identity(job)
+    assert ident["preflight"] == "failed:policy-widened"
+    assert ident["released"] is False
+    assert not hook_marker.exists()  # the task session never existed
+    assert (job / jobdir.TRANSCRIPT_FILE).read_text() == ""  # no gated session output
+    assert (job / jobdir.PROMPT_FILE).read_text() == task  # evidence restore
+    status = jobdir.read_status(job)
+    assert status.error.startswith("identity: ") and "policy-widened" in status.error
 
 
 @pytest.mark.skipif(
@@ -579,15 +802,47 @@ def test_gated_session_releases_only_into_a_verified_session(managed_policy, wor
     " the pinned model's effort below xhigh; the unit suite covers the clamp"
     " observation itself (test_identity.py guard tests).",
 )
-def test_org_effort_cap_is_a_preflight_failure(managed_policy, workspace):
+def test_org_effort_cap_is_a_preflight_failure(managed_policy, workspace, tmp_path):
     """Against a capped org, an effort baked above the cap is applied at the
-    cap (silently in stream-json) — the hook capture observes it and the
-    gate must fail rather than accept the downgrade."""
-    capture = _effort_probe(workspace, {})
+    cap (silently in stream-json) — the Stop-hook capture observes it and
+    the gate must KILL with the exact effort-clamped category, never merely
+    decline to release, and never accept the downgrade."""
+    from theozolith_worker.identity import (
+        CATEGORY_EFFORT_CLAMPED,
+        GUARD_KILL,
+        TaskGate,
+        run_preflight,
+    )
+
+    capture = workspace / "stop.json"
     managed_policy.base(EFFORT_PIN, "xhigh")
-    rc, _, _, _, _ = _run(workspace, EFFORT_PROMPT, "--dangerously-skip-permissions")
+    rc, _, _, _, _ = _run(
+        workspace, PROMPT, "--tools", "", "--settings", _stop_capture_settings(capture)
+    )
     assert rc == 0
-    applied = _captured_effort(capture)
+    applied = json.loads(capture.read_text())["effort"]["level"]
     assert applied != "xhigh", "this organization does not cap effort; the fixture is wrong"
-    guard = ClaudeAdapter().session_guard(BakedIdentity(EFFORT_PIN, "xhigh"), capture)
-    assert guard.decision().action != "release"
+    # The preflight's probe observes the clamp with the Run's own credential.
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    report = run_preflight(
+        BakedIdentity(EFFORT_PIN, "xhigh"),
+        binary="claude",
+        root=Path("/"),
+        scratch=scratch,
+        min_cli=ClaudeAdapter.MIN_ENFORCING_CLI,
+        timeout=TIMEOUT,
+    )
+    assert not report.ok
+    assert report.category == CATEGORY_EFFORT_CLAMPED
+    # And the in-session guard reaches the same verdict from the capture.
+    gate = TaskGate(
+        release_marker=tmp_path / "released",
+        effort_capture=capture,
+        config_capture=tmp_path / "config-change.jsonl",
+        config_hook_script=tmp_path / "configchange_hook.py",
+    )
+    guard = ClaudeAdapter().session_guard(BakedIdentity(EFFORT_PIN, "xhigh"), gate)
+    decision = guard.decision()
+    assert decision.action == GUARD_KILL
+    assert decision.category == CATEGORY_EFFORT_CLAMPED

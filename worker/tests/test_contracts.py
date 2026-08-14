@@ -381,16 +381,19 @@ def test_claude_adapter_materialize_managed_scope(tmp_path):
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-sonnet-5\n"
     assert (tmp_path / "etc/theozolith/effort").read_text() == "high\n"
     settings = json.loads((tmp_path / "etc/claude-code/managed-settings.json").read_text())
-    # The enforcement contract (verified live on Claude Code 2.1.231):
+    # The enforcement contract (verified live on Claude Code 2.1.232):
     # "model" alone is only the session default — the identity is held by the
     # single-entry allowlist (constraining --model, /model, ANTHROPIC_MODEL,
     # settings files, and subagent frontmatter) and by the managed env's
     # CLAUDE_CODE_EFFORT_LEVEL (which overrides /effort, --effort, the
     # process environment, and any settings-file effortLevel).
+    # forceRemoteSettingsRefresh makes every session start on freshly fetched
+    # server-managed policy — a stale cache must not count as proof.
     assert settings == {
         "model": "claude-sonnet-5",
         "availableModels": ["claude-sonnet-5"],
         "enforceAvailableModels": True,
+        "forceRemoteSettingsRefresh": True,
         "effortLevel": "high",
         "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
     }
@@ -416,6 +419,7 @@ def test_claude_adapter_materialize_merges_unrelated_operator_settings(tmp_path)
     assert settings["model"] == "claude-fable-5"
     assert settings["availableModels"] == ["claude-fable-5"]
     assert settings["enforceAvailableModels"] is True
+    assert settings["forceRemoteSettingsRefresh"] is True
     assert settings["effortLevel"] == "low"
 
 
@@ -537,19 +541,23 @@ def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch)
     a fake pin is worse than a failed build (ADR-0045)."""
     adapter = ClaudeAdapter()
 
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.240 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.240 (Claude Code)"
+
+    # The floor is 2.1.232 exactly: the enforcement settings are older
+    # (allowlist 2.1.175, alias substitution 2.1.222, per-key managed env
+    # merge 2.1.223), but the fail-closed gate additionally relies on the
+    # Stop-hook applied-effort payload, the ConfigChange hook, the
+    # --setting-sources/--tools isolation flags, dontAsk, the PreToolUse
+    # deny hook binding under skip-permissions, and the managed
+    # forceRemoteSettingsRefresh key — the whole set verified live on
+    # 2.1.232. On an older CLI an ignored freshness key would silently void
+    # a guarantee; the floor turns that into the clear cli-too-old failure.
+    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 232)
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.232 (Claude Code)"
+
     monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
-    assert adapter.verify_enforceable() == "2.1.231 (Claude Code)"
-
-    # The floor is 2.1.223 exactly: the newest behavior the adapter relies on
-    # is the per-key managed ``env`` merge (2.1.223) — before it, a
-    # server-managed org env block displaces the whole baked env, silently
-    # dropping the CLAUDE_CODE_EFFORT_LEVEL pin. 2.1.222 (alias substitution)
-    # and 2.1.175 (allowlist enforcement) are older and equally required.
-    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 223)
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.223 (Claude Code)")
-    assert adapter.verify_enforceable() == "2.1.223 (Claude Code)"
-
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.222 (Claude Code)")
     with pytest.raises(AgentAdapterError, match="predates the model-enforcement settings"):
         adapter.verify_enforceable()
 

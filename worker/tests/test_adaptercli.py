@@ -7,6 +7,7 @@ non-zero exit here IS the "build fails on an unmappable value" clause.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def enforcing_cli(monkeypatch):
     """Stub the in-image CLI version probe: unit tests run where no claude
     binary exists; the real probe is exercised by its own contract tests and
     by the live-enforcement suite."""
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
 
 
 def test_console_script_registered():
@@ -54,6 +55,7 @@ def test_materialize_managed_writes_native_config(tmp_path, capsys):
         "model": "claude-sonnet-5",
         "availableModels": ["claude-sonnet-5"],
         "enforceAvailableModels": True,
+        "forceRemoteSettingsRefresh": True,
         "effortLevel": "high",
         "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"},
     }
@@ -61,8 +63,9 @@ def test_materialize_managed_writes_native_config(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "materialized" in out
     # The build log records which CLI version the enforcement was verified
-    # against — the value the preflight probed, not an assumption.
-    assert "agent CLI: 2.1.231" in out
+    # against — the value the preflight probed, not an assumption (the
+    # version itself floats with the installed CLI, so match the shape).
+    assert re.search(r"agent CLI: \d+\.\d+\.\d+", out)
 
 
 def test_materialize_managed_fails_on_a_pre_enforcement_cli(tmp_path, capsys, monkeypatch):
