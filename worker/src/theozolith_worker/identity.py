@@ -18,19 +18,27 @@ ENFORCEMENT. This module is the machinery that makes the enforcement
   the harness): server-managed organization settings outrank the baked file
   inside the managed tier and Claude Code exposes no machine-readable dump of
   the effective post-merge policy, so the effective identity is proven
-  *behaviorally*, with the Run's own credential: static re-checks of the
-  image policy, a canary invocation proving an intruder ``--model`` still
-  coerces to the pin (the allowlist binds), and a gated task session whose
-  first turn is a no-op probe — the REAL task prompt is withheld until the
-  session's init announcement and an executed probe turn (and, when effort is
-  baked, the hook-captured applied effort) match the baked identity. After
-  release the guard keeps watching: an identity-affecting change mid-session
-  (a turn on another model, a drifted effort) kills the agent and invalidates
-  the Run.
+  *behaviorally*, with the Run's own credential — and the proof runs inside a
+  real pre-verification boundary. Every verification session (the widen and
+  same-family canaries and the identity probe) executes in a NEUTRAL scratch
+  directory outside the job mount, with all built-in tools removed
+  (``--tools ""``), permission prompts auto-denied, no user/project/local
+  settings (``--setting-sources ""``; the managed tier always applies), and
+  no non-managed MCP servers — an unverified model cannot read the task,
+  touch the checkout, load project CLAUDE.md/hooks/skills, or execute any
+  tool. The applied effort is observed through the ``Stop`` hook payload
+  (fires after a plain no-tool turn and reports the post-clamp value —
+  verified live), so no tool ever runs for the effort proof. The real task
+  prompt is withheld — the task file is not even present on disk — until the
+  full preflight passes AND the gated task session's own announced and
+  executed identity match; after release the guard keeps watching and an
+  identity-affecting change (a turn on another model, a drifted applied
+  effort, a ``ConfigChange`` hook firing on an identity-shaped settings
+  change) kills the agent and invalidates the Run.
 
 Anything unverifiable fails closed. Organization policy is never disabled,
-replaced, or weakened to make a Run pass — a conflict is a failed build or a
-failed preflight, with the source category named.
+replaced, weakened, or blocked to make a Run pass — a conflict is a failed
+build or a failed preflight, with the source category named.
 
 Everything here is deliberately value-redacting: errors and reports name
 files, keys, models, efforts, and categories — never credential values,
@@ -40,8 +48,11 @@ tokens, or the contents of unrelated operator settings.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,22 +75,45 @@ MANAGED_DROPIN_DIR = "etc/claude-code/managed-settings.d"
 # identity. policyHelper/policyHelpers preempt the entire managed tier (their
 # output becomes the only managed configuration), so they are never
 # tolerable beside a baked identity. fallbackModel moves a session off the
-# pin under provider pressure. The rest select or constrain model/effort.
+# pin under provider pressure. modelOverrides remaps what actually SERVES a
+# model ID (provider inference profiles/deployments) while the allowlist
+# still sees the Anthropic ID — an identity change invisible to the model
+# name. The rest select or constrain model/effort.
 IDENTITY_SETTING_KEYS = (
     "availableModels",
     "effortLevel",
     "enforceAvailableModels",
     "fallbackModel",
     "model",
+    "modelOverrides",
     "policyHelper",
     "policyHelpers",
 )
 
-# Managed ``env`` entries that select a model or an effort.
+# The managed key that guarantees fresh server-managed policy at startup:
+# Claude Code documents it as "block startup until remote settings are
+# freshly fetched; exit on fetch failure". materialize() writes it as
+# literally true; any other value anywhere in the managed tier defeats the
+# guarantee and is a conflict. (Live-verifiable half: startup works with the
+# key and a dead settings endpoint also kills the model endpoint, so no turn
+# ever executes — the refusal-on-fetch-failure half is documented behavior.)
+FRESHNESS_KEY = "forceRemoteSettingsRefresh"
+
+# Managed ``env`` entries (and forbidden process-environment variables) that
+# select a model or an effort, or that repoint the CLI at a different
+# provider/endpoint — behind a foreign base URL or provider switch, the
+# stream's model names are whatever the endpoint claims, so the identity is
+# unprovable and the only safe answer is to fail closed.
 IDENTITY_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
     "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_VERTEX_BASE_URL",
     "CLAUDE_CODE_EFFORT_LEVEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
 )
 
 
@@ -107,6 +141,11 @@ CATEGORY_WIDENED = "policy-widened"
 CATEGORY_EFFORT_CLAMPED = "effort-clamped"
 CATEGORY_UNVERIFIABLE = "unverifiable"
 CATEGORY_TIMEOUT = "preflight-timeout"
+# Post-gate categories (the release protocol and the released session).
+CATEGORY_CONFIG_CHANGED = "config-changed"
+CATEGORY_TASK_DELIVERY = "task-delivery"
+CATEGORY_STDIN_CLOSE = "stdin-close"
+CATEGORY_TASK_UNPROCESSED = "task-unprocessed"
 
 
 @dataclass(frozen=True)
@@ -253,11 +292,14 @@ def managed_policy_documents(root: Path) -> list[tuple[Path, dict]]:
 
 def _expected_base_values(expected: BakedIdentity) -> dict[str, object]:
     """Exactly what materialize() wrote for ``expected`` — the one tolerable
-    shape of identity keys in the base managed file."""
+    shape of identity keys in the base managed file. The freshness key is
+    part of the artifact: an image without it cannot guarantee the canaries,
+    the probe, and the task all start on freshly fetched server policy."""
     values: dict[str, object] = {
         "model": expected.model,
         "availableModels": [expected.model],
         "enforceAvailableModels": True,
+        FRESHNESS_KEY: True,
     }
     if expected.effort:
         values["effortLevel"] = expected.effort
@@ -271,8 +313,12 @@ def scan_managed_conflicts(root: Path, expected: BakedIdentity | None = None) ->
     ``expected=None`` is the build gate: ANY identity key anywhere is a
     conflict. With an expected identity (the runtime re-check) the base file
     may carry exactly the values ``materialize`` wrote for it — anything
-    else, and any identity key in a drop-in, is still a conflict. Raises
-    IdentityError on a malformed document (unknowable policy)."""
+    else, and any identity key in a drop-in, is still a conflict. The
+    freshness key is special-cased in both modes: literally ``true`` is the
+    one tolerable value anywhere (it is what materialize writes and what an
+    operator setting it themselves means); anything else defeats
+    fresh-policy startup. Raises IdentityError on a malformed document
+    (unknowable policy)."""
     conflicts: list[str] = []
     base = root / MANAGED_SETTINGS_FILE
     for path, document in managed_policy_documents(root):
@@ -291,6 +337,12 @@ def scan_managed_conflicts(root: Path, expected: BakedIdentity | None = None) ->
             if own and key in tolerable and document[key] == tolerable[key]:
                 continue
             conflicts.append(f"{path}: '{key}' can change or widen the baked model/effort identity")
+        if FRESHNESS_KEY in document and document[FRESHNESS_KEY] is not True:
+            conflicts.append(
+                f"{path}: '{FRESHNESS_KEY}' is not literally true — fresh"
+                " server-managed policy at session startup is no longer"
+                " guaranteed"
+            )
         env = document.get("env")
         if env is not None and not isinstance(env, dict):
             conflicts.append(
@@ -310,9 +362,27 @@ def scan_managed_conflicts(root: Path, expected: BakedIdentity | None = None) ->
                 ):
                     continue
                 conflicts.append(
-                    f"{path}: env '{name}' selects a model or effort over the baked identity"
+                    f"{path}: env '{name}' selects a model, effort, or provider"
+                    " endpoint over the baked identity"
                 )
     return conflicts
+
+
+def scan_process_environment(environ: Mapping[str, str]) -> list[str]:
+    """Identity-affecting variables in the RUN CONTAINER's own process
+    environment, as conflict strings naming the variable (never the value).
+
+    The credential contract (ADR-0045) delivers only the API/OAuth secret —
+    a model, effort, or provider-endpoint variable reaching the harness
+    environment means some layer outside the image is steering the session,
+    and everything the canaries and probe observe would be relative to that
+    steering. Fail closed, name the variable."""
+    return [
+        f"process environment variable '{name}' selects a model, effort, or"
+        " provider endpoint — the baked identity cannot be proven under it"
+        for name in sorted(environ)
+        if _is_identity_env_key(name)
+    ]
 
 
 # -- the baked identity, as an image (or run container) declares it -----------
@@ -358,7 +428,11 @@ def verify_managed_pin(root: Path, expected: BakedIdentity) -> str:
 
     The well-known files declare the identity; the managed settings are what
     ENFORCE it. A declared identity whose enforcement keys are missing or
-    different is an image that looks pinned and binds nothing."""
+    different is an image that looks pinned and binds nothing. The freshness
+    key is required with the same force: without it the canaries and the
+    probe may run under stale server policy and prove nothing about what the
+    task session would start under (images built before this amendment fail
+    here and need a rebuild — the missing key is named)."""
     base = root / MANAGED_SETTINGS_FILE
     if not base.is_file():
         return (
@@ -411,6 +485,40 @@ def intruder_for(expected: str) -> str:
     return "claude-sonnet-5" if "haiku" in expected else "claude-haiku-4-5"
 
 
+# Known same-family alternatives for the second canary. Ordered so the first
+# candidate is never one the provider would merely resolve TO the pin (an
+# undated alias of the pinned ID would execute the pin and prove nothing).
+# Families with a single known member (fable, mythos) have no sibling: the
+# same-family canary is skipped there and the different-family canary plus
+# the in-session guard remain the proof.
+_FAMILY_SIBLINGS: dict[str, tuple[str, ...]] = {
+    "haiku": ("claude-3-5-haiku-20241022", "claude-haiku-4-5"),
+    "opus": ("claude-opus-4-6", "claude-opus-5"),
+    "sonnet": ("claude-sonnet-4-6", "claude-sonnet-5"),
+}
+
+
+def sibling_for(expected: str) -> str:
+    """A same-family model ID different from a FULL-ID pin, for the
+    same-family widen canary; "" for aliases (family members are expected to
+    pass) and for families with no known second member.
+
+    A full-ID pin must reject even its own family: allowlist enforcement
+    that quietly matched at family granularity would satisfy the
+    different-family canary and still run the wrong model. The sibling need
+    not be servable — under intact enforcement it never reaches the
+    provider, and under broken enforcement an unavailable sibling errors the
+    canary, which also fails closed."""
+    if expected in _ALIASES:
+        return ""
+    for family, candidates in _FAMILY_SIBLINGS.items():
+        if family in expected:
+            for candidate in candidates:
+                if candidate != expected and not model_matches(expected, candidate):
+                    return candidate
+    return ""
+
+
 # -- preflight ---------------------------------------------------------------
 
 
@@ -418,7 +526,8 @@ def intruder_for(expected: str) -> str:
 class PreflightReport:
     """One preflight verdict: what was expected, what was proven, and — on
     failure — the mismatch category and an actionable, value-redacted detail.
-    A failed preflight always means the real task prompt was never sent."""
+    A failed preflight always means the real task prompt was never sent (the
+    task file was not even on disk while the preflight ran)."""
 
     ok: bool
     expected_model: str
@@ -427,6 +536,8 @@ class PreflightReport:
     detail: str = ""
     cli_version: str = ""
     canary_model: str = ""  # what the widen canary actually executed
+    probe_model: str = ""  # what the neutral identity probe executed
+    probe_effort: str = ""  # the applied effort the probe's Stop hook reported
 
     def describe(self) -> str:
         effort = self.expected_effort or "(model default)"
@@ -443,7 +554,33 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 # One tiny turn: enough to observe the executed model, never the task.
 CANARY_PROMPT = "Reply with exactly: OK"
+# The neutral identity probe's turn (never the task). No tool: the applied
+# effort is observed via the Stop hook payload, which fires after a plain
+# turn and reports the post-clamp value (verified live on 2.1.232).
+PROBE_PROMPT = (
+    "Preflight check. Reply with exactly: OK. Do not use any tools and do not read any files."
+)
 PREFLIGHT_SESSION_TIMEOUT = 240.0
+
+# The pre-verification boundary, as invocation flags: every verification
+# session runs with NO built-in tools, permission prompts auto-denied (an
+# adversarially substituted model that emits a tool call gets a denial, not
+# an execution), no user/project/local settings tiers (managed policy always
+# applies — that is the policy under test), and no non-managed MCP servers.
+# The sessions also run cwd-neutral (the preflight scratch, outside the job
+# mount) so no project CLAUDE.md, settings, hooks, or skills exist to load.
+NEUTRAL_SESSION_ARGS = (
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--tools",
+    "",
+    "--permission-mode",
+    "dontAsk",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+)
 
 
 @dataclass(frozen=True)
@@ -494,6 +631,21 @@ def scan_stream_signals(text: str) -> StreamSignals:
     )
 
 
+def read_effort_capture(capture: Path) -> str:
+    """The applied effort from a Stop-hook capture file; "" when the file is
+    absent, partial, or carries no effort field (a hook mid-write is not an
+    observation)."""
+    try:
+        data = json.loads(capture.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if isinstance(data, dict):
+        effort = data.get("effort")
+        if isinstance(effort, dict) and isinstance(effort.get("level"), str):
+            return effort["level"]
+    return ""
+
+
 def run_preflight(
     identity: BakedIdentity,
     *,
@@ -502,15 +654,21 @@ def run_preflight(
     scratch: Path,
     min_cli: tuple[int, int, int],
     run=subprocess.run,
+    environ: Mapping[str, str] | None = None,
     timeout: float = PREFLIGHT_SESSION_TIMEOUT,
 ) -> PreflightReport:
-    """The pre-launch half of the runtime gate: static policy re-checks, the
-    CLI version floor, and the widen canary. Runs with the same credential
-    environment the task process will inherit (the run container's own).
+    """The pre-launch runtime gate, entirely inside the pre-verification
+    boundary: static policy re-checks, the process-environment audit, the
+    CLI version floor, the widen canary, the same-family canary (full-ID
+    pins), and the neutral identity probe that proves an executed turn and —
+    when effort is baked — the applied (post-clamp) effort, all with the
+    Run's own credential and effective policy, all in the neutral scratch,
+    all with tools and project sources removed.
 
-    The in-session half — availability, exact/family resolution, and the
-    applied effort, proven by the gated probe turn — is ``ClaudeSessionGuard``:
-    only after BOTH halves pass does the harness release the real prompt."""
+    Only after this passes does the harness even LAUNCH the task session,
+    and the real prompt is still withheld until that session's own announced
+    and executed identity match (``ClaudeSessionGuard``)."""
+    environ = os.environ if environ is None else environ
 
     def failed(category: str, detail: str, **extra) -> PreflightReport:
         return PreflightReport(
@@ -536,10 +694,12 @@ def run_preflight(
     pair = pair_error(identity.model, identity.effort)
     if pair:
         return failed(CATEGORY_PAIR_INVALID, pair)
+    env_conflicts = scan_process_environment(environ)
+    if env_conflicts:
+        return failed(CATEGORY_POLICY_CONFLICT, "; ".join(env_conflicts))
 
-    # The CLI beside this harness must be new enough to enforce the config:
-    # allowlist enforcement (2.1.175), completed family-alias substitution
-    # (2.1.222), per-key managed env merge (2.1.223).
+    # The CLI beside this harness must be new enough for every behavior the
+    # gate relies on (see ClaudeAdapter.MIN_ENFORCING_CLI for the ledger).
     try:
         probe = run(
             [binary, "--version"],
@@ -566,128 +726,315 @@ def run_preflight(
             cli_version=version_raw,
         )
 
-    # The widen canary: ask for an intruder model with the Run's own
+    def neutral_session(prompt: str, *extra: str) -> tuple[str, str, StreamSignals | None]:
+        """One neutral one-shot verification session in the scratch;
+        (error category, error detail, signals) — category "" on a run that
+        executed at least one turn without a session error."""
+        argv = [binary, "-p", prompt, *NEUTRAL_SESSION_ARGS, *extra]
+        try:
+            proc = run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                cwd=str(scratch),
+            )
+        except subprocess.TimeoutExpired:
+            return CATEGORY_TIMEOUT, f"no verdict within {timeout:.0f}s", None
+        except OSError as exc:
+            return CATEGORY_UNVERIFIABLE, f"cannot launch the session: {exc}", None
+        signals = scan_stream_signals(proc.stdout or "")
+        if signals.is_error or proc.returncode != 0:
+            note = signals.error_note or f"exit {proc.returncode}"
+            return CATEGORY_UNAVAILABLE, note, signals
+        if not signals.turn_models:
+            return CATEGORY_UNVERIFIABLE, "the session executed no turn", signals
+        return "", "", signals
+
+    # The widen canaries: ask for an intruder model with the Run's own
     # credential and effective policy. Under an intact single-entry
     # allowlist every selection surface coerces to the pin (verified live);
     # an executed intruder — or anything else — means the effective policy
-    # no longer binds the baked identity, whatever source changed it.
-    intruder = intruder_for(identity.model)
-    try:
-        canary = run(
-            [
-                binary,
-                "-p",
-                CANARY_PROMPT,
-                "--model",
-                intruder,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            cwd=str(scratch),
-        )
-    except subprocess.TimeoutExpired:
+    # no longer binds the baked identity, whatever source changed it. A
+    # full-ID pin gets a second canary with a SAME-family sibling: family-
+    # granular enforcement would pass the different-family canary and still
+    # run the wrong model. Neither canary proves the absence of conditional
+    # fallback or of server-side overrides that only trigger later — that
+    # residual is what the in-session guard's drift kill is for.
+    canaries = [("the widen canary", intruder_for(identity.model))]
+    sibling = sibling_for(identity.model)
+    if sibling:
+        canaries.append(("the same-family canary", sibling))
+    canary_observed = ""
+    for label, intruder in canaries:
+        category, note, signals = neutral_session(CANARY_PROMPT, "--model", intruder)
+        if category == CATEGORY_TIMEOUT:
+            return failed(
+                CATEGORY_TIMEOUT,
+                f"{label} produced no verdict within {timeout:.0f}s",
+                cli_version=version_raw,
+            )
+        if category == CATEGORY_UNAVAILABLE:
+            return failed(
+                CATEGORY_UNAVAILABLE,
+                f"{label} session errored ({note}) — the baked model cannot be"
+                " verified as available to this credential",
+                cli_version=version_raw,
+                canary_model=(signals.turn_models[-1] if signals and signals.turn_models else ""),
+            )
+        if category:
+            return failed(
+                CATEGORY_UNVERIFIABLE,
+                f"{label} could not observe the effective policy: {note}",
+                cli_version=version_raw,
+            )
+        assert signals is not None
+        observed = signals.turn_models[-1]
+        if label.startswith("the widen"):
+            canary_observed = observed
+        executed_intruder = any(seen == intruder for seen in signals.turn_models)
+        off_pin = [seen for seen in signals.turn_models if not model_matches(identity.model, seen)]
+        if executed_intruder or off_pin:
+            return failed(
+                CATEGORY_WIDENED if executed_intruder else CATEGORY_SUBSTITUTED,
+                f"{label} asked for {intruder!r} and executed"
+                f" {', '.join(signals.turn_models)} — the effective policy does"
+                f" not coerce every selection to the baked {identity.model!r}"
+                " (an organization/server policy, drop-in, or helper supersedes"
+                " the image)",
+                cli_version=version_raw,
+                canary_model=observed,
+            )
+
+    # The neutral identity probe: no --model, no tools — the session the
+    # effective policy chooses by itself must announce AND execute the baked
+    # model, and, when effort is baked, the Stop hook must report the baked
+    # level as the applied one (an organization cap clamps silently in the
+    # stream; the hook payload is the machine-readable observation).
+    probe_args: list[str] = []
+    effort_capture = scratch / "preflight-effort.json"
+    if identity.effort:
+        hook = {
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": f"cat > {_shquote(effort_capture)}"}]}
+                ]
+            }
+        }
+        probe_args = ["--settings", json.dumps(hook)]
+    category, note, signals = neutral_session(PROBE_PROMPT, *probe_args)
+    if category == CATEGORY_TIMEOUT:
         return failed(
             CATEGORY_TIMEOUT,
-            f"the widen canary produced no verdict within {timeout:.0f}s",
+            f"the identity probe produced no verdict within {timeout:.0f}s",
             cli_version=version_raw,
+            canary_model=canary_observed,
         )
-    except OSError as exc:
-        return failed(
-            CATEGORY_UNVERIFIABLE, f"cannot launch the widen canary: {exc}", cli_version=version_raw
-        )
-    signals = scan_stream_signals(canary.stdout or "")
-    observed = signals.turn_models[-1] if signals.turn_models else ""
-    if signals.is_error or canary.returncode != 0:
-        note = signals.error_note or f"exit {canary.returncode}"
+    if category == CATEGORY_UNAVAILABLE:
         return failed(
             CATEGORY_UNAVAILABLE,
-            f"the canary session errored ({note}) — the baked model cannot be"
-            " verified as available to this credential",
+            f"the identity probe session errored ({note}) — the baked model"
+            " cannot be verified as available to this credential",
             cli_version=version_raw,
-            canary_model=observed,
+            canary_model=canary_observed,
         )
-    if not signals.turn_models:
+    if category:
         return failed(
             CATEGORY_UNVERIFIABLE,
-            "the canary session executed no turn — the effective policy cannot be observed",
+            f"the identity probe could not observe the session identity: {note}",
             cli_version=version_raw,
+            canary_model=canary_observed,
         )
-    executed_intruder = any(seen == intruder for seen in signals.turn_models)
+    assert signals is not None
+    probe_model = signals.turn_models[-1]
     off_pin = [seen for seen in signals.turn_models if not model_matches(identity.model, seen)]
-    if executed_intruder or off_pin:
+    init_off = signals.init_model and not model_matches(identity.model, signals.init_model)
+    if off_pin or init_off:
+        drifted = ", ".join(off_pin) or signals.init_model
         return failed(
-            CATEGORY_WIDENED if executed_intruder else CATEGORY_SUBSTITUTED,
-            f"the canary asked for {intruder!r} and executed"
-            f" {', '.join(signals.turn_models)} — the effective policy does"
-            f" not coerce every selection to the baked {identity.model!r}"
-            " (an organization/server policy, drop-in, or helper supersedes"
-            " the image)",
+            CATEGORY_SUBSTITUTED,
+            f"the identity probe ran on {drifted!r}, not the baked"
+            f" {identity.model!r} — the effective policy substituted the model",
             cli_version=version_raw,
-            canary_model=observed,
+            canary_model=canary_observed,
+            probe_model=probe_model,
         )
+    probe_effort = ""
+    if identity.effort:
+        probe_effort = read_effort_capture(effort_capture)
+        if not probe_effort:
+            return failed(
+                CATEGORY_UNVERIFIABLE,
+                "the identity probe exposed no applied effort — the CLI beside"
+                " this harness does not report effort in the Stop hook payload,"
+                " so the baked effort cannot be proven",
+                cli_version=version_raw,
+                canary_model=canary_observed,
+                probe_model=probe_model,
+            )
+        if probe_effort != identity.effort:
+            return failed(
+                CATEGORY_EFFORT_CLAMPED,
+                f"the identity probe applied effort {probe_effort!r}, not the"
+                f" baked {identity.effort!r} — an effort surface or organization"
+                " cap supersedes the pin",
+                cli_version=version_raw,
+                canary_model=canary_observed,
+                probe_model=probe_model,
+                probe_effort=probe_effort,
+            )
     return PreflightReport(
         ok=True,
         expected_model=identity.model,
         expected_effort=identity.effort,
         cli_version=version_raw,
-        canary_model=observed,
+        canary_model=canary_observed,
+        probe_model=probe_model,
+        probe_effort=probe_effort,
     )
 
 
-# -- the gated session guard --------------------------------------------------
+def _shquote(path: Path) -> str:
+    return shlex.quote(str(path))
+
+
+# -- the gated task session ---------------------------------------------------
 
 GUARD_WAIT = "wait"
 GUARD_RELEASE = "release"
 GUARD_KILL = "kill"
 
-# The in-session no-op probe turns (never the task). The tool variant makes
-# the CLI fire the PostToolUse hook whose payload carries the applied effort
-# — the one machine-readable observation of the effective effort in headless
-# mode (an organization effort cap clamps silently in stream-json).
-PROBE_PROMPT = (
-    "Preflight check. Reply with exactly: OK. Do not use any tools and do not read any files."
+
+@dataclass(frozen=True)
+class TaskGate:
+    """The filesystem contract between the harness and the gated task
+    session's hooks. Every path lives in the harness's neutral scratch,
+    OUTSIDE the job mount.
+
+    - ``release_marker``: created by the harness at release; until it
+      exists, the PreToolUse gate hook denies every tool call in the task
+      session (verified live: the denial binds even under
+      ``--dangerously-skip-permissions``).
+    - ``effort_capture``: the Stop hook's payload file (None when no effort
+      is baked) — the pre-release proof channel and the post-release drift
+      monitor.
+    - ``config_capture``: the ConfigChange hook helper appends one
+      value-redacted JSON line per identity-relevant mid-session settings
+      change; any line kills the Run.
+    - ``config_hook_script``: the helper the harness materializes (see
+      ``CONFIG_CHANGE_HOOK_SOURCE``)."""
+
+    release_marker: Path
+    effort_capture: Path | None
+    config_capture: Path
+    config_hook_script: Path
+
+
+# The ConfigChange hook helper (written by the harness into the gate
+# scratch). It NEVER blocks a settings change — organization policy is never
+# resisted (ADR-0045 doctrine); an identity-relevant change is recorded and
+# the harness kills the Run instead. project_settings changes are filtered
+# by content: the task may legitimately edit the checkout's settings, so
+# only identity-shaped keys (or an unreadable changed file — unknowable is
+# fail-closed) are recorded. skills changes are ignored: skill model
+# frontmatter is bound by the enforced allowlist (verified live). Everything
+# else (policy/user/local settings, unknown future sources) is recorded
+# unconditionally. Records carry source, path, and matched key names only.
+CONFIG_CHANGE_HOOK_SOURCE = '''\
+"""theozolith ConfigChange hook (ADR-0045): record identity-relevant
+mid-session settings changes for the harness session guard. Never blocks."""
+import json
+import re
+import sys
+
+IDENTITY_PATTERN = re.compile(
+    r\'"(model|availableModels|enforceAvailableModels|fallbackModel|effortLevel\'
+    r"|modelOverrides|policyHelper|policyHelpers|forceRemoteSettingsRefresh"
+    r"|ANTHROPIC_[A-Z_]+|CLAUDE_CODE_EFFORT_LEVEL|CLAUDE_CODE_SUBAGENT_MODEL"
+    r\'|CLAUDE_CODE_USE_BEDROCK|CLAUDE_CODE_USE_VERTEX)"\\s*:\'
 )
-PROBE_PROMPT_WITH_TOOL = (
-    "Preflight check. Run the Bash tool with the exact command 'true', then"
-    " reply with exactly: OK. Do not read any files."
-)
+
+
+def main() -> int:
+    capture = sys.argv[1]
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        event = {}
+    if not isinstance(event, dict):
+        event = {}
+    source = event.get("source") if isinstance(event.get("source"), str) else ""
+    path = event.get("file_path") if isinstance(event.get("file_path"), str) else ""
+    if source == "skills":
+        return 0
+    keys: list[str] = []
+    if source == "project_settings":
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            text = None
+        if text is not None:
+            keys = sorted({match.group(1) for match in IDENTITY_PATTERN.finditer(text)})
+            if not keys:
+                return 0
+    with open(capture, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"source": source, "file_path": path, "keys": keys}) + "\\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
 
 
 @dataclass(frozen=True)
 class GuardDecision:
     action: str  # GUARD_WAIT | GUARD_RELEASE | GUARD_KILL
     reason: str = ""
+    category: str = ""  # a CATEGORY_* string on GUARD_KILL
 
 
 class ClaudeSessionGuard:
-    """Line-by-line identity gate over a gated ``claude -p --input-format
-    stream-json`` session.
+    """Line-by-line identity gate over the gated ``claude -p --input-format
+    stream-json`` task session.
 
-    Before release: the init announcement must resolve to the baked model
-    and the probe turn must EXECUTE on it (exact for a pinned ID, family for
-    an alias); when effort is baked, the hook-captured applied effort must
-    equal it. Only then does the harness send the real task prompt. After
-    release: any executed turn off the baked model, or a drifted applied
-    effort, kills the session — a mid-run policy change invalidates the Run
-    immediately instead of being discovered post-hoc."""
+    The task session is only ever LAUNCHED after ``run_preflight`` proved
+    the effective policy with the Run's own credential. This guard is the
+    in-process re-verification on top: before release, the session's init
+    announcement must resolve to the baked model, the probe turn must
+    EXECUTE on it (exact for a pinned ID, family for an alias), and — when
+    effort is baked — the Stop-hook capture must report the baked level as
+    applied. Until the harness releases, the session's tools are denied by
+    the PreToolUse gate hook and the task file is not on disk. After release
+    (``mark_released``): any executed turn off the baked model, a drifted
+    applied effort, or a recorded identity-relevant ConfigChange kills the
+    session — a mid-run policy change invalidates the Run immediately
+    instead of being discovered post-hoc. Probe and task turns are counted
+    separately so an exit that never processed the task is detectable.
 
-    def __init__(self, identity: BakedIdentity, effort_capture: Path | None):
+    Trust note: transcript events are authored by the CLI and gate the
+    release; the capture files are same-user filesystem state and are
+    therefore a fail-closed channel only — a forged "matching" capture
+    changes nothing (release still required the transcript proof and the
+    preflight), and a forged mismatch only fails the forger's own Run."""
+
+    def __init__(self, identity: BakedIdentity, gate: TaskGate):
         self._identity = identity
-        self._capture = effort_capture if identity.effort else None
+        self._gate = gate
         self._init_ok = False
         self._turn_ok = False
         self._violation = ""
+        self._category = ""
+        self._released = False
         self.observed_model = ""
         self.observed_effort = ""
+        self.probe_turns = 0
+        self.task_turns = 0
 
     @property
     def probe_prompt(self) -> str:
-        return PROBE_PROMPT_WITH_TOOL if self._capture else PROBE_PROMPT
+        return PROBE_PROMPT
 
     def probe_input(self) -> str:
         return self.render_input(self.probe_prompt)
@@ -701,9 +1048,19 @@ class ClaudeSessionGuard:
             }
         )
 
-    def _fail(self, reason: str) -> None:
+    def mark_released(self) -> None:
+        """The task prompt has entered the process: turns observed from here
+        are task turns, and the guard is a drift monitor from here on."""
+        self._released = True
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def _fail(self, reason: str, category: str) -> None:
         if not self._violation:
             self._violation = reason
+            self._category = category
 
     def observe(self, line: str) -> None:
         line = line.strip()
@@ -725,39 +1082,40 @@ class ClaudeSessionGuard:
                     self._fail(
                         f"session initialized on {seen!r}, not the baked"
                         f" {expected!r} — the effective policy substituted the"
-                        " model"
+                        " model",
+                        CATEGORY_SUBSTITUTED,
                     )
         elif event.get("type") == "assistant":
             message = event.get("message")
             seen = message.get("model") if isinstance(message, dict) else None
             if isinstance(seen, str) and seen and seen != "<synthetic>":
+                if self._released:
+                    self.task_turns += 1
+                else:
+                    self.probe_turns += 1
                 if model_matches(expected, seen):
                     self.observed_model = seen
                     self._turn_ok = True
                 else:
-                    self._fail(f"a turn executed on {seen!r}, not the baked {expected!r}")
+                    self._fail(
+                        f"a turn executed on {seen!r}, not the baked {expected!r}",
+                        CATEGORY_SUBSTITUTED,
+                    )
         elif event.get("type") == "result" and event.get("is_error") is True:
             subtype = event.get("subtype")
             note = subtype if isinstance(subtype, str) else "error"
             if not self._turn_ok:
                 self._fail(
                     f"the probe turn errored ({note}) — the baked model cannot"
-                    " be verified as available to this credential"
+                    " be verified as available to this credential",
+                    CATEGORY_UNAVAILABLE,
                 )
 
     def _effort_state(self) -> str:
-        """ "ok" | "wait" | a violation string, from the hook capture."""
-        if self._capture is None:
+        """ "ok" | "wait" | a violation string, from the Stop-hook capture."""
+        if self._gate.effort_capture is None:
             return "ok"
-        try:
-            data = json.loads(self._capture.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return "wait"
-        level = ""
-        if isinstance(data, dict):
-            effort = data.get("effort")
-            if isinstance(effort, dict) and isinstance(effort.get("level"), str):
-                level = effort["level"]
+        level = read_effort_capture(self._gate.effort_capture)
         if not level:
             return "wait"
         self.observed_effort = level
@@ -769,13 +1127,46 @@ class ClaudeSessionGuard:
             )
         return "ok"
 
+    def _config_change(self) -> str:
+        """A violation string when the ConfigChange helper recorded an
+        identity-relevant mid-session settings change; "" otherwise."""
+        try:
+            text = self._gate.config_capture.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            source, keys = "", ""
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                record = None
+            if isinstance(record, dict):
+                source = str(record.get("source", ""))
+                key_list = record.get("keys")
+                if isinstance(key_list, list):
+                    keys = ", ".join(str(key) for key in key_list)
+            detail = f" ({keys})" if keys else ""
+            return (
+                "an identity-affecting settings change was applied mid-session"
+                f" (source: {source or 'unknown'}{detail}) — the session no"
+                " longer runs under the proven configuration"
+            )
+        return ""
+
     def decision(self) -> GuardDecision:
         if self._violation:
-            return GuardDecision(GUARD_KILL, self._violation)
+            return GuardDecision(GUARD_KILL, self._violation, self._category)
+        config = self._config_change()
+        if config:
+            self._fail(config, CATEGORY_CONFIG_CHANGED)
+            return GuardDecision(GUARD_KILL, self._violation, self._category)
         effort = self._effort_state()
         if effort not in ("ok", "wait"):
-            self._fail(effort)
-            return GuardDecision(GUARD_KILL, self._violation)
-        if self._init_ok and self._turn_ok and effort == "ok":
+            self._fail(effort, CATEGORY_EFFORT_CLAMPED)
+            return GuardDecision(GUARD_KILL, self._violation, self._category)
+        if not self._released and self._init_ok and self._turn_ok and effort == "ok":
             return GuardDecision(GUARD_RELEASE)
         return GuardDecision(GUARD_WAIT)

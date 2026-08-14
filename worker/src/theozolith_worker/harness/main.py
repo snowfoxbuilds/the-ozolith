@@ -10,14 +10,23 @@ process is recorded in ``output/status.json`` and the harness carries on —
 the driver owns what that means (best-effort contract).
 
 When the image bakes a model/effort identity (ADR-0045, fail-closed
-amendment), the launch is GATED: the adapter's preflight must prove the
-effective policy still binds the baked identity, the agent is started in
-stdin-driven mode whose first turn is a no-op probe, and the real task
-prompt is released into the process only after the session's announced and
-executed identity match the baked one. A violation at any point — preflight,
-gate, or mid-session drift — kills the agent and fails the Run with a
-distinct ``identity:`` error the driver classifies separately; the task
-prompt is never sent to an unverified session.
+amendment), the launch runs behind a real pre-verification boundary. The
+harness first WITHHOLDS the task: ``input/prompt.md`` is read into memory
+and removed from disk, so no pre-verification process can read it. The
+adapter's preflight then proves the effective policy with the Run's own
+credential in a neutral scratch outside the job mount — canaries and an
+identity probe with no tools, no project sources, no MCP. Only after that
+proof is the task session launched at all, stdin-driven, with every tool
+denied by a release-marker hook, and its first turn a no-op probe; the task
+file is restored and the pointer prompt sent only once the session's own
+announced and executed identity match. The release is atomic and observable:
+``released`` is recorded only after the task input write and delivery
+succeed, delivery failures are classified (task-delivery vs stdin-close),
+and an exit that never processed the released task is a failure, not a
+completed Run. A violation at any point — preflight, gate, delivery,
+mid-session drift, or an identity-affecting ConfigChange — kills the agent
+and fails the Run with a distinct ``identity:`` error (and stable category)
+the driver classifies separately.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -37,9 +47,16 @@ from typing import Protocol
 from theozolith_worker import shell
 from theozolith_worker.adapters import AgentAdapterError, make_agent_adapter
 from theozolith_worker.identity import (
+    CATEGORY_STDIN_CLOSE,
+    CATEGORY_TASK_DELIVERY,
+    CATEGORY_TASK_UNPROCESSED,
+    CATEGORY_TIMEOUT,
+    CATEGORY_UNVERIFIABLE,
+    CONFIG_CHANGE_HOOK_SOURCE,
     GUARD_KILL,
     GUARD_RELEASE,
     IDENTITY_ERROR_PREFIX,
+    TaskGate,
 )
 from theozolith_worker.jobdir import (
     CONTAINER_JOB_PATH,
@@ -54,6 +71,7 @@ from theozolith_worker.jobdir import (
     JobResult,
     Manifest,
     Status,
+    atomic_write,
     pending_job_requests,
     read_job_request,
     read_manifest,
@@ -68,9 +86,13 @@ KILL_GRACE_SECONDS = 10.0  # SIGTERM at the deadline, SIGKILL after this
 # gives up without ever sending the task prompt (well inside any sane agent
 # timeout; one no-op probe turn normally completes in seconds).
 GATE_RELEASE_TIMEOUT_SECONDS = 300.0
-# Job-dir scratch for the identity gate: the preflight canary's cwd and the
-# effort-capture hook file live here, outside input/ and output/.
-PREFLIGHT_DIR = "preflight"
+# The identity gate's scratch lives OUTSIDE the job mount (a container-local
+# temp dir): the canary/probe sessions run with it as cwd — a neutral
+# directory with no task inputs, no project settings, no CLAUDE.md — and the
+# task session's gate files (release marker, capture files, hook helper)
+# live under it too, where nothing in the checkout can name or reach them
+# by a job-relative path.
+SCRATCH_PREFIX = "theozolith-identity-"
 
 # The pointer prompt (ADR-0019 as amended): the argv carries a constant-size
 # pointer at the driver-materialized task file, never the task content — the
@@ -139,9 +161,11 @@ class _SubprocessAgent:
         stdin.flush()
 
     def end_input(self) -> None:
-        with contextlib.suppress(OSError):
-            if self._popen.stdin is not None:
-                self._popen.stdin.close()
+        # No suppression: a failing close after task delivery is classified
+        # explicitly (stdin-close) instead of silently becoming a Run whose
+        # session never learned its input ended.
+        if self._popen.stdin is not None:
+            self._popen.stdin.close()
 
     def drain(self) -> None:
         """Wait briefly for the stdout pump to flush the transcript tail."""
@@ -263,26 +287,35 @@ def _shutdown(
             sleep(poll_seconds)
 
 
+# deliver() -> (released, violation, category): performs the release protocol
+# (open the tool gate, write the task input, send the pointer, close stdin)
+# and reports exactly how far it got. ``released`` is True only once the
+# task prompt has actually entered the process.
+TaskDeliverer = Callable[[], tuple[bool, str, str]]
+
+
 def await_guarded(
     process: AgentProcess,
     manifest: Manifest,
     guard,
     transcript: Path,
-    prompt: str,
+    deliver: TaskDeliverer,
     *,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     kill_grace_seconds: float = KILL_GRACE_SECONDS,
     release_timeout_seconds: float = GATE_RELEASE_TIMEOUT_SECONDS,
-) -> tuple[AgentOutcome, str, bool]:
+) -> tuple[AgentOutcome, str, str, bool]:
     """The gated wait (ADR-0045): feed the growing transcript to the session
-    guard; release the real task prompt only when the guard verifies the
+    guard; run the release protocol only when the guard verifies the
     session's identity; keep monitoring after release and kill on drift.
 
-    Returns ``(outcome, violation, released)`` — a nonempty violation means
-    the Run is invalid, and ``released`` says whether the task prompt ever
-    entered the process."""
+    Returns ``(outcome, violation, category, released)`` — a nonempty
+    violation means the Run is invalid (category names the stable failure
+    class), and ``released`` says whether the task prompt ever entered the
+    process. A zero exit that never processed the released task (no task
+    turn observed) is a violation, not a completed Run."""
     start = clock()
     offset = 0
     buffer = ""
@@ -294,25 +327,25 @@ def await_guarded(
         for line in lines:
             guard.observe(line)
 
+    def killed(reason: str, category: str) -> tuple[AgentOutcome, str, str, bool]:
+        _shutdown(
+            process,
+            clock=clock,
+            sleep=sleep,
+            poll_seconds=poll_seconds,
+            kill_grace_seconds=kill_grace_seconds,
+        )
+        return AgentOutcome(), reason, category, released
+
     while True:
         feed()
         decision = guard.decision()
         if decision.action == GUARD_KILL:
-            _shutdown(
-                process,
-                clock=clock,
-                sleep=sleep,
-                poll_seconds=poll_seconds,
-                kill_grace_seconds=kill_grace_seconds,
-            )
-            return AgentOutcome(), decision.reason, released
+            return killed(decision.reason, decision.category)
         if decision.action == GUARD_RELEASE and not released:
-            try:
-                process.send(guard.render_input(prompt))
-                process.end_input()
-            except OSError:
-                pass  # the process died mid-release; poll() below reports it
-            released = True
+            released, violation, category = deliver()
+            if violation:
+                return killed(violation, category)
         code = process.poll()
         if code is not None:
             drain = getattr(process, "drain", None)
@@ -321,17 +354,30 @@ def await_guarded(
             feed()
             decision = guard.decision()
             if decision.action == GUARD_KILL:
-                return AgentOutcome(), decision.reason, released
+                return AgentOutcome(), decision.reason, decision.category, released
             if not released:
                 return (
                     AgentOutcome(),
                     f"agent session exited (exit {code}) before the identity"
                     " gate verified the session — the task prompt was never"
                     " sent",
+                    CATEGORY_UNVERIFIABLE,
+                    released,
+                )
+            if code == 0 and guard.task_turns == 0:
+                # Exit zero after only the probe: the released task was never
+                # observably processed — a stdin EOF race or a session that
+                # quit early must not become a completed Run.
+                return (
+                    AgentOutcome(),
+                    "the agent exited without processing the released task"
+                    " (no post-release turn observed)",
+                    CATEGORY_TASK_UNPROCESSED,
                     released,
                 )
             return (
                 AgentOutcome(completed=code == 0, session_died=code != 0, exit_code=code),
+                "",
                 "",
                 released,
             )
@@ -339,19 +385,11 @@ def await_guarded(
         if not released and now - start >= min(
             release_timeout_seconds, manifest.agent_timeout_seconds
         ):
-            _shutdown(
-                process,
-                clock=clock,
-                sleep=sleep,
-                poll_seconds=poll_seconds,
-                kill_grace_seconds=kill_grace_seconds,
-            )
-            return (
-                AgentOutcome(),
+            return killed(
                 "the session identity could not be verified within"
                 f" {min(release_timeout_seconds, manifest.agent_timeout_seconds):.0f}s"
                 " — the task prompt was never sent",
-                released,
+                CATEGORY_TIMEOUT,
             )
         if now - start >= manifest.agent_timeout_seconds:
             _shutdown(
@@ -361,7 +399,7 @@ def await_guarded(
                 poll_seconds=poll_seconds,
                 kill_grace_seconds=kill_grace_seconds,
             )
-            return AgentOutcome(timed_out=True), "", released
+            return AgentOutcome(timed_out=True), "", "", released
         sleep(poll_seconds)
 
 
@@ -408,6 +446,7 @@ def run_harness(
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     identity_root: Path = Path("/"),
+    scratch_root: Path | None = None,
 ) -> int:
     manifest = read_manifest(job)
     write_status(job, Status(phase=PHASE_STARTING))
@@ -439,37 +478,73 @@ def run_harness(
         write_status(job, Status(phase=PHASE_FAILED, error=f"{IDENTITY_ERROR_PREFIX}{exc}"))
         return 1
     guard = None
+    gate: TaskGate | None = None
     identity_record: dict = {}
+    withheld_task = ""
+
+    def restore_task() -> None:
+        # Best-effort restore of the withheld task input so the evidence
+        # bundle of a failed gated Run still carries what the Run was asked
+        # to do. Never before the agent process is dead or the gate released.
+        if withheld_task and not task_file.exists():
+            with contextlib.suppress(OSError):
+                atomic_write(task_file, withheld_task)
+
     if identity is not None:
-        scratch = job / PREFLIGHT_DIR
-        scratch.mkdir(parents=True, exist_ok=True)
+        # The pre-verification boundary starts here: the task input leaves
+        # the disk before ANY subprocess runs, and every verification
+        # session works in a neutral scratch outside the job mount.
+        scratch = (
+            scratch_root
+            if scratch_root is not None
+            else Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
+        )
+        preflight_dir = scratch / "preflight"
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        withheld_task = task_file.read_text(encoding="utf-8")
+        task_file.unlink()
         try:
-            report = adapter.preflight(identity, root=identity_root, scratch=scratch)
+            report = adapter.preflight(identity, root=identity_root, scratch=preflight_dir)
         except AgentAdapterError as exc:
+            restore_task()
             write_status(job, Status(phase=PHASE_FAILED, error=f"{IDENTITY_ERROR_PREFIX}{exc}"))
             return 1
         identity_record = {
             "expected_model": report.expected_model,
             "expected_effort": report.expected_effort,
             "preflight": "passed" if report.ok else f"failed:{report.category}",
+            "category": "" if report.ok else report.category,
             "detail": report.detail,
             "cli_version": report.cli_version,
             "canary_model": report.canary_model,
+            "probe_model": report.probe_model,
+            "probe_effort": report.probe_effort,
             "released": False,
             "violation": "",
             "observed_model": "",
             "observed_effort": "",
+            "probe_turns": 0,
+            "task_turns": 0,
         }
         write_identity(job, identity_record)
         if not report.ok:
+            restore_task()
             write_status(
                 job,
                 Status(phase=PHASE_FAILED, error=IDENTITY_ERROR_PREFIX + report.describe()),
             )
             return 1
-        capture = (scratch / "effort.json") if identity.effort else None
-        guard = adapter.session_guard(identity, capture)
-        argv = adapter.guarded_command(manifest, capture)
+        gate_dir = scratch / "gate"
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        gate = TaskGate(
+            release_marker=gate_dir / "released",
+            effort_capture=(gate_dir / "effort.json") if identity.effort else None,
+            config_capture=gate_dir / "config-change.jsonl",
+            config_hook_script=gate_dir / "configchange_hook.py",
+        )
+        gate.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
+        guard = adapter.session_guard(identity, gate)
+        argv = adapter.guarded_command(manifest, gate)
     else:
         argv = adapter.command(manifest, pointer)
 
@@ -480,9 +555,11 @@ def run_harness(
         else:
             process = launcher(argv, workdir, env, transcript, True)
     except OSError as exc:
+        restore_task()
         write_status(job, Status(phase=PHASE_FAILED, error=f"agent launch failed: {exc}"))
         return 1
     violation = ""
+    category = ""
     error = ""
     outcome = AgentOutcome()
     try:
@@ -491,15 +568,50 @@ def run_harness(
                 process, manifest, clock=clock, sleep=sleep, poll_seconds=poll_seconds
             )
         else:
+            assert gate is not None
+
+            def deliver() -> tuple[bool, str, str]:
+                """The atomic release protocol: open the tool gate, put the
+                task input back on disk, deliver the pointer, close stdin —
+                released only counts once the prompt has entered the
+                process, and every failure names its stage."""
+                try:
+                    gate.release_marker.write_text("released\n", encoding="utf-8")
+                    atomic_write(task_file, withheld_task)
+                except OSError as exc:
+                    return (
+                        False,
+                        f"the task input could not be materialized for release ({exc})",
+                        CATEGORY_TASK_DELIVERY,
+                    )
+                try:
+                    process.send(guard.render_input(pointer))
+                except OSError as exc:
+                    return (
+                        False,
+                        f"the task prompt could not be delivered to the session ({exc})",
+                        CATEGORY_TASK_DELIVERY,
+                    )
+                guard.mark_released()
+                try:
+                    process.end_input()
+                except OSError as exc:
+                    return (
+                        True,
+                        f"the input channel could not be closed after task delivery ({exc})",
+                        CATEGORY_STDIN_CLOSE,
+                    )
+                return True, "", ""
+
             # A dead process here is reported by the guarded wait below.
             with contextlib.suppress(OSError):
                 process.send(guard.probe_input())
-            outcome, violation, released = await_guarded(
+            outcome, violation, category, released = await_guarded(
                 process,
                 manifest,
                 guard,
                 transcript,
-                pointer,
+                deliver,
                 clock=clock,
                 sleep=sleep,
                 poll_seconds=poll_seconds,
@@ -507,8 +619,11 @@ def run_harness(
             identity_record.update(
                 released=released,
                 violation=violation,
+                category=category,
                 observed_model=guard.observed_model,
                 observed_effort=guard.observed_effort,
+                probe_turns=guard.probe_turns,
+                task_turns=guard.task_turns,
             )
             write_identity(job, identity_record)
         if not violation:
@@ -525,16 +640,21 @@ def run_harness(
                     poll_seconds=poll_seconds,
                 )
     finally:
-        # Whatever happened, no agent process outlives the harness.
+        # Whatever happened, no agent process outlives the harness — and the
+        # withheld task returns to disk for the evidence bundle only after
+        # nothing unverified is left running to read it.
         if process.poll() is None:
             process.kill()
+        restore_task()
 
     if violation:
         # The Run is invalid (ADR-0045): no gate jobs were served, and the
-        # driver classifies the failure distinctly via the identity marker.
+        # driver classifies the failure distinctly via the identity marker;
+        # the stable category rides in front of the reason.
+        marked = f"[{category}] {violation}" if category else violation
         write_status(
             job,
-            Status(phase=PHASE_FAILED, agent=outcome, error=IDENTITY_ERROR_PREFIX + violation),
+            Status(phase=PHASE_FAILED, agent=outcome, error=IDENTITY_ERROR_PREFIX + marked),
         )
         return 1
     write_status(

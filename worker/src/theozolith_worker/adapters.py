@@ -38,6 +38,7 @@ from theozolith_worker.identity import (
     ClaudeSessionGuard,
     IdentityError,
     PreflightReport,
+    TaskGate,
 )
 from theozolith_worker.jobdir import MODE_REVIEW, VERDICT_FILE, Manifest
 
@@ -167,18 +168,20 @@ class AgentAdapter(Protocol):
 
     def preflight(self, identity: BakedIdentity, *, root: Path, scratch: Path) -> PreflightReport:
         """The pre-launch runtime gate, with the Run's own credential and
-        effective policy. A failed report means the real task prompt must
-        never be sent."""
+        effective policy, run entirely inside the pre-verification boundary
+        (neutral scratch, no tools, no project sources, task file withheld).
+        A failed report means the task session was never even launched."""
         ...
 
-    def guarded_command(self, manifest: Manifest, effort_capture: Path | None) -> list[str]:
-        """The gated session argv: input arrives over stdin so the harness
-        can withhold the real task prompt until the session's identity is
+    def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
+        """The gated task-session argv: input arrives over stdin so the
+        harness can withhold the real task prompt — and keep every tool
+        denied via ``gate.release_marker`` — until the session's identity is
         verified in-process."""
         ...
 
-    def session_guard(self, identity: BakedIdentity, effort_capture: Path | None):
-        """The line-by-line gate + monitor for a gated session (see
+    def session_guard(self, identity: BakedIdentity, gate: TaskGate):
+        """The line-by-line gate + monitor for a gated task session (see
         ``identity.ClaudeSessionGuard`` for the contract)."""
         ...
 
@@ -221,15 +224,20 @@ class ClaudeAdapter:
     # CLAUDE_CODE_EFFORT_LEVEL overrides /effort, --effort, the process
     # environment, and any settings-file effortLevel (all verified live).
     MANAGED_SETTINGS = identity_mod.MANAGED_SETTINGS_FILE
-    # The oldest Claude Code whose exact documented behavior this adapter
-    # relies on: availableModels/enforceAvailableModels shipped in 2.1.175,
-    # family-alias substitution completed in 2.1.222, and the per-key managed
-    # ``env`` merge — without which a server-managed org env block would
-    # silently displace the baked CLAUDE_CODE_EFFORT_LEVEL pin — shipped in
-    # 2.1.223. Behavior verified live on 2.1.231. An older CLI would silently
-    # ignore or lose parts of the baked identity — the exact hole
-    # verify_enforceable() and the runtime preflight exist to close.
-    MIN_ENFORCING_CLI = (2, 1, 223)
+    # The oldest Claude Code whose exact behavior this adapter relies on.
+    # The enforcement settings themselves are older (availableModels
+    # enforcement 2.1.175, alias substitution 2.1.222, per-key managed
+    # ``env`` merge 2.1.223), but the fail-closed gate additionally relies
+    # on: the Stop-hook payload carrying the applied (post-clamp) effort,
+    # the ConfigChange hook, ``--setting-sources ""`` and ``--tools ""``
+    # isolation, ``--permission-mode dontAsk``, a ``--settings`` PreToolUse
+    # deny hook binding under ``--dangerously-skip-permissions``, and the
+    # managed ``forceRemoteSettingsRefresh`` key — the whole set verified
+    # live on 2.1.232, which is therefore the floor: a CLI where any of
+    # these is missing would either fail every Run with a confusing error
+    # (unknown flag) or silently void a guarantee (an ignored freshness
+    # key), and the floor turns both into the clear cli-too-old category.
+    MIN_ENFORCING_CLI = (2, 1, 232)
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
     def __init__(self, binary: str = "claude"):
@@ -314,7 +322,13 @@ class ClaudeAdapter:
         overrides /effort, --effort, the process environment, and any
         settings-file effortLevel) beside the ``effortLevel`` default.
         Unrelated operator keys — including foreign ``env`` entries — survive
-        the merge untouched.
+        the merge untouched. ``forceRemoteSettingsRefresh: true`` is part of
+        the artifact: Claude Code documents it as "block startup until
+        server-managed settings are freshly fetched; exit on fetch failure",
+        so every session the runtime gate runs (canaries, probe, task)
+        starts on fresh policy, never a stale cache (an operator already
+        setting it to ``true`` merges cleanly; any other value fails the
+        conflict scan).
 
         ``interactive`` (driverless Flight Deck images) writes ONLY
         ``/etc/theozolith/model``: no managed settings (the deck may switch
@@ -362,6 +376,7 @@ class ClaudeAdapter:
                 existing["model"] = model
                 existing["availableModels"] = [model]
                 existing["enforceAvailableModels"] = True
+                existing[identity_mod.FRESHNESS_KEY] = True
             if effort:
                 existing["effortLevel"] = effort
                 env = existing.setdefault("env", {})
@@ -391,15 +406,56 @@ class ClaudeAdapter:
             run=run,
         )
 
-    def guarded_command(self, manifest: Manifest, effort_capture: Path | None) -> list[str]:
+    def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
         # The gated variant of command(): input arrives as stream-json user
-        # messages over stdin, so the harness can run the no-op probe turn and
-        # verify the session's identity before the real task prompt enters
-        # the process. When effort is baked, a PostToolUse hook (added via
-        # --settings, a source managed settings always outrank) captures the
-        # APPLIED effort — the one machine-readable observation of an
-        # organization effort cap, which clamps silently in stream-json.
-        argv = [
+        # messages over stdin, so the harness can run the no-op probe turn
+        # and verify the session's identity before the real task prompt (or
+        # even the task FILE) exists for the process. Three hooks ride in
+        # via --settings (a source managed settings always outrank, so none
+        # of this can weaken enforcement):
+        # - PreToolUse: denies EVERY tool call until the harness creates the
+        #   release marker — binding even under --dangerously-skip-permissions
+        #   (verified live), so an adversarially substituted model that emits
+        #   a tool call during the probe turn gets a denial, not an execution.
+        # - Stop (effort baked only): captures the APPLIED effort per turn —
+        #   the machine-readable observation of an organization effort cap,
+        #   which clamps silently in stream-json.
+        # - ConfigChange: records identity-relevant mid-session settings
+        #   changes (never blocks them) for the guard to kill on.
+        gate_command = (
+            f"test -f {shlex.quote(str(gate.release_marker))} || "
+            "{ echo 'theozolith: tools are denied until the identity gate"
+            " releases the task (ADR-0045)' >&2; exit 2; }"
+        )
+        hooks: dict = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": gate_command}]}
+            ],
+            "ConfigChange": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "python3 "
+                            f"{shlex.quote(str(gate.config_hook_script))} "
+                            f"{shlex.quote(str(gate.config_capture))}",
+                        }
+                    ]
+                }
+            ],
+        }
+        if gate.effort_capture is not None:
+            hooks["Stop"] = [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"cat > {shlex.quote(str(gate.effort_capture))}",
+                        }
+                    ]
+                }
+            ]
+        return [
             self._binary,
             "-p",
             "--input-format",
@@ -408,29 +464,12 @@ class ClaudeAdapter:
             "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            "--settings",
+            json.dumps({"hooks": hooks}),
         ]
-        if effort_capture is not None:
-            hook = {
-                "hooks": {
-                    "PostToolUse": [
-                        {
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": f"cat > {shlex.quote(str(effort_capture))}",
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-            argv += ["--settings", json.dumps(hook)]
-        return argv
 
-    def session_guard(
-        self, identity: BakedIdentity, effort_capture: Path | None
-    ) -> ClaudeSessionGuard:
-        return ClaudeSessionGuard(identity, effort_capture)
+    def session_guard(self, identity: BakedIdentity, gate: TaskGate) -> ClaudeSessionGuard:
+        return ClaudeSessionGuard(identity, gate)
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
         # Headless on purpose: completion is process exit (ADR-0019), and
