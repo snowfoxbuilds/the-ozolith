@@ -35,10 +35,10 @@ from typing import Protocol
 from theozolith_worker import identity as identity_mod
 from theozolith_worker.identity import (
     BakedIdentity,
-    ClaudeSessionGuard,
+    ClaudeSessionMonitor,
     IdentityError,
+    MonitorHooks,
     PreflightReport,
-    TaskGate,
 )
 from theozolith_worker.jobdir import MODE_REVIEW, VERDICT_FILE, Manifest
 
@@ -158,41 +158,39 @@ class AgentAdapter(Protocol):
         so the build must fail, not proceed (ADR-0045)."""
         ...
 
-    # -- the runtime gate (ADR-0045 fail-closed amendment) -------------------
+    # -- the identity machinery (ADR-0045, best-effort doctrine) -------------
 
     def baked_identity(self, root: Path) -> BakedIdentity | None:
         """The identity this filesystem was baked with, or None when it
-        carries none (a model-less worker type runs ungated). Raises
+        carries none (a model-less worker type runs unmonitored). Raises
         ``AgentAdapterError`` on an inconsistent or corrupt declaration."""
         ...
 
-    def preflight(
-        self,
-        identity: BakedIdentity,
-        *,
-        root: Path,
-        scratch: Path,
-        deadline: float | None = None,
-        clock=None,
-    ) -> PreflightReport:
-        """The pre-launch runtime gate, with the Run's own credential and
-        effective policy, run entirely inside the pre-verification boundary
-        (neutral scratch, no tools, no project sources, task file withheld).
-        ``deadline`` is the Run's single end-to-end budget on ``clock`` —
-        every verification step runs under what remains of it. A failed
-        report means the task session was never even launched."""
+    def static_checks(self, identity: BakedIdentity, *, root: Path) -> PreflightReport:
+        """The zero-cost per-Run identity checks (file reads only — no
+        sessions, no tokens): managed selection consistent with the
+        well-known declaration, no superseding policy, valid pair, clean
+        process environment. A failed report fails the Run loud before
+        launch."""
         ...
 
-    def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
-        """The gated task-session argv: input arrives over stdin so the
-        harness can withhold the real task prompt — and keep every tool
-        denied via ``gate.release_marker`` — until the session's identity is
-        verified in-process."""
+    def preflight(self, identity: BakedIdentity, *, root: Path, scratch: Path) -> PreflightReport:
+        """The setup dry-run (run once per driver process, never per Run):
+        the static checks, the CLI version floor, and one neutral probe
+        session with the Run credential proving the effective configuration
+        selects the baked model (and applies the baked effort)."""
         ...
 
-    def session_guard(self, identity: BakedIdentity, gate: TaskGate):
-        """The line-by-line gate + monitor for a gated task session (see
-        ``identity.ClaudeSessionGuard`` for the contract)."""
+    def monitored_command(self, manifest: Manifest, prompt: str, hooks: MonitorHooks) -> list[str]:
+        """The ordinary one-shot argv plus the observation hooks (Stop
+        applied-effort journal, ConfigChange recorder) riding ``--settings``
+        — the session keeps its full normal capabilities, checkout
+        CLAUDE.md and skills included."""
+        ...
+
+    def session_monitor(self, identity: BakedIdentity, hooks: MonitorHooks):
+        """The fail-loud stream watcher for a monitored task session (see
+        ``identity.ClaudeSessionMonitor`` for the contract)."""
         ...
 
 
@@ -208,16 +206,15 @@ class ClaudeAdapter:
 
     name = "claude"
 
-    # The model-family aliases the availableModels allowlist can hold: each
-    # expands to the newest model of exactly one family, so a single-entry
-    # allowlist still binds the image to that family (verified live, 2.1.231).
-    # Floating, though — the control-side lint warns on them (ADR-0045).
-    # "default" and "opusplan" are deliberately NOT here, although the CLI
-    # accepts both as selections: "default" floats with the account tier and
-    # a session pinned to it fails outright under an allowlist; "opusplan" is
-    # a two-model mode that degrades to plain Sonnet under enforcement — both
-    # verified live. Neither can name the single model ADR-0045 bakes, so
-    # both classify unmappable and fail the config load and the build.
+    # The model-family aliases the managed model default can hold: each
+    # expands to the newest model of exactly one family (verified live), so
+    # a baked alias binds the main agent to that family. Floating, though —
+    # the control-side lint warns on them (ADR-0045). "default" and
+    # "opusplan" are deliberately NOT here, although the CLI accepts both as
+    # selections: "default" floats with the account tier and "opusplan" is a
+    # two-model mode — neither names the single checkable model ADR-0045
+    # bakes, so both classify unmappable and fail the config load and the
+    # build.
     ALIASES = frozenset({"sonnet", "opus", "haiku", "fable"})
     # A full provider model ID (dated or not: current-generation IDs ship
     # without a dated variant). Claude Code passes these through unchecked.
@@ -226,32 +223,27 @@ class ClaudeAdapter:
     # accept; session-only levels (e.g. max) are deliberately absent — a
     # build asking for one fails, which is ADR-0045's contract.
     EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-    # Managed settings: the CLI's admin policy layer. A bare "model" here is
-    # only the session default — enforcement is the availableModels allowlist
-    # with enforceAvailableModels, which constrains every selection surface
-    # (--model, /model, ANTHROPIC_MODEL, settings files, subagent frontmatter,
-    # CLAUDE_CODE_SUBAGENT_MODEL), and the managed "env" block, whose
+    # Managed settings: the CLI's admin policy layer. The materialized
+    # "model" is the MAIN-agent session default: the managed tier outranks
+    # the checkout's and home's settings files for the same key (verified
+    # live), the harness passes no --model, and the env audit rejects
+    # steering variables — so in the normal case the main agent runs the
+    # baked model, while subagents and background helpers stay free to use
+    # other models (ADR-0045, main-agent-only). The managed "env" block's
     # CLAUDE_CODE_EFFORT_LEVEL overrides /effort, --effort, the process
-    # environment, and any settings-file effortLevel (all verified live).
+    # environment, and any settings-file effortLevel (verified live).
     MANAGED_SETTINGS = identity_mod.MANAGED_SETTINGS_FILE
-    # The oldest Claude Code whose exact behavior this adapter relies on.
-    # The enforcement settings themselves are older (availableModels
-    # enforcement 2.1.175, alias substitution 2.1.222, per-key managed
-    # ``env`` merge 2.1.223), but the fail-closed gate additionally relies
-    # on: the Stop-hook payload carrying the applied (post-clamp) effort,
-    # the Stop hook firing once per completed turn in stream-json input
-    # mode (the probe/task boundary), the ConfigChange hook,
-    # ``--setting-sources ""`` and ``--tools ""`` isolation (including on
-    # the gated TASK session, where it must suppress user/project/local
-    # settings — and does suppress CLAUDE.md/skills — while ``--settings``
-    # hooks stay active), ``--permission-mode dontAsk``, a ``--settings``
-    # PreToolUse deny hook binding under
-    # ``--dangerously-skip-permissions``, and the managed
-    # ``forceRemoteSettingsRefresh`` key — the whole set verified live on
-    # 2.1.232, which is therefore the floor: a CLI where any of these is
-    # missing would either fail every Run with a confusing error (unknown
-    # flag) or silently void a guarantee (an ignored freshness key), and
-    # the floor turns both into the clear cli-too-old category.
+    # The oldest Claude Code whose exact behavior this adapter relies on:
+    # the managed-over-project settings precedence for the model default,
+    # the per-key managed ``env`` merge (2.1.223 — without it a
+    # server-delivered org env block displaces the baked effort pin), the
+    # Stop-hook payload carrying the applied (post-clamp) effort, the
+    # ConfigChange hook, hooks riding ``--settings``, and the dry-run
+    # probe's isolation flags (``--tools ""``, ``--permission-mode
+    # dontAsk``, ``--setting-sources ""``) — the whole set verified live on
+    # 2.1.232, which is therefore the floor: an older CLI would either fail
+    # every Run with a confusing error (unknown flag) or silently void an
+    # observation channel, and the floor turns both into cli-too-old.
     MIN_ENFORCING_CLI = (2, 1, 232)
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
@@ -320,30 +312,26 @@ class ClaudeAdapter:
         """Bake ``model``/``effort`` into the image filesystem under ``root``.
 
         ``managed`` (driver run images) first proves the managed tier under
-        ``root`` cannot supersede what it is about to write: the base
-        ``managed-settings.json`` and every ``managed-settings.d/*.json``
-        drop-in are inspected in Claude Code's documented merge order, and a
-        malformed document, a ``policyHelper``/``policyHelpers``, or any
-        identity-affecting key (model, availableModels,
-        enforceAvailableModels, fallbackModel, effortLevel, or a
-        model/effort-selecting ``env`` entry) FAILS THE BUILD naming the file
-        and key — operator policy is never silently deleted or overwritten
-        (ADR-0045 fail-closed amendment). It then writes the well-known files
-        and merges the enforcement keys into the base settings JSON:
-        ``model`` is only the session default, so the identity is held by a
-        single-entry ``availableModels`` allowlist with
-        ``enforceAvailableModels`` (constraining every model-selection
-        surface) and, for effort, ``env.CLAUDE_CODE_EFFORT_LEVEL`` (which
-        overrides /effort, --effort, the process environment, and any
-        settings-file effortLevel) beside the ``effortLevel`` default.
-        Unrelated operator keys — including foreign ``env`` entries — survive
-        the merge untouched. ``forceRemoteSettingsRefresh: true`` is part of
-        the artifact: Claude Code documents it as "block startup until
-        server-managed settings are freshly fetched; exit on fetch failure",
-        so every session the runtime gate runs (canaries, probe, task)
-        starts on fresh policy, never a stale cache (an operator already
-        setting it to ``true`` merges cleanly; any other value fails the
-        conflict scan).
+        ``root`` carries nothing that would supersede what it is about to
+        write: the base ``managed-settings.json`` and every
+        ``managed-settings.d/*.json`` drop-in are inspected in Claude Code's
+        documented merge order, and a malformed document, a
+        ``policyHelper``/``policyHelpers``, or any identity-affecting key
+        FAILS THE BUILD naming the file and key — operator policy is never
+        silently deleted or overwritten. It then writes the well-known files
+        and merges the selection keys into the base settings JSON: a managed
+        ``model`` session default for the MAIN agent (the managed tier
+        outranks checkout/user settings for the same key — verified live —
+        and the harness passes no ``--model``), plus, for effort, the
+        ``effortLevel`` default beside ``env.CLAUDE_CODE_EFFORT_LEVEL``
+        (which overrides /effort, --effort, the process environment, and
+        any settings-file effortLevel). Deliberately NO
+        ``availableModels`` allowlist: enforcement is main-agent-only
+        (ADR-0045) — subagents, skills routed through subagents, and the
+        CLI's background helpers are free to run other models, and a
+        detected main-agent drift fails the Run loud at runtime instead.
+        Unrelated operator keys — including foreign ``env`` entries —
+        survive the merge untouched.
 
         ``interactive`` (driverless Flight Deck images) writes ONLY
         ``/etc/theozolith/model``: no managed settings (the deck may switch
@@ -389,9 +377,6 @@ class ClaudeAdapter:
                 existing = json.loads(settings.read_text(encoding="utf-8"))
             if model:
                 existing["model"] = model
-                existing["availableModels"] = [model]
-                existing["enforceAvailableModels"] = True
-                existing[identity_mod.FRESHNESS_KEY] = True
             if effort:
                 existing["effortLevel"] = effort
                 env = existing.setdefault("env", {})
@@ -400,7 +385,7 @@ class ClaudeAdapter:
             written.append(settings)
         return written
 
-    # -- the runtime gate (ADR-0045 fail-closed amendment) --------------------
+    # -- the identity machinery (ADR-0045, best-effort doctrine) --------------
 
     def baked_identity(self, root: Path) -> BakedIdentity | None:
         try:
@@ -408,18 +393,13 @@ class ClaudeAdapter:
         except IdentityError as exc:
             raise AgentAdapterError(str(exc)) from exc
 
+    def static_checks(self, identity: BakedIdentity, *, root: Path) -> PreflightReport:
+        return identity_mod.static_identity_report(identity, root=root)
+
     def preflight(
-        self,
-        identity: BakedIdentity,
-        *,
-        root: Path,
-        scratch: Path,
-        run=subprocess.run,
-        deadline: float | None = None,
-        clock=None,
+        self, identity: BakedIdentity, *, root: Path, scratch: Path, run=subprocess.run
     ) -> PreflightReport:
         scratch.mkdir(parents=True, exist_ok=True)
-        kwargs = {} if clock is None else {"clock": clock}
         return identity_mod.run_preflight(
             identity,
             binary=self._binary,
@@ -427,101 +407,61 @@ class ClaudeAdapter:
             scratch=scratch,
             min_cli=self.MIN_ENFORCING_CLI,
             run=run,
-            deadline=deadline,
-            **kwargs,
         )
 
-    def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
-        # The gated variant of command(): input arrives as stream-json user
-        # messages over stdin, so the harness can run the no-op probe turn
-        # and verify the session's identity before the real task prompt (or
-        # even the task FILE) exists for the process.
-        #
-        # The session loads NO user/project/local settings source
-        # (--setting-sources ""): an initial checkout or home-directory
-        # settings key — env.ANTHROPIC_BASE_URL, a Bedrock/Vertex switch,
-        # modelOverrides, a model/effort selector, or an identity surface
-        # not yet invented — must never enter the one session that will
-        # hold the task, and disabling the sources closes them all at once
-        # instead of scanning for the known ones (verified live on 2.1.232:
-        # a booby-trapped checkout's settings do not load). The cost,
-        # equally verified: the checkout's CLAUDE.md, skills, and slash
-        # commands ride the project settings source and do not load either
-        # — the task file is the session's complete assignment (ADR-0045).
-        #
-        # Three hooks ride in via --settings, which stays active under
-        # --setting-sources "" (managed settings always outrank, so none of
-        # this can weaken enforcement):
-        # - PreToolUse: denies EVERY tool call until the harness creates the
-        #   release marker — binding even under --dangerously-skip-permissions
-        #   (verified live), so an adversarially substituted model that emits
-        #   a tool call during the probe turn gets a denial, not an execution.
-        # - Stop (always, effort baked or not): appends one turn-boundary
-        #   record per completed turn — the probe/task boundary the release
-        #   waits on, the task-processed proof, and (when effort is baked)
-        #   the applied-effort observation an organization cap would clamp
-        #   silently in stream-json.
+    def monitored_command(self, manifest: Manifest, prompt: str, hooks: MonitorHooks) -> list[str]:
+        # The ordinary one-shot launch plus two observation hooks riding
+        # --settings (managed settings outrank it, so nothing here can
+        # weaken the selection). The session keeps its FULL normal
+        # capabilities — checkout CLAUDE.md, skills, slash commands, and
+        # settings sources all load (ADR-0045: they belong to the work; the
+        # checkout is not treated as an identity threat by ruling):
+        # - Stop: appends one value-redacted applied-effort record per
+        #   completed turn — the observation an organization cap would
+        #   clamp silently in stream-json; checked after exit, fail loud
+        #   on a detected mismatch, gap recorded when absent.
         # - ConfigChange: records identity-relevant mid-session settings
-        #   changes (never blocks them) for the guard to kill on.
-        gate_command = (
-            f"test -f {shlex.quote(str(gate.release_marker))} || "
-            "{ echo 'theozolith: tools are denied until the identity gate"
-            " releases the task (ADR-0045)' >&2; exit 2; }"
-        )
-        hooks: dict = {
-            "PreToolUse": [
-                {"matcher": "*", "hooks": [{"type": "command", "command": gate_command}]}
-            ],
-            "Stop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "python3 "
-                            f"{shlex.quote(str(gate.stop_hook_script))} "
-                            f"{shlex.quote(str(gate.stop_capture))}",
-                        }
-                    ]
-                }
-            ],
-            "ConfigChange": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "python3 "
-                            f"{shlex.quote(str(gate.config_hook_script))} "
-                            f"{shlex.quote(str(gate.config_capture))}",
-                        }
-                    ]
-                }
-            ],
+        #   changes (never blocks them) for the monitor to kill on.
+        settings = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python3 "
+                                f"{shlex.quote(str(hooks.stop_hook_script))} "
+                                f"{shlex.quote(str(hooks.stop_capture))}",
+                            }
+                        ]
+                    }
+                ],
+                "ConfigChange": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python3 "
+                                f"{shlex.quote(str(hooks.config_hook_script))} "
+                                f"{shlex.quote(str(hooks.config_capture))}",
+                            }
+                        ]
+                    }
+                ],
+            }
         }
-        return [
-            self._binary,
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-            "--setting-sources",
-            "",
-            "--settings",
-            json.dumps({"hooks": hooks}),
-        ]
+        return [*self.command(manifest, prompt), "--settings", json.dumps(settings)]
 
-    def session_guard(self, identity: BakedIdentity, gate: TaskGate) -> ClaudeSessionGuard:
-        return ClaudeSessionGuard(identity, gate)
+    def session_monitor(self, identity: BakedIdentity, hooks: MonitorHooks) -> ClaudeSessionMonitor:
+        return ClaudeSessionMonitor(identity, hooks)
 
     def command(self, manifest: Manifest, prompt: str) -> list[str]:
         # Headless on purpose: completion is process exit (ADR-0019), and
         # the structured stream is both transcript and usage source. No
         # --model (ADR-0045): the CLI reads the model/effort baked into the
-        # image's managed settings — nothing at invocation selects one. Used
-        # only when the image bakes no identity; a baked identity launches
-        # through guarded_command() so the prompt can be gated.
+        # image's managed settings — nothing at invocation selects one. A
+        # baked identity launches through monitored_command(), which is this
+        # argv plus the observation hooks.
         return [
             self._binary,
             "-p",
@@ -553,18 +493,22 @@ class ClaudeAdapter:
         the stream is agent output and never trusted to be well-formed.
 
         Three independent model signals feed ``_reconcile_models``: the
-        ``system``/``init`` announcement, the model on each real assistant
-        turn (the CLI stamps synthetic error notices ``<synthetic>`` — those
-        are not executions and are dropped), and the ``result`` event's
-        ``modelUsage`` keys. modelUsage alone is NOT identity: it also bills
-        the CLI's background helper models (verified live), so it only
-        cross-checks the turn-level signals.
+        ``system``/``init`` announcement, the model on each real MAIN-agent
+        assistant turn (subagent events carry ``parent_tool_use_id`` and are
+        legitimately free to run other models — ADR-0045 main-agent-only —
+        so they never feed the identity reconciliation, though their tool
+        calls and usage still count; the CLI stamps synthetic error notices
+        ``<synthetic>`` — those are not executions and are dropped), and the
+        ``result`` event's ``modelUsage`` keys. modelUsage alone is NOT
+        identity: it also bills subagents and the CLI's background helper
+        models (verified live), so it only cross-checks the turn-level
+        signals.
         """
         tool_calls = 0
         summed: int | None = None
         final: int | None = None
         init_model = ""
-        turn_models: list[str] = []  # unique, in first-seen order
+        turn_models: list[str] = []  # unique, in first-seen order; main agent only
         usage_models: list[str] = []
         try:
             with transcript.open(encoding="utf-8", errors="replace") as handle:
@@ -587,7 +531,8 @@ class ClaudeAdapter:
                         if isinstance(message, dict):
                             seen = message.get("model")
                             if (
-                                isinstance(seen, str)
+                                not event.get("parent_tool_use_id")
+                                and isinstance(seen, str)
                                 and seen
                                 and seen != "<synthetic>"
                                 and seen not in turn_models

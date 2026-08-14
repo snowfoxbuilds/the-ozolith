@@ -42,6 +42,12 @@ CONTAINER_JOB_PATH = "/job"
 
 MODE_RUN = "run"
 MODE_REVIEW = "review"
+# The setup dry-run (ADR-0045): the harness runs the identity checks and
+# the one-time probe session, writes identity.json + status, and exits —
+# no task file, no workdir, no agent process. Driven once per driver
+# process per run image, from a dot-prefixed job dir the evidence sweep
+# and queue-behind ignore.
+MODE_DRYRUN = "identity-dryrun"
 
 # Harness phases, in order of appearance in output/status.json.
 PHASE_STARTING = "starting"
