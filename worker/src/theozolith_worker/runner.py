@@ -60,7 +60,7 @@ from theozolith_worker.containers import (
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import Comment, GitHubClient, Issue
-from theozolith_worker.identity import IDENTITY_ERROR_PREFIX
+from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 
@@ -579,8 +579,9 @@ def _run_to_pr(
             # ADR-0045: the harness marks identity-gate failures (preflight,
             # gate, mid-run drift) with a distinct prefix — a policy problem,
             # not harness breakage, and retrying it burns the same budget
-            # against the same policy.
-            if IDENTITY_ERROR_PREFIX in harness_error:
+            # against the same policy. Anchored, never substring: an error
+            # merely quoting the marker is not an identity verdict.
+            if identity_error_detail(harness_error) is not None:
                 raise _RunFailed(harness_error, "identity")
             raise _RunFailed(harness_error, "harness")
         if outcome is not None and outcome.timed_out:

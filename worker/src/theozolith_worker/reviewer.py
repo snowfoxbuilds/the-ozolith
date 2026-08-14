@@ -26,6 +26,14 @@ validation error, the bundle link, and the evidence path of the offending
 verdict file. One strike; there is no driver-side retry — the judging
 agent's second chances live inside its own session via the validate-verdict
 harness job.
+
+A review session that fails its baked-identity gate (ADR-0045; the harness
+status carries the anchored ``identity:`` marker) takes the same one-strike
+lane: identity.json and the transcript are published as evidence with
+``failure_class: identity``, then blocked + needs_human — the PR leaves the
+reviewable pool instead of relaunching an identical doomed review every
+poll. Other harness breakage keeps its existing behavior (the pass-level
+error summary).
 """
 
 from __future__ import annotations
@@ -59,7 +67,8 @@ from theozolith_worker.containers import (
 from theozolith_worker.decisions import section_text
 from theozolith_worker.events import EventSink, emit_error, make_sink, review_event
 from theozolith_worker.githubapi import GitHubClient, PullRequest
-from theozolith_worker.sessions import SessionFactory
+from theozolith_worker.identity import identity_error_detail
+from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.signals import compute_signals
 
 DIFF_LIMIT = 200_000
@@ -274,7 +283,35 @@ def review_pr(
         session = session_factory(spec, job, manifest)
         session.launch()
         try:
-            session.wait_for_agent()
+            try:
+                session.wait_for_agent()
+            except SessionError as exc:
+                # ADR-0045: an identity-gate failure (anchored marker, never
+                # substring) means the review session's baked model/effort
+                # could not be proven — no verdict exists and every re-poll
+                # would replay the same failure against the same policy. It
+                # takes the one-strike escalation lane; any other session
+                # breakage keeps its current behavior (the pass-level error
+                # summary) unchanged.
+                detail = identity_error_detail(str(exc))
+                if detail is None:
+                    raise
+                escalated = _escalate_identity_failure(
+                    config,
+                    client,
+                    pr,
+                    issue_number,
+                    round_number,
+                    detail,
+                    job,
+                    bundle_url,
+                    _read_transcript(job),
+                    container,
+                    log,
+                    sink=sink,
+                )
+                _emit_review(sink, config, pr, issue_number, escalated)
+                return escalated
         finally:
             session.finish()
 
@@ -392,6 +429,73 @@ def _escalate_invalid_verdict(
         evidence=(
             "The review session produced an invalid verdict; escalating to a human "
             f"(one strike, no retry — ADR-0014). Validation error: {reason}. {location}"
+        ),
+        bundle_url=bundle_url,
+    )
+    _publish(client, pr, issue_number, result, log)
+    return result
+
+
+def _escalate_identity_failure(
+    config: DriverConfig,
+    client: GitHubClient,
+    pr: PullRequest,
+    issue_number: int,
+    round_number: int,
+    reason: str,
+    job: Path,
+    bundle_url: str,
+    transcript: str,
+    container: str,
+    log,
+    sink: EventSink | None = None,
+) -> verdict.Verdict:
+    """The one-strike lane for a review session that failed its baked
+    identity gate (ADR-0045): evidence first — the harness's redacted
+    identity.json and whatever transcript exists survive the job dir — then
+    blocked + needs_human, so the PR leaves the reviewable pool instead of
+    relaunching an identical doomed review on every poll. The record carries
+    ``failure_class: identity``, the same class the Implementer lane uses,
+    so evidence queries see one vocabulary."""
+    prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-identity"
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
+    record = {
+        "pr": pr.number,
+        "issue": issue_number,
+        "round": round_number,
+        "verdict": None,
+        "error": reason,
+        "failure_class": "identity",
+        "head": pr.head_sha,
+        # ADR-0045: image identity (its tag covers the baked model) plus the
+        # reconciled stream-observed model and the harness's baked-identity
+        # verdict — expected vs observed, category, and whether the task
+        # (here: the review prompt) was ever released.
+        "run_image": config.run_image,
+        "model": stats.model,
+        "model_note": stats.model_note,
+        "identity": jobdir.read_identity(job),
+        "container": container,
+    }
+    files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
+    if transcript:
+        files[f"{prefix}-transcript.txt"] = transcript
+    _push_evidence_files(
+        config,
+        files,
+        message=f"Evidence: identity failure, review round {round_number} (issue #{issue_number})",
+        log=log,
+        context=f"PR #{pr.number}",
+        sink=sink,
+    )
+
+    result = verdict.Verdict(
+        verdict=verdict.ESCALATE,
+        round=round_number,
+        evidence=(
+            "The review session failed its baked-identity gate before any"
+            " verdict existed; escalating to a human (one strike, no retry —"
+            f" ADR-0045). Identity failure: {reason}"
         ),
         bundle_url=bundle_url,
     )

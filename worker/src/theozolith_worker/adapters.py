@@ -166,11 +166,21 @@ class AgentAdapter(Protocol):
         ``AgentAdapterError`` on an inconsistent or corrupt declaration."""
         ...
 
-    def preflight(self, identity: BakedIdentity, *, root: Path, scratch: Path) -> PreflightReport:
+    def preflight(
+        self,
+        identity: BakedIdentity,
+        *,
+        root: Path,
+        scratch: Path,
+        deadline: float | None = None,
+        clock=None,
+    ) -> PreflightReport:
         """The pre-launch runtime gate, with the Run's own credential and
         effective policy, run entirely inside the pre-verification boundary
         (neutral scratch, no tools, no project sources, task file withheld).
-        A failed report means the task session was never even launched."""
+        ``deadline`` is the Run's single end-to-end budget on ``clock`` —
+        every verification step runs under what remains of it. A failed
+        report means the task session was never even launched."""
         ...
 
     def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
@@ -229,14 +239,19 @@ class ClaudeAdapter:
     # enforcement 2.1.175, alias substitution 2.1.222, per-key managed
     # ``env`` merge 2.1.223), but the fail-closed gate additionally relies
     # on: the Stop-hook payload carrying the applied (post-clamp) effort,
-    # the ConfigChange hook, ``--setting-sources ""`` and ``--tools ""``
-    # isolation, ``--permission-mode dontAsk``, a ``--settings`` PreToolUse
-    # deny hook binding under ``--dangerously-skip-permissions``, and the
-    # managed ``forceRemoteSettingsRefresh`` key — the whole set verified
-    # live on 2.1.232, which is therefore the floor: a CLI where any of
-    # these is missing would either fail every Run with a confusing error
-    # (unknown flag) or silently void a guarantee (an ignored freshness
-    # key), and the floor turns both into the clear cli-too-old category.
+    # the Stop hook firing once per completed turn in stream-json input
+    # mode (the probe/task boundary), the ConfigChange hook,
+    # ``--setting-sources ""`` and ``--tools ""`` isolation (including on
+    # the gated TASK session, where it must suppress user/project/local
+    # settings — and does suppress CLAUDE.md/skills — while ``--settings``
+    # hooks stay active), ``--permission-mode dontAsk``, a ``--settings``
+    # PreToolUse deny hook binding under
+    # ``--dangerously-skip-permissions``, and the managed
+    # ``forceRemoteSettingsRefresh`` key — the whole set verified live on
+    # 2.1.232, which is therefore the floor: a CLI where any of these is
+    # missing would either fail every Run with a confusing error (unknown
+    # flag) or silently void a guarantee (an ignored freshness key), and
+    # the floor turns both into the clear cli-too-old category.
     MIN_ENFORCING_CLI = (2, 1, 232)
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
@@ -394,9 +409,17 @@ class ClaudeAdapter:
             raise AgentAdapterError(str(exc)) from exc
 
     def preflight(
-        self, identity: BakedIdentity, *, root: Path, scratch: Path, run=subprocess.run
+        self,
+        identity: BakedIdentity,
+        *,
+        root: Path,
+        scratch: Path,
+        run=subprocess.run,
+        deadline: float | None = None,
+        clock=None,
     ) -> PreflightReport:
         scratch.mkdir(parents=True, exist_ok=True)
+        kwargs = {} if clock is None else {"clock": clock}
         return identity_mod.run_preflight(
             identity,
             binary=self._binary,
@@ -404,22 +427,40 @@ class ClaudeAdapter:
             scratch=scratch,
             min_cli=self.MIN_ENFORCING_CLI,
             run=run,
+            deadline=deadline,
+            **kwargs,
         )
 
     def guarded_command(self, manifest: Manifest, gate: TaskGate) -> list[str]:
         # The gated variant of command(): input arrives as stream-json user
         # messages over stdin, so the harness can run the no-op probe turn
         # and verify the session's identity before the real task prompt (or
-        # even the task FILE) exists for the process. Three hooks ride in
-        # via --settings (a source managed settings always outrank, so none
-        # of this can weaken enforcement):
+        # even the task FILE) exists for the process.
+        #
+        # The session loads NO user/project/local settings source
+        # (--setting-sources ""): an initial checkout or home-directory
+        # settings key — env.ANTHROPIC_BASE_URL, a Bedrock/Vertex switch,
+        # modelOverrides, a model/effort selector, or an identity surface
+        # not yet invented — must never enter the one session that will
+        # hold the task, and disabling the sources closes them all at once
+        # instead of scanning for the known ones (verified live on 2.1.232:
+        # a booby-trapped checkout's settings do not load). The cost,
+        # equally verified: the checkout's CLAUDE.md, skills, and slash
+        # commands ride the project settings source and do not load either
+        # — the task file is the session's complete assignment (ADR-0045).
+        #
+        # Three hooks ride in via --settings, which stays active under
+        # --setting-sources "" (managed settings always outrank, so none of
+        # this can weaken enforcement):
         # - PreToolUse: denies EVERY tool call until the harness creates the
         #   release marker — binding even under --dangerously-skip-permissions
         #   (verified live), so an adversarially substituted model that emits
         #   a tool call during the probe turn gets a denial, not an execution.
-        # - Stop (effort baked only): captures the APPLIED effort per turn —
-        #   the machine-readable observation of an organization effort cap,
-        #   which clamps silently in stream-json.
+        # - Stop (always, effort baked or not): appends one turn-boundary
+        #   record per completed turn — the probe/task boundary the release
+        #   waits on, the task-processed proof, and (when effort is baked)
+        #   the applied-effort observation an organization cap would clamp
+        #   silently in stream-json.
         # - ConfigChange: records identity-relevant mid-session settings
         #   changes (never blocks them) for the guard to kill on.
         gate_command = (
@@ -430,6 +471,18 @@ class ClaudeAdapter:
         hooks: dict = {
             "PreToolUse": [
                 {"matcher": "*", "hooks": [{"type": "command", "command": gate_command}]}
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "python3 "
+                            f"{shlex.quote(str(gate.stop_hook_script))} "
+                            f"{shlex.quote(str(gate.stop_capture))}",
+                        }
+                    ]
+                }
             ],
             "ConfigChange": [
                 {
@@ -444,17 +497,6 @@ class ClaudeAdapter:
                 }
             ],
         }
-        if gate.effort_capture is not None:
-            hooks["Stop"] = [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"cat > {shlex.quote(str(gate.effort_capture))}",
-                        }
-                    ]
-                }
-            ]
         return [
             self._binary,
             "-p",
@@ -464,6 +506,8 @@ class ClaudeAdapter:
             "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
             "--settings",
             json.dumps({"hooks": hooks}),
         ]
@@ -588,8 +632,12 @@ def _reconcile_models(
     means the session was remapped or fell back after announcing itself, and
     a turn model absent from the usage records means the two halves of the
     stream disagree. Every disagreement lands in the note; extra usage-only
-    models are expected (background helpers) and ignored.
+    models are expected (background helpers) and ignored, and comparisons
+    strip the CLI's context-window decoration (init and usage announce e.g.
+    "claude-opus-5[1m]" while the turns execute "claude-opus-5" — the same
+    model, not a disagreement).
     """
+    normalize = identity_mod.normalize_model
     if not turn_models:
         if init_model:
             return init_model, (
@@ -607,9 +655,10 @@ def _reconcile_models(
         # but never as the whole story.
         notes.append(f"multiple models executed turns: {', '.join(turn_models)}")
     model = turn_models[-1]
-    if init_model and init_model not in turn_models:
+    normalized_turns = {normalize(turn) for turn in turn_models}
+    if init_model and normalize(init_model) not in normalized_turns:
         notes.append(f"session initialized as {init_model} but executed {model}")
-    if usage_models and not any(turn in usage_models for turn in turn_models):
+    if usage_models and not normalized_turns & {normalize(used) for used in usage_models}:
         notes.append(
             f"usage records ({', '.join(sorted(usage_models))}) do not include any executed model"
         )

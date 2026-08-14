@@ -16,17 +16,25 @@ and removed from disk, so no pre-verification process can read it. The
 adapter's preflight then proves the effective policy with the Run's own
 credential in a neutral scratch outside the job mount — canaries and an
 identity probe with no tools, no project sources, no MCP. Only after that
-proof is the task session launched at all, stdin-driven, with every tool
-denied by a release-marker hook, and its first turn a no-op probe; the task
-file is restored and the pointer prompt sent only once the session's own
-announced and executed identity match. The release is atomic and observable:
-``released`` is recorded only after the task input write and delivery
-succeed, delivery failures are classified (task-delivery vs stdin-close),
-and an exit that never processed the released task is a failure, not a
-completed Run. A violation at any point — preflight, gate, delivery,
-mid-session drift, or an identity-affecting ConfigChange — kills the agent
-and fails the Run with a distinct ``identity:`` error (and stable category)
-the driver classifies separately.
+proof is the task session launched at all — itself loading NO user/project/
+local settings source, so nothing a checkout or home directory declares can
+steer it — stdin-driven, with every tool denied by a release-marker hook,
+and its first turn a no-op probe; the task file is restored and the pointer
+prompt sent only once the session's own announced and executed identity
+match AND the probe turn has completely stopped (its record in the
+Stop-hook turn journal, the probe/task boundary). One deadline, started
+before the preflight, budgets verification and task together: exhausting it
+pre-release withholds the task with the timeout category, and the driver's
+own wait (agent timeout + grace) can never expire first. The release is
+atomic and observable: ``released`` is recorded only after the task input
+write and delivery succeed, delivery failures are classified (task-delivery
+vs stdin-close), and an exit whose journal shows no completed post-release
+turn is ``task-unprocessed``, never a completed Run. A violation at any
+point — a corrupt identity declaration, a boundary that cannot be
+established, preflight, gate, delivery, mid-session drift, or an
+identity-affecting ConfigChange — kills the agent and fails the Run with a
+distinct ``identity:`` error, a stable category, and a redacted
+``output/identity.json`` record the driver embeds into evidence.
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ from typing import Protocol
 from theozolith_worker import shell
 from theozolith_worker.adapters import AgentAdapterError, make_agent_adapter
 from theozolith_worker.identity import (
+    CATEGORY_INCONSISTENT,
     CATEGORY_STDIN_CLOSE,
     CATEGORY_TASK_DELIVERY,
     CATEGORY_TASK_UNPROCESSED,
@@ -56,6 +65,7 @@ from theozolith_worker.identity import (
     GUARD_KILL,
     GUARD_RELEASE,
     IDENTITY_ERROR_PREFIX,
+    STOP_HOOK_SOURCE,
     TaskGate,
 )
 from theozolith_worker.jobdir import (
@@ -306,17 +316,28 @@ def await_guarded(
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     kill_grace_seconds: float = KILL_GRACE_SECONDS,
     release_timeout_seconds: float = GATE_RELEASE_TIMEOUT_SECONDS,
+    deadline: float | None = None,
 ) -> tuple[AgentOutcome, str, str, bool]:
     """The gated wait (ADR-0045): feed the growing transcript to the session
     guard; run the release protocol only when the guard verifies the
     session's identity; keep monitoring after release and kill on drift.
 
+    ``deadline`` is the Run's single end-to-end budget (started before the
+    preflight): the release wait ends at the earlier of it and the release
+    timeout, and the task itself runs only until it — verification time is
+    never silently added on top of ``agent_timeout_seconds``. Without one,
+    the budget is the manifest timeout from this call.
+
     Returns ``(outcome, violation, category, released)`` — a nonempty
     violation means the Run is invalid (category names the stable failure
     class), and ``released`` says whether the task prompt ever entered the
-    process. A zero exit that never processed the released task (no task
-    turn observed) is a violation, not a completed Run."""
+    process. A zero exit that never processed the released task (no
+    completed post-release turn in the boundary journal) is a violation,
+    not a completed Run."""
     start = clock()
+    if deadline is None:
+        deadline = start + manifest.agent_timeout_seconds
+    release_deadline = min(start + release_timeout_seconds, deadline)
     offset = 0
     buffer = ""
     released = False
@@ -366,12 +387,15 @@ def await_guarded(
                 )
             if code == 0 and guard.task_turns == 0:
                 # Exit zero after only the probe: the released task was never
-                # observably processed — a stdin EOF race or a session that
-                # quit early must not become a completed Run.
+                # observably processed — a stdin EOF race, a session that
+                # quit early, or residual probe output must not become a
+                # completed Run. The proof is the boundary journal (a
+                # completed post-release turn), never a late-read assistant
+                # event.
                 return (
                     AgentOutcome(),
                     "the agent exited without processing the released task"
-                    " (no post-release turn observed)",
+                    " (no completed post-release turn in the boundary journal)",
                     CATEGORY_TASK_UNPROCESSED,
                     released,
                 )
@@ -382,16 +406,14 @@ def await_guarded(
                 released,
             )
         now = clock()
-        if not released and now - start >= min(
-            release_timeout_seconds, manifest.agent_timeout_seconds
-        ):
+        if not released and now >= release_deadline:
             return killed(
                 "the session identity could not be verified within"
-                f" {min(release_timeout_seconds, manifest.agent_timeout_seconds):.0f}s"
-                " — the task prompt was never sent",
+                f" {max(release_deadline - start, 0):.0f}s (the remaining"
+                " verification budget) — the task prompt was never sent",
                 CATEGORY_TIMEOUT,
             )
-        if now - start >= manifest.agent_timeout_seconds:
+        if now >= deadline:
             _shutdown(
                 process,
                 clock=clock,
@@ -469,17 +491,49 @@ def run_harness(
     env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
     pointer = POINTER_PROMPT.format(path=task_file)
 
+    identity_record: dict = {
+        "expected_model": "",
+        "expected_effort": "",
+        "preflight": "",
+        "category": "",
+        "detail": "",
+        "cli_version": "",
+        "canary_model": "",
+        "probe_model": "",
+        "probe_effort": "",
+        "released": False,
+        "violation": "",
+        "observed_model": "",
+        "observed_effort": "",
+        "probe_turns": 0,
+        "task_turns": 0,
+    }
+
+    def fail_identity(category: str, detail: str) -> int:
+        """One identity failure, everywhere it must land: the redacted
+        identity.json (full record shape, internally consistent — nothing
+        released, nothing observed, no turns) and the marked status error
+        the driver classifies as failure_class identity."""
+        identity_record.update(preflight=f"failed:{category}", category=category, detail=detail)
+        with contextlib.suppress(OSError):
+            write_identity(job, identity_record)
+        write_status(
+            job,
+            Status(phase=PHASE_FAILED, error=f"{IDENTITY_ERROR_PREFIX}[{category}] {detail}"),
+        )
+        return 1
+
     # The identity gate (ADR-0045): an image that declares a baked identity
     # must prove it effective before the task prompt is sent; an image that
     # declares none (a model-less worker type) launches exactly as before.
+    # A corrupt or half-declared identity is identity-inconsistent — it gets
+    # the same redacted evidence record as any later gate failure.
     try:
         identity = adapter.baked_identity(identity_root)
     except AgentAdapterError as exc:
-        write_status(job, Status(phase=PHASE_FAILED, error=f"{IDENTITY_ERROR_PREFIX}{exc}"))
-        return 1
+        return fail_identity(CATEGORY_INCONSISTENT, str(exc))
     guard = None
     gate: TaskGate | None = None
-    identity_record: dict = {}
     withheld_task = ""
 
     def restore_task() -> None:
@@ -491,41 +545,62 @@ def run_harness(
                 atomic_write(task_file, withheld_task)
 
     if identity is not None:
+        identity_record.update(expected_model=identity.model, expected_effort=identity.effort)
+        # ONE deadline budgets everything from here to task exit (ADR-0045):
+        # started before the preflight, so verification spends the Run's own
+        # agent_timeout_seconds — never a silent extension of it, and the
+        # driver's wait (agent timeout + its grace) can never expire first.
+        deadline = clock() + manifest.agent_timeout_seconds
         # The pre-verification boundary starts here: the task input leaves
         # the disk before ANY subprocess runs, and every verification
-        # session works in a neutral scratch outside the job mount.
-        scratch = (
-            scratch_root
-            if scratch_root is not None
-            else Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
-        )
-        preflight_dir = scratch / "preflight"
-        preflight_dir.mkdir(parents=True, exist_ok=True)
-        withheld_task = task_file.read_text(encoding="utf-8")
-        task_file.unlink()
+        # session works in a neutral scratch outside the job mount. A
+        # boundary that cannot be established (scratch, withhold, or hook
+        # I/O failure) is an identity failure with the task withheld — never
+        # a generic harness crash.
         try:
-            report = adapter.preflight(identity, root=identity_root, scratch=preflight_dir)
+            scratch = (
+                scratch_root
+                if scratch_root is not None
+                else Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
+            )
+            preflight_dir = scratch / "preflight"
+            preflight_dir.mkdir(parents=True, exist_ok=True)
+            withheld_task = task_file.read_text(encoding="utf-8")
+            task_file.unlink()
+        except OSError as exc:
+            restore_task()
+            return fail_identity(
+                CATEGORY_UNVERIFIABLE,
+                f"the pre-verification boundary could not be established ({exc})"
+                " — the task session was never launched",
+            )
+        try:
+            report = adapter.preflight(
+                identity,
+                root=identity_root,
+                scratch=preflight_dir,
+                deadline=deadline,
+                clock=clock,
+            )
         except AgentAdapterError as exc:
             restore_task()
-            write_status(job, Status(phase=PHASE_FAILED, error=f"{IDENTITY_ERROR_PREFIX}{exc}"))
-            return 1
-        identity_record = {
-            "expected_model": report.expected_model,
-            "expected_effort": report.expected_effort,
-            "preflight": "passed" if report.ok else f"failed:{report.category}",
-            "category": "" if report.ok else report.category,
-            "detail": report.detail,
-            "cli_version": report.cli_version,
-            "canary_model": report.canary_model,
-            "probe_model": report.probe_model,
-            "probe_effort": report.probe_effort,
-            "released": False,
-            "violation": "",
-            "observed_model": "",
-            "observed_effort": "",
-            "probe_turns": 0,
-            "task_turns": 0,
-        }
+            return fail_identity(CATEGORY_UNVERIFIABLE, str(exc))
+        except OSError as exc:
+            restore_task()
+            return fail_identity(
+                CATEGORY_UNVERIFIABLE,
+                f"the pre-verification boundary could not be established ({exc})"
+                " — the task session was never launched",
+            )
+        identity_record.update(
+            preflight="passed" if report.ok else f"failed:{report.category}",
+            category="" if report.ok else report.category,
+            detail=report.detail,
+            cli_version=report.cli_version,
+            canary_model=report.canary_model,
+            probe_model=report.probe_model,
+            probe_effort=report.probe_effort,
+        )
         write_identity(job, identity_record)
         if not report.ok:
             restore_task()
@@ -534,15 +609,25 @@ def run_harness(
                 Status(phase=PHASE_FAILED, error=IDENTITY_ERROR_PREFIX + report.describe()),
             )
             return 1
-        gate_dir = scratch / "gate"
-        gate_dir.mkdir(parents=True, exist_ok=True)
-        gate = TaskGate(
-            release_marker=gate_dir / "released",
-            effort_capture=(gate_dir / "effort.json") if identity.effort else None,
-            config_capture=gate_dir / "config-change.jsonl",
-            config_hook_script=gate_dir / "configchange_hook.py",
-        )
-        gate.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
+        try:
+            gate_dir = scratch / "gate"
+            gate_dir.mkdir(parents=True, exist_ok=True)
+            gate = TaskGate(
+                release_marker=gate_dir / "released",
+                stop_capture=gate_dir / "stop.jsonl",
+                config_capture=gate_dir / "config-change.jsonl",
+                config_hook_script=gate_dir / "configchange_hook.py",
+                stop_hook_script=gate_dir / "stop_hook.py",
+            )
+            gate.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
+            gate.stop_hook_script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
+        except OSError as exc:
+            restore_task()
+            return fail_identity(
+                CATEGORY_UNVERIFIABLE,
+                f"the gate hooks could not be materialized ({exc}) — the task"
+                " session was never launched",
+            )
         guard = adapter.session_guard(identity, gate)
         argv = adapter.guarded_command(manifest, gate)
     else:
@@ -615,6 +700,7 @@ def run_harness(
                 clock=clock,
                 sleep=sleep,
                 poll_seconds=poll_seconds,
+                deadline=deadline,
             )
             identity_record.update(
                 released=released,
