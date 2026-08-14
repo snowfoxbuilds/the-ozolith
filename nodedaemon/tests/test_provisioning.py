@@ -775,6 +775,28 @@ def test_persist_rewrite_tightens_loose_permissions(tmp_path):
     assert not token.is_symlink()
 
 
+def test_planted_symlink_survives_a_real_provision_exchange(tmp_path):
+    """The refusal holds through the FULL provision() flow — a real join
+    exchange against a live Control Node, not just _persist in isolation
+    (OZ-02). The external target is spared; the token symlink is never
+    replaced. The exchange did run (its token is spent), so recovery is a
+    fresh join string — the documented reprovision path, not a silent
+    arbitrary-file overwrite."""
+    state = tmp_path / "state"
+    state.mkdir()
+    victim = tmp_path / "outside-secret"
+    victim.write_text("SENSITIVE-UNTOUCHED\n")
+    (state / provisioning.NODE_TOKEN_FILE).symlink_to(victim)
+
+    with LiveControl(tmp_path) as live:
+        join = live.join_string()
+        with pytest.raises(ProvisionError, match="not a regular file"):
+            provisioning.provision(join, state_dir=state, node_name="victim", enable_systemd=False)
+
+    assert victim.read_text() == "SENSITIVE-UNTOUCHED\n"  # the external file is intact
+    assert (state / provisioning.NODE_TOKEN_FILE).is_symlink()  # never replaced by our write
+
+
 # -- acceptance 14: the node distribution stays stdlib-only ----------------------
 
 

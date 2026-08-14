@@ -179,6 +179,35 @@ def test_join_token_page_is_never_cached(control: ControlRig):
     assert resp.headers["Cache-Control"] == "no-store"
 
 
+def test_terminal_inline_script_carries_the_csp_nonce(control: ControlRig):
+    """The terminal's inline bootstrap must carry the per-response CSP nonce,
+    or a production browser blocks it under our nonce-only script-src (OZ-07).
+    Render the REAL ok-branch (a live attach-capable container) and assert the
+    inline <script>'s nonce equals the response's CSP nonce — the wiring that
+    happy-path header tests never exercise."""
+    control.write_config("stacks/flightdeck.toml", FLIGHTDECK_STACK_TOML)
+    login(control)
+    control.heartbeat(
+        node="box1",
+        stacks=[{"name": "flightdeck", "kind": "container", "state": "running", "detail": ""}],
+        stack_containers=[
+            {
+                "name": FLIGHTDECK_CONTAINER,
+                "stack": "flightdeck",
+                "state": "running",
+                "status": "Up",
+            }
+        ],
+    )
+    resp = control.client.get(
+        "/terminal", params={"node": "box1", "container": FLIGHTDECK_CONTAINER}
+    )
+    assert resp.status_code == 200
+    assert 'id="terminal"' in resp.text  # the ok-branch actually rendered
+    nonce = resp.headers["Content-Security-Policy"].split("'nonce-")[1].split("'")[0]
+    assert nonce and f'<script nonce="{nonce}">' in resp.text
+
+
 # -- the fleet fragment (acceptances 1 and 4) ------------------------------------
 
 
