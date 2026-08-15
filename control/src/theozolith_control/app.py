@@ -258,8 +258,14 @@ def create_app(
         # version, never command acks. Persistent off-pin escalates: one
         # restart command at the threshold, a theozolith.error after that —
         # the node stays dispatch-ineligible until a human intervenes.
+        # Deferring is NOT diverging (issue #8): while the daemon reports its
+        # update queued behind an in-flight Run, the ladder resets — counting
+        # resumes the moment the deferral clears, so a genuinely stuck node
+        # still climbs to restart and escalation.
         reported = str(body.get("version", ""))
-        action = store.observe_version(node, reported, pin, settings.offpin_beats)
+        action = store.observe_version(
+            node, reported, pin, settings.offpin_beats, deferred=bool(body.get("update_deferred"))
+        )
         if action == "escalated":
             store.record_event(
                 {
@@ -279,7 +285,11 @@ def create_app(
         # error ladder, same knob. The reference desired hash rode config_doc.
         desired_drivers = str(config_doc.get("drivers_hash") or "")
         drivers_action = store.observe_drivers(
-            node, reported_drivers, desired_drivers, settings.offpin_beats
+            node,
+            reported_drivers,
+            desired_drivers,
+            settings.offpin_beats,
+            deferred=bool(body.get("drivers_deferred")),
         )
         if drivers_action == "escalated":
             store.record_event(
