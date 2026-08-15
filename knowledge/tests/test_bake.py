@@ -99,6 +99,7 @@ def _docker_available() -> bool:
     return subprocess.run(["docker", "info"], capture_output=True).returncode == 0
 
 
+@pytest.mark.docker
 @pytest.mark.skipif(not _docker_available(), reason="docker unavailable")
 def test_bake_in_docker_build(tmp_path, sample_knowledge):
     context = tmp_path / "context"

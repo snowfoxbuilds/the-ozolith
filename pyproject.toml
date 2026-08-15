@@ -34,3 +34,6 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 # shared helpers in uniquely named modules (daemonrig, controlrig) instead.
 testpaths = ["knowledge/tests", "control/tests", "nodedaemon/tests", "worker/tests"]
 addopts = "-q"
+markers = [
+    "docker: builds a real Docker image (needs a docker daemon); runs once in the full test job, deselected in knowledge-isolated",
+]
