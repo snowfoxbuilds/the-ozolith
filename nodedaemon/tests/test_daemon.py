@@ -313,6 +313,37 @@ def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
     assert rig.update_calls and rig.execv_calls  # applied after the Run
 
 
+def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
+    """Issue #8: the pin and drivers-hash queue-behind deferrals are
+    desired-state deferrals — no command id — so they ride dedicated
+    heartbeat fields for the control-side convergence ladders to pause on
+    instead of escalating a healthy drain."""
+    stack, jobs = _driver_stack(tmp_path)
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+    rig.daemon.once()  # the driver child is up; nothing deferred yet
+    body = rig.control.transcript[-1][2]
+    assert body["update_deferred"] == "" and body["drivers_deferred"] == ""
+    (jobs / "r1").mkdir(parents=True)
+
+    pinned = {
+        "commands": [],
+        "config": {**desired([stack]), "product_version": "0.4.0", "drivers_hash": "a" * 64},
+    }
+    rig.control.heartbeat_answers.append(dict(pinned))
+    rig.daemon.once()  # both convergences defer behind the Run...
+    rig.control.heartbeat_answers.append(dict(pinned))
+    rig.daemon.once()  # ...and the NEXT heartbeat carries both deferrals
+    body = rig.control.transcript[-1][2]
+    assert body["update_deferred"] == "behind run r1 (stack worker)"
+    assert body["drivers_deferred"] == "behind run r1 (stack worker)"
+    assert rig.update_calls == [] and rig.execv_calls == []
+
+    shutil.rmtree(jobs / "r1")
+    rig.control.heartbeat_answers.append(dict(pinned))
+    rig.daemon.once()  # the Run ended: the product update applies this pass
+    assert rig.update_calls and rig.execv_calls
+
+
 def test_restart_command_reexecs_without_installing(rig: Rig):
     """The off-pin escalation step: stop the tree and re-exec in place —
     no install (convergence owns installs)."""

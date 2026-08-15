@@ -335,6 +335,54 @@ def test_persistently_offpin_node_gets_restart_then_error_and_stays_ineligible(
     assert control.dispatch(node="box1").json()["issue"]["number"] == 7
 
 
+def test_deferred_update_behind_a_run_never_restarts_or_escalates(control: ControlRig):
+    """Issue #8: a node off-pin solely because its update is queued behind
+    an in-flight Run trips nothing — no restart command, no error event —
+    for arbitrarily many beats; it converges right after the Run ends."""
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    # Far past 2x the threshold in deferral beats: the ladder never moves.
+    for _ in range(8):
+        beat = control.heartbeat(
+            node="box1", version="0.3.0", update_deferred="behind run r1 (stack worker)"
+        )
+        assert beat.json()["commands"] == []
+    assert control.store.error_events(component="control-node") == []
+    # Off-pin still pauses dispatch to the node meanwhile — that gate is
+    # keyed on the reported version, not on the ladder.
+    assert control.dispatch(node="box1").json()["issue"] is None
+    # The Run ended, the update applied: dispatch reopens, nothing queued.
+    control.heartbeat(node="box1", version="0.4.0")
+    assert control.dispatch(node="box1").json()["issue"]["number"] == 7
+    state = control.admin("GET", "/api/v1/state").json()
+    assert [c["verb"] for c in state["commands"] if c["verb"] == "restart"] == []
+
+
+def test_deferral_resets_the_climb_and_counting_resumes_when_it_clears(control: ControlRig):
+    """Issue #8 acceptance 3: a deferral beat restores full patience; once
+    the deferral clears, a genuinely stuck node still climbs to restart and
+    escalation — needing the full threshold again, not the old residue."""
+    control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    for _ in range(2):
+        control.heartbeat(node="box1", version="0.3.0")  # two undeferred beats
+    beat = control.heartbeat(
+        node="box1", version="0.3.0", update_deferred="behind run r1 (stack worker)"
+    )
+    assert beat.json()["commands"] == []  # the reset beat — no third-strike restart
+    # The deferral cleared but the node stays off-pin (a stuck install):
+    # the ladder climbs from zero to the restart rung...
+    for _ in range(2):
+        assert control.heartbeat(node="box1", version="0.3.0").json()["commands"] == []
+    beat = control.heartbeat(node="box1", version="0.3.0").json()
+    assert [c["verb"] for c in beat["commands"]] == ["restart"]
+    restart_id = beat["commands"][0]["id"]
+    # ...and on to its escalation, exactly as before.
+    for _ in range(3):
+        control.heartbeat(node="box1", version="0.3.0", completed_commands=[restart_id])
+    errors = control.store.error_events(component="control-node")
+    assert [e["payload"]["error_class"] for e in errors] == ["update-not-converging"]
+
+
 def test_dispatch_reviewer_side_is_discovery_only(control: ControlRig):
     control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
     control.github.add_pr(12, head_ref="ozolith/issue-6", labels={"pr_ready", "needs_human"})
@@ -742,6 +790,23 @@ def test_persistently_offhash_node_gets_restart_then_error(control: ControlRig):
     # Convergence clears it.
     control.heartbeat(node="box1", drivers_hash=digest)
     assert control.store.observe_drivers("box1", digest, digest, 3) is None
+
+
+def test_deferred_drivers_swap_behind_a_run_never_restarts_or_escalates(control: ControlRig):
+    """Issue #8, drivers ladder: a swap queued behind an in-flight Run is
+    not divergence — the config-dist ladder pauses exactly like the pin's."""
+    digest = _write_driver(control)
+    off = "c" * 64
+    for _ in range(8):
+        beat = control.heartbeat(
+            node="box1", drivers_hash=off, drivers_deferred="behind run r1 (stack worker)"
+        )
+        assert beat.json()["commands"] == []
+    assert control.store.error_events(component="control-node") == []
+    # The Run ended, the swap applied: nothing was ever queued.
+    control.heartbeat(node="box1", drivers_hash=digest)
+    state = control.admin("GET", "/api/v1/state").json()
+    assert [c["verb"] for c in state["commands"] if c["verb"] == "restart"] == []
 
 
 def test_simultaneous_offpin_and_offhash_queue_exactly_one_restart(control: ControlRig):

@@ -50,6 +50,10 @@ HEARTBEAT_REQUEST_KEYS = {
     "drivers_built_against",  # advisory stamp — a product version, never a value
     "completed_commands",
     "deferred_commands",  # queue-behind visibility (references, no values)
+    # Desired-state convergence deferrals (issue #8): run-id/stack-name
+    # references only, so the control-side ladders pause on a drain.
+    "update_deferred",
+    "drivers_deferred",
 }
 
 

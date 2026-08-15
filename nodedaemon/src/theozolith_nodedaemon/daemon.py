@@ -431,6 +431,15 @@ class NodeDaemon:
                 {"id": command_id, "reason": reason}
                 for command_id, reason in sorted(self._deferrals.items())
             ],
+            # Convergence deferrals (issue #8): the product pin and the
+            # drivers-hash are desired state, not commands, so their
+            # queue-behind deferrals never appear in deferred_commands.
+            # Reported here (last pass's decision — one beat stale by the
+            # once() ordering) so the control-side convergence ladders can
+            # tell a draining node from a stuck one and pause instead of
+            # queueing a pointless restart. "" = not deferred.
+            "update_deferred": self._update_blocker or "",
+            "drivers_deferred": self._drivers_blocker or "",
         }
 
     def _exchange_heartbeat(self) -> list[dict[str, Any]]:

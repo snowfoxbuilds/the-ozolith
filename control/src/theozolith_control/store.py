@@ -503,19 +503,33 @@ class Store:
             for r in rows
         ]
 
-    def observe_version(self, node: str, reported: str, pin: str, threshold: int) -> str | None:
+    def observe_version(
+        self, node: str, reported: str, pin: str, threshold: int, *, deferred: bool = False
+    ) -> str | None:
         """Track pin convergence per heartbeat (revision ruling amending
         ADR-0015). On-pin (or no pin / no report): reset. Off-pin: count;
         at ``threshold`` consecutive off-pin beats queue one restart
         command; still off-pin ``threshold`` beats after that, mark the
         node escalated (the caller emits the theozolith.error event).
+        ``deferred`` is the node's own report that its update is queued
+        behind an in-flight Run (issue #8) — also the reset case: draining
+        is convergence working as designed, so counting accumulates only
+        while the node is off-pin AND free to converge.
         Returns the action taken: None | "restart-queued" | "escalated"."""
         # An empty reported version is "no report" for convergence (fail open),
         # so it maps to None — the reset case — exactly as before.
-        return self._observe_convergence("version_health", node, reported or None, pin, threshold)
+        return self._observe_convergence(
+            "version_health", node, reported or None, pin, threshold, deferred=deferred
+        )
 
     def observe_drivers(
-        self, node: str, reported: str | None, desired: str, threshold: int
+        self,
+        node: str,
+        reported: str | None,
+        desired: str,
+        threshold: int,
+        *,
+        deferred: bool = False,
     ) -> str | None:
         """Track config-distribution convergence per heartbeat (ADR-0042): the
         exact analog of ``observe_version`` for the drivers-hash. Reuses the
@@ -523,17 +537,30 @@ class Store:
         convergence patience. ``reported`` is ``None`` when the heartbeat omitted
         the field (no report — reset) and ``''`` when a current daemon explicitly
         reported no verified tree (a real off-hash report that COUNTS toward the
-        ladder, never a reset). Returns None | "restart-queued" | "escalated"."""
-        return self._observe_convergence("drivers_health", node, reported, desired, threshold)
+        ladder, never a reset). ``deferred`` pauses the ladder exactly as in
+        ``observe_version`` — a swap queued behind a Run is not divergence.
+        Returns None | "restart-queued" | "escalated"."""
+        return self._observe_convergence(
+            "drivers_health", node, reported, desired, threshold, deferred=deferred
+        )
 
     def _observe_convergence(
-        self, table: str, node: str, reported: str | None, desired: str, threshold: int
+        self,
+        table: str,
+        node: str,
+        reported: str | None,
+        desired: str,
+        threshold: int,
+        *,
+        deferred: bool = False,
     ) -> str | None:
         """The shared convergence ladder over a ``(node, offpin_beats,
         restart_queued, escalated)`` health table (version_health /
-        drivers_health): reset on match / no desired / no report; count
-        otherwise; queue one restart at ``threshold``; mark escalated at
-        ``2 * threshold``. ``table`` is a fixed module constant, never input.
+        drivers_health): reset on match / no desired / no report — or on a
+        reported queue-behind deferral (issue #8), which restores full
+        patience for the moment the drain ends; count otherwise; queue one
+        restart at ``threshold``; mark escalated at ``2 * threshold``.
+        ``table`` is a fixed module constant, never input.
 
         The two subsystems keep INDEPENDENT counters and each emits its own
         terminal error, but they share the ONE restart lever: a node that is
@@ -548,7 +575,7 @@ class Store:
             # reported is None => the field was not reported (no report — reset).
             # reported == '' is a REAL report (explicit none applied) that counts
             # as off-hash whenever a non-empty distribution is desired.
-            if not desired or reported is None or reported == desired:
+            if not desired or reported is None or reported == desired or deferred:
                 self._db.execute(f"DELETE FROM {table} WHERE node = ?", (node,))
                 return None
             self._db.execute(
