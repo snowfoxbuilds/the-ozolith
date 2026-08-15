@@ -26,20 +26,37 @@ jobs:
       - run: uv run pytest
 
   # The run-container image must always build (M2 brief: image rot is caught
-  # here, not at the first Run on a box).
+  # here, not at the first Run on a box). buildx + a GitHub Actions layer cache
+  # keeps the costly apt (node/npm) and npm-install layers warm across runs;
+  # the image is neither loaded nor pushed — building it is the whole check.
   run-image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -f worker/docker/Dockerfile.claude -t theozolith-run-claude:ci .
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/docker/Dockerfile.claude
+          tags: theozolith-run-claude:ci
+          cache-from: type=gha,scope=run-image
+          cache-to: type=gha,mode=max,scope=run-image
 
   # Same rule for the Control Node image (the hand-run compose flow —
-  # control is never a Stack; ADR-0035).
+  # control is never a Stack; ADR-0035). Cached the same way as run-image,
+  # under its own scope so the two images never evict each other's layers.
   control-image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -f control/docker/Dockerfile -t theozolith-control:ci .
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: control/docker/Dockerfile
+          tags: theozolith-control:ci
+          cache-from: type=gha,scope=control-image
+          cache-to: type=gha,mode=max,scope=control-image
 
   # The #31 spike harness's shell regression suite (stubbed docker/tailscale;
   # no engine, tailnet, or key needed): the out-of-band gate's credibility
@@ -88,7 +105,9 @@ jobs:
         run: gitleaks git . --log-opts="--all --diff-merges=first-parent" --redact --no-banner
 
   # The laptop-only user path (ADR-0007): knowledge/ must install and run
-  # with zero dependencies on cluster components.
+  # with zero dependencies on cluster components. The docker-marked bake test
+  # is deselected here — it runs once, in the full `test` job — so this job
+  # doesn't rebuild the same image a second time.
   knowledge-isolated:
     runs-on: ubuntu-latest
     steps:
@@ -99,4 +118,4 @@ jobs:
           uv venv /tmp/iso
           uv pip install --python /tmp/iso/bin/python ./knowledge pytest
       - name: Run the knowledge tests against the isolated install
-        run: /tmp/iso/bin/python -m pytest knowledge/tests
+        run: /tmp/iso/bin/python -m pytest knowledge/tests -m "not docker"
