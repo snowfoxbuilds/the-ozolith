@@ -277,6 +277,12 @@ class NodeDaemon:
         # desired state, checked every pass. True once an install succeeded
         # and the re-exec is imminent — no second attempt is in flight.
         self._update_done = False
+        # _update_blocker/_drivers_blocker are LOG-DEDUP memos only (log once
+        # per blocker change). They are never heartbeat authority: the
+        # heartbeat's deferral fields are computed fresh in _status_payload,
+        # because these memos describe the PRIOR pass and a one-beat-stale
+        # report could let the control-side ladder queue a restart before it
+        # ever saw the deferral (issue #8).
         self._update_blocker: str | None = None
         self._product_attempted = False  # per-pass latch (nudge vs. pass check)
         # Config-distribution convergence (ADR-0042): the drivers-hash is
@@ -412,6 +418,18 @@ class NodeDaemon:
             stacks.append(
                 {"name": stack.name, "kind": stack.kind, "state": state, "detail": detail}
             )
+        # Convergence deferrals (issue #8): the product pin and the
+        # drivers-hash are desired state, not commands, so their queue-behind
+        # deferrals never appear in deferred_commands. Both convergence paths
+        # gate on the same whole-node in-flight signal, so ONE current lookup
+        # serves both fields — computed HERE, as the heartbeat is constructed,
+        # never replayed from the previous pass's converge decision (a stale
+        # report can reach the control-side ladder a beat after the ladder
+        # already queued a restart). While the node is converged the value is
+        # merely a potential blocker; control pairs it with its own divergence
+        # check, so that is harmless. Run-id/stack-name references only;
+        # "" = free to converge.
+        convergence_blocker = self._inflight_blocker(None) or ""
         return {
             "node": self._config.node,
             "version": self._config.version,
@@ -431,15 +449,8 @@ class NodeDaemon:
                 {"id": command_id, "reason": reason}
                 for command_id, reason in sorted(self._deferrals.items())
             ],
-            # Convergence deferrals (issue #8): the product pin and the
-            # drivers-hash are desired state, not commands, so their
-            # queue-behind deferrals never appear in deferred_commands.
-            # Reported here (last pass's decision — one beat stale by the
-            # once() ordering) so the control-side convergence ladders can
-            # tell a draining node from a stuck one and pause instead of
-            # queueing a pointless restart. "" = not deferred.
-            "update_deferred": self._update_blocker or "",
-            "drivers_deferred": self._drivers_blocker or "",
+            "update_deferred": convergence_blocker,
+            "drivers_deferred": convergence_blocker,
         }
 
     def _exchange_heartbeat(self) -> list[dict[str, Any]]:

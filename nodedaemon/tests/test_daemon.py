@@ -316,8 +316,10 @@ def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
 def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
     """Issue #8: the pin and drivers-hash queue-behind deferrals are
     desired-state deferrals — no command id — so they ride dedicated
-    heartbeat fields for the control-side convergence ladders to pause on
-    instead of escalating a healthy drain."""
+    heartbeat fields the control-side convergence ladders pause on. The
+    fields report the in-flight blocker AS OF this heartbeat's construction
+    — never the previous pass's converge decision, whose one-beat lag would
+    let the ladder queue a restart before control ever saw the deferral."""
     stack, jobs = _driver_stack(tmp_path)
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()  # the driver child is up; nothing deferred yet
@@ -325,14 +327,22 @@ def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
     assert body["update_deferred"] == "" and body["drivers_deferred"] == ""
     (jobs / "r1").mkdir(parents=True)
 
+    # The VERY NEXT heartbeat carries the blocker — before the daemon has
+    # even learned of the pin bump riding this exchange's answer. While the
+    # node is converged the value is only a potential blocker; control pairs
+    # it with its own divergence check, so it is inert — what matters is
+    # that no divergent-and-undeferred beat can ever precede it.
     pinned = {
         "commands": [],
         "config": {**desired([stack]), "product_version": "0.4.0", "drivers_hash": "a" * 64},
     }
     rig.control.heartbeat_answers.append(dict(pinned))
-    rig.daemon.once()  # both convergences defer behind the Run...
+    rig.daemon.once()  # this pass's converge then defers behind the Run
+    body = rig.control.transcript[-1][2]
+    assert body["update_deferred"] == "behind run r1 (stack worker)"
+    assert body["drivers_deferred"] == "behind run r1 (stack worker)"
     rig.control.heartbeat_answers.append(dict(pinned))
-    rig.daemon.once()  # ...and the NEXT heartbeat carries both deferrals
+    rig.daemon.once()  # still draining: the deferral keeps riding
     body = rig.control.transcript[-1][2]
     assert body["update_deferred"] == "behind run r1 (stack worker)"
     assert body["drivers_deferred"] == "behind run r1 (stack worker)"
@@ -341,6 +351,8 @@ def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
     shutil.rmtree(jobs / "r1")
     rig.control.heartbeat_answers.append(dict(pinned))
     rig.daemon.once()  # the Run ended: the product update applies this pass
+    body = rig.control.transcript[-1][2]
+    assert body["update_deferred"] == "" and body["drivers_deferred"] == ""  # honest again
     assert rig.update_calls and rig.execv_calls
 
 

@@ -307,7 +307,9 @@ def test_persistently_offpin_node_gets_restart_then_error_and_stays_ineligible(
 ):
     """ADR-0015 revision acceptance 3: threshold consecutive off-pin beats
     queue one restart; as many again, one theozolith.error — and the node
-    stays ineligible until it actually converges."""
+    stays ineligible until it actually converges. These heartbeats OMIT
+    update_deferred, so this is also the legacy-daemon coverage (issue #8):
+    field absence keeps exactly the pre-deferral ladder behavior."""
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
 
@@ -773,7 +775,9 @@ def test_unreported_and_converged_and_no_recorded_hash_stay_eligible(control: Co
 
 
 def test_persistently_offhash_node_gets_restart_then_error(control: ControlRig):
-    """The config-dist ladder mirrors the pin ladder exactly (ADR-0042)."""
+    """The config-dist ladder mirrors the pin ladder exactly (ADR-0042).
+    These heartbeats OMIT drivers_deferred — the legacy-daemon fallback
+    (issue #8): field absence keeps the pre-deferral ladder behavior."""
     digest = _write_driver(control)
     off = "c" * 64
     for _ in range(2):
