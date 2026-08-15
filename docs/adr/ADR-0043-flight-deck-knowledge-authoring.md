@@ -35,6 +35,9 @@ Split ~/.claude by class:
 - **Neutral**: sessions and transcripts remain per-instance. A future
   `knowledge sync` convenience command is the upgrade path — never a
   daemon.
+- The state-volume shadowing described here is also why the Flight
+  Deck's baked default model rides the root-owned
+  `/etc/theozolith/model`, never any `~/.claude` path (ADR-0045 §4).
 
 ## Alternatives Considered
 - **Per-Flight-Deck private clones**: rejected — skill edits in one

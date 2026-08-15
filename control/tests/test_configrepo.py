@@ -654,6 +654,31 @@ def test_no_model_or_effort_means_no_materialize_step(tmp_path):
     assert recipe["setup"] == ["apt-get update"]  # exactly the operator setup
 
 
+def test_deck_tag_moves_exactly_with_model(tmp_path):
+    """Issue #39 (ADR-0045 §4): the deck's derived-image tag moves when its
+    baked default model is set or changed — and ONLY then: fields outside the
+    image identity (secrets) leave the tag alone, so Flight Decks rebuild
+    exactly when their definition's model does."""
+
+    def deck_tag(extra: str) -> str:
+        write(
+            tmp_path,
+            "worker-types/flightdeck.toml",
+            f'base = "{BASE}"\ncommand = "sleep 30"\n{extra}',
+        )
+        return load_config(tmp_path).worker_types["flightdeck"].tag
+
+    plain = deck_tag("")
+    fable = deck_tag('model = "claude-fable-5"\n')
+    sonnet = deck_tag('model = "claude-sonnet-5"\n')
+    assert len({plain, fable, sonnet}) == 3
+    assert deck_tag('[secrets]\nGITHUB_TOKEN = "flightdeck-github-token"\n') == plain
+    assert (
+        deck_tag('model = "claude-fable-5"\n[secrets]\nGITHUB_TOKEN = "flightdeck-github-token"\n')
+        == fable
+    )
+
+
 # -- thin-Stack validation & hard-cutover rejections ----------------------------
 
 

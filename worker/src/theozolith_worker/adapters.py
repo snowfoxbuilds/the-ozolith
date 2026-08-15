@@ -23,11 +23,16 @@ image bytes — part of the baked identity, not an invocation surface).
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import secrets
 import shlex
 import shutil
+import stat
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -74,6 +79,125 @@ MATERIALIZE_SCOPES = (SCOPE_MANAGED, SCOPE_INTERACTIVE)
 # to, by best effort (identity.py).
 WELL_KNOWN_MODEL_FILE = identity_mod.WELL_KNOWN_MODEL_FILE
 WELL_KNOWN_EFFORT_FILE = identity_mod.WELL_KNOWN_EFFORT_FILE
+
+
+# -- symlink-safe atomic baking (the image-identity writes) -------------------
+#
+# The well-known files and the managed settings ARE the baked identity, so the
+# writes that produce them get the trusted-descriptor treatment control's TLS
+# writer established (the OZ-01/OZ-02 doctrine): every directory component
+# below the materialize root is opened O_NOFOLLOW and fstat-verified — a
+# symlink planted anywhere on the route (a hostile base layer, debris from an
+# earlier setup step) fails the build instead of steering the write into an
+# arbitrary tree — and each file lands via a fresh O_EXCL temp plus a
+# same-directory atomic replace, so a pre-existing destination symlink's
+# target is never written through (the destination shape is refused loudly)
+# and no failure leaves a temp artifact or a half-written identity behind.
+_BAKE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# Baked identity is world-READABLE by design (a session may inspect its own
+# default) and writable by nobody but root: 0644 files in 0755 directories,
+# root-owned when the build runs as root (a real image build does; tests
+# exercise the same path against a tmp root as an ordinary user).
+_BAKE_FILE_MODE = 0o644
+_BAKE_DIR_MODE = 0o755
+
+
+@contextlib.contextmanager
+def _bake_dir(root: Path, parts: tuple[str, ...]) -> Iterator[int]:
+    """A verified descriptor for the product-owned directory ``root/<parts>``.
+
+    ``root`` is caller territory (``/`` in a real image build, a tmp dir in
+    tests) and may legitimately sit behind symlinks; every component BELOW it
+    is opened O_NOFOLLOW|O_DIRECTORY (created 0755 when missing) and
+    fstat-verified before it is trusted. The final, product-owned directory
+    is then normalized — never group/world-writable, root-owned when the
+    build runs as root — so an unprivileged runtime user cannot unlink and
+    replace the baked files through a writable or wrongly-owned parent."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for depth, name in enumerate(parts):
+            where = root.joinpath(*parts[: depth + 1])
+            try:
+                child = os.open(name, _BAKE_DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(name, _BAKE_DIR_MODE, dir_fd=fd)
+                try:
+                    child = os.open(name, _BAKE_DIR_FLAGS, dir_fd=fd)
+                except OSError as exc:
+                    raise AgentAdapterError(
+                        f"refusing to traverse {where}: not a real directory ({exc.strerror})"
+                    ) from exc
+            except OSError as exc:
+                raise AgentAdapterError(
+                    f"refusing to traverse {where}: it is a symlink or not a"
+                    f" directory ({exc.strerror})"
+                ) from exc
+            os.close(fd)
+            fd = child
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise AgentAdapterError(
+                    f"refusing to traverse {where}: opened object is not a directory"
+                )
+        os.fchmod(fd, _BAKE_DIR_MODE)
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _refuse_irregular_destination(dir_fd: int, name: str, where: Path) -> None:
+    """A destination that already exists must be a regular file: a symlink is
+    never followed (its target is never overwritten) and a special file is
+    never replaced — both fail the build loudly instead."""
+    try:
+        existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(existing.st_mode):
+        raise AgentAdapterError(
+            f"refusing to write {where}: destination is not a regular file —"
+            " a planted symlink or special file is never followed or replaced"
+        )
+
+
+def _read_regular_at(dir_fd: int, name: str) -> str | None:
+    """The current content of an already-shape-checked destination, read
+    without ever following a symlink; None when absent."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _replace_file_at(dir_fd: int, name: str, data: bytes, *, where: Path) -> None:
+    """Land one baked file atomically relative to a verified descriptor: a
+    fresh unguessably-named O_EXCL|O_NOFOLLOW temp in the same directory,
+    explicit 0644 on the descriptor (umask-independent) and root ownership
+    when the build runs as root, then a dirfd-relative replace. Failure
+    unlinks the temp — the destination is the old bytes or the new, never a
+    torn write, and nothing orphaned survives."""
+    tmp_name = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(
+        tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(fd, _BAKE_FILE_MODE)
+            if os.geteuid() == 0:
+                os.fchown(fd, 0, 0)
+            handle.write(data)
+            handle.flush()
+            os.fsync(fd)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        raise
 
 
 @dataclass(frozen=True)
@@ -342,7 +466,16 @@ class ClaudeAdapter:
         models in-session, ADR-0045 §Flight Deck), nothing under
         ``/home/ozolith/.claude`` (state-volume shadowing, ADR-0043), and no
         effort — driverless effort is rejected upstream until a runtime
-        consumer exists, and this refuses it too."""
+        consumer exists, and this refuses it too.
+
+        Both scopes share one write discipline (see ``_bake_dir`` /
+        ``_replace_file_at``): every destination is resolved through
+        O_NOFOLLOW-verified descriptors and shape-checked before anything is
+        written, then landed by same-directory atomic replace as a 0644
+        regular file (root-owned, in a normalized product-owned directory,
+        when the build runs as root). The baked identity is image bytes — a
+        steered, torn, or runtime-user-writable write is a build failure,
+        never a quiet variance."""
         if scope == SCOPE_INTERACTIVE and effort:
             raise AgentAdapterError(
                 "effort is not materializable at interactive scope — driverless"
@@ -362,31 +495,40 @@ class ClaudeAdapter:
                     " identity — refusing to overwrite operator policy;"
                     " remove or relocate the conflicting keys: " + "; ".join(conflicts)
                 )
-        written: list[Path] = []
-        pairs = [(WELL_KNOWN_MODEL_FILE, model), (WELL_KNOWN_EFFORT_FILE, effort)]
-        for relpath, value in pairs:
-            if not value:
-                continue
-            target = root / relpath
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(value + "\n", encoding="utf-8")
-            written.append(target)
+        plan: list[tuple[str, str]] = []
+        for relpath, value in ((WELL_KNOWN_MODEL_FILE, model), (WELL_KNOWN_EFFORT_FILE, effort)):
+            if value:
+                plan.append((relpath, value + "\n"))
         if scope == SCOPE_MANAGED:
-            settings = root / self.MANAGED_SETTINGS
-            settings.parent.mkdir(parents=True, exist_ok=True)
-            existing: dict = {}
-            if settings.exists():
+            plan.append((self.MANAGED_SETTINGS, ""))  # content computed below
+        written: list[Path] = []
+        with contextlib.ExitStack() as stack:
+            # Every destination is resolved and shape-checked BEFORE any
+            # write, so a refused path (planted symlink, special file,
+            # unsafe parent) fails the build with no file materialized.
+            resolved: list[tuple[int, str, Path, str]] = []
+            for relpath, content in plan:
+                parts = Path(relpath).parts
+                dir_fd = stack.enter_context(_bake_dir(root, parts[:-1]))
+                _refuse_irregular_destination(dir_fd, parts[-1], root / relpath)
+                resolved.append((dir_fd, parts[-1], root / relpath, content))
+            if scope == SCOPE_MANAGED:
+                dir_fd, name, target, _ = resolved[-1]
+                raw = _read_regular_at(dir_fd, name)
                 # The conflict scan above already proved this parses to an
                 # identity-free object; the merge preserves it verbatim.
-                existing = json.loads(settings.read_text(encoding="utf-8"))
-            if model:
-                existing["model"] = model
-            if effort:
-                existing["effortLevel"] = effort
-                env = existing.setdefault("env", {})
-                env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
-            settings.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", "utf-8")
-            written.append(settings)
+                existing: dict = json.loads(raw) if raw is not None else {}
+                if model:
+                    existing["model"] = model
+                if effort:
+                    existing["effortLevel"] = effort
+                    env = existing.setdefault("env", {})
+                    env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+                content = json.dumps(existing, indent=2, sort_keys=True) + "\n"
+                resolved[-1] = (dir_fd, name, target, content)
+            for dir_fd, name, target, content in resolved:
+                _replace_file_at(dir_fd, name, content.encode("utf-8"), where=target)
+                written.append(target)
         return written
 
     # -- the identity machinery (ADR-0045, best-effort doctrine) --------------

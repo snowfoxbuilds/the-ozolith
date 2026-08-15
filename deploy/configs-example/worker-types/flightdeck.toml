@@ -39,10 +39,31 @@
 # placeholder digest with the one you build/pull.
 base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-# NO knowledge_source / knowledge_pin here (contrast the driver types): a bake
-# into /home/ozolith/.claude would be copied onto the claude-state volume on
-# first mount and then fight the flightdeck-start symlinks. The Flight Deck
-# gets its knowledge from the shared clone at start, never baked.
+# NOTHING is ever baked under /home/ozolith/.claude — not knowledge, not the
+# agent CLI's native config. The {stack}-claude-state volume copies image
+# content on FIRST mount only, never updates on rebuild, and fights the
+# flightdeck-start symlinks. So: NO knowledge_source / knowledge_pin here
+# (contrast the driver types — the deck gets its knowledge from the shared
+# clone at start, ADR-0043), and the `model` below is NOT delivered as a baked
+# ~/.claude/settings.json. Anything the image needs to say to the agent CLI
+# must live OUTSIDE every volume mountpoint: the model rides the root-owned
+# well-known file /etc/theozolith/model (ADR-0045 §4).
+
+# The deck's DEFAULT model (ADR-0045 §4). Control appends an interactive-scope
+# materialize step for this field: the build validates the ID and writes it to
+# /etc/theozolith/model — atomically, as a root-owned non-user-writable regular
+# file (a symlinked or irregular destination fails the build), outside every
+# volume — and nothing else.
+# flightdeck-start turns it into a guarded `claude --model "$(cat
+# /etc/theozolith/model)"`, and flag precedence makes every container start
+# begin at this definition while /model stays free WITHIN a session (the CLI
+# persists a /model choice to ~/.claude/settings.json on the state volume;
+# the flag outranks it without rewriting it — verified on 2.1.232, evidence
+# on issue #39). Restart = reset to definition; switch = session state.
+# Changing this value changes the instruction hash -> deterministic-tag
+# rebuild. When you change it, bump `base` to a release whose CLI knows the
+# model (the materialize step fails the build on an ID it cannot map).
+model = "claude-fable-5"
 
 setup = [
     # (1) tmux (the named attach session) + curl (fetch the tailscale binaries).
@@ -166,7 +187,16 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 '  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --timeout=30s || { echo "flightdeck-start: tailscale up on existing state failed (error or 30s timeout)" >&2; exit 1; }' \
 'fi' \
 'mkdir -p /var/log/flightdeck' \
-'tmux new-session -d -s flightdeck claude' \
+'# ADR-0045 §4: start the session at the image-baked default model. The build' \
+'# validated the ID; the flag outranks the /model preference the CLI persists' \
+'# to ~/.claude/settings.json (state volume) without rewriting it — restart =' \
+'# reset to definition, /model = free within the session. Bare claude when no' \
+'# model was baked (file absent or empty).' \
+'if [ -s /etc/theozolith/model ]; then' \
+'  tmux new-session -d -s flightdeck "claude --model \"$(cat /etc/theozolith/model)\""' \
+'else' \
+'  tmux new-session -d -s flightdeck claude' \
+'fi' \
 'tmux pipe-pane -o -t flightdeck "cat >> /var/log/flightdeck/transcript.log"' \
 '# Supervise daemon AND session; the EXIT trap reaps tailscaled either way.' \
 'while kill -0 "$TAILSCALED_PID" 2>/dev/null && tmux has-session -t flightdeck 2>/dev/null; do' \

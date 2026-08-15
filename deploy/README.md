@@ -691,6 +691,19 @@ the files owned by the driver user either by building the image with
   `flightdeck-github-token`. Never reuse a driver PAT and never use a personal token
   here; the human merge gate stays human by construction. Do not leave Flight Deck
   sessions running unattended.
+- **Flight Deck default model** (ADR-0045 §4): set `model` on the deck's worker type
+  and the derived image carries the validated ID at the well-known file
+  `/etc/theozolith/model` — materialized atomically as a root-owned, non-user-writable
+  regular file (0644; symlinked or irregular destinations fail the build), never
+  anything under `~/.claude`, which the claude-state volume shadows (ADR-0043). The baked start script launches the session as
+  `claude --model "$(cat /etc/theozolith/model)"` (bare `claude` when no model is
+  baked), so every container start deterministically begins at the definition's
+  default, while `/model` stays free within a session: the CLI persists a `/model`
+  choice to `~/.claude/settings.json` on the state volume, and the flag outranks it
+  at the next start without rewriting it (`--resume` honors the flag the same way;
+  verified on Claude Code 2.1.232, evidence on issue #39). Restart = reset to
+  definition; switch = session state. `effort` stays rejected on driverless types
+  (see the worker-types section above).
 
 ## Flight Deck knowledge & state (ADR-0043)
 
@@ -758,7 +771,11 @@ carry it, and nothing else moves it for you.
   into the shared knowledge clone itself, overwriting content live in every
   sibling Flight Deck of that type on the node.
 - `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
-  it regenerates when the container recycles (accepted v0 gap).
+  it regenerates when the container recycles (accepted v0 gap). The deck's model
+  preference is NOT part of this gap: a `/model` choice persists to
+  `~/.claude/settings.json` *on* the state volume and survives recycles — it is
+  the baked `--model` flag (see the Flight Deck section) that resets every
+  container start to the definition's default.
 
 ## Custom drivers (ADR-0042)
 
