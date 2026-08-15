@@ -63,9 +63,12 @@ def test_run_image_contract():
 
 def test_ci_builds_the_run_container_image():
     """M2 brief: the CI must build the run-container image so image rot is
-    caught (a PR #2 review finding, absorbed here)."""
+    caught (a PR #2 review finding, absorbed here). The build runs through
+    buildx (docker/build-push-action) with a GHA layer cache; what the
+    image-rot guarantee needs is that this Dockerfile is still built."""
     ci = CI.read_text()
-    assert "docker build -f worker/docker/Dockerfile.claude" in ci
+    assert "docker/build-push-action" in ci
+    assert "file: worker/docker/Dockerfile.claude" in ci
 
 
 # -- M3 substrate artifacts -------------------------------------------------------
@@ -110,7 +113,9 @@ def test_control_compose_mounts_the_partitioned_home():
 
 
 def test_ci_builds_the_control_image():
-    assert "docker build -f control/docker/Dockerfile" in CI.read_text()
+    ci = CI.read_text()
+    assert "docker/build-push-action" in ci
+    assert "file: control/docker/Dockerfile" in ci
 
 
 def test_no_tailscale_anywhere_in_product_code_or_deploy():
