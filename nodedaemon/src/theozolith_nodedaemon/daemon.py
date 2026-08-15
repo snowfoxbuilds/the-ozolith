@@ -277,12 +277,16 @@ class NodeDaemon:
         # desired state, checked every pass. True once an install succeeded
         # and the re-exec is imminent — no second attempt is in flight.
         self._update_done = False
-        # _update_blocker/_drivers_blocker are LOG-DEDUP memos only (log once
-        # per blocker change). They are never heartbeat authority: the
-        # heartbeat's deferral fields are computed fresh in _status_payload,
-        # because these memos describe the PRIOR pass and a one-beat-stale
-        # report could let the control-side ladder queue a restart before it
-        # ever saw the deferral (issue #8).
+        # _update_blocker/_drivers_blocker retain the converge step's LAST
+        # deferral decision and do two jobs: log dedup (log once per blocker
+        # change) and the heartbeat's one-pass EXIT latch — when a Run ends
+        # between passes, _status_payload reports the retained blocker for
+        # exactly one more beat so control cannot queue a restart ahead of
+        # this pass's first post-drain convergence attempt (issue #8). They
+        # are never ENTRY authority: the heartbeat computes the current
+        # in-flight signal fresh, because these memos describe the PRIOR
+        # pass and a one-beat-stale report could let the control-side ladder
+        # queue a restart before it ever saw the deferral.
         self._update_blocker: str | None = None
         self._product_attempted = False  # per-pass latch (nudge vs. pass check)
         # Config-distribution convergence (ADR-0042): the drivers-hash is
@@ -420,16 +424,25 @@ class NodeDaemon:
             )
         # Convergence deferrals (issue #8): the product pin and the
         # drivers-hash are desired state, not commands, so their queue-behind
-        # deferrals never appear in deferred_commands. Both convergence paths
-        # gate on the same whole-node in-flight signal, so ONE current lookup
-        # serves both fields — computed HERE, as the heartbeat is constructed,
-        # never replayed from the previous pass's converge decision (a stale
-        # report can reach the control-side ladder a beat after the ladder
-        # already queued a restart). While the node is converged the value is
-        # merely a potential blocker; control pairs it with its own divergence
-        # check, so that is harmless. Run-id/stack-name references only;
-        # "" = free to converge.
-        convergence_blocker = self._inflight_blocker(None) or ""
+        # deferrals never appear in deferred_commands. One transition
+        # guarantee per edge of a drain. ENTRY: the whole-node in-flight
+        # signal is looked up HERE, as the heartbeat is constructed, so a Run
+        # that began since the last pass defers this very beat — never a
+        # replay of the previous pass's converge decision, whose one-beat lag
+        # would let the control-side ladder queue a restart before it ever
+        # saw the deferral. EXIT: a Run that ENDED since the last pass leaves
+        # no current blocker, but the commands this heartbeat returns execute
+        # before this pass's converge step — an undeferred report here would
+        # let an offpin_beats=1 ladder answer with a restart that preempts
+        # the very post-drain attempt this pass is about to make. Each
+        # subsystem therefore falls back to its retained prior-pass converge
+        # blocker, and the converge function clears it as it matches or
+        # begins the post-drain attempt — so the exit grace lasts one beat: a
+        # failed attempt reports undeferred next beat and the ladder climbs
+        # afresh. While the node is converged the value is merely a potential
+        # blocker; control pairs it with its own divergence check, so that is
+        # harmless. Run-id/stack-name references only; "" = free to converge.
+        current_blocker = self._inflight_blocker(None)
         return {
             "node": self._config.node,
             "version": self._config.version,
@@ -449,8 +462,8 @@ class NodeDaemon:
                 {"id": command_id, "reason": reason}
                 for command_id, reason in sorted(self._deferrals.items())
             ],
-            "update_deferred": convergence_blocker,
-            "drivers_deferred": convergence_blocker,
+            "update_deferred": current_blocker or self._update_blocker or "",
+            "drivers_deferred": current_blocker or self._drivers_blocker or "",
         }
 
     def _exchange_heartbeat(self) -> list[dict[str, Any]]:
@@ -803,9 +816,9 @@ class NodeDaemon:
             if blocker is not None:
                 if self._update_blocker != blocker:
                     self._log(f"product update to {pin} deferred ({blocker})")
-                self._update_blocker = blocker
+                self._update_blocker = blocker  # also arms the heartbeat exit latch
                 return
-        self._update_blocker = None
+        self._update_blocker = None  # the exit latch disarms as the attempt begins
         self._product_attempted = True
         try:
             self._install_product(pin)
@@ -1161,9 +1174,9 @@ class NodeDaemon:
             # Run finishes, then convergence applies (log once per blocker).
             if self._drivers_blocker != blocker:
                 self._log(f"config distribution {desired[:12] or '(none)'} deferred ({blocker})")
-            self._drivers_blocker = blocker
+            self._drivers_blocker = blocker  # also arms the heartbeat exit latch
             return
-        self._drivers_blocker = None
+        self._drivers_blocker = None  # the exit latch disarms as the attempt begins
         if desired and self._client is None:
             return  # cache-only: cannot fetch a new distribution
         self._drivers_attempted = True

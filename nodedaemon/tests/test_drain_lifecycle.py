@@ -2,16 +2,22 @@
 converging against the REAL control-plane app, bridged at the transport seam
 (the pattern of test_channel_invariant).
 
-The heartbeat's update_deferred/drivers_deferred fields are computed as the
-heartbeat is CONSTRUCTED — the daemon's current whole-node in-flight signal —
-so control never observes a divergent-and-undeferred beat from a draining
-node. That property is proven here at ``offpin_beats = 1``, the harshest
-ladder, where a single such beat queues a restart and a second escalates: a
-report replayed from the previous pass (one beat stale) fails these tests.
-Assertions run against the control store itself — no convergence restart is
-ever CREATED for a healthy drain, not merely never executed — while a
-genuinely stuck node still climbs to restart and escalation once its
-deferral clears.
+The heartbeat's update_deferred/drivers_deferred fields carry one transition
+guarantee per edge of a drain. ENTRY: the current whole-node in-flight
+signal is computed as the heartbeat is CONSTRUCTED, so a Run that began
+since the last pass is deferred in the very next beat — never a replay of
+the prior pass's converge decision, whose one-beat lag would let the ladder
+queue a restart before control ever saw the deferral. EXIT: a Run that
+ENDED between passes leaves no current blocker, but returned commands
+execute before the pass's own converge step — so the retained prior-pass
+converge blocker (the one-pass exit latch) keeps exactly that one beat
+deferred, and the same pass then makes the first real post-drain attempt.
+Both are proven at ``offpin_beats = 1``, the harshest ladder, where a
+single divergent-and-undeferred beat queues a restart and a second
+escalates. Assertions run against the control store itself — no convergence
+restart is ever CREATED for a healthy drain, not merely never executed —
+while a genuinely stuck node still climbs to restart and escalation once
+its drain ends and its first post-drain attempt fails.
 """
 
 from __future__ import annotations
@@ -63,11 +69,11 @@ class LifecycleRig:
         self.web = TestClient(
             create_app(self.settings, self.store, secret_store, SecretBox(generate_key()))
         )
-        # The Run-end seam: naming a run id here removes its job directory
-        # right after the NEXT heartbeat is served — the driver child
-        # finishing while the answer is in flight. The same daemon pass then
-        # finds the node free and converges, so a healthy drain never shows
-        # control a divergent-and-undeferred beat.
+        # The response-in-flight Run-end seam: naming a run id here removes
+        # its job directory right after the NEXT heartbeat is served — the
+        # driver child finishing while the answer is in flight. The NATURAL
+        # ending (the Run finishing between passes) needs no seam: the test
+        # just removes the directory before calling once().
         self.end_run_after_next_heartbeat: str | None = None
 
         def bridge(method: str, url: str, headers: dict, body: bytes | None):
@@ -160,9 +166,14 @@ class LifecycleRig:
 def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, monkeypatch):
     """offpin_beats = 1: ONE divergent-and-undeferred heartbeat queues a
     restart and a second escalates, so surviving this test proves the
-    deferral covers every beat of a drain. The product pin and then the
-    drivers-hash each move while a Run is in flight; each converges after
-    its Run ends; the command store never holds a single command."""
+    deferral covers every beat of a drain INCLUDING the first beat after it
+    ends. The product pin and then the drivers-hash each move while a Run is
+    in flight; each Run ends BETWEEN passes — the natural ending, where the
+    next heartbeat is built with no current blocker and only the one-pass
+    exit latch stands between control and a restart that would preempt the
+    very convergence attempt that same pass then makes. Each subsystem
+    converges in its first post-drain pass; the command store never holds a
+    single command."""
     rig = LifecycleRig(tmp_path, monkeypatch, offpin_beats=1)
     rig.once()  # nothing divergent; the driver child starts
     assert rig.popen.spawned  # the in-flight signal needs the live child
@@ -176,11 +187,13 @@ def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, 
     assert rig.update_calls == []  # the daemon really is deferring the install
     assert rig.store.node_version("box1") == "0.3.0"  # the dispatch gate's input, intact
 
-    # The Run ends while the last answer is in flight: the same pass
-    # installs the update and re-execs — control never saw an undeferred
-    # off-pin beat, so nothing was ever queued to cancel.
-    rig.end_run_after_next_heartbeat = "r1"
+    # The Run ends BETWEEN passes. The next heartbeat sees no current
+    # blocker; the exit latch keeps that one beat deferred, control queues
+    # nothing, and the SAME pass makes the first real post-drain attempt:
+    # install, re-exec, on-pin — no command was ever created to race it.
+    shutil.rmtree(rig.jobs / "r1")
     rig.once()
+    assert rig.restart_commands() == [] and rig.control_errors() == []
     assert len(rig.update_calls) == 1 and rig.execv_calls
     rig.reexec("0.4.0")
     rig.once()  # first post-re-exec beat: on-pin, tracking gone
@@ -188,7 +201,8 @@ def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, 
     assert rig.ladder_rows("version_health") == []
 
     # The drivers-hash analog in the same lifecycle (ADR-0042): a new Run
-    # begins, then the deployment grows a config distribution.
+    # begins, then the deployment grows a config distribution; the Run again
+    # ends between passes, and the swap lands in the first post-drain pass.
     (rig.jobs / "r2").mkdir(parents=True)
     rig.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
     digest = control_configdist.drivers_hash(rig.settings.config_repo)
@@ -197,8 +211,9 @@ def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, 
         assert rig.restart_commands() == [] and rig.control_errors() == []
     assert rig.store.node_drivers_hash("box1") == ""  # off-hash the whole while
 
-    rig.end_run_after_next_heartbeat = "r2"
-    rig.once()  # the swap fetches, verifies, and applies within this pass
+    shutil.rmtree(rig.jobs / "r2")
+    rig.once()  # exit-latch beat: the swap fetches, verifies, and applies
+    assert rig.restart_commands() == [] and rig.control_errors() == []
     rig.once()  # and the next heartbeat reports the applied digest
     assert rig.store.node_drivers_hash("box1") == digest
     assert rig.ladder_rows("drivers_health") == []
@@ -210,6 +225,30 @@ def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, 
     assert rig.control_errors() == []
 
 
+def test_run_ending_while_the_answer_is_in_flight_converges_in_that_pass(tmp_path, monkeypatch):
+    """The OTHER healthy ending (offpin_beats = 1): the Run finishes while a
+    deferred heartbeat's answer is still in flight. That beat already carried
+    the fresh construction-time blocker, so nothing was queued; the same pass
+    then finds the node free and installs — no exit latch is needed on this
+    path, and none lingers past the re-exec."""
+    rig = LifecycleRig(tmp_path, monkeypatch, offpin_beats=1)
+    rig.once()  # the driver child starts
+    (rig.jobs / "r1").mkdir(parents=True)
+    rig.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
+    rig.once()  # a deferred off-pin beat; the install waits
+    assert rig.restart_commands() == [] and rig.update_calls == []
+
+    rig.end_run_after_next_heartbeat = "r1"
+    rig.once()  # deferred beat served; the Run ends; this pass converges
+    assert rig.restart_commands() == [] and rig.control_errors() == []
+    assert len(rig.update_calls) == 1 and rig.execv_calls
+    rig.reexec("0.4.0")
+    rig.once()  # first post-re-exec beat: on-pin, tracking gone
+    assert rig.store.node_version("box1") == "0.4.0"
+    assert rig.ladder_rows("version_health") == []
+    assert rig.store.fleet_state()["commands"] == [] and rig.control_errors() == []
+
+
 def test_deferral_beginning_at_beat_n_minus_one_prevents_the_restart(tmp_path, monkeypatch):
     """The stale-report regression, end to end: a node already N-1 undeferred
     beats off-pin (its installs genuinely fail) begins a Run. The next real
@@ -218,8 +257,10 @@ def test_deferral_beginning_at_beat_n_minus_one_prevents_the_restart(tmp_path, m
     restart is never enqueued. A report replayed from the prior pass would
     have said "" here (the last converge attempt ran unblocked, before the
     Run began) and control would have restarted a draining node. Once the
-    Run ends with the node still stuck, the ladder climbs afresh: restart at
-    N, escalation at 2N — the undeferred contract intact end to end."""
+    Run ends with the node still stuck, the exit latch holds ONE more beat —
+    during which the first post-drain attempt runs and fails — and then the
+    ladder climbs afresh: restart at N, escalation at 2N — the undeferred
+    contract intact end to end."""
     rig = LifecycleRig(tmp_path, monkeypatch, offpin_beats=2, update_rc=1)
     rig.once()  # the child starts; nothing divergent yet
     rig.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
@@ -235,6 +276,9 @@ def test_deferral_beginning_at_beat_n_minus_one_prevents_the_restart(tmp_path, m
     assert len(rig.update_calls) == 1  # no install attempt mid-drain
 
     shutil.rmtree(rig.jobs / "r1")  # the Run ends; the node is STILL stuck
+    rig.once()  # the exit-latch beat: still deferred, and this same pass
+    assert rig.restart_commands() == [] and rig.ladder_rows("version_health") == []
+    assert len(rig.update_calls) == 2  # ...makes the post-drain attempt (it fails)
     rig.once()  # undeferred beat 1: patience restarts from zero...
     assert rig.restart_commands() == []
     rig.once()  # ...beat 2 = N: control queues THE restart; the daemon obeys

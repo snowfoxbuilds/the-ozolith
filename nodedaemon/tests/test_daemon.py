@@ -316,10 +316,15 @@ def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
 def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
     """Issue #8: the pin and drivers-hash queue-behind deferrals are
     desired-state deferrals — no command id — so they ride dedicated
-    heartbeat fields the control-side convergence ladders pause on. The
-    fields report the in-flight blocker AS OF this heartbeat's construction
-    — never the previous pass's converge decision, whose one-beat lag would
-    let the ladder queue a restart before control ever saw the deferral."""
+    heartbeat fields the control-side convergence ladders pause on. Entry
+    into a drain reports the in-flight blocker AS OF this heartbeat's
+    construction — never the previous pass's converge decision, whose
+    one-beat lag would let the ladder queue a restart before control ever
+    saw the deferral. Exit holds the deferral ONE beat past the Run's end
+    (the retained prior-pass converge blocker): the answer to that beat is
+    executed before this pass's converge step, so an undeferred report there
+    would let control queue a restart that preempts the very post-drain
+    attempt the same pass then makes."""
     stack, jobs = _driver_stack(tmp_path)
     rig.control.heartbeat_answers.append(heartbeat_response([stack]))
     rig.daemon.once()  # the driver child is up; nothing deferred yet
@@ -350,9 +355,12 @@ def test_deferred_convergence_rides_the_heartbeat(rig: Rig, tmp_path):
 
     shutil.rmtree(jobs / "r1")
     rig.control.heartbeat_answers.append(dict(pinned))
-    rig.daemon.once()  # the Run ended: the product update applies this pass
+    rig.daemon.once()  # the Run ended between passes: the exit-latch beat
     body = rig.control.transcript[-1][2]
-    assert body["update_deferred"] == "" and body["drivers_deferred"] == ""  # honest again
+    # No current blocker exists any more, but the latch keeps this one beat
+    # deferred — and the product update applies in this very pass.
+    assert body["update_deferred"] == "behind run r1 (stack worker)"
+    assert body["drivers_deferred"] == "behind run r1 (stack worker)"
     assert rig.update_calls and rig.execv_calls
 
 
