@@ -159,6 +159,11 @@ class DriverConfig:
     node_name: str  # the physical node, for events (M3 heartbeat identity)
     worker_id: str
     jobs_dir: Path  # where per-Run job directories live
+    # Node-local bare mirrors backing reference-clone Run checkouts (#51).
+    # Deliberately node-shared (not per-Stack like jobs_dir): every driver on
+    # the node reuses one mirror per repo, and the per-repo file lock makes
+    # that safe. Never mounted into any container.
+    mirrors_dir: Path
     agent_timeout_seconds: float
     cache_volumes: tuple[tuple[str, str], ...]  # warm caches as named volumes
     agent_env: dict[str, str]  # model credentials (API key and/or OAuth token)
@@ -260,6 +265,10 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         worker_id=worker_id,
         jobs_dir=Path(
             env_value(environ, "THEOZOLITH_JOBS_DIR", default_jobs_dir) or default_jobs_dir
+        ),
+        mirrors_dir=Path(
+            env_value(environ, "THEOZOLITH_MIRRORS_DIR", "/var/tmp/theozolith/mirrors")
+            or "/var/tmp/theozolith/mirrors"
         ),
         agent_timeout_seconds=_float(environ, "THEOZOLITH_AGENT_TIMEOUT_SECONDS", default="3600"),
         cache_volumes=_volumes(

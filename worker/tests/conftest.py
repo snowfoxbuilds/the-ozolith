@@ -412,6 +412,7 @@ def make_harness(tmp_path: Path, gate_toml: str | None = None) -> Harness:
         "THEOZOLITH_CLONE_URL": f"file://{remote}",
         "THEOZOLITH_POLL_SECONDS": "0",
         "THEOZOLITH_JOBS_DIR": str(tmp_path / "jobs"),
+        "THEOZOLITH_MIRRORS_DIR": str(tmp_path / "mirrors"),
         "THEOZOLITH_WORKER_ID": "worker-a",
         # Required since ADR-0017 (no second claim path); tests inject a
         # FakeDispatch and a RecordingSink, so nothing dials this URL.

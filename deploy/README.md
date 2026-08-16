@@ -673,6 +673,21 @@ the files owned by the driver user either by building the image with
 `--build-arg OZOLITH_UID=$(id -u)` (or matching uid in the image recipe) or by setting
 `THEOZOLITH_CONTAINER_USER=$(id -u):$(id -g)`.
 
+## Repo mirror cache
+
+Each Run's checkout is a reference clone (`git clone --reference <mirror> --dissociate`)
+off a node-local bare mirror per repo (`THEOZOLITH_MIRRORS_DIR`, default
+`/var/tmp/theozolith/mirrors`), so the per-Run download is a ref advertisement instead
+of the whole history (#51). The mirror is driver-owned and never mounted into any
+container; it is created lazily on the first claim per repo, refreshed under a per-repo
+file lock before each checkout, and crash-cleaned (partial mirrors, stale locks) by the
+boot sweep. Unlike jobs dirs the mirror root is deliberately node-shared across Stacks —
+the lock makes concurrent drivers safe, and every driver on the node reuses one download.
+Deleting the mirror root is always safe: checkouts are self-contained (`--dissociate`),
+and the next claim re-creates the mirror at the cost of one full download. Mirror
+creation or refresh failures fail the Run as a pre-session infra failure under the
+normal retry budget (ADR-0016) — a stale mirror is never silently used.
+
 ## Observing Runs, and the Flight Deck
 
 - Live run containers: `docker ps --filter label=theozolith.owner` — names are

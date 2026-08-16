@@ -25,6 +25,7 @@ janitor waits for exactly these bundles before it escalates a silent claim
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -144,6 +145,55 @@ def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
         if content is not None:
             files[f"{prefix}/swept-{Path(relpath).name}"] = content
     return files
+
+
+def sweep_mirrors(config: DriverConfig, *, log=_log) -> tuple[int, int]:
+    """Boot-time crash-clean of the mirror root (#51); (removed, skipped).
+
+    Two kinds of debris, both only ever left by a dead process: partial
+    mirrors (a ``.tmp`` staging dir whose creator died before the atomic
+    rename) and stale locks (a ``.lock`` file with no mirror and no staging
+    behind it). Every removal happens while HOLDING the per-repo lock,
+    acquired non-blocking: mirror creation stages under that lock, so a
+    ``.tmp`` observed under it is provably orphaned — and a held lock means
+    a live driver somewhere on the node, which is skipped, never awaited.
+    The mirrors themselves are never swept: a final-named mirror is never
+    partial (creation is staged + atomic rename), and corruption heals
+    lazily at the next claim (delete + re-clone in ``ensure_mirror``)."""
+    root = Path(config.mirrors_dir)
+    if not root.is_dir():
+        return 0, 0
+    removed = skipped = 0
+    for staging in sorted(root.glob(f"*{gitops.MIRROR_TMP_SUFFIX}")):
+        name = staging.name.removesuffix(gitops.MIRROR_TMP_SUFFIX)
+        fd = gitops.try_mirror_lock(root / (name + gitops.MIRROR_LOCK_SUFFIX))
+        if fd is None:
+            skipped += 1
+            continue
+        try:
+            shutil.rmtree(staging, ignore_errors=True)
+            removed += 1
+            log(f"mirror sweep: removed partial mirror {staging.name}")
+        finally:
+            os.close(fd)
+    for lock in sorted(root.glob(f"*{gitops.MIRROR_LOCK_SUFFIX}")):
+        name = lock.name.removesuffix(gitops.MIRROR_LOCK_SUFFIX)
+        if (root / name).exists() or (root / (name + gitops.MIRROR_TMP_SUFFIX)).exists():
+            continue  # a live mirror keeps its lock file — that is not stale
+        fd = gitops.try_mirror_lock(lock)
+        if fd is None:
+            skipped += 1
+            continue
+        try:
+            # Unlinked while held; late waiters detect the vanished inode
+            # (fstat validation in the lock helpers) and retry on a fresh
+            # file, so mutual exclusion survives the removal.
+            lock.unlink(missing_ok=True)
+            removed += 1
+            log(f"mirror sweep: removed stale lock {lock.name}")
+        finally:
+            os.close(fd)
+    return removed, skipped
 
 
 def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int, int]:
