@@ -6,9 +6,10 @@ through the Control Node's dispatch endpoint (ADR-0017, discovery-only) and
 runs each review round as an
 ephemeral container (ADR-0013): the driver materializes the review inputs as
 files (issue intent, diff, Decisions Section, mechanical signals), the
-judging agent runs headless (ADR-0019) and writes its verdict as a file,
-and the driver validates the file, renders the evidence-citing comment, and
-applies exactly one verdict:
+judging agent runs headless (ADR-0019) and writes its verdict through the
+format-output CLI into the round's Output Proposal (ADR-0046), and the
+driver validates the proposal — the sole policy boundary — renders the
+evidence-citing comment, and applies exactly one verdict:
 
 - approve: needs_human (keeping pr_ready) + deviation:* + risk:* + an
   evidence-citing comment; the human stamps and merges. Approve means no
@@ -19,13 +20,15 @@ applies exactly one verdict:
 - escalate: blocked + needs_human with the evidence bundle link; also forced
   deterministically when the round budget is exhausted.
 
-ANY invalid verdict — missing file, unparseable JSON, schema failure, or a
-revise on the final budgeted round — escalates immediately (ADR-0014): the
-driver applies blocked + needs_human with a comment carrying the raw
-validation error, the bundle link, and the evidence path of the offending
-verdict file. One strike; there is no driver-side retry — the judging
-agent's second chances live inside its own session via the validate-verdict
-harness job.
+ANY invalid proposal — missing, unparseable, schema failure, or a revise on
+the final budgeted round — escalates immediately (ADR-0014's one-strike rule
+carried forward by ADR-0046): the driver applies blocked + needs_human with
+a comment carrying the raw validation error, the bundle link, and the
+evidence path of the offending proposal file. One strike; there is no
+driver-side retry and no completion-retry carve-out — the Reviewer's work
+product IS the proposal. The judging agent's second chances live inside its
+own session: the CLI refuses invalid enums and a final-round revise at write
+time, and `format-output status` runs the driver's exact validation.
 
 A review session that fails its baked-identity gate (ADR-0045; the harness
 status carries the anchored ``identity:`` marker) takes the same one-strike
@@ -43,7 +46,7 @@ import shutil
 from pathlib import Path
 from typing import ClassVar
 
-from theozolith_worker import adapters, evidence, gitops, jobdir, runner, verdict
+from theozolith_worker import adapters, evidence, gitops, jobdir, proposal, runner, verdict
 from theozolith_worker.base import Worker
 from theozolith_worker.bootstrap.vocabulary import (
     BLOCKED,
@@ -112,23 +115,28 @@ criteria, an open question the Worker flagged that you cannot settle).
 
 ## Your verdict
 
-Write exactly one file named `verdict.json` in your working directory (no \
-other output counts) with this JSON shape:
+Write your verdict through the `format-output` CLI — it fills this round's \
+Output Proposal, which the pipeline validates and applies after you exit. \
+Nothing you run touches GitHub. Fields (multi-line values: `-` reads stdin, \
+or `--file <path>`; `view-output <field>` shows pending state):
 
-{{"verdict": "approve" | "revise" | "escalate",
-  "deviation": "low" | "medium" | "high",
-  "risk": "low" | "medium" | "high",
-  "evidence": "2-6 sentences citing specific files, criteria, and recorded decisions",
-  "revised_plan": "numbered, concrete steps for the next Run (revise only, else empty)",
-  "resume_commit": "commit SHA the next Run resets the branch to (revise \
-only; empty means current head)",
-  "cherry_pick": [],
-  "process_issues": []}}
-
-process_issues is optional and advisory: observations about the PIPELINE \
-itself (friction you hit reviewing — missing inputs, confusing evidence), \
-each as {{"friction": "...", "suggested_fix": "..."}}. Never findings about \
-the change under review; it influences no verdict, label, or gate outcome.
+- `format-output verdict approve|revise|escalate` — required. An invalid \
+value is refused on the spot, and on the final budgeted round `revise` is \
+refused at write time.
+- `format-output evidence -` — required: 2-6 sentences citing specific \
+files, criteria, and recorded decisions.
+- `format-output deviation low|medium|high` and \
+`format-output risk low|medium|high` — required for approve.
+- `format-output revised-plan -` — revise only: numbered, concrete steps \
+for the next Run.
+- `format-output resume-commit <sha>` — revise only: the commit the next \
+Run resets the branch to (omit it to resume from the current head); \
+`format-output cherry-pick '["<sha>"]'` — optional.
+- `format-output process-issues '[{{"friction": "...", "suggested_fix": \
+"..."}}]'` — optional and advisory: observations about the PIPELINE itself \
+(friction you hit reviewing — missing inputs, confusing evidence). Never \
+findings about the change under review; it influences no verdict, label, \
+or gate outcome.
 
 deviation grades divergence from the plan (files outside the plan's \
 footprint, unrequested behavior, new dependencies, size far beyond \
@@ -136,10 +144,10 @@ expectation). risk is your own overall read of the change as implemented, \
 independent of the issue's baseline label. approve only when the acceptance \
 criteria are met by the diff as shipped.
 
-Any INVALID verdict — missing file, unparseable JSON, schema violation, or \
-a revise on the final budgeted round — escalates this PR straight to a \
-human; there is NO retry. Before finishing, run `theozolith-validate-verdict` \
-in your working directory: it applies the exact validation the driver will \
+Any INVALID proposal that reaches the pipeline — no verdict recorded, a \
+schema violation, or a revise on the final budgeted round — escalates this \
+PR straight to a human; there is NO retry. Before finishing, run \
+`format-output status`: it applies the exact validation the pipeline will \
 (schema and round rules) and reports errors while you can still fix them.
 """
 
@@ -268,6 +276,7 @@ def review_pr(
             agent_timeout_seconds=config.agent_timeout_seconds,
             round=round_number,
             round_budget=ROUND_BUDGET,
+            schema_version=proposal.SCHEMA_VERSION,
         )
         jobdir.write_manifest(job, manifest)
         spec = ContainerSpec(
@@ -320,8 +329,10 @@ def review_pr(
         finally:
             session.finish()
 
-        result, reason = verdict.validate_verdict_file(
-            job / jobdir.VERDICT_FILE,
+        # The driver is the sole policy boundary (ADR-0046): the proposal is
+        # re-validated here no matter what the in-session CLI reported.
+        result, reason = proposal.validate_review_job(
+            job,
             round_number=round_number,
             final_round=final_round,
             default_resume=pr.head_sha,
@@ -408,14 +419,11 @@ def _escalate_invalid_verdict(
         "container": container,
     }
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
-    verdict_path: str | None = None
-    try:
-        raw = (job / jobdir.VERDICT_FILE).read_text(encoding="utf-8")
-    except OSError:
-        raw = None
+    proposal_path: str | None = None
+    raw = proposal.raw_text(job)
     if raw is not None:
-        verdict_path = f"{prefix}-verdict.json"
-        files[verdict_path] = raw if raw.endswith("\n") else raw + "\n"
+        proposal_path = f"{prefix}-proposal.json"
+        files[proposal_path] = raw if raw.endswith("\n") else raw + "\n"
     if transcript:
         files[f"{prefix}-transcript.txt"] = transcript
     _push_evidence_files(
@@ -428,9 +436,9 @@ def _escalate_invalid_verdict(
     )
 
     location = (
-        f"The offending verdict file is preserved in the evidence bundle at `{verdict_path}`."
-        if verdict_path
-        else "The session emitted no verdict file."
+        f"The offending output proposal is preserved in the evidence bundle at `{proposal_path}`."
+        if proposal_path
+        else "The session wrote no output proposal."
     )
     result = verdict.Verdict(
         verdict=verdict.ESCALATE,

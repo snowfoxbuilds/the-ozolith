@@ -34,7 +34,9 @@ Layout::
       output/
         status.json      harness phase + agent outcome (atomic writes)
         transcript.txt   the headless session's structured output stream
-        verdict.json     review mode: the agent's verdict, copied out
+        proposal.json    the Output Proposal (ADR-0046): every mutation the
+                         agent proposes, written via the format-output CLI,
+                         validated and applied post-exit by the driver
         jobs/            job results, one file per answered request
       checkout/          run mode: the token-free repo checkout (driver-made)
       work/              review mode: the session workspace (driver-seeded)
@@ -74,7 +76,6 @@ MANIFEST_FILE = "input/manifest.json"
 PROMPT_FILE = "input/prompt.md"
 STATUS_FILE = "output/status.json"
 TRANSCRIPT_FILE = "output/transcript.txt"
-VERDICT_FILE = "output/verdict.json"
 # The baked-identity verdict (ADR-0045): expected vs effective model/effort,
 # preflight status, and the gate outcome — written by the harness, embedded
 # into the driver's evidence bundle. Absent when the image bakes no identity.
@@ -125,11 +126,17 @@ class Manifest:
     workdir: str = CHECKOUT_DIR  # job-dir-relative agent working directory
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT
     jobs_idle_timeout_seconds: float = DEFAULT_JOBS_IDLE_TIMEOUT
-    # Review mode: the round this session judges, so the in-session
-    # validate-verdict job applies the final-round rule exactly as the
-    # driver will (ADR-0014). 0/0 = not a review round.
+    # The round this session works or judges: run mode stamps it so the
+    # format-output CLI knows which fields the round requires; review mode
+    # additionally carries the budget so the write-time final-round rule
+    # matches the driver's exactly (ADR-0046). 0/0 = round-less (dry-run).
     round: int = 0
     round_budget: int = 0
+    # The Output Proposal schema stamp (ADR-0046): the harness asserts it
+    # against its own distribution BEFORE the session starts, and the CLI
+    # asserts it at every invocation. 0 = unstamped (dry-run manifests and
+    # pre-channel drivers), which run/review modes refuse pre-work.
+    schema_version: int = 0
 
     @property
     def serve_jobs(self) -> bool:

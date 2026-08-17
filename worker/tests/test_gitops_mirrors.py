@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import Harness, write_decisions
+from conftest import Harness, write_proposal
 from theozolith_worker import gitops, jobdir
 from theozolith_worker.bootstrap.vocabulary import FAILED, NEEDS_HUMAN
 from theozolith_worker.gitops import GitError
@@ -571,7 +571,7 @@ def test_run_checkout_uses_the_mirror_and_mounts_none_of_it(harness: Harness):
 
     def agent(prompt: str, cwd: Path) -> None:
         (cwd / "change.txt").write_text("x\n")
-        write_decisions(cwd)
+        write_proposal(cwd)
 
     harness.worker_behaviors.append(agent)
     assert harness.worker_once() == 1
@@ -602,7 +602,7 @@ def test_second_run_reuses_the_mirror_without_a_second_full_download(harness: Ha
 
     def agent(prompt: str, cwd: Path) -> None:
         (cwd / "change.txt").write_text("x\n")
-        write_decisions(cwd)
+        write_proposal(cwd)
 
     harness.worker_behaviors += [agent, agent]
     assert harness.worker_once() == 1

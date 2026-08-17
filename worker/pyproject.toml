@@ -12,7 +12,11 @@ theozolith-adapter = "theozolith_worker.adaptercli:main"
 theozolith-bootstrap = "theozolith_worker.bootstrap.cli:main"
 theozolith-driver = "theozolith_worker.drivercli:main"
 theozolith-harness = "theozolith_worker.harness.main:main"
-theozolith-validate-verdict = "theozolith_worker.harness.validate:main"
+# The in-session Output Proposal CLI (ADR-0046): deliberately unprefixed —
+# these are the exact names the run prompts teach, and they never imply
+# live GitHub writes (the proposal is pending state applied post-exit).
+format-output = "theozolith_worker.formatoutput:main"
+view-output = "theozolith_worker.formatoutput:view_main"
 
 [build-system]
 requires = ["hatchling"]

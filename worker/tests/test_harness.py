@@ -16,7 +16,7 @@ import stat
 import time
 from pathlib import Path
 
-from theozolith_worker import jobdir
+from theozolith_worker import jobdir, proposal
 from theozolith_worker.harness.main import await_exit, launch_agent, run_harness, serve_jobs
 
 
@@ -105,6 +105,7 @@ def make_job(
         workdir=workdir,
         agent_timeout_seconds=timeout,
         jobs_idle_timeout_seconds=30.0,
+        schema_version=proposal.SCHEMA_VERSION,
     )
     jobdir.write_manifest(job, manifest)
     (job / jobdir.PROMPT_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -243,10 +244,8 @@ def test_run_mode_full_cycle(tmp_path):
     assert (workdir / "gate.txt").read_text() == "ok"
 
 
-def test_review_mode_copies_verdict_and_serves_no_jobs(tmp_path):
-    job, manifest = make_job(tmp_path, mode=jobdir.MODE_REVIEW)
-    verdict = {"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}
-    (job / manifest.workdir / "verdict.json").write_text(json.dumps(verdict))
+def test_review_mode_serves_no_jobs(tmp_path):
+    job, _manifest = make_job(tmp_path, mode=jobdir.MODE_REVIEW)
     clock = ScriptedClock()
     launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0))
 
@@ -260,8 +259,40 @@ def test_review_mode_copies_verdict_and_serves_no_jobs(tmp_path):
     )
 
     assert code == 0
-    assert json.loads((job / jobdir.VERDICT_FILE).read_text()) == verdict
     assert jobdir.read_status(job).phase == jobdir.PHASE_DONE
+
+
+def test_schema_version_mismatch_fails_before_the_session_starts(tmp_path):
+    """ADR-0046: a driver and run image speaking different Output Proposal
+    schemas fail strictly pre-work with the anchored marker the driver
+    classes as a pre-session infra failure — the agent never launches."""
+    job, manifest = make_job(tmp_path)
+    stale = jobdir.Manifest(
+        **{
+            **{f: getattr(manifest, f) for f in manifest.__dataclass_fields__},
+            "schema_version": proposal.SCHEMA_VERSION + 1,
+        }
+    )
+    jobdir.write_manifest(job, stale)
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=1.0))
+
+    code = run_harness(
+        job,
+        launcher,
+        runner=_real_runner,
+        clock=clock,
+        sleep=clock.sleep,
+        identity_root=tmp_path / "no-identity",
+    )
+
+    assert code == 1
+    assert launcher.calls == []  # pre-work: no agent process was ever spawned
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert proposal.schema_error_detail(status.error) is not None
+    # An unstamped manifest (a pre-channel driver) is equally a mismatch.
+    assert proposal.schema_mismatch(0) is not None
 
 
 def test_harness_survives_agent_timeout_and_reports_it(tmp_path):

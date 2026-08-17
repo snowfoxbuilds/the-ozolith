@@ -29,7 +29,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import stat
 import subprocess
 from collections.abc import Iterator
@@ -45,7 +44,7 @@ from theozolith_worker.identity import (
     MonitorHooks,
     PreflightReport,
 )
-from theozolith_worker.jobdir import MODE_REVIEW, VERDICT_FILE, Manifest
+from theozolith_worker.jobdir import Manifest
 
 
 class AgentAdapterError(RuntimeError):
@@ -623,12 +622,11 @@ class ClaudeAdapter:
         return {}
 
     def collect(self, workdir: Path, job: Path, mode: str) -> None:
-        if mode == MODE_REVIEW:
-            verdict = workdir / "verdict.json"
-            if verdict.is_file():
-                target = job / VERDICT_FILE
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(verdict, target)
+        # Nothing to copy out (ADR-0046): every session output the driver
+        # applies is the Output Proposal, which the format-output CLI writes
+        # directly into the job dir's output/ — the hand-written review-mode
+        # verdict.json this step used to ferry is retired.
+        return
 
     def stream_stats(self, transcript: Path) -> StreamStats:
         """Scan the stream-json transcript for tool calls, token usage, and

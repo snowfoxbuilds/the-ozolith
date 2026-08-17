@@ -22,11 +22,12 @@ from conftest import (
     Harness,
     IdentityFailure,
     behavior_write,
+    format_output,
     make_harness,
-    write_decisions,
+    write_proposal,
 )
 from fakegithub import rate_limited_response
-from theozolith_worker import decisions, evidence, verdict
+from theozolith_worker import decisions, evidence, proposal, verdict
 from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
@@ -434,8 +435,8 @@ def test_final_round_revise_escalates_immediately(harness: Harness):
     assert parsed is not None and parsed.verdict == verdict.ESCALATE
     assert "final-round" in last  # the raw validation error is in the comment
     assert f"tree/theozolith/evidence/runs/issue-{number}" in last  # bundle link
-    assert "-invalid-verdict.json" in last  # evidence path of the bad file
-    assert any("-invalid-verdict.json" in p for p in harness.evidence_paths())
+    assert "-invalid-proposal.json" in last  # evidence path of the bad proposal
+    assert any("-invalid-proposal.json" in p for p in harness.evidence_paths())
 
     # No re-poll of the same PR: the next pass launches nothing.
     assert harness.reviewer_once() == 0
@@ -543,7 +544,7 @@ def _no_op(prompt: str, cwd: Path) -> None:
 
 
 def _empty_decisions(prompt: str, cwd: Path) -> None:
-    write_decisions(cwd)  # a skeleton file with no content is not reasoning
+    write_proposal(cwd)  # a skeleton file with no content is not reasoning
 
 
 def _timeout_with_changes(prompt: str, cwd: Path):
@@ -558,7 +559,7 @@ def _session_death(prompt: str, cwd: Path):
 def _assert_escalated(
     harness: Harness, number: int, failure_class: str, reason_fragment: str
 ) -> None:
-    """The local-retry budget is spent: claim released, failed + needs_human,
+    """The retry budget is spent: claim released, failed + needs_human,
     both evidence links and each failure's class in the comment."""
     assert harness.fake.assignees_of(number) == []
     labels = harness.fake.labels_of(number)
@@ -566,7 +567,7 @@ def _assert_escalated(
     assert PLAN_READY not in labels and IN_PROGRESS not in labels and BLOCKED not in labels
     (comment,) = harness.fake.comments[number]
     body = comment["body"]
-    assert "local-retry budget is spent" in body
+    assert "retry budget is spent" in body
     assert failure_class in body and reason_fragment in body
     run_ids = re.findall(r"Run `([^`]+)`", body)
     assert len(run_ids) == 2 and run_ids[0] != run_ids[1]  # two distinct Runs
@@ -610,7 +611,7 @@ def test_run_outcome_classification_matrix(harness: Harness):
     # no commits + reasoning → empty PR (asserted in depth in its own test).
     no_change = harness.file_issue("No change needed", CRITERIA_BODY)
     harness.worker_behaviors.append(
-        lambda p, cwd: write_decisions(
+        lambda p, cwd: write_proposal(
             cwd, decisions=[{"what": "no change needed", "why": "already handled"}]
         )
     )
@@ -618,12 +619,14 @@ def test_run_outcome_classification_matrix(harness: Harness):
     assert len(harness.fake.open_pr_numbers()) == 2
     assert PLAN_READY not in harness.fake.labels_of(no_change)
 
-    # no commits + no reasoning → failed (both no-file and empty-file forms).
+    # no proposal at all → the completion lane (ADR-0016 as amended by
+    # ADR-0046): one completion retry, then escalation on the second miss.
     silent = harness.file_issue("Silent", CRITERIA_BODY)
     harness.worker_behaviors.extend([_no_op, _no_op])
-    assert harness.worker_once() == 2  # the original and the one local retry
-    _assert_escalated(harness, silent, "no-changes", "no no-change reasoning")
+    assert harness.worker_once() == 2  # the original and the one completion retry
+    _assert_escalated(harness, silent, "completion", "no output proposal")
 
+    # valid proposal, no commits, no reasoning → failed on the uniform budget.
     hollow = harness.file_issue("Hollow", CRITERIA_BODY)
     harness.worker_behaviors.extend([_empty_decisions, _empty_decisions])
     harness.worker_once()
@@ -648,9 +651,13 @@ def test_run_outcome_classification_matrix(harness: Harness):
 def test_empty_pr_carries_reasoning_and_allow_empty_commit(harness: Harness):
     number = harness.file_issue("Already implemented", CRITERIA_BODY)
     harness.worker_behaviors.append(
-        lambda p, cwd: write_decisions(
+        lambda p, cwd: write_proposal(
             cwd,
             decisions=[{"what": "no change needed", "why": "util.py already covers this"}],
+            commit_message=(
+                "No changes required for the acceptance criteria\n\n"
+                "util.py already covers this; recording the reasoning for review."
+            ),
         )
     )
     assert harness.worker_once() == 1
@@ -668,12 +675,18 @@ def test_empty_pr_carries_reasoning_and_allow_empty_commit(harness: Harness):
     assert harness.remote_sha(branch) != harness.remote_sha("main")
     assert harness.remote_paths(branch) == harness.remote_paths("main")
     history = subprocess.run(
-        ["git", "--git-dir", str(harness.remote), "log", "--format=%s", branch],
+        ["git", "--git-dir", str(harness.remote), "log", "--format=%B", branch],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    assert "no changes required" in history
+    # The proposed message ships verbatim — no driver-generated filler — and
+    # the provenance trailer carries what the old generated subject did
+    # (ADR-0046: run id, issue, round).
+    assert "No changes required for the acceptance criteria" in history
+    assert "Ozolith-Run: " in history
+    assert f"Ozolith-Issue: #{number}" in history
+    assert "Ozolith-Round: 1" in history
 
     # Evidence records the empty-PR outcome; the Reviewer judges it normally.
     paths = harness.evidence_paths()
@@ -695,7 +708,7 @@ def test_failed_run_budget_is_one_local_retry_then_escalation(harness: Harness):
     links and each failure's class — mixed classes stay one uniform budget."""
     number = harness.file_issue("Cursed", CRITERIA_BODY)
 
-    harness.worker_behaviors.extend([_no_op, _session_death])
+    harness.worker_behaviors.extend([_empty_decisions, _session_death])
     assert harness.worker_once() == 2  # both Runs happened under ONE claim
 
     assert harness.fake.assignees_of(number) == []
@@ -735,6 +748,132 @@ def test_failed_run_budget_is_one_local_retry_then_escalation(harness: Harness):
 
     # failed + needs_human is not claimable: nothing left to do.
     assert harness.worker_once() == 0
+
+
+def test_completion_retry_preserves_the_worktree_and_ships(harness: Harness):
+    """ADR-0016 as amended by ADR-0046: a completed session with an invalid
+    proposal gets one completion retry — new run_id and container, worktree
+    and pending proposal preserved, error appendix on the prompt — and the
+    retry ships the FIRST session's work without redoing it."""
+    number = harness.file_issue("Forgetful", CRITERIA_BODY)
+    seen: dict = {}
+
+    def forgets_commit_message(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("finished work\n")
+        write_proposal(cwd, pr_title="the real title", skip={"commit-message"})
+
+    def fills_in(prompt: str, cwd: Path) -> None:
+        seen["retry_prompt"] = prompt
+        seen["worktree"] = (cwd / "change.txt").read_text()
+        seen["pending"] = proposal.pending_fields(proposal.read_raw(cwd.parent))
+        format_output(cwd.parent, "commit-message", "finish the widget\n\nwhy and how")
+
+    harness.worker_behaviors.extend([forgets_commit_message, fills_in])
+    assert harness.worker_once() == 2  # the original and the one completion retry
+
+    # The retry session saw the preserved worktree, the pending proposal,
+    # and the machine-generated error appendix (fill-only instruction).
+    assert seen["worktree"] == "finished work\n"
+    assert seen["pending"]["pr-title"] == "the real title"
+    assert "Completion retry" in seen["retry_prompt"]
+    assert "commit-message (missing)" in seen["retry_prompt"]
+    assert "Do NOT redo" in seen["retry_prompt"]
+
+    # The first session's work shipped; the claim never left; no label churn.
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    assert harness.fake.issues[pr_number]["title"] == f"#{number}: the real title"
+    assert harness.remote_file(branch_for(number), "change.txt") == "finished work"
+    assert harness.fake.assignees_of(number) == [WORKER_LOGIN]
+    assert harness.fake.labels_of(number) == {IN_PROGRESS, "risk:medium"}
+    # Two containers, two run_ids; the completion class rode the channel.
+    assert len({n for n in harness.record.launched if n.startswith("ozolith-run-")}) == 2
+    failed = [e for e in harness.sink.run_events(number) if e["phase"] == "failed"]
+    assert [e["failure_class"] for e in failed] == ["completion"]
+    # The failed Run's evidence preserves the partial proposal it died with.
+    (bad_run,) = {e["run_id"] for e in failed}
+    partial = json.loads(harness.evidence_file(f"runs/issue-{number}/{bad_run}/proposal.json"))
+    assert partial["fields"]["pr-title"] == "the real title"
+    assert "commit-message" not in partial["fields"]
+    # The shipped commit carries the retry's message plus provenance.
+    history = subprocess.run(
+        ["git", "--git-dir", str(harness.remote), "log", "--format=%B", branch_for(number)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "finish the widget" in history and "Ozolith-Run: " in history
+    # No filesystem state survives: no job dirs, no .completion-* parking.
+    jobs = Path(harness.worker_config.jobs_dir)
+    assert not jobs.exists() or list(jobs.iterdir()) == []
+
+
+def test_schema_version_skew_is_a_pre_session_infra_failure(harness: Harness):
+    """ADR-0046: the harness's anchored schema-version refusal classifies as
+    the pre-session infra class (ADR-0016) — never harness breakage, never
+    the completion lane (no worktree exists to preserve)."""
+    number = harness.file_issue("Skewed", CRITERIA_BODY)
+
+    def skew(prompt: str, cwd: Path):
+        raise SessionError(f"harness failed: {proposal.schema_mismatch(0)}")
+
+    harness.worker_behaviors.extend([skew, skew])
+    assert harness.worker_once() == 2
+    _assert_escalated(harness, number, "infra", "out of step")
+
+
+def test_resume_round_absent_fields_keep_title_and_narrative(harness: Harness):
+    """Absent field = no-op, never clear (ADR-0046): a resume round that
+    proposes no title/narrative keeps the PR's existing ones (only the
+    Decisions Section is replaced); proposing a narrative replaces the
+    zone while the driver keeps the frame."""
+    number = harness.file_issue("Zoned", CRITERIA_BODY)
+    harness.worker_behaviors.append(
+        behavior_write(
+            {"feature.txt": "v1\n"},
+            pr_title="round one title",
+            pr_description="Round one narrative.",
+            decisions=[{"what": "round 1 call", "why": "because"}],
+        )
+    )
+    assert harness.worker_once() == 1
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert harness.fake.issues[pr_number]["title"] == f"#{number}: round one title"
+    assert "Round one narrative." in harness.fake.issues[pr_number]["body"]
+
+    # Round 2 proposes only the commit message: title and narrative stay.
+    harness.reviewer_replies.append(revise_reply("1. keep going"))
+    assert harness.reviewer_once() == 1
+
+    def round_two(prompt: str, cwd: Path) -> None:
+        (cwd / "feature.txt").write_text("v2\n")
+        write_proposal(
+            cwd,
+            skip={"pr-title", "pr-description"},
+            decisions=[{"what": "round 2 call", "why": "narrower"}],
+        )
+
+    harness.worker_behaviors.append(round_two)
+    assert harness.worker_once() == 1
+    body = harness.fake.issues[pr_number]["body"]
+    assert harness.fake.issues[pr_number]["title"] == f"#{number}: round one title"
+    assert f"Closes #{number}." in body
+    assert "Round one narrative." in body  # absent narrative = keep
+    section = decisions.parse(body)
+    assert section is not None and section.decisions[0].what == "round 2 call"
+
+    # Round 3 proposes a new narrative: the zone is replaced, frame intact.
+    harness.reviewer_replies.append(revise_reply("1. final polish"))
+    assert harness.reviewer_once() == 1
+    harness.worker_behaviors.append(
+        behavior_write({"feature.txt": "v3\n"}, pr_description="Round three narrative.")
+    )
+    assert harness.worker_once() == 1
+    body = harness.fake.issues[pr_number]["body"]
+    assert f"Closes #{number}." in body
+    assert "Round three narrative." in body
+    assert "Round one narrative." not in body
+    assert decisions.parse(body) is not None
 
 
 def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypatch):
@@ -787,7 +926,7 @@ def test_compound_parking_failure_never_blocks_escalation(harness: Harness, monk
 
     number = harness.file_issue("Doomed", CRITERIA_BODY)
     harness.worker_behaviors.append(_no_op)
-    harness.worker_behaviors.append(_no_op)  # both Runs fail (no commits, no reasoning)
+    harness.worker_behaviors.append(_no_op)  # both Runs fail (no proposal at all)
     assert harness.worker_once() == 2
 
     # Escalation completed in full despite the compound failure.
@@ -796,7 +935,7 @@ def test_compound_parking_failure_never_blocks_escalation(harness: Harness, monk
     assert {FAILED, NEEDS_HUMAN} <= labels and IN_PROGRESS not in labels
     (comment,) = harness.fake.comments[number]
     body = comment["body"]
-    assert "local-retry budget is spent" in body
+    assert "retry budget is spent" in body
     # Honest forensics: no dead links, no false boot-sweep promise.
     assert "[evidence](" not in body
     assert "was lost" in body and "loss accepted" in body
@@ -850,7 +989,7 @@ def _audit_write(actor: str, method: str, path: str, payload, issues: set[int], 
         if tail.endswith("/comments") and method == "POST":
             # The only worker comment is the escalation record (ADR-0016).
             assert number in issues, "worker comments only on issues"
-            assert "local-retry budget is spent" in payload["body"]
+            assert "retry budget is spent" in payload["body"]
             return
         if tail.endswith("/labels") and method == "POST":
             wanted = set(payload["labels"])
@@ -937,7 +1076,7 @@ def test_run_container_holds_no_github_credential(tmp_path):
     def probing_agent(prompt: str, cwd: Path) -> None:
         captured["git_config"] = (cwd / ".git" / "config").read_text()
         (cwd / "change.txt").write_text("x\n")
-        write_decisions(cwd)
+        write_proposal(cwd)
 
     harness.worker_behaviors.append(probing_agent)
     assert harness.worker_once() == 1
@@ -984,7 +1123,7 @@ def test_hostile_git_metadata_cannot_reach_the_driver(harness: Harness):
             + '[credential]\n\thelper = "!echo password=stolen"\n'
         )
         (cwd / "change.txt").write_text("x\n")
-        write_decisions(cwd)
+        write_proposal(cwd)
 
     harness.worker_behaviors.append(boobytrap)
     assert harness.worker_once() == 1
@@ -1236,9 +1375,9 @@ def test_malformed_verdict_escalates_immediately_with_the_raw_error(harness: Har
     comment = harness.fake.comments[pr_number][-1]["body"]
     assert "not valid JSON" in comment  # the raw validation error
     assert f"tree/theozolith/evidence/runs/issue-{number}" in comment  # bundle link
-    assert "-invalid-verdict.json" in comment  # evidence path of the bad file
+    assert "-invalid-proposal.json" in comment  # evidence path of the bad proposal
     # The offending file really is preserved at the cited path.
-    invalid_path = next(p for p in harness.evidence_paths() if p.endswith("-invalid-verdict.json"))
+    invalid_path = next(p for p in harness.evidence_paths() if p.endswith("-invalid-proposal.json"))
     assert harness.evidence_file(invalid_path).startswith("this is not json")
     assert harness.record.alive == set()
 
@@ -1259,8 +1398,8 @@ def test_missing_and_schema_invalid_verdicts_also_escalate(harness: Harness):
     ]
     comment = harness.fake.comments[pr_one][-1]["body"]
     assert {BLOCKED, NEEDS_HUMAN} <= harness.fake.labels_of(pr_one)
-    assert "no verdict file emitted" in comment
-    assert "emitted no verdict file" in comment  # and no evidence path is cited
+    assert "no output proposal was written" in comment
+    assert "wrote no output proposal" in comment  # and no evidence path is cited
 
     second = harness.file_issue("Schema fail", CRITERIA_BODY)
     harness.worker_once()

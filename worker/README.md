@@ -15,18 +15,24 @@ container:
   dispatch endpoint (ADR-0017 — the Control Node writes the claim on GitHub before the
   driver ever sees the issue), prepares a per-Run job directory with a **token-free
   checkout**, launches `ozolith-run-<run-id>`, sequences gate steps as harness jobs,
-  then pushes and ships the best-effort PR with its Decisions Section. A non-completed
-  Run keeps the claim and retries locally exactly once; a second non-completion releases
-  the claim and escalates `failed` + `needs_human` with both evidence bundles
-  (ADR-0016). At boot (and idle passes) it sweeps orphaned job dirs to the evidence
+  then applies the session's **Output Proposal** post-exit (ADR-0046): commits with the
+  proposed commit message plus a provenance trailer, composes the PR (`#N: ` title
+  prefix; Closes line + narrative + Decisions Section body), pushes, and ships the
+  best-effort PR. A non-completed Run keeps the claim and retries locally exactly once;
+  a completed session whose proposal fails validation gets one **completion retry**
+  (worktree + pending proposal preserved, error appendix on the prompt); a second
+  non-completion (or completion-retry miss) releases
+  the claim and escalates `failed` + `needs_human` with every evidence bundle
+  (ADR-0016 as amended). At boot (and idle passes) it sweeps orphaned job dirs to the evidence
   branch (`swept: true`, delete only after a confirmed push). All non-claim GitHub I/O
   happens in the driver; the driver never executes repository code or model output.
 - **Reviewer** (`theozolith-driver builtin:reviewer`) — the Reviewer driver (own GitHub
   identity, stronger model):
   discovers `pr_ready` PRs through dispatch, materializes review inputs as files, launches
-  `ozolith-review-<pr>-round-<n>`, validates the agent's `verdict.json`, renders the
-  verdict comment, and applies all post-PR state. 3 review rounds per issue; at the last
-  budgeted round a revise verdict is rejected (approve or escalate only).
+  `ozolith-review-<pr>-round-<n>`, validates the round's Output Proposal (the verdict and
+  its content, ADR-0046), renders the verdict comment, and applies all post-PR state.
+  3 review rounds per issue; at the last budgeted round a revise verdict is rejected
+  (approve or escalate only), and the in-session CLI already refuses it at write time.
 - `theozolith-harness` — PID 1 of the run container: invokes the agent **headless**
   (ADR-0019 as amended) — the adapter's one-shot command (Claude: `claude -p` with
   structured output) carrying a constant-size **pointer prompt** at the mounted task
@@ -36,14 +42,21 @@ container:
   as completion with the hard agent timeout as backstop, serves driver-sequenced
   jobs, writes outputs, and exits. Run containers are never attach targets;
   interactivity lives only in the Flight Deck Stack.
+- `format-output` / `view-output` — the in-session Output Proposal CLI (ADR-0046),
+  baked into run images: the agent writes every proposed mutation (PR title/narrative,
+  Decisions-Section entries, the required rich commit message; the Reviewer's verdict
+  and content) as pending state the driver validates and applies post-exit. Enumerated
+  fields fail loud at write time; `format-output status` runs the driver's exact
+  validation; nothing the agent runs touches GitHub.
 
 Driver and harness communicate only through the job directory (`input/`, `output/`,
 `checkout|work/`), bind-mounted at `/job` — no network channel, no shared process tree.
 Both drivers support the continuous loop and `--once` (a single poll pass, the dev mode).
 
-Contracts and formats (job-dir schemas, gate step contracts, verdict schema, evidence
-bundle layout, harness mechanics) are recorded in ADR-0014. Deployment instructions live
-in `deploy/README.md`.
+Contracts and formats (job-dir schemas, gate step contracts, evidence bundle layout,
+harness mechanics) are recorded in ADR-0014; the Output Proposal schema, the
+format-output CLI, and the commit-message doctrine in ADR-0046. Deployment
+instructions live in `deploy/README.md`.
 
 ## Repo bootstrap
 

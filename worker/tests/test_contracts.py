@@ -1,4 +1,4 @@
-"""Decisions Section, verdict-file schema, and Agent-adapter contracts."""
+"""Decisions Section, Output Proposal schema, and Agent-adapter contracts."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import stat
 from pathlib import Path
 
 import pytest
-from theozolith_worker import decisions, jobdir, verdict
+from theozolith_worker import decisions, jobdir, proposal, verdict
 from theozolith_worker.adapters import (
     MODEL_ALIAS,
     MODEL_PINNED,
@@ -17,10 +17,9 @@ from theozolith_worker.adapters import (
     ClaudeAdapter,
     materialize_instruction,
 )
+from theozolith_worker.formatoutput import format_output_main
 from theozolith_worker.gate.pipeline import Finding
 from theozolith_worker.githubapi import Comment
-from theozolith_worker.harness.validate import main as validate_main
-from theozolith_worker.harness.validate import validate_session_verdict
 from theozolith_worker.runner import RunReport, render_claim_escalation
 
 
@@ -86,32 +85,6 @@ def test_decisions_section_text_strips_machine_block():
     assert "theozolith:decisions:data" not in text
 
 
-def test_agent_decisions_file_parsing(tmp_path):
-    target = tmp_path / decisions.AGENT_FILE
-    target.parent.mkdir(parents=True)
-    target.write_text(
-        json.dumps(
-            {
-                "decisions": [{"what": "w", "why": "y"}, "bare string"],
-                "open_questions": ["q"],
-                "remaining_work": [],
-                "dead_ends": ["d"],
-            }
-        )
-    )
-    section = decisions.read_agent_decisions(tmp_path)
-    assert section is not None
-    assert section.decisions == [
-        decisions.Decision("w", "y"),
-        decisions.Decision("bare string", ""),
-    ]
-    assert section.open_questions == ["q"]
-
-    target.write_text("not json {")
-    assert decisions.read_agent_decisions(tmp_path) is None
-    assert decisions.read_agent_decisions(tmp_path / "missing") is None
-
-
 def test_verdict_comment_roundtrip_and_latest():
     revise = verdict.Verdict(
         verdict=verdict.REVISE,
@@ -148,18 +121,17 @@ def test_verdict_comment_roundtrip_and_latest():
     assert found[0] == revise and found[1].id == 1
 
 
-# -- the verdict FILE: strict validation (M2 acceptance 10) -------------------
+# -- the review Output Proposal: strict driver-side validation (ADR-0046,
+# carrying ADR-0014's M2 acceptance 10 rules forward) --------------------------
 
 
-def write_verdict(tmp_path: Path, data) -> Path:
-    path = tmp_path / "verdict.json"
-    path.write_text(data if isinstance(data, str) else json.dumps(data))
-    return path
+def review_doc(fields: dict) -> dict:
+    return {"schema_version": proposal.SCHEMA_VERSION, "mode": jobdir.MODE_REVIEW, "fields": fields}
 
 
-def validate(path: Path, *, round_number: int = 1, final_round: bool = False):
-    return verdict.validate_verdict_file(
-        path,
+def validate(raw, *, round_number: int = 1, final_round: bool = False):
+    return proposal.validate_review(
+        raw,
         round_number=round_number,
         final_round=final_round,
         default_resume="head-sha",
@@ -167,34 +139,33 @@ def validate(path: Path, *, round_number: int = 1, final_round: bool = False):
     )
 
 
-def test_verdict_file_missing_or_malformed_is_rejected(tmp_path):
-    result, reason = validate(tmp_path / "absent.json")
-    assert result is None and "no verdict file" in reason
+def test_review_proposal_missing_or_malformed_is_rejected():
+    result, reason = validate(None)
+    assert result is None and "no output proposal" in reason
 
-    result, reason = validate(write_verdict(tmp_path, "{truncated"))
-    assert result is None and "not valid JSON" in reason
+    result, reason = validate({"fields": {"verdict": "approve"}})  # no version, no mode
+    assert result is None and "schema_version" in reason
 
-    result, reason = validate(write_verdict(tmp_path, ["a", "list"]))
-    assert result is None and "JSON object" in reason
+    result, reason = validate(review_doc({"verdict": "merge", "evidence": "x"}))
+    assert result is None and "verdict" in reason and "approve" in reason
 
-    result, reason = validate(write_verdict(tmp_path, {"verdict": "merge", "evidence": "x"}))
-    assert result is None and "approve|revise|escalate" in reason
-
-    result, reason = validate(write_verdict(tmp_path, {"verdict": "approve", "evidence": "  "}))
+    result, reason = validate(review_doc({"verdict": "approve", "evidence": "  "}))
     assert result is None and "evidence" in reason
 
-
-def test_verdict_file_approve_requires_grades(tmp_path):
+    # Forbidden mutations are unrepresentable: an off-schema field is
+    # rejected as a whole, never silently dropped (ADR-0046).
     result, reason = validate(
-        write_verdict(tmp_path, {"verdict": "approve", "evidence": "fine", "risk": "low"})
+        review_doc({"verdict": "escalate", "evidence": "x", "labels": ["needs_human"]})
     )
+    assert result is None and "unknown field 'labels'" in reason
+
+
+def test_review_proposal_approve_requires_grades():
+    result, reason = validate(review_doc({"verdict": "approve", "evidence": "fine", "risk": "low"}))
     assert result is None and "deviation" in reason
 
     result, _ = validate(
-        write_verdict(
-            tmp_path,
-            {"verdict": "approve", "evidence": "fine", "deviation": "low", "risk": "medium"},
-        )
+        review_doc({"verdict": "approve", "evidence": "fine", "deviation": "low", "risk": "medium"})
     )
     assert result is not None
     assert result.deviation == "low" and result.risk == "medium"
@@ -202,22 +173,19 @@ def test_verdict_file_approve_requires_grades(tmp_path):
     assert result.bundle_url == "https://example.com/bundle"
 
 
-def test_verdict_file_revise_requires_plan(tmp_path):
-    result, reason = validate(
-        write_verdict(tmp_path, {"verdict": "revise", "evidence": "off plan"})
-    )
-    assert result is None and "revised_plan" in reason
+def test_review_proposal_revise_requires_plan():
+    result, reason = validate(review_doc({"verdict": "revise", "evidence": "off plan"}))
+    assert result is None and "revised-plan" in reason
 
     result, _ = validate(
-        write_verdict(
-            tmp_path,
+        review_doc(
             {
                 "verdict": "revise",
                 "evidence": "off plan",
-                "revised_plan": "1. do it right",
-                "resume_commit": "abc",
-                "cherry_pick": ["def"],
-            },
+                "revised-plan": "1. do it right",
+                "resume-commit": "abc",
+                "cherry-pick": ["def"],
+            }
         ),
         round_number=2,
     )
@@ -225,22 +193,16 @@ def test_verdict_file_revise_requires_plan(tmp_path):
     assert result.round == 2 and result.resume_commit == "abc" and result.cherry_pick == ["def"]
 
 
-def test_final_round_rule_rejects_revise(tmp_path):
+def test_final_round_rule_rejects_revise():
     """A revise that would commission a Run with no remaining review round
-    is invalid; the driver rejects the verdict file (M2 brief)."""
-    path = write_verdict(
-        tmp_path,
-        {"verdict": "revise", "evidence": "still wrong", "revised_plan": "1. again"},
-    )
-    result, reason = validate(path, round_number=3, final_round=True)
+    is invalid; the driver rejects the proposal (M2 brief, ADR-0046)."""
+    doc = review_doc({"verdict": "revise", "evidence": "still wrong", "revised-plan": "1. again"})
+    result, reason = validate(doc, round_number=3, final_round=True)
     assert result is None and "final-round" in reason
 
     # approve and escalate remain valid at the final round.
     ok, _ = validate(
-        write_verdict(
-            tmp_path,
-            {"verdict": "escalate", "evidence": "needs a human decision"},
-        ),
+        review_doc({"verdict": "escalate", "evidence": "needs a human decision"}),
         round_number=3,
         final_round=True,
     )
@@ -861,50 +823,39 @@ def test_claude_adapter_observed_model_conflicting_signals_are_surfaced(tmp_path
     assert "do not include any executed model" in stats.model_note
 
 
-def test_claude_adapter_collect_copies_verdict_only_in_review_mode(tmp_path):
+def test_claude_adapter_collect_is_a_no_op(tmp_path):
+    """ADR-0046: nothing to ferry out of the workdir — the Output Proposal
+    is written directly into output/ by the format-output CLI."""
     adapter = ClaudeAdapter()
     workdir = tmp_path / jobdir.WORK_DIR
     workdir.mkdir()
     (workdir / "verdict.json").write_text('{"verdict": "approve"}')
-
-    adapter.collect(workdir, tmp_path, jobdir.MODE_RUN)
-    assert not (tmp_path / jobdir.VERDICT_FILE).exists()
-
-    adapter.collect(workdir, tmp_path, jobdir.MODE_REVIEW)
-    assert (tmp_path / jobdir.VERDICT_FILE).read_text() == '{"verdict": "approve"}'
+    before = {p for p in tmp_path.rglob("*")}
+    for mode in (jobdir.MODE_RUN, jobdir.MODE_REVIEW):
+        adapter.collect(workdir, tmp_path, mode)
+    assert {p for p in tmp_path.rglob("*")} == before
 
 
-# -- the shared validator: one implementation, two call sites (ADR-0014) ------
+# -- one validator, two call sites: the driver and the in-session CLI ---------
 
 VALIDATOR_FIXTURES = [
-    # (verdict.json content, round, budget) — dicts are serialized, strings raw.
+    # (proposal fields | raw string | None, round, budget)
     ({"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}, 1, 3),
     ({"verdict": "approve", "evidence": "fine"}, 1, 3),  # grades missing
-    ({"verdict": "revise", "evidence": "off plan", "revised_plan": "1. redo"}, 2, 3),
+    ({"verdict": "revise", "evidence": "off plan", "revised-plan": "1. redo"}, 2, 3),
     ({"verdict": "revise", "evidence": "off plan"}, 2, 3),  # plan missing
-    ({"verdict": "revise", "evidence": "again", "revised_plan": "1. redo"}, 3, 3),  # final round
+    ({"verdict": "revise", "evidence": "again", "revised-plan": "1. redo"}, 3, 3),  # final round
     ({"verdict": "escalate", "evidence": "human needed"}, 3, 3),
     ("this is not json {", 1, 3),
-    (None, 2, 3),  # no file at all
-    # process_issues (advisory): populated and malformed alike stay valid.
+    (None, 2, 3),  # no proposal at all
+    # process-issues (advisory): populated and malformed alike stay valid.
     (
         {
             "verdict": "approve",
             "deviation": "low",
             "risk": "low",
             "evidence": "fine",
-            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
-        },
-        1,
-        3,
-    ),
-    (
-        {
-            "verdict": "approve",
-            "deviation": "low",
-            "risk": "low",
-            "evidence": "fine",
-            "process_issues": "not even a list",
+            "process-issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
         },
         1,
         3,
@@ -912,40 +863,36 @@ VALIDATOR_FIXTURES = [
 ]
 
 
-def test_process_issues_never_invalidate_a_verdict(tmp_path):
+def test_process_issues_never_invalidate_a_verdict():
     """Advisory only (2026-07-22): a populated field is carried, a malformed
     one is dropped — neither can fail validation and trigger an escalation."""
-    populated_dir = tmp_path / "populated"
-    populated_dir.mkdir()
-    populated = write_verdict(
-        populated_dir,
-        {
-            "verdict": "approve",
-            "deviation": "low",
-            "risk": "low",
-            "evidence": "fine",
-            "process_issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
-        },
+    result, reason = validate(
+        review_doc(
+            {
+                "verdict": "approve",
+                "deviation": "low",
+                "risk": "low",
+                "evidence": "fine",
+                "process-issues": [{"friction": "slow clone", "suggested_fix": "cache it"}],
+            }
+        )
     )
-    result, reason = validate(populated)
     assert result is not None, reason
     assert result.process_issues == [
         decisions.ProcessIssue(friction="slow clone", suggested_fix="cache it")
     ]
 
-    malformed_dir = tmp_path / "malformed"
-    malformed_dir.mkdir()
-    malformed = write_verdict(
-        malformed_dir,
-        {
-            "verdict": "approve",
-            "deviation": "low",
-            "risk": "low",
-            "evidence": "fine",
-            "process_issues": [42, {"no": "friction"}],
-        },
+    result, reason = validate(
+        review_doc(
+            {
+                "verdict": "approve",
+                "deviation": "low",
+                "risk": "low",
+                "evidence": "fine",
+                "process-issues": [42, {"no": "friction"}],
+            }
+        )
     )
-    result, reason = validate(malformed)
     assert result is not None, reason
     assert result.process_issues == []
 
@@ -954,8 +901,9 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
     job = jobdir.create_job_dir(tmp_path, f"review-r{round_number}")
     (job / jobdir.WORK_DIR).mkdir(parents=True, exist_ok=True)
     if content is not None:
-        text = content if isinstance(content, str) else json.dumps(content)
-        (job / jobdir.WORK_DIR / "verdict.json").write_text(text)
+        text = content if isinstance(content, str) else json.dumps(review_doc(content))
+        (job / proposal.PROPOSAL_FILE).parent.mkdir(parents=True, exist_ok=True)
+        (job / proposal.PROPOSAL_FILE).write_text(text)
     jobdir.write_manifest(
         job,
         jobdir.Manifest(
@@ -965,47 +913,38 @@ def _review_job(tmp_path: Path, content, round_number: int, budget: int) -> Path
             workdir=jobdir.WORK_DIR,
             round=round_number,
             round_budget=budget,
+            schema_version=proposal.SCHEMA_VERSION,
         ),
     )
     return job
 
 
-def test_driver_and_harness_job_validate_identically(tmp_path):
+def test_driver_and_in_session_status_validate_identically(tmp_path):
+    """The absorbed validate-verdict contract (ADR-0046): `format-output
+    status` applies the same validation the driver will — one shared
+    implementation, so an in-session pass can never diverge from the
+    post-exit verdict."""
     for index, (content, round_number, budget) in enumerate(VALIDATOR_FIXTURES):
         job = _review_job(tmp_path / str(index), content, round_number, budget)
-        driver_result, driver_reason = verdict.validate_verdict_file(
-            job / jobdir.WORK_DIR / "verdict.json",
+        driver_result, _ = proposal.validate_review(
+            proposal.read_raw(job),
             round_number=round_number,
             final_round=round_number >= budget,
             default_resume="HEAD",
             bundle_url="",
         )
-        harness_valid, harness_message = validate_session_verdict(job)
-        assert harness_valid == (driver_result is not None), f"fixture {index} diverged"
-        if driver_result is None:
-            assert harness_message == driver_reason, f"fixture {index}: reasons diverged"
+        status_code = format_output_main(["--job", str(job), "status"])
+        assert (status_code == 0) == (driver_result is not None), f"fixture {index} diverged"
 
 
-def test_final_round_rule_matches_in_session(tmp_path):
-    final_revise = {"verdict": "revise", "evidence": "again", "revised_plan": "1. redo"}
+def test_final_round_rule_matches_in_session(tmp_path, capsys):
+    final_revise = {"verdict": "revise", "evidence": "again", "revised-plan": "1. redo"}
     job = _review_job(tmp_path / "final", final_revise, 3, 3)
-    valid, message = validate_session_verdict(job)
-    assert not valid and "final-round" in message
+    assert format_output_main(["--job", str(job), "status"]) == 1
+    assert "final-round" in capsys.readouterr().out
     # The same verdict one round earlier is fine.
     job = _review_job(tmp_path / "middle", final_revise, 2, 3)
-    valid, _ = validate_session_verdict(job)
-    assert valid
-
-
-def test_validate_verdict_cli(tmp_path, capsys):
-    good = {"verdict": "approve", "deviation": "low", "risk": "low", "evidence": "fine"}
-    job = _review_job(tmp_path / "good", good, 1, 3)
-    assert validate_main(["--job", str(job)]) == 0
-    assert "valid" in capsys.readouterr().out
-
-    job = _review_job(tmp_path / "bad", "not json {", 1, 3)
-    assert validate_main(["--job", str(job)]) == 1
-    assert "INVALID" in capsys.readouterr().out
+    assert format_output_main(["--job", str(job), "status"]) == 0
 
 
 # -- the claim-escalation record (ADR-0016: forensics, never state) ------------
@@ -1033,7 +972,7 @@ def test_claim_escalation_comment_carries_both_failures():
         ),
     ]
     body = render_claim_escalation("acme/sandbox", 7, reports)
-    assert "local-retry budget is spent" in body
+    assert "All 2 Runs" in body and "retry budget is spent" in body
     for run_id, cls, reason in (
         ("r-1", "timeout", "timed out"),
         ("r-2", "harness", "exited early"),

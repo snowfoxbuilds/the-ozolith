@@ -31,7 +31,7 @@ import shutil
 import time
 from pathlib import Path
 
-from theozolith_worker import evidence, gitops, jobdir
+from theozolith_worker import evidence, gitops, jobdir, proposal
 from theozolith_worker.config import DriverConfig
 
 
@@ -128,8 +128,7 @@ SWEPT_ARTIFACTS = (
     jobdir.MANIFEST_FILE,
     jobdir.STATUS_FILE,
     jobdir.TRANSCRIPT_FILE,
-    jobdir.VERDICT_FILE,
-    f"{jobdir.CHECKOUT_DIR}/.theozolith/decisions.json",
+    proposal.PROPOSAL_FILE,
 )
 
 
