@@ -5,6 +5,16 @@ Resume state is exactly what the Reviewer designated — the PR branch at the
 resume commit (plus cherry-picked commits) and the revised plan in the
 verdict comment — nothing else survives between Runs (ADR-0008).
 
+Context comes from GitHub at checkout, never from the dispatch grant
+(ADR-0017 as amended, #52): every Run — local retries included — re-reads
+the issue and PR context and materializes it as the Context Tree under the
+job dir's ``input/``, filtered to OWNER/MEMBER authors (the authority
+boundary; see contexttree). The prompt stays slim — rules, the issue body,
+the revised plan on resume rounds, and a navigation guide — and the agent
+discovers everything else in the tree; no discussion content is injected
+and no relevance heuristic prunes it: the only filter is the authority
+boundary, which also governs machine-verdict discovery.
+
 The driver never executes repository code or model output (ADR-0013): the
 agent session and every gate step run inside the ephemeral run container,
 commissioned through the job directory; the driver performs the side effects
@@ -26,7 +36,12 @@ state lives in comments.
 Evidence is the sole durable audit trail (ADR-0016): every Run pushes its
 bundle, and a job directory is deleted only after that push confirmed —
 otherwise it is parked beside the jobs dir for the boot-time evidence
-sweep. One enumerated exception (M5, ADR-0019): when parking AND its
+sweep. The bundle's input half (prompt, issue metadata, Context Tree) comes
+from a trusted snapshot frozen immediately before the container launches
+(#52): input/ is agent-writable through the /job bind mount from launch
+onward, so post-execution re-reads are never evidence.
+
+One enumerated exception (M5, ADR-0019): when parking AND its
 collision-safe fallback both fail, the completed directory is removed
 unpublished — accepted evidence loss, because a completed dir left in the
 jobs dir reads as an in-flight Run to queue-behind.
@@ -40,10 +55,19 @@ import secrets
 import shutil
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from theozolith_worker import adapters, decisions, events, evidence, gitops, jobdir, verdict
+from theozolith_worker import (
+    adapters,
+    contexttree,
+    decisions,
+    events,
+    evidence,
+    gitops,
+    jobdir,
+    verdict,
+)
 from theozolith_worker.bootstrap.vocabulary import (
     FAILED,
     IN_PROGRESS,
@@ -59,7 +83,7 @@ from theozolith_worker.containers import (
     run_container_name,
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
-from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
@@ -106,7 +130,29 @@ needs from you must land in the working tree and the decisions file.
 
 {body}
 
-{round_context}## Rules
+{round_context}## Context tree
+
+The issue and PR context — all comments and reviews from the repository's \
+maintainers (authors GitHub reports as OWNER or MEMBER; content from any \
+other author is removed before you see this tree, as a security boundary) — \
+is on disk at `{job}/input/`, fetched fresh for this Run. Within that \
+boundary the tree is complete and untruncated. Nothing beyond the issue \
+body above is injected into this prompt: navigate the tree instead.
+
+- `{job}/input/issue/comments/INDEX.md` — the maintainer issue comments, \
+one line each; full text in the numbered files beside the index
+- `{job}/input/issue/timeline.md` — issue events (labels, assignments, \
+renames, references)
+- `{job}/input/pr/` — present only when this Run resumes an existing PR: \
+`body.md`, `conversation/` (maintainer PR comments, verdicts included), \
+`review-comments/` (inline file/line comments), `reviews/`, `commits.md` \
+(every PR commit), `checks.md` (check runs and commit statuses)
+
+Read each surface's `INDEX.md` first and open only the items you need. \
+Comments may answer open questions, record human decisions, or narrow the \
+scope — a human decision in a comment outranks the issue body above.
+
+## Rules
 
 - Implement the issue's acceptance criteria directly in the working tree.
 - Never stop to ask questions. When a judgment call comes up, decide, then \
@@ -140,19 +186,10 @@ REVISED_PLAN_CONTEXT = """\
 ## Revised plan (round {round})
 
 A Reviewer judged the previous round of this work; the branch you are on is \
-its designated resume state. Execute this revised plan exactly:
+its designated resume state, resumed from commit `{resume}`. Execute this \
+revised plan exactly:
 
 {plan}
-
-"""
-
-DISCUSSION_CONTEXT = """\
-## Review discussion since the last verdict
-
-These comments (from the PR conversation) answer open questions or add \
-decisions — honor them:
-
-{comments}
 
 """
 
@@ -200,37 +237,31 @@ class _RunContext:
     base_branch: str = ""
     gate: GateResult = field(default_factory=GateResult)
     section: decisions.DecisionsSection | None = None
+    # The pre-launch input snapshot (#52): captured immediately before the
+    # container starts, so evidence never re-reads input the agent could
+    # have rewritten through the /job bind mount. None means no container
+    # was ever launched — the job dir's input is still driver-authored.
+    trusted_input: dict[str, bytes] | None = None
 
 
-def _resume_context(
-    client: GitHubClient, pr_number: int
-) -> tuple[verdict.Verdict | None, list[Comment]]:
-    comments = client.list_comments(pr_number)
-    found = verdict.latest_verdict(comments)
-    if found is None:
-        return None, comments
-    latest, marker = found
-    return latest, verdict.comments_after(comments, marker)
-
-
-def _build_prompt(
-    issue: Issue,
-    round_number: int,
-    revised: verdict.Verdict | None,
-    discussion: list[Comment],
-) -> str:
+def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | None) -> str:
+    """Both round shapes (#52): rules + issue body + the navigation guide,
+    plus the revised plan and resume commit on resume rounds. Discussion
+    content is never injected — every authorized comment lives in the
+    Context Tree."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
-        round_context += REVISED_PLAN_CONTEXT.format(round=round_number, plan=revised.revised_plan)
-    human_comments = [c for c in discussion if verdict.parse_comment(c.body) is None]
-    if human_comments:
-        rendered = "\n\n".join(f"@{c.author}:\n{c.body}" for c in human_comments)
-        round_context += DISCUSSION_CONTEXT.format(comments=rendered)
+        round_context = REVISED_PLAN_CONTEXT.format(
+            round=round_number,
+            resume=revised.resume_commit or "(the branch head)",
+            plan=revised.revised_plan,
+        )
     return PROMPT_TEMPLATE.format(
         number=issue.number,
         title=issue.title,
         body=issue.body or "(no body)",
         round_context=round_context,
+        job=jobdir.CONTAINER_JOB_PATH,
     )
 
 
@@ -345,13 +376,23 @@ def execute_run(
     finally:
         if report.evidence_pushed:
             shutil.rmtree(job, ignore_errors=True)
+            # The trusted input snapshot goes only after the job dir is
+            # fully gone: if removal left remnants, the sweep may push this
+            # bundle path again, and it must keep using the snapshot — a
+            # tampered remnant input must never overwrite good evidence.
+            if not job.exists():
+                evidence.discard_input_snapshot(Path(config.jobs_dir), run_id)
         else:
             # The bundle is the sole durable audit trail: never delete a job
             # dir whose push is unconfirmed — the evidence sweep retries it.
             # Parked in the -pending sibling immediately, so the Node
             # Daemon's queue-behind in-flight signal never reads a finished
-            # Run's retained evidence as a live Run (ADR-0019).
+            # Run's retained evidence as a live Run (ADR-0019). The trusted
+            # input snapshot stays with it: the sweep builds the retried
+            # bundle from that snapshot, never from the retained job dir.
             _park_for_sweep(config, job, report, log)
+            if report.evidence_discarded:
+                evidence.discard_input_snapshot(Path(config.jobs_dir), run_id)
     return report
 
 
@@ -477,16 +518,39 @@ def _run_to_pr(
 
     context.base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
     existing_pr = client.find_open_pr_by_head(branch)
+    # The grant carried claim authority only (ADR-0017 as amended, #52): the
+    # issue and PR context is re-read here, fresh, on every Run — local
+    # retries included — authority-filtered to OWNER/MEMBER authors, and
+    # materialized as the Context Tree. The granted issue snapshot froze at
+    # dispatch time; from here on the fresh one is the issue.
+    snapshot = contexttree.fetch_snapshot(client, issue.number, existing_pr)
+    issue = snapshot.issue
     revised: verdict.Verdict | None = None
-    discussion: list[Comment] = []
     force = False
     if existing_pr is not None:
         report.round = attempts_on(existing_pr.labels) + 1
         report.pr_number = existing_pr.number
         gitops.fetch(workdir, branch, env=auth)
+        # The PR commit snapshot comes from this trusted checkout, not the
+        # 250-capped REST endpoint (#52 amendment) — enumerated at the
+        # fetched PR head, BEFORE any reviewer-designated reset, so the
+        # recorded range is the PR as it stood at checkout no matter where
+        # the branch is reset below.
+        snapshot = replace(
+            snapshot,
+            pr_commits=contexttree.git_pr_commits(
+                workdir, f"origin/{existing_pr.base_ref}", "FETCH_HEAD"
+            ),
+        )
         gitops.checkout_branch(workdir, branch, create=True)
         gitops.reset_hard(workdir, "FETCH_HEAD")
-        revised, discussion = _resume_context(client, existing_pr.number)
+        # The machine verdict stays a driver-internal reset detail, selected
+        # only from the authority-filtered conversation (#52 amendment): a
+        # verdict block in an unauthorized comment can never designate the
+        # resume state. The agent reads the same filtered conversation from
+        # the tree.
+        found = verdict.latest_verdict(snapshot.pr_conversation)
+        revised = found[0] if found is not None else None
         if revised is not None and revised.resume_commit:
             if gitops.commit_exists(workdir, revised.resume_commit):
                 if revised.resume_commit != gitops.head_sha(workdir):
@@ -506,8 +570,9 @@ def _run_to_pr(
             # That state was never Reviewer-designated: overwrite it.
             force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
+    contexttree.write_tree(job / "input", snapshot)
 
-    prompt = _build_prompt(issue, report.round, revised, discussion)
+    prompt = _build_prompt(issue, report.round, revised)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
     _write_issue_metadata(job, issue, round_number=report.round)
     manifest = jobdir.Manifest(
@@ -528,6 +593,13 @@ def _run_to_pr(
         user=config.container_user,
     )
 
+    # The last driver act before the container exists: freeze the input for
+    # evidence (#52). From launch onward input/ is agent-writable via the
+    # /job bind mount, so every bundle — live, failed, or boot-swept — is
+    # built from this snapshot, never from a post-execution re-read.
+    context.trusted_input = evidence.capture_input_snapshot(
+        Path(config.jobs_dir), job, report.run_id
+    )
     session = session_factory(spec, job, manifest)
     session.launch()
     report.phase = "agent"
@@ -715,7 +787,7 @@ def _push_run_evidence(
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
     stats = _run_stats(config, job)
-    files = {
+    files: dict[str, str | bytes] = {
         f"{prefix}/run.json": json.dumps(
             {
                 "run_id": report.run_id,
@@ -761,6 +833,17 @@ def _push_run_evidence(
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }
+    # The exact input the Run saw (#52): prompt, issue metadata, and the
+    # authorized Context Tree, byte-for-byte under their relative paths —
+    # from the pre-launch trusted snapshot whenever a container launched.
+    # The job-dir fallback covers only pre-launch failures (clone, fetch),
+    # where no agent has ever had write access to input/.
+    input_files = (
+        context.trusted_input
+        if context.trusted_input is not None
+        else evidence.input_artifacts(job)
+    )
+    files.update({f"{prefix}/{rel}": content for rel, content in input_files.items()})
     try:
         evidence.push_bundle(
             config.clone_url,

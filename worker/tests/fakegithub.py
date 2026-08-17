@@ -47,10 +47,17 @@ class FakeGitHub:
         self.default_branch = "main"
         self.git_dir = git_dir
         self.tokens: dict[str, str] = {}
+        # login -> author_association stamped on comments/reviews (#52).
+        self.associations: dict[str, str] = {}
         self.issues: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[dict[str, Any]]] = {}
         self.events: dict[int, list[dict[str, Any]]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
+        self.review_comments: dict[int, list[dict[str, Any]]] = {}
+        self.review_threads: dict[int, list[dict[str, Any]]] = {}
+        self.reviews: dict[int, list[dict[str, Any]]] = {}
+        self.check_runs: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
+        self.statuses: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
         self._next_number = 1
         self._next_id = 1
         self._tick = 0
@@ -63,8 +70,12 @@ class FakeGitHub:
 
     # -- test setup helpers -------------------------------------------------
 
-    def register(self, token: str, login: str) -> None:
+    def register(self, token: str, login: str, association: str = "MEMBER") -> None:
+        """Register an API actor. Pipeline machine accounts are org MEMBERs
+        in production (the #52 authority boundary requires it), so that is
+        the default association their comments carry."""
         self.tokens[token] = login
+        self.associations[login] = association
 
     def create_issue(self, title: str, body: str, labels: set[str] | None = None) -> int:
         number = self._next_number
@@ -92,6 +103,162 @@ class FakeGitHub:
 
     def fail_next(self, predicate: Callable[[str, str], bool], responses: list[Response]) -> None:
         self.failures.append((predicate, list(responses)))
+
+    def _association_of(self, login: str | None) -> str:
+        return self.associations.get(login or "", "NONE")
+
+    def add_issue_comment(
+        self,
+        number: int,
+        login: str | None,
+        body: str,
+        association: str | None = None,
+    ) -> int:
+        """A conversation comment (issue or PR) plus its mirrored timeline
+        ``commented`` event — the fake keeps both surfaces in sync the way
+        real GitHub does, so timeline leak-prevention is exercised on every
+        comment. ``login=None`` models a deleted account (``user: null``);
+        ``association=None`` looks the login up in the registry."""
+        comment = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "body": body,
+            "created_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "html_url": f"fake://comment/{self._next_id}",
+        }
+        self._next_id += 1
+        self.comments.setdefault(number, []).append(comment)
+        self.events.setdefault(number, []).append(
+            {**comment, "event": "commented", "actor": comment["user"]}
+        )
+        return comment["id"]
+
+    def add_review_comment(
+        self,
+        number: int,
+        login: str | None,
+        body: str,
+        path: str,
+        line: int | None = None,
+        association: str | None = None,
+        **fields: Any,
+    ) -> int:
+        """An inline review comment; ``fields`` passes anchor extras through
+        verbatim (original_line, start_line, side, commit_id, in_reply_to_id,
+        pull_request_review_id, ...)."""
+        comment = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "body": body,
+            "created_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "path": path,
+            "line": line,
+            "html_url": f"fake://review-comment/{self._next_id}",
+            **fields,
+        }
+        self._next_id += 1
+        self.review_comments.setdefault(number, []).append(comment)
+        return comment["id"]
+
+    def add_review(
+        self,
+        number: int,
+        login: str | None,
+        state: str,
+        body: str = "",
+        association: str | None = None,
+    ) -> int:
+        review = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "state": state,
+            "body": body,
+            "submitted_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "html_url": f"fake://review/{self._next_id}",
+        }
+        self._next_id += 1
+        self.reviews.setdefault(number, []).append(review)
+        return review["id"]
+
+    def add_review_thread(
+        self,
+        number: int,
+        comment_ids: list[int],
+        resolved: bool = False,
+        resolved_by: str = "",
+        outdated: bool = False,
+    ) -> str:
+        """A review thread over existing review-comment ids (resolution and
+        grouping live only in GraphQL on real GitHub, and here too)."""
+        thread_id = f"RT_{self._next_id}"
+        self._next_id += 1
+        self.review_threads.setdefault(number, []).append(
+            {
+                "id": thread_id,
+                "isResolved": resolved,
+                "isOutdated": outdated,
+                "resolvedBy": {"login": resolved_by} if resolved_by else None,
+                "comment_ids": list(comment_ids),
+            }
+        )
+        return thread_id
+
+    def add_check_run(
+        self,
+        sha: str,
+        name: str,
+        status: str,
+        conclusion: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+    ) -> int:
+        run_id = self._next_id
+        self._next_id += 1
+        self.check_runs.setdefault(sha, []).append(
+            {
+                "id": run_id,
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "html_url": "",
+            }
+        )
+        return run_id
+
+    def add_status(
+        self,
+        sha: str,
+        context: str,
+        state: str,
+        description: str = "",
+        target_url: str = "",
+        creator: str = "",
+    ) -> int:
+        status_id = self._next_id
+        self._next_id += 1
+        self.statuses.setdefault(sha, []).append(
+            {
+                "id": status_id,
+                "context": context,
+                "state": state,
+                "description": description,
+                "target_url": target_url,
+                "created_at": self._timestamp(),
+                "creator": {"login": creator} if creator else None,
+            }
+        )
+        return status_id
 
     def force_assign(self, number: int, login: str) -> None:
         """Land another actor's concurrent self-assign (race simulation)."""
@@ -187,7 +354,9 @@ class FakeGitHub:
                 return responses.pop(0)
 
         response = self._route(actor, method, path, params, payload)
-        if method != "GET" and response.status < 400:
+        # POST /graphql carries only read-only queries (mirroring the real
+        # client's writes-transcript exemption): never a logged write.
+        if method != "GET" and path != "/graphql" and response.status < 400:
             self.write_log.append((actor, method, path, payload))
         if self.after_request is not None:
             self.after_request(actor, method, path)
@@ -204,6 +373,8 @@ class FakeGitHub:
         prefix = f"/repos/{self.repo}"
         if path == "/user":
             return _json_response(200, {"login": actor})
+        if path == "/graphql":
+            return self._h_graphql(payload)
         if path == prefix:
             return _json_response(200, {"default_branch": self.default_branch})
         if not path.startswith(prefix):
@@ -224,11 +395,81 @@ class FakeGitHub:
             (r"/issues/(\d+)/labels/([^/]+)", self._h_label_one),
             (r"/issues/(\d+)/assignees", self._h_assignees),
             (r"/issues/(\d+)/events", self._h_events),
+            (r"/issues/(\d+)/timeline", self._h_timeline),
             (r"/issues/(\d+)/comments", self._h_comments),
             (r"/pulls", self._h_pulls),
             (r"/pulls/(\d+)", self._h_pull),
             (r"/pulls/(\d+)/files", self._h_pull_files),
+            (r"/pulls/(\d+)/comments", self._h_review_comments),
+            (r"/pulls/(\d+)/reviews", self._h_reviews),
+            (r"/commits/([^/]+)/check-runs", self._h_check_runs),
+            (r"/commits/([^/]+)/statuses", self._h_statuses),
         ]
+
+    # GraphQL page size the real queries request; the fake honors it so the
+    # client's two-level pagination is exercised for real.
+    _GRAPHQL_PAGE = 100
+
+    def _graphql_comments(self, thread: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+        start = int(cursor) if cursor else 0
+        ids = thread["comment_ids"]
+        page = ids[start : start + self._GRAPHQL_PAGE]
+        return {
+            "pageInfo": {
+                "hasNextPage": start + self._GRAPHQL_PAGE < len(ids),
+                "endCursor": str(start + self._GRAPHQL_PAGE),
+            },
+            "nodes": [{"databaseId": cid} for cid in page],
+        }
+
+    def _graphql_thread_node(self, thread: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+        return {
+            "id": thread["id"],
+            "isResolved": thread["isResolved"],
+            "isOutdated": thread["isOutdated"],
+            "resolvedBy": thread["resolvedBy"],
+            "comments": self._graphql_comments(thread, cursor),
+        }
+
+    def _h_graphql(self, payload: Any) -> Response:
+        """The two read-only queries the client sends: the reviewThreads
+        page walk and the per-thread comment page walk."""
+        query = (payload or {}).get("query") or ""
+        variables = (payload or {}).get("variables") or {}
+        if "reviewThreads" in query:
+            threads = self.review_threads.get(variables.get("number"), [])
+            start = int(variables["cursor"]) if variables.get("cursor") else 0
+            page = threads[start : start + self._GRAPHQL_PAGE]
+            connection = {
+                "pageInfo": {
+                    "hasNextPage": start + self._GRAPHQL_PAGE < len(threads),
+                    "endCursor": str(start + self._GRAPHQL_PAGE),
+                },
+                "nodes": [self._graphql_thread_node(t, None) for t in page],
+            }
+            return _json_response(
+                200,
+                {"data": {"repository": {"pullRequest": {"reviewThreads": connection}}}},
+            )
+        if "PullRequestReviewThread" in query:
+            wanted = variables.get("id")
+            for threads in self.review_threads.values():
+                for thread in threads:
+                    if thread["id"] == wanted:
+                        return _json_response(
+                            200,
+                            {
+                                "data": {
+                                    "node": {
+                                        "comments": self._graphql_comments(
+                                            thread, variables.get("cursor")
+                                        )
+                                    }
+                                }
+                            },
+                        )
+            return _json_response(200, {"data": {"node": None}})
+        return _json_response(200, {"errors": [{"message": f"unsupported query: {query[:80]}"}]})
 
     @staticmethod
     def _page(items: list[Any], params: dict[str, str]) -> list[Any]:
@@ -298,19 +539,37 @@ class FakeGitHub:
         number = int(match.group(1))
         return _json_response(200, self._page(self.events[number], params))
 
+    def _h_timeline(self, actor, method, match, params, payload) -> Response:
+        # The fake's event log doubles as the timeline: same chronological
+        # per-issue records, served through the timeline endpoint's shape.
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.events[number], params))
+
     def _h_comments(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
         if method == "POST":
-            comment = {
-                "id": self._next_id,
-                "user": {"login": actor},
-                "body": payload["body"],
-                "created_at": self._timestamp(),
-            }
-            self._next_id += 1
-            self.comments[number].append(comment)
+            comment_id = self.add_issue_comment(number, actor, payload["body"])
+            (comment,) = [c for c in self.comments[number] if c["id"] == comment_id]
             return _json_response(201, comment)
         return _json_response(200, self._page(self.comments[number], params))
+
+    def _h_review_comments(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.review_comments.get(number, []), params))
+
+    def _h_reviews(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.reviews.get(number, []), params))
+
+    def _h_check_runs(self, actor, method, match, params, payload) -> Response:
+        ref = urllib.parse.unquote(match.group(1))
+        items = self.check_runs.get(ref, [])
+        page = self._page(items, params)
+        return _json_response(200, {"total_count": len(items), "check_runs": page})
+
+    def _h_statuses(self, actor, method, match, params, payload) -> Response:
+        ref = urllib.parse.unquote(match.group(1))
+        return _json_response(200, self._page(self.statuses.get(ref, []), params))
 
     def _h_pulls(self, actor, method, match, params, payload) -> Response:
         if method == "POST":

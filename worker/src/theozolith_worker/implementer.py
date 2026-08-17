@@ -35,8 +35,10 @@ SWEEP_RETRY_SECONDS = 900.0  # backoff between failed-evidence-push retries
 
 
 def _granted_issue(granted: dict, login: str) -> Issue:
-    """The dispatch answer as an Issue: the claim already exists on GitHub
-    (assigned to this driver, in_progress applied) — no re-read needed."""
+    """The dispatch answer as an Issue. The grant is claim authority only
+    (ADR-0017 as amended, #52): this snapshot serves logging and the
+    pre-clone metadata write; the Run re-reads the full issue and PR
+    context fresh at checkout."""
     return Issue(
         number=int(granted["number"]),
         title=str(granted.get("title", "")),

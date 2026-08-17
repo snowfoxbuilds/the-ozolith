@@ -146,8 +146,6 @@ def test_verdict_comment_roundtrip_and_latest():
     found = verdict.latest_verdict(comments)
     assert found is not None
     assert found[0] == revise and found[1].id == 1
-    assert [c.id for c in verdict.comments_after(comments, found[1])] == [2]
-    assert [c.id for c in verdict.comments_after(comments, None)] == [1, 2]
 
 
 # -- the verdict FILE: strict validation (M2 acceptance 10) -------------------

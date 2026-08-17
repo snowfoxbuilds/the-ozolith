@@ -8,6 +8,12 @@ steps travel as job files under ``input/jobs/`` answered under
 ``output/jobs/``. All schemas here are the wire format both sides speak
 (formats settled in ADR-0014).
 
+Because the whole job directory is bind-mounted, everything in it —
+``input/`` included — is agent-writable once the container starts. Evidence
+therefore never trusts post-launch job-dir input: the driver freezes a
+trusted snapshot of the input artifacts immediately before launch
+(evidence.capture_input_snapshot, #52) and every bundle is built from that.
+
 Layout::
 
     jobs/<run-id>/
@@ -16,6 +22,14 @@ Layout::
                          baked into the run image, never here — ADR-0045)
         prompt.md        the driver-rendered task; the invocation argv
                          carries only a constant-size pointer to this file
+        issue.json       machine-readable issue metadata (the boot-time
+                         evidence sweep files parked dirs by it, ADR-0016)
+        issue/           the Context Tree (#52): the issue snapshot — body,
+                         authorized (OWNER/MEMBER) comments, timeline —
+                         re-read at checkout
+        pr/              Context Tree, resume rounds only: PR body, plus
+                         authorized conversation/review comments/reviews,
+                         commits, checks + statuses
         jobs/            driver-sequenced job requests (gate steps, shutdown)
       output/
         status.json      harness phase + agent outcome (atomic writes)

@@ -280,6 +280,11 @@ def review_pr(
             user=config.container_user,
         )
 
+        # Freeze the input for evidence before the container exists (#52):
+        # from launch onward input/ is agent-writable via the /job bind
+        # mount, and a crashed review workspace is swept — the sweep must
+        # find a trusted pre-launch copy, never re-read the job dir.
+        evidence.capture_input_snapshot(Path(config.jobs_dir), job, review_id)
         session = session_factory(spec, job, manifest)
         session.launch()
         try:
@@ -360,6 +365,10 @@ def review_pr(
         return result
     finally:
         shutil.rmtree(job, ignore_errors=True)
+        # The snapshot only after the workspace is fully gone: remnants are
+        # swept, and the swept bundle must come from the snapshot.
+        if not job.exists():
+            evidence.discard_input_snapshot(Path(config.jobs_dir), review_id)
 
 
 def _escalate_invalid_verdict(

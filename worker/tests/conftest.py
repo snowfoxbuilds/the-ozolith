@@ -337,14 +337,8 @@ class Harness:
         return self.fake.create_issue(title, body, {PLAN_READY, f"risk:{risk}"})
 
     def human_comment(self, number: int, body: str) -> None:
-        self.fake.comments[number].append(
-            {
-                "id": 90_000 + len(self.fake.comments[number]),
-                "user": {"login": "sean"},
-                "body": body,
-                "created_at": self.fake._timestamp(),
-            }
-        )
+        """The repository owner comments (an authorized author, #52)."""
+        self.fake.add_issue_comment(number, "sean", body, association="OWNER")
 
     def human_requeue(self, issue_number: int, pr_number: int) -> None:
         """The human answers a blocked PR and re-queues the issue."""

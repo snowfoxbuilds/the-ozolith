@@ -26,7 +26,7 @@ from conftest import (
     write_decisions,
 )
 from fakegithub import rate_limited_response
-from theozolith_worker import decisions, verdict
+from theozolith_worker import decisions, evidence, verdict
 from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
@@ -317,13 +317,23 @@ def test_escalation_and_human_decision_round(harness: Harness):
     harness.human_comment(pr_number, "Decision: flag A must be ON; drop the off criterion.")
     harness.human_requeue(number, pr_number)
 
+    # Captured inside the session, asserted after: an assert inside a
+    # behavior fails the Run and the local retry masks it.
+    seen: dict = {}
+
     def compliant(prompt: str, cwd: Path) -> None:
-        assert "Decision: flag A must be ON" in prompt  # the answer reaches the Run
+        seen["prompt"] = prompt
+        conversation = cwd.parent / "input" / "pr" / "conversation"
+        seen["comments"] = [p.read_text() for p in sorted(conversation.glob("0*.md"))]
         behavior_write({"flag.txt": "on, per human decision\n"})(prompt, cwd)
 
     harness.worker_behaviors.append(compliant)
     harness.worker_once()
     assert harness.fake.open_pr_numbers() == [pr_number]  # same PR completes
+    # The answer reaches the Run through the Context Tree (#52), never the
+    # prompt: the authorized PR conversation is on disk in full.
+    assert any("Decision: flag A must be ON" in c for c in seen["comments"])
+    assert "Decision: flag A must be ON" not in seen["prompt"]
 
     harness.reviewer_replies.append(approve_reply())
     harness.reviewer_once()
@@ -745,8 +755,12 @@ def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypat
     assert structured["bundle"].startswith("runs/issue-") and structured["attempts"] >= 1
     # …and the retained job dir is parked in the -pending sibling, where the
     # boot sweep retries it and queue-behind never reads it as a live Run.
+    # The Run's trusted input snapshot is retained too (dot-prefixed:
+    # invisible to queue-behind) — the sweep's retried bundle is built from
+    # it, never from the agent-accessible job dir (#52).
     jobs = harness.worker_config.jobs_dir
-    assert [p for p in jobs.iterdir() if p.is_dir()] == []
+    assert [p for p in jobs.iterdir() if p.is_dir() and not p.name.startswith(".")] == []
+    assert evidence.snapshot_dir(jobs, structured["run_id"]).is_dir()
     parked = [p.name for p in pending_dir(harness.worker_config).iterdir()]
     assert parked and structured["run_id"] in parked
 
