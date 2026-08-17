@@ -5,6 +5,14 @@ Resume state is exactly what the Reviewer designated — the PR branch at the
 resume commit (plus cherry-picked commits) and the revised plan in the
 verdict comment — nothing else survives between Runs (ADR-0008).
 
+Context comes from GitHub at checkout, never from the dispatch grant
+(ADR-0017 as amended, #52): every Run — local retries included — re-reads
+the complete issue and PR context and materializes it as the Context Tree
+under the job dir's ``input/``. The prompt stays slim — rules, the issue
+body, the revised plan on resume rounds, and a navigation guide — and the
+agent discovers everything else in the tree; no discussion content is
+injected and no driver heuristic filters comments.
+
 The driver never executes repository code or model output (ADR-0013): the
 agent session and every gate step run inside the ephemeral run container,
 commissioned through the job directory; the driver performs the side effects
@@ -43,7 +51,16 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from theozolith_worker import adapters, decisions, events, evidence, gitops, jobdir, verdict
+from theozolith_worker import (
+    adapters,
+    contexttree,
+    decisions,
+    events,
+    evidence,
+    gitops,
+    jobdir,
+    verdict,
+)
 from theozolith_worker.bootstrap.vocabulary import (
     FAILED,
     IN_PROGRESS,
@@ -59,7 +76,7 @@ from theozolith_worker.containers import (
     run_container_name,
 )
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
-from theozolith_worker.githubapi import Comment, GitHubClient, Issue
+from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
@@ -106,7 +123,26 @@ needs from you must land in the working tree and the decisions file.
 
 {body}
 
-{round_context}## Rules
+{round_context}## Context tree
+
+The complete issue and PR context — every comment, unfiltered — is on disk \
+at `{job}/input/`, fetched fresh for this Run. Nothing beyond the issue body \
+above is injected into this prompt: navigate the tree instead.
+
+- `{job}/input/issue/comments/INDEX.md` — all issue comments, one line \
+each; full text in the numbered files beside the index
+- `{job}/input/issue/timeline.md` — issue events (labels, assignments, \
+references)
+- `{job}/input/pr/` — present only when this Run resumes an existing PR: \
+`body.md`, `conversation/` (PR comments, verdicts included), \
+`review-comments/` (inline file/line comments), `reviews/`, `commits.md`, \
+`checks.md`
+
+Read each surface's `INDEX.md` first and open only the items you need. \
+Comments may answer open questions, record human decisions, or narrow the \
+scope — a human decision in a comment outranks the issue body above.
+
+## Rules
 
 - Implement the issue's acceptance criteria directly in the working tree.
 - Never stop to ask questions. When a judgment call comes up, decide, then \
@@ -140,19 +176,10 @@ REVISED_PLAN_CONTEXT = """\
 ## Revised plan (round {round})
 
 A Reviewer judged the previous round of this work; the branch you are on is \
-its designated resume state. Execute this revised plan exactly:
+its designated resume state, resumed from commit `{resume}`. Execute this \
+revised plan exactly:
 
 {plan}
-
-"""
-
-DISCUSSION_CONTEXT = """\
-## Review discussion since the last verdict
-
-These comments (from the PR conversation) answer open questions or add \
-decisions — honor them:
-
-{comments}
 
 """
 
@@ -202,35 +229,23 @@ class _RunContext:
     section: decisions.DecisionsSection | None = None
 
 
-def _resume_context(
-    client: GitHubClient, pr_number: int
-) -> tuple[verdict.Verdict | None, list[Comment]]:
-    comments = client.list_comments(pr_number)
-    found = verdict.latest_verdict(comments)
-    if found is None:
-        return None, comments
-    latest, marker = found
-    return latest, verdict.comments_after(comments, marker)
-
-
-def _build_prompt(
-    issue: Issue,
-    round_number: int,
-    revised: verdict.Verdict | None,
-    discussion: list[Comment],
-) -> str:
+def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | None) -> str:
+    """Both round shapes (#52): rules + issue body + the navigation guide,
+    plus the revised plan and resume commit on resume rounds. Discussion
+    content is never injected — every comment lives in the Context Tree."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
-        round_context += REVISED_PLAN_CONTEXT.format(round=round_number, plan=revised.revised_plan)
-    human_comments = [c for c in discussion if verdict.parse_comment(c.body) is None]
-    if human_comments:
-        rendered = "\n\n".join(f"@{c.author}:\n{c.body}" for c in human_comments)
-        round_context += DISCUSSION_CONTEXT.format(comments=rendered)
+        round_context = REVISED_PLAN_CONTEXT.format(
+            round=round_number,
+            resume=revised.resume_commit or "(the branch head)",
+            plan=revised.revised_plan,
+        )
     return PROMPT_TEMPLATE.format(
         number=issue.number,
         title=issue.title,
         body=issue.body or "(no body)",
         round_context=round_context,
+        job=jobdir.CONTAINER_JOB_PATH,
     )
 
 
@@ -477,8 +492,15 @@ def _run_to_pr(
 
     context.base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
     existing_pr = client.find_open_pr_by_head(branch)
+    # The grant carried claim authority only (ADR-0017 as amended, #52): the
+    # full issue and PR context is re-read here, fresh, on every Run — local
+    # retries included — and materialized as the Context Tree. The granted
+    # issue snapshot froze at dispatch time; from here on the fresh one is
+    # the issue.
+    snapshot = contexttree.fetch_snapshot(client, issue.number, existing_pr)
+    issue = snapshot.issue
+    contexttree.write_tree(job / "input", snapshot)
     revised: verdict.Verdict | None = None
-    discussion: list[Comment] = []
     force = False
     if existing_pr is not None:
         report.round = attempts_on(existing_pr.labels) + 1
@@ -486,7 +508,11 @@ def _run_to_pr(
         gitops.fetch(workdir, branch, env=auth)
         gitops.checkout_branch(workdir, branch, create=True)
         gitops.reset_hard(workdir, "FETCH_HEAD")
-        revised, discussion = _resume_context(client, existing_pr.number)
+        # The machine verdict stays a driver-internal reset detail; the
+        # agent reads the full conversation, verdicts included, from the
+        # tree.
+        found = verdict.latest_verdict(snapshot.pr_conversation)
+        revised = found[0] if found is not None else None
         if revised is not None and revised.resume_commit:
             if gitops.commit_exists(workdir, revised.resume_commit):
                 if revised.resume_commit != gitops.head_sha(workdir):
@@ -507,7 +533,7 @@ def _run_to_pr(
             force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
 
-    prompt = _build_prompt(issue, report.round, revised, discussion)
+    prompt = _build_prompt(issue, report.round, revised)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
     _write_issue_metadata(job, issue, round_number=report.round)
     manifest = jobdir.Manifest(

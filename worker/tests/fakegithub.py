@@ -51,6 +51,9 @@ class FakeGitHub:
         self.comments: dict[int, list[dict[str, Any]]] = {}
         self.events: dict[int, list[dict[str, Any]]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
+        self.review_comments: dict[int, list[dict[str, Any]]] = {}
+        self.reviews: dict[int, list[dict[str, Any]]] = {}
+        self.check_runs: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
         self._next_number = 1
         self._next_id = 1
         self._tick = 0
@@ -92,6 +95,40 @@ class FakeGitHub:
 
     def fail_next(self, predicate: Callable[[str, str], bool], responses: list[Response]) -> None:
         self.failures.append((predicate, list(responses)))
+
+    def add_review_comment(
+        self, number: int, login: str, body: str, path: str, line: int | None = None
+    ) -> None:
+        self.review_comments.setdefault(number, []).append(
+            {
+                "id": self._next_id,
+                "user": {"login": login},
+                "body": body,
+                "created_at": self._timestamp(),
+                "path": path,
+                "line": line,
+                "html_url": f"fake://review-comment/{self._next_id}",
+            }
+        )
+        self._next_id += 1
+
+    def add_review(self, number: int, login: str, state: str, body: str = "") -> None:
+        self.reviews.setdefault(number, []).append(
+            {
+                "id": self._next_id,
+                "user": {"login": login},
+                "state": state,
+                "body": body,
+                "submitted_at": self._timestamp(),
+                "html_url": f"fake://review/{self._next_id}",
+            }
+        )
+        self._next_id += 1
+
+    def add_check_run(self, sha: str, name: str, status: str, conclusion: str = "") -> None:
+        self.check_runs.setdefault(sha, []).append(
+            {"name": name, "status": status, "conclusion": conclusion, "html_url": ""}
+        )
 
     def force_assign(self, number: int, login: str) -> None:
         """Land another actor's concurrent self-assign (race simulation)."""
@@ -224,10 +261,15 @@ class FakeGitHub:
             (r"/issues/(\d+)/labels/([^/]+)", self._h_label_one),
             (r"/issues/(\d+)/assignees", self._h_assignees),
             (r"/issues/(\d+)/events", self._h_events),
+            (r"/issues/(\d+)/timeline", self._h_timeline),
             (r"/issues/(\d+)/comments", self._h_comments),
             (r"/pulls", self._h_pulls),
             (r"/pulls/(\d+)", self._h_pull),
             (r"/pulls/(\d+)/files", self._h_pull_files),
+            (r"/pulls/(\d+)/comments", self._h_review_comments),
+            (r"/pulls/(\d+)/reviews", self._h_reviews),
+            (r"/pulls/(\d+)/commits", self._h_pull_commits),
+            (r"/commits/([^/]+)/check-runs", self._h_check_runs),
         ]
 
     @staticmethod
@@ -298,6 +340,12 @@ class FakeGitHub:
         number = int(match.group(1))
         return _json_response(200, self._page(self.events[number], params))
 
+    def _h_timeline(self, actor, method, match, params, payload) -> Response:
+        # The fake's event log doubles as the timeline: same chronological
+        # per-issue records, served through the timeline endpoint's shape.
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.events[number], params))
+
     def _h_comments(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
         if method == "POST":
@@ -306,11 +354,57 @@ class FakeGitHub:
                 "user": {"login": actor},
                 "body": payload["body"],
                 "created_at": self._timestamp(),
+                "html_url": f"fake://comment/{self._next_id}",
             }
             self._next_id += 1
             self.comments[number].append(comment)
             return _json_response(201, comment)
         return _json_response(200, self._page(self.comments[number], params))
+
+    def _h_review_comments(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.review_comments.get(number, []), params))
+
+    def _h_reviews(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        return _json_response(200, self._page(self.reviews.get(number, []), params))
+
+    def _h_pull_commits(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        if number not in self.pulls:
+            return _json_response(404, {"message": "Not Found"})
+        pr = self.pulls[number]
+        items: list[dict[str, Any]] = []
+        if self.git_dir is not None:
+            log = self._git(
+                [
+                    "log",
+                    "--reverse",
+                    "--format=%H%x01%an%x01%aI%x01%B%x02",
+                    f"refs/heads/{pr['base']}..refs/heads/{pr['head']}",
+                ]
+            )
+            for record in log.split("\x02"):
+                record = record.strip("\n ")
+                if not record:
+                    continue
+                sha, author, date, message = record.split("\x01", 3)
+                items.append(
+                    {
+                        "sha": sha,
+                        "commit": {
+                            "message": message.rstrip("\n"),
+                            "author": {"name": author, "date": date},
+                        },
+                    }
+                )
+        return _json_response(200, self._page(items, params))
+
+    def _h_check_runs(self, actor, method, match, params, payload) -> Response:
+        ref = urllib.parse.unquote(match.group(1))
+        items = self.check_runs.get(ref, [])
+        page = self._page(items, params)
+        return _json_response(200, {"total_count": len(items), "check_runs": page})
 
     def _h_pulls(self, actor, method, match, params, payload) -> Response:
         if method == "POST":

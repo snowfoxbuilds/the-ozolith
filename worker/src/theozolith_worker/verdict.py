@@ -1,10 +1,12 @@
 """Reviewer verdicts: the review-comment format both actors speak.
 
 Every Reviewer verdict lands as one PR comment: human-readable evidence and
-plan up top, plus a machine block the next Run parses. The machine block
-carries the whole schema — verdict, grades, the revised plan, and the resume
-designation (a resume commit ID, optionally followed by cherry-picked
+plan up top, plus a machine block the next Run's driver parses. The machine
+block carries the whole schema — verdict, grades, the revised plan, and the
+resume designation (a resume commit ID, optionally followed by cherry-picked
 commits) that defines the only state carried into the next Run (ADR-0008).
+Parsing is a driver-internal reset detail (#52): the agent itself reads the
+full, unfiltered conversation from the Context Tree.
 """
 
 from __future__ import annotations
@@ -98,14 +100,6 @@ def latest_verdict(comments: list[Comment]) -> tuple[Verdict, Comment] | None:
         if verdict is not None:
             return verdict, comment
     return None
-
-
-def comments_after(comments: list[Comment], marker: Comment | None) -> list[Comment]:
-    """Comments later than ``marker`` (all comments when marker is None)."""
-    if marker is None:
-        return list(comments)
-    index = next((i for i, c in enumerate(comments) if c.id == marker.id), -1)
-    return list(comments[index + 1 :])
 
 
 GRADES = ("low", "medium", "high")

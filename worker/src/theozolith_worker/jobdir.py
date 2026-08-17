@@ -16,6 +16,13 @@ Layout::
                          baked into the run image, never here — ADR-0045)
         prompt.md        the driver-rendered task; the invocation argv
                          carries only a constant-size pointer to this file
+        issue.json       machine-readable issue metadata (the boot-time
+                         evidence sweep files parked dirs by it, ADR-0016)
+        issue/           the Context Tree (#52): the full issue snapshot —
+                         body, every comment, timeline — re-read at checkout
+        pr/              Context Tree, resume rounds only: PR body,
+                         conversation, review comments, reviews, commits,
+                         checks
         jobs/            driver-sequenced job requests (gate steps, shutdown)
       output/
         status.json      harness phase + agent outcome (atomic writes)

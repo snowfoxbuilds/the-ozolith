@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-17 (#52): the dispatch grant carries claim authority only, never context — the grant-is-the-issue reading is retired; every Run, including local retries, re-reads the full issue and PR context from GitHub at checkout (see Amendments)
 
 Date: 2026-07-17
 
@@ -13,7 +13,7 @@ M3 made the Control Node operationally load-bearing (secrets distribution, infra
 Claims dispatch through the Control Node, write-through to GitHub:
 
 - Workers and the Reviewer request work from the Control Node instead of polling GitHub. One dispatch path for both actors; the Reviewer side is discovery-only (no claim label exists on PRs).
-- The Control Node is the single writer of claim creation: it selects the issue, writes the claim to GitHub itself (assigns the Worker's GitHub login, adds in_progress), then returns the issue in the same response. Grants are serialized internally; assign-and-verify is deleted.
+- The Control Node is the single writer of claim creation: it selects the issue, writes the claim to GitHub itself (assigns the Worker's GitHub login, adds in_progress), then returns the issue in the same response. Grants are serialized internally; assign-and-verify is deleted. *(Amended 2026-08-17, #52: the grant's issue payload is claim authority plus a convenience snapshot for logging and the pre-clone metadata write — never the Run's context. The driver re-reads the full issue and PR context from GitHub at checkout, every Run.)*
 - GitHub remains the sole source of coordination truth. The Control Node reconciles to GitHub, never the reverse; hand-edited labels stay meaningful; a lost Control Node database rebuilds from GitHub.
 - Claim release has three owners: the driver releases on every classified ending (completion, failure, empty PR); the Control Node releases claims it wrote that never activated (no claimed event within the activation window, ~60 seconds — a lost response or a driver death before pickup is otherwise invisible to every reaper, since a never-activated Run emits zero events); the janitor handles death after activation, past the zombie grace period.
 - Availability: Control Node down = in-flight Runs finish and publish (drivers hold their own PATs for all non-claim GitHub writes); new claims and new review rounds pause. Richer fallback behavior is a backlog item.
@@ -29,3 +29,6 @@ Claims dispatch through the Control Node, write-through to GitHub:
 - **Advisory pre-filter (status quo, ADR-0002)**: rejected — the M3 reality already made the Control Node load-bearing, and the advisory posture bought availability the operator no longer wants at the cost of racy, duplicated discovery.
 - **Control arbitrates, driver writes the claim (lease model)**: rejected — requires new lease/TTL logic, and GitHub is stale between grant and the driver's write; write-through removes both the staleness window and the lease machinery.
 - **Control Node database as coordination authority (GitHub as rendering)**: rejected — breaks hand-edited labels and human workflows until a full control UI exists; makes the Control Node database load-bearing for cluster state; inverts rather than solves the two-sources-of-truth problem.
+## Amendments
+
+- **2026-08-17 (#52, Context Tree)**: the no-re-read clause is deleted. The original decision let the driver treat the granted issue payload as the Run's context ("the grant is the issue — no re-read needed"), which froze the issue snapshot at dispatch time and gave round-1 Runs no comments at all. The grant now carries **claim authority only**: the claim exists on GitHub and the driver may run. Every Run — including local retries — re-reads the complete issue and PR context (body, all comment surfaces, timeline, reviews, commits, checks) from GitHub at checkout and materializes it into the job directory as the Context Tree (`input/issue/`, `input/pr/`). The dispatch response still returns the issue payload; it serves logging and the pre-clone `input/issue.json` metadata write, nothing more. Claim-write-through, serialized grants, and GitHub as the sole source of coordination truth are unchanged.

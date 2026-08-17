@@ -317,13 +317,23 @@ def test_escalation_and_human_decision_round(harness: Harness):
     harness.human_comment(pr_number, "Decision: flag A must be ON; drop the off criterion.")
     harness.human_requeue(number, pr_number)
 
+    # Captured inside the session, asserted after: an assert inside a
+    # behavior fails the Run and the local retry masks it.
+    seen: dict = {}
+
     def compliant(prompt: str, cwd: Path) -> None:
-        assert "Decision: flag A must be ON" in prompt  # the answer reaches the Run
+        seen["prompt"] = prompt
+        conversation = cwd.parent / "input" / "pr" / "conversation"
+        seen["comments"] = [p.read_text() for p in sorted(conversation.glob("0*.md"))]
         behavior_write({"flag.txt": "on, per human decision\n"})(prompt, cwd)
 
     harness.worker_behaviors.append(compliant)
     harness.worker_once()
     assert harness.fake.open_pr_numbers() == [pr_number]  # same PR completes
+    # The answer reaches the Run through the Context Tree (#52), never the
+    # prompt: the full PR conversation is on disk, unfiltered.
+    assert any("Decision: flag A must be ON" in c for c in seen["comments"])
+    assert "Decision: flag A must be ON" not in seen["prompt"]
 
     harness.reviewer_replies.append(approve_reply())
     harness.reviewer_once()

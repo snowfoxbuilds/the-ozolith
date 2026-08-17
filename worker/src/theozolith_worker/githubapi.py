@@ -124,6 +124,48 @@ class Comment:
     author: str
     body: str
     created_at: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewComment:
+    """An inline PR review comment, anchored to a file position."""
+
+    id: int
+    author: str
+    body: str
+    created_at: str
+    path: str
+    line: int | None
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class Review:
+    """A PR review: a state (APPROVED, CHANGES_REQUESTED, ...) plus a body."""
+
+    id: int
+    author: str
+    state: str
+    body: str
+    submitted_at: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class PrCommit:
+    sha: str
+    author: str
+    authored_at: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CheckRun:
+    name: str
+    status: str
+    conclusion: str
+    url: str = ""
 
 
 @dataclass(frozen=True)
@@ -215,12 +257,15 @@ class GitHubClient:
     def _json(self, method: str, path: str, body: Any = None) -> Any:
         return self._request(method, path, body).json()
 
-    def _paged(self, path: str) -> list[dict[str, Any]]:
+    def _paged(self, path: str, key: str | None = None) -> list[dict[str, Any]]:
+        """Every page of a list endpoint. ``key`` handles the endpoints that
+        wrap their items in an object (e.g. check-runs)."""
         sep = "&" if "?" in path else "?"
         items: list[dict[str, Any]] = []
         page = 1
         while True:
-            batch = self._json("GET", f"{path}{sep}per_page=100&page={page}") or []
+            payload = self._json("GET", f"{path}{sep}per_page=100&page={page}")
+            batch = (payload or {}).get(key, []) if key else (payload or [])
             items.extend(batch)
             if len(batch) < 100:
                 return items
@@ -301,9 +346,16 @@ class GitHubClient:
                 author=item["user"]["login"],
                 body=item.get("body") or "",
                 created_at=item.get("created_at") or "",
+                url=item.get("html_url") or "",
             )
             for item in items
         ]
+
+    def list_timeline(self, number: int) -> list[dict[str, Any]]:
+        """The issue's full event timeline, raw: the events are heterogeneous
+        (labeled, assigned, cross-referenced, committed, ...) and the Context
+        Tree renders them without interpreting most of them."""
+        return self._paged(self._repo_path(f"/issues/{number}/timeline"))
 
     # -- repository contents ------------------------------------------------
 
@@ -354,6 +406,63 @@ class GitHubClient:
             patch["body"] = body
         if patch:
             self._json("PATCH", self._repo_path(f"/pulls/{number}"), patch)
+
+    def list_review_comments(self, number: int) -> list[ReviewComment]:
+        """Every inline (file/line) review comment on the PR."""
+        items = self._paged(self._repo_path(f"/pulls/{number}/comments"))
+        return [
+            ReviewComment(
+                id=item["id"],
+                author=(item.get("user") or {}).get("login") or "",
+                body=item.get("body") or "",
+                created_at=item.get("created_at") or "",
+                path=item.get("path") or "",
+                line=item["line"] if isinstance(item.get("line"), int) else None,
+                url=item.get("html_url") or "",
+            )
+            for item in items
+        ]
+
+    def list_reviews(self, number: int) -> list[Review]:
+        items = self._paged(self._repo_path(f"/pulls/{number}/reviews"))
+        return [
+            Review(
+                id=item["id"],
+                author=(item.get("user") or {}).get("login") or "",
+                state=item.get("state") or "",
+                body=item.get("body") or "",
+                submitted_at=item.get("submitted_at") or "",
+                url=item.get("html_url") or "",
+            )
+            for item in items
+        ]
+
+    def pr_commits(self, number: int) -> list[PrCommit]:
+        items = self._paged(self._repo_path(f"/pulls/{number}/commits"))
+        return [
+            PrCommit(
+                sha=item.get("sha") or "",
+                author=(item.get("commit") or {}).get("author", {}).get("name") or "",
+                authored_at=(item.get("commit") or {}).get("author", {}).get("date") or "",
+                message=(item.get("commit") or {}).get("message") or "",
+            )
+            for item in items
+        ]
+
+    def list_check_runs(self, ref: str) -> list[CheckRun]:
+        """Check runs for a commit (the PR head), paginated under the
+        endpoint's ``check_runs`` wrapper key."""
+        query = urllib.parse.quote(ref)
+        items = self._paged(self._repo_path(f"/commits/{query}/check-runs"), key="check_runs")
+        return [
+            CheckRun(
+                name=item.get("name") or "",
+                status=item.get("status") or "",
+                conclusion=item.get("conclusion") or "",
+                url=item.get("html_url") or "",
+            )
+            for item in items
+        ]
 
     def pr_files(self, number: int) -> list[PrFile]:
         items = self._paged(self._repo_path(f"/pulls/{number}/files"))
