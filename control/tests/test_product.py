@@ -182,6 +182,42 @@ def test_build_distribution_stamps_versions_and_collects_wheels(tmp_path):
     assert 'version = "0.3.0"' in (source / "worker" / "pyproject.toml").read_text()
 
 
+def test_build_distribution_names_only_this_runs_wheels(tmp_path):
+    """A persistent dist/ (the bootstrap shim's out_dir, unlike the temp dir
+    the `theozolith build` path uses) can still hold a previous SHA's wheels.
+    build_distribution must name ONLY the wheels it just built — else the shim
+    hands pip two versions of every package and pip refuses to resolve."""
+    source = _checkout(tmp_path)
+    sha = _git(["rev-parse", "--short=12", "HEAD"], source)
+    expected = f"0.3.0+g{sha}"
+    out = tmp_path / "dist"
+    out.mkdir()
+    # A previous build at a different SHA left its full wheel set behind.
+    stale = "0.3.0+g0000deadbeef"
+    for name in product.COMPONENTS:
+        (out / f"theozolith_{name}-{stale}-py3-none-any.whl").write_bytes(b"old")
+
+    def fake_runner(args, **kwargs):
+        if args[:3] == [__import__("sys").executable, "-m", "pip"]:
+            component_dir = Path(args[-1])
+            wheel_dir = Path(args[args.index("--wheel-dir") + 1])
+            name = component_dir.name
+            (wheel_dir / f"theozolith_{name}-{expected}-py3-none-any.whl").write_bytes(b"whl")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.run(args, **kwargs)  # the git subcommands are real
+
+    version, wheels = product.build_distribution(
+        source, out, runner=fake_runner, log=lambda *_: None
+    )
+
+    assert version == expected
+    # Exactly the fresh set — the stale wheels are neither returned nor installed.
+    assert wheels == sorted(
+        f"theozolith_{name}-{expected}-py3-none-any.whl" for name in product.COMPONENTS
+    )
+    assert not any(stale in name for name in wheels)
+
+
 def test_safe_segment_rejects_traversal():
     assert product.safe_segment("0.3.0+gabc123def456")
     assert product.safe_segment("theozolith_worker-0.3.0-py3-none-any.whl")
