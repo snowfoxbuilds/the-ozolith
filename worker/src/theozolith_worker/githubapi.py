@@ -140,7 +140,11 @@ class ReviewComment:
     Anchors are lossless (#52 amendment): the current line/side pair plus
     the original-commit anchors, so an outdated comment (``line`` is None)
     keeps its original position; start-line fields carry multiline ranges,
-    and ``in_reply_to_id``/``review_id`` carry thread and review linkage."""
+    and ``in_reply_to_id``/``review_id`` carry thread and review linkage.
+    ``diff_hunk`` is the diff excerpt the comment anchors to; ``position``/
+    ``original_position`` are the legacy diff offsets; ``subject_type``
+    distinguishes file-level from line-level comments; ``updated_at``
+    records edits."""
 
     id: int
     author: str
@@ -159,6 +163,26 @@ class ReviewComment:
     original_commit_id: str = ""
     in_reply_to_id: int | None = None
     review_id: int | None = None
+    diff_hunk: str = ""
+    position: int | None = None
+    original_position: int | None = None
+    subject_type: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewThread:
+    """One PR review thread (GraphQL): resolution and grouping state for the
+    inline comments it contains. ``comment_ids`` are REST database ids, so
+    threads join against :class:`ReviewComment` items; the thread's own
+    ``id`` is its GraphQL node id — an identifier of the thread resource,
+    never of any comment."""
+
+    id: str
+    is_resolved: bool
+    is_outdated: bool = False
+    resolved_by: str = ""
+    comment_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,6 +277,46 @@ def _pull_from(data: dict[str, Any]) -> PullRequest:
     )
 
 
+# Review-thread resolution lives only in GraphQL (REST review comments carry
+# no resolved state). Both queries page at 100 — threads at the top level,
+# comments within a thread through the follow-up node query — so neither
+# level is ever capped (#52).
+_REVIEW_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          resolvedBy { login }
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_THREAD_COMMENTS_QUERY = """
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId }
+      }
+    }
+  }
+}
+"""
+
+
 class GitHubClient:
     """Typed operations the actors need, on one target repo."""
 
@@ -293,7 +357,10 @@ class GitHubClient:
         for attempt in range(MAX_RETRIES):
             response = self._transport(method, url, headers, payload)
             if response.status < 400:
-                if method != "GET":
+                # /graphql is POST-only but this client sends it exclusively
+                # read-only queries (list_review_threads); a future GraphQL
+                # MUTATION must not hide behind this exemption.
+                if method != "GET" and path != "/graphql":
                     self.writes.append((method, path))
                 return response
             delay = _retry_delay(response, attempt, self._clock())
@@ -482,6 +549,11 @@ class GitHubClient:
                 original_commit_id=item.get("original_commit_id") or "",
                 in_reply_to_id=_int_or_none(item.get("in_reply_to_id")),
                 review_id=_int_or_none(item.get("pull_request_review_id")),
+                diff_hunk=item.get("diff_hunk") or "",
+                position=_int_or_none(item.get("position")),
+                original_position=_int_or_none(item.get("original_position")),
+                subject_type=item.get("subject_type") or "",
+                updated_at=item.get("updated_at") or "",
             )
             for item in items
         ]
@@ -505,6 +577,67 @@ class GitHubClient:
     # /pulls/{number}/commits is deliberately NOT a client method: GitHub
     # caps it at 250 commits. The PR commit snapshot comes from the trusted
     # driver-side checkout instead (contexttree.git_pr_commits, #52).
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """One GraphQL query. Errors arrive as HTTP 200 with an ``errors``
+        array, so they are surfaced here rather than by the retry layer."""
+        payload = self._json("POST", "/graphql", {"query": query, "variables": variables})
+        if not isinstance(payload, dict) or payload.get("errors"):
+            errors = (payload or {}).get("errors") if isinstance(payload, dict) else payload
+            raise GitHubError(f"GraphQL query failed: {errors!r}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise GitHubError(f"GraphQL query returned no data: {payload!r}")
+        return data
+
+    def list_review_threads(self, number: int) -> list[ReviewThread]:
+        """Every review thread on the PR with its resolution state — GraphQL
+        only; REST has no resolution surface. Fully paginated on both levels
+        (threads, and comments within a thread)."""
+        owner, name = self.repo.split("/", 1)
+        threads: list[ReviewThread] = []
+        cursor: str | None = None
+        while True:
+            data = self._graphql(
+                _REVIEW_THREADS_QUERY,
+                {"owner": owner, "name": name, "number": number, "cursor": cursor},
+            )
+            connection = ((data.get("repository") or {}).get("pullRequest") or {}).get(
+                "reviewThreads"
+            ) or {}
+            for node in connection.get("nodes") or []:
+                threads.append(self._thread_from(node))
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                return threads
+            cursor = page.get("endCursor")
+
+    def _thread_from(self, node: dict[str, Any]) -> ReviewThread:
+        comments = node.get("comments") or {}
+        ids = [
+            c["databaseId"]
+            for c in comments.get("nodes") or []
+            if isinstance(c.get("databaseId"), int)
+        ]
+        page = comments.get("pageInfo") or {}
+        while page.get("hasNextPage"):
+            data = self._graphql(
+                _THREAD_COMMENTS_QUERY, {"id": node.get("id"), "cursor": page.get("endCursor")}
+            )
+            comments = (data.get("node") or {}).get("comments") or {}
+            ids += [
+                c["databaseId"]
+                for c in comments.get("nodes") or []
+                if isinstance(c.get("databaseId"), int)
+            ]
+            page = comments.get("pageInfo") or {}
+        return ReviewThread(
+            id=str(node.get("id") or ""),
+            is_resolved=bool(node.get("isResolved")),
+            is_outdated=bool(node.get("isOutdated")),
+            resolved_by=_login_of({"user": node.get("resolvedBy")}),
+            comment_ids=tuple(ids),
+        )
 
     def list_check_runs(self, ref: str) -> list[CheckRun]:
         """Check runs for a commit (the PR head), paginated under the

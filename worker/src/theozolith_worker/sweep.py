@@ -94,19 +94,27 @@ def owned_by(config: DriverConfig, name: str) -> bool:
     return config.role == "reviewer" and name.startswith("review-")
 
 
-def _issue_number(job: Path) -> int | None:
-    data = jobdir._read_json(job / "input" / "issue.json")
-    number = data.get("number") if data else None
+def _issue_number(input_files: dict[str, bytes]) -> int | None:
+    raw = input_files.get("input/issue.json")
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    number = data.get("number") if isinstance(data, dict) else None
     return number if isinstance(number, int) else None
 
 
-def _bundle_prefix(job: Path) -> str:
-    """The original run_id path when the job names its issue; otherwise a
+def _bundle_prefix(job: Path, input_files: dict[str, bytes]) -> str:
+    """The original run_id path when the input names its issue; otherwise a
     generic sweeps/ path (e.g. review-mode workspaces, ADR-0018). A
     collision-parked dir publishes under its original run_id, suffix
-    stripped."""
+    stripped. The issue number comes from the same trusted input set the
+    bundle embeds (#52): a session that rewrites or deletes the job dir's
+    issue.json must not be able to redirect where evidence publishes."""
     run_id = original_run_id(job.name)
-    issue = _issue_number(job)
+    issue = _issue_number(input_files)
     if issue is not None:
         return evidence.run_dir(issue, run_id)
     return f"sweeps/{run_id}"
@@ -125,15 +133,24 @@ SWEPT_ARTIFACTS = (
 )
 
 
-def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
-    prefix = _bundle_prefix(job)
-    files = {
+def _bundle_files(config: DriverConfig, job: Path, swept_at: str) -> dict[str, str | bytes]:
+    # The exact Run input survives interruption (#52): same relative paths
+    # as a live-pushed bundle. The pre-launch trusted snapshot is
+    # authoritative — the job dir's own input/ was agent-writable through
+    # the /job bind mount from launch onward. A missing snapshot proves no
+    # container ever launched for this run_id (capture happens strictly
+    # before launch), so only then is the job dir's input still
+    # driver-authored and safe to collect.
+    trusted = evidence.load_input_snapshot(Path(config.jobs_dir), original_run_id(job.name))
+    input_files = trusted if trusted is not None else evidence.input_artifacts(job)
+    prefix = _bundle_prefix(job, input_files)
+    files: dict[str, str | bytes] = {
         f"{prefix}/swept.json": json.dumps(
             {
                 "swept": True,
                 "swept_at": swept_at,
                 "run_id": original_run_id(job.name),
-                "worker_id": worker_id,
+                "worker_id": config.worker_id,
                 "reason": "orphaned job directory recovered by the boot-time evidence sweep",
             },
             indent=2,
@@ -145,10 +162,7 @@ def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
         content = _read(job / relpath)
         if content is not None:
             files[f"{prefix}/swept-{Path(relpath).name}"] = content
-    # The exact Run input survives interruption too (#52): same relative
-    # paths as a live-pushed bundle, restricted to the enumerated input
-    # paths — the sweep never walks the checkout or anything else.
-    for relpath, content in evidence.input_artifacts(job).items():
+    for relpath, content in input_files.items():
         files[f"{prefix}/{relpath}"] = content
     return files
 
@@ -248,7 +262,7 @@ def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int
         try:
             evidence.push_bundle(
                 config.clone_url,
-                _bundle_files(job, swept_at, config.worker_id),
+                _bundle_files(config, job, swept_at),
                 message=f"Evidence: swept orphaned job dir {job.name}",
                 author_name=config.worker_id,
                 author_email=f"{config.worker_id}@theozolith.invalid",
@@ -267,6 +281,43 @@ def sweep_orphans(config: DriverConfig, *, log=_log, now=time.time) -> tuple[int
                     log(f"evidence sweep: could not park {job.name}: {move_error}")
             continue
         shutil.rmtree(job, ignore_errors=True)
+        # The trusted input snapshot outlives the job dir until the dir is
+        # fully gone: remnants would re-enter the candidate list, and the
+        # retried bundle must keep coming from the snapshot.
+        if not job.exists():
+            evidence.discard_input_snapshot(jobs, original_run_id(job.name))
         swept += 1
         log(f"evidence sweep: pushed orphaned job dir {job.name} (swept: true) and removed it")
+    _gc_stale_snapshots(config, jobs, parking, log)
     return swept, kept
+
+
+def _gc_stale_snapshots(config: DriverConfig, jobs: Path, parking: Path, log) -> None:
+    """Remove this driver's trusted input snapshots that no longer have a
+    job dir anywhere (jobs dir or parking): their Run's evidence is either
+    durable or declared lost, so the snapshot is garbage. Runs only from
+    the sweep — i.e. while this driver has no Run in flight — so an owned
+    snapshot without a dir can never belong to live work; another driver's
+    snapshots are never touched (``owned_by``, same rule as the dirs)."""
+    root = jobs / evidence.SNAPSHOT_PARENT
+    if not root.is_dir():
+        return
+    retained = {
+        original_run_id(entry.name)
+        for base in (jobs, parking)
+        if base.is_dir()
+        for entry in base.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    }
+    for snap in sorted(root.iterdir()):
+        if not snap.is_dir() or snap.is_symlink():
+            continue
+        # A crashed capture leaves a dot-prefixed staging dir; its Run never
+        # launched (capture precedes launch), so it is pure debris.
+        run_id = snap.name.removeprefix(evidence.SNAPSHOT_STAGING_PREFIX)
+        if not owned_by(config, run_id):
+            continue
+        if snap.name == run_id and run_id in retained:
+            continue
+        shutil.rmtree(snap, ignore_errors=True)
+        log(f"evidence sweep: removed stale trusted input snapshot {snap.name}")

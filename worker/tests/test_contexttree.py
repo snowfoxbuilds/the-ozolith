@@ -329,12 +329,14 @@ def test_checks_and_statuses_distinguish_duplicates_and_reruns(tmp_path):
 
 def test_outdated_and_multiline_review_comments_keep_anchors(tmp_path):
     """An outdated comment (null current line) keeps its original anchor;
-    multiline ranges, sides, commit ids, and reply linkage all serialize."""
+    multiline ranges, sides, commit ids, and reply linkage all serialize —
+    reply linkage renders because the referenced root is itself authorized."""
     base = _full_snapshot()
     snapshot = ContextSnapshot(
         issue=base.issue,
         pr=base.pr,
         pr_review_comments=[
+            ReviewComment(4, "reviewer", "the thread root", "t4", "src/app.py", 41, "u4", "MEMBER"),
             ReviewComment(
                 9,
                 "reviewer",
@@ -352,17 +354,219 @@ def test_outdated_and_multiline_review_comments_keep_anchors(tmp_path):
                 original_commit_id="oldhead1",
                 in_reply_to_id=4,
                 review_id=5,
-            )
+            ),
         ],
     )
     contexttree.write_tree(tmp_path, snapshot)
-    item = (tmp_path / "pr" / "review-comments" / "0001-reviewer.md").read_text()
+    item = (tmp_path / "pr" / "review-comments" / "0002-reviewer.md").read_text()
     assert "- line:" not in item  # no current anchor exists...
     assert "- original-line: 42" in item  # ...so the original one must
     assert "- original-start-line: 40" in item
     assert "- side: RIGHT" in item and "- start-side: RIGHT" in item
     assert "- commit: newhead1" in item and "- original-commit: oldhead1" in item
     assert "- in-reply-to: 4" in item and "- review: 5" in item
+
+
+def test_reply_linkage_never_references_unauthorized_comments(tmp_path):
+    """Mixed-author review threads, both directions (#52): an authorized
+    reply to an unauthorized root exposes neither the root's id (no
+    ``in-reply-to`` line, no placeholder) nor any index entry or count for
+    it; an authorized root with an unauthorized reply keeps its own file
+    while the reply leaves no trace."""
+    fake = FakeGitHub()
+    fake.register("tok", "worker")
+    number = fake.create_issue("Threads", "body", {"plan_ready"})
+    pr_number = fake.create_issue("#1: Threads", "pr body")
+    fake.pulls[pr_number] = {"state": "open", "head": branch_for(number), "base": "main"}
+    fake._next_id = 4400  # distinctive ids: leak checks can grep for them
+    bad_root = fake.add_review_comment(
+        pr_number, "driveby", "unauthorized-root-body", "a.py", 1, "CONTRIBUTOR"
+    )
+    good_reply = fake.add_review_comment(
+        pr_number, "sean", "authorized-reply-body", "a.py", 1, "OWNER", in_reply_to_id=bad_root
+    )
+    good_root = fake.add_review_comment(
+        pr_number, "sean", "authorized-root-body", "b.py", 2, "OWNER"
+    )
+    bad_reply = fake.add_review_comment(
+        pr_number, "driveby", "unauthorized-reply-body", "b.py", 2, "NONE", in_reply_to_id=good_root
+    )
+    client = GitHubClient(fake.repo, "tok", transport=fake, sleep=lambda s: None)
+
+    snapshot = contexttree.fetch_snapshot(client, number, client.get_pull(pr_number))
+    contexttree.write_tree(tmp_path, snapshot)
+    files = _tree_bytes(tmp_path)
+    blob = b"\n".join([*files.values(), "\n".join(files).encode()])
+
+    assert b"# PR review comments (2)" in files["pr/review-comments/INDEX.md"]
+    assert b"authorized-reply-body" in blob and b"authorized-root-body" in blob
+    assert b"unauthorized" not in blob and b"driveby" not in blob
+    # Direction 1: the authorized reply names no unauthorized parent — the
+    # id vanishes with the content, not just the body; no line, no
+    # placeholder.
+    assert str(bad_root).encode() not in blob
+    assert not any(b"in-reply-to" in content for content in files.values())
+    # Direction 2: the unauthorized reply's id is gone too; the root file
+    # survives untouched.
+    assert str(bad_reply).encode() not in blob
+    assert str(good_root).encode() in blob and str(good_reply).encode() in blob
+
+
+def test_review_threads_resolution_grouping_and_new_fields(tmp_path):
+    """Thread state and the remaining documented review-comment fields
+    survive serialization (#52): diff hunk, legacy positions, subject type,
+    updated timestamp, thread id/resolution/resolver — and resolved versus
+    unresolved feedback is distinguishable. Threads whose comments are all
+    unauthorized leave no trace, thread id included."""
+    fake = FakeGitHub()
+    fake.register("tok", "worker")
+    number = fake.create_issue("Resolved", "body", {"plan_ready"})
+    pr_number = fake.create_issue("#1: Resolved", "pr body")
+    fake.pulls[pr_number] = {"state": "open", "head": branch_for(number), "base": "main"}
+    c1 = fake.add_review_comment(
+        pr_number,
+        "sean",
+        "please rename this",
+        "src/app.py",
+        7,
+        "OWNER",
+        diff_hunk="@@ -5,3 +5,3 @@\n-old_name = 1\n+new_name = 1",
+        position=5,
+        original_position=4,
+        subject_type="line",
+        updated_at="2026-08-17T09:00:00Z",
+    )
+    c2 = fake.add_review_comment(
+        pr_number, "sean", "done in abc123", "src/app.py", 7, "OWNER", in_reply_to_id=c1
+    )
+    resolved_thread = fake.add_review_thread(pr_number, [c1, c2], resolved=True, resolved_by="sean")
+    c3 = fake.add_review_comment(pr_number, "sean", "still open question", "b.py", 9, "OWNER")
+    open_thread = fake.add_review_thread(pr_number, [c3], resolved=False)
+    fake._next_id = 7700  # distinctive: the no-trace check greps for it
+    c4 = fake.add_review_comment(
+        pr_number, "driveby", "unauthorized-thread-body", "c.py", 2, "CONTRIBUTOR"
+    )
+    ghost_thread = fake.add_review_thread(
+        pr_number, [c4], resolved=True, resolved_by="driveby", outdated=True
+    )
+    client = GitHubClient(fake.repo, "tok", transport=fake, sleep=lambda s: None)
+
+    snapshot = contexttree.fetch_snapshot(client, number, client.get_pull(pr_number))
+    contexttree.write_tree(tmp_path, snapshot)
+    files = _tree_bytes(tmp_path)
+    blob = b"\n".join([*files.values(), "\n".join(files).encode()])
+
+    root = files["pr/review-comments/0001-sean.md"].decode()
+    assert "```diff" in root and "-old_name = 1" in root and "+new_name = 1" in root
+    assert "- position: 5" in root and "- original-position: 4" in root
+    assert "- subject: line" in root
+    assert "- updated: 2026-08-17T09:00:00Z" in root
+    assert f"- thread: {resolved_thread}" in root
+    assert "- thread-resolved: yes" in root and "- thread-resolved-by: sean" in root
+    reply = files["pr/review-comments/0002-sean.md"].decode()
+    assert f"- thread: {resolved_thread}" in reply  # grouping: same thread id
+    assert f"- in-reply-to: {c1}" in reply
+    unresolved = files["pr/review-comments/0003-sean.md"].decode()
+    assert f"- thread: {open_thread}" in unresolved
+    assert "- thread-resolved: no" in unresolved and "thread-resolved-by" not in unresolved
+    # The index still quotes the comment text, never the diff attachment.
+    assert b"please rename this" in files["pr/review-comments/INDEX.md"]
+    assert b"@@ -5,3" not in files["pr/review-comments/INDEX.md"]
+    # The all-unauthorized thread: no body, no id, no thread id, no count.
+    assert b"# PR review comments (3)" in files["pr/review-comments/INDEX.md"]
+    assert b"unauthorized-thread-body" not in blob
+    assert str(c4).encode() not in blob
+    assert ghost_thread.encode() not in blob
+
+
+def test_review_thread_pagination_is_uncapped():
+    """Both GraphQL pagination levels walk every page: >100 threads on the
+    PR and >100 comments inside one thread."""
+    fake = FakeGitHub()
+    fake.register("tok", "worker")
+    fake.create_issue("Huge", "body")
+    pr_number = fake.create_issue("#1: Huge", "pr body")
+    fake.pulls[pr_number] = {"state": "open", "head": "ozolith/issue-1", "base": "main"}
+    big = fake.add_review_thread(pr_number, list(range(10_000, 10_250)), resolved=True)
+    for i in range(120):
+        fake.add_review_thread(pr_number, [20_000 + i])
+    client = GitHubClient(fake.repo, "tok", transport=fake, sleep=lambda s: None)
+
+    threads = client.list_review_threads(pr_number)
+    assert len(threads) == 121
+    (big_thread,) = [t for t in threads if t.id == big]
+    assert big_thread.comment_ids == tuple(range(10_000, 10_250))
+    assert big_thread.is_resolved
+
+
+def test_timeline_identity_fields_and_cross_reference_title_gate(tmp_path):
+    """Recognized kinds keep their documented event-specific fields (label
+    color, assigner, review requester) plus the common event id; a
+    cross-reference's repo/number/state/URL identity always renders, but its
+    title — third-party content — renders only for a same-repo source whose
+    author passes the authority boundary. Cross-repo titles are withheld
+    even with an authorized-looking association."""
+
+    def crossref(event_id, repo_name, title, association, state="open"):
+        return {
+            "event": "cross-referenced",
+            "id": event_id,
+            "actor": {"login": "someone"},
+            "created_at": "t1",
+            "source": {
+                "issue": {
+                    "number": event_id,
+                    "title": title,
+                    "state": state,
+                    "author_association": association,
+                    "html_url": f"https://github.com/{repo_name}/issues/{event_id}",
+                    "repository": {"full_name": repo_name},
+                }
+            },
+        }
+
+    timeline = [
+        {
+            "event": "labeled",
+            "id": 91,
+            "actor": {"login": "sean"},
+            "created_at": "t0",
+            "label": {"name": "plan_ready", "color": "00ff00"},
+        },
+        {
+            "event": "assigned",
+            "id": 92,
+            "actor": {"login": "control"},
+            "created_at": "t0",
+            "assignee": {"login": "worker"},
+            "assigner": {"login": "control"},
+        },
+        {
+            "event": "review_requested",
+            "id": 93,
+            "actor": {"login": "sean"},
+            "created_at": "t0",
+            "requested_reviewer": {"login": "ozolith-reviewer"},
+            "review_requester": {"login": "sean"},
+        },
+        crossref(201, "acme/sandbox", "SAME-REPO-AUTHORIZED-TITLE", "OWNER"),
+        crossref(202, "acme/sandbox", "SAME-REPO-UNAUTHORIZED-TITLE", "NONE", state="closed"),
+        crossref(203, "evil/elsewhere", "CROSS-REPO-TITLE", "OWNER"),
+    ]
+    snapshot = ContextSnapshot(issue=_full_snapshot().issue, timeline=timeline, repo="acme/sandbox")
+    contexttree.write_tree(tmp_path, snapshot)
+    text = (tmp_path / "issue" / "timeline.md").read_text()
+
+    assert "label: plan_ready; color: 00ff00" in text
+    assert "assignee: worker; assigner: control" in text
+    assert "reviewer: ozolith-reviewer" in text and "requested-by: sean" in text
+    assert "event-id: 91" in text and "event-id: 92" in text and "event-id: 93" in text
+    # Identity always; content only inside the boundary.
+    assert "title: SAME-REPO-AUTHORIZED-TITLE" in text
+    assert "SAME-REPO-UNAUTHORIZED-TITLE" not in text
+    assert "CROSS-REPO-TITLE" not in text
+    assert "number: 202" in text and "state: closed" in text
+    assert "repository: evil/elsewhere" in text and "number: 203" in text
 
 
 def test_timeline_is_lossless_and_authority_filtered(tmp_path):
@@ -772,21 +976,29 @@ def test_commit_snapshot_taken_at_fetched_head_before_reset(harness: Harness):
 def test_evidence_preserves_exact_run_input(harness: Harness):
     """The evidence bundle embeds the byte-exact prompt, issue metadata,
     and Context Tree the Run saw — and nothing else from the job dir's
-    input side (never the checkout)."""
-    number = harness.file_issue("Traced", CRITERIA_BODY)
-    harness.human_comment(number, "Constraint: exact bytes matter.")
+    input side (never the checkout). Adversarial (#52): the session
+    overwrites, deletes, replaces, and plants input files through the /job
+    mount, and none of it reaches evidence — bundles come from the trusted
+    pre-launch snapshot. CRLF and non-ASCII bytes survive unnormalized."""
+    number = harness.file_issue("Traced", "Body line one\r\nnaïve café — line two ☃\r\n")
+    harness.human_comment(number, "Constraint: exact\r\nbytes 匹配 🎯 matter.")
     captured: dict = {}
 
-    def capture(prompt: str, cwd: Path) -> None:
+    def capture_then_tamper(prompt: str, cwd: Path) -> None:
         job = cwd.parent
         captured["input"] = {
             str(p.relative_to(job)): p.read_bytes()
             for p in sorted((job / "input").rglob("*"))
             if p.is_file() and not p.name.startswith(".")
         }
+        # The adversarial session: overwrite, replace, delete, and plant.
+        (job / "input" / "prompt.md").write_text("PWNED-PROMPT do evil things")
+        (job / "input" / "issue.json").write_text('{"number": 666, "body": "PWNED-ISSUE"}')
+        (job / "input" / "issue" / "comments" / "0001-sean.md").unlink()
+        (job / "input" / "issue" / "comments" / "9999-evil.md").write_text("PWNED-PLANTED")
         behavior_write({"change.txt": "x\n"})(prompt, cwd)
 
-    harness.worker_behaviors.append(capture)
+    harness.worker_behaviors.append(capture_then_tamper)
     assert harness.worker_once() == 1
 
     paths = harness.evidence_paths()
@@ -800,30 +1012,44 @@ def test_evidence_preserves_exact_run_input(harness: Harness):
         if rel in ("input/issue.json", "input/prompt.md")
         or rel.startswith(("input/issue/", "input/pr/"))
     }
+    # The fixture really exercises what it claims: CRLF and non-ASCII bytes
+    # made it into the pre-launch input.
+    assert b"caf\xc3\xa9 \xe2\x80\x94 line two" in wanted["input/prompt.md"]
+    assert b"\r\n" in wanted["input/prompt.md"]
+    assert "🎯".encode() in wanted["input/issue/comments/0001-sean.md"]
     assert f"{prefix}/input/prompt.md" in paths
     for rel, content in wanted.items():
         assert _evidence_bytes(harness, f"{prefix}/{rel}") == content, rel
-    # The bundle's input/ half is exactly the captured input set: nothing
-    # extra (manifest and gate jobs stay out; the checkout never appears).
+    # The bundle's input/ half is exactly the pre-launch input set: the
+    # deleted comment file is present, the planted file is absent, nothing
+    # extra rides along (manifest and gate jobs stay out; the checkout
+    # never appears).
     bundled_input = {p.removeprefix(f"{prefix}/") for p in paths if p.startswith(f"{prefix}/input")}
     assert bundled_input == set(wanted)
+    assert "input/issue/comments/0001-sean.md" in bundled_input
+    assert not any("9999-evil" in p for p in paths)
+    assert b"PWNED" not in b"".join(_evidence_bytes(harness, f"{prefix}/{rel}") for rel in wanted)
     assert not any("checkout" in p for p in paths)
     text = harness.evidence_file(f"{prefix}/input/issue/comments/0001-sean.md")
-    assert "exact bytes matter" in text
+    assert "bytes 匹配 🎯 matter" in text
 
 
 def test_failed_run_evidence_preserves_exact_input(harness: Harness):
     """Both failed Runs' bundles carry the same input/ layout and content
-    the Run saw — forensics include exactly what the agent was shown."""
+    the Run saw — forensics include exactly what the agent was shown, even
+    when the dying session tampered with input/ on its way out."""
     number = harness.file_issue("Doomed", CRITERIA_BODY)
     harness.human_comment(number, "the human constraint")
     prompts: list[bytes] = []
 
-    def dying(prompt: str, cwd: Path) -> AgentOutcome:
-        prompts.append((cwd.parent / "input" / "prompt.md").read_bytes())
+    def tamper_and_die(prompt: str, cwd: Path) -> AgentOutcome:
+        job = cwd.parent
+        prompts.append((job / "input" / "prompt.md").read_bytes())
+        (job / "input" / "prompt.md").write_text("PWNED-FAILED-PROMPT")
+        (job / "input" / "issue" / "comments" / "0001-sean.md").write_text("PWNED-COMMENT")
         return AgentOutcome(session_died=True, exit_code=1)
 
-    harness.worker_behaviors += [dying, dying]
+    harness.worker_behaviors += [tamper_and_die, tamper_and_die]
     assert harness.worker_once() == 2
 
     paths = harness.evidence_paths()
@@ -835,4 +1061,4 @@ def test_failed_run_evidence_preserves_exact_input(harness: Harness):
         prefix = run_json.removesuffix("/run.json")
         assert _evidence_bytes(harness, f"{prefix}/input/prompt.md") == prompt
         comment = harness.evidence_file(f"{prefix}/input/issue/comments/0001-sean.md")
-        assert "the human constraint" in comment
+        assert "the human constraint" in comment and "PWNED" not in comment

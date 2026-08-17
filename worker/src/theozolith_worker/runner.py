@@ -36,7 +36,12 @@ state lives in comments.
 Evidence is the sole durable audit trail (ADR-0016): every Run pushes its
 bundle, and a job directory is deleted only after that push confirmed —
 otherwise it is parked beside the jobs dir for the boot-time evidence
-sweep. One enumerated exception (M5, ADR-0019): when parking AND its
+sweep. The bundle's input half (prompt, issue metadata, Context Tree) comes
+from a trusted snapshot frozen immediately before the container launches
+(#52): input/ is agent-writable through the /job bind mount from launch
+onward, so post-execution re-reads are never evidence.
+
+One enumerated exception (M5, ADR-0019): when parking AND its
 collision-safe fallback both fail, the completed directory is removed
 unpublished — accepted evidence loss, because a completed dir left in the
 jobs dir reads as an in-flight Run to queue-behind.
@@ -232,6 +237,11 @@ class _RunContext:
     base_branch: str = ""
     gate: GateResult = field(default_factory=GateResult)
     section: decisions.DecisionsSection | None = None
+    # The pre-launch input snapshot (#52): captured immediately before the
+    # container starts, so evidence never re-reads input the agent could
+    # have rewritten through the /job bind mount. None means no container
+    # was ever launched — the job dir's input is still driver-authored.
+    trusted_input: dict[str, bytes] | None = None
 
 
 def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | None) -> str:
@@ -366,13 +376,23 @@ def execute_run(
     finally:
         if report.evidence_pushed:
             shutil.rmtree(job, ignore_errors=True)
+            # The trusted input snapshot goes only after the job dir is
+            # fully gone: if removal left remnants, the sweep may push this
+            # bundle path again, and it must keep using the snapshot — a
+            # tampered remnant input must never overwrite good evidence.
+            if not job.exists():
+                evidence.discard_input_snapshot(Path(config.jobs_dir), run_id)
         else:
             # The bundle is the sole durable audit trail: never delete a job
             # dir whose push is unconfirmed — the evidence sweep retries it.
             # Parked in the -pending sibling immediately, so the Node
             # Daemon's queue-behind in-flight signal never reads a finished
-            # Run's retained evidence as a live Run (ADR-0019).
+            # Run's retained evidence as a live Run (ADR-0019). The trusted
+            # input snapshot stays with it: the sweep builds the retried
+            # bundle from that snapshot, never from the retained job dir.
             _park_for_sweep(config, job, report, log)
+            if report.evidence_discarded:
+                evidence.discard_input_snapshot(Path(config.jobs_dir), run_id)
     return report
 
 
@@ -573,6 +593,13 @@ def _run_to_pr(
         user=config.container_user,
     )
 
+    # The last driver act before the container exists: freeze the input for
+    # evidence (#52). From launch onward input/ is agent-writable via the
+    # /job bind mount, so every bundle — live, failed, or boot-swept — is
+    # built from this snapshot, never from a post-execution re-read.
+    context.trusted_input = evidence.capture_input_snapshot(
+        Path(config.jobs_dir), job, report.run_id
+    )
     session = session_factory(spec, job, manifest)
     session.launch()
     report.phase = "agent"
@@ -760,7 +787,7 @@ def _push_run_evidence(
     prefix = evidence.run_dir(issue.number, report.run_id)
     transcript = _read_output(job, jobdir.TRANSCRIPT_FILE)
     stats = _run_stats(config, job)
-    files = {
+    files: dict[str, str | bytes] = {
         f"{prefix}/run.json": json.dumps(
             {
                 "run_id": report.run_id,
@@ -807,10 +834,16 @@ def _push_run_evidence(
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }
     # The exact input the Run saw (#52): prompt, issue metadata, and the
-    # authorized Context Tree, byte-for-byte under their relative paths.
-    files.update(
-        {f"{prefix}/{rel}": content for rel, content in evidence.input_artifacts(job).items()}
+    # authorized Context Tree, byte-for-byte under their relative paths —
+    # from the pre-launch trusted snapshot whenever a container launched.
+    # The job-dir fallback covers only pre-launch failures (clone, fetch),
+    # where no agent has ever had write access to input/.
+    input_files = (
+        context.trusted_input
+        if context.trusted_input is not None
+        else evidence.input_artifacts(job)
     )
+    files.update({f"{prefix}/{rel}": content for rel, content in input_files.items()})
     try:
         evidence.push_bundle(
             config.clone_url,

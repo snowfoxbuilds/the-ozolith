@@ -26,7 +26,7 @@ from conftest import (
     write_decisions,
 )
 from fakegithub import rate_limited_response
-from theozolith_worker import decisions, verdict
+from theozolith_worker import decisions, evidence, verdict
 from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
@@ -755,8 +755,12 @@ def test_evidence_push_failure_is_logged_never_fatal(harness: Harness, monkeypat
     assert structured["bundle"].startswith("runs/issue-") and structured["attempts"] >= 1
     # …and the retained job dir is parked in the -pending sibling, where the
     # boot sweep retries it and queue-behind never reads it as a live Run.
+    # The Run's trusted input snapshot is retained too (dot-prefixed:
+    # invisible to queue-behind) — the sweep's retried bundle is built from
+    # it, never from the agent-accessible job dir (#52).
     jobs = harness.worker_config.jobs_dir
-    assert [p for p in jobs.iterdir() if p.is_dir()] == []
+    assert [p for p in jobs.iterdir() if p.is_dir() and not p.name.startswith(".")] == []
+    assert evidence.snapshot_dir(jobs, structured["run_id"]).is_dir()
     parked = [p.name for p in pending_dir(harness.worker_config).iterdir()]
     assert parked and structured["run_id"] in parked
 

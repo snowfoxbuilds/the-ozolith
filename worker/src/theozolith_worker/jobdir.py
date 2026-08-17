@@ -8,6 +8,12 @@ steps travel as job files under ``input/jobs/`` answered under
 ``output/jobs/``. All schemas here are the wire format both sides speak
 (formats settled in ADR-0014).
 
+Because the whole job directory is bind-mounted, everything in it —
+``input/`` included — is agent-writable once the container starts. Evidence
+therefore never trusts post-launch job-dir input: the driver freezes a
+trusted snapshot of the input artifacts immediately before launch
+(evidence.capture_input_snapshot, #52) and every bundle is built from that.
+
 Layout::
 
     jobs/<run-id>/

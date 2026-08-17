@@ -54,6 +54,7 @@ class FakeGitHub:
         self.events: dict[int, list[dict[str, Any]]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
         self.review_comments: dict[int, list[dict[str, Any]]] = {}
+        self.review_threads: dict[int, list[dict[str, Any]]] = {}
         self.reviews: dict[int, list[dict[str, Any]]] = {}
         self.check_runs: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
         self.statuses: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
@@ -187,6 +188,29 @@ class FakeGitHub:
         self._next_id += 1
         self.reviews.setdefault(number, []).append(review)
         return review["id"]
+
+    def add_review_thread(
+        self,
+        number: int,
+        comment_ids: list[int],
+        resolved: bool = False,
+        resolved_by: str = "",
+        outdated: bool = False,
+    ) -> str:
+        """A review thread over existing review-comment ids (resolution and
+        grouping live only in GraphQL on real GitHub, and here too)."""
+        thread_id = f"RT_{self._next_id}"
+        self._next_id += 1
+        self.review_threads.setdefault(number, []).append(
+            {
+                "id": thread_id,
+                "isResolved": resolved,
+                "isOutdated": outdated,
+                "resolvedBy": {"login": resolved_by} if resolved_by else None,
+                "comment_ids": list(comment_ids),
+            }
+        )
+        return thread_id
 
     def add_check_run(
         self,
@@ -330,7 +354,9 @@ class FakeGitHub:
                 return responses.pop(0)
 
         response = self._route(actor, method, path, params, payload)
-        if method != "GET" and response.status < 400:
+        # POST /graphql carries only read-only queries (mirroring the real
+        # client's writes-transcript exemption): never a logged write.
+        if method != "GET" and path != "/graphql" and response.status < 400:
             self.write_log.append((actor, method, path, payload))
         if self.after_request is not None:
             self.after_request(actor, method, path)
@@ -347,6 +373,8 @@ class FakeGitHub:
         prefix = f"/repos/{self.repo}"
         if path == "/user":
             return _json_response(200, {"login": actor})
+        if path == "/graphql":
+            return self._h_graphql(payload)
         if path == prefix:
             return _json_response(200, {"default_branch": self.default_branch})
         if not path.startswith(prefix):
@@ -377,6 +405,71 @@ class FakeGitHub:
             (r"/commits/([^/]+)/check-runs", self._h_check_runs),
             (r"/commits/([^/]+)/statuses", self._h_statuses),
         ]
+
+    # GraphQL page size the real queries request; the fake honors it so the
+    # client's two-level pagination is exercised for real.
+    _GRAPHQL_PAGE = 100
+
+    def _graphql_comments(self, thread: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+        start = int(cursor) if cursor else 0
+        ids = thread["comment_ids"]
+        page = ids[start : start + self._GRAPHQL_PAGE]
+        return {
+            "pageInfo": {
+                "hasNextPage": start + self._GRAPHQL_PAGE < len(ids),
+                "endCursor": str(start + self._GRAPHQL_PAGE),
+            },
+            "nodes": [{"databaseId": cid} for cid in page],
+        }
+
+    def _graphql_thread_node(self, thread: dict[str, Any], cursor: str | None) -> dict[str, Any]:
+        return {
+            "id": thread["id"],
+            "isResolved": thread["isResolved"],
+            "isOutdated": thread["isOutdated"],
+            "resolvedBy": thread["resolvedBy"],
+            "comments": self._graphql_comments(thread, cursor),
+        }
+
+    def _h_graphql(self, payload: Any) -> Response:
+        """The two read-only queries the client sends: the reviewThreads
+        page walk and the per-thread comment page walk."""
+        query = (payload or {}).get("query") or ""
+        variables = (payload or {}).get("variables") or {}
+        if "reviewThreads" in query:
+            threads = self.review_threads.get(variables.get("number"), [])
+            start = int(variables["cursor"]) if variables.get("cursor") else 0
+            page = threads[start : start + self._GRAPHQL_PAGE]
+            connection = {
+                "pageInfo": {
+                    "hasNextPage": start + self._GRAPHQL_PAGE < len(threads),
+                    "endCursor": str(start + self._GRAPHQL_PAGE),
+                },
+                "nodes": [self._graphql_thread_node(t, None) for t in page],
+            }
+            return _json_response(
+                200,
+                {"data": {"repository": {"pullRequest": {"reviewThreads": connection}}}},
+            )
+        if "PullRequestReviewThread" in query:
+            wanted = variables.get("id")
+            for threads in self.review_threads.values():
+                for thread in threads:
+                    if thread["id"] == wanted:
+                        return _json_response(
+                            200,
+                            {
+                                "data": {
+                                    "node": {
+                                        "comments": self._graphql_comments(
+                                            thread, variables.get("cursor")
+                                        )
+                                    }
+                                }
+                            },
+                        )
+            return _json_response(200, {"data": {"node": None}})
+        return _json_response(200, {"errors": [{"message": f"unsupported query: {query[:80]}"}]})
 
     @staticmethod
     def _page(items: list[Any], params: dict[str, str]) -> list[Any]:
