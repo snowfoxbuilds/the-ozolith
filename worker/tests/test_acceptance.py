@@ -1315,6 +1315,20 @@ def test_dry_run_session_breakage_without_a_verdict_is_not_latched(harness: Harn
     assert harness.fake.pulls[pr_number]["head"] == branch_for(number)
 
 
+def test_boot_clears_a_predecessors_completion_parking(harness: Harness):
+    """A driver killed between a completion-classed Run and its one retry
+    leaves the parked worktree behind (ADR-0016 as amended by ADR-0046):
+    dot-prefixed and inert, but dead — the claim died with the process —
+    so boot hygiene clears it before the first pass."""
+    stale = Path(harness.worker_config.jobs_dir) / ".completion-20260101T000000-worker-a-1"
+    (stale / "checkout").mkdir(parents=True)
+    (stale / "checkout" / "leftover.txt").write_text("x\n")
+    harness.file_issue("Tidied", CRITERIA_BODY)
+
+    assert harness.worker_once() == 1
+    assert not stale.exists()
+
+
 def test_dry_run_sweeps_a_predecessors_stale_dot_dir(harness: Harness):
     """A driver killed mid-dry-run runs no finally block and the evidence
     sweep skips dot-prefixed dirs by design — the next dry-run clears the
