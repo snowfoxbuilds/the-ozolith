@@ -8,6 +8,7 @@ nothing from any other author anywhere in the tree.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -659,6 +660,62 @@ def test_local_retry_refetches_context(harness: Harness):
     assert not any("unauthorized between the runs" in c for c in second)
 
 
+def _bulk_commits(git_dir: Path, base: str, branch: str, count: int) -> None:
+    """Grow ``branch`` in a bare repo by ``count`` empty commits on top of
+    ``base``, built with commit-tree + update-ref (no clone, no transport)."""
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -e; export GIT_DIR="{git_dir}"'
+            " GIT_AUTHOR_NAME=bulk GIT_AUTHOR_EMAIL=b@x"
+            " GIT_COMMITTER_NAME=bulk GIT_COMMITTER_EMAIL=b@x;"
+            f' parent={base}; tree=$(git rev-parse "{base}^{{tree}}");'
+            f" for i in $(seq 1 {count}); do"
+            '   parent=$(git commit-tree "$tree" -p "$parent"'
+            '     -m "bulk commit $i" -m "second line $i");'
+            " done;"
+            f' git update-ref "refs/heads/{branch}" "$parent"',
+        ],
+        check=True,
+    )
+
+
+def test_git_pr_commits_is_uncapped_and_ordered(tmp_path):
+    """The enumerator itself, transport-free: 260 commits past the REST
+    endpoint's 250 cap all appear, chronologically, messages complete."""
+    repo = tmp_path / "repo.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "--initial-branch", "main", str(repo)], check=True
+    )
+    env = "GIT_AUTHOR_NAME=s GIT_AUTHOR_EMAIL=s@x GIT_COMMITTER_NAME=s GIT_COMMITTER_EMAIL=s@x"
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -e; export GIT_DIR="{repo}" {env};'
+            " tree=$(git mktree </dev/null);"
+            ' seed=$(git commit-tree "$tree" -m seed);'
+            ' git update-ref refs/heads/main "$seed";'
+            ' git update-ref refs/heads/topic "$seed"',
+        ],
+        check=True,
+    )
+    base = _git_out(["--git-dir", str(repo), "rev-parse", "refs/heads/main"], tmp_path)
+    _bulk_commits(repo, base, "topic", 260)
+
+    workdir = tmp_path / "checkout"
+    subprocess.run(["git", "clone", "-q", str(repo), str(workdir)], check=True)
+    head = _git_out(["rev-parse", "origin/topic"], workdir)
+    commits = contexttree.git_pr_commits(workdir, "origin/main", head)
+
+    assert len(commits) == 260  # nothing capped at the API's 250 boundary
+    assert [c.message.splitlines()[0] for c in commits[:2]] == ["bulk commit 1", "bulk commit 2"]
+    assert commits[-1].message == "bulk commit 260\n\nsecond line 260"  # complete, multi-line
+    assert commits[-1].sha == head and commits[-1].author == "bulk"
+    assert all(c.authored_at for c in commits)
+
+
 def test_pr_with_over_250_commits_is_complete_and_reset_independent(harness: Harness):
     """The commit snapshot comes from the trusted checkout, so a PR beyond
     the REST API's 250-commit cap records every commit, chronologically,
@@ -674,25 +731,13 @@ def test_pr_with_over_250_commits_is_complete_and_reset_independent(harness: Har
     harness.reviewer_replies.append(revise_reply("1. try again"))
     harness.reviewer_once()  # authorized verdict designating resume at c1
 
-    # 260 more commits land on the PR branch (built directly in the bare
-    # test remote with commit-tree + update-ref: no clone, no transport —
-    # only the driver's own fetch machinery touches the wire).
-    subprocess.run(
-        [
-            "bash",
-            "-c",
-            f'set -e; export GIT_DIR="{harness.remote}"'
-            " GIT_AUTHOR_NAME=bulk GIT_AUTHOR_EMAIL=b@x"
-            " GIT_COMMITTER_NAME=bulk GIT_COMMITTER_EMAIL=b@x;"
-            f' parent={c1}; tree=$(git rev-parse "{c1}^{{tree}}");'
-            " for i in $(seq 1 260); do"
-            '   parent=$(git commit-tree "$tree" -p "$parent"'
-            '     -m "bulk commit $i" -m "second line $i");'
-            " done;"
-            f' git update-ref "refs/heads/{branch}" "$parent"',
-        ],
-        check=True,
-    )
+    # 260 more commits land on the PR branch.
+    _bulk_commits(harness.remote, c1, branch, 260)
+    # Rebuild the mirror cache from scratch for round 2 (the documented
+    # heal path: delete the root, let ensure_mirror re-clone) — newer git
+    # (2.54, CI) corrupts the reference clone when the bulk pack arrives
+    # via the incremental mirror fetch and is then borrowed + dissociated.
+    shutil.rmtree(harness.worker_config.mirrors_dir, ignore_errors=True)
 
     seen: dict = {}
 
