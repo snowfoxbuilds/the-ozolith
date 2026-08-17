@@ -1,8 +1,9 @@
 # The Flight Deck as a thin Stack (ADR-0044): a driverless worker type
 # (worker-types/flightdeck.toml) resolves to a container-kind Stack — the
 # interactive, human-driven agent container and the web terminal's primary
-# attach target (ADR-0019). The image, start command, volumes, and its
-# dedicated no-merge machine-identity secret all live in the worker type.
+# attach target (ADR-0019). The image, start command, volumes, and the
+# default binding of its dedicated no-merge machine-identity secret all
+# live in the worker type; bindings are rebindable per Stack (ADR-0047).
 
 worker_type = "flightdeck"
 node = "box1"
@@ -23,3 +24,10 @@ attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux",
 # Deck Stack picks a distinct name, convention flightdeck-<something>.
 [env]
 FLIGHTDECK_TS_HOSTNAME = "flightdeck-box1"
+
+# Per-instance enrollment hardening (ADR-0047): once THIS deck has enrolled
+# successfully, unbind the auth key here — siblings still enrolling keep the
+# type's default binding. (Keep this table last: everything below a [table]
+# header belongs to it.)
+# [secrets]
+# TS_AUTHKEY = ""

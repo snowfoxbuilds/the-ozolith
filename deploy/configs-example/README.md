@@ -82,10 +82,13 @@ marker is absent** from the tailscale-state volume (first enrollment, a retry
 after a failed or interrupted attempt, or after deliberate state loss);
 thereafter identity lives on `{stack}-tailscale-state` and survives image
 rebuilds. There is no durable copy of the key anywhere but the encrypted store
-and that tmpfs, which evaporates with the daemon/reboot. **Hardening:** once
-every Flight Deck of the type has **enrolled successfully** (its container
-reached the running session at least once), remove the `TS_AUTHKEY` line from
-the worker type's `[secrets]`.
+and that tmpfs, which evaporates with the daemon/reboot. **Hardening (per
+instance, ADR-0047):** as each Flight Deck **enrolls successfully** (its
+container reached the running session at least once), unbind the key for that
+instance with `TS_AUTHKEY = ""` in its Stack's `[secrets]` — siblings still
+enrolling keep the type's default binding. Once every instance has enrolled,
+remove the `TS_AUTHKEY` line from the worker type's `[secrets]` (and the
+per-Stack unbinds with it).
 
 ### Enrollment completion is an explicit marker, not the state file
 
@@ -198,7 +201,8 @@ the admin console as a stale, offline entry. Prune it there (Machines → the ol
 `flightdeck-<name>` → Delete). This is expected after a deliberate state reset;
 it is not an error.
 
-If you applied the hardening (removed the `TS_AUTHKEY` mapping) **and** the
-state volume is gone, the fresh start fails fast with a distinct message:
-restore the `TS_AUTHKEY` line in the worker type's `[secrets]`, restart the
-Stack to re-enroll, then remove the line again.
+If you applied the hardening (unbound or removed the `TS_AUTHKEY` binding)
+**and** the state volume is gone, the fresh start fails fast with a distinct
+message: restore the binding — drop the Stack's `TS_AUTHKEY = ""` unbind, or
+re-add the line to the worker type's `[secrets]` — restart the Stack to
+re-enroll, then re-apply the hardening.

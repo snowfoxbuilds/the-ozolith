@@ -90,6 +90,38 @@ def test_reentering_a_secret_replaces_the_value(control):
     assert answer.json()["secrets"]["github-implementer"] == "new-value"
 
 
+def test_same_type_stacks_pull_distinct_bindings(control):
+    """ADR-0047 end-to-end: two Stacks of ONE worker type act as distinct
+    identities by rebinding a required slot per placement; node scoping keys
+    on the per-Stack binding, so each node may pull only its own credential."""
+    digest = "0" * 64
+    control.write_config(
+        "worker-types/claude-dev.toml",
+        f'driver = "builtin:implementer"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\n'
+        f'base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{digest}"\n'
+        '[secrets]\nGITHUB_TOKEN = ""\n',  # required slot: every Stack binds
+    )
+    control.write_config(
+        "stacks/impl-a.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKEN = "github-impl-a"\n',
+    )
+    control.write_config(
+        "stacks/impl-b.toml",
+        'worker_type = "claude-dev"\nnode = "box2"\n[secrets]\nGITHUB_TOKEN = "github-impl-b"\n',
+    )
+    enter_secret(control, name="github-impl-a", value="value-a")
+    enter_secret(control, name="github-impl-b", value="value-b")
+
+    mine = control.node_post("/api/v1/secrets/pull", {"node": "box1", "names": ["github-impl-a"]})
+    assert mine.json() == {"secrets": {"github-impl-a": "value-a"}}
+    # The sibling's credential is out of scope for box1 even though both
+    # Stacks share one worker type — scoping follows the resolved binding.
+    other = control.node_post("/api/v1/secrets/pull", {"node": "box1", "names": ["github-impl-b"]})
+    assert other.status_code == 403
+    assert "no Stack referencing" in other.json()["detail"]
+
+
 def test_secret_endpoints_refuse_a_non_tls_channel(tmp_path):
     """TLS mandatory: with the channel not TLS (and no --insecure-dev), both
     entry and pull are refused — values never transit plaintext."""

@@ -241,7 +241,8 @@ class WorkerTypeDef:
         # the hash covers the exact bytes that build the image, including the
         # baked model/effort config, so candidate identity equals image
         # identity. driver/workspace/secrets never enter (they change no
-        # image bytes; adding them would rebuild the fleet for nothing), and
+        # image bytes; adding them would rebuild the fleet for nothing) —
+        # which is what makes their per-Stack rebinding free (ADR-0047) — and
         # a type with no model/effort hashes byte-identically to pre-ADR-0045.
         # The rendered materialize instruction is therefore identity-bearing:
         # its format is frozen by golden tests here and in the worker package.
@@ -293,6 +294,11 @@ class StackDef:
     # generic Stack. Kept populated after resolution for display only — every
     # other field is already concrete, so consumers never special-case it.
     worker_type: str = ""
+    # Per-placement target-repo binding (ADR-0047), worker-type Stacks only:
+    # overrides the type's workspace default at resolution. The resolved
+    # Stack carries the outcome in env THEOZOLITH_REPO — this field never
+    # travels to nodes (not in as_wire).
+    workspace: str = ""
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)  # ENV_NAME -> secret name
     # process kind: the supervised argv string. Container kind (single-image
@@ -490,8 +496,34 @@ def _str_map(data: dict, key: str, context: str) -> dict[str, str]:
     return dict(value)
 
 
+# The identity names the worker-type-Stack [env] guard rejects (ADR-0045),
+# rejected as secret SLOT names too — at both declaration sites, since the
+# type-side hole is the same hole. A slot materializes <slot>_FILE and the
+# worker's env reader takes the _FILE spelling FIRST, so a slot named after
+# a baked identity field is the same override through a file.
+_RESERVED_SECRET_SLOTS = (
+    "THEOZOLITH_MODEL",
+    "THEOZOLITH_ADAPTER",
+    "THEOZOLITH_RUN_IMAGE",
+    "THEOZOLITH_RUN_IMAGE_FILE",
+)
+
+
+def _guard_secret_slots(secrets: dict[str, str], context: str) -> None:
+    for slot in _RESERVED_SECRET_SLOTS:
+        if slot in secrets:
+            raise ConfigRepoError(
+                f"{context}: [secrets] {slot} is reserved — a secret slot"
+                f" materializes {slot}_FILE, which the worker reads first and"
+                " would steer the baked worker-type identity"
+                " (ADR-0045/ADR-0047); rename the slot"
+            )
+
+
 # Fields that a fat pre-ADR-0044 Stack carried but that now live in the worker
 # type. A thin worker-type Stack that still declares one is rejected by name.
+# ``secrets`` moved back OUT of this list (ADR-0047): the type declares the
+# slot contract, the Stack may rebind per placement.
 _MOVED_TO_WORKER_TYPE = (
     "kind",
     "command",
@@ -500,9 +532,8 @@ _MOVED_TO_WORKER_TYPE = (
     "overlays",
     "ports",
     "volumes",
-    "secrets",
 )
-_WORKER_TYPE_STACK_KEYS = ("worker_type", "node", "state", "env", "attach")
+_WORKER_TYPE_STACK_KEYS = ("worker_type", "node", "state", "env", "attach", "workspace", "secrets")
 
 
 def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
@@ -526,24 +557,38 @@ def _parse_stack(name: str, data: dict[str, Any]) -> StackDef:
 
 def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> StackDef:
     """A thin worker-type Stack (ADR-0044): worker_type + placement + desired
-    state, nothing else. kind/command/image/... all moved into the worker
-    type; the concrete StackDef is produced later at resolution."""
+    state, plus the per-placement bindings — workspace and [secrets]
+    (ADR-0047). kind/command/image/... all moved into the worker type; the
+    concrete StackDef is produced later at resolution."""
     worker_type = _require_str(data, "worker_type", context)
     for key in data:
         if key in _MOVED_TO_WORKER_TYPE:
             raise ConfigRepoError(
                 f"{context}: {key!r} moved to worker-types/{worker_type}.toml"
                 " (ADR-0044) — a worker-type Stack declares only worker_type,"
-                " node, state, env, attach"
+                " node, state, env, attach, workspace, secrets"
             )
         if key not in _WORKER_TYPE_STACK_KEYS:
             raise ConfigRepoError(
                 f"{context}: unknown key {key!r} on a worker-type Stack"
-                " (allowed: worker_type, node, state, env, attach)"
+                " (allowed: worker_type, node, state, env, attach, workspace, secrets)"
             )
     state = _require_str(data, "state", context, default="running")
     if state not in DESIRED_STATES:
         raise ConfigRepoError(f"{context}: state must be one of {DESIRED_STATES}, got {state!r}")
+    # Per-placement target-repo binding (ADR-0047): overrides the type's
+    # workspace default at resolution.
+    workspace = _require_str(data, "workspace", context, default="")
+    if workspace and not _valid_workspace(workspace):
+        raise ConfigRepoError(
+            f"{context}: 'workspace' must be owner/name — exactly two non-empty"
+            f" path components — got {workspace!r}"
+        )
+    # Per-placement secret bindings (ADR-0047): slot -> stored name, merged
+    # over the type's contract at resolution. Names only — values never
+    # enter the Config Repo (ADR-0006).
+    secrets = _str_map(data, "secrets", context)
+    _guard_secret_slots(secrets, context)
     env = _str_map(data, "env", context)
     # Exact names, not a *_MODEL glob: a worker-type Stack's [env] was the
     # last per-placement override of the type's identity fields; with model
@@ -578,7 +623,9 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
         node=_require_str(data, "node", context),
         state=state,
         worker_type=worker_type,
+        workspace=workspace,
         env=env,
+        secrets=secrets,
         attach=_parse_attach(data, context),
     )
 
@@ -686,10 +733,6 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
                 f"{context}: driver must be 'builtin:<name>' or 'drivers/<name>'"
                 f" (ADR-0042), got {driver!r}"
             )
-        if not workspace:
-            raise ConfigRepoError(
-                f"{context}: 'workspace' (owner/name) is required when a driver is set"
-            )
         for field_name, present in (("command", command), ("volumes", volumes)):
             if present:
                 raise ConfigRepoError(
@@ -705,6 +748,10 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
     model = _require_str(data, "model", context, default="")
     effort = _require_str(data, "effort", context, default="")
     _validate_model_effort(context, adapter_name, model, effort, is_driver=bool(driver))
+    # The slot contract (ADR-0047): slot -> default stored name; "" declares
+    # a required slot every instantiating Stack must bind.
+    secrets = _str_map(data, "secrets", context)
+    _guard_secret_slots(secrets, context)
     return WorkerTypeDef(
         name=name,
         base=base,
@@ -716,7 +763,7 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
         model=model,
         effort=effort,
         workspace=workspace,
-        secrets=_str_map(data, "secrets", context),
+        secrets=secrets,
         command=command,
         volumes=volumes,
     )
@@ -825,6 +872,35 @@ def _resolve_driver_command(wt: WorkerTypeDef, repo_dir: Path | None) -> str:
     return f"{DRIVER_LAUNCHER} {wt.driver}"
 
 
+def _merge_secret_bindings(stack: StackDef, wt: WorkerTypeDef, context: str) -> dict[str, str]:
+    """The per-placement secret binding (ADR-0047): key-wise merge, the Stack
+    wins — how two Stacks of one type act as distinct identities. An empty
+    name on the TYPE declares a required slot (every instantiating Stack must
+    bind it — fails here at config load, never as a deploy-time 404 on the
+    node); an empty name on the STACK unbinds an inherited default (the
+    per-instance TS_AUTHKEY removal). Empty entries never reach the resolved
+    Stack, so ``secret_names_for`` and the daemon only ever see real names."""
+    resolved: dict[str, str] = {}
+    for slot, name in {**wt.secrets, **stack.secrets}.items():
+        if name:
+            resolved[slot] = name
+        elif wt.secrets.get(slot) == "":
+            raise ConfigRepoError(
+                f"{context}: [secrets] {slot} is a required slot on worker type"
+                f" {wt.name!r} — declared with an empty name in"
+                f" worker-types/{wt.name}.toml, so every instantiating Stack"
+                " must bind it to a stored secret name (ADR-0047)"
+            )
+        elif slot not in wt.secrets:
+            raise ConfigRepoError(
+                f'{context}: [secrets] {slot} = "" unbinds a slot worker type'
+                f" {wt.name!r} does not declare — remove the entry, or bind it"
+                " to a stored secret name (ADR-0047)"
+            )
+        # else: a type default deliberately unbound by this Stack — dropped.
+    return resolved
+
+
 def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | None) -> StackDef:
     """Turn a thin worker-type Stack into a concrete generic StackDef (ADR-0044).
 
@@ -834,8 +910,11 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
     baked into the run image (ADR-0045), and a model change rolls the fleet
     through the changed RUN_IMAGE tag instead of a changed env var. The kind
     is derived from the type's driver; the supervised command is resolved
-    from the driver ref (builtin or a verified drivers/<name>, ADR-0042)."""
+    from the driver ref (builtin or a verified drivers/<name>, ADR-0042).
+    Workspace and secret bindings merge Stack-over-type here (ADR-0047) —
+    the per-placement half of the split, never image-identity-bearing."""
     context = f"stacks/{stack.name}.toml"
+    workspace = stack.workspace or wt.workspace
     if wt.is_driver:
         if stack.attach:
             raise ConfigRepoError(
@@ -843,9 +922,15 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
                 f" type {wt.name!r} has a driver, so the Stack resolves to process"
                 " kind (ADR-0019/ADR-0044)"
             )
+        if not workspace:
+            raise ConfigRepoError(
+                f"{context}: worker type {wt.name!r} has a driver but no workspace —"
+                " set 'workspace' (owner/name) on this Stack or a default in"
+                f" worker-types/{wt.name}.toml (ADR-0047)"
+            )
         command = _resolve_driver_command(wt, repo_dir)
         env = {
-            "THEOZOLITH_REPO": wt.workspace,
+            "THEOZOLITH_REPO": workspace,
             "THEOZOLITH_ADAPTER": wt.adapter,
             "THEOZOLITH_RUN_IMAGE": wt.tag,
         }
@@ -857,13 +942,13 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
             state=stack.state,
             worker_type=wt.name,
             env=env,
-            secrets=dict(wt.secrets),
+            secrets=_merge_secret_bindings(stack, wt, context),
             command=command,
         )
     # Driverless: an interactive Flight Deck container running the derived tag.
     env: dict[str, str] = {}
-    if wt.workspace:
-        env["THEOZOLITH_REPO"] = wt.workspace
+    if workspace:
+        env["THEOZOLITH_REPO"] = workspace
     env.update(stack.env)
     return StackDef(
         name=stack.name,
@@ -872,7 +957,7 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
         state=stack.state,
         worker_type=wt.name,
         env=env,
-        secrets=dict(wt.secrets),
+        secrets=_merge_secret_bindings(stack, wt, context),
         command=wt.command,
         image=wt.tag,
         volumes=_resolve_volumes(wt.volumes, stack.name),

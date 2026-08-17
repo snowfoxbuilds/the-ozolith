@@ -680,17 +680,23 @@ def _product_version() -> str:
 
 def _scaffold_stack(node_name: str) -> str:
     return f"""# The staged Implementer Stack (ADR-0037/ADR-0044 scaffold): thin by
-# design — a worker type plus placement and desired state, nothing else.
-# Desired state STOPPED, so nothing deploys or builds on first boot. The
-# finish line is three steps; see README.md in this repo.
+# design — a worker type plus placement and desired state, plus optional
+# per-placement bindings (ADR-0047, commented below). Desired state STOPPED,
+# so nothing deploys or builds on first boot. The finish line is three
+# steps; see README.md in this repo.
 
 worker_type = "claude-dev"   # worker-types/claude-dev.toml owns the rest
 node = "{node_name}"
 state = "stopped"            # step 3: flip to "running" and commit
 
-# Optional [env] = per-placement expert overrides (e.g. a distinct
-# WORKER_ID). Everything that defines the worker — driver, adapter, model,
-# workspace, secrets, run image — lives in the worker type.
+# The worker's identity — driver, adapter, model, run image — lives in the
+# worker type; the Stack may add per-placement bindings (ADR-0047): a
+# 'workspace' repointing the target repo and a [secrets] table rebinding the
+# type's slots (distinct credentials per Stack), plus [env] expert overrides
+# (e.g. a distinct WORKER_ID).
+# workspace = "you/another-repo"
+# [secrets]
+# GITHUB_TOKEN = "github-implementer-{node_name}"
 # [env]
 # WORKER_ID = "worker-{node_name}"
 """
@@ -730,6 +736,9 @@ base = "{SCAFFOLD_BASE_IMAGE}:{version}@sha256:{PLACEHOLDER_DIGEST}"
 [secrets]
 # Secret NAMES only — values live in the encrypted store, never this repo
 # (ADR-0024): enter each once with 'sudo theozolith secret set <name>'.
+# Each entry is a SLOT (env name) -> stored secret name; a Stack may rebind
+# a slot per placement, and "" declares a slot every instantiating Stack
+# must bind (ADR-0047).
 GITHUB_TOKEN = "github-implementer"
 ANTHROPIC_API_KEY = "anthropic-api-key"
 """

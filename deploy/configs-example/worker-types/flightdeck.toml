@@ -155,7 +155,7 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 'if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]; then TS_ENROLL=no; else TS_ENROLL=yes; fi' \
 'if [ "$TS_ENROLL" = yes ] && [ ! -r "${TS_AUTHKEY_FILE:-/nonexistent}" ]; then' \
 '  echo "flightdeck-start: fresh tailscale enrollment needs the auth key, but TS_AUTHKEY_FILE is missing or unreadable" >&2' \
-'  echo "flightdeck-start: restore the TS_AUTHKEY mapping in the worker-type [secrets], restart, then re-apply the hardening (configs README)" >&2' \
+'  echo "flightdeck-start: restore the TS_AUTHKEY binding in the worker-type or Stack [secrets], restart, then re-apply the hardening (configs README)" >&2' \
 '  exit 1' \
 'fi' \
 'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale --socket=/tmp/tailscaled.sock &' \
@@ -234,11 +234,14 @@ ANTHROPIC_API_KEY = "anthropic-api-key"
 # Consumed only while the enrollment completion marker is absent from the
 # state volume (first enrollment, a retry after a failed or interrupted
 # attempt, or after deliberate state loss); delivered as TS_AUTHKEY_FILE.
-# HARDENING: remove this line after every Flight Deck of this type has
-# ENROLLED SUCCESSFULLY (the marker, and with it the identity, then lives on
-# {stack}-tailscale-state). To re-enroll after a deliberate state wipe,
-# restore this line first — a fresh start without it fails fast with a
-# message saying exactly that.
+# HARDENING (per instance, ADR-0047): this line is the type's DEFAULT
+# binding. As each Flight Deck ENROLLS SUCCESSFULLY (the marker, and with
+# it the identity, then lives on {stack}-tailscale-state), unbind the key
+# for that instance with `TS_AUTHKEY = ""` in its Stack's [secrets] —
+# siblings still enrolling keep the default. Remove this line once every
+# instance has enrolled. To re-enroll after a deliberate state wipe,
+# restore the binding (here or on that Stack) first — a fresh start
+# without it fails fast with a message saying exactly that.
 TS_AUTHKEY = "flightdeck-tailscale-authkey"
 # For a PRIVATE knowledge repo, uncomment and provide a git credential helper
 # in the base image that reads this token; clone-init auth is then ambient.

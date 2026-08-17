@@ -57,6 +57,9 @@ knowledge_pin = "0000000000000000000000000000000000000000"
 # Secret NAMES only — values live encrypted on the Control Node, entered
 # once via `theozolith secret set <name>`, pulled node-scoped at deploy
 # time, and delivered as <ENV>_FILE from tmpfs (never node disk).
+# Each entry is a SLOT (env name) -> default stored name; a Stack may rebind
+# a slot per placement (distinct credentials per Stack), and "" declares a
+# slot every instantiating Stack must bind (ADR-0047).
 [secrets]
 GITHUB_TOKEN = "github-implementer"
 # Claude Code accepts EITHER a workspace API key or a subscription OAuth token
