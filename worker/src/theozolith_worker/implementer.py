@@ -29,7 +29,7 @@ from typing import ClassVar
 from theozolith_worker.base import Worker
 from theozolith_worker.githubapi import Issue
 from theozolith_worker.runner import execute_claim
-from theozolith_worker.sweep import sweep_orphans
+from theozolith_worker.sweep import sweep_mirrors, sweep_orphans
 
 SWEEP_RETRY_SECONDS = 900.0  # backoff between failed-evidence-push retries
 
@@ -65,6 +65,7 @@ class Implementer(Worker):
         )
 
     def on_boot(self) -> None:
+        sweep_mirrors(self.config, log=self.log)  # crash-clean the mirror root (#51)
         _, kept = sweep_orphans(self.config, log=self.log)  # boot-time sweep (ADR-0016)
         self._arm_sweep_retry(kept)
 

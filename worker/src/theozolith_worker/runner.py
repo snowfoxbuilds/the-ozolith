@@ -457,7 +457,20 @@ def _run_to_pr(
     email = f"{login}@users.noreply.github.com"
     auth = gitops.auth_env(config.token)
 
-    gitops.clone(config.clone_url, workdir, env=auth)
+    # Reference clone off the node-local mirror (#51): same disposable,
+    # self-contained checkout a full clone produced — --dissociate severs
+    # every tie to the mirror — but the per-Run download is a ref
+    # advertisement instead of the whole history. Mirror failures — trust
+    # validation refusals, git failures, and per-operation timeout expiry
+    # alike — raise GitError and land in the pre-session infra lane
+    # (ADR-0016).
+    gitops.clone_with_mirror(
+        config.clone_url,
+        config.mirrors_dir,
+        workdir,
+        env=auth,
+        timeout=config.git_timeout_seconds,
+    )
     gitops.sanitize_checkout(workdir, config.clone_url)
     _exclude_metadata(workdir)
     report.phase = "checkout"

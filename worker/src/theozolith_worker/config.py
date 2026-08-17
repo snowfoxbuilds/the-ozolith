@@ -159,6 +159,17 @@ class DriverConfig:
     node_name: str  # the physical node, for events (M3 heartbeat identity)
     worker_id: str
     jobs_dir: Path  # where per-Run job directories live
+    # Node-local bare mirrors backing reference-clone Run checkouts (#51).
+    # Deliberately node-shared (not per-Stack like jobs_dir): every driver on
+    # the node reuses one mirror per repo, and the per-repo file lock makes
+    # that safe. Never mounted into any container. The root is validated
+    # fail-closed at every use (driver-owned, no group/world write, never a
+    # symlink) — see gitops.ensure_mirrors_root.
+    mirrors_dir: Path
+    # Per-operation budget for the mirror path: the lock wait, mirror
+    # creation, the update fetch, and the reference clone each get this many
+    # seconds. Expiry is a normal pre-session infra failure (ADR-0016).
+    git_timeout_seconds: float
     agent_timeout_seconds: float
     cache_volumes: tuple[tuple[str, str], ...]  # warm caches as named volumes
     agent_env: dict[str, str]  # model credentials (API key and/or OAuth token)
@@ -200,6 +211,15 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
     repo = _required(environ, "THEOZOLITH_REPO")
     if "/" not in repo:
         raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
+    # Conservative default: a cold mirror clone of a large repo over a slow
+    # link must fit, yet a stuck holder/waiter still resolves into the infra
+    # lane the same day it happens, not never.
+    git_timeout = _float(environ, "THEOZOLITH_GIT_TIMEOUT_SECONDS", default="600")
+    if git_timeout <= 0:
+        raise ConfigError(
+            "THEOZOLITH_GIT_TIMEOUT_SECONDS must be positive — the bound is what"
+            " turns a stuck mirror lock holder into a normal infra failure"
+        )
     token = _required(environ, f"{prefix}_GITHUB_TOKEN", "GITHUB_TOKEN")
     api_url = env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or ""
 
@@ -261,6 +281,11 @@ def load_config(environ: Mapping[str, str] | None = None, *, role: str) -> Drive
         jobs_dir=Path(
             env_value(environ, "THEOZOLITH_JOBS_DIR", default_jobs_dir) or default_jobs_dir
         ),
+        mirrors_dir=Path(
+            env_value(environ, "THEOZOLITH_MIRRORS_DIR", "/var/tmp/theozolith/mirrors")
+            or "/var/tmp/theozolith/mirrors"
+        ),
+        git_timeout_seconds=git_timeout,
         agent_timeout_seconds=_float(environ, "THEOZOLITH_AGENT_TIMEOUT_SECONDS", default="3600"),
         cache_volumes=_volumes(
             env_value(environ, "THEOZOLITH_CACHE_VOLUMES", DEFAULT_CACHE_VOLUMES)

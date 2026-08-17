@@ -65,6 +65,14 @@ fi
 # into it (provision chowns its files to the dir owner).
 install -d -m 0750 -o ozolith -g ozolith /var/lib/theozolith
 
+# The node-shared scratch root (job dirs live under it) and the repo mirror
+# cache (#51): provisioned before the service ever starts, service-user
+# owned, no group/world write. The drivers ALSO validate this at runtime
+# and fail closed on a root they do not own — this install line is what
+# makes the happy path pass that check. /var/tmp aging may remove the cache
+# later; the drivers lazily recreate it with the same ownership rules.
+install -d -m 0750 -o ozolith -g ozolith /var/tmp/theozolith /var/tmp/theozolith/mirrors
+
 # The unit, embedded so `curl | bash` needs no sidecar files. Every
 # TheOzolith process on this node (the daemon, the driver processes it
 # supervises) lives in this unit's cgroup: KillMode=control-group means

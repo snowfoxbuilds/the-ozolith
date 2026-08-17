@@ -33,7 +33,7 @@ from theozolith_worker.events import EventSink, emit_error, error_event, make_si
 from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory, container_session_factory
-from theozolith_worker.sweep import sweep_orphans
+from theozolith_worker.sweep import sweep_mirrors, sweep_orphans
 
 # The setup dry-run's own session budget: identity checks plus one probe
 # turn — minutes at most, never an agent-length wait.
@@ -308,8 +308,10 @@ class Worker:
     # -- lifecycle hooks --------------------------------------------------------
 
     def on_boot(self) -> None:
-        """Boot-time evidence sweep (ADR-0016): recover orphaned job dirs.
-        Overridden by types that need the swept-and-kept result."""
+        """Boot-time sweeps: recover orphaned job dirs (ADR-0016) and
+        crash-clean partial mirrors / stale mirror locks (#51). Overridden
+        by types that need the swept-and-kept result."""
+        sweep_mirrors(self.config, log=self.log)
         sweep_orphans(self.config, log=self.log)
 
     def _startup_log(self) -> None:
