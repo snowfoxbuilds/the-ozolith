@@ -23,12 +23,33 @@ Mirrors (#51): each Run checkout is a ``git clone --reference <mirror>
 --dissociate`` off a driver-owned bare mirror per repo, so the per-Run
 download is a ref advertisement, not the whole history. The mirror lives on
 the node, outside every container mount, and is lazily created on the first
-claim per repo then refreshed (``git remote update --prune``) under a
-per-repo file lock before each checkout. ``--dissociate`` keeps every
-ADR-0013 invariant byte-identical: object transfer is local-disk at clone
-time and the resulting worktree has no dependency on the mirror afterwards
-— disposable, distrusted, sanitized exactly like the full clone it
-replaces.
+claim per repo then refreshed under a per-repo file lock before each
+checkout. ``--dissociate`` keeps every ADR-0013 invariant byte-identical:
+object transfer is local-disk at clone time and the resulting worktree has
+no dependency on the mirror afterwards — disposable, distrusted, sanitized
+exactly like the full clone it replaces.
+
+Mirror trust boundary (#51 amendment): the mirror cache is persistent state
+on a multi-user node, so nothing about it is taken on faith. The cache root
+must be a real directory (``lstat``, never a symlink), owned by the
+effective driver UID, with no group/world write access — validated before
+every use and fail-closed otherwise. Mirror, staging, and lock entries must
+be real driver-owned files/directories; symlinked entries are rejected, and
+nothing is recursively deleted (or handed to git) until its parent root has
+proven trusted. Persistent git config is never provenance either:
+``sanitize_mirror`` rewrites the mirror's config to a known-minimal form
+(exact caller-supplied URL, mirror refspec, hooks disarmed, alternates
+dropped) before any authenticated operation, and the update fetches the
+caller-supplied URL/refspec directly rather than trusting a stored
+``remote.origin``.
+
+Timeouts (#51 amendment): every mirror operation — the flock wait, mirror
+creation, the update fetch, and the reference clone — runs under an
+operator-configurable budget (``THEOZOLITH_GIT_TIMEOUT_SECONDS``). Expiry
+kills the subprocess, cleans partial state, releases the lock, and raises a
+self-describing :class:`GitTimeout` (a :class:`GitError`), so a stuck
+holder or waiter lands in the ordinary pre-session infra lane (ADR-0016)
+instead of wedging the driver.
 """
 
 from __future__ import annotations
@@ -39,7 +60,9 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
+import time
 from pathlib import Path
 
 TOKEN_ENV = "THEOZOLITH_GIT_TOKEN"
@@ -51,6 +74,12 @@ _HELPER = f'!f() {{ echo username=x-access-token; echo password="${TOKEN_ENV}"; 
 
 class GitError(RuntimeError):
     """A git command failed."""
+
+
+class GitTimeout(GitError):
+    """A git operation (or the mirror lock wait) exceeded its budget. The
+    subprocess, if any, was already killed; partial on-disk state is the
+    raiser's cleanup responsibility."""
 
 
 def auth_env(token: str) -> dict[str, str]:
@@ -65,21 +94,42 @@ def auth_env(token: str) -> dict[str, str]:
     }
 
 
+def _run_git(
+    args: list[str],
+    cwd: Path | str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """The one subprocess seam every git invocation goes through.
+
+    ``subprocess.run`` kills the child before raising ``TimeoutExpired``, so
+    no git process outlives its budget still holding the mirror lock; the
+    kill is converted into a self-describing :class:`GitTimeout` here and
+    partial-state cleanup stays with the caller."""
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=None if cwd is None else str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **env} if env else None,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(f"git {' '.join(args)} timed out after {timeout:.0f}s") from exc
+
+
 def git(
     args: list[str],
     cwd: Path | str,
     *,
     check: bool = True,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, **env} if env else None,
-    )
+    proc = _run_git(args, cwd=cwd, env=env, timeout=timeout)
     if check and proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
@@ -92,6 +142,7 @@ def clone(
     branch: str | None = None,
     reference: Path | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ):
     args = ["clone", "--quiet", url, str(dest)]
     if branch:
@@ -100,13 +151,13 @@ def clone(
         # Objects come from the local reference repo; --dissociate copies
         # them out so the checkout never depends on the mirror again (#51).
         args[2:2] = ["--reference", str(reference), "--dissociate"]
-    proc = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, **env} if env else None,
-    )
+    try:
+        proc = _run_git(args, env=env, timeout=timeout)
+    except GitTimeout:
+        # git cleans its own destination on failure, but a killed clone
+        # cannot — never leave a partial checkout for a later step to trust.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     if proc.returncode != 0:
         raise GitError(f"git clone failed: {proc.stderr.strip()}")
 
@@ -115,6 +166,120 @@ def clone(
 
 MIRROR_TMP_SUFFIX = ".tmp"  # staging dir during creation; atomic-renamed away
 MIRROR_LOCK_SUFFIX = ".lock"  # per-repo advisory lock beside the mirror
+
+_LOCK_RETRY_SECONDS = 0.05  # poll cadence of the deadline-bounded flock loop
+
+
+# -- the mirror trust boundary (#51 amendment) ----------------------------------
+
+
+def _require_trusted_dir(path: Path, what: str) -> None:
+    """Fail closed unless ``path`` is a real directory (``lstat`` — symlinks
+    are rejected, never followed), owned by the effective driver UID, with
+    no group/world write access."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise GitError(f"{what} {path} is unusable: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise GitError(f"{what} {path} is a symlink — refusing to use it")
+    if not stat.S_ISDIR(st.st_mode):
+        raise GitError(f"{what} {path} is not a directory — refusing to use it")
+    if st.st_uid != os.geteuid():
+        raise GitError(
+            f"{what} {path} is owned by uid {st.st_uid}, not the driver"
+            f" (uid {os.geteuid()}) — refusing to use it"
+        )
+    if st.st_mode & 0o022:
+        raise GitError(
+            f"{what} {path} is group/world writable"
+            f" (mode {stat.S_IMODE(st.st_mode):04o}) — refusing to use it"
+        )
+
+
+def _require_trusted_ancestor(path: Path, what: str) -> None:
+    """The containing directory's bar: nobody but root or the driver may be
+    able to swap our entry out from under a passed validation. Root- or
+    driver-owned with no group/world write is safe; a world-writable sticky
+    directory (``/var/tmp``) is safe too — the sticky bit blocks non-owners
+    from renaming or unlinking our entries."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise GitError(f"{what} {path} is unusable: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise GitError(f"{what} {path} is not a real directory — refusing to use it")
+    if st.st_uid not in (0, os.geteuid()):
+        raise GitError(
+            f"{what} {path} is owned by uid {st.st_uid}, neither root nor the"
+            f" driver (uid {os.geteuid()}) — refusing to use it"
+        )
+    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+        raise GitError(
+            f"{what} {path} is writable by others without the sticky bit"
+            f" (mode {stat.S_IMODE(st.st_mode):04o}) — refusing to use it"
+        )
+
+
+def validate_mirrors_root(mirrors_dir: Path) -> Path:
+    """Validate (never create) the cache root and its containing directory."""
+    root = Path(mirrors_dir)
+    if root.parent != root:
+        _require_trusted_ancestor(root.parent, "mirror root parent")
+    _require_trusted_dir(root, "mirror root")
+    return root
+
+
+def ensure_mirrors_root(mirrors_dir: Path) -> Path:
+    """Create-if-missing, then validate, the cache root.
+
+    Production provisions ``/var/tmp/theozolith/mirrors`` at install time
+    (driver-owned, no group/world write); this lazy path exists for dev
+    shapes and for ``/var/tmp`` aging having removed the cache. Missing
+    components are created 0700; creation then re-validates, so a symlink
+    planted before our ``mkdir`` (EEXIST) is caught by the ``lstat`` checks
+    and fails closed. The cache is non-authoritative — when validation
+    fails, the remedy is always: delete the root, let it recreate."""
+    root = Path(mirrors_dir)
+    missing: list[Path] = []
+    probe = root
+    while probe.parent != probe:
+        try:
+            os.lstat(probe)
+            break
+        except FileNotFoundError:
+            missing.append(probe)
+            probe = probe.parent
+    for path in reversed(missing):
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass  # raced a sibling driver on this node — validated below
+        except OSError as exc:
+            raise GitError(f"cannot create mirror root {path}: {exc}") from exc
+    return validate_mirrors_root(root)
+
+
+def _entry_state(path: Path, what: str) -> str:
+    """``"missing"`` or ``"dir"``; anything else under the (validated) root
+    fails closed — a symlinked or foreign-owned entry is never followed,
+    deleted, or handed to git."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as exc:
+        raise GitError(f"cannot stat {what} {path}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise GitError(f"{what} {path} is a symlink — refusing to touch it")
+    if not stat.S_ISDIR(st.st_mode):
+        raise GitError(f"{what} {path} is not a directory — refusing to touch it")
+    if st.st_uid != os.geteuid():
+        raise GitError(
+            f"{what} {path} is owned by uid {st.st_uid}, not the driver"
+            f" (uid {os.geteuid()}) — refusing to touch it"
+        )
+    return "dir"
 
 
 def mirror_name(url: str) -> str:
@@ -137,10 +302,20 @@ def _lock_path(mirrors_dir: Path, url: str) -> Path:
 
 
 def _open_lock(lock_path: Path) -> int:
+    """Open (creating if needed) the lock file, refusing anything that is
+    not a driver-owned regular file: ``O_NOFOLLOW`` rejects a symlinked lock
+    entry outright, and the post-open ``fstat`` rejects a squatted one."""
     try:
-        return os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
         raise GitError(f"cannot open mirror lock {lock_path}: {exc}") from exc
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        raise GitError(
+            f"mirror lock {lock_path} is not a driver-owned regular file — refusing to lock it"
+        )
+    return fd
 
 
 def _lock_still_named(fd: int, lock_path: Path) -> bool:
@@ -156,17 +331,34 @@ def _lock_still_named(fd: int, lock_path: Path) -> bool:
     return (st_fd.st_dev, st_fd.st_ino) == (st_path.st_dev, st_path.st_ino)
 
 
-def _acquire_lock(lock_path: Path) -> int:
+def _acquire_lock(lock_path: Path, timeout: float | None = None) -> int:
+    """Acquire the per-repo flock; with a ``timeout``, poll non-blocking
+    against a monotonic deadline and raise :class:`GitTimeout` (descriptor
+    closed) on expiry — a stuck holder becomes a normal pre-session infra
+    failure, never a wedged driver."""
+    deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         fd = _open_lock(lock_path)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if _lock_still_named(fd, lock_path):
                 return fd
+        except BlockingIOError:
+            os.close(fd)
+            if time.monotonic() >= deadline:
+                raise GitTimeout(
+                    f"timed out after {timeout:.0f}s waiting for mirror lock"
+                    f" {lock_path} — a concurrent mirror operation is stuck or slow"
+                ) from None
+            time.sleep(_LOCK_RETRY_SECONDS)
+            continue
         except BaseException:
             os.close(fd)
             raise
-        os.close(fd)
+        os.close(fd)  # the sweep unlinked this inode under us — retry on the fresh file
 
 
 def try_mirror_lock(lock_path: Path) -> int | None:
@@ -187,95 +379,176 @@ def try_mirror_lock(lock_path: Path) -> int | None:
 
 
 @contextlib.contextmanager
-def mirror_lock(mirrors_dir: Path, url: str):
-    """The per-repo mirror lock (#51): every mirror access — creation,
-    ``remote update``, and the reference clone reading objects — happens
-    under it, so concurrent Runs on one node can neither race the update nor
-    watch a repack delete a pack file mid-copy."""
-    Path(mirrors_dir).mkdir(parents=True, exist_ok=True)
-    fd = _acquire_lock(_lock_path(mirrors_dir, url))
+def mirror_lock(mirrors_dir: Path, url: str, *, timeout: float | None = None):
+    """The per-repo mirror lock (#51): every mirror access — creation, the
+    update fetch, and the reference clone reading objects — happens under
+    it, so concurrent Runs on one node can neither race the update nor
+    watch a repack delete a pack file mid-copy. The cache root is validated
+    fail-closed (created 0700 first if missing) before any lock file is
+    opened, so nothing below ever touches an untrusted tree."""
+    root = ensure_mirrors_root(mirrors_dir)
+    fd = _acquire_lock(_lock_path(root, url), timeout)
     try:
         yield
     finally:
         os.close(fd)  # closing the last descriptor releases the flock
 
 
-def _mirror_valid(mirror: Path) -> bool:
-    if not mirror.is_dir():
-        return False
-    probe = subprocess.run(
-        ["git", "--git-dir", str(mirror), "rev-parse", "--is-bare-repository"],
-        capture_output=True,
-        text=True,
-        check=False,
+def sanitize_mirror(mirror: Path, url: str) -> None:
+    """Rewrite the mirror's git metadata to a known-good minimum.
+
+    The mirror is persistent cache state, so its on-disk configuration is
+    never provenance: before any authenticated operation the config is
+    replaced wholesale — exact caller-supplied remote URL and mirror
+    refspec, hooks pointed at an empty directory, detached auto-gc off (a
+    repack must finish inside the lock window, not outside it) — and a
+    foreign ``objects/info/alternates`` is dropped. A pre-created or
+    tampered repo therefore cannot redirect the authenticated fetch, run
+    hook code in the driver, or splice a foreign object store into
+    checkouts. ``sanitize_checkout`` is this function's worktree sibling."""
+    no_hooks = mirror / "theozolith-no-hooks"
+    no_hooks.mkdir(exist_ok=True)
+    alternates = mirror / "objects" / "info" / "alternates"
+    alternates.unlink(missing_ok=True)
+    config = "\n".join(
+        [
+            "[core]",
+            "\trepositoryformatversion = 0",
+            "\tfilemode = true",
+            "\tbare = true",
+            f"\thooksPath = {no_hooks}",
+            "[gc]",
+            "\tautoDetach = false",
+            '[remote "origin"]',
+            f"\turl = {url}",
+            "\tfetch = +refs/*:refs/*",
+            "\tmirror = true",
+            "",
+        ]
     )
-    return probe.returncode == 0 and probe.stdout.strip() == "true"
+    config_path = mirror / "config"
+    config_path.unlink(missing_ok=True)  # never write through a pre-existing symlink
+    config_path.write_text(config, encoding="utf-8")
 
 
-def _ensure_mirror_locked(mirrors_dir: Path, url: str, env: dict[str, str] | None) -> Path:
-    """Create-or-heal the bare mirror; caller holds the per-repo lock.
+def _bare_repo_shape(mirror: Path) -> bool:
+    """Cheap structural probe run BEFORE any git subprocess touches the
+    entry (git never runs inside a path that has not been validated): does
+    this look like the skeleton of a bare repo? Corruption below this level
+    surfaces as a GitError from the update or reference clone."""
+    return (
+        (mirror / "HEAD").is_file() and (mirror / "objects").is_dir() and (mirror / "refs").is_dir()
+    )
+
+
+def _mirror_parses(mirror: Path, timeout: float | None) -> bool:
+    """Post-sanitize repo check — by this point the entry is a validated,
+    driver-owned directory whose config we just wrote ourselves."""
+    proc = _run_git(
+        ["--git-dir", str(mirror), "rev-parse", "--is-bare-repository"], timeout=timeout
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _ensure_mirror_locked(
+    mirrors_dir: Path, url: str, env: dict[str, str] | None, timeout: float | None = None
+) -> Path:
+    """Create-or-heal the bare mirror; caller holds the per-repo lock and
+    has validated the cache root.
 
     Creation stages into a ``.tmp`` sibling and atomically renames into
     place, so a final-named mirror is never partial; a mirror that no longer
-    parses as a bare repo is deleted and lazily re-created (corruption
-    recovery is delete + re-clone, never repair-in-place)."""
+    looks like a bare repo is deleted and lazily re-created (corruption
+    recovery is delete + re-clone, never repair-in-place). An existing
+    mirror is adopted only after ``_entry_state`` proves it a real,
+    driver-owned directory and ``sanitize_mirror`` has replaced its config —
+    ``rev-parse`` alone is never treated as provenance. A timed-out creation
+    clone removes its partial stage before re-raising."""
     mirror = mirror_path(mirrors_dir, url)
-    if _mirror_valid(mirror):
-        return mirror
-    if mirror.exists():
-        shutil.rmtree(mirror)
     staging = mirror.with_name(mirror.name + MIRROR_TMP_SUFFIX)
-    if staging.exists():
+    if _entry_state(mirror, "mirror") == "dir":
+        if _bare_repo_shape(mirror):
+            sanitize_mirror(mirror, url)
+            if _mirror_parses(mirror, timeout):
+                return mirror
+        shutil.rmtree(mirror)  # driver-owned, inside the validated root — safe to discard
+    if _entry_state(staging, "mirror staging") == "dir":
         shutil.rmtree(staging)  # a dead predecessor's partial stage (we hold the lock)
-    clone_args = ["clone", "--quiet", "--mirror", url, str(staging)]
-    proc = subprocess.run(
-        ["git", *clone_args],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, **env} if env else None,
-    )
+    try:
+        proc = _run_git(
+            ["clone", "--quiet", "--mirror", url, str(staging)], env=env, timeout=timeout
+        )
+    except GitTimeout:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     if proc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise GitError(f"git clone --mirror failed: {proc.stderr.strip()}")
-    # Auto-gc kicked off by a later `remote update` must finish under the
-    # lock, not detach into the window where a reference clone reads packs.
-    git(["config", "gc.autoDetach", "false"], staging)
+    sanitize_mirror(staging, url)
     staging.rename(mirror)
     return mirror
 
 
-def _update_mirror_locked(mirror: Path, env: dict[str, str] | None) -> None:
-    git(["remote", "update", "--prune"], mirror, env=env)
+def _update_mirror_locked(
+    mirror: Path, url: str, env: dict[str, str] | None, timeout: float | None = None
+) -> None:
+    """Refresh the mirror by fetching the CALLER-supplied URL and mirror
+    refspec directly on argv — the authenticated operation never consults
+    stored remote configuration (which ``sanitize_mirror`` just rewrote
+    anyway; this is the second belt on the same trust boundary)."""
+    try:
+        git(
+            ["fetch", "--quiet", "--prune", url, "+refs/*:refs/*"],
+            mirror,
+            env=env,
+            timeout=timeout,
+        )
+    except GitTimeout:
+        # A killed fetch can leave repo-internal lock/tmp debris that would
+        # poison later fetches. The cache is non-authoritative: delete the
+        # mirror so the next attempt re-clones clean.
+        shutil.rmtree(mirror, ignore_errors=True)
+        raise
 
 
-def ensure_mirror(mirrors_dir: Path, url: str, *, env: dict[str, str] | None = None) -> Path:
+def ensure_mirror(
+    mirrors_dir: Path, url: str, *, env: dict[str, str] | None = None, timeout: float | None = None
+) -> Path:
     """Lazily create (or heal) the repo's driver-owned bare mirror."""
-    with mirror_lock(mirrors_dir, url):
-        return _ensure_mirror_locked(mirrors_dir, url, env)
+    with mirror_lock(mirrors_dir, url, timeout=timeout):
+        return _ensure_mirror_locked(mirrors_dir, url, env, timeout)
 
 
-def update_mirror(mirrors_dir: Path, url: str, *, env: dict[str, str] | None = None) -> Path:
-    """Refresh the mirror (``git remote update --prune``) under the lock."""
-    with mirror_lock(mirrors_dir, url):
-        mirror = _ensure_mirror_locked(mirrors_dir, url, env)
-        _update_mirror_locked(mirror, env)
+def update_mirror(
+    mirrors_dir: Path, url: str, *, env: dict[str, str] | None = None, timeout: float | None = None
+) -> Path:
+    """Refresh the mirror (direct-URL fetch, mirror refspec) under the lock."""
+    with mirror_lock(mirrors_dir, url, timeout=timeout):
+        mirror = _ensure_mirror_locked(mirrors_dir, url, env, timeout)
+        _update_mirror_locked(mirror, url, env, timeout)
         return mirror
 
 
 def clone_with_mirror(
-    url: str, mirrors_dir: Path, dest: Path, *, env: dict[str, str] | None = None
+    url: str,
+    mirrors_dir: Path,
+    dest: Path,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> None:
     """The Run checkout (#51): ensure + update the mirror, then reference-
     clone off it with ``--dissociate``, all under the per-repo lock. The
     result is byte-for-byte the disposable, self-contained checkout a full
-    clone produced — only the download shrinks. Any failure here is a
-    pre-session infra failure (ADR-0016): the caller's Run fails and burns
-    the normal retry; a half-context checkout is never handed to an agent."""
-    with mirror_lock(mirrors_dir, url):
-        mirror = _ensure_mirror_locked(mirrors_dir, url, env)
-        _update_mirror_locked(mirror, env)
-        clone(url, dest, reference=mirror, env=env)
+    clone produced — only the download shrinks. Any failure here — a trust
+    validation refusal, a git failure, or a ``timeout`` expiry on the lock
+    wait or any single git operation — is a pre-session infra failure
+    (ADR-0016): the caller's Run fails and burns the normal retry; a
+    half-context checkout is never handed to an agent."""
+    with mirror_lock(mirrors_dir, url, timeout=timeout):
+        mirror = _ensure_mirror_locked(mirrors_dir, url, env, timeout)
+        _update_mirror_locked(mirror, url, env, timeout)
+        clone(url, dest, reference=mirror, env=env, timeout=timeout)
 
 
 def sanitize_checkout(workdir: Path, remote_url: str) -> None:

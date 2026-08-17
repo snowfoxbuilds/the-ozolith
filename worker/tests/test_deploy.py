@@ -1043,3 +1043,44 @@ def test_flightdeck_start_daemon_death_after_start_fails_the_container(tmp_path)
     )
     assert proc.returncode == 1
     assert "tailscaled exited" in proc.stderr
+
+
+# -- repo mirror cache provisioning + retention (#51 amendment) ---------------------
+
+
+def test_installer_provisions_the_mirror_cache_root():
+    """The trusted cache root exists before the service ever starts —
+    service-user owned, no group/world write — so the drivers' fail-closed
+    runtime validation passes on the happy path."""
+    installer = (DEPLOY / "install-nodedaemon.sh").read_text()
+    line = (
+        "install -d -m 0750 -o ozolith -g ozolith /var/tmp/theozolith /var/tmp/theozolith/mirrors"
+    )
+    assert line in installer
+    # Provisioned before the unit is registered or provision could start it.
+    assert installer.index(line) < installer.index("systemctl daemon-reload")
+
+
+def test_cleanup_removes_the_default_mirror_cache_root():
+    """Uninstall removes the node-shared scratch root (job dirs + mirror
+    cache — full repo history, possibly private refs) only after the daemon
+    and its drivers are down, and tells the operator that a custom
+    THEOZOLITH_MIRRORS_DIR is theirs to remove separately."""
+    readme = (DEPLOY / "README.md").read_text()
+    cleanup = readme[readme.index("## Cleanup / deletion test") :]
+    assert "sudo rm -rf /var/tmp/theozolith" in cleanup
+    assert cleanup.index("systemctl disable --now theozolith-nodedaemon") < cleanup.index(
+        "sudo rm -rf /var/tmp/theozolith"
+    )
+    assert "THEOZOLITH_MIRRORS_DIR" in cleanup
+
+
+def test_mirror_cache_docs_state_the_retention_and_trust_facts():
+    """Operator docs carry the #51 amendment doctrine: caches are never
+    backup/restore inputs, they hold repo history (possibly private refs),
+    ownership/mode rules are stated, and the timeout knob is documented."""
+    readme = (DEPLOY / "README.md").read_text()
+    assert "never backed up and never restored" in readme
+    assert "may include private refs" in readme
+    assert "THEOZOLITH_GIT_TIMEOUT_SECONDS" in readme
+    assert "no group/world write" in readme

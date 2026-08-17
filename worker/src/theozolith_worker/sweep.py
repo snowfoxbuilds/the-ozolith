@@ -159,9 +159,22 @@ def sweep_mirrors(config: DriverConfig, *, log=_log) -> tuple[int, int]:
     a live driver somewhere on the node, which is skipped, never awaited.
     The mirrors themselves are never swept: a final-named mirror is never
     partial (creation is staged + atomic rename), and corruption heals
-    lazily at the next claim (delete + re-clone in ``ensure_mirror``)."""
+    lazily at the next claim (delete + re-clone in ``ensure_mirror``).
+
+    Trust boundary (#51 amendment): the sweep never walks — let alone
+    deletes inside — an untrusted root. A root that fails validation is
+    logged and left alone (boot must not crash; the Run path re-validates
+    and fails the Run loudly into the infra lane), and a symlinked or
+    foreign-owned entry is skipped, never followed or removed."""
     root = Path(config.mirrors_dir)
-    if not root.is_dir():
+    try:
+        os.lstat(root)
+    except OSError:
+        return 0, 0  # no cache yet — nothing to sweep, nothing to create at boot
+    try:
+        gitops.validate_mirrors_root(root)
+    except gitops.GitError as exc:
+        log(f"mirror sweep: skipping untrusted mirror root: {exc}")
         return 0, 0
     removed = skipped = 0
     for staging in sorted(root.glob(f"*{gitops.MIRROR_TMP_SUFFIX}")):
@@ -171,6 +184,14 @@ def sweep_mirrors(config: DriverConfig, *, log=_log) -> tuple[int, int]:
             skipped += 1
             continue
         try:
+            try:
+                state = gitops._entry_state(staging, "mirror staging")
+            except gitops.GitError as exc:
+                skipped += 1
+                log(f"mirror sweep: left in place: {exc}")
+                continue
+            if state != "dir":
+                continue  # vanished between glob and lock — nothing to do
             shutil.rmtree(staging, ignore_errors=True)
             removed += 1
             log(f"mirror sweep: removed partial mirror {staging.name}")

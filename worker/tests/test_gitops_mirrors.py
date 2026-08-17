@@ -7,10 +7,18 @@ rulings from the issue (lock contention, corruption recovery, checkout
 self-containedness), the boot sweep of partial mirrors and stale locks, and
 the two integration facts: the mirror appears in no container mount spec,
 and mirror failure is a pre-session infra failure burning the normal retry.
+
+The PR #54 amendment adds two pinned surfaces: the trust boundary (an
+untrusted or symlinked cache root/entry fails closed before any
+authenticated git subprocess; persistent mirror config is rewritten, never
+believed) and the operation budget (flock waits and every mirror git op are
+deadline-bounded; expiry cleans partial state, releases the lock, and rides
+the same pre-session infra lane).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -114,7 +122,7 @@ def test_concurrent_updates_on_one_repo_serialize_on_the_lock(
     tmp_path: Path, remote: Path, monkeypatch
 ):
     """Two claims, one repo (the issue's contention test): the per-repo file
-    lock admits one `remote update` at a time across concurrent claimants."""
+    lock admits one update fetch at a time across concurrent claimants."""
     mirrors = tmp_path / "mirrors"
     url = url_of(remote)
     gitops.ensure_mirror(mirrors, url)
@@ -126,7 +134,7 @@ def test_concurrent_updates_on_one_repo_serialize_on_the_lock(
 
     def slow_git(args, cwd, **kwargs):
         nonlocal active, peak
-        if args[:2] == ["remote", "update"]:
+        if args[:3] == ["fetch", "--quiet", "--prune"]:
             with gauge:
                 active += 1
                 peak = max(peak, active)
@@ -179,12 +187,303 @@ def test_partial_staging_left_by_a_dead_creator_is_replaced(tmp_path: Path, remo
     assert _git(["--git-dir", str(mirror), "rev-parse", "refs/heads/main"], tmp_path)
 
 
+# -- the trust boundary (PR #54 amendment) ------------------------------------------
+
+
+def _trusted_root(tmp_path: Path, name: str = "mirrors") -> Path:
+    root = tmp_path / name
+    root.mkdir(mode=0o700)
+    return root
+
+
+def _forbid_subprocess(monkeypatch):
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("a git subprocess ran despite an untrusted mirror root")
+
+    monkeypatch.setattr(gitops, "_run_git", no_subprocess)
+
+
+def test_world_writable_root_fails_before_any_git_subprocess(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    mirrors = _trusted_root(tmp_path)
+    mirrors.chmod(0o777)
+    _forbid_subprocess(monkeypatch)
+
+    with pytest.raises(GitError, match="group/world writable"):
+        gitops.clone_with_mirror(
+            url_of(remote), mirrors, tmp_path / "checkout", env=gitops.auth_env("sekrit")
+        )
+
+
+def test_wrong_owner_root_fails_before_any_git_subprocess(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    """Simulated by shifting the driver's effective UID: every real directory
+    in the fixture now has the 'wrong' owner, and validation must refuse it
+    before any subprocess — the check order (root before lock before git) is
+    the pinned behavior."""
+    mirrors = _trusted_root(tmp_path)
+    _forbid_subprocess(monkeypatch)
+    real_euid = os.geteuid()
+    monkeypatch.setattr(gitops.os, "geteuid", lambda: real_euid + 1)
+
+    with pytest.raises(GitError, match="owned by uid"):
+        gitops.clone_with_mirror(
+            url_of(remote), mirrors, tmp_path / "checkout", env=gitops.auth_env("sekrit")
+        )
+
+
+def test_symlinked_root_fails_closed(tmp_path: Path, remote: Path, monkeypatch):
+    real_root = tmp_path / "real-root"
+    real_root.mkdir(mode=0o700)
+    link_root = tmp_path / "link-root"
+    link_root.symlink_to(real_root)
+    _forbid_subprocess(monkeypatch)
+
+    with pytest.raises(GitError, match="symlink"):
+        gitops.ensure_mirror(link_root, url_of(remote))
+    assert real_root.is_dir()  # the target is never deleted
+
+
+def test_symlinked_lock_entry_fails_closed(tmp_path: Path, remote: Path):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    elsewhere = tmp_path / "elsewhere-lock"
+    elsewhere.write_text("not ours\n")
+    (root / (gitops.mirror_name(url) + gitops.MIRROR_LOCK_SUFFIX)).symlink_to(elsewhere)
+
+    with pytest.raises(GitError, match="mirror lock"):
+        gitops.ensure_mirror(root, url)
+    assert elsewhere.read_text() == "not ours\n"
+
+
+def test_symlinked_staging_entry_fails_closed(tmp_path: Path, remote: Path):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    elsewhere = tmp_path / "elsewhere-staging"
+    elsewhere.mkdir()
+    (elsewhere / "marker").write_text("keep\n")
+    (root / (gitops.mirror_name(url) + gitops.MIRROR_TMP_SUFFIX)).symlink_to(elsewhere)
+
+    with pytest.raises(GitError, match="symlink"):
+        gitops.ensure_mirror(root, url)
+    assert (elsewhere / "marker").read_text() == "keep\n"  # never followed, never deleted
+
+
+def test_symlinked_mirror_entry_fails_closed(tmp_path: Path, remote: Path):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    elsewhere = tmp_path / "elsewhere-mirror"
+    elsewhere.mkdir()
+    (elsewhere / "marker").write_text("keep\n")
+    gitops.mirror_path(root, url).symlink_to(elsewhere)
+
+    with pytest.raises(GitError, match="symlink"):
+        gitops.clone_with_mirror(url, root, tmp_path / "checkout")
+    assert (elsewhere / "marker").read_text() == "keep\n"
+
+
+def test_precreated_hostile_mirror_never_sees_credentials(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    """A bare repo squatting the mirror path with a redirected remote, a
+    credential helper, a live hook, and an alternates file: persistent config
+    is not provenance. The config is rewritten to the caller's URL (hooks
+    disarmed, alternates dropped) before any authenticated operation, and no
+    credentialed git invocation ever carries the hostile URL."""
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    hostile_url = "https://evil.invalid/exfil.git"
+    hook_canary = tmp_path / "hook-ran"
+    mirror = gitops.mirror_path(root, url)
+    _git(["init", "--bare", "--quiet", str(mirror)], tmp_path)
+    for key, value in (
+        ("remote.origin.url", hostile_url),
+        ("remote.origin.fetch", "+refs/*:refs/*"),
+        ("remote.origin.mirror", "true"),
+        ("credential.helper", f"!f() {{ touch {hook_canary}; }}; f"),
+    ):
+        _git(["--git-dir", str(mirror), "config", key, value], tmp_path)
+    hook = mirror / "hooks" / "reference-transaction"
+    hook.write_text(f"#!/bin/sh\ntouch {hook_canary}\n")
+    hook.chmod(0o755)
+    (mirror / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (mirror / "objects" / "info" / "alternates").write_text(str(tmp_path / "foreign") + "\n")
+
+    credentialed: list[list[str]] = []
+    real_run = gitops._run_git
+
+    def recording_run(args, cwd=None, *, env=None, timeout=None):
+        if env and gitops.TOKEN_ENV in env:
+            credentialed.append(list(args))
+            assert hostile_url not in " ".join(args)
+        return real_run(args, cwd=cwd, env=env, timeout=timeout)
+
+    monkeypatch.setattr(gitops, "_run_git", recording_run)
+
+    dest = tmp_path / "checkout"
+    gitops.clone_with_mirror(url, root, dest, env=gitops.auth_env("sekrit"))
+
+    assert credentialed  # the authenticated update fetch + reference clone did run
+    config_text = (mirror / "config").read_text()
+    assert hostile_url not in config_text
+    assert url in config_text
+    assert "theozolith-no-hooks" in config_text  # hooks disarmed
+    assert not (mirror / "objects" / "info" / "alternates").exists()
+    assert not hook_canary.exists()
+    assert (dest / "README.md").exists()  # and the checkout is the real repo
+
+
+# -- timeouts (PR #54 amendment) ----------------------------------------------------
+
+
+def _fds_open_on(path: Path) -> int:
+    count = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{fd}") == str(path):
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def test_lock_wait_timeout_raises_giterror_and_releases_descriptors(tmp_path: Path, remote: Path):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    lock_path = root / (gitops.mirror_name(url) + gitops.MIRROR_LOCK_SUFFIX)
+    holder = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        before = _fds_open_on(lock_path)
+        with pytest.raises(GitError, match=r"timed out.*mirror lock"):
+            gitops.ensure_mirror(root, url, timeout=0.3)
+        assert _fds_open_on(lock_path) == before  # every waiter descriptor closed
+    finally:
+        os.close(holder)
+    # Once the holder is gone the same call recovers.
+    assert gitops.ensure_mirror(root, url, timeout=30).is_dir()
+
+
+def test_timed_out_mirror_clone_cleans_staging_and_recovers(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    tripped: list[list[str]] = []
+    real_run = subprocess.run
+
+    def killing_run(argv, **kwargs):
+        if argv[:4] == ["git", "clone", "--quiet", "--mirror"] and not tripped:
+            tripped.append(argv)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", killing_run)
+    with pytest.raises(GitError, match="timed out"):
+        gitops.ensure_mirror(root, url, timeout=5)
+
+    assert list(root.glob(f"*{gitops.MIRROR_TMP_SUFFIX}")) == []  # partial stage cleaned
+    # The lock was released and a later attempt recovers in full.
+    assert gitops.ensure_mirror(root, url, timeout=30).is_dir()
+
+
+def test_timed_out_update_deletes_the_mirror_and_recovers(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    """A killed fetch can leave repo-internal debris that poisons later
+    fetches; the cache is non-authoritative, so the timed-out mirror is
+    deleted for a clean re-clone at the next attempt."""
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    gitops.ensure_mirror(root, url)
+    tripped: list[list[str]] = []
+    real_run = subprocess.run
+
+    def killing_run(argv, **kwargs):
+        if argv[:4] == ["git", "fetch", "--quiet", "--prune"] and not tripped:
+            tripped.append(argv)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", killing_run)
+    with pytest.raises(GitError, match="timed out"):
+        gitops.update_mirror(root, url, timeout=5)
+
+    assert not gitops.mirror_path(root, url).exists()
+    dest = tmp_path / "checkout"
+    gitops.clone_with_mirror(url, root, dest, timeout=30)  # lock free; full recovery
+    assert (dest / "README.md").exists()
+
+
+def test_timed_out_reference_clone_cleans_the_partial_checkout(
+    tmp_path: Path, remote: Path, monkeypatch
+):
+    root = _trusted_root(tmp_path)
+    url = url_of(remote)
+    dest = tmp_path / "checkout"
+    tripped: list[list[str]] = []
+    real_run = subprocess.run
+
+    def killing_run(argv, **kwargs):
+        if argv[:2] == ["git", "clone"] and "--reference" in argv and not tripped:
+            tripped.append(argv)
+            # What a kill leaves behind: git cannot clean its own destination.
+            (dest / ".git").mkdir(parents=True)
+            (dest / ".git" / "partial").write_text("x")
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", killing_run)
+    with pytest.raises(GitError, match="timed out"):
+        gitops.clone_with_mirror(url, root, dest, timeout=5)
+
+    assert not dest.exists()  # the partial checkout is cleaned
+    assert gitops.mirror_path(root, url).is_dir()  # the mirror only READ — kept
+    gitops.clone_with_mirror(url, root, dest, timeout=30)
+    assert (dest / "README.md").exists()
+
+
+def test_stuck_lock_holder_is_a_pre_session_infra_failure(harness: Harness):
+    """The end-to-end ruling: a stuck holder rides the existing ADR-0016
+    lane — both budgeted Runs fail `infra` before any Run container
+    launches, evidence names the timeout, and the claim escalates."""
+    number = harness.file_issue("Mirror stuck", CRITERIA_BODY)
+    harness.worker_config = dataclasses.replace(harness.worker_config, git_timeout_seconds=0.4)
+    root = Path(harness.worker_config.mirrors_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = root / (
+        gitops.mirror_name(harness.worker_config.clone_url) + gitops.MIRROR_LOCK_SUFFIX
+    )
+    holder = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        assert harness.worker_once() == 2  # the original Run and the one local retry
+    finally:
+        os.close(holder)
+
+    run_specs = [s for s in harness.record.specs if s.name.startswith("ozolith-run-")]
+    assert run_specs == []  # pre-session: no Run container ever launched
+    labels = harness.fake.labels_of(number)
+    assert FAILED in labels and NEEDS_HUMAN in labels
+    run_reports = [
+        json.loads(harness.evidence_file(path))
+        for path in harness.evidence_paths()
+        if path.endswith("/run.json")
+    ]
+    assert len(run_reports) == 2
+    assert {report["failure_class"] for report in run_reports} == {"infra"}
+    assert all("timed out" in report["reason"] for report in run_reports)
+
+
 # -- boot sweep -------------------------------------------------------------------
 
 
 def test_sweep_removes_partial_mirrors_and_stale_locks(harness: Harness, remote: Path):
     root = Path(harness.worker_config.mirrors_dir)
     root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o755)  # explicit: the sweep validates the root (umask-proof)
     # A live mirror keeps both its directory and its lock file.
     live = gitops.ensure_mirror(root, url_of(remote))
     live_lock = root / (live.name + gitops.MIRROR_LOCK_SUFFIX)
@@ -208,6 +507,7 @@ def test_sweep_skips_debris_whose_lock_is_held_by_a_live_process(harness: Harnes
     the sweep must skip, never wait, never delete under it."""
     root = Path(harness.worker_config.mirrors_dir)
     root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o755)  # explicit: the sweep validates the root (umask-proof)
     staging = root / f"busy-0f0f0f{gitops.MIRROR_TMP_SUFFIX}"
     staging.mkdir()
     lock = root / f"busy-0f0f0f{gitops.MIRROR_LOCK_SUFFIX}"
@@ -226,6 +526,38 @@ def test_sweep_skips_debris_whose_lock_is_held_by_a_live_process(harness: Harnes
 
 def test_sweep_of_missing_mirror_root_is_a_no_op(harness: Harness):
     assert sweep_mirrors(harness.worker_config, log=harness.logs.append) == (0, 0)
+
+
+def test_sweep_declines_an_untrusted_root_without_touching_it(harness: Harness):
+    """Fail-closed but boot-safe (#54 amendment): the sweep never walks an
+    untrusted root — it logs and leaves everything, including debris, alone;
+    the Run path is where the loud fail-closed refusal lives."""
+    root = Path(harness.worker_config.mirrors_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    debris = root / f"dead-abc123{gitops.MIRROR_TMP_SUFFIX}"
+    debris.mkdir()
+    root.chmod(0o777)
+    try:
+        assert sweep_mirrors(harness.worker_config, log=harness.logs.append) == (0, 0)
+    finally:
+        root.chmod(0o755)
+    assert debris.exists()
+    assert any("untrusted mirror root" in line for line in harness.logs)
+
+
+def test_sweep_leaves_symlinked_staging_debris_in_place(harness: Harness, tmp_path: Path):
+    root = Path(harness.worker_config.mirrors_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o755)
+    elsewhere = tmp_path / "sweep-elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "marker").write_text("keep\n")
+    (root / f"evil-abc123{gitops.MIRROR_TMP_SUFFIX}").symlink_to(elsewhere)
+
+    removed, skipped = sweep_mirrors(harness.worker_config, log=harness.logs.append)
+
+    assert (removed, skipped) == (0, 1)
+    assert (elsewhere / "marker").read_text() == "keep\n"  # never followed, never deleted
 
 
 # -- integration with the Run lane --------------------------------------------------
@@ -278,10 +610,10 @@ def test_second_run_reuses_the_mirror_without_a_second_full_download(harness: Ha
     creations = []
     real_ensure = gitops._ensure_mirror_locked
 
-    def counting_ensure(mirrors_dir, url, env):
+    def counting_ensure(mirrors_dir, url, env, timeout=None):
         mirror = gitops.mirror_path(mirrors_dir, url)
         creations.append(not mirror.is_dir())
-        return real_ensure(mirrors_dir, url, env)
+        return real_ensure(mirrors_dir, url, env, timeout)
 
     monkeypatch.setattr(gitops, "_ensure_mirror_locked", counting_ensure)
     assert harness.worker_once() == 1
@@ -294,8 +626,8 @@ def test_mirror_failure_is_a_pre_session_infra_failure(harness: Harness, monkeyp
     escalates to failed + needs_human."""
     number = harness.file_issue("Mirror down", CRITERIA_BODY)
 
-    def broken_update(mirror, env):
-        raise GitError("git remote update --prune failed: remote hung up")
+    def broken_update(mirror, url, env, timeout=None):
+        raise GitError("git fetch --quiet --prune failed: remote hung up")
 
     monkeypatch.setattr(gitops, "_update_mirror_locked", broken_update)
     assert harness.worker_once() == 2  # the original Run and the one local retry

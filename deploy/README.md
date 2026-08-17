@@ -683,10 +683,52 @@ container; it is created lazily on the first claim per repo, refreshed under a p
 file lock before each checkout, and crash-cleaned (partial mirrors, stale locks) by the
 boot sweep. Unlike jobs dirs the mirror root is deliberately node-shared across Stacks —
 the lock makes concurrent drivers safe, and every driver on the node reuses one download.
-Deleting the mirror root is always safe: checkouts are self-contained (`--dissociate`),
-and the next claim re-creates the mirror at the cost of one full download. Mirror
-creation or refresh failures fail the Run as a pre-session infra failure under the
+Mirror creation or refresh failures fail the Run as a pre-session infra failure under the
 normal retry budget (ADR-0016) — a stale mirror is never silently used.
+
+**Trust boundary.** The cache is a persistent, driver-owned resource on a multi-user
+box, so the drivers treat nothing about it as given. The installer provisions
+`/var/tmp/theozolith` and `/var/tmp/theozolith/mirrors` before the service starts,
+owned `ozolith:ozolith` with no group/world write (`0750`). At every use the driver
+re-validates fail-closed (with `lstat` — symlinks are rejected, never followed): the
+root and its containing directory must be real directories the driver (or, for the
+parent, root) owns, with no group/world write access — a world-writable sticky parent
+like `/var/tmp` itself is acceptable; a custom `THEOZOLITH_MIRRORS_DIR` is held to
+exactly the same rules, so put it somewhere whose parent only root or the service user
+can write. Mirror, staging, and lock entries must be real, driver-owned
+files/directories; anything else fails the Run closed (`infra` lane) without deleting
+or running git inside the suspect path. Persistent git config inside a mirror is never
+trusted either: before any authenticated operation the driver rewrites the mirror's
+config to a known-minimal form (exact configured clone URL, mirror refspec, hooks
+disarmed, alternates dropped) and the update fetch passes the URL and refspec on the
+command line — a pre-created or tampered repo cannot redirect credentials.
+
+**Timeouts.** `THEOZOLITH_GIT_TIMEOUT_SECONDS` (default `600`, must be positive)
+bounds each mirror operation separately: the per-repo lock wait, mirror creation, the
+update fetch, and the reference clone. On expiry the git subprocess is killed, partial
+state is cleaned (a timed-out update deletes the mirror — it re-clones on the next
+claim), the lock is released, and the Run fails pre-session into the normal `infra`
+retry/evidence lane — a stuck holder or waiter never wedges the driver and never
+launches a Run container. Size it to a cold full clone of your largest repo over your
+slowest link.
+
+**A cache, not a backup.** Mirrors are never backed up and never restored (ADR-0024's
+local-copy doctrine does not extend here); deleting the mirror root is always safe and
+is the standard remedy for any validation refusal. Checkouts are self-contained
+(`--dissociate`), and the next claim re-creates the mirror at the cost of one full
+download. `/var/tmp` aging (systemd-tmpfiles) may delete it on its own; the drivers
+lazily recreate it with the same ownership rules. Note the cache holds full repository
+history and may include private refs of the target repo — treat its confidentiality
+like the repo's, and remove it on uninstall (see the cleanup procedure below; a custom
+`THEOZOLITH_MIRRORS_DIR` location must be removed separately — the cleanup script only
+knows the default root).
+
+**Upgrading from the initial #51 revision.** Roots the earlier revision created
+(`0755`, service-user owned) already satisfy the ownership/mode rules and are kept;
+each existing mirror is adopted only after entry validation, gets its config rewritten
+to the known-minimal form before the next authenticated fetch, and anything failing
+validation must be removed by hand (`rm -rf` of the root is always valid) — the driver
+refuses to delete what it cannot prove is its own.
 
 ## Observing Runs, and the Flight Deck
 
@@ -875,6 +917,13 @@ for name in theozolith theozolith-control theozolith-nodedaemon; do  # incl. the
     && sudo rm -f "/usr/local/bin/$name"
 done
 sudo rm -rf /opt/theozolith /var/lib/theozolith /var/lib/theozolith-control ~/.theozolith
+# The node-shared scratch root: job dirs plus the repo mirror cache (#51).
+# Removed AFTER the daemon and drivers are down (the disable above killed the
+# whole cgroup). The mirror cache holds full repository history and may
+# include private refs — deleting it is part of data removal, not just tidy-up.
+# A custom THEOZOLITH_MIRRORS_DIR (or THEOZOLITH_JOBS_DIR) location is NOT
+# covered by this line — remove it separately.
+sudo rm -rf /var/tmp/theozolith
 ```
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node
