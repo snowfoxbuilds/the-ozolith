@@ -661,8 +661,10 @@ def test_local_retry_refetches_context(harness: Harness):
 
 
 def _bulk_commits(git_dir: Path, base: str, branch: str, count: int) -> None:
-    """Grow ``branch`` in a bare repo by ``count`` empty commits on top of
-    ``base``, built with commit-tree + update-ref (no clone, no transport)."""
+    """Grow ``branch`` in a bare repo by ``count`` commits on top of
+    ``base``, built with hash-object/mktree/commit-tree + update-ref (no
+    clone, no transport). Each commit carries a distinct one-file tree, the
+    shape of real PR history."""
     subprocess.run(
         [
             "bash",
@@ -670,8 +672,10 @@ def _bulk_commits(git_dir: Path, base: str, branch: str, count: int) -> None:
             f'set -e; export GIT_DIR="{git_dir}"'
             " GIT_AUTHOR_NAME=bulk GIT_AUTHOR_EMAIL=b@x"
             " GIT_COMMITTER_NAME=bulk GIT_COMMITTER_EMAIL=b@x;"
-            f' parent={base}; tree=$(git rev-parse "{base}^{{tree}}");'
+            f" parent={base};"
             f" for i in $(seq 1 {count}); do"
+            '   blob=$(printf "content %d\\n" "$i" | git hash-object -w --stdin);'
+            '   tree=$(printf "100644 blob %s\\tfile-%d\\n" "$blob" "$i" | git mktree);'
             '   parent=$(git commit-tree "$tree" -p "$parent"'
             '     -m "bulk commit $i" -m "second line $i");'
             " done;"
