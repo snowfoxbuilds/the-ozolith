@@ -21,6 +21,7 @@ from conftest import (
     WORKER_LOGIN,
     Harness,
     IdentityFailure,
+    SchemaSkew,
     behavior_write,
     format_output,
     make_harness,
@@ -397,6 +398,150 @@ def test_reviewer_non_identity_harness_failure_keeps_current_behavior(harness: H
     assert any("review pass failed" in line for line in harness.logs)
     labels = harness.fake.labels_of(pr_number)
     assert PR_READY in labels and BLOCKED not in labels  # unchanged behavior
+
+
+def test_reviewer_schema_skew_is_a_pre_session_infra_failure(harness: Harness):
+    """ADR-0046: a review session refused by the harness's pre-work schema
+    assert indicts the DEPLOYMENT, not the review — durable evidence with
+    failure_class infra survives the job cleanup, the failure surfaces
+    through the pass-level error lane, and NOT ONE GitHub write happens: no
+    verdict comment, no label, no identity or invalid-proposal
+    classification. The PR stays reviewable, so the first pass after
+    driver/image convergence reviews it normally."""
+    number = harness.file_issue("Feature", CRITERIA_BODY)
+    harness.worker_once()
+    (pr_number,) = harness.fake.open_pr_numbers()
+    labels_before = set(harness.fake.labels_of(pr_number))
+    comments_before = len(harness.fake.comments[pr_number])
+
+    harness.reviewer_replies.append(SchemaSkew())
+    assert harness.reviewer_once() == 0  # no verdict was applied
+
+    # Pre-session: the refusal fired before any agent/model launch — the
+    # scripted session consumed no prompt and produced no transcript.
+    assert harness.reviewer_prompts == []
+
+    # The pass-level lane carries the anchored marker: schema skew is never
+    # laundered into ordinary harness breakage, and never silently dropped.
+    (failure_line,) = [line for line in harness.logs if "review pass failed" in line]
+    assert "schema-version: " in failure_line
+    skew_errors = [
+        e
+        for e in harness.sink.events
+        if e["type"] == "theozolith.error" and "schema-version: " in e["message"]
+    ]
+    assert skew_errors  # surfaced on the control error feed too
+
+    # No GitHub state moved and no review event fired: the PR is exactly as
+    # reviewable as before the pass.
+    assert set(harness.fake.labels_of(pr_number)) == labels_before
+    assert PR_READY in labels_before
+    assert len(harness.fake.comments[pr_number]) == comments_before
+    assert [e for e in harness.sink.events if e["type"] == "theozolith.review"] == []
+
+    # Evidence survived the job cleanup, classified infra — not identity,
+    # not an invalid proposal.
+    paths = harness.evidence_paths()
+    (record_path,) = [p for p in paths if p.endswith("-infra.json")]
+    record = json.loads(harness.evidence_file(record_path))
+    assert record["failure_class"] == "infra"
+    assert record["verdict"] is None
+    assert record["error"].startswith("schema-version: ")
+    assert "out of step" in record["error"]
+    assert record["pr"] == pr_number and record["issue"] == number and record["round"] == 1
+    assert record["head"] and record["run_image"] and record["container"]
+    assert not any(p.endswith("-identity.json") for p in paths)
+    assert not any(p.endswith("-invalid.json") for p in paths)
+
+    # The bundle keeps the deployment forensics: the manifest the driver
+    # stamped, the harness's status refusal, and the pre-launch trusted
+    # input snapshot — but no transcript (the agent never ran).
+    prefix = record_path.removesuffix(".json")
+    manifest = json.loads(harness.evidence_file(f"{prefix}-manifest.json"))
+    assert manifest["schema_version"] == proposal.SCHEMA_VERSION
+    status = json.loads(harness.evidence_file(f"{prefix}-status.json"))
+    assert status["phase"] == "failed" and status["error"].startswith("schema-version: ")
+    assert f"{prefix}-input/prompt.md" in paths
+    assert not any(p.endswith("-infra-transcript.txt") for p in paths)
+
+    # Recovery: driver and image converge — the very next pass reviews
+    # normally, no operator intervention on the PR required.
+    harness.reviewer_replies.append(approve_reply())
+    assert harness.reviewer_once() == 1
+    assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
+
+
+def test_review_evidence_preserves_the_raw_proposal(harness: Harness):
+    """ADR-0046: every applied verdict's evidence keeps the round's Output
+    Proposal byte-for-byte — including fields the normalized review record
+    drops (revised-plan, cherry-pick, process-issues) — never regenerated
+    from the validated Verdict."""
+    raw_seen: dict[str, str] = {}
+
+    def scripted(label: str, fields: list[tuple[str, str]]):
+        def reply(prompt: str, cwd: Path) -> None:
+            job = cwd.parent
+            for name, value in fields:
+                format_output(job, name, value)
+            raw_seen[label] = (job / proposal.PROPOSAL_FILE).read_text()
+
+        return reply
+
+    # An approve proposal: the advisory process-issues field never reaches
+    # the normalized record, but the raw file in evidence keeps it.
+    approved = harness.file_issue("Approve case", CRITERIA_BODY)
+    harness.worker_once()
+    head = harness.remote_sha(branch_for(approved))
+    harness.reviewer_replies.append(
+        scripted(
+            "approve",
+            [
+                ("verdict", "approve"),
+                ("evidence", "Every criterion is met by the diff as shipped."),
+                ("deviation", "low"),
+                ("risk", "low"),
+                ("process-issues", json.dumps([{"friction": "diff was partial"}])),
+            ],
+        )
+    )
+    assert harness.reviewer_once() == 1
+    prefix = f"runs/issue-{approved}/reviews/round-1-{head[:12]}"
+    stored = harness.evidence_file(f"{prefix}-proposal.json")
+    assert stored == raw_seen["approve"]  # byte-for-byte, as the CLI wrote it
+    assert json.loads(stored)["fields"]["process-issues"] == [{"friction": "diff was partial"}]
+    record = harness.evidence_file(f"{prefix}.json")
+    assert json.loads(record)["verdict"] == "approve"
+    assert "process-issues" not in record
+
+    # A revise proposal: revised-plan, resume-commit, and cherry-pick all
+    # survive raw alongside the record (which keeps only resume_commit).
+    revised = harness.file_issue("Revise case", CRITERIA_BODY)
+    harness.worker_once()
+    head = harness.remote_sha(branch_for(revised))
+    harness.reviewer_replies.append(
+        scripted(
+            "revise",
+            [
+                ("verdict", "revise"),
+                ("evidence", "The change misses the second criterion."),
+                ("revised-plan", "1. cover the second criterion\n2. keep the rest"),
+                ("resume-commit", head),
+                ("cherry-pick", json.dumps([head])),
+                ("process-issues", json.dumps([{"friction": "signals were thin"}])),
+            ],
+        )
+    )
+    assert harness.reviewer_once() == 1
+    prefix = f"runs/issue-{revised}/reviews/round-1-{head[:12]}"
+    stored = harness.evidence_file(f"{prefix}-proposal.json")
+    assert stored == raw_seen["revise"]
+    fields = json.loads(stored)["fields"]
+    assert fields["revised-plan"] == "1. cover the second criterion\n2. keep the rest"
+    assert fields["cherry-pick"] == [head]
+    assert fields["process-issues"] == [{"friction": "signals were thin"}]
+    record = harness.evidence_file(f"{prefix}.json")
+    assert json.loads(record)["resume_commit"] == head
+    assert "revised-plan" not in record and "cherry-pick" not in record
 
 
 # -- 5. round budget and the final-round rule ---------------------------------

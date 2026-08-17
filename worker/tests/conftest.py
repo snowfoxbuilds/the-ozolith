@@ -106,6 +106,17 @@ class IdentityFailure:
     )
 
 
+@dataclass
+class SchemaSkew:
+    """A scripted reviewer reply that makes the session refuse the way a
+    real schema-version mismatch does (ADR-0046): the harness asserts the
+    manifest's stamp strictly BEFORE the agent launches — no prompt is
+    consumed, no transcript exists — records the anchored refusal in
+    status.json, and the driver sees a SessionError from wait_for_agent."""
+
+    stamped: int = 0  # the manifest stamp the refusal reports (0 = unstamped)
+
+
 class RecordingSink:
     """Collects driver events; the default 'Control Node is fine' sink."""
 
@@ -260,6 +271,18 @@ class FakeSession:
             # fake passes it the way a healthy image does.
             jobdir.write_identity(self.job, {"dry_run": "passed", "expected_model": ""})
             return AgentOutcome(completed=True)
+        if (
+            self.manifest.mode == jobdir.MODE_REVIEW
+            and self.harness.reviewer_replies
+            and isinstance(self.harness.reviewer_replies[0], SchemaSkew)
+        ):
+            # The pre-work schema assert (ADR-0046) refuses before the agent
+            # exists: no prompt consumed, no transcript, no model call. Like
+            # the real harness, the refusal lands in status.json first.
+            skew = self.harness.reviewer_replies.pop(0)
+            error = proposal.schema_mismatch(skew.stamped)
+            jobdir.write_status(self.job, jobdir.Status(phase=jobdir.PHASE_FAILED, error=error))
+            raise SessionError(f"harness failed: {error}")
         prompt = (self.job / jobdir.PROMPT_FILE).read_text()
         self._write_transcript(prompt)
         if self.manifest.mode == jobdir.MODE_RUN:

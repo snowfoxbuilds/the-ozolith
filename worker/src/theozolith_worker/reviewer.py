@@ -35,8 +35,19 @@ status carries the anchored ``identity:`` marker) takes the same one-strike
 lane: identity.json and the transcript are published as evidence with
 ``failure_class: identity``, then blocked + needs_human — the PR leaves the
 reviewable pool instead of relaunching an identical doomed review every
-poll. Other harness breakage keeps its existing behavior (the pass-level
-error summary).
+poll. A schema-version refusal (the anchored ``schema-version:`` marker)
+is different in kind: it fires strictly before the agent launches and
+indicts the deployment, not the review — driver and run image are out of
+step. It records a ``failure_class: infra`` evidence bundle and then takes
+the pass-level error lane with NO GitHub write at all: the PR stays
+reviewable and recovers by itself once driver and image converge. Other
+harness breakage keeps its existing behavior (the pass-level error
+summary).
+
+Evidence is the durable audit trail: every applied verdict's bundle keeps
+the round's Output Proposal byte-for-byte beside the normalized review
+record — the raw file preserves advisory and mode-specific fields
+(revised-plan, cherry-pick, process-issues) the record drops.
 """
 
 from __future__ import annotations
@@ -191,11 +202,15 @@ def _review_inputs(client: GitHubClient, pr: PullRequest, issue_number: int) -> 
     }
 
 
-def _read_transcript(job: Path) -> str:
+def _job_text(job: Path, relpath: str) -> str | None:
     try:
-        return (job / jobdir.TRANSCRIPT_FILE).read_text(encoding="utf-8")
+        return (job / relpath).read_text(encoding="utf-8")
     except OSError:
-        return ""
+        return None
+
+
+def _read_transcript(job: Path) -> str:
+    return _job_text(job, jobdir.TRANSCRIPT_FILE) or ""
 
 
 def _emit_review(
@@ -293,7 +308,7 @@ def review_pr(
         # from launch onward input/ is agent-writable via the /job bind
         # mount, and a crashed review workspace is swept — the sweep must
         # find a trusted pre-launch copy, never re-read the job dir.
-        evidence.capture_input_snapshot(Path(config.jobs_dir), job, review_id)
+        trusted_input = evidence.capture_input_snapshot(Path(config.jobs_dir), job, review_id)
         session = session_factory(spec, job, manifest)
         session.launch()
         try:
@@ -309,6 +324,27 @@ def review_pr(
                 # summary) unchanged.
                 detail = identity_error_detail(str(exc))
                 if detail is None:
+                    # ADR-0046: the harness's anchored schema-version refusal
+                    # fires strictly pre-work — driver and run image are out
+                    # of step, a pre-session infra failure (ADR-0016), never
+                    # an invalid verdict. Evidence goes durable before the
+                    # job dir dies, then the failure takes the pass-level
+                    # lane unchanged: no verdict, no comment, no label — the
+                    # PR stays reviewable so a later pass recovers it once
+                    # driver and image converge.
+                    if proposal.schema_error_detail(str(exc)) is not None:
+                        _record_schema_skew(
+                            config,
+                            pr,
+                            issue_number,
+                            round_number,
+                            str(exc),
+                            job,
+                            trusted_input,
+                            container,
+                            log,
+                            sink=sink,
+                        )
                     raise
                 escalated = _escalate_identity_failure(
                     config,
@@ -370,6 +406,10 @@ def review_pr(
             container=container,
             observed=adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE),
             identity=jobdir.read_identity(job),
+            # The proposal exactly as the session wrote it (ADR-0046): the
+            # normalized record drops advisory fields, so the audit trail
+            # keeps the raw file — read before the job dir is cleaned.
+            raw_proposal=proposal.raw_text(job),
             sink=sink,
         )
         _emit_review(sink, config, pr, issue_number, result)
@@ -519,6 +559,74 @@ def _escalate_identity_failure(
     return result
 
 
+def _record_schema_skew(
+    config: DriverConfig,
+    pr: PullRequest,
+    issue_number: int,
+    round_number: int,
+    error: str,
+    job: Path,
+    trusted_input: dict[str, bytes],
+    container: str,
+    log,
+    sink: EventSink | None = None,
+) -> None:
+    """Durable evidence for a pre-session schema-version refusal (ADR-0046):
+    the driver stamped one output-proposal schema, the run image speaks
+    another — an infra failure of the deployment, never of this review. The
+    bundle is recorded before the job dir dies; deliberately NO GitHub write
+    of any kind follows — no verdict, no comment, no label — so the PR stays
+    reviewable and the next pass after driver/image convergence reviews it
+    normally. The caller re-raises into the pass-level error summary."""
+    prefix = f"runs/issue-{issue_number}/reviews/round-{round_number}-{pr.head_sha[:12]}-infra"
+    stats = adapters.stream_stats(config.adapter, job / jobdir.TRANSCRIPT_FILE)
+    record = {
+        "pr": pr.number,
+        "issue": issue_number,
+        "round": round_number,
+        "verdict": None,
+        # The refusal as the harness wrote it to status.json, anchored
+        # marker included — the raw error, not a paraphrase.
+        "error": error.removeprefix("harness failed: "),
+        "failure_class": "infra",
+        "head": pr.head_sha,
+        # ADR-0045 vocabulary, kept for evidence queries even though the
+        # agent never launched: image identity plus whatever the (empty)
+        # stream reported, and the harness's identity record when one exists.
+        "run_image": config.run_image,
+        "model": stats.model,
+        "model_note": stats.model_note,
+        "identity": jobdir.read_identity(job),
+        "container": container,
+    }
+    files: dict[str, str | bytes] = {
+        f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"
+    }
+    for label, relpath in (("manifest", jobdir.MANIFEST_FILE), ("status", jobdir.STATUS_FILE)):
+        text = _job_text(job, relpath)
+        if text is not None:
+            files[f"{prefix}-{label}.json"] = text if text.endswith("\n") else text + "\n"
+    transcript = _read_transcript(job)
+    if transcript:
+        files[f"{prefix}-transcript.txt"] = transcript
+    # The pre-launch trusted snapshot (#52): its relpaths live under input/,
+    # so the keys read ...-infra-input/<file>.
+    files.update({f"{prefix}-{rel}": content for rel, content in trusted_input.items()})
+    _push_evidence_files(
+        config,
+        files,
+        message=f"Evidence: schema skew, review round {round_number} (issue #{issue_number})",
+        log=log,
+        context=f"PR #{pr.number}",
+        sink=sink,
+    )
+    log(
+        f"PR #{pr.number} review round {round_number}: output-proposal schema skew"
+        f" (pre-session infra failure, ADR-0016); evidence at {prefix};"
+        " no verdict applied — the PR stays reviewable"
+    )
+
+
 def _apply(
     config: DriverConfig,
     client: GitHubClient,
@@ -531,6 +639,7 @@ def _apply(
     container: str = "",
     observed: adapters.StreamStats | None = None,
     identity: dict | None = None,
+    raw_proposal: str | None = None,
     sink: EventSink | None = None,
 ) -> None:
     _publish(client, pr, issue_number, result, log)
@@ -544,6 +653,7 @@ def _apply(
         log,
         observed=observed,
         identity=identity,
+        raw_proposal=raw_proposal,
         sink=sink,
     )
 
@@ -615,6 +725,7 @@ def _push_review_evidence(
     log,
     observed: adapters.StreamStats | None = None,
     identity: dict | None = None,
+    raw_proposal: str | None = None,
     sink: EventSink | None = None,
 ) -> None:
     record = {
@@ -644,6 +755,13 @@ def _push_review_evidence(
     files = {f"{prefix}.json": json.dumps(record, indent=2, sort_keys=True) + "\n"}
     if transcript:
         files[f"{prefix}-transcript.txt"] = transcript
+    # The Output Proposal byte-for-byte as the session left it (ADR-0046),
+    # never regenerated from the normalized record above — it keeps the
+    # fields the record drops (revised-plan, cherry-pick, process-issues)
+    # and exactly the formatting the CLI or agent wrote. None only when no
+    # container ran (the deterministic budget escalation).
+    if raw_proposal is not None:
+        files[f"{prefix}-proposal.json"] = raw_proposal
     _push_evidence_files(
         config,
         files,
