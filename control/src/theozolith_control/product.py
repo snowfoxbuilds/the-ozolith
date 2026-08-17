@@ -230,27 +230,44 @@ def _stamp_version(component_dir: Path, version: str) -> None:
         )
 
 
-def _pip_wheel(component_dir: Path, out_dir: Path, runner) -> None:
-    proc = runner(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--wheel-dir",
-            str(out_dir),
-            str(component_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise ProductError(
-            f"pip wheel failed for {component_dir.name}:"
-            f" {(proc.stderr or proc.stdout or '').strip()[-400:]}"
+def _pip_wheel(component_dir: Path, out_dir: Path, runner) -> str:
+    """Build one component wheel and return its filename. ``--no-deps`` makes
+    pip produce exactly one wheel; it is built into a private staging dir
+    under ``out_dir`` and moved into place, so ``build_distribution`` can name
+    exactly the wheels THIS run produced even when ``out_dir`` is a persistent
+    ``dist/`` still holding a previous build's wheels (the bootstrap shim's
+    case — installing that stale set alongside the fresh one is the two-version
+    conflict pip refuses)."""
+    with tempfile.TemporaryDirectory(prefix=".wheel-", dir=out_dir) as stage:
+        proc = runner(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--wheel-dir",
+                str(stage),
+                str(component_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if proc.returncode != 0:
+            raise ProductError(
+                f"pip wheel failed for {component_dir.name}:"
+                f" {(proc.stderr or proc.stdout or '').strip()[-400:]}"
+            )
+        built = [p for p in Path(stage).iterdir() if p.name.endswith(".whl")]
+        if len(built) != 1:
+            raise ProductError(
+                f"expected exactly one wheel for {component_dir.name}, pip produced {len(built)}"
+            )
+        wheel = built[0]
+        # stage is under out_dir, so this is a same-filesystem atomic rename.
+        os.replace(wheel, out_dir / wheel.name)
+        return wheel.name
 
 
 def build_distribution(
@@ -261,15 +278,17 @@ def build_distribution(
     filenames)."""
     version = source_version(source, runner=runner)
     out_dir.mkdir(parents=True, exist_ok=True)
+    wheels: list[str] = []
     with tempfile.TemporaryDirectory(prefix="theozolith-build-") as sandbox:
         for component in COMPONENTS:
             staged = Path(sandbox) / component
             shutil.copytree(source / component, staged, ignore=_BUILD_IGNORES)
             _stamp_version(staged, version)
-            _pip_wheel(staged, out_dir, runner)
-    wheels = sorted(p.name for p in out_dir.iterdir() if p.name.endswith(".whl"))
-    if not wheels:
-        raise ProductError("the build produced no wheels")
+            # Only this run's wheels — never whatever else out_dir already holds:
+            # a persistent dist/ (the bootstrap shim) accumulates prior SHAs'
+            # wheels, and installing two versions of a package is what pip refuses.
+            wheels.append(_pip_wheel(staged, out_dir, runner))
+    wheels = sorted(wheels)
     log(f"built {len(wheels)} wheel(s) at version {version}")
     return version, wheels
 
