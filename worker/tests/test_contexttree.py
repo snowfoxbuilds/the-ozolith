@@ -731,8 +731,12 @@ def test_grant_payload_is_claim_authority_not_context(harness: Harness):
     assert harness.worker_once() == 1
     assert "STALE GRANT BODY" not in seen["prompt"]
     assert "change.txt exists on the branch" in seen["prompt"]  # the fresh body
+    assert "stale title" not in seen["prompt"]
+    # The fresh issue title is what the prompt carries (the PR title itself
+    # is proposal-owned since ADR-0046: driver prefix + proposed words).
+    assert "Fresh title" in seen["prompt"]
     (pr_number,) = harness.fake.open_pr_numbers()
-    assert harness.fake.issues[pr_number]["title"] == f"#{number}: Fresh title"
+    assert harness.fake.issues[pr_number]["title"] == f"#{number}: scripted change"
 
 
 def test_prompt_shapes_and_resume_tree(harness: Harness):

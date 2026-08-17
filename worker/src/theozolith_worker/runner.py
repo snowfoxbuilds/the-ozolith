@@ -21,9 +21,16 @@ commissioned through the job directory; the driver performs the side effects
 (commit, push, PR, labels) after sanitizing the container-touched checkout's
 git metadata.
 
+The agent's outputs leave the session as one Output Proposal (ADR-0046):
+``output/proposal.json`` in the job dir, written through the format-output
+CLI, validated and applied here post-exit — the sole policy boundary. The
+driver composes the PR (``#N: `` title prefix, Closes line + narrative +
+Decisions Section body) and commits with the proposed commit message plus a
+provenance trailer; no fallback-generated message ever ships.
+
 Run outcomes (ADR-0014, failure lane replaced by ADR-0016): a completed
 session with commits ships the normal best-effort PR; a completed session
-with zero commits but no-change reasoning in the decisions payload ships an
+with zero commits but no-change reasoning in the proposal ships an
 EMPTY PR (one driver-synthesized allow-empty commit) the Reviewer judges
 like any other; everything else is a FAILED Run. The failed lane is local
 retry (``execute_claim``): the driver keeps the claim and launches one full
@@ -32,6 +39,13 @@ bundle — under a uniform budget across failure classes. A second
 non-completion releases the claim and applies failed + needs_human with
 both evidence links and each failure's class. Nothing is re-queued and no
 state lives in comments.
+
+One narrower lane joins it (ADR-0016 as amended by ADR-0046): a COMPLETED
+session whose proposal fails validation gets exactly one completion retry —
+new container, new run_id, its own evidence bundle, but the worktree and the
+partially-filled proposal preserved, with a machine-generated error appendix
+on the prompt. Capped at one and terminal: the retry ships or the claim
+escalates. Implementer-only; the Reviewer's one-strike rule stands.
 
 Evidence is the sole durable audit trail (ADR-0016): every Run pushes its
 bundle, and a job directory is deleted only after that push confirmed —
@@ -66,6 +80,7 @@ from theozolith_worker import (
     evidence,
     gitops,
     jobdir,
+    proposal,
     verdict,
 )
 from theozolith_worker.bootstrap.vocabulary import (
@@ -91,7 +106,9 @@ from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
 BRANCH_PREFIX = "ozolith/issue-"
 
 # Paths in the checkout that are pipeline metadata, never repo content.
-EXCLUDED_METADATA = (".theozolith/decisions.json", ".claude/settings.local.json")
+# (The in-worktree decisions file is gone — the Output Proposal lives in the
+# job dir, outside the checkout, ADR-0046.)
+EXCLUDED_METADATA = (".claude/settings.local.json",)
 
 # Runs per claim: the original plus exactly one local retry (ADR-0016).
 CLAIM_RUN_BUDGET = 2
@@ -124,7 +141,8 @@ PROMPT_TEMPLATE = """\
 You are an Implementer in TheOzolith agentic coding pipeline, executing one \
 stateless, headless Run against the checked-out repository (your working \
 directory). No human watches or steers this session; everything the pipeline \
-needs from you must land in the working tree and the decisions file.
+needs from you must land in the working tree and your Output Proposal \
+(written with the `format-output` CLI).
 
 ## Issue #{number}: {title}
 
@@ -158,24 +176,38 @@ scope — a human decision in a comment outranks the issue body above.
 - Never stop to ask questions. When a judgment call comes up, decide, then \
 record the decision and its rationale. A separate Reviewer adjudicates your \
 decisions afterwards.
-- Record your run summary in `.theozolith/decisions.json` (create the file) \
-with exactly this JSON shape:
-  {{"decisions": [{{"what": "...", "why": "..."}}], "open_questions": [], \
-"remaining_work": [], "dead_ends": [], "process_issues": []}}
-  Decisions are judgment calls with rationale; open_questions are calls only \
-a human can make; remaining_work is what a follow-up round still needs; \
-dead_ends are approaches you tried and abandoned (so the next Run does not \
-repeat them).
-- process_issues is optional and advisory: observations about the PIPELINE \
-itself (friction you hit — a confusing prompt, missing tooling, a flaky \
-gate), each as {{"friction": "...", "suggested_fix": "..."}}. Never findings \
+- Everything the pipeline may publish for you goes through your Output \
+Proposal, written with `format-output <field> <value>` (multi-line values: \
+`-` reads stdin, or `--file <path>`; `view-output <field>` shows pending \
+state). Nothing you run touches GitHub — the proposal is validated and \
+applied only after you exit.
+- `format-output commit-message` is REQUIRED every round. The pipeline \
+commits your work with exactly this message (plus a provenance trailer) — \
+no message is ever generated for you. Git history is the only context \
+surface guaranteed to every future Run, so write it rich: a subject line, \
+the what and why, key decisions with rationale, dead ends tried, \
+constraints discovered. A weak message is a legitimate review finding.
+- `format-output pr-title` (descriptive; the pipeline adds the `#N: ` \
+prefix) and `format-output pr-description` (the PR narrative) are required \
+on the round that creates the PR; on later rounds omit them to keep what \
+exists.
+- Fill the PR's Decisions Section through these fields (each takes a JSON \
+array): `decisions` `[{{"what": "...", "why": "..."}}]` — judgment calls \
+with rationale; `open-questions` — calls only a human can make; \
+`remaining-work` — what a follow-up round still needs; `dead-ends` — \
+approaches you tried and abandoned (so the next Run does not repeat them).
+- `process-issues` (`[{{"friction": "...", "suggested_fix": "..."}}]`) is \
+optional and advisory: observations about the PIPELINE itself (friction you \
+hit — a confusing prompt, missing tooling, a flaky gate). Never findings \
 about the change; it influences no verdict, label, or gate outcome.
 - If you conclude that NO code change is needed, change nothing and record \
-why in the decisions file — the pipeline ships an empty PR carrying your \
-reasoning for review. A run with no changes and no recorded reasoning is \
-treated as a failure.
+why in `decisions` and the commit message — the pipeline ships an empty PR \
+carrying your reasoning for review. A run with no changes and no recorded \
+reasoning is treated as a failure.
+- Before you finish, run `format-output status` and make sure it reports \
+the proposal as valid — an incomplete proposal cannot ship.
 - Do not run git commit/push and do not open PRs; the pipeline owns version \
-control.
+control and commits with your proposed message.
 - Do not edit `.theozolith/gate.toml` or CI workflows unless the issue \
 explicitly asks for it.
 - When you are done, simply finish your reply and exit; the pipeline treats \
@@ -192,6 +224,41 @@ revised plan exactly:
 {plan}
 
 """
+
+# The machine-generated error appendix on a completion retry (ADR-0016 as
+# amended by ADR-0046): fill-only instruction, soft enforcement — churn the
+# retry session does make is reviewable like anything else.
+COMPLETION_RETRY_CONTEXT = """\
+
+
+## Completion retry: finish the previous session's Output Proposal
+
+A previous session completed the work in this working tree but exited with \
+an invalid Output Proposal. The current work is unfinished, missing: \
+{missing}.
+
+The working tree and the partially-filled proposal are preserved exactly as \
+that session left them. Do NOT redo or rework the change: review the \
+existing state (`git status`, `git diff`, `view-output <field>`), fill in \
+what is missing with `format-output`, confirm with `format-output status`, \
+and exit.
+"""
+
+
+@dataclass
+class CompletionCarryover:
+    """The enumerated no-carryover exception (ADR-0016 as amended by
+    ADR-0046): everything one completion retry inherits from a completed Run
+    whose Output Proposal failed validation. The worktree is parked in a
+    dot-prefixed sibling of the job dirs (ignored by queue-behind and the
+    evidence sweep) until the retry Run adopts it; the agent session itself
+    is never preserved."""
+
+    checkout: Path  # the preserved worktree, parked outside any job dir
+    proposal_text: str | None  # the pending proposal file, byte-for-byte
+    errors: list[str]  # what validation rejected — quoted in the appendix
+    base_branch: str
+    force: bool  # push disposition the preserved worktree embodies
 
 
 @dataclass
@@ -211,8 +278,13 @@ class RunReport:
     # no-changes | infra ("" for completed Runs). ADR-0045 adds identity:
     # the static checks failed before launch or the fail-loud monitor
     # detected an off-identity session (killed mid-run) — the Run is
-    # invalid.
+    # invalid. ADR-0046 adds completion: the session completed but its
+    # Output Proposal failed validation — the one class whose retry
+    # preserves the worktree.
     failure_class: str = ""
+    # Set only on a completion-classed failure that successfully parked its
+    # worktree: what execute_claim hands the one completion retry.
+    carryover: CompletionCarryover | None = None
     evidence_pushed: bool = False
     # True only on the compound failure: the push failed AND both parking
     # attempts failed, so the completed job dir was removed unpublished
@@ -237,6 +309,12 @@ class _RunContext:
     base_branch: str = ""
     gate: GateResult = field(default_factory=GateResult)
     section: decisions.DecisionsSection | None = None
+    # The push disposition the checkout ended up with (reviewer-designated
+    # reset or stale-branch overwrite): a completion retry must carry it.
+    force: bool = False
+    # Set when a completed session's proposal failed validation: the error
+    # list a completion retry's prompt appendix quotes (ADR-0016 as amended).
+    completion_errors: list[str] | None = None
     # The pre-launch input snapshot (#52): captured immediately before the
     # container starts, so evidence never re-reads input the agent could
     # have rewritten through the /job bind mount. None means no container
@@ -319,6 +397,37 @@ def _no_change_intro(section: decisions.DecisionsSection) -> str:
     return "\n".join(lines)
 
 
+def commit_message_with_trailer(proposed: str, run_id: str, issue_number: int, round_n: int) -> str:
+    """The proposed commit message plus the provenance trailer (ADR-0046).
+    The previously generated ``Run <id> for #<N> (round <r>)`` subject is
+    demoted to these trailer facts; the agent-authored message is the
+    archival copy of the round's context — no fallback ever ships."""
+    return (
+        f"{proposed.rstrip()}\n"
+        "\n"
+        f"Ozolith-Run: {run_id}\n"
+        f"Ozolith-Issue: #{issue_number}\n"
+        f"Ozolith-Round: {round_n}\n"
+    )
+
+
+def compose_pr_body(
+    issue_number: int,
+    narrative: str,
+    section: decisions.DecisionsSection,
+    *,
+    no_change_intro: str = "",
+) -> str:
+    """Zone composition (ADR-0046): Closes line + narrative + Decisions
+    Section. The driver owns the frame; the proposal supplies the content."""
+    zones = [f"Closes #{issue_number}."]
+    if no_change_intro:
+        zones.append(no_change_intro)
+    if narrative.strip():
+        zones.append(narrative.strip())
+    return decisions.upsert("\n\n".join(zones), section)
+
+
 def execute_run(
     config: DriverConfig,
     client: GitHubClient,
@@ -328,10 +437,15 @@ def execute_run(
     run_id: str | None = None,
     log=_log,
     sink: events.EventSink | None = None,
+    completion: CompletionCarryover | None = None,
 ) -> RunReport:
     """One Run on one claimed issue. Assumes the claim already exists on
     GitHub (written by the Control Node, ADR-0017). Never raises: every
-    failure mode returns a failed report under the uniform budget."""
+    failure mode returns a failed report under the uniform budget.
+
+    ``completion`` makes this Run the one completion retry (ADR-0016 as
+    amended): the preserved worktree and pending proposal are adopted
+    instead of a fresh clone, and the prompt carries the error appendix."""
     run_id = run_id or new_run_id(config)
     sink = sink or events.make_sink(config, log)
     job = jobdir.create_job_dir(config.jobs_dir, run_id)
@@ -349,9 +463,20 @@ def execute_run(
     )
     context = _RunContext()
     try:
-        _run_to_pr(config, client, issue, session_factory, job, report, context, log, sink)
+        _run_to_pr(
+            config, client, issue, session_factory, job, report, context, log, sink, completion
+        )
     except _RunFailed as failed:
         _fail_run(config, issue, report, job, context, failed, log, sink)
+        # The evidence (diffstat included) is pushed; NOW the worktree can
+        # leave the doomed job dir. Only a first miss parks one — the retry
+        # itself never stacks another carryover (capped at one, terminal).
+        if (
+            failed.failure_class == "completion"
+            and completion is None
+            and context.completion_errors is not None
+        ):
+            report.carryover = _stash_completion_carryover(config, job, report, context, log)
     except Exception as exc:  # pre/post-session driver-side breakage
         # An internal failure, not a Run outcome: container-start and GitHub
         # write failures land here — summarize for the dashboard errors
@@ -479,6 +604,45 @@ def _park_for_sweep(config: DriverConfig, job: Path, report: RunReport, log) -> 
     )
 
 
+def _stash_completion_carryover(
+    config: DriverConfig,
+    job: Path,
+    report: RunReport,
+    context: _RunContext,
+    log,
+) -> CompletionCarryover | None:
+    """Park the completed-but-unproposed worktree for the one completion
+    retry (ADR-0016 as amended by ADR-0046). Runs strictly AFTER the failed
+    Run's evidence push (the diffstat needs the worktree in place), and moves
+    it into a dot-prefixed sibling of the job dirs — invisible to
+    queue-behind and the evidence sweep — so the job dir itself can be
+    cleaned normally. None (logged) when parking fails: the claim then takes
+    the ordinary local-retry lane instead."""
+    workdir = job / jobdir.CHECKOUT_DIR
+    if not workdir.is_dir() or not context.completion_errors:
+        return None
+    holding = Path(config.jobs_dir) / f".completion-{report.run_id}"
+    shutil.rmtree(holding, ignore_errors=True)
+    target = holding / jobdir.CHECKOUT_DIR
+    try:
+        holding.mkdir(parents=True, exist_ok=True)
+        workdir.rename(target)
+    except OSError as exc:
+        shutil.rmtree(holding, ignore_errors=True)
+        log(
+            f"run {report.run_id}: completion carryover could not be parked ({exc});"
+            " falling back to the full local retry (fresh clone)"
+        )
+        return None
+    return CompletionCarryover(
+        checkout=target,
+        proposal_text=proposal.raw_text(job),
+        errors=list(context.completion_errors),
+        base_branch=context.base_branch,
+        force=context.force,
+    )
+
+
 def _run_to_pr(
     config: DriverConfig,
     client: GitHubClient,
@@ -489,6 +653,7 @@ def _run_to_pr(
     context: _RunContext,
     log,
     sink: events.EventSink,
+    completion: CompletionCarryover | None = None,
 ) -> None:
     """The Run body: checkout, agent session, gate, ship. Raises _RunFailed
     for every non-shipping outcome (ADR-0016 classification)."""
@@ -498,35 +663,49 @@ def _run_to_pr(
     email = f"{login}@users.noreply.github.com"
     auth = gitops.auth_env(config.token)
 
-    # Reference clone off the node-local mirror (#51): same disposable,
-    # self-contained checkout a full clone produced — --dissociate severs
-    # every tie to the mirror — but the per-Run download is a ref
-    # advertisement instead of the whole history. Mirror failures — trust
-    # validation refusals, git failures, and per-operation timeout expiry
-    # alike — raise GitError and land in the pre-session infra lane
-    # (ADR-0016).
-    gitops.clone_with_mirror(
-        config.clone_url,
-        config.mirrors_dir,
-        workdir,
-        env=auth,
-        timeout=config.git_timeout_seconds,
-    )
+    if completion is None:
+        # Reference clone off the node-local mirror (#51): same disposable,
+        # self-contained checkout a full clone produced — --dissociate severs
+        # every tie to the mirror — but the per-Run download is a ref
+        # advertisement instead of the whole history. Mirror failures — trust
+        # validation refusals, git failures, and per-operation timeout expiry
+        # alike — raise GitError and land in the pre-session infra lane
+        # (ADR-0016).
+        gitops.clone_with_mirror(
+            config.clone_url,
+            config.mirrors_dir,
+            workdir,
+            env=auth,
+            timeout=config.git_timeout_seconds,
+        )
+    else:
+        # The enumerated carryover (ADR-0016 as amended by ADR-0046): the
+        # preserved worktree — uncommitted completed work included — IS this
+        # Run's checkout. No branch dance and no reviewer-designated reset
+        # may run below: any reset here would wipe exactly the work the
+        # retry exists to ship.
+        completion.checkout.rename(workdir)
+        shutil.rmtree(completion.checkout.parent, ignore_errors=True)
     gitops.sanitize_checkout(workdir, config.clone_url)
     _exclude_metadata(workdir)
     report.phase = "checkout"
 
-    context.base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
+    context.base_branch = (
+        completion.base_branch
+        if completion is not None
+        else gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
+    )
+    context.force = completion.force if completion is not None else False
     existing_pr = client.find_open_pr_by_head(branch)
     # The grant carried claim authority only (ADR-0017 as amended, #52): the
     # issue and PR context is re-read here, fresh, on every Run — local
-    # retries included — authority-filtered to OWNER/MEMBER authors, and
-    # materialized as the Context Tree. The granted issue snapshot froze at
-    # dispatch time; from here on the fresh one is the issue.
+    # retries and the completion retry included — authority-filtered to
+    # OWNER/MEMBER authors, and materialized as the Context Tree. The
+    # granted issue snapshot froze at dispatch time; from here on the fresh
+    # one is the issue.
     snapshot = contexttree.fetch_snapshot(client, issue.number, existing_pr)
     issue = snapshot.issue
     revised: verdict.Verdict | None = None
-    force = False
     if existing_pr is not None:
         report.round = attempts_on(existing_pr.labels) + 1
         report.pr_number = existing_pr.number
@@ -542,8 +721,6 @@ def _run_to_pr(
                 workdir, f"origin/{existing_pr.base_ref}", "FETCH_HEAD"
             ),
         )
-        gitops.checkout_branch(workdir, branch, create=True)
-        gitops.reset_hard(workdir, "FETCH_HEAD")
         # The machine verdict stays a driver-internal reset detail, selected
         # only from the authority-filtered conversation (#52 amendment): a
         # verdict block in an unauthorized comment can never designate the
@@ -551,28 +728,38 @@ def _run_to_pr(
         # the tree.
         found = verdict.latest_verdict(snapshot.pr_conversation)
         revised = found[0] if found is not None else None
-        if revised is not None and revised.resume_commit:
-            if gitops.commit_exists(workdir, revised.resume_commit):
-                if revised.resume_commit != gitops.head_sha(workdir):
-                    gitops.reset_hard(workdir, revised.resume_commit)
-                    force = True
-                if revised.cherry_pick:
-                    gitops.cherry_pick(workdir, login, email, *revised.cherry_pick)
-            else:
-                report.notes.append(
-                    f"designated resume commit {revised.resume_commit} not found; "
-                    "resuming from branch head"
-                )
-    else:
+        if completion is None:
+            gitops.checkout_branch(workdir, branch, create=True)
+            gitops.reset_hard(workdir, "FETCH_HEAD")
+            if revised is not None and revised.resume_commit:
+                if gitops.commit_exists(workdir, revised.resume_commit):
+                    if revised.resume_commit != gitops.head_sha(workdir):
+                        gitops.reset_hard(workdir, revised.resume_commit)
+                        context.force = True
+                    if revised.cherry_pick:
+                        gitops.cherry_pick(workdir, login, email, *revised.cherry_pick)
+                else:
+                    report.notes.append(
+                        f"designated resume commit {revised.resume_commit} not found; "
+                        "resuming from branch head"
+                    )
+    elif completion is None:
         gitops.checkout_branch(workdir, branch, create=True)
         if gitops.ref_exists(workdir, f"origin/{branch}"):
             # A previous Run pushed but crashed before opening the PR.
             # That state was never Reviewer-designated: overwrite it.
-            force = True
+            context.force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
     contexttree.write_tree(job / "input", snapshot)
 
     prompt = _build_prompt(issue, report.round, revised)
+    if completion is not None:
+        # Main prompt plus the machine-generated error appendix (ADR-0016 as
+        # amended): fill-only instruction, soft enforcement.
+        prompt += COMPLETION_RETRY_CONTEXT.format(missing="; ".join(completion.errors))
+        report.notes.append("completion retry: worktree and pending proposal preserved")
+        if completion.proposal_text is not None:
+            jobdir.atomic_write(job / proposal.PROPOSAL_FILE, completion.proposal_text)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
     _write_issue_metadata(job, issue, round_number=report.round)
     manifest = jobdir.Manifest(
@@ -581,6 +768,8 @@ def _run_to_pr(
         adapter=config.adapter,
         workdir=jobdir.CHECKOUT_DIR,
         agent_timeout_seconds=config.agent_timeout_seconds,
+        round=report.round,
+        schema_version=proposal.SCHEMA_VERSION,
     )
     jobdir.write_manifest(job, manifest)
     spec = ContainerSpec(
@@ -654,9 +843,6 @@ def _run_to_pr(
     gitops.sanitize_checkout(workdir, config.clone_url)
     _exclude_metadata(workdir)
 
-    agent_section = decisions.read_agent_decisions(workdir)
-    context.section = agent_section
-
     # -- Run-outcome classification (ADR-0014/0016) ---------------------------
 
     if outcome is None or not outcome.completed:
@@ -668,6 +854,11 @@ def _run_to_pr(
             # merely quoting the marker is not an identity verdict.
             if identity_error_detail(harness_error) is not None:
                 raise _RunFailed(harness_error, "identity")
+            # ADR-0046: the schema-version refusal fails strictly pre-work —
+            # driver and run image are out of step, a pre-session infra
+            # failure (ADR-0016), never harness breakage. Same anchoring.
+            if proposal.schema_error_detail(harness_error) is not None:
+                raise _RunFailed(harness_error, "infra")
             raise _RunFailed(harness_error, "harness")
         if outcome is not None and outcome.timed_out:
             raise _RunFailed("agent session timed out", "timeout")
@@ -677,42 +868,63 @@ def _run_to_pr(
             f"agent session {(outcome or jobdir.AgentOutcome()).describe()}", "harness"
         )
 
-    section = agent_section or decisions.fallback_section(
-        "agent exited without a valid .theozolith/decisions.json"
-    )
+    # The Output Proposal is the session's entire result (ADR-0046); the
+    # driver re-validates it here no matter what the in-session CLI said.
+    validated, errors = proposal.validate_run_job(job, round_number=report.round)
+    if validated is None:
+        # The completion lane (ADR-0016 as amended): evidence still carries
+        # whatever Decisions-Section content the agent did record.
+        section = proposal.lenient_section(proposal.read_raw(job))
+        section.gate_findings = gate.findings
+        context.section = section
+        context.completion_errors = errors
+        raise _RunFailed(f"output proposal invalid: {'; '.join(errors)}", "completion")
+    section = validated.section
     section.gate_findings = gate.findings
     context.section = section
 
-    committed = gitops.commit_all(
-        workdir, f"Run {report.run_id} for #{issue.number} (round {report.round})", login, email
+    message = commit_message_with_trailer(
+        validated.commit_message, report.run_id, issue.number, report.round
     )
+    committed = gitops.commit_all(workdir, message, login, email)
     empty = not committed
-    if empty and not _has_reasoning(agent_section):
+    if empty and not _has_reasoning(section):
         raise _RunFailed("run completed with no commits and no no-change reasoning", "no-changes")
     if empty:
-        # A concluded no-change Run still ships: one allow-empty commit,
+        # A concluded no-change Run still ships: one allow-empty commit —
+        # carrying the proposed message, which records why nothing changed —
         # reasoning in the PR body, judged like any PR (ADR-0014).
-        gitops.commit_empty(
-            workdir,
-            f"Run {report.run_id} for #{issue.number} (round {report.round}): no changes required",
-            login,
-            email,
-        )
+        gitops.commit_empty(workdir, message, login, email)
     report.head = gitops.head_sha(workdir)
 
-    gitops.push(workdir, branch, force=force, env=auth)
+    gitops.push(workdir, branch, force=context.force, env=auth)
 
-    title = f"#{issue.number}: {issue.title}"
+    intro = _no_change_intro(section) if empty else ""
     if existing_pr is None:
-        body = f"Closes #{issue.number}."
-        if empty:
-            body += "\n\n" + _no_change_intro(section)
         pr = client.create_pr(
-            head=branch, base=context.base_branch, title=title, body=decisions.upsert(body, section)
+            head=branch,
+            base=context.base_branch,
+            # The driver owns the number prefix; the proposal owns the words.
+            title=f"#{issue.number}: {validated.pr_title}",
+            body=compose_pr_body(
+                issue.number, validated.pr_description, section, no_change_intro=intro
+            ),
         )
     else:
         pr = existing_pr
-        client.update_pr(pr.number, body=decisions.upsert(pr.body, section))
+        # Absent field = no-op, never clear (ADR-0046): a resume round that
+        # proposes no title/narrative keeps the PR's existing ones and only
+        # the Decisions Section is replaced.
+        body = (
+            compose_pr_body(issue.number, validated.pr_description, section, no_change_intro=intro)
+            if validated.pr_description
+            else decisions.upsert(pr.body, section)
+        )
+        client.update_pr(
+            pr.number,
+            title=f"#{issue.number}: {validated.pr_title}" if validated.pr_title else None,
+            body=body,
+        )
     report.pr_number = pr.number
     client.add_labels(pr.number, PR_READY)
     report.phase = "empty-pr" if empty else "pr-open"
@@ -833,6 +1045,13 @@ def _push_run_evidence(
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }
+    # The Output Proposal as the session left it (ADR-0046) — for a
+    # completion-classed failure this is the partial file the retry inherits.
+    raw_proposal = proposal.raw_text(job)
+    if raw_proposal is not None:
+        files[f"{prefix}/proposal.json"] = (
+            raw_proposal if raw_proposal.endswith("\n") else raw_proposal + "\n"
+        )
     # The exact input the Run saw (#52): prompt, issue metadata, and the
     # authorized Context Tree, byte-for-byte under their relative paths —
     # from the pre-launch trusted snapshot whenever a container launched.
@@ -888,7 +1107,10 @@ def _push_run_evidence(
 
 
 def render_claim_escalation(repo: str, issue_number: int, reports: list[RunReport]) -> str:
-    lines = ["Both Runs for this claim failed; the local-retry budget is spent (ADR-0016).", ""]
+    lines = [
+        f"All {len(reports)} Runs for this claim failed; the retry budget is spent (ADR-0016).",
+        "",
+    ]
     for report in reports:
         line = f"- Run `{report.run_id}` — **{report.failure_class}**: {report.reason}"
         if report.evidence_pushed:
@@ -929,9 +1151,10 @@ def execute_claim(
     log=_log,
     sink: events.EventSink | None = None,
 ) -> list[RunReport]:
-    """Everything one granted claim owes: up to CLAIM_RUN_BUDGET Runs (the
-    original and one local retry), then release + failed + needs_human with
-    complete forensics. Returns the reports, one per Run executed."""
+    """Everything one granted claim owes: up to CLAIM_RUN_BUDGET full Runs
+    (the original and one local retry) plus at most one completion retry
+    (ADR-0016 as amended by ADR-0046), then release + failed + needs_human
+    with complete forensics. Returns the reports, one per Run executed."""
     sink = sink or events.make_sink(config, log)
 
     def _emit_claimed(run_id: str) -> bool:
@@ -941,9 +1164,12 @@ def execute_claim(
         return sink.emit(claimed)
 
     reports: list[RunReport] = []
-    for run_number in range(1, CLAIM_RUN_BUDGET + 1):
+    full_runs = 0
+    completion_used = False
+    carryover: CompletionCarryover | None = None
+    while True:
         run_id = new_run_id(config)
-        if run_number == 1:
+        if not reports:
             # The activation handshake (ADR-0017): without a landed claimed
             # event the Control Node releases this grant after ~60s; running
             # anyway would fork ownership. Walk away and let it.
@@ -954,20 +1180,50 @@ def execute_claim(
                 )
                 return reports
         else:
-            # The claim is already activated: the retry's claimed event is
+            # The claim is already activated: a retry's claimed event is
             # best-effort visibility, never a gate.
             _emit_claimed(run_id)
+        is_completion_retry = carryover is not None
+        if not is_completion_retry:
+            full_runs += 1
         report = execute_run(
-            config, client, issue, session_factory, run_id=run_id, log=log, sink=sink
+            config,
+            client,
+            issue,
+            session_factory,
+            run_id=run_id,
+            log=log,
+            sink=sink,
+            completion=carryover,
         )
+        carryover = None
         reports.append(report)
         if report.phase != "failed":
             return reports
-        if run_number < CLAIM_RUN_BUDGET:
+        if is_completion_retry:
+            # Capped at one and terminal (ADR-0016 as amended): the
+            # completion retry ships or the claim escalates — a second miss
+            # (or any other retry failure) never re-enters the local lane.
+            break
+        if (
+            report.failure_class == "completion"
+            and not completion_used
+            and report.carryover is not None
+        ):
+            completion_used = True
+            carryover = report.carryover
             log(
-                f"run {report.run_id} failed [{report.failure_class}]; keeping the claim and"
-                " launching the one local retry (ADR-0016)"
+                f"run {report.run_id} completed with an invalid output proposal; keeping the"
+                " claim and launching the one completion retry — worktree and pending"
+                " proposal preserved (ADR-0016 as amended by ADR-0046)"
             )
+            continue
+        if full_runs >= CLAIM_RUN_BUDGET:
+            break
+        log(
+            f"run {report.run_id} failed [{report.failure_class}]; keeping the claim and"
+            " launching the one local retry (ADR-0016)"
+        )
     _escalate_claim(config, client, issue, reports, log, sink)
     return reports
 

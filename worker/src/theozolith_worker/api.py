@@ -29,7 +29,6 @@ from theozolith_worker.jobdir import (
     PROMPT_FILE,
     STATUS_FILE,
     TRANSCRIPT_FILE,
-    VERDICT_FILE,
     WORK_DIR,
     AgentOutcome,
     JobDirError,
@@ -40,6 +39,7 @@ from theozolith_worker.jobdir import (
     atomic_write,
     create_job_dir,
 )
+from theozolith_worker.proposal import PROPOSAL_FILE, SCHEMA_VERSION
 from theozolith_worker.reviewer import Reviewer
 from theozolith_worker.runner import RunReport, execute_claim
 from theozolith_worker.sessions import (
@@ -59,9 +59,10 @@ __all__ = [
     "MODE_REVIEW",
     "MODE_RUN",
     "PROMPT_FILE",
+    "PROPOSAL_FILE",
+    "SCHEMA_VERSION",
     "STATUS_FILE",
     "TRANSCRIPT_FILE",
-    "VERDICT_FILE",
     "WORK_DIR",
     "AgentOutcome",
     "Comment",

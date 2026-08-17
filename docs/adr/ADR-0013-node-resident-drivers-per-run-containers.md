@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended in part by ADR-0019 (2026-07-21): interactive tmux harness mechanics retired; Runs execute headless and are not attach targets (interactivity moves to the Pilot).
+Status: ACCEPTED — amended in part by ADR-0019 (2026-07-21): interactive tmux harness mechanics retired; Runs execute headless and are not attach targets (interactivity moves to the Pilot). Amended in part by ADR-0046 (2026-08-17): the job directory's output half carries the schema-validated Output Proposal (`output/proposal.json`, written through the format-output CLI) instead of a mode-specific decisions or verdict file; the driver validates and applies it post-exit as the sole policy boundary.
 
 Date: 2026-07-15
 

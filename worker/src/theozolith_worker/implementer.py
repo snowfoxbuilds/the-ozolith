@@ -23,7 +23,9 @@ failed-push sweep-retry backoff.
 
 from __future__ import annotations
 
+import shutil
 import time
+from pathlib import Path
 from typing import ClassVar
 
 from theozolith_worker.base import Worker
@@ -68,6 +70,13 @@ class Implementer(Worker):
 
     def on_boot(self) -> None:
         sweep_mirrors(self.config, log=self.log)  # crash-clean the mirror root (#51)
+        # A predecessor killed between a completion-classed Run and its one
+        # retry leaves the parked worktree behind (ADR-0016 as amended by
+        # ADR-0046). Dot-prefixed and so inert to queue-behind and the
+        # sweep, but dead — the claim died with the process (evidence for
+        # the failed Run already pushed) — so each boot clears the leavings.
+        for stale in Path(self.config.jobs_dir).glob(".completion-*"):
+            shutil.rmtree(stale, ignore_errors=True)
         _, kept = sweep_orphans(self.config, log=self.log)  # boot-time sweep (ADR-0016)
         self._arm_sweep_retry(kept)
 

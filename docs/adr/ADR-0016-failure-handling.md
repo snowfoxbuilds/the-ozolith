@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-07-27 by ADR-0024 (cache/store split; see Amendments)
+Status: ACCEPTED — amended 2026-07-27 by ADR-0024 (cache/store split; see Amendments); amended 2026-08-17 with ADR-0046 (#53): the completion-retry class joins the full local retry (see Amendments)
 
 Date: 2026-07-17
 
@@ -29,6 +29,36 @@ ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the re
 - **Escalate zombies before evidence, link the expected path**: rejected by the operator — faster issue turnaround is not worth escalations without complete forensics.
 - **Driver-side circuit breaker for sick nodes**: rejected — the Control Node holds the grant gate (ADR-0017) and the fleet view, so it can distinguish a failing node from a failing issue; a driver cannot.
 - **Auto-strip failed at dispatch when plan_ready is present**: rejected — launders a forgotten label into silence; a visibly stalled grant is preferable to an unnoticed failure loop.
+## Amendments (2026-08-17, ADR-0046 / #53)
+
+- **Completion retry — a second, narrower retry class beside the full local retry.**
+  A COMPLETED session whose Output Proposal fails validation (missing or invalid
+  required fields — most commonly `commit-message`) gets exactly one **completion
+  retry**: a new container, a new run_id, and its own evidence bundle, but with the
+  **worktree and the partially-filled proposal preserved** — the finished work is not
+  thrown away over a missing field. The relaunch prompt is the main prompt plus a
+  machine-generated error appendix (e.g. `the current work is unfinished, missing:
+  commit-message, pr-description`) with a fill-only instruction; enforcement of
+  fill-only is soft — any churn the retry session does make is reviewable.
+- This is an enumerated exception to the no-carryover rule (ADR-0008/ADR-0014
+  statelessness), and it is **Implementer-only**. Agent sessions are never preserved
+  (vendor `--resume` would be a load-bearing vendor feature — a swap-boundary and
+  ADR-0043 violation); only the worktree and the pending proposal carry over. The
+  Reviewer's work product *is* the proposal, so a missing or invalid verdict
+  escalates immediately (ADR-0014's one-strike rule stands — no driver-side retry
+  for the Reviewer).
+- **Capped at one per claim, and terminal**: the completion retry does not burn the
+  full local retry, but its outcome is final — it ships, or the claim escalates
+  `failed` + `needs_human` with every Run's evidence linked. A second invalid
+  proposal, or a completion retry that fails for any other reason, escalates; it
+  never re-enters the local-retry lane.
+- Evidence: the completed-but-invalid Run carries the distinct failure class
+  `completion` in its bundle and run events, alongside the existing uniform-budget
+  classes.
+- The uniform budget is otherwise unchanged: any non-completed Run still burns the
+  single full local retry regardless of class, and a schema-version mismatch
+  detected pre-work (ADR-0046) lands in the existing pre-session infra class.
+
 ## Amendments (2026-07-27, grilling session)
 
 - **Cache, never archive — made true by construction by ADR-0024.** The single control database silently mixed durability classes: the encrypted secret store (ADR-0015) and per-node tokens (ADR-0023) lived in the same "deletable" file as heartbeat state and the event cache, so deleting the cache destroyed secrets and fleet enrollment. ADR-0024 splits it into `cache.db` (node/stack state, events, janitor findings, sessions, join tokens — always safe to delete) and `store.db` (encrypted secrets, per-node tokens — the backup set). This ADR's rule stands; its storage now obeys it.

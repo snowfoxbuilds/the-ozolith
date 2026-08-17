@@ -7,10 +7,10 @@ contract records here when they are unresolvable.
 
 The section is embedded in the PR description between markers, with the
 machine-readable JSON in an HTML comment and the human-readable markdown
-rendered from it. The agent hands the Worker its half by writing
-``.theozolith/decisions.json`` in the worktree; a Run that fails to produce a
-parseable file still ships — the Worker synthesizes a section saying so (the
-gate and the contract never block PR creation).
+rendered from it. The agent hands the driver its half through the Output
+Proposal's Decisions-Section fields (ADR-0046 — the in-worktree
+``.theozolith/decisions.json`` is retired); a failed Run still ships its
+evidence with a synthesized section saying what broke.
 """
 
 from __future__ import annotations
@@ -18,15 +18,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 
 from theozolith_worker.gate.pipeline import Finding
 
 BEGIN = "<!-- theozolith:decisions:begin -->"
 END = "<!-- theozolith:decisions:end -->"
 DATA_RE = re.compile(r"<!-- theozolith:decisions:data\n(.*?)\n-->", re.DOTALL)
-
-AGENT_FILE = Path(".theozolith") / "decisions.json"
 
 
 @dataclass(frozen=True)
@@ -107,18 +104,6 @@ def section_from_dict(data: dict) -> DecisionsSection:
         ],
         process_issues=process_issues_from(data.get("process_issues")),
     )
-
-
-def read_agent_decisions(worktree: Path) -> DecisionsSection | None:
-    """Parse the agent-written decisions file, or None if absent/invalid."""
-    path = worktree / AGENT_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return section_from_dict(data)
 
 
 def _bullets(items: list[str], empty: str) -> list[str]:

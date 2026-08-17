@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from theozolith_worker import jobdir
+from theozolith_worker import jobdir, proposal
 from theozolith_worker.containers import ContainerSpec
 from theozolith_worker.harness.main import run_harness
 from theozolith_worker.sessions import ContainerSession, SessionError
@@ -80,6 +80,7 @@ def make_run_job(tmp_path: Path) -> tuple[Path, jobdir.Manifest, ContainerSpec]:
         mode=jobdir.MODE_RUN,
         adapter="claude",
         agent_timeout_seconds=20.0,
+        schema_version=proposal.SCHEMA_VERSION,
     )
     jobdir.write_manifest(job, manifest)
     spec = ContainerSpec(name="ozolith-run-r1", image="img")

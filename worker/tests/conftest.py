@@ -18,11 +18,12 @@ from pathlib import Path
 
 import pytest
 from fakegithub import FakeGitHub
-from theozolith_worker import jobdir
+from theozolith_worker import jobdir, proposal
 from theozolith_worker.bootstrap.vocabulary import FAILED, IN_PROGRESS, PLAN_READY
 from theozolith_worker.config import DriverConfig, load_config
 from theozolith_worker.containers import ContainerSpec
 from theozolith_worker.evidence import EVIDENCE_BRANCH
+from theozolith_worker.formatoutput import format_output_main
 from theozolith_worker.githubapi import GitHubClient
 from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome, Manifest
@@ -44,18 +45,33 @@ def _git(args: list[str], cwd: Path) -> str:
     return proc.stdout.strip()
 
 
-def write_decisions(cwd: Path, **kwargs) -> None:
-    """Write the agent-side decisions file the way a well-behaved agent does."""
-    payload = {
-        "decisions": [],
-        "open_questions": [],
-        "remaining_work": [],
-        "dead_ends": [],
-        **kwargs,
+def format_output(job: Path, name: str, value) -> None:
+    """One field written the way a well-behaved agent does: through the real
+    format-output CLI code path (write-time rules included)."""
+    text = value if isinstance(value, str) else json.dumps(value)
+    code = format_output_main(["--job", str(job), name, text])
+    assert code == 0, f"format-output refused {name}: exit {code}"
+
+
+def write_proposal(cwd: Path, *, skip: set[str] | None = None, **fields) -> None:
+    """Fill the Run's Output Proposal from inside the scripted agent.
+
+    ``cwd`` is the session workdir (job/checkout, like the container's);
+    the job dir is its parent. Required fields get sane defaults unless
+    named in ``skip`` (how tests script an incomplete proposal); kwargs use
+    Python names (pr_title, commit_message, decisions, ...)."""
+    job = cwd.parent
+    skip = skip or set()
+    defaults = {
+        "pr-title": "scripted change",
+        "pr-description": "What the scripted agent did and why.",
+        "commit-message": "scripted change\n\nWhat changed and why, decisions, dead ends.",
     }
-    target = cwd / ".theozolith" / "decisions.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload))
+    values = {**defaults, **{key.replace("_", "-"): value for key, value in fields.items()}}
+    for name, value in values.items():
+        if name in skip or value in (None, [], ""):
+            continue
+        format_output(job, name, value)
 
 
 # A Run behavior: (prompt, checkout) -> AgentOutcome | None (None = completed).
@@ -88,6 +104,17 @@ class IdentityFailure:
             "notes": [],
         }
     )
+
+
+@dataclass
+class SchemaSkew:
+    """A scripted reviewer reply that makes the session refuse the way a
+    real schema-version mismatch does (ADR-0046): the harness asserts the
+    manifest's stamp strictly BEFORE the agent launches — no prompt is
+    consumed, no transcript exists — records the anchored refusal in
+    status.json, and the driver sees a SessionError from wait_for_agent."""
+
+    stamped: int = 0  # the manifest stamp the refusal reports (0 = unstamped)
 
 
 class RecordingSink:
@@ -157,13 +184,13 @@ class FakeDispatch:
         ]
 
 
-def behavior_write(files: dict[str, str], **decisions_kwargs) -> RunBehavior:
+def behavior_write(files: dict[str, str], **proposal_kwargs) -> RunBehavior:
     def behavior(prompt: str, cwd: Path) -> None:
         for relpath, content in files.items():
             target = cwd / relpath
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-        write_decisions(cwd, **decisions_kwargs)
+        write_proposal(cwd, **proposal_kwargs)
 
     return behavior
 
@@ -244,6 +271,18 @@ class FakeSession:
             # fake passes it the way a healthy image does.
             jobdir.write_identity(self.job, {"dry_run": "passed", "expected_model": ""})
             return AgentOutcome(completed=True)
+        if (
+            self.manifest.mode == jobdir.MODE_REVIEW
+            and self.harness.reviewer_replies
+            and isinstance(self.harness.reviewer_replies[0], SchemaSkew)
+        ):
+            # The pre-work schema assert (ADR-0046) refuses before the agent
+            # exists: no prompt consumed, no transcript, no model call. Like
+            # the real harness, the refusal lands in status.json first.
+            skew = self.harness.reviewer_replies.pop(0)
+            error = proposal.schema_mismatch(skew.stamped)
+            jobdir.write_status(self.job, jobdir.Status(phase=jobdir.PHASE_FAILED, error=error))
+            raise SessionError(f"harness failed: {error}")
         prompt = (self.job / jobdir.PROMPT_FILE).read_text()
         self._write_transcript(prompt)
         if self.manifest.mode == jobdir.MODE_RUN:
@@ -266,16 +305,36 @@ class FakeSession:
             raise SessionError(f"harness failed: identity: {reply.detail}")
         if callable(reply):
             reply = reply(prompt, self.workdir)
-        if reply is not None:
-            content = reply if isinstance(reply, str) else json.dumps(reply)
-            (self.workdir / "verdict.json").write_text(content)
-        # Mimic the harness adapter's collect step.
-        emitted = self.workdir / "verdict.json"
-        if emitted.is_file():
-            target = self.job / jobdir.VERDICT_FILE
+        if isinstance(reply, str):
+            # A garbled hand-written proposal: the bind mount makes the file
+            # agent-writable, so the driver must survive raw bytes (ADR-0046:
+            # the CLI is convenience, never the trust boundary).
+            target = self.job / proposal.PROPOSAL_FILE
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(emitted.read_text())
+            target.write_text(reply)
+        elif reply is not None:
+            for key, value in reply.items():
+                if value in (None, "", []):
+                    continue  # an unset field is omitted, never written empty
+                self._write_review_field(key.replace("_", "-"), value)
         return AgentOutcome(completed=True)
+
+    def _write_review_field(self, name: str, value) -> None:
+        """The real CLI write path when the value is legal; a direct file
+        poke (what a misbehaving agent can always do) when the CLI refuses —
+        so scripted invalid verdicts still reach the driver's validation."""
+        manifest = jobdir.read_manifest(self.job)
+        text = value if isinstance(value, str) else json.dumps(value)
+        try:
+            proposal.write_field(self.job, manifest, name, text)
+        except proposal.ProposalError:
+            raw = proposal.read_raw(self.job) or {
+                "schema_version": proposal.SCHEMA_VERSION,
+                "mode": manifest.mode,
+                "fields": {},
+            }
+            raw.setdefault("fields", {})[name] = value
+            jobdir.atomic_write(self.job / proposal.PROPOSAL_FILE, json.dumps(raw))
 
     def run_job(self, name: str, command: str, timeout: float) -> tuple[bool, str]:
         self.harness.gate_jobs.append(command)

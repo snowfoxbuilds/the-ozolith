@@ -47,7 +47,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from theozolith_worker import shell
+from theozolith_worker import proposal, shell
 from theozolith_worker.adapters import AgentAdapterError, make_agent_adapter
 from theozolith_worker.identity import (
     CATEGORY_EFFORT_CLAMPED,
@@ -455,6 +455,15 @@ def run_harness(
     if manifest.mode == MODE_DRYRUN:
         return _run_identity_dryrun(job, adapter, identity_root, scratch_root)
 
+    # The Output Proposal schema assert (ADR-0046), strictly pre-work: a
+    # driver and run image speaking different proposal schemas must fail
+    # BEFORE the session starts — a pre-session infra failure (ADR-0016),
+    # marked so the driver never classes it as harness breakage.
+    mismatch = proposal.schema_mismatch(manifest.schema_version)
+    if mismatch is not None:
+        write_status(job, Status(phase=PHASE_FAILED, error=mismatch))
+        return 1
+
     workdir = job / manifest.workdir
     if not workdir.is_dir():
         write_status(job, Status(phase=PHASE_FAILED, error=f"missing workdir {manifest.workdir}"))
@@ -468,7 +477,7 @@ def run_harness(
     transcript = job / TRANSCRIPT_FILE
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.touch()
-    # THEOZOLITH_JOB lets in-session tools (theozolith-validate-verdict)
+    # THEOZOLITH_JOB lets in-session tools (format-output / view-output)
     # find the manifest and outputs from inside the workdir.
     env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
     pointer = POINTER_PROMPT.format(path=task_file)
