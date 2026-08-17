@@ -24,15 +24,21 @@ The credential-free half of any worker (Implementer, Reviewer, Initializer): PID
 
 **Claim Protocol**
 
-How an Implementer takes exclusive ownership of a plan_ready issue: the Implementer requests work from the Control Node; the Control Node selects an issue, writes the claim to GitHub itself (assigns the Implementer's GitHub login, adds in_progress), and returns the issue in the same response — claim-write-through, single serialized claim-writer (ADR-0017). GitHub remains the sole source of coordination truth. A granted claim that never activates (no claimed event within the activation window) is released by the Control Node. Control Node down = new claims pause; in-flight Runs are unaffected.
+How an Implementer takes exclusive ownership of a plan_ready issue: the Implementer requests work from the Control Node; the Control Node selects an issue, writes the claim to GitHub itself (assigns the Implementer's GitHub login, adds in_progress), and returns the issue in the same response — claim-write-through, single serialized claim-writer (ADR-0017). GitHub remains the sole source of coordination truth. A granted claim that never activates (no claimed event within the activation window) is released by the Control Node. The grant carries claim authority only, never context: each Run — including the local retry — re-reads the full issue and PR context fresh at checkout (grilling 2026-08-16, amending ADR-0017's no-re-read clause). Control Node down = new claims pause; in-flight Runs are unaffected.
 
-*Avoid*: drivers claiming directly against GitHub (retired 2026-07-17); "assign-and-verify" (deleted by ADR-0017).
+*Avoid*: drivers claiming directly against GitHub (retired 2026-07-17); "assign-and-verify" (deleted by ADR-0017); "the grant is the issue" (retired 2026-08-16 — the grant is the claim; context is read at checkout).
 
 **Claude agent**
 
 A single `.md` subagent file used by Claude. One component inside the Claude agent config.
 
 *Avoid*: "agent" (which means an entire tool config), "skill".
+
+**Completion Retry**
+
+The cheap retry class for contract failures (grilling 2026-08-16): a session that completed cleanly but whose Output Proposal fails validation — missing or invalid required fields, e.g. commit-message — relaunches once with the working tree and partially-filled proposal preserved, a new container, run_id, and evidence bundle, and the main prompt plus a machine-generated error appendix naming the missing fields (fill-only; code churn there is a reviewable finding). Capped at one — a second miss escalates failed + needs_human. Implementer-only: it exists to protect work products that survive the session (worktree, pending proposal); the Reviewer's work product is the proposal itself, so a missing verdict escalates immediately (ADR-0014 stands). Distinct from the full local retry (crash, timeout, zero commits), which discards everything.
+
+*Avoid*: preserving agent sessions (vendor resume is never load-bearing; every retry is a fresh context window); chaining completion retries; extending it to the Reviewer.
 
 **Config Distribution**
 
@@ -52,6 +58,12 @@ The node type a physical machine becomes when the Node Daemon is installed on it
 
 *Avoid*: containerizing the Node Daemon; "builder node" (removed — every container-host builds its own images).
 
+**Context Tree**
+
+The per-Run file tree (input/) carrying the complete structured snapshot of the claimed issue and its PR: bodies, every comment surface (issue comments, PR conversation comments, review comments, reviews), timeline, commits, and checks, split into per-item files with per-surface index files. Serialized deterministically by the driver at checkout; the agent discovers content progressively and judges relevance itself. The driver never relevance-filters, summarizes, or truncates (grilling 2026-08-16).
+
+*Avoid*: injecting thread content into the prompt (the prompt carries only the rules, the issue body, the resume-round revised plan, and the navigation guide); driver-side "relevant comment" heuristics (retired 2026-08-16).
+
 **Control Node**
 
 The product's central service, shipped in TheOzolith's control/ component (deployed on the Pi). Renders the fleet dashboard; receives Node Daemon heartbeats and Run events; answers heartbeats with infrastructure commands (drain, recycle, update, rebuild); dispatches claims as the single writer of claim creation on GitHub (ADR-0017); escalates zombie claims evidence-first and quarantines failing nodes at dispatch (ADR-0016). Authoritative for node and docker lifecycle and for claim dispatch; never originates other coordination — it cannot approve, revise, or advance an issue, and GitHub remains the sole source of coordination truth. Control Node down: in-flight Runs finish and publish; new claims and review rounds pause.
@@ -60,7 +72,7 @@ The product's central service, shipped in TheOzolith's control/ component (deplo
 
 **Decisions Section**
 
-The mandatory section of every best-effort PR description. Fixed schema (inherited from the former Handoff Doc; ADR-0003 as amended by ADR-0008): decisions made with rationale, open questions, remaining work, dead ends tried, and optional process issues (pipeline friction + suggested fix — advisory, human-harvested; never review findings). A first-class review input: the Reviewer judges the Implementer's decisions, not just the diff.
+The mandatory section of every best-effort PR description. Fixed schema (inherited from the former Handoff Doc; ADR-0003 as amended by ADR-0008): decisions made with rationale, open questions, remaining work, dead ends tried, and optional process issues (pipeline friction + suggested fix — advisory, human-harvested; never review findings). A first-class review input: the Reviewer judges the Implementer's decisions, not just the diff. Entries are proposed through the format-output CLI into the worker's Output Proposal; the separate hand-written decisions file is retired (grilling 2026-08-16).
 
 *Avoid*: "Handoff Doc" (retired term — the schema now lives in the PR description); relying on agent-native session files (never load-bearing).
 
@@ -84,7 +96,7 @@ The implementation-stage worker type (renamed from "Worker" 2026-07-21; ADR-0020
 
 **Implementer Run**
 
-The Run kind that attempts one GitHub issue (renamed from "Worker Run" 2026-07-21): fresh clone/worktree; the only carryover is PR branch content at the Reviewer-designated resume commit. A completed agent session ends in a best-effort PR — including a justified no-change empty PR; a failed one (timeout, session death, harness crash, or zero commits with no reasoning) ends in evidence plus one local retry or a failed + needs_human escalation, never a PR (ADR-0016).
+The Run kind that attempts one GitHub issue (renamed from "Worker Run" 2026-07-21): fresh clone/worktree; the only carryover is PR branch content at the Reviewer-designated resume commit. A completed agent session ends in a best-effort PR — including a justified no-change empty PR; a failed one (timeout, session death, harness crash, or zero commits with no reasoning) ends in evidence plus one full local retry or a failed + needs_human escalation, never a PR (ADR-0016); a completed session with an unfinished Output Proposal gets one Completion Retry instead (grilling 2026-08-16).
 
 *Avoid*: "attempt-N" (a review-round counter, not an Implementer Run counter); "Worker Run" (pre-taxonomy name).
 
@@ -124,6 +136,12 @@ The whole agentic coding pipeline system: planning, execution, review, and monit
 
 *Avoid*: using it for the Control Node or a Worker.
 
+**Output Proposal**
+
+The structured set of GitHub mutations a worker's agent proposes during a Run, written into the job dir through the format-output CLI (view-output reads pending state back; a bare status call prints the full fill-state table). The schema is per worker type, selected by the job manifest — Implementer: pr-title (descriptive part; the driver owns the #N: prefix), pr-description (narrative zone; the driver composes the PR body from the Closes line, the narrative, and the Decisions Section), Decisions-Section entries, and a required rich commit-message (subject plus what/why, key decisions, dead ends — reviewed like any artifact; git history is the only context surface guaranteed to every future Run, so redundancy with the Decisions Section is intentional; the driver commits with it and appends a provenance trailer, and no fallback-generated message ever ships); Reviewer: the Verdict and its content. The proposal lives in the job dir, not the worktree (the in-worktree decisions file and its _exclude_metadata fence are retired), and is version-checked: the driver stamps an integer schema_version into the job manifest and the CLI asserts compatibility at first invocation — skew fails pre-work as an infra-class failure, never post-exit (grilling 2026-08-16). Allowlist by schema: forbidden mutations (base branch, issue state, labels, needs_human, other PRs) are unrepresentable, not validated away. Absent field = no-op, never clear. The CLI validates in-session, fail-loud; the driver re-validates and applies post-exit — the sole trust boundary (grilling 2026-08-16).
+
+*Avoid*: treating CLI validation as enforcement (the driver is the policy boundary); names implying live GitHub writes (application happens after process exit, by the driver); raw PR-body access (zone composition, never full replace).
+
 **Review Run**
 
 The Run kind that executes one review round: a fresh container reads the PR, diff, evidence, and Decisions Section, and emits a verdict file that the reviewer driver publishes. The round (attempt-N, 3 max per PR) is the budget unit; the Review Run is its execution. One invalid verdict = immediate escalation, no retry.
@@ -160,6 +178,12 @@ A declarative unit of workload the Node Daemon runs: name, workload, placement, 
 
 *Avoid*: "role" (legacy Home Server term); a control Stack kind (deleted 2026-08-04 — the substrate never supervises its own control plane).
 
+**Verdict**
+
+The Reviewer's enumerated ruling on one review round: approve | revise | escalate, proposed through format-output and validated in-session — an invalid value or a final-round revise fails at write time, absorbing ADR-0014's post-exit validate-verdict job into the CLI (grilling 2026-08-16). Content is audience-conditional: a non-final revise carries findings plus the amendment prompt (the revised plan the next Implementer Run executes; ADR-0008); approve and every final-round verdict carry human-facing content — signals, decisions required, findings. The reviewer driver renders the published comment and labels from it. No Completion Retry: a completed review session that never proposed a verdict escalates immediately — the judgment died with the session (ADR-0014 stands; grilling 2026-08-16).
+
+*Avoid*: "decision" (a Decisions-Section entry — an Implementer artifact); "require_changes" and GitHub's REQUEST_CHANGES (the Reviewer never files GitHub reviews).
+
 **Worker**
 
 The base abstraction for every automated pipeline actor (redefined 2026-07-21; ADR-0020): a long-lived, node-resident driver process on a container-host, bound to one Agent config (ADR-0013 — not a container), executing ephemeral headless Runs. All worker types share the same infrastructure — heartbeat, container lifecycle, and the fetch-execute loop — and differ only in GitHub state management and the Agent adapter/model. Built-in types: Implementer, Reviewer, Initializer. The code mirrors the taxonomy with inheritance: custom worker types extend the base Worker or one of the built-in types.
@@ -188,6 +212,8 @@ A configuration that involves multiple agents working together.
 - Worker is the base type: Implementer, Reviewer, and Initializer are worker types sharing driver infrastructure (heartbeat, container lifecycle, fetch-execute loop) and differing only in GitHub state management and the Agent adapter/model; custom worker types extend the base or a built-in type (ADR-0020).
 - A worker is bound to exactly one Agent config; the Implementer executes one Implementer Run at a time.
 - A worker = one node-resident driver plus one ephemeral run container per Run; driver and harness communicate only through the job directory.
+- A Run's agent reads context from the Context Tree and proposes GitHub mutations only through its Output Proposal; the driver validates and applies both sides of the channel (grilling 2026-08-16).
+- Every Run's checkout is a self-contained reference clone (git clone --reference --dissociate) from a driver-owned node-local mirror that is never mounted into containers (grilling 2026-08-16).
 - An Implementer Run belongs to exactly one Implementer and targets exactly one GitHub issue; a Review Run belongs to the Reviewer and executes exactly one round of one PR.
 - The Control Node dispatches claims and review rounds, observes workers and Runs, and writes claim creation to GitHub; GitHub owns all coordination state (ADR-0017).
 - A Decisions Section belongs to exactly one PR; all review rounds for an issue reuse that one PR and branch.
