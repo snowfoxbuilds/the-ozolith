@@ -674,21 +674,25 @@ def test_pr_with_over_250_commits_is_complete_and_reset_independent(harness: Har
     harness.reviewer_replies.append(revise_reply("1. try again"))
     harness.reviewer_once()  # authorized verdict designating resume at c1
 
-    # A crashed/hostile push lands 260 more commits on the PR branch.
-    bulk = harness.remote.parent / "bulk"
-    subprocess.run(["git", "clone", "-q", f"file://{harness.remote}", str(bulk)], check=True)
-    subprocess.run(["git", "checkout", "-q", branch], cwd=bulk, check=True)
+    # 260 more commits land on the PR branch (built directly in the bare
+    # test remote with commit-tree + update-ref: no clone, no transport —
+    # only the driver's own fetch machinery touches the wire).
     subprocess.run(
         [
             "bash",
             "-c",
-            "for i in $(seq 1 260); do git -c user.name=bulk -c user.email=b@x "
-            'commit -q --allow-empty -m "bulk commit $i" -m "second line $i"; done',
+            f'set -e; export GIT_DIR="{harness.remote}"'
+            " GIT_AUTHOR_NAME=bulk GIT_AUTHOR_EMAIL=b@x"
+            " GIT_COMMITTER_NAME=bulk GIT_COMMITTER_EMAIL=b@x;"
+            f' parent={c1}; tree=$(git rev-parse "{c1}^{{tree}}");'
+            " for i in $(seq 1 260); do"
+            '   parent=$(git commit-tree "$tree" -p "$parent"'
+            '     -m "bulk commit $i" -m "second line $i");'
+            " done;"
+            f' git update-ref "refs/heads/{branch}" "$parent"',
         ],
-        cwd=bulk,
         check=True,
     )
-    subprocess.run(["git", "push", "-q", "origin", branch], cwd=bulk, check=True)
 
     seen: dict = {}
 
