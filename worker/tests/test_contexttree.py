@@ -704,6 +704,9 @@ def test_pr_with_over_250_commits_is_complete_and_reset_independent(harness: Har
     harness.worker_behaviors.append(capture)
     harness.worker_once()
 
+    # A Run that fails before the session masks the capture (ADR-0016 local
+    # retry); surface the driver's own failure log instead of a KeyError.
+    assert "commits" in seen, "\n".join(harness.logs)
     commits = seen["commits"]
     assert "# PR commits (261)" in commits  # c1 + all 260, nothing capped
     assert commits.count("\n## ") == 261
