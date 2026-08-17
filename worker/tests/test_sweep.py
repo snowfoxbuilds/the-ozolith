@@ -30,6 +30,12 @@ def orphan_job(harness: Harness, run_id: str, issue: int | None = 5) -> Path:
 
 def test_orphans_are_pushed_under_the_original_run_id_and_deleted(harness: Harness):
     job = orphan_job(harness, RUN_ID, issue=5)
+    # The Context Tree a dead driver left behind (#52): the sweep preserves
+    # it under the same relative paths a live-pushed bundle uses — and never
+    # walks the checkout beside it.
+    jobdir.atomic_write(job / "input" / "issue" / "body.md", "# Issue #5: t\n\nthe body\n")
+    jobdir.atomic_write(job / "input" / "issue" / "comments" / "0001-sean.md", "a decision\n")
+    jobdir.atomic_write(job / "checkout" / "src" / "app.py", "NEVER-PUBLISHED\n")
 
     swept, kept = sweep_orphans(harness.worker_config, log=harness.logs.append)
 
@@ -44,6 +50,13 @@ def test_orphans_are_pushed_under_the_original_run_id_and_deleted(harness: Harne
     assert f"{prefix}/swept-transcript.txt" in paths
     swept = harness.evidence_file(f"{prefix}/swept-transcript.txt")
     assert swept == '{"type":"system"} half a stream'
+    # The exact Run input survived, same paths and content as a live bundle.
+    assert harness.evidence_file(f"{prefix}/input/prompt.md") == "the prompt"
+    assert harness.evidence_file(f"{prefix}/input/issue/body.md").endswith("the body")
+    assert harness.evidence_file(f"{prefix}/input/issue/comments/0001-sean.md") == "a decision"
+    # The checkout stays out of evidence, always.
+    assert not any("checkout" in p or "NEVER-PUBLISHED" in p for p in paths)
+    assert "NEVER-PUBLISHED" not in harness.evidence_file(f"{prefix}/swept.json")
 
 
 def test_push_failure_parks_the_job_dir_for_retry(harness: Harness, monkeypatch):

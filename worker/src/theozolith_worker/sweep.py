@@ -112,11 +112,12 @@ def _bundle_prefix(job: Path) -> str:
     return f"sweeps/{run_id}"
 
 
-# Job-dir artifacts worth preserving post-mortem (never the checkout).
+# Job-dir output artifacts worth preserving post-mortem (never the
+# checkout). The Run's INPUT — prompt, issue metadata, Context Tree — is
+# collected separately by evidence.input_artifacts under the same relative
+# paths a live-pushed bundle uses (#52).
 SWEPT_ARTIFACTS = (
     jobdir.MANIFEST_FILE,
-    jobdir.PROMPT_FILE,
-    "input/issue.json",
     jobdir.STATUS_FILE,
     jobdir.TRANSCRIPT_FILE,
     jobdir.VERDICT_FILE,
@@ -144,6 +145,11 @@ def _bundle_files(job: Path, swept_at: str, worker_id: str) -> dict[str, str]:
         content = _read(job / relpath)
         if content is not None:
             files[f"{prefix}/swept-{Path(relpath).name}"] = content
+    # The exact Run input survives interruption too (#52): same relative
+    # paths as a live-pushed bundle, restricted to the enumerated input
+    # paths — the sweep never walks the checkout or anything else.
+    for relpath, content in evidence.input_artifacts(job).items():
+        files[f"{prefix}/{relpath}"] = content
     return files
 
 

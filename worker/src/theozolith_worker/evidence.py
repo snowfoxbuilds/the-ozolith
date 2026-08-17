@@ -19,6 +19,50 @@ from theozolith_worker.gitops import GitError
 EVIDENCE_BRANCH = "theozolith/evidence"
 PUSH_ATTEMPTS = 3
 
+# The Run's exact input, preserved in every bundle (#52): the rendered
+# prompt, the machine-readable issue metadata, and the Context Tree. These
+# enumerated paths are the ONLY things collected recursively — never the
+# checkout, credentials, or unrelated job data.
+INPUT_ARTIFACT_FILES = ("input/issue.json", "input/prompt.md")
+INPUT_ARTIFACT_TREES = ("input/issue", "input/pr")
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def input_artifacts(job: Path) -> dict[str, str]:
+    """The exact input the Run saw, keyed by job-dir-relative path (#52).
+
+    Normal, failed, and boot-swept bundles all embed these files under the
+    same relative paths, so evidence always shows the byte-exact authorized
+    context and prompt supplied to that Run. Collection is restricted to the
+    enumerated input paths; dot-prefixed entries (atomic-write temporaries)
+    and non-regular files are skipped, and whatever is missing (a Run that
+    died before the tree was written) is simply absent."""
+    files: dict[str, str] = {}
+    for relpath in INPUT_ARTIFACT_FILES:
+        content = _read_text(job / relpath)
+        if content is not None:
+            files[relpath] = content
+    for tree in INPUT_ARTIFACT_TREES:
+        root = job / tree
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root)
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if path.is_symlink() or not path.is_file():
+                continue
+            content = _read_text(path)
+            if content is not None:
+                files[str(Path(tree) / relative)] = content
+    return files
+
 
 def run_dir(issue_number: int, run_id: str) -> str:
     return f"runs/issue-{issue_number}/{run_id}"

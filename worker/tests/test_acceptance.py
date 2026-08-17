@@ -331,7 +331,7 @@ def test_escalation_and_human_decision_round(harness: Harness):
     harness.worker_once()
     assert harness.fake.open_pr_numbers() == [pr_number]  # same PR completes
     # The answer reaches the Run through the Context Tree (#52), never the
-    # prompt: the full PR conversation is on disk, unfiltered.
+    # prompt: the authorized PR conversation is on disk in full.
     assert any("Decision: flag A must be ON" in c for c in seen["comments"])
     assert "Decision: flag A must be ON" not in seen["prompt"]
 

@@ -47,6 +47,8 @@ class FakeGitHub:
         self.default_branch = "main"
         self.git_dir = git_dir
         self.tokens: dict[str, str] = {}
+        # login -> author_association stamped on comments/reviews (#52).
+        self.associations: dict[str, str] = {}
         self.issues: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[dict[str, Any]]] = {}
         self.events: dict[int, list[dict[str, Any]]] = {}
@@ -54,6 +56,7 @@ class FakeGitHub:
         self.review_comments: dict[int, list[dict[str, Any]]] = {}
         self.reviews: dict[int, list[dict[str, Any]]] = {}
         self.check_runs: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
+        self.statuses: dict[str, list[dict[str, Any]]] = {}  # keyed by sha
         self._next_number = 1
         self._next_id = 1
         self._tick = 0
@@ -66,8 +69,12 @@ class FakeGitHub:
 
     # -- test setup helpers -------------------------------------------------
 
-    def register(self, token: str, login: str) -> None:
+    def register(self, token: str, login: str, association: str = "MEMBER") -> None:
+        """Register an API actor. Pipeline machine accounts are org MEMBERs
+        in production (the #52 authority boundary requires it), so that is
+        the default association their comments carry."""
         self.tokens[token] = login
+        self.associations[login] = association
 
     def create_issue(self, title: str, body: str, labels: set[str] | None = None) -> int:
         number = self._next_number
@@ -96,39 +103,138 @@ class FakeGitHub:
     def fail_next(self, predicate: Callable[[str, str], bool], responses: list[Response]) -> None:
         self.failures.append((predicate, list(responses)))
 
+    def _association_of(self, login: str | None) -> str:
+        return self.associations.get(login or "", "NONE")
+
+    def add_issue_comment(
+        self,
+        number: int,
+        login: str | None,
+        body: str,
+        association: str | None = None,
+    ) -> int:
+        """A conversation comment (issue or PR) plus its mirrored timeline
+        ``commented`` event — the fake keeps both surfaces in sync the way
+        real GitHub does, so timeline leak-prevention is exercised on every
+        comment. ``login=None`` models a deleted account (``user: null``);
+        ``association=None`` looks the login up in the registry."""
+        comment = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "body": body,
+            "created_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "html_url": f"fake://comment/{self._next_id}",
+        }
+        self._next_id += 1
+        self.comments.setdefault(number, []).append(comment)
+        self.events.setdefault(number, []).append(
+            {**comment, "event": "commented", "actor": comment["user"]}
+        )
+        return comment["id"]
+
     def add_review_comment(
-        self, number: int, login: str, body: str, path: str, line: int | None = None
-    ) -> None:
-        self.review_comments.setdefault(number, []).append(
-            {
-                "id": self._next_id,
-                "user": {"login": login},
-                "body": body,
-                "created_at": self._timestamp(),
-                "path": path,
-                "line": line,
-                "html_url": f"fake://review-comment/{self._next_id}",
-            }
-        )
+        self,
+        number: int,
+        login: str | None,
+        body: str,
+        path: str,
+        line: int | None = None,
+        association: str | None = None,
+        **fields: Any,
+    ) -> int:
+        """An inline review comment; ``fields`` passes anchor extras through
+        verbatim (original_line, start_line, side, commit_id, in_reply_to_id,
+        pull_request_review_id, ...)."""
+        comment = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "body": body,
+            "created_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "path": path,
+            "line": line,
+            "html_url": f"fake://review-comment/{self._next_id}",
+            **fields,
+        }
         self._next_id += 1
+        self.review_comments.setdefault(number, []).append(comment)
+        return comment["id"]
 
-    def add_review(self, number: int, login: str, state: str, body: str = "") -> None:
-        self.reviews.setdefault(number, []).append(
-            {
-                "id": self._next_id,
-                "user": {"login": login},
-                "state": state,
-                "body": body,
-                "submitted_at": self._timestamp(),
-                "html_url": f"fake://review/{self._next_id}",
-            }
-        )
+    def add_review(
+        self,
+        number: int,
+        login: str | None,
+        state: str,
+        body: str = "",
+        association: str | None = None,
+    ) -> int:
+        review = {
+            "id": self._next_id,
+            "user": {"login": login} if login is not None else None,
+            "state": state,
+            "body": body,
+            "submitted_at": self._timestamp(),
+            "author_association": (
+                association if association is not None else self._association_of(login)
+            ),
+            "html_url": f"fake://review/{self._next_id}",
+        }
         self._next_id += 1
+        self.reviews.setdefault(number, []).append(review)
+        return review["id"]
 
-    def add_check_run(self, sha: str, name: str, status: str, conclusion: str = "") -> None:
+    def add_check_run(
+        self,
+        sha: str,
+        name: str,
+        status: str,
+        conclusion: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+    ) -> int:
+        run_id = self._next_id
+        self._next_id += 1
         self.check_runs.setdefault(sha, []).append(
-            {"name": name, "status": status, "conclusion": conclusion, "html_url": ""}
+            {
+                "id": run_id,
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "html_url": "",
+            }
         )
+        return run_id
+
+    def add_status(
+        self,
+        sha: str,
+        context: str,
+        state: str,
+        description: str = "",
+        target_url: str = "",
+        creator: str = "",
+    ) -> int:
+        status_id = self._next_id
+        self._next_id += 1
+        self.statuses.setdefault(sha, []).append(
+            {
+                "id": status_id,
+                "context": context,
+                "state": state,
+                "description": description,
+                "target_url": target_url,
+                "created_at": self._timestamp(),
+                "creator": {"login": creator} if creator else None,
+            }
+        )
+        return status_id
 
     def force_assign(self, number: int, login: str) -> None:
         """Land another actor's concurrent self-assign (race simulation)."""
@@ -268,8 +374,8 @@ class FakeGitHub:
             (r"/pulls/(\d+)/files", self._h_pull_files),
             (r"/pulls/(\d+)/comments", self._h_review_comments),
             (r"/pulls/(\d+)/reviews", self._h_reviews),
-            (r"/pulls/(\d+)/commits", self._h_pull_commits),
             (r"/commits/([^/]+)/check-runs", self._h_check_runs),
+            (r"/commits/([^/]+)/statuses", self._h_statuses),
         ]
 
     @staticmethod
@@ -349,15 +455,8 @@ class FakeGitHub:
     def _h_comments(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
         if method == "POST":
-            comment = {
-                "id": self._next_id,
-                "user": {"login": actor},
-                "body": payload["body"],
-                "created_at": self._timestamp(),
-                "html_url": f"fake://comment/{self._next_id}",
-            }
-            self._next_id += 1
-            self.comments[number].append(comment)
+            comment_id = self.add_issue_comment(number, actor, payload["body"])
+            (comment,) = [c for c in self.comments[number] if c["id"] == comment_id]
             return _json_response(201, comment)
         return _json_response(200, self._page(self.comments[number], params))
 
@@ -369,42 +468,15 @@ class FakeGitHub:
         number = int(match.group(1))
         return _json_response(200, self._page(self.reviews.get(number, []), params))
 
-    def _h_pull_commits(self, actor, method, match, params, payload) -> Response:
-        number = int(match.group(1))
-        if number not in self.pulls:
-            return _json_response(404, {"message": "Not Found"})
-        pr = self.pulls[number]
-        items: list[dict[str, Any]] = []
-        if self.git_dir is not None:
-            log = self._git(
-                [
-                    "log",
-                    "--reverse",
-                    "--format=%H%x01%an%x01%aI%x01%B%x02",
-                    f"refs/heads/{pr['base']}..refs/heads/{pr['head']}",
-                ]
-            )
-            for record in log.split("\x02"):
-                record = record.strip("\n ")
-                if not record:
-                    continue
-                sha, author, date, message = record.split("\x01", 3)
-                items.append(
-                    {
-                        "sha": sha,
-                        "commit": {
-                            "message": message.rstrip("\n"),
-                            "author": {"name": author, "date": date},
-                        },
-                    }
-                )
-        return _json_response(200, self._page(items, params))
-
     def _h_check_runs(self, actor, method, match, params, payload) -> Response:
         ref = urllib.parse.unquote(match.group(1))
         items = self.check_runs.get(ref, [])
         page = self._page(items, params)
         return _json_response(200, {"total_count": len(items), "check_runs": page})
+
+    def _h_statuses(self, actor, method, match, params, payload) -> Response:
+        ref = urllib.parse.unquote(match.group(1))
+        return _json_response(200, self._page(self.statuses.get(ref, []), params))
 
     def _h_pulls(self, actor, method, match, params, payload) -> Response:
         if method == "POST":

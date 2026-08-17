@@ -7,11 +7,13 @@ verdict comment — nothing else survives between Runs (ADR-0008).
 
 Context comes from GitHub at checkout, never from the dispatch grant
 (ADR-0017 as amended, #52): every Run — local retries included — re-reads
-the complete issue and PR context and materializes it as the Context Tree
-under the job dir's ``input/``. The prompt stays slim — rules, the issue
-body, the revised plan on resume rounds, and a navigation guide — and the
-agent discovers everything else in the tree; no discussion content is
-injected and no driver heuristic filters comments.
+the issue and PR context and materializes it as the Context Tree under the
+job dir's ``input/``, filtered to OWNER/MEMBER authors (the authority
+boundary; see contexttree). The prompt stays slim — rules, the issue body,
+the revised plan on resume rounds, and a navigation guide — and the agent
+discovers everything else in the tree; no discussion content is injected
+and no relevance heuristic prunes it: the only filter is the authority
+boundary, which also governs machine-verdict discovery.
 
 The driver never executes repository code or model output (ADR-0013): the
 agent session and every gate step run inside the ephemeral run container,
@@ -48,7 +50,7 @@ import secrets
 import shutil
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from theozolith_worker import (
@@ -125,18 +127,21 @@ needs from you must land in the working tree and the decisions file.
 
 {round_context}## Context tree
 
-The complete issue and PR context — every comment, unfiltered — is on disk \
-at `{job}/input/`, fetched fresh for this Run. Nothing beyond the issue body \
-above is injected into this prompt: navigate the tree instead.
+The issue and PR context — all comments and reviews from the repository's \
+maintainers (authors GitHub reports as OWNER or MEMBER; content from any \
+other author is removed before you see this tree, as a security boundary) — \
+is on disk at `{job}/input/`, fetched fresh for this Run. Within that \
+boundary the tree is complete and untruncated. Nothing beyond the issue \
+body above is injected into this prompt: navigate the tree instead.
 
-- `{job}/input/issue/comments/INDEX.md` — all issue comments, one line \
-each; full text in the numbered files beside the index
+- `{job}/input/issue/comments/INDEX.md` — the maintainer issue comments, \
+one line each; full text in the numbered files beside the index
 - `{job}/input/issue/timeline.md` — issue events (labels, assignments, \
-references)
+renames, references)
 - `{job}/input/pr/` — present only when this Run resumes an existing PR: \
-`body.md`, `conversation/` (PR comments, verdicts included), \
-`review-comments/` (inline file/line comments), `reviews/`, `commits.md`, \
-`checks.md`
+`body.md`, `conversation/` (maintainer PR comments, verdicts included), \
+`review-comments/` (inline file/line comments), `reviews/`, `commits.md` \
+(every PR commit), `checks.md` (check runs and commit statuses)
 
 Read each surface's `INDEX.md` first and open only the items you need. \
 Comments may answer open questions, record human decisions, or narrow the \
@@ -232,7 +237,8 @@ class _RunContext:
 def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | None) -> str:
     """Both round shapes (#52): rules + issue body + the navigation guide,
     plus the revised plan and resume commit on resume rounds. Discussion
-    content is never injected — every comment lives in the Context Tree."""
+    content is never injected — every authorized comment lives in the
+    Context Tree."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
         round_context = REVISED_PLAN_CONTEXT.format(
@@ -493,24 +499,36 @@ def _run_to_pr(
     context.base_branch = gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
     existing_pr = client.find_open_pr_by_head(branch)
     # The grant carried claim authority only (ADR-0017 as amended, #52): the
-    # full issue and PR context is re-read here, fresh, on every Run — local
-    # retries included — and materialized as the Context Tree. The granted
-    # issue snapshot froze at dispatch time; from here on the fresh one is
-    # the issue.
+    # issue and PR context is re-read here, fresh, on every Run — local
+    # retries included — authority-filtered to OWNER/MEMBER authors, and
+    # materialized as the Context Tree. The granted issue snapshot froze at
+    # dispatch time; from here on the fresh one is the issue.
     snapshot = contexttree.fetch_snapshot(client, issue.number, existing_pr)
     issue = snapshot.issue
-    contexttree.write_tree(job / "input", snapshot)
     revised: verdict.Verdict | None = None
     force = False
     if existing_pr is not None:
         report.round = attempts_on(existing_pr.labels) + 1
         report.pr_number = existing_pr.number
         gitops.fetch(workdir, branch, env=auth)
+        # The PR commit snapshot comes from this trusted checkout, not the
+        # 250-capped REST endpoint (#52 amendment) — enumerated at the
+        # fetched PR head, BEFORE any reviewer-designated reset, so the
+        # recorded range is the PR as it stood at checkout no matter where
+        # the branch is reset below.
+        snapshot = replace(
+            snapshot,
+            pr_commits=contexttree.git_pr_commits(
+                workdir, f"origin/{existing_pr.base_ref}", "FETCH_HEAD"
+            ),
+        )
         gitops.checkout_branch(workdir, branch, create=True)
         gitops.reset_hard(workdir, "FETCH_HEAD")
-        # The machine verdict stays a driver-internal reset detail; the
-        # agent reads the full conversation, verdicts included, from the
-        # tree.
+        # The machine verdict stays a driver-internal reset detail, selected
+        # only from the authority-filtered conversation (#52 amendment): a
+        # verdict block in an unauthorized comment can never designate the
+        # resume state. The agent reads the same filtered conversation from
+        # the tree.
         found = verdict.latest_verdict(snapshot.pr_conversation)
         revised = found[0] if found is not None else None
         if revised is not None and revised.resume_commit:
@@ -532,6 +550,7 @@ def _run_to_pr(
             # That state was never Reviewer-designated: overwrite it.
             force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
+    contexttree.write_tree(job / "input", snapshot)
 
     prompt = _build_prompt(issue, report.round, revised)
     jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
@@ -787,6 +806,11 @@ def _push_run_evidence(
         f"{prefix}/transcript.txt": transcript or "(empty)\n",
         f"{prefix}/diffstat.txt": diffstat + "\n",
     }
+    # The exact input the Run saw (#52): prompt, issue metadata, and the
+    # authorized Context Tree, byte-for-byte under their relative paths.
+    files.update(
+        {f"{prefix}/{rel}": content for rel, content in evidence.input_artifacts(job).items()}
+    )
     try:
         evidence.push_bundle(
             config.clone_url,

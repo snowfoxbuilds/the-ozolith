@@ -120,16 +120,27 @@ class PullRequest:
 
 @dataclass(frozen=True)
 class Comment:
+    """A conversation comment (issue or PR). ``author_association`` is
+    GitHub's word on who wrote it (OWNER, MEMBER, COLLABORATOR, ...); the
+    Context Tree's authority filter keys on it (#52 amendment). ``author``
+    is empty when GitHub reports no user (deleted accounts)."""
+
     id: int
     author: str
     body: str
     created_at: str
     url: str = ""
+    author_association: str = ""
 
 
 @dataclass(frozen=True)
 class ReviewComment:
-    """An inline PR review comment, anchored to a file position."""
+    """An inline PR review comment, anchored to a file position.
+
+    Anchors are lossless (#52 amendment): the current line/side pair plus
+    the original-commit anchors, so an outdated comment (``line`` is None)
+    keeps its original position; start-line fields carry multiline ranges,
+    and ``in_reply_to_id``/``review_id`` carry thread and review linkage."""
 
     id: int
     author: str
@@ -138,6 +149,16 @@ class ReviewComment:
     path: str
     line: int | None
     url: str = ""
+    author_association: str = ""
+    original_line: int | None = None
+    start_line: int | None = None
+    original_start_line: int | None = None
+    side: str = ""
+    start_side: str = ""
+    commit_id: str = ""
+    original_commit_id: str = ""
+    in_reply_to_id: int | None = None
+    review_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -150,22 +171,37 @@ class Review:
     body: str
     submitted_at: str
     url: str = ""
-
-
-@dataclass(frozen=True)
-class PrCommit:
-    sha: str
-    author: str
-    authored_at: str
-    message: str
+    author_association: str = ""
+    commit_id: str = ""
 
 
 @dataclass(frozen=True)
 class CheckRun:
+    """One check run on a commit. ``id`` plus the timestamps distinguish
+    reruns and same-named runs from different suites (#52 amendment)."""
+
     name: str
     status: str
     conclusion: str
     url: str = ""
+    id: int = 0
+    started_at: str = ""
+    completed_at: str = ""
+
+
+@dataclass(frozen=True)
+class CommitStatus:
+    """One legacy commit-status event (the pre-Checks CI API). The statuses
+    list endpoint returns every event, superseded ones included; ``id`` and
+    ``created_at`` distinguish reruns of the same context."""
+
+    id: int
+    context: str
+    state: str
+    description: str = ""
+    target_url: str = ""
+    created_at: str = ""
+    creator: str = ""
 
 
 @dataclass(frozen=True)
@@ -175,6 +211,22 @@ class PrFile:
     additions: int
     deletions: int
     patch: str
+
+
+def _login_of(data: dict[str, Any]) -> str:
+    """The payload's author login, defensively: deleted accounts arrive as
+    ``"user": null`` and must parse (the authority filter decides what
+    happens to the item; parsing never crashes a Run)."""
+    user = data.get("user")
+    return (user.get("login") or "") if isinstance(user, dict) else ""
+
+
+def _association_of(data: dict[str, Any]) -> str:
+    return str(data.get("author_association") or "")
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
 
 
 def _issue_from(data: dict[str, Any]) -> Issue:
@@ -343,10 +395,11 @@ class GitHubClient:
         return [
             Comment(
                 id=item["id"],
-                author=item["user"]["login"],
+                author=_login_of(item),
                 body=item.get("body") or "",
                 created_at=item.get("created_at") or "",
                 url=item.get("html_url") or "",
+                author_association=_association_of(item),
             )
             for item in items
         ]
@@ -408,17 +461,27 @@ class GitHubClient:
             self._json("PATCH", self._repo_path(f"/pulls/{number}"), patch)
 
     def list_review_comments(self, number: int) -> list[ReviewComment]:
-        """Every inline (file/line) review comment on the PR."""
+        """Every inline (file/line) review comment on the PR, anchors intact."""
         items = self._paged(self._repo_path(f"/pulls/{number}/comments"))
         return [
             ReviewComment(
                 id=item["id"],
-                author=(item.get("user") or {}).get("login") or "",
+                author=_login_of(item),
                 body=item.get("body") or "",
                 created_at=item.get("created_at") or "",
                 path=item.get("path") or "",
-                line=item["line"] if isinstance(item.get("line"), int) else None,
+                line=_int_or_none(item.get("line")),
                 url=item.get("html_url") or "",
+                author_association=_association_of(item),
+                original_line=_int_or_none(item.get("original_line")),
+                start_line=_int_or_none(item.get("start_line")),
+                original_start_line=_int_or_none(item.get("original_start_line")),
+                side=item.get("side") or "",
+                start_side=item.get("start_side") or "",
+                commit_id=item.get("commit_id") or "",
+                original_commit_id=item.get("original_commit_id") or "",
+                in_reply_to_id=_int_or_none(item.get("in_reply_to_id")),
+                review_id=_int_or_none(item.get("pull_request_review_id")),
             )
             for item in items
         ]
@@ -428,31 +491,25 @@ class GitHubClient:
         return [
             Review(
                 id=item["id"],
-                author=(item.get("user") or {}).get("login") or "",
+                author=_login_of(item),
                 state=item.get("state") or "",
                 body=item.get("body") or "",
                 submitted_at=item.get("submitted_at") or "",
                 url=item.get("html_url") or "",
+                author_association=_association_of(item),
+                commit_id=item.get("commit_id") or "",
             )
             for item in items
         ]
 
-    def pr_commits(self, number: int) -> list[PrCommit]:
-        items = self._paged(self._repo_path(f"/pulls/{number}/commits"))
-        return [
-            PrCommit(
-                sha=item.get("sha") or "",
-                author=(item.get("commit") or {}).get("author", {}).get("name") or "",
-                authored_at=(item.get("commit") or {}).get("author", {}).get("date") or "",
-                message=(item.get("commit") or {}).get("message") or "",
-            )
-            for item in items
-        ]
+    # /pulls/{number}/commits is deliberately NOT a client method: GitHub
+    # caps it at 250 commits. The PR commit snapshot comes from the trusted
+    # driver-side checkout instead (contexttree.git_pr_commits, #52).
 
     def list_check_runs(self, ref: str) -> list[CheckRun]:
         """Check runs for a commit (the PR head), paginated under the
         endpoint's ``check_runs`` wrapper key."""
-        query = urllib.parse.quote(ref)
+        query = urllib.parse.quote(ref, safe="")
         items = self._paged(self._repo_path(f"/commits/{query}/check-runs"), key="check_runs")
         return [
             CheckRun(
@@ -460,6 +517,28 @@ class GitHubClient:
                 status=item.get("status") or "",
                 conclusion=item.get("conclusion") or "",
                 url=item.get("html_url") or "",
+                id=item.get("id") or 0,
+                started_at=item.get("started_at") or "",
+                completed_at=item.get("completed_at") or "",
+            )
+            for item in items
+        ]
+
+    def list_statuses(self, ref: str) -> list[CommitStatus]:
+        """Every legacy commit-status event on a commit, paginated. The list
+        endpoint keeps superseded events; the Context Tree keeps them all,
+        distinguishable by id and timestamp (#52)."""
+        query = urllib.parse.quote(ref, safe="")
+        items = self._paged(self._repo_path(f"/commits/{query}/statuses"))
+        return [
+            CommitStatus(
+                id=item.get("id") or 0,
+                context=item.get("context") or "",
+                state=item.get("state") or "",
+                description=item.get("description") or "",
+                target_url=item.get("target_url") or "",
+                created_at=item.get("created_at") or "",
+                creator=_login_of({"user": item.get("creator")}),
             )
             for item in items
         ]
