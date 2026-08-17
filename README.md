@@ -114,11 +114,14 @@ Then, in the Config Repo:
 1. **Define the worker type** — `worker-types/<type>.toml`: the driver (`builtin:implementer`,
    `builtin:reviewer`, or a custom `drivers/<name>`), `adapter`, `model`, `workspace` (the
    `owner/name` repo it works), the digest-pinned run-image `base` (+ optional `setup`,
-   `knowledge_source`/`knowledge_pin`), and a `[secrets]` table mapping env → secret **names**.
+   `knowledge_source`/`knowledge_pin`), and a `[secrets]` table mapping env → secret **names**
+   (the type's defaults; `""` declares a slot every instantiating Stack must bind).
    See `deploy/configs-example/worker-types/claude-dev.toml` (Implementer) and
    `claude-review.toml` (Reviewer — its **own** GitHub identity, no self-grading).
 2. **Place it with a Stack** — `stacks/<name>.toml`: `worker_type`, `node` (exact node name),
-   `state`, plus an optional `[env]` of per-placement overrides. See
+   `state`, plus optional per-placement bindings (ADR-0047): a `workspace` repointing the
+   target repo, a `[secrets]` table rebinding the type's slots (distinct credentials per
+   Stack — e.g. one machine account per repo), and an `[env]` of expert overrides. See
    `deploy/configs-example/stacks/implementer.toml`. The Implementer/Reviewer resolve to
    **process** Stacks; the Flight Deck resolves to a **container** Stack. (The Control Node is
    never a Stack — a `stacks/control.toml` is rejected at validation, ADR-0035.)

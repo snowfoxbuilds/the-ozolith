@@ -1,6 +1,7 @@
 # The Reviewer as a thin Stack (ADR-0044): its own worker type, its own
 # GitHub identity — no self-grading by construction (ADR-0008). The driver,
-# model, and secrets live in worker-types/claude-review.toml.
+# model, and default bindings live in worker-types/claude-review.toml;
+# rebind `workspace` or `[secrets]` per Stack here (ADR-0047).
 
 worker_type = "claude-review"
 node = "box1"

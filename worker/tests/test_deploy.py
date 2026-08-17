@@ -625,7 +625,7 @@ def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path)
 
     proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
     assert proc.returncode == 1
-    assert "restore the TS_AUTHKEY mapping" in proc.stderr
+    assert "restore the TS_AUTHKEY binding" in proc.stderr
     assert not daemon_calls.exists()  # decided before launching, not after
     assert not tmux_calls.exists()
 

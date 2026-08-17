@@ -20,9 +20,10 @@ def write(tmp_path, relpath: str, text: str) -> None:
     target.write_text(text, encoding="utf-8")
 
 
-def driver_type(tmp_path, name: str = "claude-dev", **fields) -> None:
+def driver_type(tmp_path, name: str = "claude-dev", secrets: dict | None = None, **fields) -> None:
     """A minimal valid driver (pipeline) worker type. ``model`` is required
-    with a driver (ADR-0045); pass ``model=None`` to omit it."""
+    with a driver (ADR-0045); pass ``model=None`` to omit it. ``secrets``
+    becomes the type's ``[secrets]`` table (slot -> stored name)."""
     body = {
         "driver": '"builtin:implementer"',
         "adapter": '"claude"',
@@ -32,6 +33,9 @@ def driver_type(tmp_path, name: str = "claude-dev", **fields) -> None:
         **{k: v for k, v in fields.items()},
     }
     lines = [f"{k} = {v}" for k, v in body.items() if v is not None]
+    if secrets is not None:
+        lines.append("[secrets]")
+        lines.extend(f'{key} = "{value}"' for key, value in secrets.items())
     write(tmp_path, f"worker-types/{name}.toml", "\n".join(lines) + "\n")
 
 
@@ -234,6 +238,208 @@ def test_stack_placeholder_is_not_substituted_on_generic_stack_volumes(tmp_path)
     )
     stack = next(s for s in load_config(tmp_path).stacks if s.name == "plain")
     assert stack.volumes == ("{stack}-data:/data",)  # literal, unresolved
+
+
+# -- per-Stack bindings (ADR-0047) -----------------------------------------------
+
+
+def test_stack_secrets_rebind_a_worker_type_slot(tmp_path):
+    """Two Stacks of one type act as distinct identities by rebinding a slot
+    to different stored secret names — the whole point of ADR-0047."""
+    driver_type(
+        tmp_path,
+        secrets={"GITHUB_TOKEN": "github-implementer", "ANTHROPIC_API_KEY": "anthropic-api-key"},
+    )
+    for name, binding in (("impl-a", "github-impl-a"), ("impl-b", "github-impl-b")):
+        write(
+            tmp_path,
+            f"stacks/{name}.toml",
+            f'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKEN = "{binding}"\n',
+        )
+    config = load_config(tmp_path)
+    by_name = {s.name: s for s in config.stacks}
+    # Rebound slot per Stack; the untouched slot inherits the type default.
+    assert by_name["impl-a"].secrets == {
+        "GITHUB_TOKEN": "github-impl-a",
+        "ANTHROPIC_API_KEY": "anthropic-api-key",
+    }
+    assert by_name["impl-b"].secrets == {
+        "GITHUB_TOKEN": "github-impl-b",
+        "ANTHROPIC_API_KEY": "anthropic-api-key",
+    }
+    # Node scoping unions the RESOLVED bindings (issue #60 invariant #3).
+    assert config.secret_names_for("box1") == {
+        "github-impl-a",
+        "github-impl-b",
+        "anthropic-api-key",
+    }
+
+
+def test_stack_secrets_augment_with_a_new_slot(tmp_path):
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": "github-implementer"})
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nEXTRA_TOKEN = "extra"\n',
+    )
+    config = load_config(tmp_path)
+    stack = next(s for s in config.stacks if s.name == "implementer")
+    assert stack.secrets == {"GITHUB_TOKEN": "github-implementer", "EXTRA_TOKEN": "extra"}
+    assert config.secret_names_for("box1") == {"github-implementer", "extra"}
+
+
+def test_type_empty_secret_declares_a_required_slot(tmp_path):
+    """Type ``ENV = ""`` = a required slot with no default: every
+    instantiating Stack must bind it, and the failure is at config load on
+    the Control Node — never a silent 404 at deploy time."""
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": ""})
+    write(
+        tmp_path,
+        "stacks/bound.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKEN = "github-impl-a"\n',
+    )
+    config = load_config(tmp_path)
+    stack = next(s for s in config.stacks if s.name == "bound")
+    assert stack.secrets == {"GITHUB_TOKEN": "github-impl-a"}
+
+    thin_stack(tmp_path, "unbound", "claude-dev")
+    with pytest.raises(
+        ConfigRepoError, match=r"stacks/unbound\.toml.*GITHUB_TOKEN is a required slot"
+    ):
+        load_config(tmp_path)
+
+
+def test_stack_cannot_unbind_a_required_slot(tmp_path):
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": ""})
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKEN = ""\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"GITHUB_TOKEN is a required slot"):
+        load_config(tmp_path)
+
+
+def test_stack_empty_secret_unbinds_an_inherited_default(tmp_path):
+    """Stack ``ENV = ""`` = deliberate per-placement unbind of a type
+    default — e.g. dropping TS_AUTHKEY for one enrolled Flight Deck while
+    its siblings keep enrolling."""
+    driver_type(
+        tmp_path,
+        secrets={"GITHUB_TOKEN": "github-implementer", "TS_AUTHKEY": "enroll-key"},
+    )
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nTS_AUTHKEY = ""\n',
+    )
+    config = load_config(tmp_path)
+    stack = next(s for s in config.stacks if s.name == "implementer")
+    assert stack.secrets == {"GITHUB_TOKEN": "github-implementer"}
+    assert config.secret_names_for("box1") == {"github-implementer"}
+
+
+def test_stack_empty_secret_for_undeclared_slot_is_rejected(tmp_path):
+    """An empty binding for a slot the type never declares is a typo, not an
+    unbind — fail loud with the slot name."""
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": "github-implementer"})
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKN = ""\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"GITHUB_TOKN.*does not declare"):
+        load_config(tmp_path)
+
+
+def test_dormant_type_with_required_slots_loads(tmp_path):
+    """A required slot is only decidable per instantiation — a type with no
+    Stacks is a legitimate template and loads."""
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": ""})
+    assert "claude-dev" in load_config(tmp_path).worker_types
+
+
+@pytest.mark.parametrize(
+    "slot",
+    ["THEOZOLITH_MODEL", "THEOZOLITH_ADAPTER", "THEOZOLITH_RUN_IMAGE", "THEOZOLITH_RUN_IMAGE_FILE"],
+)
+@pytest.mark.parametrize("site", ["worker-type", "stack"])
+def test_reserved_secret_slot_names_are_rejected(tmp_path, site, slot):
+    """A secret slot materializes <slot>_FILE, which the worker reads FIRST —
+    a slot named after a baked identity field is the same hijack the [env]
+    guard rejects (ADR-0045), at either declaration site."""
+    if site == "worker-type":
+        driver_type(tmp_path, secrets={slot: "some-name"})
+        thin_stack(tmp_path, "implementer", "claude-dev")
+    else:
+        driver_type(tmp_path)
+        write(
+            tmp_path,
+            "stacks/implementer.toml",
+            f'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\n{slot} = "some-name"\n',
+        )
+    with pytest.raises(ConfigRepoError, match=rf"\[secrets\] {slot} is reserved.*_FILE"):
+        load_config(tmp_path)
+
+
+def test_stack_workspace_overrides_the_type(tmp_path):
+    """The target repo is a per-placement binding too (ADR-0047): one type,
+    N repos, each Stack picking its own."""
+    driver_type(tmp_path)  # workspace = "acme/sandbox" default
+    thin_stack(tmp_path, "impl-other", "claude-dev", workspace='"acme/other"')
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "impl-other")
+    assert stack.env["THEOZOLITH_REPO"] == "acme/other"
+
+
+def test_workspaceless_driver_type_requires_a_stack_workspace(tmp_path):
+    """A driver type with no default workspace is a multi-repo template —
+    every instantiating Stack must bind the repo, fail-loud at load."""
+    driver_type(tmp_path, workspace=None)
+    thin_stack(tmp_path, "bound", "claude-dev", workspace='"acme/other"')
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "bound")
+    assert stack.env["THEOZOLITH_REPO"] == "acme/other"
+
+    thin_stack(tmp_path, "unbound", "claude-dev")
+    with pytest.raises(ConfigRepoError, match=r"stacks/unbound\.toml.*driver but no workspace"):
+        load_config(tmp_path)
+
+
+def test_dormant_workspaceless_driver_type_loads(tmp_path):
+    driver_type(tmp_path, workspace=None)
+    assert "claude-dev" in load_config(tmp_path).worker_types
+
+
+def test_stack_workspace_shape_is_validated(tmp_path):
+    driver_type(tmp_path)
+    thin_stack(tmp_path, "implementer", "claude-dev", workspace='"justname"')
+    with pytest.raises(ConfigRepoError, match=r"stacks/implementer\.toml.*must be owner/name"):
+        load_config(tmp_path)
+
+
+def test_driverless_stack_workspace_override(tmp_path):
+    """Uniform binding: a driverless (Flight Deck) Stack overrides the repo
+    the same way; with neither side set, THEOZOLITH_REPO stays absent."""
+    write(tmp_path, "worker-types/flightdeck.toml", f'base = "{BASE}"\n')
+    thin_stack(tmp_path, "deck-a", "flightdeck", workspace='"acme/other"')
+    thin_stack(tmp_path, "deck-b", "flightdeck")
+    config = load_config(tmp_path)
+    by_name = {s.name: s for s in config.stacks}
+    assert by_name["deck-a"].env == {"THEOZOLITH_REPO": "acme/other"}
+    assert "THEOZOLITH_REPO" not in by_name["deck-b"].env
+
+
+def test_stack_env_repo_still_wins_over_stack_workspace(tmp_path):
+    """[env] stays the last-word expert channel (unchanged by ADR-0047):
+    the typed workspace binding seeds THEOZOLITH_REPO, [env] overrides it."""
+    driver_type(tmp_path)
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\nworkspace = "acme/other"\n'
+        '[env]\nTHEOZOLITH_REPO = "acme/expert"\n',
+    )
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "implementer")
+    assert stack.env["THEOZOLITH_REPO"] == "acme/expert"
 
 
 # -- CRITICAL: derived-image identity (ADR-0044 as amended by ADR-0045) ----------
@@ -444,13 +650,19 @@ def test_custom_driver_name_must_be_a_python_identifier(tmp_path, bad):
         load_config(tmp_path)
 
 
-def test_driver_requires_workspace(tmp_path):
+def test_driver_stack_requires_a_resolved_workspace(tmp_path):
+    """The driver⇒workspace requirement moved from type parse to per-Stack
+    resolution (ADR-0047): a workspace-less driver type is a legal multi-repo
+    template; a Stack instantiating it without binding one fails at load."""
     write(
         tmp_path,
         "worker-types/i.toml",
-        f'driver = "builtin:implementer"\nbase = "{BASE}"\n',
+        f'driver = "builtin:implementer"\nmodel = "claude-sonnet-5"\nbase = "{BASE}"\n',
     )
-    with pytest.raises(ConfigRepoError, match=r"'workspace'.*required when a driver is set"):
+    load_config(tmp_path)  # dormant: loads
+
+    thin_stack(tmp_path, "implementer", "i")
+    with pytest.raises(ConfigRepoError, match=r"driver but no workspace.*worker-types/i\.toml"):
         load_config(tmp_path)
 
 

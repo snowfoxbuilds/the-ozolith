@@ -174,7 +174,7 @@ A deployment shape where the Control Node and one Container-Host share a physica
 
 **Stack**
 
-A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state. Two workload kinds: container (image or compose file plus overlays) and process (a native command from the product or config distribution, run as a supervised Node Daemon child — how worker drivers deploy; ADR-0042). Built-in Stacks (worker, reviewer) and user-defined Stacks (e.g. a script runner) share the same format. The Control Node is never a Stack — it always runs as its own systemd unit on every deployment shape (2026-08-04).
+A declarative unit of workload the Node Daemon runs: name, workload, placement, desired state, plus optional per-placement bindings — env, workspace, and secret-slot rebindings (ADR-0047). Two workload kinds: container (image or compose file plus overlays) and process (a native command from the product or config distribution, run as a supervised Node Daemon child — how worker drivers deploy; ADR-0042). Built-in Stacks (worker, reviewer) and user-defined Stacks (e.g. a script runner) share the same format. The Control Node is never a Stack — it always runs as its own systemd unit on every deployment shape (2026-08-04).
 
 *Avoid*: "role" (legacy Home Server term); a control Stack kind (deleted 2026-08-04 — the substrate never supervises its own control plane).
 
@@ -192,9 +192,9 @@ The base abstraction for every automated pipeline actor (redefined 2026-07-21; A
 
 **Worker-Type Definition**
 
-The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source, driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, model + reasoning effort (typed fields; grilling 2026-08-10), workspace (target repo), and secret names. Compiled into a derived image at config change — the compiler materializes model and reasoning effort into the tool's native config at build (never hand-written in setup instructions, never selected at invocation), and the build fails on a model the adapter cannot map. Instantiated by a thin worker Stack (worker type + placement + desired state).
+The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source, driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, model + reasoning effort (typed fields; grilling 2026-08-10), workspace (target repo), and secret names. Compiled into a derived image at config change — the compiler materializes model and reasoning effort into the tool's native config at build (never hand-written in setup instructions, never selected at invocation), and the build fails on a model the adapter cannot map. Instantiated by a thin worker Stack (worker type + placement + desired state, plus optional per-placement bindings).
 
-*Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers); "harness" as a field (the adapter is the variable; the harness is product plumbing); setting the model via setup instructions, env vars, or invocation flags (it is a typed field, baked at build).
+*Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers) — per-Stack workspace/secret bindings are the enumerated exception (ADR-0047), identity fields never move; "harness" as a field (the adapter is the variable; the harness is product plumbing); setting the model via setup instructions, env vars, or invocation flags (it is a typed field, baked at build).
 
 **Workflow**
 
@@ -222,7 +222,7 @@ A configuration that involves multiple agents working together.
 - The Flight Deck is a human-driven, credentialed, interactive agent container Stack; it never claims issues and holds no transition authority.
 - The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
 - A worker-type definition names exactly one driver: `builtin:<name>` from the product distribution or `drivers/<name>` from the Config Distribution (ADR-0042).
-- A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, model + reasoning effort, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09; model/effort fields added 2026-08-10).
+- A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, model + reasoning effort, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09; model/effort fields added 2026-08-10); workspace and secret bindings are per-Stack overridable (ADR-0047).
 - The heartbeat/command channel carries desired state, references, and advisory telemetry (typed, size-capped, never coordination authority; ADR-0016); the only secret payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
 - Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision), failed + needs_human (on the issue: execution failure escalated with evidence; only the human removes failed, and failed overrides plan_ready at dispatch — ADR-0016). Issues and PRs carry separate label sets; each actor polls exactly one label.
 - TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content lives in one private config repo (ADR-0007) — declarations and knowledge as data, plus custom driver code under `drivers/` (ADR-0042).

@@ -166,6 +166,15 @@ Stacks and worker types on top, never below.
    (`/run/theozolith/secrets`, `/run/secrets/<name>` inside containers) and wired via
    `<ENV>_FILE`. Never on node disk.
 
+   The worker type's `[secrets]` declares the **slots** (env names) with optional
+   default store-names; a Stack may **rebind** any slot per placement in its own
+   `[secrets]` table (ADR-0047) — how two Stacks of one type act as distinct
+   identities, e.g. one GitHub machine account per target repository. On the type,
+   `SLOT = ""` declares a required slot every instantiating Stack must bind
+   (fail-loud at config load); on the Stack, `SLOT = ""` unbinds an inherited
+   default. Values stay one-per-name in the store — distinctness comes from
+   distinct names (`theozolith secret set github-impl-a`, `… github-impl-b`).
+
    A Claude worker authenticates the model with **either** a workspace API key
    (`ANTHROPIC_API_KEY`) **or** a subscription OAuth token
    (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`) — map whichever you have in
@@ -177,7 +186,9 @@ Stacks and worker types on top, never below.
    set <name>` stores the new value, but a running driver read its credential once at
    startup and injects it into each Run container it launches — there is **no
    hot-reload**. Recycle the affected driver Stack so its next Runs pick up the
-   replacement (in-flight Runs finish on the old value):
+   replacement (in-flight Runs finish on the old value). With per-Stack bindings,
+   rotating one identity touches only the Stacks bound to that name — recycle those,
+   the siblings never notice:
 
    ```sh
    theozolith command recycle --node <node> --target <stack>

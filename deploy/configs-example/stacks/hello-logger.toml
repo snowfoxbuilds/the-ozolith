@@ -1,5 +1,6 @@
 # The custom driver as a thin Stack (ADR-0044): worker type + placement +
-# desired state, nothing else. Staged at state = "stopped" — nothing deploys or
+# desired state (+ optional per-placement `workspace`/`[secrets]` bindings,
+# ADR-0047). Staged at state = "stopped" — nothing deploys or
 # builds until you flip it to "running" and commit (ADR-0037). The resolved kind
 # is process (the worker type has a driver), so there is no `attach` key; run
 # containers are headless and never attach targets (ADR-0019).

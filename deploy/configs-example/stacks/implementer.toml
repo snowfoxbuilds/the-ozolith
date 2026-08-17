@@ -1,8 +1,10 @@
 # The Implementer as a thin Stack (ADR-0044): worker type + placement +
-# desired state, nothing else. Everything that defines the worker — driver,
-# adapter, model, workspace, secrets, run image — lives in the worker type
-# (worker-types/claude-dev.toml). Copy this tree into your Config Repo
-# (default ~/.theozolith/configs on the Control Node) and adjust.
+# desired state, plus optional per-placement bindings (ADR-0047). The
+# worker's identity — driver, adapter, model, run image — lives in the
+# worker type (worker-types/claude-dev.toml); the Stack may rebind the
+# target repo and the type's secret slots for THIS placement. Copy this
+# tree into your Config Repo (default ~/.theozolith/configs on the Control
+# Node) and adjust.
 #
 # No `attach` key: the resolved kind is process (the type has a driver), and
 # run containers are headless and never attach targets (ADR-0019).
@@ -11,6 +13,13 @@
 worker_type = "claude-dev"
 node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
 state = "running"
+
+# Optional per-placement bindings (ADR-0047): repoint the target repo and
+# rebind secret slots — how several Stacks of ONE type each work a different
+# repository as their own machine account, no type cloning, no rebuild.
+# workspace = "acme/other-repo"
+# [secrets]
+# GITHUB_TOKEN = "github-impl-box1"
 
 # Optional [env] = per-placement expert overrides (they win over the values
 # the worker type injects).
