@@ -499,13 +499,12 @@ def test_review_thread_pagination_is_uncapped():
     assert big_thread.is_resolved
 
 
-def test_timeline_identity_fields_and_cross_reference_title_gate(tmp_path):
+def test_timeline_identity_fields_and_cross_reference_titles(tmp_path):
     """Recognized kinds keep their documented event-specific fields (label
     color, assigner, review requester) plus the common event id; a
-    cross-reference's repo/number/state/URL identity always renders, but its
-    title — third-party content — renders only for a same-repo source whose
-    author passes the authority boundary. Cross-repo titles are withheld
-    even with an authorized-looking association."""
+    cross-reference renders its full identity INCLUDING the title whenever
+    GitHub provides it — titles are issue/PR metadata, not comment content,
+    so the comment-authority boundary does not apply, same-repo or not."""
 
     def crossref(event_id, repo_name, title, association, state="open"):
         return {
@@ -549,11 +548,11 @@ def test_timeline_identity_fields_and_cross_reference_title_gate(tmp_path):
             "requested_reviewer": {"login": "ozolith-reviewer"},
             "review_requester": {"login": "sean"},
         },
-        crossref(201, "acme/sandbox", "SAME-REPO-AUTHORIZED-TITLE", "OWNER"),
-        crossref(202, "acme/sandbox", "SAME-REPO-UNAUTHORIZED-TITLE", "NONE", state="closed"),
-        crossref(203, "evil/elsewhere", "CROSS-REPO-TITLE", "OWNER"),
+        crossref(201, "acme/sandbox", "SAME-REPO-MEMBER-TITLE", "OWNER"),
+        crossref(202, "acme/sandbox", "SAME-REPO-NON-MEMBER-TITLE", "NONE", state="closed"),
+        crossref(203, "other/elsewhere", "CROSS-REPO-TITLE", "OWNER"),
     ]
-    snapshot = ContextSnapshot(issue=_full_snapshot().issue, timeline=timeline, repo="acme/sandbox")
+    snapshot = ContextSnapshot(issue=_full_snapshot().issue, timeline=timeline)
     contexttree.write_tree(tmp_path, snapshot)
     text = (tmp_path / "issue" / "timeline.md").read_text()
 
@@ -561,12 +560,12 @@ def test_timeline_identity_fields_and_cross_reference_title_gate(tmp_path):
     assert "assignee: worker; assigner: control" in text
     assert "reviewer: ozolith-reviewer" in text and "requested-by: sean" in text
     assert "event-id: 91" in text and "event-id: 92" in text and "event-id: 93" in text
-    # Identity always; content only inside the boundary.
-    assert "title: SAME-REPO-AUTHORIZED-TITLE" in text
-    assert "SAME-REPO-UNAUTHORIZED-TITLE" not in text
-    assert "CROSS-REPO-TITLE" not in text
+    # Titles render regardless of source repo or source author association.
+    assert "title: SAME-REPO-MEMBER-TITLE" in text
+    assert "title: SAME-REPO-NON-MEMBER-TITLE" in text
+    assert "title: CROSS-REPO-TITLE" in text
     assert "number: 202" in text and "state: closed" in text
-    assert "repository: evil/elsewhere" in text and "number: 203" in text
+    assert "repository: other/elsewhere" in text and "number: 203" in text
 
 
 def test_timeline_is_lossless_and_authority_filtered(tmp_path):

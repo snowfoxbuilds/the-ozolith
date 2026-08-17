@@ -29,11 +29,11 @@ filter is applied at fetch time (so the driver's machine-verdict discovery
 obeys the same boundary) AND again at serialization (so no producer of a
 snapshot can leak past it). No trace includes linkage: an authorized reply
 never names an unauthorized parent (``in-reply-to`` is emitted only when the
-referenced comment is itself authorized), review-thread state attaches only
-to authorized comments (an all-unauthorized thread vanishes entirely), and a
-cross-reference's title — third-party content, unlike its repo/number/URL
-identity — renders only for same-repo sources whose author passes the same
-boundary.
+referenced comment is itself authorized), and review-thread state attaches
+only to authorized comments (an all-unauthorized thread vanishes entirely).
+The boundary covers comments, reviews, and embedded comment/review payloads
+— and nothing else: issue/PR metadata such as a cross-referenced item's
+title is not comment content and renders whenever GitHub provides it.
 
 Within that boundary the tree is lossless and uncapped: authorized content
 is never summarized or truncated — verdict machine blocks included — and PR
@@ -120,10 +120,6 @@ class ContextSnapshot:
     # only for authorized comments at serialization, so an all-unauthorized
     # thread leaves no trace.
     pr_review_threads: list[ReviewThread] = field(default_factory=list)
-    # The snapshot's repo (owner/name): the cross-reference title gate needs
-    # it — an author association only means anything in OUR repo. Empty on
-    # hand-built snapshots, which therefore fail closed (titles withheld).
-    repo: str = ""
 
 
 def authorized(items: Iterable) -> list:
@@ -148,9 +144,7 @@ def fetch_snapshot(
     comments = authorized(client.list_comments(issue_number))
     timeline = client.list_timeline(issue_number)
     if pr is None:
-        return ContextSnapshot(
-            issue=issue, issue_comments=comments, timeline=timeline, repo=client.repo
-        )
+        return ContextSnapshot(issue=issue, issue_comments=comments, timeline=timeline)
     return ContextSnapshot(
         issue=issue,
         issue_comments=comments,
@@ -162,7 +156,6 @@ def fetch_snapshot(
         pr_checks=client.list_check_runs(pr.head_sha),
         pr_statuses=client.list_statuses(pr.head_sha),
         pr_review_threads=client.list_review_threads(pr.number),
-        repo=client.repo,
     )
 
 
@@ -380,24 +373,20 @@ def _payload_author(payload: dict[str, Any]) -> str:
 # identity fields (id/actor/timestamp/commit); an UNMAPPED kind fails
 # closed — its payload is withheld, because an unrecognized future event
 # could embed comment content the authority filter has not classified.
-def _cross_reference_details(event: dict[str, Any], repo: str) -> list[tuple[str, object]]:
-    """Full cross-reference identity (kind, repository, number, state, URL).
-    The referencing item's TITLE is third-party content, not identity: it
-    renders only when the source lives in this repo AND its author passes
-    the comment-authority boundary — a foreign repo's associations mean
-    nothing here, so cross-repo titles are always withheld (fail closed)."""
+def _cross_reference_details(event: dict[str, Any]) -> list[tuple[str, object]]:
+    """Full cross-reference identity — kind, repository, number, title,
+    state, URL. The title is issue/PR metadata, not comment content, so the
+    comment-authority boundary does not apply: it renders whenever GitHub
+    provides it, same-repo or not."""
     source = (event.get("source") or {}).get("issue") or {}
-    same_repo = bool(repo) and (source.get("repository") or {}).get("full_name") == repo
-    details: list[tuple[str, object]] = [
+    return [
         ("kind", "pull request" if "pull_request" in source else "issue"),
         ("repository", (source.get("repository") or {}).get("full_name")),
         ("number", source.get("number")),
+        ("title", source.get("title")),
         ("state", source.get("state")),
         ("url", source.get("html_url")),
     ]
-    if same_repo and _payload_authorized(source):
-        details.insert(3, ("title", source.get("title")))
-    return details
 
 
 def _label_details(e: dict[str, Any]) -> list[tuple[str, object]]:
@@ -432,6 +421,7 @@ _EVENT_DETAILS: dict[str, Any] = {
         ("team", (e.get("requested_team") or {}).get("name")),
         ("requested-by", (e.get("review_requester") or {}).get("login")),
     ],
+    "cross-referenced": _cross_reference_details,
     "locked": lambda e: [("reason", e.get("lock_reason"))],
     "closed": lambda e: [("state_reason", e.get("state_reason"))],
     # Commit messages/authors are NOT taken from the timeline: commits.md,
@@ -524,21 +514,18 @@ def _timeline_comment_entry(kind: str, event: dict[str, Any]) -> list[str] | Non
     return lines
 
 
-def _timeline_entry(event: dict[str, Any], repo: str) -> list[str] | None:
+def _timeline_entry(event: dict[str, Any]) -> list[str] | None:
     kind = str(event.get("event") or "unknown")
     if kind in _COMMENT_EVENTS:
         return _timeline_comment_entry(kind, event)
     actor = (event.get("actor") or {}).get("login") or ""
     when = event.get("created_at") or ""
     head = "- " + " ".join(p for p in (when, kind, f"by {actor}" if actor else "") if p)
-    if kind == "cross-referenced":
-        details = _cross_reference_details(event, repo)
+    maker = _EVENT_DETAILS.get(kind)
+    if maker is None:
+        details = [("note", "unrecognized event type; payload withheld (authority unknown)")]
     else:
-        maker = _EVENT_DETAILS.get(kind)
-        if maker is None:
-            details = [("note", "unrecognized event type; payload withheld (authority unknown)")]
-        else:
-            details = list(maker(event))
+        details = list(maker(event))
     # The safe common identity fields every rendered event keeps: its id and
     # the commit it points at (kind/actor/timestamp are on the head line).
     details.append(("commit", event.get("commit_id")))
@@ -547,8 +534,8 @@ def _timeline_entry(event: dict[str, Any], repo: str) -> list[str] | None:
     return [head + (f" — {rendered}" if rendered else "")]
 
 
-def _timeline_md(timeline: list[dict[str, Any]], repo: str) -> str:
-    entries = [entry for event in timeline if (entry := _timeline_entry(event, repo)) is not None]
+def _timeline_md(timeline: list[dict[str, Any]]) -> str:
+    entries = [entry for event in timeline if (entry := _timeline_entry(event)) is not None]
     lines = [f"# Issue timeline ({len(entries)})", ""]
     lines += [line for entry in entries for line in entry] or ["(none)"]
     return "\n".join(lines) + "\n"
@@ -635,7 +622,7 @@ def write_tree(input_dir: Path, snapshot: ContextSnapshot) -> None:
         "Issue comments",
         _comment_items(authorized(snapshot.issue_comments), "Issue comment"),
     )
-    _write(issue_root, "timeline.md", _timeline_md(snapshot.timeline, snapshot.repo))
+    _write(issue_root, "timeline.md", _timeline_md(snapshot.timeline))
 
     if snapshot.pr is None:
         return
