@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): `configs/` changes role from human-managed source to the machine-owned PINNED BUILD, committed only by `theozolith config ingest`; it stays in the durable git class (resolved pins are underivable decisions — re-ingesting an old source commit is not a rollback) and `recover` restores it unchanged.
 
 Date: 2026-07-27
 
