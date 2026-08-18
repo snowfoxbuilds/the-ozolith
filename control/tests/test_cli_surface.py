@@ -122,6 +122,25 @@ def test_config_ingest_dispatches_with_the_default_source(monkeypatch, tmp_path)
     assert calls[1][0] == "https://example.invalid/config.git"
 
 
+def test_config_ingest_dry_run_flag_dispatches(monkeypatch, tmp_path):
+    """`config ingest --dry-run` (the config linter) threads the flag through
+    and skips the partition-ownership repair — a dry run changes nothing."""
+    from theozolith_control import cli, ingest
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path / "home"))
+    calls = []
+    monkeypatch.setattr(
+        ingest, "ingest", lambda source, pinned, **kw: calls.append(kw.get("dry_run")) or None
+    )
+
+    def no_repair(settings):
+        raise AssertionError("a dry run must not repair partition ownership")
+
+    monkeypatch.setattr(cli, "_repair_partition_ownership", no_repair)
+    assert cli_main(["config", "ingest", "--dry-run"]) == 0
+    assert calls == [True]
+
+
 def test_config_migrate_dispatches_with_deployment_defaults(monkeypatch, tmp_path):
     """`theozolith config migrate` (ADR-0048 amendment): no arguments ->
     legacy = the deployment's configs/ (the future pinned build), dest = the

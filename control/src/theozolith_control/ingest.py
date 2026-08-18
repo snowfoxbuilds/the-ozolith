@@ -30,6 +30,19 @@ distributes. This module is the ONLY path between them:
    running server observes the new commit within one heartbeat; only
    ``control.toml`` tier-2 settings keep their documented restart requirement.
 
+A DRY RUN (``theozolith config ingest --dry-run``) is the config LINTER: the
+identical pipeline through the lint step — every refusal above fires the
+same — followed by a PREVIEW of what the commit would change (per-file
+adds/updates/deletes, would-be re-tags, ``control.toml`` and product-version
+movement) instead of the commit itself. The preview writes NOTHING into the
+pinned build, not even loose objects: the staged tree is hashed through a
+throwaway object directory and diffed against HEAD via git's alternates
+mechanism. Two deliberate deviations, both reported loudly in the notes: a
+dirty LOCAL git source is previewed from its working tree (linting
+uncommitted edits is the dry run's home case — a real ingest still
+refuses), and the ignored-leftover purge and pending-marker repair are
+reported, never performed.
+
 The whole transaction — from the initial clean check through the commit and
 working-tree publish — runs under the exclusive pinned-build WRITE LOCK
 (``repolock``), shared with every other supported writer of ``configs/``
@@ -89,6 +102,10 @@ _SKIP_TOP_LEVEL = (".git", configdist.KNOWLEDGE_DIR, controltoml.CONTROL_TOML)
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
+# git's well-known empty tree object — always resolvable without existing on
+# disk; the preview's diff base when the pinned build is unborn or missing.
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 # Manifest media types a registry may serve for a tag; the digest of whichever
 # the registry canonically serves IS the pin `docker pull <ref>@<digest>`
 # resolves.
@@ -112,15 +129,24 @@ class IngestReport:
 
     source_commit: str = ""
     pinned_commit: str = ""  # the pinned build's new HEAD ("" when unchanged)
-    changed: bool = False
+    changed: bool = False  # in a dry run: whether a real ingest WOULD commit
     resolved_bases: dict[str, str] = field(default_factory=dict)  # ref -> digest
     knowledge_pins: dict[str, str] = field(default_factory=dict)  # tree -> hash
     retagged: dict[str, tuple[str, str]] = field(default_factory=dict)  # type -> (old, new)
     notes: list[str] = field(default_factory=list)
+    dry_run: bool = False  # lint + preview only — nothing was committed
+    changes: list[str] = field(default_factory=list)  # dry run: per-file preview
 
     def summary(self) -> str:
         lines = [f"source commit: {self.source_commit}"]
-        if self.changed:
+        if self.dry_run:
+            lines.append("DRY RUN — lint and preview only, nothing was committed")
+            if self.changed:
+                lines.append(f"ingest would commit {len(self.changes)} change(s):")
+                lines.extend(f"  {change}" for change in self.changes)
+            else:
+                lines.append("ingest would be a no-op (pinned build already up to date)")
+        elif self.changed:
             lines.append(f"pinned build committed: {self.pinned_commit}")
         else:
             lines.append("pinned build unchanged (already up to date)")
@@ -128,8 +154,9 @@ class IngestReport:
             lines.append(f"resolved base {ref} -> {digest[:19]}…")
         for name, tree_hash in sorted(self.knowledge_pins.items()):
             lines.append(f"knowledge/{name} pinned {tree_hash[:12]}")
+        retag_verb = "would re-tag" if self.dry_run else "re-tagged"
         for name, (old, new) in sorted(self.retagged.items()):
-            lines.append(f"worker type {name} re-tagged: {old or '(new)'} -> {new}")
+            lines.append(f"worker type {name} {retag_verb}: {old or '(new)'} -> {new}")
         lines.extend(self.notes)
         return "\n".join(lines)
 
@@ -235,8 +262,14 @@ def _folder_commit(root: Path) -> str:
     return f"folder-{digest.hexdigest()[:12]}"
 
 
-def _harvest_source(source: str, workdir: Path, runner) -> tuple[Path, str]:
-    """The source tree to stage from, plus its provenance stamp."""
+def _harvest_source(
+    source: str, workdir: Path, runner, *, dirty_ok: bool = False
+) -> tuple[Path, str, bool]:
+    """The source tree to stage from, its provenance stamp, and whether the
+    stamp covers an uncommitted WORKING TREE — only ever True under
+    ``dirty_ok`` (the dry run previews uncommitted local edits under a folder
+    content stamp; a real ingest refuses them — the stamp it commits must be
+    truthful)."""
     if _is_git_url(source):
         clone = workdir / "source"
         proc = runner(
@@ -248,26 +281,31 @@ def _harvest_source(source: str, workdir: Path, runner) -> tuple[Path, str]:
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()[:300]
             raise IngestError(f"cannot clone Config Repo {source}: {detail}")
-        return clone, _require_git(["rev-parse", "HEAD"], clone, runner, source)
+        return clone, _require_git(["rev-parse", "HEAD"], clone, runner, source), False
     root = Path(source).expanduser()
     if not root.is_dir():
         raise IngestError(f"Config Repo {source} is not a directory (or a git URL)")
     if (root / ".git").exists():
         dirty = _require_git(["status", "--porcelain"], root, runner, str(root))
-        if dirty:
+        if dirty and not dirty_ok:
             raise IngestError(
                 f"Config Repo {root} has uncommitted changes — commit them first;"
                 " the pinned build stamps the source commit, so the stamp must"
                 " be truthful (ADR-0048):\n" + dirty
             )
+        if dirty:
+            try:
+                return root, _folder_commit(root), True
+            except configdist.ConfigDistError as exc:
+                raise IngestError(f"cannot hash Config Repo folder {root}: {exc}") from exc
         head = _run_git(["rev-parse", "HEAD"], root, runner)
         if head.returncode == 0:
-            return root, (head.stdout or "").strip()
+            return root, (head.stdout or "").strip(), False
         # A clean repo with no commits yet (init just scaffolded an empty
         # Config Repo): harvest it as the (empty) folder it is.
-        return root, _folder_commit(root)
+        return root, _folder_commit(root), False
     try:
-        return root, _folder_commit(root)
+        return root, _folder_commit(root), False
     except configdist.ConfigDistError as exc:
         raise IngestError(f"cannot hash Config Repo folder {root}: {exc}") from exc
 
@@ -496,6 +534,52 @@ def _commit_staging(
     return _require_git(commit_args, pinned_dir, runner, str(pinned_dir))
 
 
+def _preview_changes(staging: Path, pinned_dir: Path, work: Path, runner, parent: str) -> list[str]:
+    """What a commit of the staged tree would change relative to ``parent``
+    (the committed HEAD; ``""`` = unborn or no pinned build at all), as
+    ``git diff-tree`` name-status lines — ``[]`` means a real ingest would be
+    a no-op. The staged tree is hashed EXACTLY as ``_commit_staging`` would
+    hash it (same throwaway index, same forced add, git's own mode
+    normalization — the identical tree object id) but NOT ONE BYTE lands in
+    the pinned build: blobs and trees go to a throwaway object directory in
+    the workdir, and the pinned build's own objects are readable through
+    git's alternates mechanism."""
+    throwaway = work / "preview-git"
+    throwaway.mkdir()
+    what = f"{pinned_dir} (dry run)"
+    _require_git(["init", "--quiet"], throwaway, runner, what)
+    objects = work / "preview-objects"
+    objects.mkdir()
+    env = {
+        "GIT_INDEX_FILE": str(work / "preview-index"),
+        "GIT_OBJECT_DIRECTORY": str(objects),
+    }
+    pinned_objects = pinned_dir / ".git" / "objects"
+    if pinned_objects.is_dir():
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(pinned_objects.resolve())
+    scoped = ["--git-dir", str((throwaway / ".git").resolve()), "--work-tree", "."]
+    _require_git([*scoped, "add", "-A", "--force"], staging, runner, what, env=env)
+    tree = _require_git([*scoped, "write-tree"], staging, runner, what, env=env)
+    base = _EMPTY_TREE
+    if parent:
+        base = _require_git(
+            [*scoped, "rev-parse", f"{parent}^{{tree}}"], staging, runner, what, env=env
+        )
+    if base == tree:
+        return []
+    diff = _require_git(
+        [*scoped, "diff-tree", "-r", "--name-status", base, tree], staging, runner, what, env=env
+    )
+    verbs = {"A": "add", "M": "update", "D": "delete", "T": "replace"}
+    changes = []
+    for line in diff.splitlines():
+        if "\t" not in line:
+            continue
+        letter, _, path = line.partition("\t")
+        changes.append(f"{verbs.get(letter, letter)} {path}")
+    return changes
+
+
 def _tags_of(repo_dir: Path) -> dict[str, str]:
     """Worker-type tags of a loadable tree; {} when it does not load (a fresh
     or broken pinned build must not block reporting)."""
@@ -517,21 +601,34 @@ def ingest(
     pinned_dir: Path,
     *,
     resolve_digest: Callable[[str], str] | None = None,
+    dry_run: bool = False,
     runner=None,
     log=print,
 ) -> IngestReport:
     """Run the full pipeline; raises ``IngestError`` with nothing committed on
     any refusal. See the module docstring for the steps. The whole transaction
     — clean check through commit and working-tree publish — holds the shared
-    pinned-build write lock; a concurrent writer is refused loudly."""
+    pinned-build write lock; a concurrent writer is refused loudly. A DRY RUN
+    runs the identical pipeline through the lint step and reports what the
+    commit would change instead of committing. It holds the same lock — the
+    preview must read one consistent build, and a refusal on contention is
+    itself an honest preview (a real ingest would be refused right now too) —
+    but writes nothing, not even the empty repository a first real ingest
+    would initialize."""
     # Resolved at call time (not as a def-time default) so test rigs that
     # monkeypatch subprocess.run fake the git layer here too.
     runner = runner or subprocess.run
     pinned_dir = Path(pinned_dir)
+    if dry_run and not pinned_dir.is_dir():
+        # No pinned build at all: nothing to lock or race (taking the lock
+        # would CREATE the directory), and the preview is simply "everything
+        # would be added".
+        return _ingest_locked(source, pinned_dir, resolve_digest, runner, log, dry_run=True)
     pinned_dir.mkdir(parents=True, exist_ok=True)
+    writer = "theozolith config ingest" + (" --dry-run" if dry_run else "")
     try:
-        with repolock.pinned_write_lock(pinned_dir, writer="theozolith config ingest"):
-            return _ingest_locked(source, pinned_dir, resolve_digest, runner, log)
+        with repolock.pinned_write_lock(pinned_dir, writer=writer):
+            return _ingest_locked(source, pinned_dir, resolve_digest, runner, log, dry_run=dry_run)
     except repolock.RepoLockError as exc:
         raise IngestError(str(exc)) from exc
 
@@ -542,46 +639,66 @@ def _ingest_locked(
     resolve_digest: Callable[[str], str] | None,
     runner,
     log,
+    dry_run: bool = False,
 ) -> IngestReport:
-    report = IngestReport()
+    report = IngestReport(dry_run=dry_run)
     resolve = resolve_digest or resolve_image_digest
 
     # The pinned build must exist as a clean git repo before anything is
     # staged. A marker left by an interrupted ingest is repaired FIRST — that
     # dirt is provably ours — and only then does the clean check refuse what
-    # remains (a hand edit).
-    if not (pinned_dir / ".git").exists():
+    # remains (a hand edit). A dry run performs neither mutation: the repair
+    # and the ignored-leftover purge are REPORTED instead, and the preview is
+    # computed against the committed HEAD either way.
+    git_exists = (pinned_dir / ".git").exists()
+    if not git_exists and not dry_run:
         _require_git(["init", "--quiet"], pinned_dir, runner, str(pinned_dir))
-    _recover_pending(pinned_dir, runner, report)
-    dirty = _require_git(["status", "--porcelain"], pinned_dir, runner, str(pinned_dir))
-    if dirty:
-        raise IngestError(
-            f"pinned build {pinned_dir} has uncommitted changes — it is machine-"
-            "owned and committed only by ingest; restore it (git checkout/reset)"
-            " before ingesting (ADR-0048):\n" + dirty
-        )
-    # IGNORED leftovers pass the clean check (status never shows them) but
-    # would stay loadable and distributable from the worktree — a file only a
-    # `.git/info/exclude` rule hides is not committed content and can never be
-    # a lost hand edit, so it is purged, not refused. After this the worktree
-    # is exactly HEAD on EVERY successful ingest, the no-op path included.
-    purge = _run_git(["clean", "-ffdx"], pinned_dir, runner)
-    if purge.returncode != 0:
-        raise IngestError(
-            f"pinned build {pinned_dir}: cannot remove ignored leftover files"
-            f" (git clean failed): {(purge.stderr or '').strip()[:300]}"
-        )
-    purged = (purge.stdout or "").strip()
-    if purged:
+        git_exists = True
+    if git_exists and dry_run and (pinned_dir / ".git" / PENDING_MARKER).exists():
         report.notes.append(
-            "removed ignored leftovers from the machine-owned worktree (only"
-            " committed HEAD is loadable/distributable): "
-            + "; ".join(line.removeprefix("Removing ") for line in purged.splitlines())
+            "an interrupted ingest left the working tree behind HEAD — a real"
+            " ingest repairs this first; the preview is computed against the"
+            " committed HEAD"
         )
+    elif git_exists:
+        if not dry_run:
+            _recover_pending(pinned_dir, runner, report)
+        dirty = _require_git(["status", "--porcelain"], pinned_dir, runner, str(pinned_dir))
+        if dirty:
+            raise IngestError(
+                f"pinned build {pinned_dir} has uncommitted changes — it is machine-"
+                "owned and committed only by ingest; restore it (git checkout/reset)"
+                " before ingesting (ADR-0048):\n" + dirty
+            )
+        # IGNORED leftovers pass the clean check (status never shows them) but
+        # would stay loadable and distributable from the worktree — a file only
+        # a `.git/info/exclude` rule hides is not committed content and can
+        # never be a lost hand edit, so it is purged (a dry run reports what
+        # would go), not refused. After this the worktree is exactly HEAD on
+        # EVERY successful ingest, the no-op path included.
+        purge = _run_git(["clean", "-ffdxn" if dry_run else "-ffdx"], pinned_dir, runner)
+        if purge.returncode != 0:
+            raise IngestError(
+                f"pinned build {pinned_dir}: cannot remove ignored leftover files"
+                f" (git clean failed): {(purge.stderr or '').strip()[:300]}"
+            )
+        purged = (purge.stdout or "").strip()
+        if purged:
+            names = "; ".join(
+                line.removeprefix("Would remove ").removeprefix("Removing ")
+                for line in purged.splitlines()
+            )
+            report.notes.append(
+                ("a real ingest will remove" if dry_run else "removed")
+                + " ignored leftovers from the machine-owned worktree (only"
+                " committed HEAD is loadable/distributable): " + names
+            )
     # The HEAD this transaction extends — the commit parent AND the expected
     # old value of the compare-and-swap ref move at publish ("" = unborn).
-    head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
-    original_head = (head.stdout or "").strip() if head.returncode == 0 else ""
+    original_head = ""
+    if git_exists:
+        head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
+        original_head = (head.stdout or "").strip() if head.returncode == 0 else ""
     old_control_toml = ""
     control_path = pinned_dir / controltoml.CONTROL_TOML
     if control_path.is_file():
@@ -591,7 +708,15 @@ def _ingest_locked(
 
     with tempfile.TemporaryDirectory(prefix="theozolith-ingest-") as workdir:
         work = Path(workdir)
-        source_dir, report.source_commit = _harvest_source(source, work, runner)
+        source_dir, report.source_commit, worktree_preview = _harvest_source(
+            source, work, runner, dirty_ok=dry_run
+        )
+        if worktree_preview:
+            report.notes.append(
+                "source has uncommitted changes — this preview reflects the"
+                " WORKING TREE; a real ingest will refuse until they are"
+                " committed"
+            )
         staging = work / "staging"
         staging.mkdir()
         _copy_config_files(source_dir, staging)
@@ -609,6 +734,33 @@ def _ingest_locked(
             raise IngestError(f"staged config does not load — nothing committed: {exc}") from exc
         for warning in staged_config.warnings:
             report.notes.append(f"warning: {warning}")
+
+        if dry_run:
+            # PREVIEW instead of commit: the staged tree is hashed exactly as
+            # the real commit would hash it, so the no-op answer here IS the
+            # answer a real ingest would give.
+            report.changes = _preview_changes(staging, pinned_dir, work, runner, original_head)
+            report.changed = bool(report.changes)
+            if report.changed:
+                new_tags = {name: wt.tag for name, wt in staged_config.worker_types.items()}
+                report.retagged = {
+                    name: (old_tags.get(name, ""), tag)
+                    for name, tag in sorted(new_tags.items())
+                    if old_tags.get(name, "") != tag
+                }
+                if staged_config.product_version != old_product:
+                    report.notes.append(
+                        f"product version would move: {old_product or '(none)'} ->"
+                        f" {staged_config.product_version or '(none)'}"
+                    )
+                staged_control = (staging / controltoml.CONTROL_TOML).read_text(encoding="utf-8")
+                if staged_control != old_control_toml:
+                    report.notes.append(
+                        "control.toml would change: tier-2 settings apply on the"
+                        " next service restart"
+                    )
+            log(report.summary())
+            return report
 
         # COMMIT FIRST (from the staging tree, through a throwaway index):
         # until update-ref below, nothing observable has moved and any failure
