@@ -48,7 +48,10 @@ CACHE_DB_FILE = "cache.db"
 @dataclass(frozen=True)
 class ControlSettings:
     data_dir: Path  # ~/.theozolith — the partitioned home (ADR-0024)
-    config_repo: Path  # the Config Repo working home (ADR-0006), configs/
+    # configs/ — since ADR-0048 the machine-owned PINNED BUILD: the tree
+    # control loads and distributes, committed only by `theozolith config
+    # ingest`. The field keeps its historical name.
+    config_repo: Path
     admin_token: str  # the machine credential: CLI + API ("" until init)
     repo: str | None  # target repo (owner/name) for dispatch + janitor
     github_token: str | None  # the control PAT (claim writes, janitor)
@@ -97,6 +100,12 @@ class ControlSettings:
     # True when serve terminates TLS: decides the session cookie's name and
     # Secure flag (__Host- + Secure over TLS; a plain dev cookie otherwise).
     serve_tls: bool = False
+    # The default HUMAN Config Repo location (ADR-0048): what init scaffolds
+    # and what `theozolith config ingest` reads when no source is named.
+    # Operators may keep the Config Repo anywhere (or on a git host) and pass
+    # it to ingest explicitly; this default just makes the one-box story
+    # ergonomic.
+    config_source: Path = Path("config-src")
 
     # -- the partition (ADR-0024) ------------------------------------------
 
@@ -187,6 +196,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     config_repo = Path(
         env_value(environ, "THEOZOLITH_CONFIG_REPO") or (data_dir / "configs")
     ).expanduser()
+    config_source = Path(
+        env_value(environ, "THEOZOLITH_CONFIG_SOURCE") or (data_dir / "config-src")
+    ).expanduser()
 
     # Tier-2: shipped defaults <- control.toml <- validated env overrides.
     # The persisted control_port rides the same fail-closed path: a
@@ -204,6 +216,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     return ControlSettings(
         data_dir=data_dir,
         config_repo=config_repo,
+        config_source=config_source,
         # The machine credential: init writes it to secrets/admin-token; the
         # env var stays as the container/dev override.
         admin_token=env_value(environ, "THEOZOLITH_ADMIN_TOKEN")

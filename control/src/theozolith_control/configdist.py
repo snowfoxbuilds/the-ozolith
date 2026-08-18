@@ -1,11 +1,16 @@
-"""The config distribution: packaging ``drivers/`` into a hash-pinned artifact.
+"""The config distribution: packaging ``drivers/`` + ``knowledge/`` into a
+hash-pinned artifact.
 
 ADR-0042: custom driver code lives in the private Config Repo under
-``drivers/``. On a config change the Control Node packages that tree into a
-content-addressed zip served over the artifact-pull path, and the heartbeat
-channel carries only the drivers-hash reference. Nodes fetch by hash, verify
-by RECOMPUTING the manifest over the unpacked tree (never by hashing archive
-bytes), and converge like the product pin.
+``drivers/``. ADR-0048 extends the same distribution to the pinned build's
+compiled ``knowledge/`` trees (baked into derived images, bind-mounted into
+Flight Decks). On a config change the Control Node packages both subtrees into
+a content-addressed zip served over the artifact-pull path, and the heartbeat
+channel carries only the hash reference. Nodes fetch by hash, verify by
+RECOMPUTING the manifest over the unpacked tree (never by hashing archive
+bytes), and converge like the product pin. The wire/metadata field keeps its
+original ``drivers_hash`` name for protocol stability; it covers the whole
+distributed tree.
 
 The canonical hash is content-only — file relpaths and sha256 of file bytes,
 nothing about mtimes, modes, or the archive envelope — so it is stable across
@@ -13,12 +18,12 @@ checkouts by construction. The algorithm is implemented twice (nodedaemon is
 stdlib-only and cannot import this package); the two are pinned together by a
 mandatory cross-package contract test.
 
-File set: every regular file under ``<repo>/drivers/``, recursive, excluding
-dot-prefixed path components, ``__pycache__`` components, and ``*.pyc``.
-Symlinks and other non-regular files are a packaging error (fail closed — a
-symlink could escape the repo). A missing or effectively-empty ``drivers/``
-hashes to ``""`` (no artifact, no gate, byte-for-byte the deployment shape
-that predates this feature).
+File set: every regular file under ``<repo>/drivers/`` and
+``<repo>/knowledge/``, recursive, excluding dot-prefixed path components,
+``__pycache__`` components, and ``*.pyc``. Symlinks and other non-regular
+files are a packaging error (fail closed — a symlink could escape the repo).
+Missing or effectively-empty subtrees hash to ``""`` (no artifact, no gate,
+byte-for-byte the deployment shape that predates this feature).
 """
 
 from __future__ import annotations
@@ -40,6 +45,14 @@ from typing import Any
 # contents ride the config distribution.
 DRIVERS_DIR = "drivers"
 
+# The pinned build's compiled knowledge trees (ADR-0048): one subtree per
+# knowledge name, produced by `theozolith config ingest`, distributed alongside
+# drivers/ under the same single hash.
+KNOWLEDGE_DIR = "knowledge"
+
+# The subtrees the distribution covers, in manifest order.
+DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR)
+
 # The metadata member at the archive root — metadata ABOUT the manifest, never
 # part of it (the contract hash is the manifest hash, not archive bytes).
 ARTIFACT_METADATA = "config-dist.json"
@@ -57,7 +70,7 @@ class ConfigDistError(RuntimeError):
 def excluded_part(part: str) -> bool:
     """One path component the config-distribution file set ignores: dot-prefixed
     (covers ``.git``, dot-temp siblings, editor droppings), a ``__pycache__``
-    directory, or a ``*.pyc`` file. Shared by the drivers manifest and
+    directory, or a ``*.pyc`` file. Shared by the distribution manifest and
     folder-mode config-commit hashing so the two never diverge on what counts
     as content (ADR-0042)."""
     return part.startswith(".") or part == "__pycache__" or part.endswith(".pyc")
@@ -69,8 +82,8 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
     order, so the manifest is stable.
 
     With ``refuse_irregular`` a symlink or other non-regular entry that passes
-    the name filter raises ``ConfigDistError`` — ``drivers/`` fails closed
-    because a symlink could package a file from outside the repo — and so does
+    the name filter raises ``ConfigDistError`` — a distributed subtree fails
+    closed because a symlink could package a file from outside the repo — and so does
     an entry whose METADATA cannot be read at all (a classifier OSError after
     a successful scandir): unclassifiable is indistinguishable from irregular.
     Without it (folder-mode commit hashing) such entries are simply skipped: a
@@ -78,7 +91,7 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
     fail-close heartbeats.
 
     The ROOT itself is guarded the same way under ``refuse_irregular``: a
-    ``drivers`` that is a symlink (even to a directory), a regular file, or any
+    subtree root that is a symlink (even to a directory), a regular file, or any
     other non-directory entry is refused — a symlinked root would otherwise
     package a whole external tree, and a non-directory root would silently read
     as the empty sentinel. Only a genuinely missing root is the empty
@@ -164,31 +177,33 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
     return sorted(found)
 
 
-def drivers_manifest(repo_dir: Path) -> list[list[str]]:
+def dist_manifest(repo_dir: Path) -> list[list[str]]:
     """The manifest: sorted ``[relpath, sha256hex]`` entries over the
-    ``drivers/`` file set. ``relpath`` is POSIX and INCLUDES the ``drivers/``
-    prefix; the digest is sha256 over the file bytes."""
+    ``drivers/`` + ``knowledge/`` file sets (ADR-0042/0048). ``relpath`` is
+    POSIX and INCLUDES the subtree prefix; the digest is sha256 over the file
+    bytes."""
     repo_dir = Path(repo_dir)
-    root = repo_dir / DRIVERS_DIR
     entries: list[list[str]] = []
-    for path in regular_files(root, refuse_irregular=True):
-        relpath = path.relative_to(repo_dir).as_posix()
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            # An unreadable drivers/ file is a packaging error, normalized to
-            # ConfigDistError so the config-loading boundary can convert it into
-            # the established ConfigRepoError path (ADR-0042).
-            raise ConfigDistError(
-                f"cannot read {relpath!r} for the config distribution: {exc}"
-            ) from exc
-        entries.append([relpath, hashlib.sha256(data).hexdigest()])
+    for subtree in DIST_DIRS:
+        root = repo_dir / subtree
+        for path in regular_files(root, refuse_irregular=True):
+            relpath = path.relative_to(repo_dir).as_posix()
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                # An unreadable distributed file is a packaging error, normalized
+                # to ConfigDistError so the config-loading boundary can convert it
+                # into the established ConfigRepoError path (ADR-0042).
+                raise ConfigDistError(
+                    f"cannot read {relpath!r} for the config distribution: {exc}"
+                ) from exc
+            entries.append([relpath, hashlib.sha256(data).hexdigest()])
     return sorted(entries)
 
 
 def manifest_hash(entries: list[list[str]]) -> str:
     """The content-only distribution hash. An empty manifest (missing or
-    effectively-empty ``drivers/``) hashes to ``""`` — the no-distribution
+    effectively-empty subtrees) hashes to ``""`` — the no-distribution
     sentinel, distinct from any real 64-hex digest."""
     if not entries:
         return ""
@@ -196,25 +211,50 @@ def manifest_hash(entries: list[list[str]]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def drivers_hash(repo_dir: Path) -> str:
-    """The recorded distribution hash for a Config Repo (``""`` when none)."""
-    return manifest_hash(drivers_manifest(repo_dir))
+def dist_hash(repo_dir: Path) -> str:
+    """The recorded distribution hash for a pinned build (``""`` when none).
+    Rides the wire and the artifact metadata under the historical name
+    ``drivers_hash`` (protocol stability across ADR-0048)."""
+    return manifest_hash(dist_manifest(repo_dir))
+
+
+def knowledge_tree_hash(repo_dir: Path, name: str) -> str:
+    """The per-tree content pin for one compiled ``knowledge/<name>/`` tree
+    (ADR-0048): the manifest hash over the tree's file set with relpaths
+    RELATIVE TO THE TREE ROOT, so the pin is a property of tree content alone.
+    ``""`` for a missing or empty tree. Computed at ingest, joined into worker
+    types via ``pins.toml``, and independently recomputed by the node before a
+    bake (``theozolith_nodedaemon.configdist.knowledge_tree_hash`` — pinned by
+    the cross-package contract tests)."""
+    root = Path(repo_dir) / KNOWLEDGE_DIR / name
+    entries: list[list[str]] = []
+    for path in regular_files(root, refuse_irregular=True):
+        relpath = path.relative_to(root).as_posix()
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ConfigDistError(
+                f"cannot read knowledge/{name}/{relpath} for the per-tree pin: {exc}"
+            ) from exc
+        entries.append([relpath, hashlib.sha256(data).hexdigest()])
+    return manifest_hash(sorted(entries))
 
 
 def build_artifact(
     repo_dir: Path, out_dir: Path, *, built_against: str, built_at: str | None = None
 ) -> tuple[str, Path | None]:
-    """Package ``drivers/`` into ``<out_dir>/<hash>.zip`` (atomic tempfile +
-    ``os.replace``). Members ride under their ``drivers/...`` arcnames plus a
-    ``config-dist.json`` metadata member at the archive root. Returns
-    ``(hash, path)``; ``("", None)`` when there is no distribution to build.
+    """Package ``drivers/`` + ``knowledge/`` into ``<out_dir>/<hash>.zip``
+    (atomic tempfile + ``os.replace``). Members ride under their subtree
+    arcnames plus a ``config-dist.json`` metadata member at the archive root.
+    Returns ``(hash, path)``; ``("", None)`` when there is no distribution to
+    build.
 
     ``built_against`` stamps the product version the artifact was built against
     (advisory skew, never fail-closed). It is metadata about the manifest and
     never enters the hash, so the artifact name is fully determined by content."""
     repo_dir = Path(repo_dir)
     out_dir = Path(out_dir)
-    entries = drivers_manifest(repo_dir)
+    entries = dist_manifest(repo_dir)
     digest = manifest_hash(entries)
     if not digest:
         return "", None
@@ -233,9 +273,16 @@ def build_artifact(
     # is then verified by unpack-and-recompute before it is published, which
     # also catches any file that changed after this snapshot was taken.
     snapshot: dict[str, bytes] = {}
+    executable: set[str] = set()
     for relpath, expected in entries:
         try:
             data = (repo_dir / relpath).read_bytes()
+            if (repo_dir / relpath).stat().st_mode & 0o111:
+                # The executable bit rides the archive as metadata and is
+                # restored at extraction (a compiled skill script must stay
+                # runnable through bake and the deck mount, ADR-0048). It
+                # never enters the hash — mode-only edits do not re-distribute.
+                executable.add(relpath)
         except OSError as exc:
             raise ConfigDistError(
                 f"cannot read {relpath!r} for the config distribution: {exc}"
@@ -255,6 +302,8 @@ def build_artifact(
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
             for relpath, _ in entries:
                 info = zipfile.ZipInfo(relpath, date_time=_ZIP_DATE_TIME)
+                mode = 0o755 if relpath in executable else 0o644
+                info.external_attr = (stat.S_IFREG | mode) << 16
                 archive.writestr(info, snapshot[relpath])
             meta = zipfile.ZipInfo(ARTIFACT_METADATA, date_time=_ZIP_DATE_TIME)
             archive.writestr(meta, json.dumps(metadata, sort_keys=True).encode("utf-8"))
@@ -301,13 +350,13 @@ def artifact_structure_error(names: list[str]) -> str | None:
     extraction, so the two must agree on what an artifact may contain.
 
     A valid archive holds EXACTLY the single ``config-dist.json`` metadata
-    member at the root plus zero or more ``drivers/...`` files that the canonical
-    manifest counts. Every member must therefore be either that one metadata
-    file or a hash-covered drivers file — anything the manifest would ignore
-    (a dot-prefixed component, a ``__pycache__`` directory, a ``*.pyc``, a bare
-    directory entry, a second top-level file, an unsafe/traversal name, or a
-    duplicate) is rejected, so no ignored-but-importable content can ride along
-    outside ``drivers_hash``."""
+    member at the root plus zero or more ``drivers/...`` / ``knowledge/...``
+    files that the canonical manifest counts. Every member must therefore be
+    either that one metadata file or a hash-covered distributed file — anything
+    the manifest would ignore (a dot-prefixed component, a ``__pycache__``
+    directory, a ``*.pyc``, a bare directory entry, a second top-level file, an
+    unsafe/traversal name, or a duplicate) is rejected, so no
+    ignored-but-importable content can ride along outside ``drivers_hash``."""
     seen: set[str] = set()
     saw_metadata = False
     for name in names:
@@ -322,10 +371,10 @@ def artifact_structure_error(names: list[str]) -> str | None:
             saw_metadata = True
             continue
         parts = name.split("/")
-        if parts[0] != DRIVERS_DIR or len(parts) < 2:
+        if parts[0] not in DIST_DIRS or len(parts) < 2:
             return (
                 f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
-                f" {DRIVERS_DIR}/ file"
+                f" {DRIVERS_DIR}/ or {KNOWLEDGE_DIR}/ file"
             )
         if any(excluded_part(part) for part in parts):
             return (
@@ -347,6 +396,8 @@ def validate_metadata_bytes(raw: bytes, recomputed: str) -> dict[str, Any]:
     ``theozolith_nodedaemon.configdist.validate_metadata_bytes`` (pinned by the
     cross-package contract tests): control validates before publishing or
     serving, the node independently before stopping any live driver.
+    ``drivers_hash`` is the historical protocol name; it covers the whole
+    distributed tree (ADR-0048).
 
     Every data-format failure — invalid UTF-8, malformed or pathologically
     nested JSON, a scalar/array instead of an object, a wrong format, an
@@ -395,7 +446,7 @@ def verify_artifact(path: Path) -> tuple[str, dict[str, Any]]:
 
 def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
     """Unpack an artifact's bytes into a throwaway temp dir, recompute the
-    drivers manifest over the unpacked tree, and validate the metadata member;
+    distribution manifest over the unpacked tree, and validate the metadata member;
     return ``(recomputed_hash, metadata)``. This is the ONLY proof an artifact
     is publishable or servable — never the filename, never trusted archive
     bytes. Verifying a BYTE SNAPSHOT (not a pathname) also means a caller that
@@ -451,7 +502,7 @@ def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
                 raise ConfigDistError(
                     f"config distribution member {info.filename!r} cannot be extracted: {exc}"
                 ) from exc
-        recomputed = drivers_hash(root)
+        recomputed = dist_hash(root)
         # The metadata is read as BYTES and validated by the shared envelope
         # rule — decoding is part of validation, so invalid UTF-8 is a
         # ConfigDistError like any other malformed metadata, never a leaked

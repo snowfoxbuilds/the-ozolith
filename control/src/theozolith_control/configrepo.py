@@ -1,10 +1,13 @@
-"""The Config Repo: TOML on the Control Node, JSON desired state on the wire.
+"""The pinned build: TOML on the Control Node, JSON desired state on the wire.
 
-ADR-0006/0015: the git-backed folder (default ~/.theozolith/configs) is
+ADR-0006/0015/0048: the git-backed folder (default ~/.theozolith/configs) is
 parsed only here; each node receives its own desired-state document over the
 heartbeat channel and caches it for degraded mode. The channel carries
 declarations and references — compose/overlay text is inlined (declarative
-topology is desired state), secret and image *values* never are.
+topology is desired state), secret and image *values* never are. Since
+ADR-0048 this tree is the machine-owned PINNED BUILD, committed only by
+``theozolith config ingest`` from the human Config Repo; loading is unchanged,
+but resolved pins are joined from the ingest-written ``pins.toml``.
 
 Layout::
 
@@ -16,10 +19,18 @@ Layout::
     worker-types/<name>.toml  the complete customization unit for one worker
                               (ADR-0044): driver/adapter/model/effort/workspace/
                               secrets plus the derived-image recipe (digest-
-                              pinned base, setup, optional Knowledge Source).
-                              Driverless types are Flight Decks (interactive
-                              containers). model/effort are validated against
-                              the adapter and baked into the image (ADR-0045).
+                              pinned base, setup, optional in-repo knowledge
+                              reference ``knowledge = "knowledge/<name>"``,
+                              ADR-0048). Driverless types are Flight Decks
+                              (interactive containers). model/effort are
+                              validated against the adapter and baked into the
+                              image (ADR-0045).
+    knowledge/<name>/         one COMPILED knowledge tree per name (ADR-0048):
+                              the ADR-0009 compiler's output, written at ingest,
+                              distributed to nodes alongside drivers/
+    pins.toml                 machine-written by ingest: source-commit stamp,
+                              base tag->digest resolutions, per-knowledge-tree
+                              content-hash pins
     product.toml              optional [product] version pin for the update command
 
 An empty or missing repo is a legal deployment (the deletion test): every
@@ -67,10 +78,25 @@ from theozolith_control import configdist
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
 
-# Repo-relative prefixes that are git-native only (ADR-0042): Config Repo write
-# access equals code execution with driver credentials on nodes, so drivers/ is
-# never touched by the web UI or any future config editor — edited in git only.
-GIT_NATIVE_ONLY = ("drivers/",)
+# Repo-relative prefixes that are git-native only (ADR-0042/0048): a config
+# write here equals code execution (drivers/) or agent-instruction injection
+# (knowledge/) on nodes, so neither is ever touched by the web UI or any future
+# config editor — drivers/ is edited in git, knowledge/ is compiled by ingest.
+GIT_NATIVE_ONLY = ("drivers/", "knowledge/")
+
+# Files only `theozolith config ingest` writes (ADR-0048); refused for any
+# UI/editor write alongside the git-native prefixes.
+MACHINE_OWNED_FILES = ("pins.toml",)
+
+# The ingest-written pins file at the pinned-build root (ADR-0048).
+PINS_FILE = "pins.toml"
+
+# An in-repo knowledge reference is ``knowledge/<name>`` (ADR-0048). The name
+# rule matches the knowledge package's entry-name rule and — by requiring a
+# leading alphanumeric — can never collide with the distribution's excluded
+# names (dot-prefixed components never ride the config distribution).
+KNOWLEDGE_REF_PREFIX = "knowledge/"
+KNOWLEDGE_TREE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
 # supervised command each resolves to control-side. Every builtin runs through
@@ -112,10 +138,11 @@ ATTACH_PLACEHOLDERS = (ATTACH_HOST, ATTACH_CONTAINER)
 # The per-Stack placeholder a driverless worker type's volume names may carry
 # (ADR-0043): substituted with the resolving Stack's name so two same-type
 # Flight Decks on one node get distinct runtime-state and tailnet-identity
-# volumes while still sharing the one `knowledge-<worker-type>` clone (which
-# deliberately omits the placeholder). Echoes the {host}/{container} attach
-# convention; it is the only volume placeholder and is resolved control-side —
-# the daemon only ever receives concrete volume names.
+# volumes; an entry that omits it (e.g. the read-only knowledge bind, ADR-0048)
+# is deliberately shared across siblings of the type. Echoes the
+# {host}/{container} attach convention; it is the only volume placeholder and
+# is resolved control-side — the daemon only ever receives concrete volume
+# names.
 VOLUME_STACK = "{stack}"
 
 
@@ -159,9 +186,64 @@ def refuse_ui_write(relpath: str) -> None:
         if parts[0] == prefix.rstrip("/"):
             raise ConfigRepoError(
                 f"{relpath!r} is under a git-native-only path ({prefix}) — driver"
-                " code is never editable through the web UI or a config editor;"
-                " edit it in git (ADR-0042)"
+                " code and compiled knowledge are never editable through the web"
+                " UI or a config editor; edit the Config Repo and ingest"
+                " (ADR-0042/0048)"
             )
+    if normalized in MACHINE_OWNED_FILES:
+        raise ConfigRepoError(
+            f"{relpath!r} is machine-owned — only `theozolith config ingest` writes it (ADR-0048)"
+        )
+
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class Pins:
+    """The ingest-resolved pins (pins.toml, ADR-0048): the decisions that exist
+    nowhere else. ``base`` maps a tag-only base ref to its resolved
+    ``sha256:<hex>`` digest; ``knowledge`` maps a tree name to its per-tree
+    content hash; ``source_commit`` stamps the Config Repo commit the pinned
+    build was ingested from."""
+
+    source_commit: str = ""
+    base: dict[str, str] = field(default_factory=dict)
+    knowledge: dict[str, str] = field(default_factory=dict)
+
+
+def load_pins(repo_dir: Path) -> Pins:
+    """Parse ``pins.toml`` at the pinned-build root; a missing file is the
+    empty pin set (a pre-ingest tree, or one whose bases are digest-pinned by
+    hand and which references no knowledge). Malformed shapes fail loudly —
+    the file is machine-written, so any deviation is corruption or a hand
+    edit, both of which the load must surface."""
+    path = Path(repo_dir) / PINS_FILE
+    if not path.is_file():
+        return Pins()
+    data = _load_toml(path)
+    source = data.get("source", {})
+    commit = source.get("commit", "") if isinstance(source, dict) else ""
+    if not isinstance(commit, str):
+        raise ConfigRepoError(f"{PINS_FILE}: [source].commit must be a string")
+    base = data.get("base", {})
+    knowledge = data.get("knowledge", {})
+    if not isinstance(base, dict) or not isinstance(knowledge, dict):
+        raise ConfigRepoError(f"{PINS_FILE}: [base] and [knowledge] must be tables")
+    for ref, digest in base.items():
+        if not isinstance(digest, str) or not (
+            digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
+        ):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [base] {ref!r} must map to 'sha256:<64 hex>', got {digest!r}"
+            )
+    for name, tree_hash in knowledge.items():
+        if not isinstance(tree_hash, str) or not _HEX64.fullmatch(tree_hash):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [knowledge] {name!r} must map to a 64-hex content"
+                f" hash, got {tree_hash!r}"
+            )
+    return Pins(source_commit=commit, base=dict(base), knowledge=dict(knowledge))
 
 
 @dataclass(frozen=True)
@@ -183,7 +265,11 @@ class WorkerTypeDef:
     name: str
     base: str  # full ref, pinned by digest
     setup: tuple[str, ...] = ()
-    knowledge_source: str = ""
+    # In-repo knowledge reference (ADR-0048): "" or "knowledge/<name>". The
+    # pin is the ingest-computed per-tree content hash joined from pins.toml
+    # at load — never authored in the worker-type TOML. Both are identity:
+    # editing a knowledge tree re-tags exactly the types that reference it.
+    knowledge: str = ""
     knowledge_pin: str = ""
     # -- per-type variables --
     driver: str = ""  # "" (Flight Deck) | "builtin:<name>" | "drivers/<name>"
@@ -207,6 +293,11 @@ class WorkerTypeDef:
     @property
     def is_driver(self) -> bool:
         return bool(self.driver)
+
+    @property
+    def knowledge_tree(self) -> str:
+        """The bare tree name of the knowledge reference ("" when none)."""
+        return self.knowledge[len(KNOWLEDGE_REF_PREFIX) :] if self.knowledge else ""
 
     @property
     def base_digest(self) -> str:
@@ -250,7 +341,7 @@ class WorkerTypeDef:
             {
                 "base": self.base,
                 "setup": list(self.materialized_setup),
-                "knowledge_source": self.knowledge_source,
+                "knowledge": self.knowledge,
                 "knowledge_pin": self.knowledge_pin,
             },
             sort_keys=True,
@@ -263,17 +354,18 @@ class WorkerTypeDef:
         return f"theozolith/{self.name}:{self.base_tag}-{self.instruction_hash[:12]}"
 
     def recipe_wire(self) -> dict[str, Any]:
-        """The derived-image recipe as it rides in the ``images`` wire list —
-        the same 8 keys as the pre-ADR-0044 ImageDef.as_wire(), so the daemon
-        needs no new keys and degraded-mode caches stay shape-compatible.
+        """The derived-image recipe as it rides in the ``images`` wire list.
+        Still 8 keys: ``knowledge`` (the in-repo reference) and
+        ``knowledge_pin`` (the per-tree content pin) replace the retired
+        ``knowledge_source`` pair (ADR-0048) — the node bakes the referenced
+        tree from its applied config-distribution tree after verifying the pin.
         ``setup`` is the MATERIALIZED setup (ADR-0045): the daemon renders one
-        RUN per entry exactly as before and stays adapter-blind — an
-        un-upgraded daemon still builds the correct bytes under the new tag."""
+        RUN per entry exactly as before and stays adapter-blind."""
         return {
             "name": self.name,
             "base": self.base,
             "setup": list(self.materialized_setup),
-            "knowledge_source": self.knowledge_source,
+            "knowledge": self.knowledge,
             "knowledge_pin": self.knowledge_pin,
             "tag": self.tag,
             "base_digest": self.base_digest,
@@ -702,11 +794,48 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
     return stack
 
 
-def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
+def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None) -> WorkerTypeDef:
     context = f"worker-types/{name}.toml"
     base = _require_str(data, "base", context)
     if "@sha256:" not in base:
-        raise ConfigRepoError(f"{context}: base must be pinned by digest (ADR-0006)")
+        # A tag-only base is legal exactly when ingest resolved it (ADR-0048):
+        # the digest lives in pins.toml keyed by the verbatim ref. Anything
+        # else keeps the ADR-0006 fail-loud rule.
+        resolved = (pins.base if pins else {}).get(base, "")
+        if not resolved:
+            raise ConfigRepoError(
+                f"{context}: base must be pinned by digest (ADR-0006) — pin it"
+                " in the Config Repo, or use a tag and let `theozolith config"
+                " ingest` resolve it (ADR-0048)"
+            )
+        base = f"{base}@{resolved}"
+    for legacy in ("knowledge_source", "knowledge_pin"):
+        if legacy in data:
+            raise ConfigRepoError(
+                f"{context}: {legacy!r} is retired (ADR-0048) — knowledge lives"
+                " in the Config Repo: reference it as knowledge ="
+                ' "knowledge/<name>" and let ingest compute the per-tree pin'
+            )
+    knowledge = _require_str(data, "knowledge", context, default="")
+    knowledge_pin = ""
+    if knowledge:
+        tree = knowledge[len(KNOWLEDGE_REF_PREFIX) :]
+        if not knowledge.startswith(KNOWLEDGE_REF_PREFIX) or not KNOWLEDGE_TREE_NAME.fullmatch(
+            tree
+        ):
+            raise ConfigRepoError(
+                f"{context}: knowledge reference {knowledge!r} must be"
+                ' "knowledge/<name>" with a plain tree name'
+                " (^[A-Za-z0-9][A-Za-z0-9._-]*$) (ADR-0048)"
+            )
+        knowledge_pin = (pins.knowledge if pins else {}).get(tree, "")
+        if not knowledge_pin:
+            raise ConfigRepoError(
+                f"{context}: no ingest-computed pin for {knowledge!r} — the"
+                " pinned build is written only by `theozolith config ingest`,"
+                " which compiles the tree and records its content hash in"
+                f" {PINS_FILE} (ADR-0048)"
+            )
     driver = _require_str(data, "driver", context, default="")
     workspace = _require_str(data, "workspace", context, default="")
     command = _require_str(data, "command", context, default="")
@@ -739,6 +868,13 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
                     f"{context}: {field_name!r} is a driverless (Flight Deck) field"
                     " and is rejected when a driver is set (ADR-0044)"
                 )
+    elif knowledge:
+        raise ConfigRepoError(
+            f"{context}: 'knowledge' is a driver-type field (ADR-0048) — nothing"
+            " bakes under a Flight Deck's ~/.claude (the state volume shadows"
+            " it); decks read the node's applied knowledge through the read-only"
+            " bind mount instead"
+        )
     if workspace and not _valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
@@ -756,8 +892,8 @@ def _parse_worker_type(name: str, data: dict[str, Any]) -> WorkerTypeDef:
         name=name,
         base=base,
         setup=_str_list(data, "setup", context),
-        knowledge_source=_require_str(data, "knowledge_source", context, default=""),
-        knowledge_pin=_require_str(data, "knowledge_pin", context, default=""),
+        knowledge=knowledge,
+        knowledge_pin=knowledge_pin,
         driver=driver,
         adapter=adapter_name,
         model=model,
@@ -821,8 +957,9 @@ def _resolve_volumes(volumes: tuple[str, ...], stack_name: str) -> tuple[str, ..
     """Substitute the ``{stack}`` placeholder in each worker-type volume entry
     with the resolving Stack's name (ADR-0043). Only the name segment (before
     the first ``:``) is rewritten — mount paths are fixed — and only the whole
-    ``{stack}`` token is replaced; ``knowledge-<worker-type>`` volumes that
-    deliberately omit it stay shared across siblings of the type."""
+    ``{stack}`` token is replaced; entries that deliberately omit it (the
+    read-only knowledge bind, ADR-0048) stay shared across siblings of the
+    type."""
     resolved = []
     for volume in volumes:
         name, sep, rest = volume.partition(":")
@@ -1026,8 +1163,9 @@ def load_config(repo_dir: Path) -> DeployConfig:
             " worker-types/<name>.toml and add the worker-type fields"
             " (driver/adapter/model/effort/workspace/secrets) (ADR-0044)"
         )
+    pins = load_pins(repo_dir)
     worker_types = {
-        path.stem: _parse_worker_type(path.stem, _load_toml(path))
+        path.stem: _parse_worker_type(path.stem, _load_toml(path), pins)
         for path in sorted((repo_dir / "worker-types").glob("*.toml"))
     }
     warnings = tuple(
@@ -1037,10 +1175,18 @@ def load_config(repo_dir: Path) -> DeployConfig:
     # driver-bearing worker type resolves its command here, so a dangling
     # drivers/<name> reference fails load_config() even when no Stack
     # instantiates the type — dormant definitions break at configure time,
-    # never later when a Stack first activates them.
+    # never later when a Stack first activates them. A dangling knowledge
+    # reference fails the same way (ADR-0048): the pin joined above proves a
+    # tree was ingested, this proves it is still present to distribute.
     for wt in worker_types.values():
         if wt.is_driver:
             _resolve_driver_command(wt, repo_dir)
+        if wt.knowledge and not (repo_dir / wt.knowledge).is_dir():
+            raise ConfigRepoError(
+                f"worker-types/{wt.name}.toml: knowledge reference"
+                f" {wt.knowledge!r} has no compiled tree in the pinned build —"
+                " run `theozolith config ingest` (ADR-0048)"
+            )
     stacks = _resolve_stacks(
         tuple(
             _parse_stack(path.stem, _load_toml(path))
@@ -1065,7 +1211,7 @@ def load_config(repo_dir: Path) -> DeployConfig:
     # a broken repo. Only ConfigDistError is caught — a programming error must
     # not be swallowed by an overbroad except.
     try:
-        drivers_hash = configdist.drivers_hash(repo_dir)
+        drivers_hash = configdist.dist_hash(repo_dir)
     except configdist.ConfigDistError as exc:
         raise ConfigRepoError(f"config distribution: {exc}") from exc
     return DeployConfig(

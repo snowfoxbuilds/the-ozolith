@@ -9,6 +9,7 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
 from theozolith_control import product
 from theozolith_control.cli import main as cli_main
 
@@ -101,3 +102,34 @@ def test_both_entry_points_share_one_main():
     scripts = tomllib.loads(pyproject.read_text())["project"]["scripts"]
     assert scripts["theozolith"] == "theozolith_control.cli:main"
     assert scripts["theozolith-control"] == scripts["theozolith"]
+
+
+def test_config_ingest_dispatches_with_the_default_source(monkeypatch, tmp_path):
+    """`theozolith config ingest` (ADR-0048): no positional -> the scaffolded
+    config-src beside the data dir; an explicit path/URL wins."""
+    from theozolith_control import cli, ingest
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path / "home"))
+    calls = []
+    monkeypatch.setattr(
+        ingest, "ingest", lambda source, pinned, **kw: calls.append((source, pinned)) or None
+    )
+    monkeypatch.setattr(cli, "_repair_partition_ownership", lambda settings: None)
+    assert cli_main(["config", "ingest"]) == 0
+    assert cli_main(["config", "ingest", "https://example.invalid/config.git"]) == 0
+    assert calls[0][0] == str(tmp_path / "home" / "config-src")
+    assert calls[0][1] == tmp_path / "home" / "configs"
+    assert calls[1][0] == "https://example.invalid/config.git"
+
+
+def test_config_ingest_refusal_exits_nonzero(monkeypatch, tmp_path, capsys):
+    from theozolith_control import ingest
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path / "home"))
+
+    def refuse(source, pinned, **kw):
+        raise ingest.IngestError("pinned build has uncommitted changes")
+
+    monkeypatch.setattr(ingest, "ingest", refuse)
+    with pytest.raises(SystemExit, match="uncommitted changes"):
+        cli_main(["config", "ingest"])

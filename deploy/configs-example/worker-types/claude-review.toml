@@ -19,8 +19,9 @@ setup = [
     "pip install --no-cache-dir uv",
 ]
 
-knowledge_source = "https://github.com/acme/my-knowledge.git"
-knowledge_pin = "0000000000000000000000000000000000000000"
+# Shares the Implementer's knowledge tree (ADR-0048): same compiled bytes,
+# same per-tree pin — editing the tree re-tags both types.
+knowledge = "knowledge/claude-dev"
 
 [secrets]
 GITHUB_TOKEN = "github-reviewer"

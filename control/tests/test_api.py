@@ -684,7 +684,7 @@ def _write_driver(control, content: str = "def run():\n    return 1\n") -> str:
     from theozolith_control import configdist
 
     control.write_config("drivers/custom/impl.py", content)
-    return configdist.drivers_hash(control.settings.config_repo)
+    return configdist.dist_hash(control.settings.config_repo)
 
 
 def test_heartbeat_carries_drivers_hash_both_directions(control: ControlRig):

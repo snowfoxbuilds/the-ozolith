@@ -4,7 +4,7 @@
 # image the container-host builds locally.
 #
 # The derived-image identity (tag = base tag + instruction hash) covers the
-# bytes that build the image: base/setup/knowledge_* PLUS the materialized
+# bytes that build the image: base/setup/knowledge PLUS the materialized
 # model/effort config (ADR-0045) — the bake writes a managed model default
 # and effort pin into the image's managed settings, so changing either
 # re-tags and rebuilds the image. driver/workspace/secrets still never
@@ -43,6 +43,10 @@ adapter = "claude"               # the Agent adapter the harness invokes
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works
 
+# Digest-pinned, or tag-only — `theozolith config ingest` resolves a tag to
+# its digest and records it in the pinned build's pins.toml (ADR-0048). The
+# zeros below are the fail-closed placeholder: fine while every referencing
+# Stack is stopped, refused by ingest once one runs.
 base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 setup = [
@@ -50,9 +54,11 @@ setup = [
     "pip install --no-cache-dir uv",
 ]
 
-# Baked at IMAGE BUILD time by the M1 bake CLI — never at container start.
-knowledge_source = "https://github.com/acme/my-knowledge.git"
-knowledge_pin = "0000000000000000000000000000000000000000"
+# The knowledge/<name>/ tree in THIS Config Repo (ADR-0048): ingest compiles
+# it (ADR-0009) and pins its content hash; the node bakes the compiled tree
+# into the derived image at IMAGE BUILD time — never at container start.
+# Editing the tree re-tags exactly the worker types that reference it.
+knowledge = "knowledge/claude-dev"
 
 # Secret NAMES only — values live encrypted on the Control Node, entered
 # once via `theozolith secret set <name>`, pulled node-scoped at deploy

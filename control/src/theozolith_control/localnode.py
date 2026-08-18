@@ -727,11 +727,11 @@ base = "{SCAFFOLD_BASE_IMAGE}:{version}@sha256:{PLACEHOLDER_DIGEST}"
 #     "apt-get update && apt-get install -y --no-install-recommends ripgrep",
 # ]
 
-# Optional Knowledge Source: a git repo of skills/subagents/workflows the
-# knowledge machinery bakes in at image build time (never at container
-# start).
-# knowledge_source = "https://github.com/you/your-knowledge.git"
-# knowledge_pin = "<commit sha>"
+# Optional knowledge reference (ADR-0048): a knowledge/<name>/ tree in THIS
+# Config Repo (skills/subagents/workflows, ADR-0009 layout). Ingest compiles
+# it and pins its content hash; the node bakes the compiled tree into the
+# derived image at build time (never at container start).
+# knowledge = "knowledge/claude-dev"
 
 [secrets]
 # Secret NAMES only — values live in the encrypted store, never this repo
@@ -765,6 +765,9 @@ The finish line, three steps:
        docker pull {ref}
        docker inspect --format '{{{{index .RepoDigests 0}}}}' {ref}
 
+   or drop the `@sha256:...` suffix entirely and let ingest resolve the tag
+   against the registry (ADR-0048).
+
 2. **Enter the secrets** the worker type references (values go to the
    encrypted store on the Control Node, never into this repo):
 
@@ -774,14 +777,22 @@ The finish line, three steps:
    While you are here, set `workspace` in `worker-types/claude-dev.toml` to
    the repository the Implementer works.
 
-3. **Flip desired state and commit**: set `state = "running"` in
-   `stacks/implementer.toml` and commit. On the next heartbeat the local
-   daemon builds the derived image and brings the worker up — `theozolith
-   status` exits 0 with the Stack running.
+3. **Flip desired state, commit, ingest**: set `state = "running"` in
+   `stacks/implementer.toml`, commit, and run
 
-Everything here is ordinary git: edit, commit, done. Secrets never live in
-this repo (ADR-0024), and a Stack named `control` is rejected — the
-substrate never supervises its own control plane (ADR-0035).
+       sudo theozolith config ingest
+
+   Ingest lints this repo, resolves the mechanical pins (a tag-only `base`
+   resolves to its digest; `knowledge/<name>/` trees compile and get content-
+   hash pins), and commits the machine-owned pinned build the service loads
+   (ADR-0048). On the next heartbeat the local daemon builds the derived
+   image and brings the worker up — `theozolith status` exits 0 with the
+   Stack running.
+
+Everything here is ordinary git: edit, commit, ingest. This repo is YOURS —
+keep it here, move it anywhere, or host it on a git server and ingest by URL.
+Secrets never live in it (ADR-0024), and a Stack named `control` is rejected —
+the substrate never supervises its own control plane (ADR-0035).
 
 **Custom drivers** (ADR-0042): a `drivers/` directory here can hold your own
 worker types — a `drivers/<name>.py` module exporting a `Driver` class, named
@@ -789,6 +800,12 @@ by a worker type as `driver = "drivers/<name>"`. It is delivered to nodes as a
 hash-pinned, verified config distribution and runs without forking the product.
 `drivers/` is **git-native only** — never edit it through any config UI: a write
 there is code execution with driver credentials on every node that runs it.
+
+**Knowledge** (ADR-0048): a `knowledge/<name>/` directory here holds one
+knowledge root (skills/, agents/, workflows/, AGENTS.md). Ingest compiles it;
+driver workers bake the compiled tree into their images, and Flight Decks
+read-only-mount the node's applied copy — restart the agent CLI to pick up
+changes.
 """
 
 
@@ -830,5 +847,5 @@ def write_scaffold(
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "").strip()[:300]
                 raise SystemExit(f"error: could not commit the scaffold: {detail}")
-        log(f"scaffolded {', '.join(written)} (desired state stopped — see configs/README.md)")
+        log(f"scaffolded {', '.join(written)} (desired state stopped — see the Config Repo README)")
     return written

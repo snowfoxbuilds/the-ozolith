@@ -23,6 +23,9 @@ dependencies = [
     # nodedaemon/, and knowledge/ remain stdlib-only.
     "textual>=1.0",
     "theozolith-worker",
+    # `theozolith config ingest` runs the ADR-0009 knowledge compiler on the
+    # Control Node (ADR-0048): compile at ingest, distribute compiled output.
+    "theozolith-knowledge",
 ]
 
 [project.scripts]
@@ -41,6 +44,7 @@ packages = ["src/theozolith_control"]
 
 [tool.uv.sources]
 theozolith-worker = { workspace = true }
+theozolith-knowledge = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27", "pytest-asyncio>=1"]

@@ -341,6 +341,9 @@ class NodeDaemon:
         # its affected driver Stacks so THIS pass's _reconcile restarts them on
         # the new tree (ADR-0042).
         self._converge_drivers()
+        # Before reconcile so a Flight Deck (re)started this pass mounts the
+        # freshly exported knowledge trees (ADR-0048).
+        self._export_knowledge()
         self._reconcile()
 
     def _wire_setting(self, key: str, config_value: float, shipped_default: float) -> float:
@@ -952,21 +955,22 @@ class NodeDaemon:
 
     def _applied_tree_shape_error(self, tree: Path) -> str | None:
         """The applied root ``config-dist/<hash>/`` may hold ONLY the unpacked
-        artifact shape: the ``drivers`` directory (real, not a symlink) and the
-        ``config-dist.json`` metadata file (regular, not a symlink) — either
-        may be absent, but NOTHING else may be present. The source-tree
-        exclusion predicate does not apply here: it selects files from a
-        working repo, while this root is the product of an extraction that only
-        ever writes those two names — so a dot-prefixed sibling, a ``*.pyc``,
-        or an irregular hidden entry is a planted foreign entry, not tolerable
-        droppings. The drivers manifest covers only ``drivers/``, so any rogue
-        sibling would otherwise be unhashed-but-present content riding a
-        converged report (ADR-0042: the applied state directory is potentially
-        malformed after a restore or local corruption). Entry CLASSIFICATION
-        can itself fail with OSError after a successful scandir (the metadata
-        stat is lazy) — that too is a shape failure: an entry that cannot be
-        proven regular must never ride a converged report. Returns a reason,
-        or ``None`` when the shape is valid."""
+        artifact shape: the ``drivers`` and ``knowledge`` directories (real,
+        not symlinks; ADR-0042/0048) and the ``config-dist.json`` metadata
+        file (regular, not a symlink) — any may be absent, but NOTHING else
+        may be present. The source-tree exclusion predicate does not apply
+        here: it selects files from a working repo, while this root is the
+        product of an extraction that only ever writes those names — so a
+        dot-prefixed sibling, a ``*.pyc``, or an irregular hidden entry is a
+        planted foreign entry, not tolerable droppings. The manifest covers
+        only the distributed subtrees, so any rogue sibling would otherwise be
+        unhashed-but-present content riding a converged report (ADR-0042: the
+        applied state directory is potentially malformed after a restore or
+        local corruption). Entry CLASSIFICATION can itself fail with OSError
+        after a successful scandir (the metadata stat is lazy) — that too is a
+        shape failure: an entry that cannot be proven regular must never ride
+        a converged report. Returns a reason, or ``None`` when the shape is
+        valid."""
         if tree.is_symlink():
             return "applied tree is a symlink"
         try:
@@ -977,7 +981,7 @@ class NodeDaemon:
         for entry in entries:
             try:
                 expected = (
-                    entry.name == configdist.DRIVERS_DIR and entry.is_dir(follow_symlinks=False)
+                    entry.name in configdist.DIST_DIRS and entry.is_dir(follow_symlinks=False)
                 ) or (
                     entry.name == configdist.ARTIFACT_METADATA
                     and entry.is_file(follow_symlinks=False)
@@ -1192,16 +1196,107 @@ class NodeDaemon:
                 f"config distribution {desired[:12] or '(none)'} apply failed: {exc}",
             )
 
+    # -- deck knowledge export (ADR-0048) ----------------------------------------------
+
+    @staticmethod
+    def _reclaim(path: Path) -> None:
+        """Best-effort removal of a file or tree; leftovers are swept later."""
+        with contextlib.suppress(OSError):
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink()
+
+    def _export_knowledge(self) -> None:
+        """Maintain the STABLE deck-facing knowledge export at
+        ``<state>/knowledge`` from the verified applied distribution: one
+        child directory per compiled tree, each swapped whole through the
+        same crash-recoverable exchange the applied tree uses. Flight Decks
+        read-only bind-mount the stable parent (ADR-0048) — the parent inode
+        never moves, so a swap never changes the container spec (no recreate,
+        no killed tmux session); a running agent keeps what it loaded and
+        picks up the new trees on agent-CLI restart.
+
+        Non-converged (empty applied hash) leaves the existing export alone —
+        advisory skew: the deck keeps the last exported trees exactly as a
+        worker keeps its built image. Failures log and emit but never fail
+        the pass; the export is re-derived state, repaired next pass."""
+        applied = self._current_drivers_hash()
+        if not applied:
+            return
+        source_root = self._config.config_dist_dir / applied / configdist.KNOWLEDGE_DIR
+        export = self._config.knowledge_export_dir
+        try:
+            desired: dict[str, Path] = {}
+            if source_root.is_dir() and not source_root.is_symlink():
+                with os.scandir(source_root) as it:
+                    for entry in sorted(it, key=lambda e: e.name):
+                        if entry.is_dir(follow_symlinks=False):
+                            desired[entry.name] = Path(entry.path)
+            if not desired and not export.is_dir():
+                return  # nothing to export and nothing stale to retire
+            export.mkdir(parents=True, exist_ok=True)
+            with os.scandir(export) as it:
+                current = {e.name for e in it if not e.name.startswith(".")}
+        except OSError as exc:
+            self._log(f"knowledge export enumeration failed: {exc}")
+            return
+        for name, source in desired.items():
+            target = export / name
+            try:
+                source_hash = configdist.tree_hash(source)
+                try:
+                    up_to_date = configdist.tree_hash(target) == source_hash
+                except configdist.ConfigDistError:
+                    up_to_date = False  # malformed export tree: re-export it
+                if up_to_date:
+                    continue
+                staging = export / f".{name}.tmp"
+                self._reclaim(staging)
+                shutil.copytree(source, staging, symlinks=False)
+                self._exchange_config_dist_tree(staging, target)
+                self._log(f"knowledge export {name!r} updated ({source_hash[:12]})")
+            except (OSError, configdist.ConfigDistError) as exc:
+                self._log(f"knowledge export {name!r} failed: {exc}")
+                self._emit_error(type(exc).__name__, f"knowledge export {name!r} failed: {exc}")
+        for stale in sorted(current - set(desired)):
+            # Retire through a dot-prefixed rename so the tree disappears from
+            # the mounted parent atomically, then reclaim the bytes.
+            retired = export / f".{stale}.retired"
+            try:
+                self._reclaim(retired)
+                os.replace(export / stale, retired)
+            except OSError as exc:
+                self._log(f"knowledge export {stale!r} retire failed: {exc}")
+                continue
+            self._reclaim(retired)
+            self._log(f"knowledge export {stale!r} retired")
+        with contextlib.suppress(OSError):
+            for leftover in export.glob(".*"):
+                self._reclaim(leftover)
+
     # -- reconciliation ---------------------------------------------------------------
 
     def _reconcile(self) -> None:
         images = self._images()
+        # The verified applied config-distribution tree is the only knowledge
+        # source a build may consume (ADR-0048); '' -> None defers any
+        # knowledge-referencing recipe until the node converges.
+        applied = self._current_drivers_hash()
+        dist_root = self._config.config_dist_dir / applied if applied else None
         for name, image in images.items():
             try:
-                ensure_image(
-                    self._docker, image, force=name in self._rebuild_targets, log=self._log
-                )
-                self._rebuild_targets.discard(name)
+                # Discard a rebuild target only when a build actually ran: a
+                # knowledge-deferred forced rebuild stays pending for the pass
+                # that converges the distribution (ADR-0048).
+                if ensure_image(
+                    self._docker,
+                    image,
+                    force=name in self._rebuild_targets,
+                    log=self._log,
+                    dist_root=dist_root,
+                ):
+                    self._rebuild_targets.discard(name)
             except Exception as exc:
                 self._log(f"image {name}: build failed: {exc}")
                 self._emit_error(type(exc).__name__, f"image {name}: build failed: {exc}")

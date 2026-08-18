@@ -387,39 +387,24 @@ def mount_web(
 
     @app.post("/settings")
     async def settings_submit(request: Request):
-        """The fixed-schema write path (ADR-0023): one known tier-2 key at a
-        time, committed to control.toml in the Config Repo — the
-        product.toml pin-bump precedent, never a free-form editor. The
-        public origin is not a settings key: writes to it are refused."""
+        """RETIRED write path (ADR-0048): everything goes through
+        `theozolith config ingest` — the settings surface included. The
+        pinned build has no second writer, so the dashboard form is
+        display-only and a POST is refused with the pointer. (STANDING
+        CONSTRAINT, ADR-0042/0048: should a general repo editor ever land
+        here, it MUST call configrepo.refuse_ui_write() on every
+        repo-relative path it touches.)"""
         if not sessions.authorized(request):
             return _login_redirect()
         if not _origin_ok(request):
             return _wrong_origin()
-        form = await request.form()
-        key = str(form.get("key", "")).strip()
-        value = str(form.get("value", "")).strip()
-        # STANDING CONSTRAINT (ADR-0042): this is the only web write path into
-        # the Config Repo, and it is a fixed control.toml allow-list — it can
-        # never address drivers/ (a drivers-shaped key is refused by
-        # controltoml.set_value below). Should a general repo editor ever land
-        # here, it MUST call configrepo.refuse_ui_write() on every repo-relative
-        # path it touches: drivers/ is git-native only, because a write there is
-        # code execution with driver credentials on every node.
-        if key in ("public_origin", "control_ip", "control_port", "browser_origin"):
-            return HTMLResponse(
-                "the [control] fields are read-only — re-pointing a deployment"
-                " is 'theozolith recover --ip' (or init --force) and the browser"
-                " origin is 'theozolith origin-init --force', never a settings"
-                " edit",
-                status_code=403,
-            )
-        try:
-            controltoml.set_value(settings.config_repo, key, value)
-        except controltoml.ControlTomlError as exc:
-            page = _page(request, "settings.html", _settings_context(error=str(exc)))
-            page.status_code = 400
-            return page
-        return RedirectResponse(f"/settings?saved={key}", status_code=303)
+        return HTMLResponse(
+            "settings are read-only here (ADR-0048): edit control.toml"
+            " [settings] in your Config Repo and run"
+            " 'theozolith config ingest' — the pinned build is committed only"
+            " by ingest",
+            status_code=403,
+        )
 
     # -- join tokens (node provisioning; ADR-0023) ----------------------------
 

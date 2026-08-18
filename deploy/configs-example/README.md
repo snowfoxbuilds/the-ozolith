@@ -1,11 +1,27 @@
 # configs-example — a starter Config Repo
 
-A complete, minimal Config Repo (ADR-0006): copy it to your Control Node's
-`configs/` and edit in place. It declares two pipeline workers (Implementer,
+A complete, minimal Config Repo (ADR-0006/0048): copy it anywhere you like
+(or host it on a git server), edit it, commit, and run
+`theozolith config ingest <path-or-url>` on the Control Node — ingest lints
+it, resolves the mechanical pins, compiles `knowledge/`, and commits the
+machine-owned pinned build the service loads. Never edit the pinned build
+(`configs/`) itself. The example declares two pipeline workers (Implementer,
 Reviewer) as process Stacks, one **Flight Deck** as an interactive container
-Stack, and one **custom driver** (`hello-logger`, staged at `state = "stopped"`)
-demonstrating ADR-0042. Everything with a placeholder — image digests, the
-knowledge URL, the tailscale checksum, secret values — is yours to fill in.
+Stack, and one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
+every Stack staged at `state = "stopped"`. Everything with a placeholder —
+image digests (or use tag-only bases and let ingest resolve them), the
+tailscale checksum, secret values — is yours to fill in before flipping a
+Stack to running (ingest refuses live placeholders).
+
+## Knowledge (`knowledge/`, ADR-0048)
+
+`knowledge/claude-dev/` is a knowledge root (ADR-0009 layout: `AGENTS.md`,
+`skills/`, optionally `agents/`, `workflows/`) referenced by the claude worker
+types as `knowledge = "knowledge/claude-dev"`. Ingest compiles it and pins its
+content hash; driver workers bake the compiled tree into their derived images
+(editing it re-tags exactly the types that reference it), and Flight Decks
+read the node's applied copy through a read-only mount — restart the agent
+CLI to pick up changes.
 
 ## Custom drivers (`drivers/`, ADR-0042)
 
@@ -171,10 +187,11 @@ it, use the tailnet IP.
 ### Start lifecycle: every failure is a failed container
 
 `flightdeck-start` (baked by the worker type's setup) is deliberately
-fail-fast — a Flight Deck that cannot bring up its knowledge clone AND its
-tailnet access exits non-zero immediately, and Docker's restart policy owns
-any retry. There is no in-container retry loop and no "running but
-unreachable" state:
+fail-fast — a Flight Deck that cannot bring up its tailnet access exits
+non-zero immediately, and Docker's restart policy owns any retry. (Knowledge
+never blocks a start: the read-only mount's symlinks may dangle until the
+node converges a distribution, ADR-0048.) There is no in-container retry loop
+and no "running but unreachable" state:
 
 - enrollment vs. reuse is decided from the completion marker (see above)
   **before** `tailscaled` launches — the two branches cannot be misrouted by a

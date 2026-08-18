@@ -89,27 +89,30 @@ def _git_config_repo(control: ControlRig) -> None:
     subprocess.run(["git", "init", "--quiet", str(control.settings.config_repo)], check=True)
 
 
-def test_settings_form_commits_one_key_to_control_toml(control: ControlRig):
+def test_settings_page_displays_the_pinned_values_and_refuses_all_writes(control: ControlRig):
+    """ADR-0048: the settings surface goes through `theozolith config ingest`
+    — the page displays what the pinned build carries and EVERY authorized
+    POST (a known key, a control-address key, a made-up key alike) is refused
+    with the ingest pointer; nothing is ever written."""
     _git_config_repo(control)
-    _login(control)
-    saved = control.client.post(
-        "/settings", data={"key": "heartbeat_seconds", "value": "30"}, follow_redirects=False
+    (control.settings.config_repo / "control.toml").write_text(
+        "[settings]\nheartbeat_seconds = 30\n"
     )
-    assert saved.status_code == 303
-    assert controltoml.read_values(control.settings.config_repo)["heartbeat_seconds"] == 30.0
-    show = subprocess.run(
-        ["git", "-C", str(control.settings.config_repo), "show", "--name-only", "--format=%s"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
-    assert show == ["theozolith:", "settings:", "heartbeat_seconds", "=", "30", "control.toml"]
-
+    _login(control)
     page = control.client.get("/settings").text
-    assert 'value="30.0"' in page or 'value="30"' in page
+    assert 'value="30.0"' in page or 'value="30"' in page  # the ingested value renders
+    assert "config ingest" in page
+    assert 'action="/settings"' not in page  # display-only: no write affordance remains
+
+    for key in ("heartbeat_seconds", "public_origin", "control_ip", "made_up"):
+        refused = control.client.post("/settings", data={"key": key, "value": "10.6.6.6"})
+        assert refused.status_code == 403, key
+        assert "config ingest" in refused.text
+    assert controltoml.read_values(control.settings.config_repo)["heartbeat_seconds"] == 30.0
+    assert controltoml.read_control_ip(control.settings.config_repo) != "10.6.6.6"
 
 
-def test_settings_form_renders_control_fields_read_only_and_rejects_writes(control: ControlRig):
+def test_settings_page_renders_control_fields_read_only(control: ControlRig):
     _git_config_repo(control)
     _login(control)
     page = control.client.get("/settings").text
@@ -119,12 +122,6 @@ def test_settings_form_renders_control_fields_read_only_and_rejects_writes(contr
     assert "readonly" in page and f"https://{control.settings.control_ip}" in page
     assert control.settings.control_ip in page
     assert "<code>control_port</code>" in page and 'value="443"' in page
-    for key in ("public_origin", "control_ip", "control_port"):
-        refused = control.client.post("/settings", data={"key": key, "value": "10.6.6.6"})
-        assert refused.status_code == 403, key
-    assert controltoml.read_control_ip(control.settings.config_repo) != "10.6.6.6"
-    bad = control.client.post("/settings", data={"key": "made_up", "value": "1"})
-    assert bad.status_code == 400
 
 
 # -- the dashboard join page (the CLI's twin) ----------------------------------

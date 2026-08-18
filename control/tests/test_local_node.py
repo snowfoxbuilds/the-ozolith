@@ -814,10 +814,17 @@ def test_failed_bootstrap_retries_without_force_or_ca_rotation(local_cli, monkey
         cli_main(["init", "--ip", "192.0.2.20", "--with-local-node"])
     ca_after_first = (local_cli.home / "secrets" / "tls" / "ca.pem").read_bytes()
 
-    # The operator edits a scaffold file between attempts.
-    stack = local_cli.home / "configs" / "stacks" / "implementer.toml"
+    # The operator edits a scaffold file between attempts — in the Config
+    # Repo, committed (ADR-0048: the pinned build is machine-owned; edits are
+    # authored in config-src and re-ingested by the resume).
+    stack = local_cli.home / "config-src" / "stacks" / "implementer.toml"
     edited = stack.read_text() + "\n# operator note\n"
     stack.write_text(edited)
+    for argv in (
+        ["git", "add", "-A"],
+        ["git", "-c", "user.name=op", "-c", "user.email=op@invalid", "commit", "-q", "-m", "note"],
+    ):
+        subprocess.run(argv, cwd=str(stack.parent.parent), check=True, capture_output=True)
 
     def succeeding_bootstrap(settings, *, node_name, **kwargs):
         attempts.append("resumed")
@@ -829,6 +836,11 @@ def test_failed_bootstrap_retries_without_force_or_ca_rotation(local_cli, monkey
     assert "Single-Node Deployment" in out
     assert (local_cli.home / "secrets" / "tls" / "ca.pem").read_bytes() == ca_after_first
     assert stack.read_text() == edited  # operator edit survived the retry
+    # ...and the resume's re-ingest materialized it into the pinned build.
+    assert (
+        "# operator note"
+        in (local_cli.home / "configs" / "stacks" / "implementer.toml").read_text()
+    )
     assert attempts == [local_cli.node, "resumed"]
 
 

@@ -1,24 +1,39 @@
-"""Derived-image builds: Dockerfile rendering and the build/skip/force rules."""
+"""Derived-image builds: Dockerfile rendering, the build/skip/force rules, and
+the ADR-0048 knowledge gate (COPY from the verified applied distribution)."""
 
 from __future__ import annotations
 
 from daemonrig import FakeDocker, image_recipe
+from theozolith_nodedaemon import configdist
 from theozolith_nodedaemon.builds import dockerfile_for, ensure_image, image_status
 
 
-def test_dockerfile_renders_base_setup_bake_and_labels():
-    recipe = image_recipe(setup=["apt-get install -y jq", "pip install uv"])
-    recipe["knowledge_source"] = "https://github.com/acme/knowledge.git"
-    recipe["knowledge_pin"] = "abc123"
+def _applied_tree(tmp_path, name: str = "dev", files: dict[str, str] | None = None):
+    """A verified-shaped applied config-distribution root carrying one
+    compiled knowledge tree; returns (dist_root, per-tree pin)."""
+    root = tmp_path / "config-dist" / ("f" * 64)
+    for relpath, text in (files or {"CLAUDE.md": "# k\n", "skills/s/SKILL.md": "s\n"}).items():
+        target = root / configdist.KNOWLEDGE_DIR / name / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return root, configdist.knowledge_tree_hash(root, name)
+
+
+def test_dockerfile_renders_base_setup_copy_and_labels():
+    recipe = image_recipe(
+        setup=["apt-get install -y jq", "pip install uv"],
+        knowledge="knowledge/dev",
+        knowledge_pin="a" * 64,
+    )
     text = dockerfile_for(recipe, built_at="2026-07-16T00:00:00Z")
 
     assert f"FROM {recipe['base']}" in text
     assert "RUN apt-get install -y jq" in text
     assert "RUN pip install uv" in text
-    # Knowledge Source bakes at BUILD time via the M1 CLI (NODE-SUBSTRATE.md).
-    assert "theozolith-knowledge bake" in text
-    assert "--source https://github.com/acme/knowledge.git" in text
-    assert "--pin abc123" in text
+    # Compiled knowledge is COPIED from the staged build context at BUILD
+    # time (ADR-0048) — never cloned, never installed at container start.
+    assert "COPY --chown=ozolith:ozolith knowledge/ /home/ozolith/.claude/" in text
+    assert "bake" not in text
     assert f'LABEL theozolith.instruction-hash="{recipe["instruction_hash"]}"' in text
     assert f'LABEL theozolith.base-digest="{recipe["base_digest"]}"' in text
     assert 'LABEL theozolith.built-at="2026-07-16T00:00:00Z"' in text
@@ -27,9 +42,9 @@ def test_dockerfile_renders_base_setup_bake_and_labels():
     assert text.rstrip().endswith("USER ozolith")
 
 
-def test_no_knowledge_source_means_no_bake_line():
+def test_no_knowledge_reference_means_no_copy_line():
     text = dockerfile_for(image_recipe(), built_at="t")
-    assert "theozolith-knowledge bake" not in text
+    assert "COPY" not in text
 
 
 def test_materialize_instruction_rides_setup_verbatim():
@@ -56,6 +71,45 @@ def test_ensure_image_builds_skips_and_forces():
     assert ensure_image(docker, recipe, log=lambda *_: None) is False  # tag exists
     assert ensure_image(docker, recipe, force=True, log=lambda *_: None) is True
     assert [b["no_cache"] for b in docker.builds] == [False, True]
+
+
+def test_knowledge_recipe_builds_when_the_applied_tree_matches_the_pin(tmp_path):
+    docker = FakeDocker()
+    root, pin = _applied_tree(tmp_path)
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin=pin)
+    assert ensure_image(docker, recipe, log=lambda *_: None, dist_root=root) is True
+    assert docker.builds  # the context was staged and the build ran
+
+
+def test_knowledge_recipe_defers_without_an_applied_tree(tmp_path):
+    docker = FakeDocker()
+    logs: list[str] = []
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin="a" * 64)
+    assert ensure_image(docker, recipe, log=logs.append, dist_root=None) is False
+    assert not docker.builds
+    assert any("deferring" in line and "no verified" in line for line in logs)
+
+
+def test_knowledge_recipe_defers_on_a_pin_mismatch(tmp_path):
+    """The image must never bake content that disagrees with the identity it
+    would be tagged under (ADR-0048): an off-pin applied tree defers — the
+    distribution converges first, then the build runs."""
+    docker = FakeDocker()
+    logs: list[str] = []
+    root, _ = _applied_tree(tmp_path)
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin="b" * 64)
+    assert ensure_image(docker, recipe, log=logs.append, dist_root=root) is False
+    assert not docker.builds
+    assert any("disagree" in line for line in logs)
+
+
+def test_knowledge_recipe_defers_when_the_tree_is_absent(tmp_path):
+    docker = FakeDocker()
+    logs: list[str] = []
+    root, pin = _applied_tree(tmp_path, name="other")
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin=pin)
+    assert ensure_image(docker, recipe, log=logs.append, dist_root=root) is False
+    assert any("no knowledge/dev" in line for line in logs)
 
 
 def test_image_status_reads_the_stamped_labels():

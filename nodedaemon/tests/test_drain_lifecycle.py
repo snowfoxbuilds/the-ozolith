@@ -205,7 +205,7 @@ def test_threshold_one_drain_never_restarts_and_both_ladders_converge(tmp_path, 
     # ends between passes, and the swap lands in the first post-drain pass.
     (rig.jobs / "r2").mkdir(parents=True)
     rig.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
-    digest = control_configdist.drivers_hash(rig.settings.config_repo)
+    digest = control_configdist.dist_hash(rig.settings.config_repo)
     for _ in range(5):
         rig.once()
         assert rig.restart_commands() == [] and rig.control_errors() == []

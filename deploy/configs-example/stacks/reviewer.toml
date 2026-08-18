@@ -5,4 +5,7 @@
 
 worker_type = "claude-review"
 node = "box1"
-state = "running"
+# Staged at "stopped": the worker-type carries fill-in placeholders (base
+# digest, tailscale sha256) that ingest refuses for a RUNNING Stack
+# (ADR-0048) — fill them in, flip to "running", commit, ingest.
+state = "stopped"

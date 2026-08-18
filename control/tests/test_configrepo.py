@@ -46,6 +46,27 @@ def thin_stack(tmp_path, name: str, worker_type: str, **fields) -> None:
     write(tmp_path, f"stacks/{name}.toml", "\n".join(lines) + "\n")
 
 
+def write_pins(
+    tmp_path, *, knowledge: dict[str, str] | None = None, base: dict[str, str] | None = None
+) -> None:
+    """A machine-shaped pins.toml (ADR-0048): what `theozolith config ingest`
+    would have written for the given knowledge trees / base resolutions."""
+    lines = ['[source]\ncommit = "cafe1234"']
+    if base:
+        lines.append("[base]")
+        lines.extend(f'"{ref}" = "{digest}"' for ref, digest in base.items())
+    if knowledge:
+        lines.append("[knowledge]")
+        lines.extend(f'"{name}" = "{tree_hash}"' for name, tree_hash in knowledge.items())
+    write(tmp_path, "pins.toml", "\n".join(lines) + "\n")
+
+
+def write_knowledge_tree(tmp_path, name: str, files: dict[str, str] | None = None) -> None:
+    """A compiled knowledge tree in the pinned build (ADR-0048)."""
+    for relpath, text in (files or {"CLAUDE.md": "# k\n"}).items():
+        write(tmp_path, f"knowledge/{name}/{relpath}", text)
+
+
 # -- empty / migration ----------------------------------------------------------
 
 
@@ -192,11 +213,12 @@ def test_driverless_worker_type_resolves_to_a_flightdeck_container(tmp_path):
 
 
 def test_stack_placeholder_substituted_in_worker_type_volumes(tmp_path):
-    """ADR-0043: {stack} in a driverless type's volume names resolves to the
-    Stack name (per-Flight-Deck state/tailnet identity), while knowledge-* is
-    left literal (shared across siblings of the type). Two same-type Flight
-    Decks on one node therefore get distinct state/tailscale volumes and the
-    same knowledge volume."""
+    """ADR-0043/0048: {stack} in a driverless type's volume names resolves to
+    the Stack name (per-Flight-Deck state/tailnet identity), while an entry
+    without the placeholder — the read-only knowledge bind — is left literal
+    (shared across siblings of the type). Two same-type Flight Decks on one
+    node therefore get distinct state/tailscale volumes and the same knowledge
+    mount."""
     write(
         tmp_path,
         "worker-types/flightdeck.toml",
@@ -204,7 +226,7 @@ def test_stack_placeholder_substituted_in_worker_type_volumes(tmp_path):
         "volumes = [\n"
         '    "{stack}-logs:/var/log/flightdeck",\n'
         '    "{stack}-claude-state:/home/ozolith/.claude",\n'
-        '    "knowledge-claude-dev:/home/ozolith/knowledge",\n'
+        '    "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",\n'
         '    "{stack}-tailscale-state:/var/lib/tailscale",\n'
         "]\n",
     )
@@ -217,14 +239,15 @@ def test_stack_placeholder_substituted_in_worker_type_volumes(tmp_path):
     assert box1.volumes == (
         "flightdeck-box1-logs:/var/log/flightdeck",
         "flightdeck-box1-claude-state:/home/ozolith/.claude",
-        "knowledge-claude-dev:/home/ozolith/knowledge",  # shared: not substituted
+        # shared, not substituted; the :ro suffix survives untouched
+        "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
         "flightdeck-box1-tailscale-state:/var/lib/tailscale",
     )
     # Distinct per-instance state/tailnet volumes; identical shared knowledge.
     state1 = {v for v in box1.volumes if "claude-state" in v or "tailscale-state" in v}
     state2 = {v for v in box2.volumes if "claude-state" in v or "tailscale-state" in v}
     assert state1.isdisjoint(state2)
-    knowledge = "knowledge-claude-dev:/home/ozolith/knowledge"
+    knowledge = "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro"
     assert knowledge in box1.volumes and knowledge in box2.volumes
 
 
@@ -448,28 +471,40 @@ GOLDEN_BASE = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:" + "a" 
 GOLDEN_IMAGE_FIELDS = (
     f'base = "{GOLDEN_BASE}"\n'
     f'setup = ["apt-get update && apt-get install -y ripgrep"]\n'
-    f'knowledge_source = "https://github.com/acme/my-knowledge.git"\n'
-    f'knowledge_pin = "{"b" * 40}"\n'
+    f'knowledge = "knowledge/gold"\n'
 )
+GOLDEN_KNOWLEDGE = {"CLAUDE.md": "# golden knowledge\n"}
+# sha256-manifest hash of GOLDEN_KNOWLEDGE as configdist.knowledge_tree_hash
+# computes it — a fixed literal so the golden below is a full-config golden.
+GOLDEN_KNOWLEDGE_PIN = "1a7090eb2377900ecf12c6d8ccd2d44ad9e843bd2e4fc660b80f332d1fc77a05"
 
 
-def test_tag_without_model_is_golden_stable_across_adr_0045(tmp_path):
-    """A type with NO model/effort has no materialize step, so its hash must
-    be BYTE-IDENTICAL to the pre-ADR-0045 value — this literal is the old
-    goldtype golden. It is what guarantees adopting this release rebuilds
-    nothing until a definition actually sets a model."""
+def _golden_repo(tmp_path):
+    write_knowledge_tree(tmp_path, "gold", GOLDEN_KNOWLEDGE)
+    write_pins(tmp_path, knowledge={"gold": GOLDEN_KNOWLEDGE_PIN})
+
+
+def test_tag_without_model_is_golden_stable(tmp_path):
+    """A driverless type with NO model/effort has no materialize step — and
+    since ADR-0048 it can carry no knowledge either (a deck's ~/.claude is
+    volume-shadowed), so its identity is base + setup with EMPTY knowledge
+    fields. GOLDEN: the ADR-0048 identity formula (canonical JSON over base,
+    materialized setup, knowledge reference, per-tree pin). The key set
+    changed deliberately with ADR-0048 (knowledge_source -> knowledge), a
+    one-time fleet re-tag; from here the literal moves only when the hash
+    formula changes again — a deliberate act, never drift."""
     write(
         tmp_path,
         "worker-types/goldtype.toml",
-        GOLDEN_IMAGE_FIELDS
+        f'base = "{GOLDEN_BASE}"\n'
+        'setup = ["apt-get update && apt-get install -y ripgrep"]\n'
         # Per-type fields outside the identity: still excluded from the hash.
-        + 'workspace = "acme/sandbox"\n[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+        'workspace = "acme/sandbox"\n[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
     )
     wt = load_config(tmp_path).worker_types["goldtype"]
-    assert wt.tag == "theozolith/goldtype:0.3.0-48a66bc6e009"
-    assert wt.instruction_hash == (
-        "48a66bc6e009a3a84ebaf7bf7d05dc2c9df09851e4fddfb9344eacffbfd59f68"
-    )
+    assert wt.knowledge == "" and wt.knowledge_pin == ""
+    assert wt.tag == "theozolith/goldtype:0.3.0-fbd115afa5ef"
+    assert wt.instruction_hash == "fbd115afa5ef8c384c27b2d32325de43dac5fc88c275da7d1f3bc810728eea4a"
 
 
 def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
@@ -477,6 +512,7 @@ def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
     hash (ADR-0045): same image fields as the golden above, different tag.
     GOLDEN: pins hash-over-materialized-setup end to end — it moves only when
     the renderer format or the hash formula changes, both deliberate acts."""
+    _golden_repo(tmp_path)
     write(
         tmp_path,
         "worker-types/goldtype.toml",
@@ -489,10 +525,87 @@ def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
     assert wt.materialized_setup[-1] == (
         "theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed"
     )
-    assert wt.tag == "theozolith/goldtype:0.3.0-8e28b92a4665"
+    assert wt.tag == "theozolith/goldtype:0.3.0-a3f5923671c0"
     assert wt.instruction_hash == (
-        "8e28b92a46657896d8a6f984dccfcabd9f4ee85cba539b0b56145bbd8d069280"
+        "a3f5923671c0705065a7076b662ead480d86de61d1f7241aca7523a378014fcf"
     )
+
+
+def test_legacy_knowledge_fields_are_rejected_with_the_new_home(tmp_path):
+    driver_type(tmp_path, knowledge_source='"https://github.com/acme/k.git"')
+    with pytest.raises(ConfigRepoError, match=r"retired \(ADR-0048\)"):
+        load_config(tmp_path)
+    driver_type(tmp_path, knowledge_pin='"abc123"')
+    with pytest.raises(ConfigRepoError, match=r"retired \(ADR-0048\)"):
+        load_config(tmp_path)
+
+
+def test_knowledge_reference_requires_an_ingested_pin(tmp_path):
+    write_knowledge_tree(tmp_path, "dev")
+    driver_type(tmp_path, knowledge='"knowledge/dev"')
+    with pytest.raises(ConfigRepoError, match="no ingest-computed pin"):
+        load_config(tmp_path)
+
+
+def test_knowledge_reference_requires_the_compiled_tree(tmp_path):
+    write_pins(tmp_path, knowledge={"dev": "c" * 64})
+    driver_type(tmp_path, knowledge='"knowledge/dev"')
+    with pytest.raises(ConfigRepoError, match="no compiled tree in the pinned build"):
+        load_config(tmp_path)
+
+
+def test_knowledge_reference_shape_is_validated(tmp_path):
+    for bad in ("dev", "knowledge/", "knowledge/../x", "knowledge/.dot", "knowledge/a/b"):
+        driver_type(tmp_path, knowledge=f'"{bad}"')
+        with pytest.raises(ConfigRepoError, match="knowledge reference"):
+            load_config(tmp_path)
+
+
+def test_pins_join_supplies_pin_and_tag_moves_with_the_tree_hash(tmp_path):
+    """Selective rebuild (ADR-0048): the per-tree pin is identity, so bumping
+    ONE tree's pin re-tags exactly the types that reference that tree."""
+    write_knowledge_tree(tmp_path, "dev")
+    write_knowledge_tree(tmp_path, "review")
+    write_pins(tmp_path, knowledge={"dev": "a" * 64, "review": "b" * 64})
+    driver_type(tmp_path, name="dev-type", knowledge='"knowledge/dev"')
+    driver_type(tmp_path, name="review-type", knowledge='"knowledge/review"')
+    before = {n: wt.tag for n, wt in load_config(tmp_path).worker_types.items()}
+    write_pins(tmp_path, knowledge={"dev": "c" * 64, "review": "b" * 64})
+    after = {n: wt.tag for n, wt in load_config(tmp_path).worker_types.items()}
+    assert before["dev-type"] != after["dev-type"]
+    assert before["review-type"] == after["review-type"]
+    assert load_config(tmp_path).worker_types["dev-type"].knowledge_pin == "c" * 64
+
+
+def test_base_tag_resolves_through_pins(tmp_path):
+    """An ingest-resolved base (ADR-0048): the Config Repo names a tag, the
+    pinned build's pins.toml carries the digest, load joins them."""
+    ref = "ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2"
+    write_pins(tmp_path, base={ref: f"sha256:{'d' * 64}"})
+    driver_type(tmp_path, base=f'"{ref}"')
+    wt = load_config(tmp_path).worker_types["claude-dev"]
+    assert wt.base == f"{ref}@sha256:{'d' * 64}"
+    assert wt.base_digest == f"sha256:{'d' * 64}"
+    assert wt.tag.startswith("theozolith/claude-dev:1.2-")
+
+
+def test_unresolved_base_tag_names_ingest(tmp_path):
+    driver_type(tmp_path, base='"ghcr.io/acme/run:1.2"')
+    with pytest.raises(ConfigRepoError, match="must be pinned by digest"):
+        load_config(tmp_path)
+
+
+def test_malformed_pins_fail_loudly(tmp_path):
+    driver_type(tmp_path)
+    for body in (
+        '[base]\n"ghcr.io/a:1" = "nope"\n',
+        f'[knowledge]\n"dev" = "{"g" * 64}"\n',  # non-hex
+        '[knowledge]\n"dev" = 7\n',
+        "base = 3\n",
+    ):
+        write(tmp_path, "pins.toml", body)
+        with pytest.raises(ConfigRepoError, match=r"pins\.toml"):
+            load_config(tmp_path)
 
 
 def test_model_and_effort_change_the_tag(tmp_path):
@@ -831,7 +944,7 @@ def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
         "name",
         "base",
         "setup",
-        "knowledge_source",
+        "knowledge",
         "knowledge_pin",
         "tag",
         "base_digest",
@@ -1364,6 +1477,9 @@ def test_refuse_ui_write_rejects_drivers_paths(tmp_path):
         "drivers/custom/impl.py",
         "drivers",
         "drivers/",  # trailing slash: an empty component, refused as malformed
+        "knowledge/dev/CLAUDE.md",  # compiled knowledge is ingest-written (ADR-0048)
+        "knowledge",
+        "pins.toml",  # machine-owned, ingest-only (ADR-0048)
     ):
         with pytest.raises(configrepo.ConfigRepoError):
             configrepo.refuse_ui_write(bad)
@@ -1409,4 +1525,5 @@ def test_refuse_ui_write_allows_other_paths(tmp_path):
     configrepo.refuse_ui_write("worker-types/x.toml")
     configrepo.refuse_ui_write("stacks/drivers.toml")  # 'drivers' as a filename is fine
     configrepo.refuse_ui_write("drivers.toml")  # a top-level file merely NAMED drivers*
+    configrepo.refuse_ui_write("stacks/pins.toml")  # only the ROOT pins.toml is machine-owned
     configrepo.refuse_ui_write("compose/app/overlay.yaml")

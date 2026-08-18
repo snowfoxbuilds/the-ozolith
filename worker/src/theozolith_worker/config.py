@@ -94,9 +94,9 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
     """Parse ``name:/path,name:/path`` into named-volume mounts.
 
     A cache volume that would persist a Claude configuration tree is refused
-    (ADR-0043): live knowledge must never mount into a Run — it breaks pin
+    (ADR-0043/0048): live knowledge must never mount into a Run — it breaks pin
     reproducibility and opens a prompt-injection persistence channel. The
-    shared-clone symlink carve-out is Flight-Deck-only; this closes the one
+    knowledge-mount symlink carve-out is Flight-Deck-only; this closes the one
     config-reachable channel that could reintroduce it on a run container.
     Destinations are normalized first (the engine mounts the cleaned path, so
     ``/home//ozolith/./.claude`` and ``/home/ozolith/.claude`` are the same
@@ -117,8 +117,8 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
         if ".claude" in dest.split("/"):
             raise ConfigError(
                 f"THEOZOLITH_CACHE_VOLUMES entry {item!r} targets a .claude path —"
-                " live knowledge must never mount into a Run (ADR-0043); the"
-                " shared-clone symlink carve-out is Flight-Deck-only"
+                " live knowledge must never mount into a Run (ADR-0043/0048); the"
+                " knowledge-mount symlink carve-out is Flight-Deck-only"
             )
         covered = [
             tree
@@ -130,7 +130,7 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
                 f"THEOZOLITH_CACHE_VOLUMES entry {item!r} mounts an ancestor of the"
                 f" protected .claude tree {covered[0]!r} — a persistent volume there"
                 " would carry a Claude configuration across Runs (ADR-0043); the"
-                " shared-clone symlink carve-out is Flight-Deck-only"
+                " knowledge-mount symlink carve-out is Flight-Deck-only"
             )
         pairs.append((name, dest))
     return tuple(pairs)

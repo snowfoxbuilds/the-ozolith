@@ -12,15 +12,17 @@
 # authority transitions (above all the merge) as a human. Do not leave
 # Flight Deck sessions running unattended.
 #
-# Knowledge & state (ADR-0043): ~/.claude is split by class. Runtime state
-# (sessions/transcripts/--resume) lives on the per-Flight-Deck
-# `{stack}-claude-state` volume — never shared, never worker-visible. Knowledge
-# (skills/subagents/workflows) lives on ONE shared writable clone per worker
-# type per node — the `knowledge-*` volume — which flightdeck-start clones at
-# start (`theozolith-knowledge clone-init`) and symlinks the ~/.claude
-# knowledge dirs into. A skill edited in one Flight Deck is live in siblings of
-# the same type after an agent-CLI restart. Promote = commit/push + re-pin +
-# rebuild (see deploy/README.md). The symlink carve-out is Flight-Deck-only.
+# Knowledge & state (ADR-0043 as amended by ADR-0048): ~/.claude is split by
+# class. Runtime state (sessions/transcripts/--resume) lives on the
+# per-Flight-Deck `{stack}-claude-state` volume — never shared, never
+# worker-visible. Knowledge (skills/subagents/workflows) is authored in the
+# Config Repo `knowledge/` tree, compiled at ingest, and read-only
+# bind-mounted from the node's applied pinned tree (the stable
+# /var/lib/theozolith/knowledge export the daemon maintains) — no writable
+# clone, no promote workflow. flightdeck-start symlinks the ~/.claude
+# knowledge dirs into the mount; an edit reaches every deck on every node via
+# ordinary config distribution, picked up on agent-CLI restart. The symlink
+# carve-out is Flight-Deck-only.
 #
 # One-hop remote access (issue #20 §1, landed via issue #31): each Flight Deck
 # runs a userspace `tailscaled` as the unprivileged ozolith uid and is its own
@@ -42,9 +44,10 @@ base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:000000000000000
 # NOTHING is ever baked under /home/ozolith/.claude — not knowledge, not the
 # agent CLI's native config. The {stack}-claude-state volume copies image
 # content on FIRST mount only, never updates on rebuild, and fights the
-# flightdeck-start symlinks. So: NO knowledge_source / knowledge_pin here
-# (contrast the driver types — the deck gets its knowledge from the shared
-# clone at start, ADR-0043), and the `model` below is NOT delivered as a baked
+# flightdeck-start symlinks. So: NO `knowledge` reference here (config load
+# rejects it on driverless types — contrast the driver types, which bake;
+# the deck reads the node's applied tree through the read-only mount below,
+# ADR-0048), and the `model` below is NOT delivered as a baked
 # ~/.claude/settings.json. Anything the image needs to say to the agent CLI
 # must live OUTSIDE every volume mountpoint: the model rides the root-owned
 # well-known file /etc/theozolith/model (ADR-0045 §4).
@@ -90,20 +93,22 @@ install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscale"  /usr/local/
 install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscaled" /usr/local/bin/tailscaled && \
 rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 
-    # (3) Seed the three volume mountpoints ozolith-owned. setup runs as root;
+    # (3) Seed the named-volume mountpoints ozolith-owned. setup runs as root;
     #     an absent mountpoint would otherwise be created root-owned, and its
     #     ownership is copied onto the volume on first mount. /var/lib/tailscale
-    #     ownership is what lets the uid-1000 daemon write its state.
-    "mkdir -p /home/ozolith/.claude /home/ozolith/knowledge /var/lib/tailscale && chown ozolith:ozolith /home/ozolith/.claude /home/ozolith/knowledge /var/lib/tailscale",
+    #     ownership is what lets the uid-1000 daemon write its state. (The
+    #     knowledge bind mount needs no seeding: it is read-only host content.)
+    "mkdir -p /home/ozolith/.claude /var/lib/tailscale && chown ozolith:ozolith /home/ozolith/.claude /var/lib/tailscale",
 
     # (4) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
     #     content baked by setup — never product source — which is how the
-    #     no-tailscale-in-product constraint is honored. The knowledge URL is a
-    #     LITERAL here: it is worker-type identity (it defines the shared clone
-    #     all siblings mount), so changing it changes the instruction hash ->
-    #     deterministic-tag rebuild. Runtime values ($FLIGHTDECK_TS_HOSTNAME,
-    #     $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at build — every script line is
-    #     a single-quoted printf argument — and expand only at container start.
+    #     no-tailscale-in-product constraint is honored. The knowledge TREE
+    #     NAME is a LITERAL here (ADR-0048): it selects which applied tree the
+    #     symlinks target, it is worker-type identity, and changing it changes
+    #     the instruction hash -> deterministic-tag rebuild. Runtime values
+    #     ($FLIGHTDECK_TS_HOSTNAME, $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at
+    #     build — every script line is a single-quoted printf argument — and
+    #     expand only at container start.
     #
     #     The issue #31 lifecycle contract, in order:
     #       - enrollment is decided BEFORE tailscaled launches, from the
@@ -139,13 +144,16 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
     '''printf '%s\n' \
 '#!/bin/sh' \
 'set -eu' \
-'# ADR-0043: shared knowledge clone + live symlinks' \
-'theozolith-knowledge clone-init --source "https://github.com/acme/my-knowledge.git" --target /home/ozolith/knowledge' \
-'mkdir -p /home/ozolith/knowledge/skills /home/ozolith/knowledge/agents/claude /home/ozolith/knowledge/workflows' \
-'ln -sfnT /home/ozolith/knowledge/skills        /home/ozolith/.claude/skills' \
-'ln -sfnT /home/ozolith/knowledge/agents/claude /home/ozolith/.claude/agents' \
-'ln -sfnT /home/ozolith/knowledge/workflows     /home/ozolith/.claude/workflows' \
-'ln -sfnT /home/ozolith/knowledge/AGENTS.md     /home/ozolith/.claude/CLAUDE.md' \
+'# ADR-0048: knowledge is the node-applied pinned tree, mounted read-only at' \
+'# /var/lib/theozolith/knowledge. Symlink the ~/.claude knowledge dirs into' \
+'# the COMPILED tree for this deck (skills/, agents/, workflows/, CLAUDE.md).' \
+'# The links may dangle until the node has converged a distribution carrying' \
+'# the tree — the agent CLI just starts without skills and a restart after' \
+'# convergence picks them up.' \
+'ln -sfnT /var/lib/theozolith/knowledge/claude-dev/skills    /home/ozolith/.claude/skills' \
+'ln -sfnT /var/lib/theozolith/knowledge/claude-dev/agents    /home/ozolith/.claude/agents' \
+'ln -sfnT /var/lib/theozolith/knowledge/claude-dev/workflows /home/ozolith/.claude/workflows' \
+'ln -sfnT /var/lib/theozolith/knowledge/claude-dev/CLAUDE.md /home/ozolith/.claude/CLAUDE.md' \
 '# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled' \
 ': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
 '# Enrollment is decided BEFORE the daemon can touch the statedir — from the' \
@@ -210,15 +218,19 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 
 command = "/usr/local/bin/flightdeck-start"
 
-# Node-local named volumes (ADR-0043). `{stack}` is substituted control-side
+# Node-local volumes (ADR-0043/0048). `{stack}` is substituted control-side
 # with this Flight Deck Stack's name, so two same-type Flight Decks on one node
-# get distinct runtime-state and tailnet-identity volumes. The knowledge volume
-# is deliberately NOT `{stack}` — it is `knowledge-<worker-type>`, shared by all
-# siblings of the type on the node (edit a skill once, live everywhere).
+# get distinct runtime-state and tailnet-identity volumes. The knowledge entry
+# is a READ-ONLY BIND of the stable export the Node Daemon maintains from the
+# applied pinned tree — deliberately shared (no `{stack}`), never writable,
+# and mounted at the PARENT so a tree swap on the host never recreates the
+# container: a running session keeps what it loaded, an agent-CLI restart
+# picks up the new trees. The host path is `<state-dir>/knowledge`; adjust it
+# if your nodes override THEOZOLITH_STATE_DIR.
 volumes = [
     "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
     "{stack}-claude-state:/home/ozolith/.claude",    # per-instance runtime state (never shared)
-    "knowledge-claude-dev:/home/ozolith/knowledge",  # SHARED: worker-type name, not {stack}
+    "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",  # applied knowledge (ADR-0048)
     "{stack}-tailscale-state:/var/lib/tailscale",    # per-instance tailnet machine identity
 ]
 
@@ -243,6 +255,3 @@ ANTHROPIC_API_KEY = "anthropic-api-key"
 # restore the binding (here or on that Stack) first — a fresh start
 # without it fails fast with a message saying exactly that.
 TS_AUTHKEY = "flightdeck-tailscale-authkey"
-# For a PRIVATE knowledge repo, uncomment and provide a git credential helper
-# in the base image that reads this token; clone-init auth is then ambient.
-# KNOWLEDGE_GIT_TOKEN = "knowledge-git-token"

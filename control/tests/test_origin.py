@@ -117,7 +117,7 @@ def test_leftover_public_origin_is_ignored_and_dropped(tmp_path):
     )
     assert controltoml.read_control_ip(tmp_path) == CONTROL_IP
     assert controltoml.read_control_port(tmp_path) == 443
-    controltoml.set_value(tmp_path, "heartbeat_seconds", "30")
+    controltoml.write_control_address(tmp_path, CONTROL_IP)  # any regeneration
     assert "public_origin" not in controltoml.control_toml_path(tmp_path).read_text()
 
 
