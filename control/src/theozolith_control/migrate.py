@@ -30,16 +30,25 @@ BEFORE the upgraded service must load that now-incompatible configuration:
    the read-only mount pattern in ``deploy/configs-example`` — but never
    rewritten: a start script is operator content.
 
-The migrated repo is git-initialized and committed (machine identity) when it
-is not already a git repo, and the report ends with the exact next steps:
-review, place knowledge trees, ``theozolith config ingest``, restart.
+The whole migration is FAILURE-ATOMIC: it builds, transforms, and
+git-commits (machine identity; ``--allow-empty`` for a minimal legacy tree)
+in an invocation-owned sibling temporary directory and atomically renames
+the finished repository into place — a failure leaves the destination
+absent and the command immediately rerunnable. The report ends with the
+exact next steps: place knowledge trees, review and commit, STOP the old
+service, ``theozolith config ingest``, start the upgraded service, update
+the nodes — the pre-upgrade code must never load an ingested build (it
+would silently ignore the new knowledge fields and serve knowledge-less
+worker types).
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,11 +87,16 @@ class MigrateReport:
             "  1. For each worker type noted above, place its knowledge root in",
             '     this repo under knowledge/<name>/ and set knowledge = "knowledge/<name>".',
             "  2. Review the migrated files, then commit.",
-            f"  3. Run: theozolith config ingest {self.dest}",
+            "  3. Stop the old control service (sudo systemctl stop",
+            "     theozolith-control.service) — the pre-upgrade code must never",
+            "     load an ingested build; it would silently drop the new",
+            "     knowledge wiring. Running containers keep running.",
+            f"  4. Run: theozolith config ingest {self.dest}",
             "     (writes the pinned build the service loads; the legacy configs",
             "     tree keeps its history and machine-written control address)",
-            "  4. Restart the control service so the upgraded code serves the",
-            "     ingested build.",
+            "  5. Start the service on the upgraded code (sudo systemctl start",
+            "     theozolith-control.service), then update the nodes",
+            "     (theozolith build / theozolith command update).",
         ]
         return "\n".join(lines)
 
@@ -226,12 +240,15 @@ def _toml_literal(value) -> str:
     return repr(value)
 
 
-def _git_init_and_commit(dest: Path, runner, report: MigrateReport) -> None:
-    if (dest / ".git").exists():
-        return
+def _git_init_and_commit(staging: Path, runner, report: MigrateReport) -> None:
+    """Initialize and commit the STAGED repo. ``add`` is forced so no
+    user-global excludes file can silently drop a migrated config file from
+    the initial commit; ``--allow-empty`` because a minimal legacy deployment
+    (nothing but machine-owned files) legitimately migrates to an empty
+    Config Repo — the empty initial commit is still a valid starting point."""
     for argv in (
         ["git", "init", "--quiet"],
-        ["git", "add", "-A"],
+        ["git", "add", "-A", "--force"],
         [
             "git",
             "-c",
@@ -240,44 +257,101 @@ def _git_init_and_commit(dest: Path, runner, report: MigrateReport) -> None:
             f"user.email={controltoml.COMMIT_AUTHOR_EMAIL}",
             "commit",
             "--quiet",
+            "--allow-empty",
             "-m",
             "theozolith config migrate: pre-ADR-0048 configs -> Config Repo",
         ],
     ):
-        proc = runner(argv, cwd=str(dest), capture_output=True, text=True, check=False)
+        proc = runner(argv, cwd=str(staging), capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()[:300]
             raise MigrateError(f"could not git-commit the migrated repo: {detail}")
     report.notes.append("initialized the migrated repo as git and committed the import")
 
 
+def _check_paths(legacy_dir: Path, dest: Path) -> tuple[Path, Path]:
+    """Resolved-path shape guards: the copy must never recurse into itself or
+    write into the legacy tree, and a symlinked destination must never
+    redirect the publish somewhere else. Returns (legacy, dest) resolved."""
+    if not legacy_dir.is_dir():
+        raise MigrateError(f"legacy config tree {legacy_dir} is not a directory")
+    if dest.is_symlink():
+        raise MigrateError(
+            f"migration destination {dest} is a symlink — refused; point the"
+            " command at the real directory to create"
+        )
+    legacy_res = legacy_dir.resolve()
+    dest_res = dest.resolve()
+    if dest_res == legacy_res:
+        raise MigrateError("the migration destination must differ from the legacy tree")
+    if legacy_res in dest_res.parents:
+        raise MigrateError(
+            f"migration destination {dest} is inside the legacy tree"
+            f" {legacy_dir} — the legacy configs stay untouched until ingest;"
+            " point the destination outside it"
+        )
+    if dest_res in legacy_res.parents:
+        raise MigrateError(
+            f"legacy tree {legacy_dir} is inside the migration destination"
+            f" {dest} — refused; point the destination at a fresh directory"
+        )
+    if dest.exists():
+        if not dest.is_dir():
+            raise MigrateError(f"migration destination {dest} is not a directory")
+        if any(dest.iterdir()):
+            raise MigrateError(
+                f"migration destination {dest} is not empty — this command creates a"
+                " fresh Config Repo; point it at a new directory"
+            )
+    return legacy_res, dest_res
+
+
 def migrate_legacy(legacy_dir: Path, dest: Path, *, runner=None, log=print) -> MigrateReport:
     """Migrate a pre-ADR-0048 ``configs/`` tree into a human Config Repo at
     ``dest``. The legacy tree is never modified; ``dest`` must be missing or
-    empty (this command creates a repo, it never merges into one)."""
+    empty (this command creates a repo, it never merges into one).
+
+    FAILURE-ATOMIC: every step — copy, transformations, validation, git init,
+    the initial commit — runs in an invocation-owned dot-prefixed sibling
+    temporary directory, and the finished repository is published to ``dest``
+    with one atomic rename only after everything succeeded. On any failure
+    the temporary tree is removed and ``dest`` is left absent (or exactly the
+    empty directory it was): a failed migration is immediately rerunnable."""
     runner = runner or subprocess.run
     legacy_dir = Path(legacy_dir)
     dest = Path(dest)
-    if not legacy_dir.is_dir():
-        raise MigrateError(f"legacy config tree {legacy_dir} is not a directory")
-    if dest.resolve() == legacy_dir.resolve():
-        raise MigrateError("the migration destination must differ from the legacy tree")
-    if dest.exists() and any(dest.iterdir()):
-        raise MigrateError(
-            f"migration destination {dest} is not empty — this command creates a"
-            " fresh Config Repo; point it at a new directory"
-        )
+    legacy_res, dest_res = _check_paths(legacy_dir, dest)
     report = MigrateReport(dest=dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    _copy_tree(legacy_dir, dest, report.written)
-    for path in sorted((dest / "worker-types").glob("*.toml")):
-        _strip_legacy_knowledge(path, path.stem, report)
+    dest_res.parent.mkdir(parents=True, exist_ok=True)
+    # Dot-prefixed: an excluded name to every tree walk in the system, so a
+    # crash-orphaned staging dir can never be mistaken for content.
+    staging = Path(tempfile.mkdtemp(prefix=f".{dest_res.name}.migrate-", dir=dest_res.parent))
+    try:
+        _copy_tree(legacy_res, staging, report.written)
+        for path in sorted((staging / "worker-types").glob("*.toml")):
+            _strip_legacy_knowledge(path, path.stem, report)
+            try:
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            _note_legacy_deck_wiring(data, path.stem, report)
+        _write_settings_only_control_toml(legacy_res, staging, report)
+        if not report.written:
+            report.notes.append(
+                "the legacy tree carried no operator-authored config files —"
+                " the Config Repo starts empty (machine-owned files stay in"
+                " the pinned build)"
+            )
+        _git_init_and_commit(staging, runner, report)
         try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
-            continue
-        _note_legacy_deck_wiring(data, path.stem, report)
-    _write_settings_only_control_toml(legacy_dir, dest, report)
-    _git_init_and_commit(dest, runner, report)
+            os.rename(staging, dest_res)
+        except OSError as exc:
+            raise MigrateError(
+                f"cannot publish the migrated repo to {dest}: {exc} — the"
+                " destination must still be missing or an empty directory"
+            ) from exc
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     log(report.summary())
     return report

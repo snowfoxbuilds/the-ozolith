@@ -367,10 +367,13 @@ checkout — it reuses the existing `/opt/theozolith` venv (ADR-0041; the old
 Deployments that predate config ingestion hand-edited `configs/` directly and
 declared worker-type knowledge as `knowledge_source`/`knowledge_pin` (a git
 URL + SHA, cloned with the now-retired `KNOWLEDGE_GIT_TOKEN`). The upgraded
-code **refuses those fields loudly at config load**, so migrate BEFORE the
-upgraded service must load them. `theozolith config migrate` does the
-mechanical half; the sequence below keeps the service on its old code — still
-serving the old config — until the new pinned build is committed.
+code **refuses those fields loudly at config load** — and the OLD code must
+never load an ingested (post-ADR-0048) build either: it would not crash, it
+would silently ignore the new `knowledge` field and serve knowledge-less
+worker types, re-tagging the fleet onto images with no knowledge baked in.
+So the first ingest happens inside a **bounded, deliberate control-plane
+stop**: prepare and review everything while the old service keeps running,
+stop it, ingest, start the upgraded service.
 
 1. **Back up first.** The standard one-folder backup (next section) covers
    everything the migration touches; at minimum copy `configs/` — it is a git
@@ -379,13 +382,17 @@ serving the old config — until the new pinned build is committed.
 2. **Upgrade the code, keep the service running**: `sudo python3 build.py`
    from the updated checkout installs the new CLI and packages. The running
    service process still runs the OLD code and keeps loading the old config
-   — do not restart it yet.
+   — do not restart it yet. Everything through step 5 is preparation the old
+   service never observes.
 3. **Migrate**: `sudo theozolith config migrate` reads `configs/` (never
-   modifying it) and writes a human Config Repo at `config-src/` — config
-   files copied, retired `knowledge_source`/`knowledge_pin` removed and
-   preserved as MIGRATION comments, `control.toml` reduced to its operator
-   `[settings]` surface (the machine `[control]` block stays in `configs/`,
-   where ingest preserves it). It prints one note per follow-up.
+   modifying it — the legacy tree stays byte-for-byte and history-identical
+   until ingest) and atomically publishes a human Config Repo at
+   `config-src/` — config files copied, retired
+   `knowledge_source`/`knowledge_pin` removed and preserved as MIGRATION
+   comments, `control.toml` reduced to its operator `[settings]` surface
+   (the machine `[control]` block stays in `configs/`, where ingest
+   preserves it). It prints one note per follow-up. A failed migration
+   leaves no partial `config-src/` and is immediately rerunnable.
 4. **Place the knowledge**: for each worker type the report names, clone that
    knowledge repo's CONTENT into `config-src/knowledge/<name>/` (the ADR-0009
    source layout: `skills/`, `agents/`, `workflows/`, `AGENTS.md`) and set
@@ -394,25 +401,37 @@ serving the old config — until the new pinned build is committed.
    adopt the read-only-mount pattern from
    `deploy/configs-example/worker-types/flightdeck.toml`. The
    `KNOWLEDGE_GIT_TOKEN` secret can be deleted once no type references it.
-5. **Review and commit** `config-src/`, then **ingest**:
-   `sudo theozolith config ingest`. This commits the machine-owned pinned
-   build ONTO the existing `configs/` git history — machine `control.toml`
-   address, product pin, stacks, worker types, and secrets (which live in the
-   encrypted store, untouched by all of this) are preserved.
-6. **Restart the service** (`sudo systemctl restart theozolith-control.service`)
-   so the upgraded code serves the ingested build, and push the fleet
-   (`theozolith build` / `theozolith command update`) so nodes run matching
-   daemons — the recipe wire format changed with the knowledge fields, so
-   upgrade control and nodes together.
+5. **Review and commit** `config-src/`.
+6. **Stop the old service**: `sudo systemctl stop theozolith-control.service`.
+   This begins the bounded outage — control-plane only. Nodes ride it out in
+   degraded mode: running containers and Runs keep running, daemons keep
+   retrying heartbeats, and nothing new is dispatched until control returns.
+7. **Ingest while stopped**: `sudo theozolith config ingest`. This commits
+   the machine-owned pinned build ONTO the existing `configs/` git history —
+   machine `control.toml` address, product pin, stacks, worker types, and
+   secrets (which live in the encrypted store, untouched by all of this) are
+   preserved. **If the ingest is refused** (a lint failure, a placeholder
+   checksum, an unresolvable base tag), nothing was committed: `configs/` is
+   exactly as it was, so you may either fix `config-src/` and re-run ingest,
+   or start the OLD service again (reinstall the previous release first) and
+   finish the preparation later.
+8. **Start the upgraded service immediately**
+   (`sudo systemctl start theozolith-control.service`) — ending the outage —
+   **then update the nodes** (`theozolith build` / `theozolith command
+   update`) so they run matching daemons: the recipe wire format changed with
+   the knowledge fields, so control and nodes upgrade together, control
+   first.
 
-**Rollback.** Each step is independently reversible: before the ingest,
-nothing changed for the running service (delete `config-src/` to abandon a
-migration and re-run it). After the ingest, `configs/` is one commit ahead —
-`git -C configs revert HEAD` (or `git reset --hard HEAD^` before anything
-consumed it) restores the pre-migration tree byte-for-byte, and reinstalling
-the previous release restores the old code. The backup from step 1 is the
-belt-and-braces path: restore the folder and the deployment is exactly where
-it started.
+**Rollback.** Before the pinned-build commit (through step 6), nothing
+changed for the service: delete `config-src/` to abandon a migration, and
+start the service again on whichever code is installed (reinstall the
+previous release if you already upgraded). After the pinned-build commit
+(step 7 onward): stop the service, `git -C configs revert HEAD` (or `git
+reset --hard HEAD^` if nothing consumed the new build yet) restores the
+pre-migration tree byte-for-byte, reinstall the previous release, and start
+— the old code again loads exactly the config it always had. The backup from
+step 1 is the belt-and-braces path: restore the folder and the deployment is
+exactly where it started.
 
 ## Backup and recovery (ADR-0024)
 

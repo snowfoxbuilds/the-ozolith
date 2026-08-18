@@ -420,8 +420,11 @@ def extract_zip(data: bytes, dest: Path) -> None:
                 if (info.external_attr >> 16) & 0o111:
                     # Restore the executable bit the control side stamped as
                     # archive metadata (ADR-0048: a compiled skill script must
-                    # stay runnable through bake and the deck mount). Modes
-                    # never enter the hash.
+                    # stay runnable through bake and the deck mount). The same
+                    # normalized state rides every manifest entry
+                    # (entry_mode), so the extracted tree verifies with the
+                    # restored bit in its hash — a chmod-only change is a real
+                    # content change.
                     os.chmod(target, 0o755)
             except OSError as exc:
                 raise ConfigDistError(

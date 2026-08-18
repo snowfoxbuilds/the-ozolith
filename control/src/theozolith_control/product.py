@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from theozolith_control import bearerhttp
+from theozolith_control import bearerhttp, repolock
 from theozolith_control.controltoml import COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME
 
 # The components one product version covers (ADR-0013 §8: one versioned
@@ -113,9 +113,21 @@ def read_pin(config_repo: Path) -> str:
 
 def write_pin(config_repo: Path, version: str, *, runner=subprocess.run, log=_log) -> None:
     """Write the pin and commit it when the Config Repo is git-backed —
-    the recorded version IS the deployment decision (ADR-0006/0015)."""
+    the recorded version IS the deployment decision (ADR-0006/0015). The
+    write-and-commit holds the shared pinned-build write lock (ADR-0048
+    amendment): a pin bump can never land inside an ingest transaction's
+    window and be overwritten or orphaned by its ref move — the contending
+    writer fails cleanly and retries instead."""
     if not version:
         raise ProductError("refusing to pin an empty version (never deploy an unrecorded version)")
+    try:
+        with repolock.pinned_write_lock(config_repo, writer="product-pin write"):
+            _write_pin_locked(config_repo, version, runner, log)
+    except repolock.RepoLockError as exc:
+        raise ProductError(str(exc)) from exc
+
+
+def _write_pin_locked(config_repo: Path, version: str, runner, log) -> None:
     config_repo.mkdir(parents=True, exist_ok=True)
     target = config_repo / "product.toml"
     target.write_text(

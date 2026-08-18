@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from theozolith_control import repolock
+
 CONTROL_TOML = "control.toml"
 
 # The settings-form commit convention (the product.toml precedent).
@@ -349,15 +351,33 @@ def write_control_address(
         canonical = str(ipaddress.ip_address(ip))
     except ValueError as exc:
         raise ControlTomlError(f"control IP {ip!r} is not an IP address: {exc}") from exc
-    if port is None:
-        port = read_control_port(config_repo)
-    elif isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    if isinstance(port, bool) or (
+        port is not None and (not isinstance(port, int) or not 1 <= port <= 65535)
+    ):
         raise ControlTomlError(f"control port {port!r} must be an integer in 1-65535")
-    path = _write(
-        config_repo, canonical, port, read_browser_origin(config_repo), read_values(config_repo)
-    )
-    suffix = "" if port == DEFAULT_CONTROL_PORT else f":{port}"
-    _commit(config_repo, f"theozolith: control address {canonical}{suffix}", runner=runner, log=log)
+    # The whole read-modify-write-commit holds the shared pinned-build write
+    # lock (ADR-0048 amendment): an ingest or product-pin transaction in
+    # flight is never interleaved with, and never orphaned by, this write.
+    try:
+        with repolock.pinned_write_lock(config_repo, writer="control address write"):
+            if port is None:
+                port = read_control_port(config_repo)
+            path = _write(
+                config_repo,
+                canonical,
+                port,
+                read_browser_origin(config_repo),
+                read_values(config_repo),
+            )
+            suffix = "" if port == DEFAULT_CONTROL_PORT else f":{port}"
+            _commit(
+                config_repo,
+                f"theozolith: control address {canonical}{suffix}",
+                runner=runner,
+                log=log,
+            )
+    except repolock.RepoLockError as exc:
+        raise ControlTomlError(str(exc)) from exc
     return path
 
 
@@ -366,15 +386,22 @@ def write_browser_origin(
 ) -> Path:
     """Persist the browser origin (origin-init only; ADR-0036), keeping the
     address fields and every committed setting. The caller validates the
-    origin (origin.parse_browser_origin) — this is the storage step."""
-    path = _write(
-        config_repo,
-        read_control_ip(config_repo),
-        read_control_port(config_repo),
-        browser_origin,
-        read_values(config_repo),
-    )
-    _commit(config_repo, f"theozolith: browser origin {browser_origin}", runner=runner, log=log)
+    origin (origin.parse_browser_origin) — this is the storage step. Holds
+    the shared pinned-build write lock for the read-modify-write-commit."""
+    try:
+        with repolock.pinned_write_lock(config_repo, writer="browser-origin write"):
+            path = _write(
+                config_repo,
+                read_control_ip(config_repo),
+                read_control_port(config_repo),
+                browser_origin,
+                read_values(config_repo),
+            )
+            _commit(
+                config_repo, f"theozolith: browser origin {browser_origin}", runner=runner, log=log
+            )
+    except repolock.RepoLockError as exc:
+        raise ControlTomlError(str(exc)) from exc
     return path
 
 

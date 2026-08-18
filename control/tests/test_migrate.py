@@ -158,6 +158,106 @@ def test_migrate_refuses_bad_destinations(tmp_path):
         migrate_legacy(tmp_path / "nope", tmp_path / "dest", log=lambda *_: None)
 
 
+def test_migrate_refuses_overlapping_and_symlinked_shapes(tmp_path):
+    """Resolved-path guards: the copy must never recurse into itself, never
+    write inside the legacy tree, and never follow a symlinked destination
+    somewhere else. The legacy tree stays byte-for-byte untouched."""
+    legacy = legacy_tree(tmp_path)
+    head = _git(legacy, "rev-parse", "HEAD")
+    with pytest.raises(MigrateError, match="inside the legacy tree"):
+        migrate_legacy(legacy, legacy / "config-src", log=lambda *_: None)
+    assert not (legacy / "config-src").exists()
+    with pytest.raises(MigrateError, match="inside the migration destination"):
+        migrate_legacy(legacy, tmp_path, log=lambda *_: None)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    linked = tmp_path / "linked-dest"
+    linked.symlink_to(elsewhere)
+    with pytest.raises(MigrateError, match="symlink"):
+        migrate_legacy(legacy, linked, log=lambda *_: None)
+    assert not any(elsewhere.iterdir())
+    # A destination aliasing the legacy tree through a symlink never gets far
+    # enough to resolve — the symlink guard refuses it outright.
+    legacy_link = tmp_path / "legacy-link"
+    legacy_link.symlink_to(legacy)
+    with pytest.raises(MigrateError, match="symlink"):
+        migrate_legacy(legacy, legacy_link, log=lambda *_: None)
+    assert _git(legacy, "rev-parse", "HEAD") == head
+    assert _git(legacy, "status", "--porcelain") == ""
+
+
+def test_failed_copy_publishes_nothing_and_is_rerunnable(tmp_path):
+    """A symlink deep in the legacy tree fails the copy after real files were
+    already traversed: the destination stays absent (no partial repo), no
+    staging leftovers survive, the legacy tree is untouched, and the rerun
+    succeeds once the cause is removed."""
+    legacy = legacy_tree(tmp_path)
+    link = legacy / "worker-types" / "zz-link.toml"
+    link.symlink_to(legacy / "worker-types" / "claude-dev.toml")
+    dest = tmp_path / "config-src"
+    with pytest.raises(MigrateError, match="symlink"):
+        migrate_legacy(legacy, dest, log=lambda *_: None)
+    assert not dest.exists()
+    assert not list(tmp_path.glob(".config-src.migrate-*"))
+    assert _git(legacy, "status", "--porcelain") == "?? worker-types/zz-link.toml"
+
+    link.unlink()
+    migrate_legacy(legacy, dest, log=lambda *_: None)
+    assert (dest / "worker-types/claude-dev.toml").is_file()
+    assert _git(dest, "status", "--porcelain") == ""
+    assert _git(legacy, "status", "--porcelain") == ""
+
+
+def test_injected_git_failure_publishes_nothing_and_is_rerunnable(tmp_path):
+    """A git init/add/commit failure aborts before anything is published: the
+    destination stays absent, the invocation-owned staging tree is removed,
+    and the same command immediately reruns clean."""
+    legacy = legacy_tree(tmp_path)
+    dest = tmp_path / "config-src"
+
+    def failing(argv, **kwargs):
+        if argv[0] == "git" and ("commit" in argv or "add" in argv):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="injected failure")
+        return subprocess.run(argv, **kwargs)
+
+    with pytest.raises(MigrateError, match="could not git-commit"):
+        migrate_legacy(legacy, dest, runner=failing, log=lambda *_: None)
+    assert not dest.exists()
+    assert not list(tmp_path.glob(".config-src.migrate-*"))
+    assert _git(legacy, "status", "--porcelain") == ""
+
+    migrate_legacy(legacy, dest, log=lambda *_: None)
+    assert (dest / "product.toml").is_file()
+    assert _git(dest, "status", "--porcelain") == ""
+
+
+def test_preexisting_empty_destination_is_accepted(tmp_path):
+    legacy = legacy_tree(tmp_path)
+    dest = tmp_path / "config-src"
+    dest.mkdir()
+    migrate_legacy(legacy, dest, log=lambda *_: None)
+    assert (dest / "product.toml").is_file()
+    assert _git(dest, "status", "--porcelain") == ""
+
+
+def test_minimal_legacy_migrates_to_an_empty_config_repo(tmp_path):
+    """A deployment whose configs tree holds nothing operator-authored (the
+    machine control.toml at shipped defaults) migrates to a VALID empty
+    Config Repo: git-initialized with an empty initial commit."""
+    legacy = tmp_path / "configs"
+    write(legacy, "control.toml", '[control]\ncontrol_ip = "192.0.2.7"\n')
+    _git(legacy, "init", "-q")
+    _git(legacy, "add", "-A")
+    _git(legacy, "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q", "-m", "legacy")
+    dest = tmp_path / "config-src"
+    report = migrate_legacy(legacy, dest, log=lambda *_: None)
+    assert report.written == []
+    assert any("starts empty" in note for note in report.notes)
+    assert _git(dest, "rev-parse", "HEAD")  # the empty initial commit exists
+    assert _git(dest, "status", "--porcelain") == ""
+    assert [p.name for p in dest.iterdir()] == [".git"]
+
+
 def test_migrate_without_legacy_knowledge_is_a_plain_copy(tmp_path):
     legacy = tmp_path / "configs"
     write(

@@ -5,12 +5,11 @@ BEFORE committing, stamp source provenance, and never leave a partial state."""
 
 from __future__ import annotations
 
-import fcntl
 import subprocess
 from pathlib import Path
 
 import pytest
-from theozolith_control import configdist, configrepo, controltoml
+from theozolith_control import configdist, configrepo, controltoml, product, repolock
 from theozolith_control.ingest import PENDING_MARKER, IngestError, ingest, resolve_image_digest
 
 DIGEST = "a" * 64
@@ -372,22 +371,148 @@ def _failing_git(*fail_tokens: str):
     return run
 
 
-def test_concurrent_ingest_is_refused_by_the_repository_lock(tmp_path):
-    """The whole transaction holds an exclusive flock beside the pinned build:
-    a second ingest is refused loudly while one runs, and proceeds normally
+def test_concurrent_ingest_is_refused_by_the_shared_write_lock(tmp_path):
+    """The whole transaction holds the shared pinned-build write lock: a
+    second writer is refused loudly while one runs, and proceeds normally
     once the lock is released — serialized, never interleaved."""
     src = source_repo(tmp_path)
     pinned = pinned_dir(tmp_path)
     ingest(str(src), pinned, log=lambda *_: None)
-    lock_path = pinned.parent / f".{pinned.name}.ingest-lock"
-    with open(lock_path, "w") as holder:
-        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with repolock.pinned_write_lock(pinned, writer="the test, standing in for a writer"):
         with pytest.raises(IngestError, match="already running"):
             ingest(str(src), pinned, log=lambda *_: None)
         # The refused attempt changed nothing.
         assert _git(pinned, "status", "--porcelain") == ""
     report = ingest(str(src), pinned, log=lambda *_: None)
     assert not report.changed
+
+
+def test_short_writers_racing_an_ingest_are_refused_cleanly(tmp_path):
+    """Interleaving one: the product-pin and control-address writers attempt
+    while an ingest transaction holds the write lock (the server's
+    POST /api/v1/product/update racing a CLI ingest). Each is refused with
+    nothing written and nothing committed — the ingest transaction can never
+    be interleaved with, overwritten, or orphaned."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    with repolock.pinned_write_lock(pinned, writer="ingest (held by the test)"):
+        with pytest.raises(product.ProductError, match="serialized"):
+            product.write_pin(pinned, "9.9.9", log=lambda *_: None)
+        with pytest.raises(controltoml.ControlTomlError, match="serialized"):
+            controltoml.write_control_address(pinned, "192.0.2.99", log=lambda *_: None)
+        with pytest.raises(controltoml.ControlTomlError, match="serialized"):
+            controltoml.write_browser_origin(pinned, "https://ozolith.example", log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert "9.9.9" not in (pinned / "product.toml").read_text()
+
+
+def test_ingest_racing_a_short_writer_is_refused_cleanly(tmp_path):
+    """Interleaving two: an ingest attempts while a short writer (a product
+    pin bump mid-commit) holds the write lock — refused with the pinned
+    build untouched, and normal once the writer finishes."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+
+    committed: list[str] = []
+
+    def pin_and_race(argv, **kwargs):
+        if argv[0] == "git" and "commit" in argv and not committed:
+            committed.append("racing")
+            with pytest.raises(IngestError, match="already running"):
+                ingest(str(src), pinned, log=lambda *_: None)
+        return subprocess.run(argv, **kwargs)
+
+    product.write_pin(pinned, "9.9.9", runner=pin_and_race, log=lambda *_: None)
+    assert committed == ["racing"]  # the race actually ran, mid-transaction
+    assert "9.9.9" in (pinned / "product.toml").read_text()
+    assert _git(pinned, "status", "--porcelain") == ""
+
+
+def test_unsupported_concurrent_commit_fails_the_publish_and_is_preserved(tmp_path):
+    """A hand-run git commit racing the transaction (supported writers share
+    the lock and cannot get here): the compare-and-swap ref move fails
+    cleanly, the interloper's commit stays HEAD — never overwritten or
+    orphaned — no marker survives, and the next ingest extends the
+    interloper's history."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    write(src, "knowledge/dev/AGENTS.md", "# team knowledge v2\n")
+    _commit_all(src, "edit")
+
+    def interloping(argv, **kwargs):
+        if argv[0] == "git" and "update-ref" in argv:
+            (pinned / "interloper.toml").write_text("# a hand edit, hand-committed\n")
+            _commit_all(pinned, "interloper")
+        return subprocess.run(argv, **kwargs)
+
+    with pytest.raises(IngestError, match="HEAD moved during the ingest"):
+        ingest(str(src), pinned, runner=interloping, log=lambda *_: None)
+    assert _git(pinned, "log", "-1", "--format=%s") == "interloper"
+    assert (pinned / "interloper.toml").is_file()
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / ".git" / PENDING_MARKER).exists()
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert report.changed
+    assert "interloper" in _git(pinned, "log", "--format=%s")
+    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+
+
+def test_ignored_leftovers_are_purged_and_the_worktree_is_exactly_head(tmp_path):
+    """A `.git/info/exclude` rule hides files from the clean check, but
+    nothing outside committed HEAD may remain loadable or distributable: the
+    next ingest — even a no-op one — removes ignored files and nested
+    repositories from the machine-owned worktree and reports it."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    (pinned / ".git" / "info").mkdir(exist_ok=True)
+    (pinned / ".git" / "info" / "exclude").write_text("stacks/leftover.toml\njunk/\n")
+    # A stray Stack file config load WOULD read, and a nested repository.
+    write(
+        pinned,
+        "stacks/leftover.toml",
+        'worker_type = "claude-dev"\nnode = "box9"\nstate = "stopped"\n',
+    )
+    nested = pinned / "junk"
+    nested.mkdir()
+    _git(nested, "init", "-q")
+    (nested / "file.txt").write_text("x\n")
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert not report.changed  # the no-op path purges too
+    assert not (pinned / "stacks" / "leftover.toml").exists()
+    assert not nested.exists()
+    assert any("ignored leftovers" in note for note in report.notes)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain", "--ignored") == ""
+    assert [s.name for s in configrepo.load_config(pinned).stacks] == ["implementer"]
+
+
+def test_exclude_rules_cannot_drop_staged_content_from_the_commit(tmp_path):
+    """The staged add is FORCED: a `.git/info/exclude` pattern (or a
+    user-global excludes file) matching a real config file must not silently
+    drop it from the pinned commit — the published worktree still carries it,
+    committed."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    (pinned / ".git" / "info").mkdir(exist_ok=True)
+    (pinned / ".git" / "info" / "exclude").write_text("product.toml\n")
+    write(src, "product.toml", '[product]\nversion = "0.4.0"\n')
+    _commit_all(src, "bump")
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert report.changed
+    assert "product.toml" in _git(pinned, "ls-tree", "-r", "--name-only", "HEAD")
+    assert (pinned / "product.toml").read_text() == '[product]\nversion = "0.4.0"\n'
+    assert _git(pinned, "status", "--porcelain", "--ignored") == ""
 
 
 @pytest.mark.parametrize("fail_on", ["commit-tree", "update-ref"])
