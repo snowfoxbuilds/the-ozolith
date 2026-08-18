@@ -515,6 +515,146 @@ def test_exclude_rules_cannot_drop_staged_content_from_the_commit(tmp_path):
     assert _git(pinned, "status", "--porcelain", "--ignored") == ""
 
 
+# -- dry run: the config linter (lint + preview, nothing committed) ------------
+
+
+def test_dry_run_previews_changes_without_committing(tmp_path):
+    """`config ingest --dry-run`: the full pipeline through lint, then a
+    per-file preview of what the commit would change — with NOTHING written
+    into the pinned build, not even loose objects."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    objects_before = _git(pinned, "count-objects", "-v")
+    write(src, "knowledge/dev/AGENTS.md", "# updated knowledge\n")
+    write(src, "product.toml", '[product]\nversion = "0.4.0"\n')
+    _commit_all(src, "update")
+
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert report.dry_run and report.changed and not report.pinned_commit
+    assert "update knowledge/dev/CLAUDE.md" in report.changes
+    assert "update product.toml" in report.changes
+    assert "update pins.toml" in report.changes  # the source stamp moved
+    # The knowledge pin moved, so the referencing type WOULD re-tag.
+    assert "claude-dev" in report.retagged
+    assert any("product version would move" in note for note in report.notes)
+    assert "would re-tag" in report.summary()
+    # Nothing moved: HEAD, worktree, no marker — and no objects were written.
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain", "--ignored") == ""
+    assert not (pinned / ".git" / PENDING_MARKER).exists()
+    assert _git(pinned, "count-objects", "-v") == objects_before
+    assert "# team knowledge" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+
+
+def test_dry_run_of_an_up_to_date_build_reports_a_no_op(tmp_path):
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert report.dry_run and not report.changed
+    assert report.changes == []
+    assert "no-op" in report.summary()
+
+
+def test_dry_run_previews_a_dirty_source_working_tree(tmp_path):
+    """The linter's home case: preview uncommitted Config Repo edits. The
+    preview reflects the working tree under a folder content stamp and says a
+    real ingest would refuse — and the real ingest still does."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    write(src, "control.toml", "[settings]\nheartbeat_seconds = 60\n")  # uncommitted
+
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert report.changed
+    assert "update control.toml" in report.changes
+    assert report.source_commit.startswith("folder-")
+    assert any("WORKING TREE" in note for note in report.notes)
+    assert any("control.toml would change" in note for note in report.notes)
+    with pytest.raises(IngestError, match="commit them first"):
+        ingest(str(src), pinned, log=lambda *_: None)
+
+
+def test_dry_run_lints_with_the_real_refusals(tmp_path):
+    """A broken Config Repo fails the dry run with the exact ingest refusal —
+    that is the linter contract — and the pinned build stays untouched."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    write(
+        src,
+        "worker-types/broken.toml",
+        'driver = "builtin:nope"\nbase = "x@sha256:' + "b" * 64 + '"\n',
+    )
+    _commit_all(src, "break it")
+    with pytest.raises(IngestError, match="nothing committed"):
+        ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+
+
+def test_dry_run_against_a_missing_pinned_build_creates_nothing(tmp_path):
+    """Previewing before the first real ingest: everything would be added,
+    and the preview does not even create the pinned-build directory."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert report.changed
+    assert not pinned.exists()
+    assert "add worker-types/claude-dev.toml" in report.changes
+    assert "add knowledge/dev/CLAUDE.md" in report.changes
+    assert report.retagged["claude-dev"][0] == ""  # every type is (new)
+
+
+def test_dry_run_reports_what_a_real_ingest_would_purge(tmp_path):
+    """Ignored leftovers are REPORTED by the dry run, removed only by a real
+    ingest."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    (pinned / ".git" / "info").mkdir(exist_ok=True)
+    (pinned / ".git" / "info" / "exclude").write_text("leftover.toml\n")
+    (pinned / "leftover.toml").write_text("stray\n")
+
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert any(
+        "a real ingest will remove" in note and "leftover.toml" in note for note in report.notes
+    )
+    assert (pinned / "leftover.toml").exists()
+
+
+def test_dry_run_notes_an_interrupted_ingest_and_previews_against_head(tmp_path):
+    """A pending marker means the worktree may lag HEAD; the dry run neither
+    repairs nor refuses — it notes the state and previews against HEAD."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    (pinned / ".git" / PENDING_MARKER).write_text("x\n")
+    (pinned / "half-published.toml").write_text("ours\n")
+
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert any("interrupted ingest" in note for note in report.notes)
+    assert not report.changed  # same source vs HEAD: a no-op
+    assert (pinned / ".git" / PENDING_MARKER).exists()  # not repaired
+    assert (pinned / "half-published.toml").exists()  # not touched
+
+
+def test_dry_run_holds_the_shared_writer_lock(tmp_path):
+    """The preview reads one consistent build — and a refusal on contention
+    is itself an honest preview (a real ingest would be refused too)."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    with (
+        repolock.pinned_write_lock(pinned, writer="test holder"),
+        pytest.raises(IngestError, match="already running"),
+    ):
+        ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+
+
 @pytest.mark.parametrize("fail_on", ["commit-tree", "update-ref"])
 def test_git_failure_before_the_publish_leaves_the_pinned_build_untouched(tmp_path, fail_on):
     """A git failure before the working-tree publish (creating the commit

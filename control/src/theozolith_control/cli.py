@@ -1177,14 +1177,17 @@ def _janitor_once(args) -> int:
 def _config_ingest(args) -> int:
     """`theozolith config ingest` (ADR-0048): the only write path into the
     pinned build. Runs locally against the data dir — no server round-trip;
-    the running service observes the new commit on its next config read."""
+    the running service observes the new commit on its next config read.
+    `--dry-run` is the config linter: the identical pipeline through the lint
+    step, then a preview of what ingest would change — nothing written."""
     settings = load_settings()
     source = args.source or str(settings.config_source)
     try:
-        ingest.ingest(source, settings.config_repo, log=_log)
+        ingest.ingest(source, settings.config_repo, dry_run=args.dry_run, log=_log)
     except ingest.IngestError as exc:
         raise SystemExit(f"error: {exc}") from exc
-    _repair_partition_ownership(settings)
+    if not args.dry_run:
+        _repair_partition_ownership(settings)
     return 0
 
 
@@ -1421,6 +1424,15 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Config Repo location: a directory or a git URL (default: the"
         " init-scaffolded config-src/ beside the data dir).",
+    )
+    config_ingest.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Lint and preview only: run the identical pipeline (harvest,"
+        " compile, resolve pins, lint) and report what ingest would change —"
+        " per-file diff, worker-type re-tags, settings movement — committing"
+        " nothing. Uncommitted edits in a local source are previewed from the"
+        " working tree.",
     )
     config_ingest.set_defaults(func=_config_ingest)
     config_migrate = config_sub.add_parser(

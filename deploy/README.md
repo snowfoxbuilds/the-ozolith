@@ -173,6 +173,15 @@ Stacks and worker types on top, never below.
    (they apply on service restart); the dashboard's Settings page is
    display-only, and the control address renders read-only there.
 
+   `sudo theozolith config ingest --dry-run [source]` is the config
+   **linter**: the identical pipeline through the lint step — every refusal
+   fires the same — then a report of what ingest would change (per-file
+   adds/updates/deletes, worker-type re-tags, `control.toml` and
+   product-version movement) with **nothing committed**, not even loose git
+   objects. Uncommitted edits in a local Config Repo are previewed from the
+   working tree (with the refusal a real ingest would give called out), so
+   you can lint before you commit.
+
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
    ```sh
@@ -401,7 +410,12 @@ stop it, ingest, start the upgraded service.
    adopt the read-only-mount pattern from
    `deploy/configs-example/worker-types/flightdeck.toml`. The
    `KNOWLEDGE_GIT_TOKEN` secret can be deleted once no type references it.
-5. **Review and commit** `config-src/`.
+5. **Review and commit** `config-src/`, then **preview the first ingest**:
+   `sudo theozolith config ingest --dry-run` lints the migrated repo with
+   the upgraded validator and prints everything the first ingest will change
+   — writing nothing, so it is safe while the old service is still running.
+   Fix any refusal now: it shrinks the stop window below to one
+   already-validated ingest.
 6. **Stop the old service**: `sudo systemctl stop theozolith-control.service`.
    This begins the bounded outage — control-plane only. Nodes ride it out in
    degraded mode: running containers and Runs keep running, daemons keep
