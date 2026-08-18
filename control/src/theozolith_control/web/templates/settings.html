@@ -2,11 +2,12 @@
 {% block title %}Settings · TheOzolith{% endblock %}
 {% block content %}
 <h2>Settings</h2>
-<p class="muted">Tier-2 tunables live in <code>control.toml</code> in the Config Repo; every save
-is a fixed-schema commit touching only that file. Every setting has a shipped default —
-the file is optional. <code>THEOZOLITH_*</code> environment variables override these
-(expert escape hatch).</p>
-{% if saved %}<p class="flash flash-good">✓ <code>{{ saved }}</code> committed to control.toml</p>{% endif %}
+<p class="muted">Read-only (ADR-0048): tier-2 tunables are authored in <code>control.toml</code>
+<code>[settings]</code> in your Config Repo and reach the pinned build only through
+<code>theozolith config ingest</code> — the dashboard never writes config. Every setting has a
+shipped default — the file is optional. <code>THEOZOLITH_*</code> environment variables override
+these (expert escape hatch). Values below are what the pinned build carries; the running
+service applies settings changes on restart.</p>
 {% if error %}<p class="flash flash-error">✕ {{ error }}</p>{% endif %}
 <table class="settings">
   <tr><th>Setting</th><th>Value</th><th></th></tr>
@@ -32,13 +33,7 @@ the file is optional. <code>THEOZOLITH_*</code> environment variables override t
   {% for row in rows %}
   <tr>
     <td><code>{{ row.key }}</code><div class="muted">{{ row.label }}</div></td>
-    <td>
-      <form method="post" action="/settings" class="inline">
-        <input type="hidden" name="key" value="{{ row.key }}">
-        <input name="value" value="{{ row.value }}">
-        <button type="submit">Save</button>
-      </form>
-    </td>
+    <td><input value="{{ row.value }}" readonly disabled></td>
     <td>{% if row.is_default %}<span class="muted">default</span>
         {% else %}<span class="muted">default: {{ row.default }}</span>{% endif %}</td>
   </tr>

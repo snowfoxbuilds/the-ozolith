@@ -75,39 +75,41 @@ def test_unknown_and_malformed_keys_fail_closed(tmp_path):
         controltoml.read_values(repo)
 
 
-def test_set_value_commits_only_control_toml_with_the_convention(tmp_path):
-    """Acceptance 7 (storage half): one fixed-schema commit per save,
-    touching only control.toml, fixed author identity, and the value takes
-    effect on the next settings load."""
+def test_machine_writes_commit_only_control_toml_with_the_convention(tmp_path):
+    """One fixed-schema commit per machine write, touching only control.toml,
+    fixed author identity — the convention every pinned-build writer shares
+    (ADR-0048: the address writers are MACHINE state; the [settings] surface
+    itself is authored in the Config Repo and arrives via ingest, and the
+    committed value takes effect on the next settings load)."""
     repo = _git_repo(tmp_path)
     controltoml.write_control_address(repo, CONTROL_IP)
-    controltoml.set_value(repo, "heartbeat_seconds", "30")
 
+    subject = _git(repo, "log", "-1", "--format=%s")
+    assert subject.strip() == f"theozolith: control address {CONTROL_IP}"
+    author = _git(repo, "log", "-1", "--format=%an <%ae>").strip()
+    assert author == "theozolith <theozolith@invalid>"
+    touched = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert touched == ["control.toml"]
+    # A no-op write produces no commit.
+    before = _git(repo, "rev-parse", "HEAD")
+    controltoml.write_control_address(repo, CONTROL_IP)
+    assert _git(repo, "rev-parse", "HEAD") == before
+
+    # The committed settings surface loads exactly as ingest materialized it.
+    (repo / "control.toml").write_text(
+        f'[control]\ncontrol_ip = "{CONTROL_IP}"\n[settings]\nheartbeat_seconds = 30\n'
+    )
     assert controltoml.read_values(repo)["heartbeat_seconds"] == 30.0
     settings = load_settings(
         {"THEOZOLITH_DATA_DIR": str(tmp_path / "home"), "THEOZOLITH_CONFIG_REPO": str(repo)}
     )
     assert settings.heartbeat_seconds == 30.0
 
-    subject = _git(repo, "log", "-1", "--format=%s")
-    assert subject.strip() == "theozolith: settings: heartbeat_seconds = 30"
-    author = _git(repo, "log", "-1", "--format=%an <%ae>").strip()
-    assert author == "theozolith <theozolith@invalid>"
-    touched = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
-    assert touched == ["control.toml"]
-    # A no-op save produces no commit.
-    before = _git(repo, "rev-parse", "HEAD")
-    controltoml.set_value(repo, "heartbeat_seconds", "30")
-    assert _git(repo, "rev-parse", "HEAD") == before
 
-
-def test_set_value_refuses_unknown_keys_and_the_control_address(tmp_path):
-    repo = _git_repo(tmp_path)
-    controltoml.write_control_address(repo, CONTROL_IP)
-    for key in ("control_ip", "control_port", "public_origin", "made_up"):
-        with pytest.raises(controltoml.ControlTomlError, match="unknown or read-only"):
-            controltoml.set_value(repo, key, "10.6.6.6")
-    assert controltoml.read_control_ip(repo) == CONTROL_IP
+def test_settings_form_write_path_is_retired(tmp_path):
+    """ADR-0048: there is no set_value — the settings surface goes through
+    `theozolith config ingest`; the pinned build has no second writer."""
+    assert not hasattr(controltoml, "set_value")
 
 
 def test_control_port_absent_defaults_and_malformed_fails_closed(tmp_path):
@@ -143,7 +145,10 @@ def test_load_settings_fails_closed_on_a_malformed_control_port(tmp_path):
 def test_address_writes_preserve_committed_settings(tmp_path):
     repo = _git_repo(tmp_path)
     controltoml.write_control_address(repo, CONTROL_IP, port=9443)
-    controltoml.set_value(repo, "session_days", "7")
+    (repo / "control.toml").write_text(
+        f'[control]\ncontrol_ip = "{CONTROL_IP}"\ncontrol_port = 9443\n'
+        "[settings]\nsession_days = 7\n"
+    )
     controltoml.write_control_address(repo, "192.0.2.31")
     assert controltoml.read_control_ip(repo) == "192.0.2.31"
     assert controltoml.read_control_port(repo) == 9443  # recover keeps the port

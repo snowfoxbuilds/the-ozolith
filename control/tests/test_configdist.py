@@ -62,13 +62,13 @@ def _populate(repo: Path) -> None:
 
 
 def test_missing_or_empty_drivers_hashes_to_empty(tmp_path):
-    assert configdist.drivers_hash(tmp_path / "nope") == ""
+    assert configdist.dist_hash(tmp_path / "nope") == ""
     (tmp_path / "drivers").mkdir()
-    assert configdist.drivers_hash(tmp_path) == ""  # dir present but no files
+    assert configdist.dist_hash(tmp_path) == ""  # dir present but no files
     # A tree of only excluded files is effectively empty.
     _write(tmp_path, "drivers/__pycache__/x.pyc", b"\x00")
     _write(tmp_path, "drivers/.hidden", "secret")
-    assert configdist.drivers_hash(tmp_path) == ""
+    assert configdist.dist_hash(tmp_path) == ""
 
 
 def test_manifest_is_content_only_and_order_independent(tmp_path):
@@ -81,13 +81,13 @@ def test_manifest_is_content_only_and_order_independent(tmp_path):
     _write(repo_b, "drivers/custom/__init__.py", "print('hi')\n")
     for path in repo_b.rglob("*.py"):
         os.utime(path, (0, 0))  # zero the mtimes: the hash must not depend on them
-    assert configdist.drivers_hash(repo_a) == configdist.drivers_hash(repo_b) != ""
+    assert configdist.dist_hash(repo_a) == configdist.dist_hash(repo_b) != ""
 
 
 def test_relpaths_include_the_drivers_prefix(tmp_path):
     _populate(tmp_path)
-    entries = configdist.drivers_manifest(tmp_path)
-    relpaths = [relpath for relpath, _ in entries]
+    entries = configdist.dist_manifest(tmp_path)
+    relpaths = [relpath for relpath, *_ in entries]
     assert relpaths == sorted(relpaths)
     assert all(relpath.startswith("drivers/") for relpath in relpaths)
     assert "drivers/custom/impl.py" in relpaths
@@ -99,7 +99,7 @@ def test_exclusion_rules(tmp_path):
     _write(tmp_path, "drivers/mod/b.pyc", b"\x00")
     _write(tmp_path, "drivers/.editor.swp", "junk")
     _write(tmp_path, "drivers/.hidden/keep.py", "nope\n")
-    relpaths = [relpath for relpath, _ in configdist.drivers_manifest(tmp_path)]
+    relpaths = [relpath for relpath, *_ in configdist.dist_manifest(tmp_path)]
     assert relpaths == ["drivers/mod/a.py"]
 
 
@@ -109,7 +109,7 @@ def test_symlink_is_a_packaging_error(tmp_path):
     outside.write_text("escape", encoding="utf-8")
     os.symlink(outside, tmp_path / "drivers" / "link.py")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
 
 
 def test_symlinked_directory_is_a_packaging_error(tmp_path):
@@ -118,12 +118,12 @@ def test_symlinked_directory_is_a_packaging_error(tmp_path):
     (tmp_path / "elsewhere" / "sneaky.py").write_text("x\n", encoding="utf-8")
     os.symlink(tmp_path / "elsewhere", tmp_path / "drivers" / "linkdir")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
 
 
 def test_build_unpack_recompute_round_trip(tmp_path):
     _populate(tmp_path)
-    expected = configdist.drivers_hash(tmp_path)
+    expected = configdist.dist_hash(tmp_path)
     out_dir = tmp_path / "artifacts"
     built, path = configdist.build_artifact(tmp_path, out_dir, built_against="1.2.3")
     assert built == expected
@@ -160,30 +160,30 @@ def test_drivers_root_symlink_to_external_dir_is_rejected(tmp_path):
     (external / "x.py").write_text("escape\n", encoding="utf-8")
     os.symlink(external, tmp_path / "drivers")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
 
 
 def test_drivers_root_as_regular_file_is_rejected(tmp_path):
     """A ``drivers`` regular file must not read as the empty sentinel."""
     (tmp_path / "drivers").write_text("not a directory\n", encoding="utf-8")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
 
 
 def test_drivers_root_as_fifo_is_rejected(tmp_path):
     """A FIFO / socket / device at ``drivers`` is an irregular root — refused."""
     os.mkfifo(tmp_path / "drivers")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
 
 
 def test_missing_drivers_root_stays_the_empty_sentinel(tmp_path):
     """A genuinely absent ``drivers/`` is the no-distribution shape, not an
     error — the regression the root guard must not break."""
-    assert configdist.drivers_hash(tmp_path) == ""
-    assert configdist.drivers_manifest(tmp_path) == []
+    assert configdist.dist_hash(tmp_path) == ""
+    assert configdist.dist_manifest(tmp_path) == []
 
 
 @pytest.mark.skipif(
@@ -199,11 +199,91 @@ def test_unreadable_drivers_file_is_config_dist_error(tmp_path):
     os.chmod(target, 0)
     try:
         with pytest.raises(configdist.ConfigDistError):
-            configdist.drivers_hash(tmp_path)
+            configdist.dist_hash(tmp_path)
         with pytest.raises(node_configdist.ConfigDistError):
             node_configdist.manifest_hash_of_tree(tmp_path)
     finally:
         os.chmod(target, 0o644)
+
+
+# -- normalized executable state is hashed content (ADR-0048 amendment) ------
+
+
+def test_chmod_only_change_creates_a_new_hash_artifact_and_pin(tmp_path):
+    """Flipping ONLY the executable bit — no byte changes — must produce a new
+    distribution hash, a new artifact name, and a new per-tree knowledge pin,
+    with the node-side recompute agreeing at every step: executable state is
+    part of what the deck mounts and the image bakes, so a chmod is a real
+    content change, never an invisible one."""
+    _populate(tmp_path)
+    _write(tmp_path, "knowledge/dev/skills/s/run.sh", "#!/bin/sh\necho hi\n")
+    before_hash = configdist.dist_hash(tmp_path)
+    before_pin = configdist.knowledge_tree_hash(tmp_path, "dev")
+    before_digest, before_path = configdist.build_artifact(
+        tmp_path, tmp_path / "out", built_against="1.0"
+    )
+    assert before_digest == before_hash
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == before_hash
+
+    (tmp_path / "knowledge/dev/skills/s/run.sh").chmod(0o755)
+    after_hash = configdist.dist_hash(tmp_path)
+    after_pin = configdist.knowledge_tree_hash(tmp_path, "dev")
+    assert after_hash != before_hash
+    assert after_pin != before_pin
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == after_hash
+    assert node_configdist.knowledge_tree_hash(tmp_path, "dev") == after_pin
+    after_digest, after_path = configdist.build_artifact(
+        tmp_path, tmp_path / "out", built_against="1.0"
+    )
+    assert after_digest == after_hash and after_path != before_path
+    # Both artifacts verify and extract to trees that recompute to their own
+    # hashes — the exec bit rides the archive and is restored on extraction.
+    for digest, path in ((before_digest, before_path), (after_digest, after_path)):
+        recomputed, _ = configdist.verify_artifact(path)
+        assert recomputed == digest
+        dest = tmp_path / f"unpack-{digest[:8]}"
+        dest.mkdir()
+        node_configdist.extract_zip(path.read_bytes(), dest)
+        assert node_configdist.manifest_hash_of_tree(dest) == digest
+    assert (
+        not (tmp_path / f"unpack-{before_digest[:8]}/knowledge/dev/skills/s/run.sh").stat().st_mode
+        & 0o111
+    )
+    assert (
+        tmp_path / f"unpack-{after_digest[:8]}/knowledge/dev/skills/s/run.sh"
+    ).stat().st_mode & 0o111
+
+
+def test_entry_mode_is_normalized_and_agrees_across_packages():
+    """Only the executable state enters the hash — group/other permission noise
+    normalizes away — and the two stdlib implementations are pinned."""
+    for st_mode, expected in (
+        (0o644, "644"),
+        (0o600, "644"),
+        (0o664, "644"),
+        (0o755, "755"),
+        (0o700, "755"),
+        (0o111, "755"),
+        (0o544, "755"),
+    ):
+        assert configdist.entry_mode(st_mode) == expected
+        assert node_configdist.entry_mode(st_mode) == expected
+
+
+def test_build_refuses_mode_mutation_between_manifest_and_archive(tmp_path, monkeypatch):
+    """A chmod that lands after the manifest is computed but before the archive
+    snapshot must fail the build exactly like a byte mutation: the published
+    modes must never disagree with the hash they were packaged under."""
+    _populate(tmp_path)
+    real = configdist.dist_manifest(tmp_path)
+    flipped = [
+        [relpath, digest, "755" if mode == "644" else "644"] for relpath, digest, mode in real
+    ]
+    monkeypatch.setattr(configdist, "dist_manifest", lambda repo: flipped)
+    out = tmp_path / "out"
+    with pytest.raises(configdist.ConfigDistError, match="changed while packaging"):
+        configdist.build_artifact(tmp_path, out, built_against="1.0")
+    assert not list(out.glob("*.zip")) and not list(out.glob(".*"))
 
 
 # -- artifact integrity: no poisoning past verify-by-recompute ---------------
@@ -214,9 +294,9 @@ def test_build_refuses_mutation_between_manifest_and_archive(tmp_path, monkeypat
     is written must never publish an artifact whose bytes disagree with its
     hash. Simulated by a stale manifest: the byte snapshot detects the drift."""
     _populate(tmp_path)
-    real = configdist.drivers_manifest(tmp_path)
-    stale = [[relpath, "0" * 64] for relpath, _ in real]  # hashes no longer match disk
-    monkeypatch.setattr(configdist, "drivers_manifest", lambda repo: stale)
+    real = configdist.dist_manifest(tmp_path)
+    stale = [[relpath, "0" * 64, mode] for relpath, _, mode in real]  # hashes no longer match disk
+    monkeypatch.setattr(configdist, "dist_manifest", lambda repo: stale)
     out = tmp_path / "out"
     with pytest.raises(configdist.ConfigDistError):
         configdist.build_artifact(tmp_path, out, built_against="1.0")
@@ -226,7 +306,7 @@ def test_build_refuses_mutation_between_manifest_and_archive(tmp_path, monkeypat
 
 def test_verify_artifact_accepts_a_clean_build(tmp_path):
     _populate(tmp_path)
-    expected = configdist.drivers_hash(tmp_path)
+    expected = configdist.dist_hash(tmp_path)
     _, path = configdist.build_artifact(tmp_path, tmp_path / "out", built_against="9.9")
     recomputed, meta = configdist.verify_artifact(path)
     assert recomputed == expected
@@ -251,17 +331,17 @@ def test_verify_artifact_rejects_tampered_member(tmp_path):
 
 def test_verify_artifact_rejects_bad_metadata_and_unsafe_members(tmp_path):
     _populate(tmp_path)
-    entries = configdist.drivers_manifest(tmp_path)
+    entries = configdist.dist_manifest(tmp_path)
     # A zip whose metadata format is wrong is rejected even if the tree is fine.
     import json
 
     bad_meta = tmp_path / "bad_meta.zip"
     with zipfile.ZipFile(bad_meta, "w") as z:
-        for relpath, _ in entries:
+        for relpath, *_ in entries:
             z.writestr(relpath, (tmp_path / relpath).read_bytes())
         z.writestr(
             configdist.ARTIFACT_METADATA,
-            json.dumps({"format": 999, "drivers_hash": configdist.drivers_hash(tmp_path)}),
+            json.dumps({"format": 999, "drivers_hash": configdist.dist_hash(tmp_path)}),
         )
     with pytest.raises(configdist.ConfigDistError):
         configdist.verify_artifact(bad_meta)
@@ -417,11 +497,50 @@ def test_cross_package_hash_agreement(tmp_path):
     _populate(tmp_path)
     _write(tmp_path, "drivers/data/blob.bin", bytes(range(256)))
     _write(tmp_path, "drivers/nested/deep/leaf.py", "leaf = True\n")
-    control_hash = configdist.drivers_hash(tmp_path)
-    # manifest_hash_of_tree computes over <root>/drivers with relpaths relative
-    # to <root> — identical to the control side pointed at the same repo.
+    _write(tmp_path, "knowledge/dev/CLAUDE.md", "# k\n")  # ADR-0048: both subtrees
+    control_hash = configdist.dist_hash(tmp_path)
+    # manifest_hash_of_tree computes over the distributed subtrees with
+    # relpaths relative to <root> — identical to the control side pointed at
+    # the same repo.
     node_hash = node_configdist.manifest_hash_of_tree(tmp_path)
     assert control_hash == node_hash != ""
+
+
+def test_cross_package_knowledge_tree_pin_agreement(tmp_path):
+    """The per-tree knowledge pin (ADR-0048) MUST agree across packages:
+    control computes it at ingest and bakes it into the instruction hash; the
+    node recomputes it over the applied tree before every bake. Relpaths are
+    tree-relative, so the pin is a property of the content alone."""
+    _write(tmp_path, "knowledge/dev/CLAUDE.md", "# k\n")
+    _write(tmp_path, "knowledge/dev/skills/s/SKILL.md", "s\n")
+    _write(tmp_path, "knowledge/other/CLAUDE.md", "# other\n")
+    control_pin = configdist.knowledge_tree_hash(tmp_path, "dev")
+    node_pin = node_configdist.knowledge_tree_hash(tmp_path, "dev")
+    assert control_pin == node_pin != ""
+    assert configdist.knowledge_tree_hash(tmp_path, "other") != control_pin
+    assert configdist.knowledge_tree_hash(tmp_path, "missing") == ""
+    assert node_configdist.knowledge_tree_hash(tmp_path, "missing") == ""
+
+
+def test_knowledge_members_ride_the_artifact_and_verify_on_both_sides(tmp_path):
+    """An artifact carrying knowledge/ members (ADR-0048) builds, verifies on
+    the control side, extracts on the node side, and recomputes to the same
+    hash — with the executable bit restored from archive metadata."""
+    _populate(tmp_path)
+    _write(tmp_path, "knowledge/dev/CLAUDE.md", "# k\n")
+    _write(tmp_path, "knowledge/dev/skills/s/run.sh", "#!/bin/sh\necho hi\n")
+    (tmp_path / "knowledge/dev/skills/s/run.sh").chmod(0o755)
+    out = tmp_path / "out"
+    digest, path = configdist.build_artifact(tmp_path, out, built_against="0.3.0")
+    assert digest and path is not None
+    recomputed, _ = configdist.verify_artifact(path)
+    assert recomputed == digest
+    dest = tmp_path / "node-tree"
+    dest.mkdir()
+    node_configdist.extract_zip(path.read_bytes(), dest)
+    assert node_configdist.manifest_hash_of_tree(dest) == digest
+    assert (dest / "knowledge/dev/skills/s/run.sh").stat().st_mode & 0o111
+    assert not (dest / "knowledge/dev/CLAUDE.md").stat().st_mode & 0o111
 
 
 def test_node_rejects_zip_path_traversal(tmp_path):
@@ -461,7 +580,7 @@ def test_safe_member(name, ok):
 def _clean_meta(tmp_path: Path) -> dict:
     return {
         "format": configdist.ARTIFACT_FORMAT,
-        "drivers_hash": configdist.drivers_hash(tmp_path),
+        "drivers_hash": configdist.dist_hash(tmp_path),
         "built_against": "1.0",
         "built_at": "1980-01-01T00:00:00+00:00",
     }
@@ -558,7 +677,7 @@ def test_duplicate_config_dist_member_is_rejected(tmp_path):
 
 def test_clean_control_built_artifact_verifies_on_both_sides(tmp_path):
     _populate(tmp_path)
-    digest = configdist.drivers_hash(tmp_path)
+    digest = configdist.dist_hash(tmp_path)
     _, path = configdist.build_artifact(tmp_path, tmp_path / "out", built_against="1.0")
     # Control side: structural rule + recompute agree.
     recomputed, _ = configdist.verify_artifact(path)
@@ -715,7 +834,7 @@ def test_root_enumeration_failure_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(configdist.os, "scandir", boom)
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
 
 
 def test_nested_enumeration_failure_fails_closed(tmp_path, monkeypatch):
@@ -733,7 +852,7 @@ def test_nested_enumeration_failure_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(configdist.os, "scandir", boom)
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
 
 
 def test_enumeration_failure_becomes_config_repo_error_at_load(tmp_path, monkeypatch):
@@ -831,7 +950,7 @@ def test_root_entry_classifier_failure_fails_closed(tmp_path, monkeypatch):
     _write(tmp_path, "drivers/a.py", "a = 1\n")
     _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / "a.py")
     with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
 
 
 @pytest.mark.parametrize("target_rel", ["sub", "sub/leaf.py"])
@@ -842,7 +961,7 @@ def test_nested_entry_classifier_failure_fails_closed(tmp_path, monkeypatch, tar
     _write(tmp_path, "drivers/sub/leaf.py", "leaf = 1\n")
     _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / target_rel)
     with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
 
 
 def test_entry_classifier_failure_becomes_config_repo_error_at_load(tmp_path, monkeypatch):
@@ -876,7 +995,7 @@ def test_cross_package_entry_classifier_failure_fails_closed(tmp_path, monkeypat
     _write(tmp_path, "drivers/custom/impl.py", "x = 1\n")
     _boom_entry_classifiers(monkeypatch, tmp_path / "drivers" / "custom" / "impl.py")
     with pytest.raises(configdist.ConfigDistError, match="cannot classify"):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
     with pytest.raises(node_configdist.ConfigDistError, match="cannot classify"):
         node_configdist.manifest_hash_of_tree(tmp_path)
 
@@ -889,7 +1008,7 @@ def test_cross_package_missing_root_is_the_empty_sentinel_on_both_sides(tmp_path
     implementations agree (the node's dist root holds config-dist.json but no
     drivers/ — same shape, same answer)."""
     (tmp_path / "config-dist.json").write_text("{}", encoding="utf-8")
-    assert configdist.drivers_hash(tmp_path) == ""
+    assert configdist.dist_hash(tmp_path) == ""
     assert node_configdist.manifest_hash_of_tree(tmp_path) == ""
 
 
@@ -911,7 +1030,7 @@ def test_cross_package_fail_closed_on_irregular_descendants(tmp_path, plant):
     else:
         os.mkfifo(planted)
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.manifest_hash_of_tree(tmp_path)
 
@@ -930,7 +1049,7 @@ def test_cross_package_fail_closed_on_irregular_drivers_root(tmp_path, shape):
     else:
         root.write_text("not a directory\n", encoding="utf-8")
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_hash(tmp_path)
+        configdist.dist_hash(tmp_path)
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.manifest_hash_of_tree(tmp_path)
 
@@ -951,7 +1070,7 @@ def test_cross_package_fail_closed_on_enumeration_failure(tmp_path, monkeypatch)
 
     monkeypatch.setattr(configdist.os, "scandir", boom)
     with pytest.raises(configdist.ConfigDistError):
-        configdist.drivers_manifest(tmp_path)
+        configdist.dist_manifest(tmp_path)
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.manifest_hash_of_tree(tmp_path)
 
@@ -965,10 +1084,10 @@ def test_source_exclusion_and_applied_tree_validation_are_different_layers(tmp_p
     contain an excluded member — so the very same entry FAILS node-side
     verification instead of riding unhashed beside a converged report."""
     _populate(tmp_path)
-    clean_control = configdist.drivers_hash(tmp_path)
+    clean_control = configdist.dist_hash(tmp_path)
     assert node_configdist.manifest_hash_of_tree(tmp_path) == clean_control  # clean agreement
     (tmp_path / "drivers" / ".editor-swap").symlink_to(tmp_path / "outside-nowhere")
-    assert configdist.drivers_hash(tmp_path) == clean_control  # source layer: skipped
+    assert configdist.dist_hash(tmp_path) == clean_control  # source layer: skipped
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.manifest_hash_of_tree(tmp_path)  # applied layer: rejected
 
@@ -985,8 +1104,8 @@ def test_node_applied_tree_rejects_excluded_names_the_source_manifest_skips(tmp_
     rejects can be planted into an applied tree while preserving a converged
     report."""
     _populate(tmp_path)
-    clean_control = configdist.drivers_hash(tmp_path)
+    clean_control = configdist.dist_hash(tmp_path)
     _write(tmp_path, f"drivers/custom/{plant}", b"\x00evil")
-    assert configdist.drivers_hash(tmp_path) == clean_control  # source layer: skipped
+    assert configdist.dist_hash(tmp_path) == clean_control  # source layer: skipped
     with pytest.raises(node_configdist.ConfigDistError):
         node_configdist.manifest_hash_of_tree(tmp_path)  # applied layer: rejected

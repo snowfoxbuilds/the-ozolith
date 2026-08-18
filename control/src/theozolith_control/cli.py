@@ -53,8 +53,10 @@ from theozolith_control import (
     bearerhttp,
     bootstrap,
     controltoml,
+    ingest,
     janitor,
     localnode,
+    migrate,
     origin,
     passwords,
     product,
@@ -666,13 +668,17 @@ def _init(args) -> int:
         ip = bootstrap.detect_host_ip()
         _log(f"control IP: {ip} (auto-detected; wrong for your LAN? re-run with --ip)")
 
-    # The partition (ADR-0024): durability class legible from the path.
+    # The partition (ADR-0024, amended by ADR-0048): durability class legible
+    # from the path. configs/ is the machine-owned pinned build; config-src/
+    # is the scaffolded human Config Repo the operator edits and ingests.
     settings.config_repo.mkdir(parents=True, exist_ok=True)
+    settings.config_source.mkdir(parents=True, exist_ok=True)
     settings.secrets_dir.mkdir(parents=True, exist_ok=True)
     settings.secrets_dir.chmod(0o700)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
     settings.logs_dir.mkdir(parents=True, exist_ok=True)
     _git_init(settings.config_repo)
+    _git_init(settings.config_source)
 
     # 1. Master key (unchanged from ADR-0015 first-start behavior).
     ensure_key_file(settings.key_path)
@@ -708,11 +714,26 @@ def _init(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
-    # 3b. The stage-don't-deploy scaffold (ADR-0037), before the unit
-    # install so the partition chown hands it to the service user whole.
+    # 3b. The stage-don't-deploy scaffold (ADR-0037/0048): seeded into the
+    # HUMAN Config Repo, then materialized into the pinned build by the
+    # initial ingest — before the unit install so the partition chown hands
+    # everything to the service user whole.
     node_name = socket.gethostname()
     if nodedaemon_exec:
-        localnode.write_scaffold(settings.config_repo, node_name, log=_log)
+        localnode.write_scaffold(settings.config_source, node_name, log=_log)
+    if initialized:
+        # A --force re-init never ingests: the deployment's Config Repo may
+        # live elsewhere, and materializing the default config-src over a
+        # populated pinned build would discard real config (ADR-0048).
+        _log(
+            "existing deployment: skipping the initial ingest — run"
+            " 'theozolith config ingest [SOURCE]' yourself"
+        )
+    else:
+        try:
+            ingest.ingest(str(settings.config_source), settings.config_repo, log=_log)
+        except ingest.IngestError as exc:
+            raise SystemExit(f"error: initial ingest failed: {exc}") from exc
 
     # 4. The systemd unit (root-mediated bare metal only; ADR-0034) — after
     # every artifact exists, so the chown hands the complete partition over.
@@ -760,7 +781,13 @@ def _resume_local_node(settings: ControlSettings, nodedaemon_exec: str) -> int:
     _log("already initialized — resuming the local node in place (CA untouched;")
     _log("completed phases are skipped or reconciled; ADR-0037)")
     node_name = socket.gethostname()
-    localnode.write_scaffold(settings.config_repo, node_name, log=_log)
+    settings.config_source.mkdir(parents=True, exist_ok=True)
+    _git_init(settings.config_source)
+    localnode.write_scaffold(settings.config_source, node_name, log=_log)
+    try:
+        ingest.ingest(str(settings.config_source), settings.config_repo, log=_log)
+    except ingest.IngestError as exc:
+        raise SystemExit(f"error: initial ingest failed: {exc}") from exc
     _install_systemd_unit(settings, settings.control_port)
     localnode.bootstrap_local_node(
         settings, node_name=node_name, nodedaemon_exec=nodedaemon_exec, log=_log
@@ -780,11 +807,13 @@ def _print_local_handoff(settings: ControlSettings, ip: str, port: int, node_nam
     _log(f"{node_name!r} is registered and heartbeating over loopback)")
     _log("")
     _log("a worker Stack is STAGED, not deployed — finish line (three steps) in")
-    _log(f"{settings.config_repo / 'README.md'}:")
+    _log(f"{settings.config_source / 'README.md'}:")
     _log("  1) pin the base image digest in worker-types/claude-dev.toml")
+    _log("     (or use a tag-only base — ingest resolves it)")
     _log("  2) enter secrets:      sudo theozolith secret set github-implementer")
     _log("                         sudo theozolith secret set anthropic-api-key")
-    _log('  3) flip state = "running" in stacks/implementer.toml and commit')
+    _log('  3) flip state = "running" in stacks/implementer.toml, commit, then')
+    _log("     sudo theozolith config ingest")
     _log("")
     _log("check the fleet:       sudo theozolith status")
     _log("more nodes later:      sudo theozolith join-token create   (one paste per box)")
@@ -1145,6 +1174,36 @@ def _janitor_once(args) -> int:
 # -- operator subcommands (HTTP) -------------------------------------------------
 
 
+def _config_ingest(args) -> int:
+    """`theozolith config ingest` (ADR-0048): the only write path into the
+    pinned build. Runs locally against the data dir — no server round-trip;
+    the running service observes the new commit on its next config read."""
+    settings = load_settings()
+    source = args.source or str(settings.config_source)
+    try:
+        ingest.ingest(source, settings.config_repo, log=_log)
+    except ingest.IngestError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _repair_partition_ownership(settings)
+    return 0
+
+
+def _config_migrate(args) -> int:
+    """`theozolith config migrate` (ADR-0048 amendment): pre-ingest configs ->
+    human Config Repo. Reads the legacy tree (never modifies it), writes the
+    migrated repo, and prints the follow-up steps — run BEFORE the upgraded
+    service must load the now-retired knowledge_source/knowledge_pin fields."""
+    settings = load_settings()
+    legacy = Path(args.legacy) if args.legacy else settings.config_repo
+    dest = Path(args.dest) if args.dest else settings.config_source
+    try:
+        migrate.migrate_legacy(legacy, dest, log=_log)
+    except migrate.MigrateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _repair_partition_ownership(settings)
+    return 0
+
+
 def _secret_set(args) -> int:
     url, token, ca = _admin_env(args)
     value = args.value
@@ -1342,6 +1401,51 @@ def main(argv: list[str] | None = None) -> int:
         " origin-init' (ADR-0036).",
     )
     tls_init.set_defaults(func=_tls_init)
+
+    config_cmd = sub.add_parser(
+        "config",
+        help="The Config Repo -> pinned build pipeline (ADR-0048).",
+    )
+    config_sub = config_cmd.add_subparsers(dest="config_cmd", required=True)
+    config_ingest = config_sub.add_parser(
+        "ingest",
+        help="Harvest the Config Repo (path or git URL), lint it, resolve"
+        " mechanical pins (knowledge tree hashes, base tag->digest), compile"
+        " knowledge, and commit the pinned build — the ONLY write path into"
+        " configs/. The running service picks the new tree up within one"
+        " heartbeat; control.toml settings changes need a restart.",
+    )
+    config_ingest.add_argument(
+        "source",
+        nargs="?",
+        default="",
+        help="Config Repo location: a directory or a git URL (default: the"
+        " init-scaffolded config-src/ beside the data dir).",
+    )
+    config_ingest.set_defaults(func=_config_ingest)
+    config_migrate = config_sub.add_parser(
+        "migrate",
+        help="Migrate a pre-ADR-0048 configs tree (knowledge_source/"
+        "knowledge_pin era) into a human Config Repo: config files copied,"
+        " retired knowledge fields removed and noted, control.toml reduced to"
+        " its [settings] surface. The legacy tree is never modified; run this"
+        " before the upgraded service must load it, then review, ingest, and"
+        " restart (deploy/README.md: upgrading a pre-ingest deployment).",
+    )
+    config_migrate.add_argument(
+        "dest",
+        nargs="?",
+        default="",
+        help="Destination directory for the migrated Config Repo (default: the"
+        " config-src/ location beside the data dir); must be missing or empty.",
+    )
+    config_migrate.add_argument(
+        "--legacy",
+        default="",
+        help="The pre-ADR-0048 configs tree to migrate from (default: the"
+        " deployment's configs/ dir — the future pinned build).",
+    )
+    config_migrate.set_defaults(func=_config_migrate)
 
     secret = sub.add_parser("secret", help="Enter and list secrets (values never displayed).")
     secret_sub = secret.add_subparsers(dest="secret_cmd", required=True)

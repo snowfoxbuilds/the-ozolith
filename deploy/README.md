@@ -10,8 +10,9 @@ Deployment footprint (the deletion test, restated 2026-07-27; ADR-0023, amended 
 ADR-0034): **docker — or the systemd unit init installs on bare metal — + the
 TheOzolith package + `theozolith init` output** — every tier-2 tunable at its
 shipped default, environment variables as the expert override only. There is no `.env`:
-settings live in `control.toml` in the Config Repo (dashboard-edited), secrets in the
-encrypted store, node identity in the join-string exchange. A private Config Repo adds
+settings live in `control.toml` in the Config Repo (materialized into the pinned
+build by `theozolith config ingest`, ADR-0048), secrets in the encrypted store,
+node identity in the join-string exchange. A private Config Repo adds
 Stacks and worker types on top, never below.
 
 ## Full substrate
@@ -82,7 +83,8 @@ Stacks and worker types on top, never below.
    provisioning error, Ctrl-C): re-run the same command —
    `sudo theozolith init --with-local-node`, no `--force`. On an initialized
    box it resumes in place: the CA never rotates, completed phases are
-   skipped or reconciled, operator edits in `configs/` are preserved, an
+   skipped or reconciled, operator edits in the Config Repo are preserved
+   (the resume re-ingests them into the pinned build, ADR-0048), an
    unconsumed machine-only join token was already revoked on the way out,
    and no join string is ever shown. Reconciliation proves health rather
    than assuming it: a registered node counts as healthy only with a fresh
@@ -98,8 +100,11 @@ Stacks and worker types on top, never below.
    will manage or `chown` (a `THEOZOLITH_DATA_DIR` override is refused there;
    it stays honored for unprivileged and compose runs, which use
    `~/.theozolith/`) —
-   partitioned by durability class (ADR-0024): `configs/` (the git-backed
-   Config Repo — `control.toml`, `stacks/`, `worker-types/`, `product.toml`),
+   partitioned by durability class (ADR-0024, amended by ADR-0048):
+   `configs/` (the machine-owned **pinned build** — `control.toml`, `stacks/`,
+   `worker-types/`, `knowledge/`, `pins.toml`, `product.toml` — committed only
+   by `theozolith config ingest`), `config-src/` (the scaffolded human
+   **Config Repo** the operator edits and ingests; keep it here or anywhere),
    `secrets/` (master key, CA keypair, TLS material, admin password hash,
    `store.db` — a **sibling** of configs/, never inside any git tree), `cache/`
    (`cache.db`, deletable at any time: costs a re-login and one heartbeat
@@ -141,18 +146,32 @@ Stacks and worker types on top, never below.
    outstanding join string. `theozolith-nodedaemon provision --inspect 'ozjoin1:…'`
    pretty-prints a payload without acting.
 
-3. **Config Repo** (`configs/` in the Control Node's data partition —
-   `/var/lib/theozolith-control/configs` root-mediated, `~/.theozolith/configs`
-   otherwise; ADR-0006): declare
-   Stacks and derived images — `deploy/configs-example/` is a complete starter. Desired
-   state distributes over the heartbeat channel; nodes cache it for degraded mode.
-   The Implementer/Reviewer drivers are process-kind Stacks (the daemon injects the
-   control channel — URL, per-node token, CA — into them; Stack env overrides win);
-   `control` and the Flight Deck are container Stacks. Tier-2 tunables (heartbeat
-   interval, grace periods, sweep cadences, terminal cap, event budget, session
-   length, bootstrap port) live in `control.toml` and are edited on the dashboard's
-   Settings page — each save is a fixed-schema commit touching only that file. The
-   control address (and the browser origin derived from it) renders read-only there.
+3. **Config Repo -> pinned build** (ADR-0006/0048): author your **Config
+   Repo** anywhere — the init-scaffolded `config-src/` beside the data dir, any
+   directory, or a git host — declaring Stacks, worker types, `drivers/`, and
+   `knowledge/`; `deploy/configs-example/` is a complete starter. Then run
+
+   ```sh
+   sudo theozolith config ingest              # the scaffolded config-src/
+   sudo theozolith config ingest <path-or-git-url>
+   ```
+
+   Ingest lints the repo with the exact fail-loud config-load checks, resolves
+   the mechanical pins (tag-only `base` -> registry digest; per-knowledge-tree
+   content hashes), compiles `knowledge/`, and commits the machine-owned
+   **pinned build** (`configs/` in the data partition —
+   `/var/lib/theozolith-control/configs` root-mediated) with the source commit
+   stamped. The pinned build is the tree the service loads and distributes:
+   never hand-edit it; rollback is `git revert` there. The running service
+   picks a new commit up within one heartbeat; nodes converge over the hash
+   ladder. The Implementer/Reviewer drivers are process-kind Stacks (the
+   daemon injects the control channel — URL, per-node token, CA — into them;
+   Stack env overrides win); the Flight Deck is a container Stack. Tier-2
+   tunables (heartbeat interval, grace periods, sweep cadences, terminal cap,
+   event budget, session length, bootstrap port) live in `control.toml`
+   `[settings]` in the Config Repo and go through ingest like everything else
+   (they apply on service restart); the dashboard's Settings page is
+   display-only, and the control address renders read-only there.
 
 4. **Secrets**: enter values once on the dashboard's Secrets form, or:
 
@@ -342,6 +361,77 @@ touching when you want the *CLI on this box* updated too (it is just another
 node-shaped install): re-run `sudo python3 build.py` from the updated
 checkout — it reuses the existing `/opt/theozolith` venv (ADR-0041; the old
 `sudo /opt/theozolith/bin/python build.py` spelling still works).
+
+## Upgrading a pre-ingest deployment (ADR-0048)
+
+Deployments that predate config ingestion hand-edited `configs/` directly and
+declared worker-type knowledge as `knowledge_source`/`knowledge_pin` (a git
+URL + SHA, cloned with the now-retired `KNOWLEDGE_GIT_TOKEN`). The upgraded
+code **refuses those fields loudly at config load** — and the OLD code must
+never load an ingested (post-ADR-0048) build either: it would not crash, it
+would silently ignore the new `knowledge` field and serve knowledge-less
+worker types, re-tagging the fleet onto images with no knowledge baked in.
+So the first ingest happens inside a **bounded, deliberate control-plane
+stop**: prepare and review everything while the old service keeps running,
+stop it, ingest, start the upgraded service.
+
+1. **Back up first.** The standard one-folder backup (next section) covers
+   everything the migration touches; at minimum copy `configs/` — it is a git
+   repo, so `git -C configs bundle create ~/configs-backup.bundle --all` is a
+   complete history backup.
+2. **Upgrade the code, keep the service running**: `sudo python3 build.py`
+   from the updated checkout installs the new CLI and packages. The running
+   service process still runs the OLD code and keeps loading the old config
+   — do not restart it yet. Everything through step 5 is preparation the old
+   service never observes.
+3. **Migrate**: `sudo theozolith config migrate` reads `configs/` (never
+   modifying it — the legacy tree stays byte-for-byte and history-identical
+   until ingest) and atomically publishes a human Config Repo at
+   `config-src/` — config files copied, retired
+   `knowledge_source`/`knowledge_pin` removed and preserved as MIGRATION
+   comments, `control.toml` reduced to its operator `[settings]` surface
+   (the machine `[control]` block stays in `configs/`, where ingest
+   preserves it). It prints one note per follow-up. A failed migration
+   leaves no partial `config-src/` and is immediately rerunnable.
+4. **Place the knowledge**: for each worker type the report names, clone that
+   knowledge repo's CONTENT into `config-src/knowledge/<name>/` (the ADR-0009
+   source layout: `skills/`, `agents/`, `workflows/`, `AGENTS.md`) and set
+   `knowledge = "knowledge/<name>"` on the type. Flight Deck types using the
+   retired writable-clone pattern (`clone-init`, `knowledge-<type>` volumes)
+   adopt the read-only-mount pattern from
+   `deploy/configs-example/worker-types/flightdeck.toml`. The
+   `KNOWLEDGE_GIT_TOKEN` secret can be deleted once no type references it.
+5. **Review and commit** `config-src/`.
+6. **Stop the old service**: `sudo systemctl stop theozolith-control.service`.
+   This begins the bounded outage — control-plane only. Nodes ride it out in
+   degraded mode: running containers and Runs keep running, daemons keep
+   retrying heartbeats, and nothing new is dispatched until control returns.
+7. **Ingest while stopped**: `sudo theozolith config ingest`. This commits
+   the machine-owned pinned build ONTO the existing `configs/` git history —
+   machine `control.toml` address, product pin, stacks, worker types, and
+   secrets (which live in the encrypted store, untouched by all of this) are
+   preserved. **If the ingest is refused** (a lint failure, a placeholder
+   checksum, an unresolvable base tag), nothing was committed: `configs/` is
+   exactly as it was, so you may either fix `config-src/` and re-run ingest,
+   or start the OLD service again (reinstall the previous release first) and
+   finish the preparation later.
+8. **Start the upgraded service immediately**
+   (`sudo systemctl start theozolith-control.service`) — ending the outage —
+   **then update the nodes** (`theozolith build` / `theozolith command
+   update`) so they run matching daemons: the recipe wire format changed with
+   the knowledge fields, so control and nodes upgrade together, control
+   first.
+
+**Rollback.** Before the pinned-build commit (through step 6), nothing
+changed for the service: delete `config-src/` to abandon a migration, and
+start the service again on whichever code is installed (reinstall the
+previous release if you already upgraded). After the pinned-build commit
+(step 7 onward): stop the service, `git -C configs revert HEAD` (or `git
+reset --hard HEAD^` if nothing consumed the new build yet) restores the
+pre-migration tree byte-for-byte, reinstall the previous release, and start
+— the old code again loads exactly the config it always had. The backup from
+step 1 is the belt-and-braces path: restore the folder and the deployment is
+exactly where it started.
 
 ## Backup and recovery (ADR-0024)
 
@@ -773,58 +863,65 @@ refuses to delete what it cannot prove is its own.
   definition; switch = session state. `effort` stays rejected on driverless types
   (see the worker-types section above).
 
-## Flight Deck knowledge & state (ADR-0043)
+## Flight Deck knowledge & state (ADR-0043 as amended by ADR-0048)
 
-A Flight Deck's `~/.claude` conflates two classes of content, and they are split
-across named volumes with different cardinality (`<stack>` = the Flight Deck
-Stack's name; `<worker-type>` = its worker-type name; the worker type declares
-the volumes with a literal `{stack}` placeholder that the Control Node
-substitutes at resolution time, so two same-type Flight Decks on one node get
-distinct per-instance volumes):
+A Flight Deck's `~/.claude` conflates two classes of content, and they are
+split across mounts with different cardinality (`<stack>` = the Flight Deck
+Stack's name; the worker type declares the volumes with a literal `{stack}`
+placeholder that the Control Node substitutes at resolution time, so two
+same-type Flight Decks on one node get distinct per-instance volumes):
 
-| Volume | Mountpoint | Cardinality |
+| Mount | Mountpoint | Cardinality |
 | --- | --- | --- |
-| `<stack>-claude-state` | `/home/ozolith/.claude` | **one per Flight Deck** — runtime state (sessions, transcripts, `--resume`); never shared, never worker-visible |
-| `knowledge-<worker-type>` | `/home/ozolith/knowledge` | **one per worker type per node** — the shared knowledge clone; siblings of the type mount the same name |
-| `<stack>-logs` | `/var/log/flightdeck` | one per Flight Deck |
+| `<stack>-claude-state` (named volume) | `/home/ozolith/.claude` | **one per Flight Deck** — runtime state (sessions, transcripts, `--resume`); never shared, never worker-visible |
+| `<state-dir>/knowledge` (read-only bind) | `/var/lib/theozolith/knowledge` | **one per node** — the applied pinned knowledge trees the Node Daemon exports; every deck on the node reads the same content |
+| `<stack>-logs` (named volume) | `/var/log/flightdeck` | one per Flight Deck |
 
 (One-hop remote access into a Flight Deck — and the per-instance machine-identity
 volume it will add — is split out and tracked separately; see
 `configs-example/README.md` for status and the ways in today.)
 
-**Knowledge is a live symlinked clone, not a bake.** At start the Flight Deck
-runs `theozolith-knowledge clone-init` to materialize the shared clone on the
-`knowledge-<worker-type>` volume, then points its `~/.claude` knowledge
-directories at that clone's raw working tree:
+**Knowledge is the applied pinned tree, mounted read-only — not a clone, not a
+bake** (ADR-0048; the ADR-0043 writable clone and its promote workflow are
+retired). Knowledge is authored in the Config Repo's `knowledge/<name>/` trees,
+compiled by `theozolith config ingest`, and distributed to nodes with the rest
+of the config. The daemon maintains a stable export at
+`/var/lib/theozolith/knowledge/<name>/`; when the desired distribution becomes
+empty (the Config Repo dropped its last `knowledge/` tree and `drivers/`), the
+export retires with it — a deck never keeps mounting deleted knowledge. The
+deck's worker type SELECTS its tree with `knowledge = "knowledge/<name>"`
+(validated at config load exactly like a driver type's reference: ingested
+pin joined, compiled tree present — a dangling reference refuses the load;
+per-Stack overrides are rejected). Control injects the selection as
+`THEOZOLITH_KNOWLEDGE_TREE`, and `flightdeck-start` points the `~/.claude`
+knowledge directories at that compiled tree — **failing loud when the node has
+not converged it yet** (docker restart policy retries until it has; a deck
+never silently runs without its knowledge):
 
 ```
-~/.claude/skills     -> ~/knowledge/skills
-~/.claude/agents     -> ~/knowledge/agents/claude
-~/.claude/workflows  -> ~/knowledge/workflows
-~/.claude/CLAUDE.md  -> ~/knowledge/AGENTS.md
+~/.claude/skills     -> /var/lib/theozolith/knowledge/<name>/skills
+~/.claude/agents     -> /var/lib/theozolith/knowledge/<name>/agents
+~/.claude/workflows  -> /var/lib/theozolith/knowledge/<name>/workflows
+~/.claude/CLAUDE.md  -> /var/lib/theozolith/knowledge/<name>/CLAUDE.md
 ```
 
-The symlinked view is byte-equivalent to a compiled/synced view (ADR-0009), so a
-skill edited in one Flight Deck is **live in every sibling of the same type on
-the node after an agent-CLI restart** — no sync step, no rebuild. Runtime state
-stays on the never-shared per-instance volume.
+An edit lands by editing the Config Repo, committing, and running
+`theozolith config ingest`; it reaches **every deck on every node** through
+ordinary config distribution and is picked up on **agent-CLI restart** (the
+export swaps whole trees by atomic rename beneath the stable mount, so a
+running session keeps what it loaded and no container is ever rebuilt or
+recreated by a knowledge-CONTENT change — the pin stays out of the deck's
+image identity by construction). Changing the SELECTED tree is different: it
+changes the container spec (the injected env), so the deck is recreated on the
+new tree. The same content edit re-tags exactly the driver worker types whose
+definitions reference the tree — driver workers keep **baking** knowledge into
+their derived images, so Run images stay standalone. A chmod is a content
+change too: the distribution hash and per-tree pins cover each file's
+normalized executable state, so flipping a skill script's exec bit
+redistributes and re-tags like any edit.
 
-**Promote** (make an edit reach the pipeline's Runs — the single review
-chokepoint):
-
-```sh
-# in the Flight Deck:
-cd ~/knowledge && git add -A && git commit && git push && git rev-parse HEAD
-# on the Control Node: bump the worker type's knowledge_pin to that SHA
-#   -> the deterministic tag changes -> nodes rebuild -> new Runs carry it.
-```
-
-**Cross-node** transport is plain git, human-driven — there is **no auto-sync
-daemon, ever**. Only pushed commits travel: in the source Flight Deck, commit
-and push (to `main` or an authoring branch), then attach the other node's
-Flight Deck of the same type and `git pull` (or fetch/checkout the authoring
-branch) there. **Uncommitted scratch stays node-local** — `git pull` cannot
-carry it, and nothing else moves it for you.
+**Cross-node** transport is config distribution — there is **no auto-sync
+daemon and no shared network filesystem, ever**.
 
 **Warnings.**
 
@@ -832,12 +929,10 @@ carry it, and nothing else moves it for you.
   knowledge (it would break pin reproducibility and open a prompt-injection
   persistence channel); a cache volume aimed at a `.claude` path is refused by
   construction.
-- **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude`.
-  Sync damages the carve-out in both directions at once: it replaces direct
-  symlinks (like `CLAUDE.md`) with copied files, silently unsharing the clone —
-  and where a knowledge directory is a symlink, it writes *through* the link
-  into the shared knowledge clone itself, overwriting content live in every
-  sibling Flight Deck of that type on the node.
+- **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude`:
+  it replaces the symlinks with copied files, silently detaching the deck from
+  the applied tree (the mount itself is read-only, so nothing can write
+  through the links).
 - `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
   it regenerates when the container recycles (accepted v0 gap). The deck's model
   preference is NOT part of this gap: a `/model` choice persists to

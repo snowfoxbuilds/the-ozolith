@@ -394,7 +394,12 @@ def container_stack(name: str = "flightdeck", **overrides) -> dict:
     return stack
 
 
-def image_recipe(name: str = "claude-dev", setup: list[str] | None = None) -> dict:
+def image_recipe(
+    name: str = "claude-dev",
+    setup: list[str] | None = None,
+    knowledge: str = "",
+    knowledge_pin: str = "",
+) -> dict:
     setup = setup if setup is not None else ["pip install uv"]
     import hashlib
 
@@ -402,8 +407,8 @@ def image_recipe(name: str = "claude-dev", setup: list[str] | None = None) -> di
         {
             "base": "ghcr.io/x/run:1.0@sha256:" + "0" * 64,
             "setup": setup,
-            "knowledge_source": "",
-            "knowledge_pin": "",
+            "knowledge": knowledge,
+            "knowledge_pin": knowledge_pin,
         },
         sort_keys=True,
     )
@@ -412,8 +417,8 @@ def image_recipe(name: str = "claude-dev", setup: list[str] | None = None) -> di
         "name": name,
         "base": "ghcr.io/x/run:1.0@sha256:" + "0" * 64,
         "setup": setup,
-        "knowledge_source": "",
-        "knowledge_pin": "",
+        "knowledge": knowledge,
+        "knowledge_pin": knowledge_pin,
         "tag": f"theozolith/{name}:1.0-{digest[:12]}",
         "base_digest": "sha256:" + "0" * 64,
         "instruction_hash": digest,

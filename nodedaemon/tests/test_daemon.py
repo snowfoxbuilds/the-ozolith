@@ -5186,3 +5186,159 @@ def test_builtin_driver_stack_gets_no_drivers_dir_and_is_untouched_by_swaps(rig:
     ]
     assert len(builtin_spawns) == 1  # never restarted by the swap
     assert "THEOZOLITH_DRIVERS_DIR" not in builtin_spawns[0].env
+
+
+# -- deck knowledge export + knowledge-aware builds (ADR-0048) --------------------
+
+
+def _knowledge_dist(text: str = "# k\n"):
+    return make_config_dist(
+        {
+            "drivers/custom/impl.py": "x = 1\n",
+            "knowledge/dev/CLAUDE.md": text,
+            "knowledge/dev/skills/s/SKILL.md": "skill\n",
+        }
+    )
+
+
+def test_applied_tree_accepts_the_knowledge_subtree(rig: Rig):
+    """ADR-0048: knowledge/ rides the distribution beside drivers/ — the
+    applied-tree shape gate, the manifest, and the converged report all cover
+    it; a knowledge-carrying tree is fully converged, never a rogue entry."""
+    digest, data = _knowledge_dist()
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    root = rig.config.state_dir / "config-dist"
+    assert (root / digest / "knowledge" / "dev" / "CLAUDE.md").is_file()
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert rig.control.transcript[-1][2]["drivers_hash"] == digest
+
+
+def test_knowledge_export_is_maintained_updated_and_retired(rig: Rig):
+    """The stable deck-facing export at <state>/knowledge: one child per tree,
+    swapped whole on change, retired when the applied tree drops it — while
+    the PARENT directory inode never moves (the deck's bind mount)."""
+    a_hash, a_data = _knowledge_dist("# v1\n")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
+    parent_inode = export.stat().st_ino
+
+    b_hash, b_data = _knowledge_dist("# v2\n")
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# v2\n"
+    assert export.stat().st_ino == parent_inode  # the mount anchor never moved
+
+    c_hash, c_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[c_hash] = c_data
+    rig.control.heartbeat_answers.append(dist_response([], c_hash))
+    rig.daemon.once()
+    assert not (export / "dev").exists()  # retired with the tree
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+
+def test_knowledge_only_to_empty_distribution_retires_the_export(rig: Rig):
+    """A knowledge-only distribution whose desired hash becomes EMPTY (the
+    Config Repo dropped its last knowledge/ tree) retires the stable deck
+    export with it — retired trees disappear, or a deck would keep mounting
+    knowledge the Config Repo deleted forever. Distinct from non-convergence
+    (desired non-empty, apply failing), which keeps the last export."""
+    digest, data = make_config_dist(
+        {
+            "knowledge/dev/CLAUDE.md": "# v1\n",
+            "knowledge/other/CLAUDE.md": "# other\n",
+        }
+    )
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    assert (export / "dev" / "CLAUDE.md").is_file()
+    assert (export / "other" / "CLAUDE.md").is_file()
+    parent_inode = export.stat().st_ino
+
+    rig.control.heartbeat_answers.append(dist_response([], ""))
+    rig.daemon.once()
+    assert not (export / "dev").exists()
+    assert not (export / "other").exists()
+    # The mounted parent survives (the deck's bind anchor), empty.
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+    # The empty state is stable: another empty-desired pass changes nothing
+    # and never errors — and its heartbeat (sent before convergence) now
+    # reports the retirement.
+    rig.control.heartbeat_answers.append(dist_response([], ""))
+    rig.daemon.once()
+    assert rig.control.transcript[-1][2]["drivers_hash"] == ""
+    assert export.is_dir() and not any(export.iterdir())
+
+
+def test_knowledge_export_survives_a_failed_convergence(rig: Rig):
+    """Not converged -> the export is left alone (advisory skew): a deck keeps
+    the last exported trees exactly as a worker keeps its built image."""
+    a_hash, a_data = _knowledge_dist("# v1\n")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+
+    b_hash, _ = _knowledge_dist("# v2\n")  # desired but never served (409)
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+
+
+def test_knowledge_export_repairs_local_drift(rig: Rig):
+    """A hand-mutated or corrupted export re-exports from the applied tree on
+    the next pass — the export is re-derived state, never authoritative."""
+    digest, data = _knowledge_dist("# v1\n")
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    (export / "dev" / "CLAUDE.md").write_text("# vandalized\n")
+    (export / "stale-extra").mkdir()
+
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert not (export / "stale-extra").exists()  # not in the applied tree
+
+
+def test_knowledge_recipe_defers_then_builds_once_converged(rig: Rig):
+    """End to end (ADR-0048): a knowledge-referencing recipe defers while the
+    node has no verified distribution, then builds in the SAME pass that
+    converges it (converge runs before reconcile)."""
+    import tempfile
+
+    from theozolith_nodedaemon import configdist as node_configdist
+
+    digest, data = _knowledge_dist("# v1\n")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        node_configdist.extract_zip(data, root)
+        pin = node_configdist.knowledge_tree_hash(root, "dev")
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin=pin)
+
+    # Pass 1: distribution not yet served (409) -> the build defers.
+    rig.control.heartbeat_answers.append(
+        {"commands": [], "config": desired([], [recipe], drivers_hash=digest)}
+    )
+    rig.daemon.once()
+    assert recipe["tag"] not in rig.docker.images
+    assert any("deferring derived image" in line for line in rig.logs)
+
+    # Pass 2: the artifact is available -> converge, then build, one pass.
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(
+        {"commands": [], "config": desired([], [recipe], drivers_hash=digest)}
+    )
+    rig.daemon.once()
+    assert recipe["tag"] in rig.docker.images

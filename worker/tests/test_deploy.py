@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,20 @@ DEPLOY = REPO_ROOT / "deploy"
 DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.claude"
 CONTROL_DOCKERFILE = REPO_ROOT / "control" / "docker" / "Dockerfile"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+
+@pytest.fixture(scope="module")
+def example_config(tmp_path_factory):
+    """configs-example is a HUMAN Config Repo (ADR-0048): it becomes loadable
+    by going through the real `theozolith config ingest` pipeline — which is
+    itself the assertion that the shipped example ingests cleanly (knowledge
+    compiles, lints pass, pins resolve)."""
+    from theozolith_control.configrepo import load_config
+    from theozolith_control.ingest import ingest
+
+    pinned = tmp_path_factory.mktemp("pinned-build")
+    ingest(str(DEPLOY / "configs-example"), pinned, log=lambda *_: None)
+    return load_config(pinned)
 
 
 def test_compose_no_longer_runs_the_actors():
@@ -139,14 +154,13 @@ def test_no_tailscale_anywhere_in_product_code_or_deploy():
         assert "tailscale" not in (DEPLOY / name).read_text().lower(), name
 
 
-def test_configs_example_parses_and_places_the_builtin_stacks():
-    """The starter Config Repo must stay valid: worker/reviewer as process
-    Stacks, the Flight Deck as a container Stack (ADR-0013/0019). Control is
-    never a Stack — the substrate never supervises its own control plane
-    (ADR-0035) — so the example must not carry one."""
-    from theozolith_control.configrepo import load_config
-
-    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
+    """The starter Config Repo must stay valid THROUGH INGEST (ADR-0048):
+    worker/reviewer as process Stacks, the Flight Deck as a container Stack
+    (ADR-0013/0019). Control is never a Stack — the substrate never
+    supervises its own control plane (ADR-0035) — so the example must not
+    carry one."""
+    config = example_config
     kinds = {stack.name: stack.kind for stack in config.stacks}
     assert kinds == {
         "implementer": "process",
@@ -158,12 +172,23 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     }
     assert config.product_version
     assert "claude-dev" in config.worker_types
+    # The example knowledge tree compiled at ingest and pinned per tree; both
+    # claude types share it, so they share the pin (ADR-0048).
+    assert config.worker_types["claude-dev"].knowledge == "knowledge/claude-dev"
+    assert (
+        config.worker_types["claude-dev"].knowledge_pin
+        == config.worker_types["claude-review"].knowledge_pin
+        != ""
+    )
     # The custom driver resolves to the one launcher with a drivers/<name> ref
     # (ADR-0042), and its module is present so the load did not fault.
     hello = next(s for s in config.stacks if s.name == "hello-logger")
     assert hello.command == "theozolith-driver drivers/hello_logger"
     assert hello.state == "stopped"
     assert (REPO_ROOT / "deploy" / "configs-example" / "drivers" / "hello_logger.py").is_file()
+    # Every example Stack is STAGED (stopped): the fill-in placeholders would
+    # be refused by ingest on a running Stack (ADR-0048).
+    assert {stack.state for stack in config.stacks} == {"stopped"}
     # The Implementer Stack's node gets exactly its referenced secrets (the
     # worker type owns them, ADR-0044).
     implementer = next(s for s in config.stacks if s.name == "implementer")
@@ -188,74 +213,84 @@ def test_configs_example_parses_and_places_the_builtin_stacks():
     assert "flightdeck-github-token" not in driver_secrets
 
 
-def test_configs_example_flightdeck_knowledge_wiring():
-    """ADR-0043 + issue #31: the example Flight Deck wires per-instance runtime
-    state, ONE shared knowledge clone, and a per-instance tailnet identity
-    volume; bakes the knowledge symlinks into flightdeck-start; and keeps the
-    carve-out Flight-Deck-only. The tailscale half is landed behind the #31
-    gate evidence (uid-1000, userspace networking, no added capabilities)."""
-    from theozolith_control.configrepo import load_config
-
-    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+def test_configs_example_flightdeck_knowledge_wiring(example_config):
+    """ADR-0048 (amending ADR-0043) + issue #31: the example Flight Deck wires
+    per-instance runtime state, the READ-ONLY bind of the node's applied
+    knowledge export, and a per-instance tailnet identity volume; bakes the
+    knowledge symlinks into flightdeck-start; and keeps the carve-out
+    Flight-Deck-only. The tailscale half is landed behind the #31 gate
+    evidence (uid-1000, userspace networking, no added capabilities)."""
+    config = example_config
     flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
 
     # Per-instance state + logs + tailnet identity (resolved from {stack});
-    # exactly one SHARED knowledge-* clone that is deliberately NOT
-    # per-instance — and nothing else.
+    # exactly one SHARED read-only knowledge bind that is deliberately NOT
+    # per-instance — and nothing else. Mounted at the stable PARENT the Node
+    # Daemon maintains, so a tree swap never recreates the container.
     assert set(flightdeck.volumes) == {
         "flightdeck-logs:/var/log/flightdeck",
         "flightdeck-claude-state:/home/ozolith/.claude",
-        "knowledge-claude-dev:/home/ozolith/knowledge",
+        "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
         "flightdeck-tailscale-state:/var/lib/tailscale",
     }
 
     wt = config.worker_types["flightdeck"]
-    assert wt.knowledge_source == ""  # never baked; the clone is live (ADR-0043)
+    # The deck SELECTS its tree via the worker-type knowledge field (ADR-0048
+    # amendment): validated like a driver's (pin joined at load), delivered
+    # as control-injected env — and NEVER baked: the wire recipe carries
+    # empty knowledge fields (the state volume shadows ~/.claude), so a
+    # content edit moves the pin without touching the image identity.
+    assert wt.knowledge == "knowledge/claude-dev"
+    assert wt.knowledge_pin == config.worker_types["claude-dev"].knowledge_pin
+    recipe = wt.recipe_wire()
+    assert recipe["knowledge"] == "" and recipe["knowledge_pin"] == ""
+    assert flightdeck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "claude-dev"
     script = "\n".join(wt.setup)
 
-    # clone-init + all four symlinks are baked into flightdeck-start.
-    assert "theozolith-knowledge clone-init" in script
-    for target in (
-        "ln -sfnT /home/ozolith/knowledge/skills",
-        "ln -sfnT /home/ozolith/knowledge/agents/claude",
-        "ln -sfnT /home/ozolith/knowledge/workflows",
-        "ln -sfnT /home/ozolith/knowledge/AGENTS.md",
-    ):
-        assert target in script, target
-    for claude_dir in (
-        "/home/ozolith/.claude/skills",
-        "/home/ozolith/.claude/agents",
-        "/home/ozolith/.claude/workflows",
-        "/home/ozolith/.claude/CLAUDE.md",
-    ):
-        assert claude_dir in script, claude_dir
+    # The writable clone is RETIRED (ADR-0048): no clone-init, no knowledge
+    # URL — the symlinks resolve into the mounted COMPILED tree, selected at
+    # container start from the injected env (no hardcoded tree name), and
+    # the script fails loud when the selected tree is unavailable. The
+    # replace idiom is portable (no GNU-only ln -T): a real directory at a
+    # destination is refused, a stale link or file is relinked.
+    assert "clone-init" not in script
+    assert "github.com" not in script
+    assert "ln -sfnT" not in script and "ln -sfn" not in script
+    assert "knowledge/claude-dev" not in script  # the selection is env, not a literal
+    assert '"${THEOZOLITH_KNOWLEDGE_TREE:?' in script
+    assert 'KNOWLEDGE_TREE_DIR="/var/lib/theozolith/knowledge/${THEOZOLITH_KNOWLEDGE_TREE}"' in (
+        script
+    )
+    assert 'if [ ! -d "$KNOWLEDGE_TREE_DIR" ]; then' in script
+    assert "link_knowledge" in script and 'ln -s "$1" "$2"' in script
+    assert "for entry in skills agents workflows CLAUDE.md; do" in script
+    assert '"/home/ozolith/.claude/$entry"' in script
 
-    # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts a
-    # knowledge-* clone, any .claude path, or a tailnet identity.
+    # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts
+    # the knowledge export, any .claude path, or a tailnet identity.
     for stack in config.stacks:
         if stack.name == "flightdeck":
             continue
         for volume in stack.volumes:
-            assert "knowledge-" not in volume and ".claude" not in volume, (stack.name, volume)
+            assert "knowledge" not in volume and ".claude" not in volume, (stack.name, volume)
             assert "tailscale" not in volume, (stack.name, volume)
     for name, other in config.worker_types.items():
         if name == "flightdeck":
             continue
         for volume in other.volumes:
-            assert "knowledge-" not in volume and ".claude" not in volume, (name, volume)
+            assert "knowledge" not in volume and ".claude" not in volume, (name, volume)
             assert "tailscale" not in volume, (name, volume)
 
 
-def test_configs_example_flightdeck_tailscale_wiring():
+def test_configs_example_flightdeck_tailscale_wiring(example_config):
     """Issue #31: the tailscale half of the example, landed behind the gate
     evidence recorded on the issue. Static binaries are pinned by version AND
-    sha256 with a FAIL-CLOSED placeholder; the auth key enters as a named
-    secret only; the hostname is per-placement Stack env; no capability or
-    device passthrough exists anywhere to grant (the worker-type schema has no
-    such field — this test pins the example's side of that doctrine)."""
-    from theozolith_control.configrepo import load_config
-
-    config = load_config(REPO_ROOT / "deploy" / "configs-example")
+    sha256 with a FAIL-CLOSED placeholder (human-entered, never ingest-
+    computed — ADR-0048); the auth key enters as a named secret only; the
+    hostname is per-placement Stack env; no capability or device passthrough
+    exists anywhere to grant (the worker-type schema has no such field — this
+    test pins the example's side of that doctrine)."""
+    config = example_config
     flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
     wt = config.worker_types["flightdeck"]
     setup = "\n".join(wt.setup)
@@ -289,7 +324,7 @@ def test_configs_example_flightdeck_tailscale_wiring():
     assert "TS_AUTHKEY_FILE" in setup
 
 
-def test_flightdeck_tailscale_version_matches_the_gate_harness():
+def test_flightdeck_tailscale_version_matches_the_gate_harness(example_config):
     """The version the example ships must be the version the #31 gate harness
     (spikes/issue-31-tailscale-uid1000, PR #34) actually tested — gate evidence
     for one binary says nothing about another. Both sides fetch the same
@@ -298,10 +333,7 @@ def test_flightdeck_tailscale_version_matches_the_gate_harness():
     spike_dockerfile = REPO_ROOT / "spikes" / "issue-31-tailscale-uid1000" / "Dockerfile"
     if not spike_dockerfile.exists():
         pytest.skip("gate harness (PR #34) not present in this checkout yet")
-    from theozolith_control.configrepo import load_config
-
-    config = load_config(REPO_ROOT / "deploy" / "configs-example")
-    setup = "\n".join(config.worker_types["flightdeck"].setup)
+    setup = "\n".join(example_config.worker_types["flightdeck"].setup)
     example = re.search(r"TS_VERSION=(\d+\.\d+\.\d+)", setup)
     spike = re.search(r"TS_VERSION=(\d+\.\d+\.\d+)", spike_dockerfile.read_text())
     assert example and spike, "both sides must pin TS_VERSION major.minor.patch"
@@ -311,13 +343,10 @@ def test_flightdeck_tailscale_version_matches_the_gate_harness():
 # -- flightdeck-start: the generated script is EXECUTED, not just grepped ---------
 
 
-def _generate_flightdeck_start(tmp_path: Path) -> Path:
+def _generate_flightdeck_start(tmp_path: Path, config) -> Path:
     """Run the worker type's script-writing setup entry in a real /bin/sh —
     exactly what the image build does — with the baked destination redirected
     into tmp_path, and return the generated script."""
-    from theozolith_control.configrepo import load_config
-
-    config = load_config(REPO_ROOT / "deploy" / "configs-example")
     wt = config.worker_types["flightdeck"]
     generators = [s for s in wt.setup if "/usr/local/bin/flightdeck-start" in s]
     assert len(generators) == 1
@@ -335,12 +364,17 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     content = content.replace("/home/ozolith", str(sandbox / "home"))
     content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
     content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
+    content = content.replace("/var/lib/theozolith/knowledge", str(sandbox / "knowledge"))
     content = content.replace("/etc/theozolith", str(sandbox / "etc"))
     rewritten = sandbox / "start"
     rewritten.write_text(content)
     rewritten.chmod(0o755)
     (sandbox / "home" / ".claude").mkdir(parents=True)  # the state-volume mountpoint
     (sandbox / "tsstate").mkdir()  # the tailscale-state volume mountpoint
+    # The applied knowledge tree the deck's selection resolves to (ADR-0048):
+    # present by default so the fail-loud gate passes; the unavailable-tree
+    # test removes it.
+    (sandbox / "knowledge" / "claude-dev").mkdir(parents=True)
     return rewritten
 
 
@@ -464,11 +498,23 @@ def _instant_sleep(bin_dir: Path) -> None:
 
 
 def _run_start(
-    script: Path, bin_dir: Path, *, timeout: float | None = None, **extra_env: str
+    script: Path, bin_dir: Path, *, timeout: float | None = None, **extra_env: str | None
 ) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    """The container-start env: the knowledge selection rides as the
+    control-injected THEOZOLITH_KNOWLEDGE_TREE (ADR-0048) — defaulted here so
+    every lifecycle test starts like a resolved deck Stack; pass ``None`` to
+    UNSET a variable (the missing-selection test)."""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "THEOZOLITH_KNOWLEDGE_TREE": "claude-dev",
+    }
     env.pop("TS_AUTHKEY_FILE", None)
-    env.update(extra_env)
+    for key, value in extra_env.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     return subprocess.run([str(script)], env=env, capture_output=True, text=True, timeout=timeout)
 
 
@@ -485,12 +531,12 @@ def _assert_daemon_reaped(pid_file: Path) -> None:
     raise AssertionError("tailscaled survived flightdeck-start exiting")
 
 
-def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
+def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_config):
     """The generator is one classic-Dockerfile-safe printf; the script it emits
     must carry every runtime expansion UNTOUCHED by the build — the hostname,
     the key path, and the daemon pid expand at container start, never at image
     build (an issue #31 test requirement)."""
-    script = _generate_flightdeck_start(tmp_path).read_text()
+    script = _generate_flightdeck_start(tmp_path, example_config).read_text()
     lines = script.splitlines()
     assert lines[0] == "#!/bin/sh"
     assert lines[1] == "set -eu"  # fail-fast: a failed step exits the container
@@ -511,19 +557,24 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
     # ... and the only variables in the script are its own runtime ones.
     assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
         "FLIGHTDECK_TS_HOSTNAME",
+        "THEOZOLITH_KNOWLEDGE_TREE",
+        "KNOWLEDGE_TREE_DIR",
+        "entry",
         "TS_AUTHKEY_FILE",
         "TS_ENROLL",
         "TS_TRIES",
         "TAILSCALED_PID",
     }
-    # Order is the issue #31 lifecycle: knowledge first, then the enrollment
-    # decision — read from the Ozolith-owned COMPLETION MARKER, never from
-    # tailscaled.state — BEFORE the daemon launches, readiness before `up`,
-    # tmux last, and a supervisor — never the removed draft's `exec tmux
-    # wait-for`.
+    # Order is the issue #31 lifecycle: the knowledge selection gate and
+    # symlinks first (into the read-only mount, ADR-0048 — no clone step
+    # exists anymore), then the enrollment decision — read from the
+    # Ozolith-owned COMPLETION MARKER, never from tailscaled.state — BEFORE
+    # the daemon launches, readiness before `up`, tmux last, and a supervisor
+    # — never the removed draft's `exec tmux wait-for`.
+    assert "clone-init" not in script
     assert (
-        script.index("clone-init")
-        < script.index("ln -sfnT")
+        script.index("KNOWLEDGE_TREE_DIR=")
+        < script.index("link_knowledge")
         < script.index(".theozolith-enrolled-v1 ]")
         < script.index("tailscaled --tun=userspace-networking")
         < script.index(" up --ssh")
@@ -536,7 +587,14 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
     # false success marker, and tailscaled.state is never deleted or rewritten.
     assert "if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]" in script
     assert "-s /var/lib/tailscale/tailscaled.state ]" not in script
-    assert "rm " not in script  # nothing on the state volume is ever deleted
+    # Nothing on the TAILNET-IDENTITY volume is ever deleted; the only rm in
+    # the script is the portable symlink replace under ~/.claude (never a
+    # real directory — the guard above it refuses those), which GNU ln -sfnT
+    # performed implicitly before.
+    for line in lines:
+        if "rm " in line:
+            assert "tailscale" not in line, line
+            assert 'rm -f "$2"' in line, line
     assert (
         script.index(" up --ssh")
         < script.index("> /var/lib/tailscale/.theozolith-enrolled-v1.tmp")
@@ -552,13 +610,13 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path):
             assert not line.strip().startswith(("until", "while")), line
 
 
-def test_flightdeck_start_up_attempts_are_natively_bounded(tmp_path):
+def test_flightdeck_start_up_attempts_are_natively_bounded(tmp_path, example_config):
     """`tailscale up` waits for Running state FOREVER by default, so "one
     attempt" alone never guaranteed prompt failure. BOTH up commands — fresh
     enrollment and marker-present reuse — must carry the CLI's NATIVE
     --timeout=30s, and the bound must be that flag, never an external
     `timeout` process wrapping the command."""
-    script = _generate_flightdeck_start(tmp_path).read_text()
+    script = _generate_flightdeck_start(tmp_path, example_config).read_text()
     up_commands = [
         line
         for line in script.splitlines()
@@ -572,33 +630,104 @@ def test_flightdeck_start_up_attempts_are_natively_bounded(tmp_path):
     assert not any(line.strip().startswith("timeout ") for line in script.splitlines())
 
 
-def test_flightdeck_start_clone_failure_fails_the_container(tmp_path):
-    """A failed clone-init must exit the container non-zero BEFORE any symlink,
-    tailscaled launch, or tmux step — Docker's restart policy owns the retry;
-    there is no in-container retry loop to hide the failure."""
+def test_flightdeck_start_unavailable_tree_fails_before_the_daemon(tmp_path, example_config):
+    """ADR-0048 amendment: the selected knowledge tree is a HARD prerequisite
+    — when the node has not converged a distribution carrying it (or the tree
+    was retired), the deck fails loud BEFORE tailscaled ever launches, and
+    docker restart policy owns the retry. Silently starting without skills is
+    exactly what this replaces."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
-    _stub(bin_dir, "theozolith-knowledge", exit_code=7)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    shutil.rmtree(sandbox / "knowledge" / "claude-dev")  # not converged yet
     daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
-    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
 
-    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
-    assert proc.returncode == 7
-    assert not daemon_calls.exists()  # the daemon never launched over broken knowledge
-    assert not tmux_calls.exists()
-    assert not (sandbox / "home" / ".claude" / "skills").is_symlink()
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "not available on this node" in proc.stderr
+    assert not daemon_calls.exists()
+    assert not (sandbox / "home" / ".claude" / "skills").exists()
 
 
-def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path):
+def test_flightdeck_start_missing_selection_fails_before_the_daemon(tmp_path, example_config):
+    """Without the control-injected THEOZOLITH_KNOWLEDGE_TREE (a deck run
+    outside a resolved worker-type Stack), the script refuses to guess."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        THEOZOLITH_KNOWLEDGE_TREE=None,
+    )
+    assert proc.returncode != 0
+    assert "THEOZOLITH_KNOWLEDGE_TREE" in proc.stderr
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_start_replaces_stale_links_but_refuses_a_real_directory(
+    tmp_path, example_config
+):
+    """The portable replace idiom keeps GNU ln -sfnT's safety: a stale symlink
+    or plain file at a ~/.claude destination is replaced, a REAL directory
+    (state-volume debris) fails the start loudly instead of being deleted."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    claude = sandbox / "home" / ".claude"
+    (claude / "skills").symlink_to(sandbox / "elsewhere")  # stale link
+    (claude / "CLAUDE.md").write_text("stale file\n")
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    # Both stale entries were relinked into the selected tree before the
+    # (deliberately dying) stub daemon failed the container.
+    assert daemon_calls.exists()
+    assert os.readlink(claude / "skills") == str(sandbox / "knowledge" / "claude-dev" / "skills")
+    assert os.readlink(claude / "CLAUDE.md") == str(
+        sandbox / "knowledge" / "claude-dev" / "CLAUDE.md"
+    )
+
+    (claude / "agents").unlink()
+    (claude / "agents").mkdir()  # a real directory must never be deleted
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "refusing to symlink over it" in proc.stderr
+    assert (claude / "agents").is_dir() and not (claude / "agents").is_symlink()
+
+
+def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path, example_config):
     """FLIGHTDECK_TS_HOSTNAME comes from the Stack [env]; without it the
     container fails with a naming message before tailscaled ever launches."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
 
     proc = _run_start(script, bin_dir)
@@ -607,7 +736,7 @@ def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path):
     assert not daemon_calls.exists()
 
 
-def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path):
+def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path, example_config):
     """Issue #31 lifecycle point 2: enrollment due (completion marker absent)
     with the auth-key secret absent fails fast with a DISTINCT
     restore-the-mapping message, BEFORE tailscaled launches (point 1) — and a
@@ -616,10 +745,9 @@ def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path)
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     # Debris of a rejected first enrollment: state present, no marker.
     (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
 
@@ -630,7 +758,7 @@ def test_flightdeck_start_missing_authkey_fails_fast_before_the_daemon(tmp_path)
     assert not tmux_calls.exists()
 
 
-def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_path):
+def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_path, example_config):
     """The success path end-to-end over an empty state volume (a first start,
     or the volume after deliberate state loss — both correctly route to
     enrollment): knowledge symlinks, enrollment via file:$TS_AUTHKEY_FILE
@@ -640,10 +768,9 @@ def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_pat
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    knowledge_calls = _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
     tmux_calls = _tmux_stub(bin_dir, has_session_code=1)  # session already over
@@ -656,14 +783,14 @@ def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_pat
     )
     assert proc.returncode == 0, proc.stderr
     home = sandbox / "home"
-    assert "clone-init --source" in knowledge_calls.read_text()
+    # The symlinks target the COMPILED trees on the read-only mount (ADR-0048).
     for link, target in (
-        (".claude/skills", "knowledge/skills"),
-        (".claude/agents", "knowledge/agents/claude"),
-        (".claude/workflows", "knowledge/workflows"),
-        (".claude/CLAUDE.md", "knowledge/AGENTS.md"),
+        (".claude/skills", "claude-dev/skills"),
+        (".claude/agents", "claude-dev/agents"),
+        (".claude/workflows", "claude-dev/workflows"),
+        (".claude/CLAUDE.md", "claude-dev/CLAUDE.md"),
     ):
-        assert os.readlink(home / link) == str(home / target), link
+        assert os.readlink(home / link) == str(sandbox / "knowledge" / target), link
     up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
     assert len(up_lines) == 1
     assert "--ssh" in up_lines[0]
@@ -682,7 +809,7 @@ def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_pat
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_path):
+def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_path, example_config):
     """Issue #31 lifecycle point 1's other branch: a PROMOTED completion
     marker (a successful prior enrollment) routes to `up` WITHOUT the auth
     key — so the remove-the-mapping hardening (no TS_AUTHKEY_FILE at all)
@@ -690,10 +817,9 @@ def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_pat
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
     _tmux_stub(bin_dir, has_session_code=1)
@@ -706,7 +832,7 @@ def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_pat
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_path):
+def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_path, example_config):
     """ADR-0045 §4 end-to-end: with the image-baked model file present, the
     generated script (produced by the REAL worker-type setup command) starts
     the session as `claude --model "claude-fable-5"` — delivered to tmux as
@@ -717,12 +843,11 @@ def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_pat
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "etc").mkdir()  # the sandboxed /etc/theozolith
     (sandbox / "etc" / "model").write_text("claude-fable-5\n")
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     _tailscale_stub(bin_dir, status_code=0, up_code=0)
     tmux_calls = _tmux_stub(bin_dir, has_session_code=1)  # session already over
@@ -749,17 +874,16 @@ def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_pat
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_absent_model_file_launches_bare_claude(tmp_path):
+def test_flightdeck_start_absent_model_file_launches_bare_claude(tmp_path, example_config):
     """The compatibility branch (ADR-0045 §4): NO model file in the image —
     a model-less worker type, or a pre-§4 base — must launch exactly `claude`
     as the session command, with no --model flag and no empty argument."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     _tailscale_stub(bin_dir, status_code=0, up_code=0)
     _tmux_stub(bin_dir, has_session_code=1)
@@ -770,19 +894,18 @@ def test_flightdeck_start_absent_model_file_launches_bare_claude(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_empty_model_file_launches_bare_claude(tmp_path):
+def test_flightdeck_start_empty_model_file_launches_bare_claude(tmp_path, example_config):
     """An EMPTY model file takes the same bare-`claude` branch as an absent
     one (the guard is `-s`, non-empty): a build that materialized nothing
     must never produce `claude --model ""`."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "etc").mkdir()
     (sandbox / "etc" / "model").write_text("")
     (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     _tailscale_stub(bin_dir, status_code=0, up_code=0)
     _tmux_stub(bin_dir, has_session_code=1)
@@ -793,7 +916,9 @@ def test_flightdeck_start_empty_model_file_launches_bare_claude(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_failed_enrollment_is_retried_with_the_key_not_reused(tmp_path):
+def test_flightdeck_start_failed_enrollment_is_retried_with_the_key_not_reused(
+    tmp_path, example_config
+):
     """The defect the completion marker exists to fix: tailscaled writes its
     machine key BEFORE auth-key registration completes, so a REJECTED first
     enrollment leaves a non-empty tailscaled.state behind. The next start
@@ -804,10 +929,9 @@ def test_flightdeck_start_failed_enrollment_is_retried_with_the_key_not_reused(t
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60", writes_state=sandbox / "tsstate")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=1)  # rejected key
     _stub(bin_dir, "tmux", exit_code=0)
@@ -846,7 +970,7 @@ def test_flightdeck_start_failed_enrollment_is_retried_with_the_key_not_reused(t
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_interrupted_promotion_is_not_a_marker(tmp_path):
+def test_flightdeck_start_interrupted_promotion_is_not_a_marker(tmp_path, example_config):
     """A leftover promotion temp file — an interruption between `up` success
     and the same-volume mv — must NOT count as enrolled: only the final
     marker name flips the decision, so the next start re-enrolls with the
@@ -854,12 +978,11 @@ def test_flightdeck_start_interrupted_promotion_is_not_a_marker(tmp_path):
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
     (sandbox / "tsstate" / ".theozolith-enrolled-v1.tmp").write_text("enrolled")
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=0)
     _tmux_stub(bin_dir, has_session_code=1)
@@ -878,16 +1001,15 @@ def test_flightdeck_start_interrupted_promotion_is_not_a_marker(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path):
+def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path, example_config):
     """Issue #31 lifecycle point 3: while waiting for the LocalAPI, a daemon
     that already exited is detected and fails the container — the wait is
     never served out against a corpse, and `up` is never attempted."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")  # reuse branch
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _tailscaled_stub(bin_dir, lifespan=None)  # dies immediately
     ts_calls = _tailscale_stub(bin_dir, status_code=1)  # LocalAPI never answers
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
@@ -900,16 +1022,15 @@ def test_flightdeck_start_daemon_death_before_ready_fails_promptly(tmp_path):
     assert not tmux_calls.exists()
 
 
-def test_flightdeck_start_readiness_wait_is_bounded(tmp_path):
+def test_flightdeck_start_readiness_wait_is_bounded(tmp_path, example_config):
     """Issue #31 lifecycle point 3/4: a live daemon whose LocalAPI never
     answers exhausts a BOUNDED wait and fails the container — no unbounded
     loop, no `up` attempt against a dead socket."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")  # reuse branch
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=1)  # never ready
     _instant_sleep(bin_dir)
@@ -921,7 +1042,7 @@ def test_flightdeck_start_readiness_wait_is_bounded(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path):
+def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path, example_config):
     """Issue #31 lifecycle point 4: a failing `tailscale up` (invalid/expired
     key, rejected flags) gets exactly ONE attempt and fails the container
     promptly — the removed draft's invisible `until ... sleep 5` loop must
@@ -929,10 +1050,9 @@ def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path):
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-EXPIRED\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_stub(bin_dir, status_code=0, up_code=1)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
@@ -951,7 +1071,7 @@ def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_fresh_enrollment_timeout_fails_finitely(tmp_path):
+def test_flightdeck_start_fresh_enrollment_timeout_fails_finitely(tmp_path, example_config):
     """A tailnet that never reaches Running must not hang a fresh enrollment:
     readiness succeeds, the single `up` attempt hits the CLI's native 30s
     bound, and the container exits non-zero within a finite interval — the
@@ -963,10 +1083,9 @@ def test_flightdeck_start_fresh_enrollment_timeout_fails_finitely(tmp_path):
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60", writes_state=sandbox / "tsstate")
     ts_calls = _tailscale_timeout_stub(bin_dir)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
@@ -990,7 +1109,9 @@ def test_flightdeck_start_fresh_enrollment_timeout_fails_finitely(tmp_path):
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_reuse_timeout_fails_finitely_preserving_identity(tmp_path):
+def test_flightdeck_start_reuse_timeout_fails_finitely_preserving_identity(
+    tmp_path, example_config
+):
     """The marker-present branch gets the same native bound: a stalled
     tailnet fails the container within a finite interval after ONE keyless
     `up` attempt, with no destructive recovery — the completion marker and
@@ -999,10 +1120,9 @@ def test_flightdeck_start_reuse_timeout_fails_finitely_preserving_identity(tmp_p
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     (sandbox / "tsstate" / "tailscaled.state").write_text("machine-key-material")
     (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
     ts_calls = _tailscale_timeout_stub(bin_dir)
     tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
@@ -1019,17 +1139,16 @@ def test_flightdeck_start_reuse_timeout_fails_finitely_preserving_identity(tmp_p
     _assert_daemon_reaped(daemon_pid)
 
 
-def test_flightdeck_start_daemon_death_after_start_fails_the_container(tmp_path):
+def test_flightdeck_start_daemon_death_after_start_fails_the_container(tmp_path, example_config):
     """Issue #31 lifecycle point 5: after the session is up, a dying tailscaled
     must fail the container — never a nominally healthy container with dead
     one-hop access (the removed draft's `exec tmux wait-for` defect)."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
-    script = _sandboxed_script(_generate_flightdeck_start(tmp_path), sandbox)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-SECRETVALUE\n")
-    _stub(bin_dir, "theozolith-knowledge", exit_code=0)
     _tailscaled_stub(bin_dir, lifespan="1")  # dies shortly after startup
     _tailscale_stub(bin_dir, status_code=0, up_code=0)
     _tmux_stub(bin_dir, has_session_code=0)  # the session stays alive

@@ -2,7 +2,9 @@
 
 ADR-0042: the Node Daemon fetches a config-distribution artifact by its
 drivers-hash and VERIFIES it by recomputing the manifest over the unpacked
-tree — never by trusting the archive bytes or the served filename. This module
+tree — never by trusting the archive bytes or the served filename. ADR-0048
+extends the distributed tree to the pinned build's compiled ``knowledge/``
+trees alongside ``drivers/``; the hash keeps its historical wire name. This module
 mirrors the SUBSET of ``theozolith_control.configdist`` the node needs: the
 canonical hash algorithm. It cannot import the control package (nodedaemon is
 stdlib-only, ADR-0010), so the algorithm is duplicated here and pinned to the
@@ -45,6 +47,13 @@ from typing import Any
 
 DRIVERS_DIR = "drivers"
 
+# The pinned build's compiled knowledge trees (ADR-0048), distributed alongside
+# drivers/ under the same single hash.
+KNOWLEDGE_DIR = "knowledge"
+
+# The subtrees the distribution covers, in manifest order.
+DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR)
+
 # The metadata member at the archive/unpacked root (control side writes it):
 # metadata ABOUT the manifest, excluded from the hash by construction.
 ARTIFACT_METADATA = "config-dist.json"
@@ -65,6 +74,16 @@ def excluded_part(part: str) -> bool:
     a REJECTION rule, not a skip rule: an accepted artifact can never contain
     such a member, so finding one in a verified tree is a structural failure."""
     return part.startswith(".") or part == "__pycache__" or part.endswith(".pyc")
+
+
+def entry_mode(st_mode: int) -> str:
+    """The normalized executable state a manifest entry records: ``"755"``
+    when ANY executable bit is set, ``"644"`` otherwise — exactly the two
+    modes the artifact stamps and ``extract_zip`` restores, so the hash never
+    depends on umask noise while a chmod-only change still changes it. Mirror
+    of ``theozolith_control.configdist.entry_mode`` (pinned by the
+    cross-package contract tests)."""
+    return "755" if st_mode & 0o111 else "644"
 
 
 def _regular_files(root: Path) -> list[Path]:
@@ -99,15 +118,15 @@ def _regular_files(root: Path) -> list[Path]:
     root = Path(root)
     if root.is_symlink():
         raise ConfigDistError(
-            f"{root} is a symlink — a verified tree refuses a symlinked drivers"
+            f"{root} is a symlink — a verified tree refuses a symlinked subtree"
             " root (it could alias a tree from outside the applied state, ADR-0042)"
         )
     if not root.exists():
-        return []  # a genuinely missing drivers/ is the empty sentinel
+        return []  # a genuinely missing subtree is the empty sentinel
     if not root.is_dir():
         raise ConfigDistError(
             f"{root} is not a directory — a verified tree refuses a non-directory"
-            " drivers root (regular file, FIFO, socket, device; ADR-0042)"
+            " subtree root (regular file, FIFO, socket, device; ADR-0042)"
         )
     found: list[Path] = []
     stack = [root]
@@ -162,39 +181,78 @@ def _regular_files(root: Path) -> list[Path]:
 
 
 def manifest_hash_of_tree(dist_root: Path) -> str:
-    """Recompute the drivers-hash over an unpacked config-distribution root
-    (which holds ``drivers/`` plus the ``config-dist.json`` metadata member).
-    The manifest covers only the ``drivers/`` file set, with relpaths INCLUDING
-    the ``drivers/`` prefix — the metadata member at the root is excluded by
-    construction. An empty tree hashes to ``""``. Byte-for-byte the control
-    side's ``manifest_hash(drivers_manifest(...))``.
+    """Recompute the distribution hash over an unpacked config-distribution
+    root (which holds ``drivers/`` + ``knowledge/`` plus the
+    ``config-dist.json`` metadata member). The manifest covers the ``drivers/``
+    and ``knowledge/`` file sets, with relpaths INCLUDING the subtree prefix —
+    the metadata member at the root is excluded by construction. An empty tree
+    hashes to ``""``. Byte-for-byte the control side's
+    ``manifest_hash(dist_manifest(...))``.
 
-    FAIL CLOSED (ADR-0042): a symlinked or otherwise irregular ``drivers``
+    FAIL CLOSED (ADR-0042): a symlinked or otherwise irregular subtree
     root, any symlink/FIFO/socket/device below it, any entry whose name an
     accepted artifact can never contain (a dot component, ``__pycache__``, a
     ``*.pyc``), a failure to enumerate any included directory, or an unreadable
     file all raise ``ConfigDistError`` — the caller reads that as non-converged
     and repairs; an entry is never silently omitted from the hash."""
     dist_root = Path(dist_root)
-    root = dist_root / DRIVERS_DIR
     entries: list[list[str]] = []
-    for path in _regular_files(root):
-        relpath = path.relative_to(dist_root).as_posix()
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            # Normalize a read failure over the unpacked tree to ConfigDistError
-            # so the caller treats it as non-converged / a repair trigger rather
-            # than an unhandled crash (ADR-0042).
-            raise ConfigDistError(
-                f"cannot read {relpath!r} while recomputing the config distribution: {exc}"
-            ) from exc
-        entries.append([relpath, hashlib.sha256(data).hexdigest()])
+    for subtree in DIST_DIRS:
+        root = dist_root / subtree
+        for path in _regular_files(root):
+            relpath = path.relative_to(dist_root).as_posix()
+            try:
+                data = path.read_bytes()
+                mode = entry_mode(path.stat().st_mode)
+            except OSError as exc:
+                # Normalize a read failure over the unpacked tree to ConfigDistError
+                # so the caller treats it as non-converged / a repair trigger rather
+                # than an unhandled crash (ADR-0042).
+                raise ConfigDistError(
+                    f"cannot read {relpath!r} while recomputing the config distribution: {exc}"
+                ) from exc
+            entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
     entries.sort()
     if not entries:
         return ""
     canonical = json.dumps(entries, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def tree_hash(root: Path) -> str:
+    """The content hash of ONE tree, relpaths RELATIVE TO ``root`` (unlike
+    ``manifest_hash_of_tree``, which prefixes the subtree name). ``""`` for a
+    missing or empty tree; the walk is this side's fail-closed one, so a
+    malformed tree raises ``ConfigDistError``, never a silent skip. Used for
+    per-knowledge-tree pins (ADR-0048) and for comparing an exported deck tree
+    against the applied one."""
+    root = Path(root)
+    entries: list[list[str]] = []
+    for path in _regular_files(root):
+        relpath = path.relative_to(root).as_posix()
+        try:
+            data = path.read_bytes()
+            mode = entry_mode(path.stat().st_mode)
+        except OSError as exc:
+            raise ConfigDistError(
+                f"cannot read {relpath!r} under {root} while hashing the tree: {exc}"
+            ) from exc
+        entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
+    entries.sort()
+    if not entries:
+        return ""
+    canonical = json.dumps(entries, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def knowledge_tree_hash(dist_root: Path, name: str) -> str:
+    """The per-tree content pin for one applied ``knowledge/<name>/`` tree
+    (ADR-0048). ``""`` for a missing or empty tree. Recomputed before a bake
+    and compared to the recipe's ``knowledge_pin`` — the image must never bake
+    content that disagrees with the identity it is tagged under. Mirror of
+    ``theozolith_control.configdist.knowledge_tree_hash`` (pinned by the
+    cross-package contract tests)."""
+    return tree_hash(Path(dist_root) / KNOWLEDGE_DIR / name)
 
 
 def safe_member(name: str) -> bool:
@@ -219,11 +277,11 @@ def artifact_structure_error(names: list[str]) -> str | None:
     cross-package contract test).
 
     A valid archive holds EXACTLY the single ``config-dist.json`` metadata member
-    at the root plus zero or more ``drivers/...`` files the canonical manifest
-    counts. Anything the manifest would ignore (a dot component, ``__pycache__``,
-    a ``*.pyc``, a bare directory entry, a second top-level file, an unsafe name,
-    or a duplicate) is rejected, so no ignored-but-importable content can ride
-    along outside ``drivers_hash``."""
+    at the root plus zero or more ``drivers/...`` / ``knowledge/...`` files the
+    canonical manifest counts. Anything the manifest would ignore (a dot
+    component, ``__pycache__``, a ``*.pyc``, a bare directory entry, a second
+    top-level file, an unsafe name, or a duplicate) is rejected, so no
+    ignored-but-importable content can ride along outside ``drivers_hash``."""
     seen: set[str] = set()
     saw_metadata = False
     for name in names:
@@ -236,10 +294,10 @@ def artifact_structure_error(names: list[str]) -> str | None:
             saw_metadata = True
             continue
         parts = name.split("/")
-        if parts[0] != DRIVERS_DIR or len(parts) < 2:
+        if parts[0] not in DIST_DIRS or len(parts) < 2:
             return (
                 f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
-                f" {DRIVERS_DIR}/ file"
+                f" {DRIVERS_DIR}/ or {KNOWLEDGE_DIR}/ file"
             )
         if any(excluded_part(part) for part in parts):
             return (
@@ -359,6 +417,15 @@ def extract_zip(data: bytes, dest: Path) -> None:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
+                if (info.external_attr >> 16) & 0o111:
+                    # Restore the executable bit the control side stamped as
+                    # archive metadata (ADR-0048: a compiled skill script must
+                    # stay runnable through bake and the deck mount). The same
+                    # normalized state rides every manifest entry
+                    # (entry_mode), so the extracted tree verifies with the
+                    # restored bit in its hash — a chmod-only change is a real
+                    # content change.
+                    os.chmod(target, 0o755)
             except OSError as exc:
                 raise ConfigDistError(
                     f"config distribution member {info.filename!r} cannot be extracted: {exc}"

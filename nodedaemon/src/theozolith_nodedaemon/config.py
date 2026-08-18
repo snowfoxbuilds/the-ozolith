@@ -93,6 +93,16 @@ class DaemonConfig:
         return self.config_dist_dir / "current"
 
     @property
+    def knowledge_export_dir(self) -> Path:
+        # The STABLE deck-facing knowledge export (ADR-0048): one child dir
+        # per compiled knowledge tree, copied from the applied distribution
+        # and swapped whole on change. Flight Decks read-only bind-mount this
+        # parent — its inode never moves, so a swap never recreates a
+        # container; a restarted agent CLI picks up the new trees. Outside
+        # config-dist/ so the distribution GC never sweeps it.
+        return self.state_dir / "knowledge"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 

@@ -11,16 +11,15 @@ Two tables, two write paths:
 - ``[control]`` holds ``control_ip`` and ``control_port``, the read-only
   address fields (ADR-0031/0034), plus ``browser_origin`` (ADR-0036: written
   only by ``origin-init``; its absence is the browser-disabled state).
-  Written by init/origin-init (``recover --ip`` for the IP), rendered
-  read-only in the dashboard settings form, and refused by ``set_value`` —
-  the dashboard cannot repoint the deployment. A leftover ``public_origin``
-  from a pre-ADR-0034 file is ignored on read and dropped on the next
-  regeneration.
-- ``[settings]`` holds the tier-2 tunables. The dashboard settings form
-  edits them through ``set_value``: a fixed-schema, single-file write that
-  regenerates control.toml from the known key set and commits it (the
-  ``product.toml`` pin-bump precedent — same author identity), never a
-  free-form editor.
+  Written by init/origin-init (``recover --ip`` for the IP) and rendered
+  read-only in the dashboard — the dashboard cannot repoint the deployment.
+  Machine state: ``theozolith config ingest`` preserves it (ADR-0048). A
+  leftover ``public_origin`` from a pre-ADR-0034 file is ignored on read and
+  dropped on the next regeneration.
+- ``[settings]`` holds the tier-2 tunables, authored in the Config Repo's
+  control.toml and materialized into the pinned build by ingest (ADR-0048)
+  — the dashboard settings form is display-only; there is no second write
+  path.
 
 Unknown keys fail closed: a typo in a hand-edited file must surface as an
 error, not silently configure nothing.
@@ -33,6 +32,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from theozolith_control import repolock
 
 CONTROL_TOML = "control.toml"
 
@@ -350,15 +351,33 @@ def write_control_address(
         canonical = str(ipaddress.ip_address(ip))
     except ValueError as exc:
         raise ControlTomlError(f"control IP {ip!r} is not an IP address: {exc}") from exc
-    if port is None:
-        port = read_control_port(config_repo)
-    elif isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    if isinstance(port, bool) or (
+        port is not None and (not isinstance(port, int) or not 1 <= port <= 65535)
+    ):
         raise ControlTomlError(f"control port {port!r} must be an integer in 1-65535")
-    path = _write(
-        config_repo, canonical, port, read_browser_origin(config_repo), read_values(config_repo)
-    )
-    suffix = "" if port == DEFAULT_CONTROL_PORT else f":{port}"
-    _commit(config_repo, f"theozolith: control address {canonical}{suffix}", runner=runner, log=log)
+    # The whole read-modify-write-commit holds the shared pinned-build write
+    # lock (ADR-0048 amendment): an ingest or product-pin transaction in
+    # flight is never interleaved with, and never orphaned by, this write.
+    try:
+        with repolock.pinned_write_lock(config_repo, writer="control address write"):
+            if port is None:
+                port = read_control_port(config_repo)
+            path = _write(
+                config_repo,
+                canonical,
+                port,
+                read_browser_origin(config_repo),
+                read_values(config_repo),
+            )
+            suffix = "" if port == DEFAULT_CONTROL_PORT else f":{port}"
+            _commit(
+                config_repo,
+                f"theozolith: control address {canonical}{suffix}",
+                runner=runner,
+                log=log,
+            )
+    except repolock.RepoLockError as exc:
+        raise ControlTomlError(str(exc)) from exc
     return path
 
 
@@ -367,43 +386,27 @@ def write_browser_origin(
 ) -> Path:
     """Persist the browser origin (origin-init only; ADR-0036), keeping the
     address fields and every committed setting. The caller validates the
-    origin (origin.parse_browser_origin) — this is the storage step."""
-    path = _write(
-        config_repo,
-        read_control_ip(config_repo),
-        read_control_port(config_repo),
-        browser_origin,
-        read_values(config_repo),
-    )
-    _commit(config_repo, f"theozolith: browser origin {browser_origin}", runner=runner, log=log)
+    origin (origin.parse_browser_origin) — this is the storage step. Holds
+    the shared pinned-build write lock for the read-modify-write-commit."""
+    try:
+        with repolock.pinned_write_lock(config_repo, writer="browser-origin write"):
+            path = _write(
+                config_repo,
+                read_control_ip(config_repo),
+                read_control_port(config_repo),
+                browser_origin,
+                read_values(config_repo),
+            )
+            _commit(
+                config_repo, f"theozolith: browser origin {browser_origin}", runner=runner, log=log
+            )
+    except repolock.RepoLockError as exc:
+        raise ControlTomlError(str(exc)) from exc
     return path
 
 
-def set_value(config_repo: Path, key: str, raw: str, *, runner=subprocess.run, log=print) -> Any:
-    """The settings-form write path: validate one known tier-2 key, rewrite
-    control.toml from the fixed schema (touching nothing else), and commit
-    ``theozolith: settings: <key> = <value>``. The control address is not a
-    settings key and is refused here by construction."""
-    setting = _BY_KEY.get(key)
-    if setting is None:
-        raise ControlTomlError(
-            f"unknown or read-only settings key {key!r} (known: {', '.join(sorted(_BY_KEY))})"
-        )
-    value = setting.coerce(raw, source="settings form")
-    values = read_values(config_repo)
-    values[key] = value
-    _write(
-        config_repo,
-        read_control_ip(config_repo),
-        read_control_port(config_repo),
-        read_browser_origin(config_repo),
-        values,
-    )
-    # The message carries the exact TOML literal that was written.
-    _commit(
-        config_repo,
-        f"theozolith: settings: {key} = {_toml_literal(value)}",
-        runner=runner,
-        log=log,
-    )
-    return value
+# set_value (the dashboard settings-form write path) is retired (ADR-0048):
+# the [settings] surface is authored in the Config Repo and reaches the
+# pinned build only through `theozolith config ingest`. The remaining writers
+# above are MACHINE state (the [control] address block from init/origin-init/
+# recover), which ingest preserves rather than harvests.

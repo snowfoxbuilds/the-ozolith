@@ -794,7 +794,7 @@ def test_config_dist_offhash_banner_and_stamp_skew_render(control: ControlRig):
     from theozolith_control import configdist
 
     control.write_config("drivers/custom/impl.py", "def run():\n    return 1\n")
-    digest = configdist.drivers_hash(control.settings.config_repo)
+    digest = configdist.dist_hash(control.settings.config_repo)
     login(control)
     # box1 off-hash (blocking, warning); box2 converged but stamp-skewed (advisory).
     control.heartbeat(node="box1", version="0.3.0", drivers_hash="d" * 64)
@@ -828,14 +828,18 @@ def test_explicit_empty_report_renders_off_hash_not_healthy(control: ControlRig)
     assert "config-distribution skew" in banner and "box1" in banner
 
 
-def test_settings_form_refuses_a_drivers_shaped_key(control: ControlRig):
-    """The one web write path into the Config Repo is a fixed control.toml
-    allow-list — it can never address drivers/ (ADR-0042)."""
+def test_settings_form_write_path_is_retired(control: ControlRig):
+    """ADR-0048: the pinned build has no second writer — the settings form is
+    display-only, and ANY authorized POST (a legitimate key, a drivers-shaped
+    key, anything) is refused with the ingest pointer and writes nothing."""
     login(control)
-    answer = control.client.post(
-        "/settings",
-        data={"key": "drivers/custom/impl.py", "value": "x"},
-        headers={"Origin": CONTROL_ORIGIN},
-    )
-    assert answer.status_code == 400  # unknown control.toml key, refused
+    for key in ("heartbeat_seconds", "drivers/custom/impl.py"):
+        answer = control.client.post(
+            "/settings",
+            data={"key": key, "value": "30"},
+            headers={"Origin": CONTROL_ORIGIN},
+        )
+        assert answer.status_code == 403
+        assert "config ingest" in answer.text
     assert not (control.settings.config_repo / "drivers").exists()
+    assert not (control.settings.config_repo / "control.toml").exists()

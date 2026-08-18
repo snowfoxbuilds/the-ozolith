@@ -1,0 +1,768 @@
+"""`theozolith config ingest` (ADR-0048): human Config Repo -> pinned build.
+
+The human-authored Config Repo (a local path or a git URL) is the source of
+truth; the machine-owned pinned build (``configs/``) is what control loads and
+distributes. This module is the ONLY path between them:
+
+1. HARVEST the Config Repo at its current commit (a dirty git source is
+   refused — the pinned build stamps the source commit, so the stamp must be
+   truthful; a plain folder harvests under a content hash).
+2. STAGE a candidate tree: config files copied verbatim, ``knowledge/<name>``
+   trees compiled by the ADR-0009 compiler (compile errors surface HERE, not
+   at image build or container start), ``control.toml`` merged (the machine-
+   written [control] address block is preserved from the pinned build; the
+   [settings] surface is harvested from the source), and ``pins.toml``
+   written with the resolved pins.
+3. RESOLVE pins where resolution is mechanical: per-knowledge-tree content
+   hashes and base tag->digest. NEVER where the value must come out-of-band —
+   a vendor-published artifact checksum in a setup line stays human-entered
+   in the Config Repo, and ingest only refuses the fail-closed placeholder
+   for worker types a running Stack references (computing it would sign
+   whatever the network served).
+4. LINT by loading the staged tree with the exact fail-loud checks config
+   load applies (``configrepo.load_config``): a config that would not load is
+   never committed.
+5. COMMIT to the pinned build (refusing a dirty tree first) with the source
+   commit stamped in the message and in ``pins.toml``. Rollback is ``git
+   revert`` on the pinned build — resolved pins are decisions that exist
+   nowhere else.
+6. RELOAD, not restart: control re-reads the config tree per request, so the
+   running server observes the new commit within one heartbeat; only
+   ``control.toml`` tier-2 settings keep their documented restart requirement.
+
+The whole transaction — from the initial clean check through the commit and
+working-tree publish — runs under the exclusive pinned-build WRITE LOCK
+(``repolock``), shared with every other supported writer of ``configs/``
+(the control-address and product-pin writers): a concurrent writer is
+refused loudly rather than interleaved, so no transaction can ever race the
+clean check, the staging, or the commit. As a backstop against UNSUPPORTED
+writers (a hand-run ``git commit`` racing the transaction), the ref move is
+COMPARE-AND-SWAP against the HEAD the transaction started from: a moved
+HEAD fails the publish cleanly with the interloper's commit preserved,
+never overwritten or orphaned.
+
+The commit is COMMIT-FIRST git plumbing, never a working-tree mutation
+followed by ``git add``: the staged tree is written into the object store
+through a throwaway index (``add -A --force``/``write-tree``/
+``commit-tree`` — forced, so no ignore rule can silently drop staged
+content from the commit), the ref moves atomically (``update-ref`` with the
+expected old value), and only then is the working tree synced to HEAD
+(``reset --hard`` + ``clean -ffdx``: ignored files and nested repositories
+included — the machine-owned worktree is exactly HEAD, nothing else is
+loadable or distributable). A failure before the ref moves leaves the
+pinned build byte-for-byte untouched; an interruption after it leaves a
+marker (``.git/theozolith-ingest-pending``) that the next ingest repairs by
+finishing the same working-tree sync — the working tree is never the only
+copy of a half-applied state, and no partially replaced tree can survive a
+crash.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from theozolith_knowledge import KnowledgeError, compile_claude, load_knowledge_root
+
+from theozolith_control import configdist, configrepo, controltoml, repolock
+
+# A sha256 whose value is the fail-closed placeholder convention (all zeros):
+# legal in a template (a scaffolded or dormant worker type), refused for any
+# worker type a running Stack references (ADR-0048).
+PLACEHOLDER_SHA256 = "0" * 64
+
+# Top-level entries never copied from the source tree into the staging tree.
+_SKIP_TOP_LEVEL = (".git", configdist.KNOWLEDGE_DIR, controltoml.CONTROL_TOML)
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+# Manifest media types a registry may serve for a tag; the digest of whichever
+# the registry canonically serves IS the pin `docker pull <ref>@<digest>`
+# resolves.
+_MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+    )
+)
+
+
+class IngestError(RuntimeError):
+    """The ingest cannot proceed; nothing has been committed."""
+
+
+@dataclass
+class IngestReport:
+    """What one ingest did — printed by the CLI, asserted by tests."""
+
+    source_commit: str = ""
+    pinned_commit: str = ""  # the pinned build's new HEAD ("" when unchanged)
+    changed: bool = False
+    resolved_bases: dict[str, str] = field(default_factory=dict)  # ref -> digest
+    knowledge_pins: dict[str, str] = field(default_factory=dict)  # tree -> hash
+    retagged: dict[str, tuple[str, str]] = field(default_factory=dict)  # type -> (old, new)
+    notes: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        lines = [f"source commit: {self.source_commit}"]
+        if self.changed:
+            lines.append(f"pinned build committed: {self.pinned_commit}")
+        else:
+            lines.append("pinned build unchanged (already up to date)")
+        for ref, digest in sorted(self.resolved_bases.items()):
+            lines.append(f"resolved base {ref} -> {digest[:19]}…")
+        for name, tree_hash in sorted(self.knowledge_pins.items()):
+            lines.append(f"knowledge/{name} pinned {tree_hash[:12]}")
+        for name, (old, new) in sorted(self.retagged.items()):
+            lines.append(f"worker type {name} re-tagged: {old or '(new)'} -> {new}")
+        lines.extend(self.notes)
+        return "\n".join(lines)
+
+
+def _run_git(
+    args: list[str], cwd: Path, runner, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    kwargs: dict = {"cwd": str(cwd), "capture_output": True, "text": True, "check": False}
+    if env is not None:
+        kwargs["env"] = {**os.environ, **env}
+    return runner(["git", *args], **kwargs)
+
+
+def _git_subcommand(args: list[str]) -> str:
+    """The subcommand word for an error message: the first argument that is
+    neither an option nor an option's value (``-c``, ``--git-dir``,
+    ``--work-tree`` all take one)."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("-c", "--git-dir", "--work-tree"):
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return args[0]
+
+
+def _require_git(
+    args: list[str], cwd: Path, runner, what: str, env: dict[str, str] | None = None
+) -> str:
+    proc = _run_git(args, cwd, runner, env)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise IngestError(f"{what}: git {_git_subcommand(args)} failed: {detail}")
+    return (proc.stdout or "").strip()
+
+
+# The crash-recovery plumbing (ADR-0048 amendment): no interruption may leave
+# a partially replaced pinned tree. (The write lock itself is `repolock` —
+# shared with every other supported pinned-build writer.)
+
+# Written just before the ref moves, removed once the working tree matches the
+# new HEAD; its presence means an ingest died between those two points.
+PENDING_MARKER = "theozolith-ingest-pending"
+
+
+def _sync_worktree_to_head(pinned_dir: Path, runner) -> bool:
+    """Make the machine-owned working tree match HEAD EXACTLY (``reset
+    --hard`` + ``clean -ffdx``: ignored files and nested repositories
+    removed too — nothing outside committed HEAD may remain loadable or
+    distributable) — the publish half of a committed transaction, and the
+    repair a crashed one needs. True on success; an unborn HEAD is vacuously
+    in sync (nothing was ever committed, so nothing was ever
+    half-published)."""
+    if _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner).returncode != 0:
+        return True
+    for args in (["reset", "--hard", "--quiet"], ["clean", "-ffdxq"]):
+        if _run_git(args, pinned_dir, runner).returncode != 0:
+            return False
+    return True
+
+
+def _recover_pending(pinned_dir: Path, runner, report: IngestReport) -> None:
+    """Finish a transaction that died between ``update-ref`` and the
+    working-tree publish: the marker proves the dirt (if any) is ours, so the
+    tree is restored to HEAD — never refused as a hand edit. An unrepairable
+    tree fails loudly with the marker left in place for the next attempt."""
+    marker = pinned_dir / ".git" / PENDING_MARKER
+    if not marker.exists():
+        return
+    if not _sync_worktree_to_head(pinned_dir, runner):
+        raise IngestError(
+            f"pinned build {pinned_dir}: an interrupted ingest left the working"
+            " tree behind HEAD and it could not be restored (git reset --hard"
+            " failed) — repair the repository, then re-run ingest"
+        )
+    with contextlib.suppress(OSError):
+        marker.unlink()
+    report.notes.append(
+        "recovered an interrupted ingest: the working tree was restored to the"
+        " committed HEAD before this run"
+    )
+
+
+def _is_git_url(source: str) -> bool:
+    return "://" in source or source.startswith("git@")
+
+
+def _folder_commit(root: Path) -> str:
+    """Content stamp for a non-git source folder — same convention as the
+    pinned build's own folder mode (``configrepo._commit``), normalized
+    executable state included (a chmod-only source edit changes the compiled
+    output, so the provenance stamp must move with it)."""
+    digest = hashlib.sha256()
+    for path in configdist.regular_files(root):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(configdist.entry_mode(path.stat().st_mode).encode())
+        digest.update(path.read_bytes())
+    return f"folder-{digest.hexdigest()[:12]}"
+
+
+def _harvest_source(source: str, workdir: Path, runner) -> tuple[Path, str]:
+    """The source tree to stage from, plus its provenance stamp."""
+    if _is_git_url(source):
+        clone = workdir / "source"
+        proc = runner(
+            ["git", "clone", "--quiet", "--depth", "1", source, str(clone)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise IngestError(f"cannot clone Config Repo {source}: {detail}")
+        return clone, _require_git(["rev-parse", "HEAD"], clone, runner, source)
+    root = Path(source).expanduser()
+    if not root.is_dir():
+        raise IngestError(f"Config Repo {source} is not a directory (or a git URL)")
+    if (root / ".git").exists():
+        dirty = _require_git(["status", "--porcelain"], root, runner, str(root))
+        if dirty:
+            raise IngestError(
+                f"Config Repo {root} has uncommitted changes — commit them first;"
+                " the pinned build stamps the source commit, so the stamp must"
+                " be truthful (ADR-0048):\n" + dirty
+            )
+        head = _run_git(["rev-parse", "HEAD"], root, runner)
+        if head.returncode == 0:
+            return root, (head.stdout or "").strip()
+        # A clean repo with no commits yet (init just scaffolded an empty
+        # Config Repo): harvest it as the (empty) folder it is.
+        return root, _folder_commit(root)
+    try:
+        return root, _folder_commit(root)
+    except configdist.ConfigDistError as exc:
+        raise IngestError(f"cannot hash Config Repo folder {root}: {exc}") from exc
+
+
+def _copy_config_files(source_dir: Path, staging: Path) -> None:
+    """Copy the source tree verbatim, minus the specially handled top-level
+    entries and the content-exclusion names (dot-prefixed, ``__pycache__``,
+    ``*.pyc``). Symlinks and other irregular entries are refused loudly — a
+    symlink could smuggle content from outside the repo into the pinned build,
+    and the distribution would fail closed on it later anyway."""
+    stack: list[tuple[Path, Path]] = [(source_dir, staging)]
+    while stack:
+        current, dest = stack.pop()
+        for entry in sorted(current.iterdir(), key=lambda p: p.name):
+            if configdist.excluded_part(entry.name):
+                continue
+            if current == source_dir and entry.name in _SKIP_TOP_LEVEL:
+                continue
+            relpath = entry.relative_to(source_dir).as_posix()
+            if entry.is_symlink():
+                raise IngestError(f"Config Repo entry {relpath} is a symlink — refused")
+            if entry.is_dir():
+                (dest / entry.name).mkdir(parents=True, exist_ok=True)
+                stack.append((entry, dest / entry.name))
+            elif entry.is_file():
+                target = dest / entry.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry, target)
+            else:
+                raise IngestError(f"Config Repo entry {relpath} is not a regular file — refused")
+
+
+def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
+    """Compile every ``knowledge/<name>`` source tree into the staging tree
+    (ADR-0009 at ingest) and return the per-tree content pins."""
+    source_root = source_dir / configdist.KNOWLEDGE_DIR
+    pins: dict[str, str] = {}
+    if not source_root.is_dir():
+        return pins
+    for entry in sorted(source_root.iterdir(), key=lambda p: p.name):
+        if configdist.excluded_part(entry.name):
+            continue
+        if not entry.is_dir() or entry.is_symlink():
+            raise IngestError(
+                f"knowledge/{entry.name} must be a directory (one knowledge root"
+                " per name, ADR-0048)"
+            )
+        if not configrepo.KNOWLEDGE_TREE_NAME.fullmatch(entry.name):
+            raise IngestError(
+                f"knowledge/{entry.name}: tree names must match"
+                " ^[A-Za-z0-9][A-Za-z0-9._-]*$ (ADR-0048)"
+            )
+        try:
+            fileset = compile_claude(load_knowledge_root(entry), scope="global")
+        except KnowledgeError as exc:
+            raise IngestError(f"knowledge/{entry.name} does not compile: {exc}") from exc
+        for relpath, file_entry in fileset.items():
+            target = staging / configdist.KNOWLEDGE_DIR / entry.name / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(file_entry.content)
+            if file_entry.executable:
+                target.chmod(0o755)
+        try:
+            pins[entry.name] = configdist.knowledge_tree_hash(staging, entry.name)
+        except configdist.ConfigDistError as exc:
+            raise IngestError(f"knowledge/{entry.name}: {exc}") from exc
+    return pins
+
+
+def _live_worker_types(staging: Path) -> set[str]:
+    """Worker types referenced by a Stack whose desired state is running —
+    the scope of the placeholder refusal: a template (dormant or stopped) may
+    carry the fail-closed placeholder; a live type may not (ADR-0048)."""
+    live: set[str] = set()
+    for path in sorted((staging / "stacks").glob("*.toml")):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue  # the staged lint will fail loudly on this file
+        worker_type = data.get("worker_type")
+        state = data.get("state", "running")
+        if isinstance(worker_type, str) and worker_type and state == "running":
+            live.add(worker_type)
+    return live
+
+
+def _refuse_live_placeholders(staging: Path) -> None:
+    live = _live_worker_types(staging)
+    for name in sorted(live):
+        path = staging / "worker-types" / f"{name}.toml"
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue  # the staged lint will fail loudly on this file
+        candidates = [data.get("base", "")]
+        setup = data.get("setup", [])
+        if isinstance(setup, list):
+            candidates.extend(str(line) for line in setup)
+        for text in candidates:
+            if isinstance(text, str) and PLACEHOLDER_SHA256 in text:
+                raise IngestError(
+                    f"worker-types/{name}.toml carries the all-zero placeholder"
+                    " sha256 while a running Stack references it — fill in the"
+                    " real checksum (checksums that must come out-of-band are"
+                    " never computed by ingest, ADR-0048)"
+                )
+
+
+def _resolve_bases(staging: Path, resolve_digest: Callable[[str], str]) -> dict[str, str]:
+    """tag->digest resolutions for every worker-type base not already pinned."""
+    resolved: dict[str, str] = {}
+    for path in sorted((staging / "worker-types").glob("*.toml")):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue  # the staged lint will fail loudly on this file
+        base = data.get("base", "")
+        if not isinstance(base, str) or not base or "@sha256:" in base or base in resolved:
+            continue
+        try:
+            digest = resolve_digest(base)
+        except IngestError:
+            raise
+        except Exception as exc:
+            raise IngestError(
+                f"cannot resolve base tag {base!r}: {exc} — pin it by digest in"
+                " the Config Repo if registry resolution is unavailable"
+            ) from exc
+        if not isinstance(digest, str) or not (
+            digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
+        ):
+            raise IngestError(
+                f"resolver returned {digest!r} for base tag {base!r} — expected 'sha256:<64 hex>'"
+            )
+        resolved[base] = digest
+    return resolved
+
+
+def _write_pins(
+    staging: Path, source_commit: str, bases: dict[str, str], knowledge: dict[str, str]
+) -> None:
+    lines = [
+        "# Machine-written by `theozolith config ingest` (ADR-0048) — never hand-edit.",
+        "# Resolved pins are decisions that exist nowhere else: rollback is",
+        "# `git revert` on the pinned build, not a re-ingest of an old source commit.",
+        "",
+        "[source]",
+        f'commit = "{source_commit}"',
+    ]
+    if bases:
+        lines += ["", "[base]"]
+        lines += [f'"{ref}" = "{digest}"' for ref, digest in sorted(bases.items())]
+    if knowledge:
+        lines += ["", "[knowledge]"]
+        lines += [f'"{name}" = "{tree_hash}"' for name, tree_hash in sorted(knowledge.items())]
+    (staging / configrepo.PINS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _merge_control_toml(source_dir: Path, pinned_dir: Path, staging: Path) -> None:
+    """control.toml goes through ingest too (ADR-0048), split by ownership:
+    the [settings] surface is harvested from the source; the [control] address
+    block is MACHINE state written by init/origin-init/recover and is
+    preserved from the pinned build — a Config Repo that tries to author it is
+    refused."""
+    source_toml = source_dir / controltoml.CONTROL_TOML
+    if source_toml.is_file():
+        try:
+            data = tomllib.loads(source_toml.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise IngestError(f"{controltoml.CONTROL_TOML}: {exc}") from exc
+        if isinstance(data, dict) and "control" in data:
+            raise IngestError(
+                f"{controltoml.CONTROL_TOML}: the [control] table is machine"
+                " state (written by init / origin-init / recover) — remove it"
+                " from the Config Repo; only [settings] is authored there"
+                " (ADR-0048)"
+            )
+    try:
+        values = controltoml.read_values(source_dir)
+        merged = controltoml.render(
+            controltoml.read_control_ip(pinned_dir),
+            controltoml.read_control_port(pinned_dir),
+            controltoml.read_browser_origin(pinned_dir),
+            values,
+        )
+    except controltoml.ControlTomlError as exc:
+        raise IngestError(str(exc)) from exc
+    (staging / controltoml.CONTROL_TOML).write_text(merged, encoding="utf-8")
+
+
+def _commit_staging(
+    staging: Path, pinned_dir: Path, work: Path, runner, message: str, parent: str
+) -> str:
+    """Write the staged tree into the pinned build's object store through a
+    THROWAWAY index (never the repo's own) and create the commit object with
+    ``parent`` — the HEAD the transaction started from (``""`` for unborn),
+    so the commit and the later compare-and-swap ref move agree on what they
+    extend. The ``add`` is FORCED: no ignore rule (``.git/info/exclude``, a
+    user-global excludes file) may silently drop staged content from the
+    commit. Returns the new commit id, or ``""`` when the staged tree is
+    identical to the parent's tree (nothing to commit). Nothing observable
+    moves here: only loose objects and the commit object are written, the ref
+    does NOT — so a failure at any point leaves the pinned build
+    byte-for-byte untouched."""
+    git_dir = str((pinned_dir / ".git").resolve())
+    env = {"GIT_INDEX_FILE": str(work / "ingest-index")}
+    scoped = ["--git-dir", git_dir, "--work-tree", "."]
+    _require_git([*scoped, "add", "-A", "--force"], staging, runner, str(pinned_dir), env=env)
+    tree = _require_git([*scoped, "write-tree"], staging, runner, str(pinned_dir), env=env)
+    if parent:
+        head = _run_git(
+            ["rev-parse", "--verify", "--quiet", f"{parent}^{{tree}}"], pinned_dir, runner
+        )
+        if head.returncode == 0 and (head.stdout or "").strip() == tree:
+            return ""
+    commit_args = [
+        "-c",
+        f"user.name={controltoml.COMMIT_AUTHOR_NAME}",
+        "-c",
+        f"user.email={controltoml.COMMIT_AUTHOR_EMAIL}",
+        "commit-tree",
+    ]
+    if parent:
+        commit_args += ["-p", parent]
+    commit_args += ["-m", message, tree]
+    return _require_git(commit_args, pinned_dir, runner, str(pinned_dir))
+
+
+def _tags_of(repo_dir: Path) -> dict[str, str]:
+    """Worker-type tags of a loadable tree; {} when it does not load (a fresh
+    or broken pinned build must not block reporting)."""
+    try:
+        return {name: wt.tag for name, wt in configrepo.load_config(repo_dir).worker_types.items()}
+    except configrepo.ConfigRepoError:
+        return {}
+
+
+def _product_version_of(repo_dir: Path) -> str:
+    try:
+        return configrepo.load_config(repo_dir).product_version
+    except configrepo.ConfigRepoError:
+        return ""
+
+
+def ingest(
+    source: str,
+    pinned_dir: Path,
+    *,
+    resolve_digest: Callable[[str], str] | None = None,
+    runner=None,
+    log=print,
+) -> IngestReport:
+    """Run the full pipeline; raises ``IngestError`` with nothing committed on
+    any refusal. See the module docstring for the steps. The whole transaction
+    — clean check through commit and working-tree publish — holds the shared
+    pinned-build write lock; a concurrent writer is refused loudly."""
+    # Resolved at call time (not as a def-time default) so test rigs that
+    # monkeypatch subprocess.run fake the git layer here too.
+    runner = runner or subprocess.run
+    pinned_dir = Path(pinned_dir)
+    pinned_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with repolock.pinned_write_lock(pinned_dir, writer="theozolith config ingest"):
+            return _ingest_locked(source, pinned_dir, resolve_digest, runner, log)
+    except repolock.RepoLockError as exc:
+        raise IngestError(str(exc)) from exc
+
+
+def _ingest_locked(
+    source: str,
+    pinned_dir: Path,
+    resolve_digest: Callable[[str], str] | None,
+    runner,
+    log,
+) -> IngestReport:
+    report = IngestReport()
+    resolve = resolve_digest or resolve_image_digest
+
+    # The pinned build must exist as a clean git repo before anything is
+    # staged. A marker left by an interrupted ingest is repaired FIRST — that
+    # dirt is provably ours — and only then does the clean check refuse what
+    # remains (a hand edit).
+    if not (pinned_dir / ".git").exists():
+        _require_git(["init", "--quiet"], pinned_dir, runner, str(pinned_dir))
+    _recover_pending(pinned_dir, runner, report)
+    dirty = _require_git(["status", "--porcelain"], pinned_dir, runner, str(pinned_dir))
+    if dirty:
+        raise IngestError(
+            f"pinned build {pinned_dir} has uncommitted changes — it is machine-"
+            "owned and committed only by ingest; restore it (git checkout/reset)"
+            " before ingesting (ADR-0048):\n" + dirty
+        )
+    # IGNORED leftovers pass the clean check (status never shows them) but
+    # would stay loadable and distributable from the worktree — a file only a
+    # `.git/info/exclude` rule hides is not committed content and can never be
+    # a lost hand edit, so it is purged, not refused. After this the worktree
+    # is exactly HEAD on EVERY successful ingest, the no-op path included.
+    purge = _run_git(["clean", "-ffdx"], pinned_dir, runner)
+    if purge.returncode != 0:
+        raise IngestError(
+            f"pinned build {pinned_dir}: cannot remove ignored leftover files"
+            f" (git clean failed): {(purge.stderr or '').strip()[:300]}"
+        )
+    purged = (purge.stdout or "").strip()
+    if purged:
+        report.notes.append(
+            "removed ignored leftovers from the machine-owned worktree (only"
+            " committed HEAD is loadable/distributable): "
+            + "; ".join(line.removeprefix("Removing ") for line in purged.splitlines())
+        )
+    # The HEAD this transaction extends — the commit parent AND the expected
+    # old value of the compare-and-swap ref move at publish ("" = unborn).
+    head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
+    original_head = (head.stdout or "").strip() if head.returncode == 0 else ""
+    old_control_toml = ""
+    control_path = pinned_dir / controltoml.CONTROL_TOML
+    if control_path.is_file():
+        old_control_toml = control_path.read_text(encoding="utf-8")
+    old_tags = _tags_of(pinned_dir)
+    old_product = _product_version_of(pinned_dir)
+
+    with tempfile.TemporaryDirectory(prefix="theozolith-ingest-") as workdir:
+        work = Path(workdir)
+        source_dir, report.source_commit = _harvest_source(source, work, runner)
+        staging = work / "staging"
+        staging.mkdir()
+        _copy_config_files(source_dir, staging)
+        report.knowledge_pins = _compile_knowledge(source_dir, staging)
+        _refuse_live_placeholders(staging)
+        report.resolved_bases = _resolve_bases(staging, resolve)
+        _write_pins(staging, report.source_commit, report.resolved_bases, report.knowledge_pins)
+        _merge_control_toml(source_dir, pinned_dir, staging)
+
+        # LINT: the staged tree must load under the exact fail-loud checks the
+        # server applies — a config that would not load is never committed.
+        try:
+            staged_config = configrepo.load_config(staging)
+        except configrepo.ConfigRepoError as exc:
+            raise IngestError(f"staged config does not load — nothing committed: {exc}") from exc
+        for warning in staged_config.warnings:
+            report.notes.append(f"warning: {warning}")
+
+        # COMMIT FIRST (from the staging tree, through a throwaway index):
+        # until update-ref below, nothing observable has moved and any failure
+        # leaves the pinned build untouched.
+        commit = _commit_staging(
+            staging,
+            pinned_dir,
+            work,
+            runner,
+            f"theozolith config ingest: source {report.source_commit}",
+            original_head,
+        )
+    if not commit:
+        report.changed = False
+        log(report.summary())
+        return report
+
+    # Publish: move the ref atomically — COMPARE-AND-SWAP against the HEAD
+    # the transaction started from, so a commit an unsupported writer slipped
+    # in (supported writers share the repolock and cannot get here) fails the
+    # publish cleanly instead of being overwritten or orphaned — then sync
+    # the working tree to it. The marker brackets the only window in which an
+    # interruption can leave the working tree behind the ref — the next
+    # ingest finishes the sync from the marker; a same-process failure
+    # attempts the same repair immediately.
+    marker = pinned_dir / ".git" / PENDING_MARKER
+    marker.write_text(commit + "\n", encoding="utf-8")
+    try:
+        moved = _run_git(
+            ["update-ref", "HEAD", commit, original_head or "0" * 40], pinned_dir, runner
+        )
+        if moved.returncode != 0:
+            now = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
+            current = (now.stdout or "").strip() if now.returncode == 0 else ""
+            if current != original_head:
+                raise IngestError(
+                    f"pinned build {pinned_dir}: HEAD moved during the ingest"
+                    " transaction — a concurrent writer committed to the pinned"
+                    " build outside the shared write lock. Nothing was"
+                    " published; the concurrent commit is preserved. Re-run"
+                    " ingest."
+                )
+            detail = (moved.stderr or moved.stdout or "").strip()[:300]
+            raise IngestError(f"{pinned_dir}: git update-ref failed: {detail}")
+        _require_git(["reset", "--hard", "--quiet"], pinned_dir, runner, str(pinned_dir))
+        _require_git(["clean", "-ffdxq"], pinned_dir, runner, str(pinned_dir))
+    except BaseException:
+        if _sync_worktree_to_head(pinned_dir, runner):
+            with contextlib.suppress(OSError):
+                marker.unlink()
+        raise
+    with contextlib.suppress(OSError):
+        marker.unlink()
+    report.changed = True
+    report.pinned_commit = commit
+
+    new_tags = _tags_of(pinned_dir)
+    report.retagged = {
+        name: (old_tags.get(name, ""), tag)
+        for name, tag in sorted(new_tags.items())
+        if old_tags.get(name, "") != tag
+    }
+    new_product = _product_version_of(pinned_dir)
+    if new_product != old_product:
+        # The product-update flow (`theozolith update`) also writes the
+        # product.toml pin into the pinned build; ingest overwrites it with
+        # the source's value, so a divergence is surfaced, never silent.
+        report.notes.append(
+            f"product version: {old_product or '(none)'} -> {new_product or '(none)'}"
+            " — the Config Repo's product.toml wins over any pin the update"
+            " flow wrote since the last ingest"
+        )
+    new_control = control_path.read_text(encoding="utf-8") if control_path.is_file() else ""
+    if new_control != old_control_toml:
+        report.notes.append(
+            "control.toml changed: tier-2 settings apply on the next service restart"
+        )
+    report.notes.append(
+        "reload: the running control service re-reads the pinned build per"
+        " request; nodes converge over the hash ladder"
+    )
+    log(report.summary())
+    return report
+
+
+# -- registry digest resolution ---------------------------------------------------
+
+
+def _split_image_ref(ref: str) -> tuple[str, str, str]:
+    """``registry.example/name/space:tag`` -> (registry, repository, tag).
+    Docker Hub shorthand (no dotted/ported first component) resolves against
+    registry-1.docker.io with the ``library/`` convention."""
+    if "@" in ref:
+        raise IngestError(f"base ref {ref!r} already carries a digest")
+    head, _, rest = ref.partition("/")
+    if rest and ("." in head or ":" in head or head == "localhost"):
+        registry, remainder = head, rest
+    else:
+        registry, remainder = "registry-1.docker.io", ref
+    repo, sep, tag = remainder.rpartition(":")
+    if not sep:
+        repo, tag = remainder, "latest"
+    if not repo or not tag or "/" in tag:
+        raise IngestError(f"cannot parse base ref {ref!r} as registry/repository:tag")
+    if registry == "registry-1.docker.io" and "/" not in repo:
+        repo = f"library/{repo}"
+    return registry, repo, tag
+
+
+def _anonymous_token(www_authenticate: str) -> str:
+    """The anonymous bearer-token flow a public registry answers 401 with."""
+    if not www_authenticate.lower().startswith("bearer "):
+        raise IngestError(f"registry auth challenge not understood: {www_authenticate!r}")
+    params = dict(re.findall(r'(\w+)="([^"]*)"', www_authenticate[len("bearer ") :]))
+    realm = params.get("realm", "")
+    if not realm.startswith("https://"):
+        raise IngestError(f"registry auth realm not https: {realm!r}")
+    query = {k: v for k, v in params.items() if k in ("service", "scope")}
+    url = realm + ("?" + urllib.parse.urlencode(query) if query else "")
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    token = data.get("token") or data.get("access_token") or ""
+    if not token:
+        raise IngestError("registry token endpoint returned no token")
+    return token
+
+
+def resolve_image_digest(ref: str) -> str:
+    """Resolve a tag-only image ref to its manifest digest via the registry
+    HTTP API (anonymous pull scope). This is MECHANICAL pin resolution
+    (ADR-0048): the registry is the same authority ``docker pull`` trusts, and
+    the resulting digest-pinned ref is what every node build verifies against."""
+    registry, repo, tag = _split_image_ref(ref)
+    url = f"https://{registry}/v2/{repo}/manifests/{urllib.parse.quote(tag, safe='')}"
+    token = ""
+    for attempt in (1, 2):
+        request = urllib.request.Request(url, method="HEAD", headers={"Accept": _MANIFEST_ACCEPT})
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                digest = resp.headers.get("Docker-Content-Digest", "")
+                if not (
+                    digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
+                ):
+                    raise IngestError(
+                        f"registry returned no usable digest for {ref!r} ({digest!r})"
+                    )
+                return digest
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 1:
+                token = _anonymous_token(exc.headers.get("WWW-Authenticate", "") or "")
+                continue
+            raise IngestError(f"cannot resolve base tag {ref!r}: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise IngestError(f"cannot resolve base tag {ref!r}: {exc.reason}") from exc
+    raise IngestError(f"cannot resolve base tag {ref!r}")  # pragma: no cover

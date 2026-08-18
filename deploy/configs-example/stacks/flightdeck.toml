@@ -7,7 +7,10 @@
 
 worker_type = "flightdeck"
 node = "box1"
-state = "running"
+# Staged at "stopped": the worker-type carries fill-in placeholders (base
+# digest, tailscale sha256) that ingest refuses for a RUNNING Stack
+# (ADR-0048) — fill them in, flip to "running", commit, ingest.
+state = "stopped"
 
 # Web-terminal attach command, executed by the Control Node's PTY bridge as
 # a structured argv array ({host}/{container} only as complete arguments,
