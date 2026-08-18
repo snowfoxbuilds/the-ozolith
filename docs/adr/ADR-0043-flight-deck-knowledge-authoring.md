@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): the shared writable clone, promote workflow, and `knowledge-<worker-type>` volume are RETIRED; the Flight Deck's knowledge surface is a read-only bind-mount of the node's applied pinned knowledge tree, updated via config distribution and picked up on agent-CLI restart. Authoring moves to the Config Repo; git remains the only transport, no sync daemon as ever.
 Date: 2026-08-09
 
 # ADR-0043: Flight Deck knowledge authoring and sharing

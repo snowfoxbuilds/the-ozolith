@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): for deployments, knowledge lives in the Config Repo's `knowledge/` tree and the compiler runs at INGEST time — the pinned build carries compiled per-tool output for both delivery paths (baked into worker images, bind-mounted by Flight Decks).
 
 Date: 2026-07-14
 

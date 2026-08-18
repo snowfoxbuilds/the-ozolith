@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): the human-authored Config Repo remains the source of truth, but the tree control loads and distributes is now its machine-built PINNED BUILD, produced only by `theozolith config ingest` (lint, mechanical pin resolution, knowledge compile, provenance-stamped commit).
 
 Date: 2026-07-13
 
