@@ -12,11 +12,16 @@ bytes), and converge like the product pin. The wire/metadata field keeps its
 original ``drivers_hash`` name for protocol stability; it covers the whole
 distributed tree.
 
-The canonical hash is content-only — file relpaths and sha256 of file bytes,
-nothing about mtimes, modes, or the archive envelope — so it is stable across
-checkouts by construction. The algorithm is implemented twice (nodedaemon is
-stdlib-only and cannot import this package); the two are pinned together by a
-mandatory cross-package contract test.
+The canonical hash covers file relpaths, sha256 of file bytes, and the
+NORMALIZED EXECUTABLE STATE of each file (any executable bit -> "755", else
+"644" — exactly the two modes the artifact stamps and extraction restores) —
+nothing about mtimes, ownership, other mode bits, or the archive envelope —
+so it is stable across checkouts by construction while a chmod-only change
+still re-distributes (a compiled skill script that gains or loses its exec
+bit is a REAL content change to the tree the deck mounts and the image
+bakes). The algorithm is implemented twice (nodedaemon is stdlib-only and
+cannot import this package); the two are pinned together by a mandatory
+cross-package contract test.
 
 File set: every regular file under ``<repo>/drivers/`` and
 ``<repo>/knowledge/``, recursive, excluding dot-prefixed path components,
@@ -177,11 +182,21 @@ def regular_files(root: Path, *, refuse_irregular: bool = False) -> list[Path]:
     return sorted(found)
 
 
+def entry_mode(st_mode: int) -> str:
+    """The normalized executable state a manifest entry records: ``"755"``
+    when ANY executable bit is set, ``"644"`` otherwise — exactly the two
+    modes ``build_artifact`` stamps into the archive and extraction restores,
+    so the hash never depends on umask noise while a chmod-only change still
+    changes it. Mirror of ``theozolith_nodedaemon.configdist.entry_mode``
+    (pinned by the cross-package contract tests)."""
+    return "755" if st_mode & 0o111 else "644"
+
+
 def dist_manifest(repo_dir: Path) -> list[list[str]]:
-    """The manifest: sorted ``[relpath, sha256hex]`` entries over the
+    """The manifest: sorted ``[relpath, sha256hex, mode]`` entries over the
     ``drivers/`` + ``knowledge/`` file sets (ADR-0042/0048). ``relpath`` is
     POSIX and INCLUDES the subtree prefix; the digest is sha256 over the file
-    bytes."""
+    bytes; ``mode`` is the normalized executable state (``entry_mode``)."""
     repo_dir = Path(repo_dir)
     entries: list[list[str]] = []
     for subtree in DIST_DIRS:
@@ -190,6 +205,7 @@ def dist_manifest(repo_dir: Path) -> list[list[str]]:
             relpath = path.relative_to(repo_dir).as_posix()
             try:
                 data = path.read_bytes()
+                mode = entry_mode(path.stat().st_mode)
             except OSError as exc:
                 # An unreadable distributed file is a packaging error, normalized
                 # to ConfigDistError so the config-loading boundary can convert it
@@ -197,7 +213,7 @@ def dist_manifest(repo_dir: Path) -> list[list[str]]:
                 raise ConfigDistError(
                     f"cannot read {relpath!r} for the config distribution: {exc}"
                 ) from exc
-            entries.append([relpath, hashlib.sha256(data).hexdigest()])
+            entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
     return sorted(entries)
 
 
@@ -232,11 +248,12 @@ def knowledge_tree_hash(repo_dir: Path, name: str) -> str:
         relpath = path.relative_to(root).as_posix()
         try:
             data = path.read_bytes()
+            mode = entry_mode(path.stat().st_mode)
         except OSError as exc:
             raise ConfigDistError(
                 f"cannot read knowledge/{name}/{relpath} for the per-tree pin: {exc}"
             ) from exc
-        entries.append([relpath, hashlib.sha256(data).hexdigest()])
+        entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
     return manifest_hash(sorted(entries))
 
 
@@ -273,21 +290,21 @@ def build_artifact(
     # is then verified by unpack-and-recompute before it is published, which
     # also catches any file that changed after this snapshot was taken.
     snapshot: dict[str, bytes] = {}
-    executable: set[str] = set()
-    for relpath, expected in entries:
+    for relpath, expected, expected_mode in entries:
         try:
             data = (repo_dir / relpath).read_bytes()
-            if (repo_dir / relpath).stat().st_mode & 0o111:
-                # The executable bit rides the archive as metadata and is
-                # restored at extraction (a compiled skill script must stay
-                # runnable through bake and the deck mount, ADR-0048). It
-                # never enters the hash — mode-only edits do not re-distribute.
-                executable.add(relpath)
+            # The normalized executable state is PART of the manifest entry
+            # (ADR-0048 amendment): it enters the hash, rides the archive as
+            # member metadata, and is restored at extraction — a compiled
+            # skill script must stay runnable through bake and the deck
+            # mount, and a chmod-only edit re-distributes like any other
+            # content change.
+            mode = entry_mode((repo_dir / relpath).stat().st_mode)
         except OSError as exc:
             raise ConfigDistError(
                 f"cannot read {relpath!r} for the config distribution: {exc}"
             ) from exc
-        if hashlib.sha256(data).hexdigest() != expected:
+        if hashlib.sha256(data).hexdigest() != expected or mode != expected_mode:
             # The file changed between manifest creation and this snapshot: the
             # working tree moved past ``digest``. Fail the build; the node
             # retries and converges to the fresh hash on the next heartbeat.
@@ -300,9 +317,9 @@ def build_artifact(
     os.close(fd)
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
-            for relpath, _ in entries:
+            for relpath, _, mode_str in entries:
                 info = zipfile.ZipInfo(relpath, date_time=_ZIP_DATE_TIME)
-                mode = 0o755 if relpath in executable else 0o644
+                mode = 0o755 if mode_str == "755" else 0o644
                 info.external_attr = (stat.S_IFREG | mode) << 16
                 archive.writestr(info, snapshot[relpath])
             meta = zipfile.ZipInfo(ARTIFACT_METADATA, date_time=_ZIP_DATE_TIME)
@@ -498,6 +515,12 @@ def verify_artifact_bytes(data: bytes) -> tuple[str, dict[str, Any]]:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
+                if (info.external_attr >> 16) & 0o111:
+                    # Restore the executable bit exactly as node-side extraction
+                    # does: the normalized mode is part of the manifest entry
+                    # (ADR-0048 amendment), so the recompute below must see the
+                    # same executable state the archive stamped.
+                    os.chmod(target, 0o755)
             except OSError as exc:
                 raise ConfigDistError(
                     f"config distribution member {info.filename!r} cannot be extracted: {exc}"

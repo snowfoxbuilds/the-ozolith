@@ -267,8 +267,15 @@ class WorkerTypeDef:
     setup: tuple[str, ...] = ()
     # In-repo knowledge reference (ADR-0048): "" or "knowledge/<name>". The
     # pin is the ingest-computed per-tree content hash joined from pins.toml
-    # at load — never authored in the worker-type TOML. Both are identity:
-    # editing a knowledge tree re-tags exactly the types that reference it.
+    # at load — never authored in the worker-type TOML. DRIVER types bake the
+    # tree, so both fields are image identity: editing a knowledge tree
+    # re-tags exactly the types that reference it. DRIVERLESS (Flight Deck)
+    # types never bake (~/.claude is volume-shadowed): the reference selects
+    # which applied tree the deck's read-only mount serves, delivered as the
+    # control-injected THEOZOLITH_KNOWLEDGE_TREE env — changing the SELECTION
+    # changes the container spec (the deck is recreated), while a content
+    # edit moves only the pin and redistributes live, rebuilding and
+    # recreating nothing.
     knowledge: str = ""
     knowledge_pin: str = ""
     # -- per-type variables --
@@ -298,6 +305,18 @@ class WorkerTypeDef:
     def knowledge_tree(self) -> str:
         """The bare tree name of the knowledge reference ("" when none)."""
         return self.knowledge[len(KNOWLEDGE_REF_PREFIX) :] if self.knowledge else ""
+
+    @property
+    def baked_knowledge(self) -> str:
+        """The knowledge reference AS BAKED: only a driver type bakes its
+        tree into the derived image (ADR-0048) — a Flight Deck's ~/.claude is
+        volume-shadowed, so its reference selects the read-only mount instead
+        and must stay out of the image recipe and the image identity."""
+        return self.knowledge if self.is_driver else ""
+
+    @property
+    def baked_knowledge_pin(self) -> str:
+        return self.knowledge_pin if self.is_driver else ""
 
     @property
     def base_digest(self) -> str:
@@ -335,14 +354,19 @@ class WorkerTypeDef:
         # image bytes; adding them would rebuild the fleet for nothing) —
         # which is what makes their per-Stack rebinding free (ADR-0047) — and
         # a type with no model/effort hashes byte-identically to pre-ADR-0045.
-        # The rendered materialize instruction is therefore identity-bearing:
-        # its format is frozen by golden tests here and in the worker package.
+        # The knowledge keys are the BAKED values: a Flight Deck's reference
+        # selects a mount, changes no image bytes, and so hashes as empty —
+        # a knowledge-content edit must never rebuild or recreate a deck
+        # (ADR-0048 amendment); the selection change recreates it through the
+        # injected env instead. The rendered materialize instruction is
+        # therefore identity-bearing: its format is frozen by golden tests
+        # here and in the worker package.
         canonical = json.dumps(
             {
                 "base": self.base,
                 "setup": list(self.materialized_setup),
-                "knowledge": self.knowledge,
-                "knowledge_pin": self.knowledge_pin,
+                "knowledge": self.baked_knowledge,
+                "knowledge_pin": self.baked_knowledge_pin,
             },
             sort_keys=True,
         )
@@ -359,14 +383,18 @@ class WorkerTypeDef:
         ``knowledge_pin`` (the per-tree content pin) replace the retired
         ``knowledge_source`` pair (ADR-0048) — the node bakes the referenced
         tree from its applied config-distribution tree after verifying the pin.
-        ``setup`` is the MATERIALIZED setup (ADR-0045): the daemon renders one
-        RUN per entry exactly as before and stays adapter-blind."""
+        The BAKED values ride: a driverless type's recipe carries empty
+        knowledge fields, so the node never bakes under a Flight Deck's
+        volume-shadowed ~/.claude (the deck reads the applied tree through
+        its read-only mount instead). ``setup`` is the MATERIALIZED setup
+        (ADR-0045): the daemon renders one RUN per entry exactly as before
+        and stays adapter-blind."""
         return {
             "name": self.name,
             "base": self.base,
             "setup": list(self.materialized_setup),
-            "knowledge": self.knowledge,
-            "knowledge_pin": self.knowledge_pin,
+            "knowledge": self.baked_knowledge,
+            "knowledge_pin": self.baked_knowledge_pin,
             "tag": self.tag,
             "base_digest": self.base_digest,
             "instruction_hash": self.instruction_hash,
@@ -694,6 +722,17 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
                 " worker-type fields baked into the derived image (ADR-0045);"
                 f" edit worker-types/{worker_type}.toml"
             )
+    if "THEOZOLITH_KNOWLEDGE_TREE" in env:
+        # Per-Stack knowledge is rejected (ADR-0048): the tree selection is
+        # worker-type identity, injected control-side from the type's
+        # `knowledge` field — an [env] override here would silently point one
+        # deck at different instructions than its type declares.
+        raise ConfigRepoError(
+            f"{context}: [env] THEOZOLITH_KNOWLEDGE_TREE cannot be set on a"
+            " worker-type Stack — the knowledge selection is the worker"
+            " type's `knowledge` field (per-Stack knowledge is rejected,"
+            f" ADR-0048); edit worker-types/{worker_type}.toml"
+        )
     for key in ("THEOZOLITH_RUN_IMAGE", "THEOZOLITH_RUN_IMAGE_FILE"):
         # Not inert — the opposite: after ADR-0045 the run-image tag IS the
         # model, so a per-placement override here would silently run a
@@ -868,13 +907,10 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                     f"{context}: {field_name!r} is a driverless (Flight Deck) field"
                     " and is rejected when a driver is set (ADR-0044)"
                 )
-    elif knowledge:
-        raise ConfigRepoError(
-            f"{context}: 'knowledge' is a driver-type field (ADR-0048) — nothing"
-            " bakes under a Flight Deck's ~/.claude (the state volume shadows"
-            " it); decks read the node's applied knowledge through the read-only"
-            " bind mount instead"
-        )
+    # Driverless types may declare knowledge too (ADR-0048 amendment): the
+    # reference selects which applied tree the deck's read-only mount serves
+    # (nothing bakes — the state volume shadows ~/.claude). The pin join and
+    # the compiled-tree presence check below apply identically to both kinds.
     if workspace and not _valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
@@ -1086,6 +1122,14 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
     env: dict[str, str] = {}
     if workspace:
         env["THEOZOLITH_REPO"] = workspace
+    if wt.knowledge:
+        # The deck's knowledge SELECTION (ADR-0048 amendment): flightdeck-start
+        # symlinks ~/.claude into exactly this tree under the read-only mount
+        # and fails loud when it is absent. Identity-bearing per type — the
+        # [env] guard above keeps it un-overridable per Stack — and part of
+        # the container spec, so changing the selected tree recreates the
+        # deck while content edits redistribute live.
+        env["THEOZOLITH_KNOWLEDGE_TREE"] = wt.knowledge_tree
     env.update(stack.env)
     return StackDef(
         name=stack.name,
@@ -1144,11 +1188,14 @@ def _commit(repo_dir: Path) -> str:
     # Folder mode: hash ALL regular files, not just *.toml — a drivers/*.py edit
     # in a non-git configs folder must bump the commit so nodes see the change
     # (ADR-0042). The exclusion predicate is shared with the drivers manifest
-    # (one source of truth for what counts as content). Existing folder-mode
-    # commits jump once when this lands: a harmless single ripple.
+    # (one source of truth for what counts as content), and so is the
+    # normalized executable state (a chmod-only change re-distributes, so the
+    # commit must move with it). Existing folder-mode commits jump once when
+    # either rule lands: a harmless single ripple.
     digest = hashlib.sha256()
     for path in configdist.regular_files(repo_dir):
         digest.update(path.relative_to(repo_dir).as_posix().encode())
+        digest.update(configdist.entry_mode(path.stat().st_mode).encode())
         digest.update(path.read_bytes())
     return f"folder-{digest.hexdigest()[:12]}"
 

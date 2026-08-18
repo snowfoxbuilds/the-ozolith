@@ -362,6 +362,58 @@ node-shaped install): re-run `sudo python3 build.py` from the updated
 checkout — it reuses the existing `/opt/theozolith` venv (ADR-0041; the old
 `sudo /opt/theozolith/bin/python build.py` spelling still works).
 
+## Upgrading a pre-ingest deployment (ADR-0048)
+
+Deployments that predate config ingestion hand-edited `configs/` directly and
+declared worker-type knowledge as `knowledge_source`/`knowledge_pin` (a git
+URL + SHA, cloned with the now-retired `KNOWLEDGE_GIT_TOKEN`). The upgraded
+code **refuses those fields loudly at config load**, so migrate BEFORE the
+upgraded service must load them. `theozolith config migrate` does the
+mechanical half; the sequence below keeps the service on its old code — still
+serving the old config — until the new pinned build is committed.
+
+1. **Back up first.** The standard one-folder backup (next section) covers
+   everything the migration touches; at minimum copy `configs/` — it is a git
+   repo, so `git -C configs bundle create ~/configs-backup.bundle --all` is a
+   complete history backup.
+2. **Upgrade the code, keep the service running**: `sudo python3 build.py`
+   from the updated checkout installs the new CLI and packages. The running
+   service process still runs the OLD code and keeps loading the old config
+   — do not restart it yet.
+3. **Migrate**: `sudo theozolith config migrate` reads `configs/` (never
+   modifying it) and writes a human Config Repo at `config-src/` — config
+   files copied, retired `knowledge_source`/`knowledge_pin` removed and
+   preserved as MIGRATION comments, `control.toml` reduced to its operator
+   `[settings]` surface (the machine `[control]` block stays in `configs/`,
+   where ingest preserves it). It prints one note per follow-up.
+4. **Place the knowledge**: for each worker type the report names, clone that
+   knowledge repo's CONTENT into `config-src/knowledge/<name>/` (the ADR-0009
+   source layout: `skills/`, `agents/`, `workflows/`, `AGENTS.md`) and set
+   `knowledge = "knowledge/<name>"` on the type. Flight Deck types using the
+   retired writable-clone pattern (`clone-init`, `knowledge-<type>` volumes)
+   adopt the read-only-mount pattern from
+   `deploy/configs-example/worker-types/flightdeck.toml`. The
+   `KNOWLEDGE_GIT_TOKEN` secret can be deleted once no type references it.
+5. **Review and commit** `config-src/`, then **ingest**:
+   `sudo theozolith config ingest`. This commits the machine-owned pinned
+   build ONTO the existing `configs/` git history — machine `control.toml`
+   address, product pin, stacks, worker types, and secrets (which live in the
+   encrypted store, untouched by all of this) are preserved.
+6. **Restart the service** (`sudo systemctl restart theozolith-control.service`)
+   so the upgraded code serves the ingested build, and push the fleet
+   (`theozolith build` / `theozolith command update`) so nodes run matching
+   daemons — the recipe wire format changed with the knowledge fields, so
+   upgrade control and nodes together.
+
+**Rollback.** Each step is independently reversible: before the ingest,
+nothing changed for the running service (delete `config-src/` to abandon a
+migration and re-run it). After the ingest, `configs/` is one commit ahead —
+`git -C configs revert HEAD` (or `git reset --hard HEAD^` before anything
+consumed it) restores the pre-migration tree byte-for-byte, and reinstalling
+the previous release restores the old code. The backup from step 1 is the
+belt-and-braces path: restore the folder and the deployment is exactly where
+it started.
+
 ## Backup and recovery (ADR-0024)
 
 Backup is **one folder, one copy command**: the data partition minus `cache/`
@@ -815,8 +867,17 @@ bake** (ADR-0048; the ADR-0043 writable clone and its promote workflow are
 retired). Knowledge is authored in the Config Repo's `knowledge/<name>/` trees,
 compiled by `theozolith config ingest`, and distributed to nodes with the rest
 of the config. The daemon maintains a stable export at
-`/var/lib/theozolith/knowledge/<name>/`, and `flightdeck-start` points the
-`~/.claude` knowledge directories at the compiled tree:
+`/var/lib/theozolith/knowledge/<name>/`; when the desired distribution becomes
+empty (the Config Repo dropped its last `knowledge/` tree and `drivers/`), the
+export retires with it — a deck never keeps mounting deleted knowledge. The
+deck's worker type SELECTS its tree with `knowledge = "knowledge/<name>"`
+(validated at config load exactly like a driver type's reference: ingested
+pin joined, compiled tree present — a dangling reference refuses the load;
+per-Stack overrides are rejected). Control injects the selection as
+`THEOZOLITH_KNOWLEDGE_TREE`, and `flightdeck-start` points the `~/.claude`
+knowledge directories at that compiled tree — **failing loud when the node has
+not converged it yet** (docker restart policy retries until it has; a deck
+never silently runs without its knowledge):
 
 ```
 ~/.claude/skills     -> /var/lib/theozolith/knowledge/<name>/skills
@@ -829,10 +890,16 @@ An edit lands by editing the Config Repo, committing, and running
 `theozolith config ingest`; it reaches **every deck on every node** through
 ordinary config distribution and is picked up on **agent-CLI restart** (the
 export swaps whole trees by atomic rename beneath the stable mount, so a
-running session keeps what it loaded and no container is ever recreated by a
-knowledge change). The same edit re-tags exactly the worker types whose
+running session keeps what it loaded and no container is ever rebuilt or
+recreated by a knowledge-CONTENT change — the pin stays out of the deck's
+image identity by construction). Changing the SELECTED tree is different: it
+changes the container spec (the injected env), so the deck is recreated on the
+new tree. The same content edit re-tags exactly the driver worker types whose
 definitions reference the tree — driver workers keep **baking** knowledge into
-their derived images, so Run images stay standalone.
+their derived images, so Run images stay standalone. A chmod is a content
+change too: the distribution hash and per-tree pins cover each file's
+normalized executable state, so flipping a skill script's exec bit
+redistributes and re-tags like any edit.
 
 **Cross-node** transport is config distribution — there is **no auto-sync
 daemon and no shared network filesystem, ever**.

@@ -5244,6 +5244,42 @@ def test_knowledge_export_is_maintained_updated_and_retired(rig: Rig):
     assert export.is_dir() and export.stat().st_ino == parent_inode
 
 
+def test_knowledge_only_to_empty_distribution_retires_the_export(rig: Rig):
+    """A knowledge-only distribution whose desired hash becomes EMPTY (the
+    Config Repo dropped its last knowledge/ tree) retires the stable deck
+    export with it — retired trees disappear, or a deck would keep mounting
+    knowledge the Config Repo deleted forever. Distinct from non-convergence
+    (desired non-empty, apply failing), which keeps the last export."""
+    digest, data = make_config_dist(
+        {
+            "knowledge/dev/CLAUDE.md": "# v1\n",
+            "knowledge/other/CLAUDE.md": "# other\n",
+        }
+    )
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    assert (export / "dev" / "CLAUDE.md").is_file()
+    assert (export / "other" / "CLAUDE.md").is_file()
+    parent_inode = export.stat().st_ino
+
+    rig.control.heartbeat_answers.append(dist_response([], ""))
+    rig.daemon.once()
+    assert not (export / "dev").exists()
+    assert not (export / "other").exists()
+    # The mounted parent survives (the deck's bind anchor), empty.
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+    # The empty state is stable: another empty-desired pass changes nothing
+    # and never errors — and its heartbeat (sent before convergence) now
+    # reports the retirement.
+    rig.control.heartbeat_answers.append(dist_response([], ""))
+    rig.daemon.once()
+    assert rig.control.transcript[-1][2]["drivers_hash"] == ""
+    assert export.is_dir() and not any(export.iterdir())
+
+
 def test_knowledge_export_survives_a_failed_convergence(rig: Rig):
     """Not converged -> the export is left alone (advisory skew): a deck keeps
     the last exported trees exactly as a worker keeps its built image."""

@@ -76,6 +76,16 @@ def excluded_part(part: str) -> bool:
     return part.startswith(".") or part == "__pycache__" or part.endswith(".pyc")
 
 
+def entry_mode(st_mode: int) -> str:
+    """The normalized executable state a manifest entry records: ``"755"``
+    when ANY executable bit is set, ``"644"`` otherwise — exactly the two
+    modes the artifact stamps and ``extract_zip`` restores, so the hash never
+    depends on umask noise while a chmod-only change still changes it. Mirror
+    of ``theozolith_control.configdist.entry_mode`` (pinned by the
+    cross-package contract tests)."""
+    return "755" if st_mode & 0o111 else "644"
+
+
 def _regular_files(root: Path) -> list[Path]:
     """Sorted regular files under ``root``, enforcing the POST-EXTRACTION
     structure of an accepted artifact — FAIL CLOSED (ADR-0042). Extraction
@@ -193,6 +203,7 @@ def manifest_hash_of_tree(dist_root: Path) -> str:
             relpath = path.relative_to(dist_root).as_posix()
             try:
                 data = path.read_bytes()
+                mode = entry_mode(path.stat().st_mode)
             except OSError as exc:
                 # Normalize a read failure over the unpacked tree to ConfigDistError
                 # so the caller treats it as non-converged / a repair trigger rather
@@ -200,7 +211,7 @@ def manifest_hash_of_tree(dist_root: Path) -> str:
                 raise ConfigDistError(
                     f"cannot read {relpath!r} while recomputing the config distribution: {exc}"
                 ) from exc
-            entries.append([relpath, hashlib.sha256(data).hexdigest()])
+            entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
     entries.sort()
     if not entries:
         return ""
@@ -221,11 +232,12 @@ def tree_hash(root: Path) -> str:
         relpath = path.relative_to(root).as_posix()
         try:
             data = path.read_bytes()
+            mode = entry_mode(path.stat().st_mode)
         except OSError as exc:
             raise ConfigDistError(
                 f"cannot read {relpath!r} under {root} while hashing the tree: {exc}"
             ) from exc
-        entries.append([relpath, hashlib.sha256(data).hexdigest()])
+        entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
     entries.sort()
     if not entries:
         return ""

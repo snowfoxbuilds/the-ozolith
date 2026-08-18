@@ -56,6 +56,7 @@ from theozolith_control import (
     ingest,
     janitor,
     localnode,
+    migrate,
     origin,
     passwords,
     product,
@@ -1187,6 +1188,22 @@ def _config_ingest(args) -> int:
     return 0
 
 
+def _config_migrate(args) -> int:
+    """`theozolith config migrate` (ADR-0048 amendment): pre-ingest configs ->
+    human Config Repo. Reads the legacy tree (never modifies it), writes the
+    migrated repo, and prints the follow-up steps — run BEFORE the upgraded
+    service must load the now-retired knowledge_source/knowledge_pin fields."""
+    settings = load_settings()
+    legacy = Path(args.legacy) if args.legacy else settings.config_repo
+    dest = Path(args.dest) if args.dest else settings.config_source
+    try:
+        migrate.migrate_legacy(legacy, dest, log=_log)
+    except migrate.MigrateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _repair_partition_ownership(settings)
+    return 0
+
+
 def _secret_set(args) -> int:
     url, token, ca = _admin_env(args)
     value = args.value
@@ -1406,6 +1423,29 @@ def main(argv: list[str] | None = None) -> int:
         " init-scaffolded config-src/ beside the data dir).",
     )
     config_ingest.set_defaults(func=_config_ingest)
+    config_migrate = config_sub.add_parser(
+        "migrate",
+        help="Migrate a pre-ADR-0048 configs tree (knowledge_source/"
+        "knowledge_pin era) into a human Config Repo: config files copied,"
+        " retired knowledge fields removed and noted, control.toml reduced to"
+        " its [settings] surface. The legacy tree is never modified; run this"
+        " before the upgraded service must load it, then review, ingest, and"
+        " restart (deploy/README.md: upgrading a pre-ingest deployment).",
+    )
+    config_migrate.add_argument(
+        "dest",
+        nargs="?",
+        default="",
+        help="Destination directory for the migrated Config Repo (default: the"
+        " config-src/ location beside the data dir); must be missing or empty.",
+    )
+    config_migrate.add_argument(
+        "--legacy",
+        default="",
+        help="The pre-ADR-0048 configs tree to migrate from (default: the"
+        " deployment's configs/ dir — the future pinned build).",
+    )
+    config_migrate.set_defaults(func=_config_migrate)
 
     secret = sub.add_parser("secret", help="Enter and list secrets (values never displayed).")
     secret_sub = secret.add_subparsers(dest="secret_cmd", required=True)

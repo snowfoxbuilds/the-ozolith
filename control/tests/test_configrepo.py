@@ -531,6 +531,96 @@ def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
     )
 
 
+def test_driverless_knowledge_selects_the_mount_and_stays_out_of_the_image(tmp_path):
+    """ADR-0048 amendment: a Flight Deck may declare knowledge =
+    "knowledge/<name>". The reference is validated exactly like a driver's
+    (ingested pin joined, compiled tree present) but never bakes: the wire
+    recipe carries EMPTY knowledge fields (the node must not bake under the
+    volume-shadowed ~/.claude), the image identity ignores reference and pin
+    (a content edit redistributes live, rebuilding and recreating nothing),
+    and the resolved Stack carries the selection as THEOZOLITH_KNOWLEDGE_TREE
+    — part of the container spec, so changing the SELECTED TREE recreates the
+    deck."""
+    write_knowledge_tree(tmp_path, "dev")
+    write_knowledge_tree(tmp_path, "ops")
+    write_pins(tmp_path, knowledge={"dev": "a" * 64, "ops": "b" * 64})
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\nknowledge = "knowledge/dev"\ncommand = "flightdeck-start"\n',
+    )
+    thin_stack(tmp_path, "deck", "flightdeck")
+    config = load_config(tmp_path)
+    wt = config.worker_types["flightdeck"]
+    assert wt.knowledge == "knowledge/dev" and wt.knowledge_pin == "a" * 64
+    recipe = wt.recipe_wire()
+    assert recipe["knowledge"] == "" and recipe["knowledge_pin"] == ""
+    stack = next(s for s in config.stacks if s.name == "deck")
+    assert stack.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev"
+
+    # Content edit: the pin moves, the tag does not — live redistribution.
+    write_pins(tmp_path, knowledge={"dev": "c" * 64, "ops": "b" * 64})
+    after_content = load_config(tmp_path)
+    assert after_content.worker_types["flightdeck"].tag == wt.tag
+    deck = next(s for s in after_content.stacks if s.name == "deck")
+    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev"  # spec unchanged: no recreate
+
+    # Selection edit: the tag still does not move (no image bytes changed),
+    # but the injected env does — the container spec changes and the deck is
+    # recreated on the new tree.
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\nknowledge = "knowledge/ops"\ncommand = "flightdeck-start"\n',
+    )
+    after_selection = load_config(tmp_path)
+    assert after_selection.worker_types["flightdeck"].tag == wt.tag
+    deck = next(s for s in after_selection.stacks if s.name == "deck")
+    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "ops"
+
+
+def test_driverless_knowledge_validation_is_not_weakened(tmp_path):
+    """A deck's knowledge reference fails loud exactly like a driver's: no
+    ingested pin, or no compiled tree in the pinned build, refuses the load —
+    unavailable knowledge is never silently skipped (ADR-0048)."""
+    write_knowledge_tree(tmp_path, "dev")
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\nknowledge = "knowledge/dev"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="no ingest-computed pin"):
+        load_config(tmp_path)
+    write_pins(tmp_path, knowledge={"missing": "a" * 64})
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\nknowledge = "knowledge/missing"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="no compiled tree in the pinned build"):
+        load_config(tmp_path)
+
+
+def test_stack_env_knowledge_tree_override_is_rejected(tmp_path):
+    """Per-Stack knowledge is rejected (ADR-0048): the selection is worker-type
+    identity, so an [env] override on a worker-type Stack fails the load."""
+    write_knowledge_tree(tmp_path, "dev")
+    write_pins(tmp_path, knowledge={"dev": "a" * 64})
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\nknowledge = "knowledge/dev"\n',
+    )
+    thin_stack(tmp_path, "deck", "flightdeck")
+    write(
+        tmp_path,
+        "stacks/deck.toml",
+        'worker_type = "flightdeck"\nnode = "box1"\n[env]\nTHEOZOLITH_KNOWLEDGE_TREE = "other"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="THEOZOLITH_KNOWLEDGE_TREE"):
+        load_config(tmp_path)
+
+
 def test_legacy_knowledge_fields_are_rejected_with_the_new_home(tmp_path):
     driver_type(tmp_path, knowledge_source='"https://github.com/acme/k.git"')
     with pytest.raises(ConfigRepoError, match=r"retired \(ADR-0048\)"):

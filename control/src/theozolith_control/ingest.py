@@ -29,12 +29,32 @@ distributes. This module is the ONLY path between them:
 6. RELOAD, not restart: control re-reads the config tree per request, so the
    running server observes the new commit within one heartbeat; only
    ``control.toml`` tier-2 settings keep their documented restart requirement.
+
+The whole transaction — from the initial clean check through the commit and
+working-tree publish — runs under an exclusive REPOSITORY LOCK (a flock on a
+dot-file beside the pinned build): a second concurrent ingest is refused
+loudly rather than interleaved, so two ingests can never race the clean
+check, the staging, or the commit.
+
+The commit is COMMIT-FIRST git plumbing, never a working-tree mutation
+followed by ``git add``: the staged tree is written into the object store
+through a throwaway index (``add -A``/``write-tree``/``commit-tree``), the
+ref moves atomically (``update-ref``), and only then is the working tree
+synced to HEAD (``reset --hard`` + ``clean -fd``). A failure before the ref
+moves leaves the pinned build byte-for-byte untouched; an interruption after
+it leaves a marker (``.git/theozolith-ingest-pending``) that the next ingest
+repairs by finishing the same working-tree sync — the working tree is never
+the only copy of a half-applied state, and no partially replaced tree can
+survive a crash.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -106,16 +126,109 @@ class IngestReport:
         return "\n".join(lines)
 
 
-def _run_git(args: list[str], cwd: Path, runner) -> subprocess.CompletedProcess:
-    return runner(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
+def _run_git(
+    args: list[str], cwd: Path, runner, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    kwargs: dict = {"cwd": str(cwd), "capture_output": True, "text": True, "check": False}
+    if env is not None:
+        kwargs["env"] = {**os.environ, **env}
+    return runner(["git", *args], **kwargs)
 
 
-def _require_git(args: list[str], cwd: Path, runner, what: str) -> str:
-    proc = _run_git(args, cwd, runner)
+def _git_subcommand(args: list[str]) -> str:
+    """The subcommand word for an error message: the first argument that is
+    neither an option nor an option's value (``-c``, ``--git-dir``,
+    ``--work-tree`` all take one)."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("-c", "--git-dir", "--work-tree"):
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return args[0]
+
+
+def _require_git(
+    args: list[str], cwd: Path, runner, what: str, env: dict[str, str] | None = None
+) -> str:
+    proc = _run_git(args, cwd, runner, env)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise IngestError(f"{what}: git {args[0]} failed: {detail}")
+        raise IngestError(f"{what}: git {_git_subcommand(args)} failed: {detail}")
     return (proc.stdout or "").strip()
+
+
+# The lock and crash-recovery plumbing (ADR-0048 amendment): one ingest at a
+# time, and no interruption may leave a partially replaced pinned tree.
+
+# Written just before the ref moves, removed once the working tree matches the
+# new HEAD; its presence means an ingest died between those two points.
+PENDING_MARKER = "theozolith-ingest-pending"
+
+
+@contextlib.contextmanager
+def _repo_lock(pinned_dir: Path):
+    """An exclusive flock on a dot-file BESIDE the pinned build (never inside
+    it — the working tree is machine-owned content). Held from before the
+    clean check until after the commit and working-tree publish; a concurrent
+    ingest is refused loudly rather than queued, so no two transactions ever
+    interleave. The lock file is never unlinked (unlink+flock races)."""
+    lock_path = pinned_dir.parent / f".{pinned_dir.name}.ingest-lock"
+    try:
+        handle = lock_path.open("w")
+    except OSError as exc:
+        raise IngestError(f"cannot open the ingest lock {lock_path}: {exc}") from exc
+    with handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise IngestError(
+                f"another `theozolith config ingest` is already running for"
+                f" {pinned_dir} (lock {lock_path}) — the ingest transaction is"
+                " serialized; retry when it finishes"
+            ) from exc
+        yield
+
+
+def _sync_worktree_to_head(pinned_dir: Path, runner) -> bool:
+    """Make the machine-owned working tree match HEAD exactly (``reset
+    --hard`` + ``clean -fd``) — the publish half of a committed transaction,
+    and the repair a crashed one needs. True on success; an unborn HEAD is
+    vacuously in sync (nothing was ever committed, so nothing was ever
+    half-published)."""
+    if _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner).returncode != 0:
+        return True
+    for args in (["reset", "--hard", "--quiet"], ["clean", "-fdq"]):
+        if _run_git(args, pinned_dir, runner).returncode != 0:
+            return False
+    return True
+
+
+def _recover_pending(pinned_dir: Path, runner, report: IngestReport) -> None:
+    """Finish a transaction that died between ``update-ref`` and the
+    working-tree publish: the marker proves the dirt (if any) is ours, so the
+    tree is restored to HEAD — never refused as a hand edit. An unrepairable
+    tree fails loudly with the marker left in place for the next attempt."""
+    marker = pinned_dir / ".git" / PENDING_MARKER
+    if not marker.exists():
+        return
+    if not _sync_worktree_to_head(pinned_dir, runner):
+        raise IngestError(
+            f"pinned build {pinned_dir}: an interrupted ingest left the working"
+            " tree behind HEAD and it could not be restored (git reset --hard"
+            " failed) — repair the repository, then re-run ingest"
+        )
+    with contextlib.suppress(OSError):
+        marker.unlink()
+    report.notes.append(
+        "recovered an interrupted ingest: the working tree was restored to the"
+        " committed HEAD before this run"
+    )
 
 
 def _is_git_url(source: str) -> bool:
@@ -124,10 +237,13 @@ def _is_git_url(source: str) -> bool:
 
 def _folder_commit(root: Path) -> str:
     """Content stamp for a non-git source folder — same convention as the
-    pinned build's own folder mode (``configrepo._commit``)."""
+    pinned build's own folder mode (``configrepo._commit``), normalized
+    executable state included (a chmod-only source edit changes the compiled
+    output, so the provenance stamp must move with it)."""
     digest = hashlib.sha256()
     for path in configdist.regular_files(root):
         digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(configdist.entry_mode(path.stat().st_mode).encode())
         digest.update(path.read_bytes())
     return f"folder-{digest.hexdigest()[:12]}"
 
@@ -355,22 +471,33 @@ def _merge_control_toml(source_dir: Path, pinned_dir: Path, staging: Path) -> No
     (staging / controltoml.CONTROL_TOML).write_text(merged, encoding="utf-8")
 
 
-def _sync_into_pinned(staging: Path, pinned_dir: Path) -> None:
-    """Replace the pinned working tree's content with the staged tree (the
-    ``.git`` directory stays). Content-identical files produce no git diff, so
-    the commit below records exactly the real change set."""
-    for entry in sorted(pinned_dir.iterdir(), key=lambda p: p.name):
-        if entry.name == ".git":
-            continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-    for entry in sorted(staging.iterdir(), key=lambda p: p.name):
-        if entry.is_dir():
-            shutil.copytree(entry, pinned_dir / entry.name, symlinks=False)
-        else:
-            shutil.copy2(entry, pinned_dir / entry.name)
+def _commit_staging(staging: Path, pinned_dir: Path, work: Path, runner, message: str) -> str:
+    """Write the staged tree into the pinned build's object store through a
+    THROWAWAY index (never the repo's own) and create the commit object.
+    Returns the new commit id, or ``""`` when the staged tree is identical to
+    HEAD's tree (nothing to commit). Nothing observable moves here: only
+    loose objects and the commit object are written, the ref does NOT — so a
+    failure at any point leaves the pinned build byte-for-byte untouched."""
+    git_dir = str((pinned_dir / ".git").resolve())
+    env = {"GIT_INDEX_FILE": str(work / "ingest-index")}
+    scoped = ["--git-dir", git_dir, "--work-tree", "."]
+    _require_git([*scoped, "add", "-A"], staging, runner, str(pinned_dir), env=env)
+    tree = _require_git([*scoped, "write-tree"], staging, runner, str(pinned_dir), env=env)
+    head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"], pinned_dir, runner)
+    if head.returncode == 0 and (head.stdout or "").strip() == tree:
+        return ""
+    parent = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
+    commit_args = [
+        "-c",
+        f"user.name={controltoml.COMMIT_AUTHOR_NAME}",
+        "-c",
+        f"user.email={controltoml.COMMIT_AUTHOR_EMAIL}",
+        "commit-tree",
+    ]
+    if parent.returncode == 0:
+        commit_args += ["-p", (parent.stdout or "").strip()]
+    commit_args += ["-m", message, tree]
+    return _require_git(commit_args, pinned_dir, runner, str(pinned_dir))
 
 
 def _tags_of(repo_dir: Path) -> dict[str, str]:
@@ -398,18 +525,35 @@ def ingest(
     log=print,
 ) -> IngestReport:
     """Run the full pipeline; raises ``IngestError`` with nothing committed on
-    any refusal. See the module docstring for the steps."""
+    any refusal. See the module docstring for the steps. The whole transaction
+    — clean check through commit and working-tree publish — holds the
+    repository lock; a concurrent ingest is refused loudly."""
     # Resolved at call time (not as a def-time default) so test rigs that
     # monkeypatch subprocess.run fake the git layer here too.
     runner = runner or subprocess.run
     pinned_dir = Path(pinned_dir)
+    pinned_dir.mkdir(parents=True, exist_ok=True)
+    with _repo_lock(pinned_dir):
+        return _ingest_locked(source, pinned_dir, resolve_digest, runner, log)
+
+
+def _ingest_locked(
+    source: str,
+    pinned_dir: Path,
+    resolve_digest: Callable[[str], str] | None,
+    runner,
+    log,
+) -> IngestReport:
     report = IngestReport()
     resolve = resolve_digest or resolve_image_digest
 
-    # The pinned build must exist as a clean git repo before anything is staged.
-    pinned_dir.mkdir(parents=True, exist_ok=True)
+    # The pinned build must exist as a clean git repo before anything is
+    # staged. A marker left by an interrupted ingest is repaired FIRST — that
+    # dirt is provably ours — and only then does the clean check refuse what
+    # remains (a hand edit).
     if not (pinned_dir / ".git").exists():
         _require_git(["init", "--quiet"], pinned_dir, runner, str(pinned_dir))
+    _recover_pending(pinned_dir, runner, report)
     dirty = _require_git(["status", "--porcelain"], pinned_dir, runner, str(pinned_dir))
     if dirty:
         raise IngestError(
@@ -445,31 +589,40 @@ def ingest(
         for warning in staged_config.warnings:
             report.notes.append(f"warning: {warning}")
 
-        _sync_into_pinned(staging, pinned_dir)
-
-    _require_git(["add", "-A"], pinned_dir, runner, str(pinned_dir))
-    staged = _require_git(["status", "--porcelain"], pinned_dir, runner, str(pinned_dir))
-    if not staged:
+        # COMMIT FIRST (from the staging tree, through a throwaway index):
+        # until update-ref below, nothing observable has moved and any failure
+        # leaves the pinned build untouched.
+        commit = _commit_staging(
+            staging,
+            pinned_dir,
+            work,
+            runner,
+            f"theozolith config ingest: source {report.source_commit}",
+        )
+    if not commit:
         report.changed = False
         log(report.summary())
         return report
-    _require_git(
-        [
-            "-c",
-            f"user.name={controltoml.COMMIT_AUTHOR_NAME}",
-            "-c",
-            f"user.email={controltoml.COMMIT_AUTHOR_EMAIL}",
-            "commit",
-            "--quiet",
-            "-m",
-            f"theozolith config ingest: source {report.source_commit}",
-        ],
-        pinned_dir,
-        runner,
-        str(pinned_dir),
-    )
+
+    # Publish: move the ref atomically, then sync the working tree to it. The
+    # marker brackets the only window in which an interruption can leave the
+    # working tree behind the ref — the next ingest finishes the sync from the
+    # marker; a same-process failure attempts the same repair immediately.
+    marker = pinned_dir / ".git" / PENDING_MARKER
+    marker.write_text(commit + "\n", encoding="utf-8")
+    try:
+        _require_git(["update-ref", "HEAD", commit], pinned_dir, runner, str(pinned_dir))
+        _require_git(["reset", "--hard", "--quiet"], pinned_dir, runner, str(pinned_dir))
+        _require_git(["clean", "-fdq"], pinned_dir, runner, str(pinned_dir))
+    except BaseException:
+        if _sync_worktree_to_head(pinned_dir, runner):
+            with contextlib.suppress(OSError):
+                marker.unlink()
+        raise
+    with contextlib.suppress(OSError):
+        marker.unlink()
     report.changed = True
-    report.pinned_commit = _require_git(["rev-parse", "HEAD"], pinned_dir, runner, str(pinned_dir))
+    report.pinned_commit = commit
 
     new_tags = _tags_of(pinned_dir)
     report.retagged = {

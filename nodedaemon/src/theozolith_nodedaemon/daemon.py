@@ -1217,18 +1217,28 @@ class NodeDaemon:
         no killed tmux session); a running agent keeps what it loaded and
         picks up the new trees on agent-CLI restart.
 
-        Non-converged (empty applied hash) leaves the existing export alone —
-        advisory skew: the deck keeps the last exported trees exactly as a
-        worker keeps its built image. Failures log and emit but never fail
-        the pass; the export is re-derived state, repaired next pass."""
+        Non-converged (empty applied hash while a distribution IS desired)
+        leaves the existing export alone — advisory skew: the deck keeps the
+        last exported trees exactly as a worker keeps its built image. A
+        RETIRED distribution (desired hash empty, nothing applied) is the
+        exception: the export retires with it — every child tree is removed,
+        or a deck would keep mounting knowledge the Config Repo deleted,
+        forever. Failures log and emit but never fail the pass; the export is
+        re-derived state, repaired next pass."""
         applied = self._current_drivers_hash()
         if not applied:
-            return
-        source_root = self._config.config_dist_dir / applied / configdist.KNOWLEDGE_DIR
+            if str(self._desired.get("drivers_hash", "") or ""):
+                return  # not converged yet: keep the last export (advisory skew)
+            # Desired is EMPTY and nothing is applied: the distribution was
+            # retired (_retire_config_dist), so no source trees remain —
+            # fall through with an empty desired set to retire every export.
+            source_root = None
+        else:
+            source_root = self._config.config_dist_dir / applied / configdist.KNOWLEDGE_DIR
         export = self._config.knowledge_export_dir
         try:
             desired: dict[str, Path] = {}
-            if source_root.is_dir() and not source_root.is_symlink():
+            if source_root is not None and source_root.is_dir() and not source_root.is_symlink():
                 with os.scandir(source_root) as it:
                     for entry in sorted(it, key=lambda e: e.name):
                         if entry.is_dir(follow_symlinks=False):

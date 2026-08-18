@@ -5,12 +5,13 @@ BEFORE committing, stamp source provenance, and never leave a partial state."""
 
 from __future__ import annotations
 
+import fcntl
 import subprocess
 from pathlib import Path
 
 import pytest
 from theozolith_control import configdist, configrepo, controltoml
-from theozolith_control.ingest import IngestError, ingest, resolve_image_digest
+from theozolith_control.ingest import PENDING_MARKER, IngestError, ingest, resolve_image_digest
 
 DIGEST = "a" * 64
 BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{DIGEST}"
@@ -221,6 +222,47 @@ def test_knowledge_edit_retags_only_the_referencing_type(tmp_path):
     assert old and new and old != new
 
 
+def test_chmod_only_knowledge_edit_repins_and_retags(tmp_path):
+    """A chmod-only change (no byte edits) to a knowledge source script is a
+    real content change (ADR-0048 amendment): the compiled tree's executable
+    state flips, so ingest commits a new pinned build, records a new per-tree
+    pin, re-tags the referencing worker type, and the distribution hash moves
+    — a node rebakes the derived image from the re-distributed tree."""
+    src = source_repo(tmp_path)
+    script = src / "knowledge/dev/skills/hello/run.sh"
+    script.write_text("#!/bin/sh\necho hello\n")
+    _commit_all(src, "script, not yet executable")
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    before_dist = configdist.dist_hash(pinned)
+    before_tag = configrepo.load_config(pinned).worker_types["claude-dev"].tag
+
+    script.chmod(0o755)
+    _commit_all(src, "chmod +x only")
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.changed
+    assert after.knowledge_pins["dev"] != before.knowledge_pins["dev"]
+    assert set(after.retagged) == {"claude-dev"}
+    assert configrepo.load_config(pinned).worker_types["claude-dev"].tag != before_tag
+    assert configdist.dist_hash(pinned) != before_dist
+    assert (pinned / "knowledge/dev/skills/hello/run.sh").stat().st_mode & 0o111
+
+
+def test_chmod_only_folder_source_edit_changes_the_provenance_stamp(tmp_path):
+    """Folder-mode sources stamp a content hash as provenance; a chmod-only
+    edit must move that stamp too (git sources get this from git tracking the
+    exec bit) — the pinned build's source stamp stays truthful."""
+    src = source_repo(tmp_path, git=False)
+    script = src / "knowledge/dev/skills/hello/run.sh"
+    script.write_text("#!/bin/sh\necho hello\n")
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    script.chmod(0o755)
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.changed
+    assert after.source_commit != before.source_commit
+
+
 def test_knowledge_that_does_not_compile_is_refused_at_ingest(tmp_path):
     """Compile errors surface at ingest — never at image build or container
     start (ADR-0048). An empty knowledge root is the simplest reject."""
@@ -312,6 +354,100 @@ def test_executable_skill_scripts_survive_the_round_trip(tmp_path):
     node_configdist.extract_zip(path.read_bytes(), dest)
     assert (dest / "knowledge/dev/skills/hello/run.sh").stat().st_mode & 0o111
     assert node_configdist.manifest_hash_of_tree(dest) == digest
+
+
+# -- the ingest transaction: lock, commit-first, crash recovery -------------------
+
+
+def _failing_git(*fail_tokens: str):
+    """A runner that delegates to the real subprocess.run but fails any git
+    invocation whose argv carries one of the tokens — the injected-failure
+    harness for the transaction tests."""
+
+    def run(argv, **kwargs):
+        if argv[0] == "git" and any(token in argv for token in fail_tokens):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="injected failure")
+        return subprocess.run(argv, **kwargs)
+
+    return run
+
+
+def test_concurrent_ingest_is_refused_by_the_repository_lock(tmp_path):
+    """The whole transaction holds an exclusive flock beside the pinned build:
+    a second ingest is refused loudly while one runs, and proceeds normally
+    once the lock is released — serialized, never interleaved."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    lock_path = pinned.parent / f".{pinned.name}.ingest-lock"
+    with open(lock_path, "w") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(IngestError, match="already running"):
+            ingest(str(src), pinned, log=lambda *_: None)
+        # The refused attempt changed nothing.
+        assert _git(pinned, "status", "--porcelain") == ""
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert not report.changed
+
+
+@pytest.mark.parametrize("fail_on", ["commit-tree", "update-ref"])
+def test_git_failure_before_the_publish_leaves_the_pinned_build_untouched(tmp_path, fail_on):
+    """A git failure before the working-tree publish (creating the commit
+    object, or moving the ref) aborts with the pinned build byte-for-byte at
+    its previous state: old HEAD, clean tree, old content, no pending marker
+    — and the next ingest succeeds with correct provenance."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    first = ingest(str(src), pinned, log=lambda *_: None)
+    head_before = _git(pinned, "rev-parse", "HEAD")
+    write(src, "knowledge/dev/AGENTS.md", "# team knowledge v2\n")
+    edited = _commit_all(src, "edit")
+
+    with pytest.raises(IngestError, match=f"git {fail_on} failed"):
+        ingest(str(src), pinned, runner=_failing_git(fail_on), log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head_before
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / ".git" / PENDING_MARKER).exists()
+    assert first.source_commit in (pinned / "pins.toml").read_text()
+    assert "v2" not in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert report.changed and report.source_commit == edited
+    assert edited in _git(pinned, "log", "-1", "--format=%s")
+    assert edited in (pinned / "pins.toml").read_text()
+    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+
+
+def test_interrupted_publish_is_recovered_by_the_next_ingest(tmp_path):
+    """An interruption AFTER the ref moves but before the working tree syncs
+    (the only window a crash can leave a stale tree) leaves the pending
+    marker; the next ingest repairs the tree to HEAD instead of refusing it
+    as a hand edit, and provenance — commit message, pins.toml, content —
+    matches the committed transaction exactly."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head_before = _git(pinned, "rev-parse", "HEAD")
+    write(src, "knowledge/dev/AGENTS.md", "# team knowledge v2\n")
+    edited = _commit_all(src, "edit")
+
+    with pytest.raises(IngestError, match="git reset failed"):
+        ingest(str(src), pinned, runner=_failing_git("reset"), log=lambda *_: None)
+    # Commit-first: the ref moved, the publish did not — the marker brackets it.
+    assert (pinned / ".git" / PENDING_MARKER).exists()
+    assert _git(pinned, "rev-parse", "HEAD") != head_before
+    assert "v2" not in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert any("recovered an interrupted ingest" in note for note in report.notes)
+    # The commit already landed; recovery published it, so this run is a no-op.
+    assert not report.changed
+    assert not (pinned / ".git" / PENDING_MARKER).exists()
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert edited in _git(pinned, "log", "-1", "--format=%s")
+    assert edited in (pinned / "pins.toml").read_text()
+    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert configrepo.load_config(pinned).worker_types["claude-dev"].knowledge_pin
 
 
 def test_resolve_image_digest_ref_parsing():

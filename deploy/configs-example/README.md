@@ -18,10 +18,13 @@ Stack to running (ingest refuses live placeholders).
 `knowledge/claude-dev/` is a knowledge root (ADR-0009 layout: `AGENTS.md`,
 `skills/`, optionally `agents/`, `workflows/`) referenced by the claude worker
 types as `knowledge = "knowledge/claude-dev"`. Ingest compiles it and pins its
-content hash; driver workers bake the compiled tree into their derived images
-(editing it re-tags exactly the types that reference it), and Flight Decks
-read the node's applied copy through a read-only mount — restart the agent
-CLI to pick up changes.
+content hash (the pin covers each file's executable state too — a chmod
+redistributes like any edit); driver workers bake the compiled tree into
+their derived images (editing it re-tags exactly the types that reference
+it). The Flight Deck's own `knowledge` field selects which node-applied tree
+its read-only mount serves — the deck fails loud until the node has converged
+that tree, content edits reach it on agent-CLI restart, and changing the
+selected tree recreates the deck.
 
 ## Custom drivers (`drivers/`, ADR-0042)
 

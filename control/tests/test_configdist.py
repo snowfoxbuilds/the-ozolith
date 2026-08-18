@@ -87,7 +87,7 @@ def test_manifest_is_content_only_and_order_independent(tmp_path):
 def test_relpaths_include_the_drivers_prefix(tmp_path):
     _populate(tmp_path)
     entries = configdist.dist_manifest(tmp_path)
-    relpaths = [relpath for relpath, _ in entries]
+    relpaths = [relpath for relpath, *_ in entries]
     assert relpaths == sorted(relpaths)
     assert all(relpath.startswith("drivers/") for relpath in relpaths)
     assert "drivers/custom/impl.py" in relpaths
@@ -99,7 +99,7 @@ def test_exclusion_rules(tmp_path):
     _write(tmp_path, "drivers/mod/b.pyc", b"\x00")
     _write(tmp_path, "drivers/.editor.swp", "junk")
     _write(tmp_path, "drivers/.hidden/keep.py", "nope\n")
-    relpaths = [relpath for relpath, _ in configdist.dist_manifest(tmp_path)]
+    relpaths = [relpath for relpath, *_ in configdist.dist_manifest(tmp_path)]
     assert relpaths == ["drivers/mod/a.py"]
 
 
@@ -206,6 +206,86 @@ def test_unreadable_drivers_file_is_config_dist_error(tmp_path):
         os.chmod(target, 0o644)
 
 
+# -- normalized executable state is hashed content (ADR-0048 amendment) ------
+
+
+def test_chmod_only_change_creates_a_new_hash_artifact_and_pin(tmp_path):
+    """Flipping ONLY the executable bit — no byte changes — must produce a new
+    distribution hash, a new artifact name, and a new per-tree knowledge pin,
+    with the node-side recompute agreeing at every step: executable state is
+    part of what the deck mounts and the image bakes, so a chmod is a real
+    content change, never an invisible one."""
+    _populate(tmp_path)
+    _write(tmp_path, "knowledge/dev/skills/s/run.sh", "#!/bin/sh\necho hi\n")
+    before_hash = configdist.dist_hash(tmp_path)
+    before_pin = configdist.knowledge_tree_hash(tmp_path, "dev")
+    before_digest, before_path = configdist.build_artifact(
+        tmp_path, tmp_path / "out", built_against="1.0"
+    )
+    assert before_digest == before_hash
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == before_hash
+
+    (tmp_path / "knowledge/dev/skills/s/run.sh").chmod(0o755)
+    after_hash = configdist.dist_hash(tmp_path)
+    after_pin = configdist.knowledge_tree_hash(tmp_path, "dev")
+    assert after_hash != before_hash
+    assert after_pin != before_pin
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == after_hash
+    assert node_configdist.knowledge_tree_hash(tmp_path, "dev") == after_pin
+    after_digest, after_path = configdist.build_artifact(
+        tmp_path, tmp_path / "out", built_against="1.0"
+    )
+    assert after_digest == after_hash and after_path != before_path
+    # Both artifacts verify and extract to trees that recompute to their own
+    # hashes — the exec bit rides the archive and is restored on extraction.
+    for digest, path in ((before_digest, before_path), (after_digest, after_path)):
+        recomputed, _ = configdist.verify_artifact(path)
+        assert recomputed == digest
+        dest = tmp_path / f"unpack-{digest[:8]}"
+        dest.mkdir()
+        node_configdist.extract_zip(path.read_bytes(), dest)
+        assert node_configdist.manifest_hash_of_tree(dest) == digest
+    assert (
+        not (tmp_path / f"unpack-{before_digest[:8]}/knowledge/dev/skills/s/run.sh").stat().st_mode
+        & 0o111
+    )
+    assert (
+        tmp_path / f"unpack-{after_digest[:8]}/knowledge/dev/skills/s/run.sh"
+    ).stat().st_mode & 0o111
+
+
+def test_entry_mode_is_normalized_and_agrees_across_packages():
+    """Only the executable state enters the hash — group/other permission noise
+    normalizes away — and the two stdlib implementations are pinned."""
+    for st_mode, expected in (
+        (0o644, "644"),
+        (0o600, "644"),
+        (0o664, "644"),
+        (0o755, "755"),
+        (0o700, "755"),
+        (0o111, "755"),
+        (0o544, "755"),
+    ):
+        assert configdist.entry_mode(st_mode) == expected
+        assert node_configdist.entry_mode(st_mode) == expected
+
+
+def test_build_refuses_mode_mutation_between_manifest_and_archive(tmp_path, monkeypatch):
+    """A chmod that lands after the manifest is computed but before the archive
+    snapshot must fail the build exactly like a byte mutation: the published
+    modes must never disagree with the hash they were packaged under."""
+    _populate(tmp_path)
+    real = configdist.dist_manifest(tmp_path)
+    flipped = [
+        [relpath, digest, "755" if mode == "644" else "644"] for relpath, digest, mode in real
+    ]
+    monkeypatch.setattr(configdist, "dist_manifest", lambda repo: flipped)
+    out = tmp_path / "out"
+    with pytest.raises(configdist.ConfigDistError, match="changed while packaging"):
+        configdist.build_artifact(tmp_path, out, built_against="1.0")
+    assert not list(out.glob("*.zip")) and not list(out.glob(".*"))
+
+
 # -- artifact integrity: no poisoning past verify-by-recompute ---------------
 
 
@@ -215,7 +295,7 @@ def test_build_refuses_mutation_between_manifest_and_archive(tmp_path, monkeypat
     hash. Simulated by a stale manifest: the byte snapshot detects the drift."""
     _populate(tmp_path)
     real = configdist.dist_manifest(tmp_path)
-    stale = [[relpath, "0" * 64] for relpath, _ in real]  # hashes no longer match disk
+    stale = [[relpath, "0" * 64, mode] for relpath, _, mode in real]  # hashes no longer match disk
     monkeypatch.setattr(configdist, "dist_manifest", lambda repo: stale)
     out = tmp_path / "out"
     with pytest.raises(configdist.ConfigDistError):
@@ -257,7 +337,7 @@ def test_verify_artifact_rejects_bad_metadata_and_unsafe_members(tmp_path):
 
     bad_meta = tmp_path / "bad_meta.zip"
     with zipfile.ZipFile(bad_meta, "w") as z:
-        for relpath, _ in entries:
+        for relpath, *_ in entries:
             z.writestr(relpath, (tmp_path / relpath).read_bytes())
         z.writestr(
             configdist.ARTIFACT_METADATA,

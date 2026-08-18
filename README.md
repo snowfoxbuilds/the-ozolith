@@ -100,10 +100,13 @@ heartbeats within the interval (60 s default). Join tokens default to 1 hour / s
 
 ### 3. Add a worker to the fleet
 
-A worker is a **worker type** placed by a thin **Stack**. `deploy/configs-example/` is a
-complete starter — copy it into the git-backed Config Repo (`~/.theozolith/configs` on the
-Control Node, `/var/lib/theozolith-control/configs` root-mediated; ADR-0006) and adjust. For a
-pipeline worker, first label the target repo once:
+A worker is a **worker type** placed by a thin **Stack**, declared in your **Config Repo** —
+the human-authored tree `theozolith init` scaffolds at `config-src/` beside the data dir
+(keep it there, move it anywhere, or host it on a git server). `deploy/configs-example/` is a
+complete starter to copy in and adjust. The Config Repo is the source of truth (ADR-0006/0048);
+`theozolith config ingest` turns it into the machine-owned **pinned build** (`configs/`) the
+service actually loads — never hand-edit that one. For a pipeline worker, first label the
+target repo once:
 
 ```sh
 GITHUB_TOKEN=... theozolith-bootstrap --repo owner/name    # labels + issue forms, one-time
@@ -113,8 +116,9 @@ Then, in the Config Repo:
 
 1. **Define the worker type** — `worker-types/<type>.toml`: the driver (`builtin:implementer`,
    `builtin:reviewer`, or a custom `drivers/<name>`), `adapter`, `model`, `workspace` (the
-   `owner/name` repo it works), the digest-pinned run-image `base` (+ optional `setup`,
-   `knowledge_source`/`knowledge_pin`), and a `[secrets]` table mapping env → secret **names**
+   `owner/name` repo it works), the run-image `base` (digest-pinned, or a bare tag ingest
+   resolves; + optional `setup` and an in-repo knowledge reference
+   `knowledge = "knowledge/<name>"`), and a `[secrets]` table mapping env → secret **names**
    (the type's defaults; `""` declares a slot every instantiating Stack must bind).
    See `deploy/configs-example/worker-types/claude-dev.toml` (Implementer) and
    `claude-review.toml` (Reviewer — its **own** GitHub identity, no self-grading).
@@ -133,9 +137,17 @@ Then, in the Config Repo:
 
    Encrypted at rest on the Control Node, pulled node-scoped over TLS (only nodes whose Stacks
    reference a name may pull it), materialized to tmpfs — never on node disk.
-4. **Commit the Config Repo.** Desired state distributes over the heartbeat channel; the node
-   builds the derived image locally, pulls its secrets, and starts the worker. Nodes cache the
-   config for degraded mode.
+4. **Commit the Config Repo, then ingest** — every Config Repo commit lands via
+
+   ```sh
+   sudo theozolith config ingest              # or: theozolith config ingest <path-or-git-url>
+   ```
+
+   Ingest lints the repo with the exact fail-loud config-load checks, resolves the mechanical
+   pins (tag-only `base` → registry digest; per-knowledge-tree content hashes), compiles
+   `knowledge/`, and commits the pinned build (rollback = `git revert` there). Desired state
+   then distributes over the heartbeat channel; the node builds the derived image locally,
+   pulls its secrets, and starts the worker. Nodes cache the config for degraded mode.
 
 The Implementer/Reviewer split is the pipeline in one node: dispatch → Run → best-effort PR →
 review rounds → human merge. For interactive (human-driven) agent work, the **Flight Deck** is a
@@ -148,30 +160,31 @@ driverless worker type — see step 4.
 `~/.claude`, or `bake` a pinned Knowledge Source into a container image at build time. See
 [knowledge/README.md](knowledge/README.md).
 
-**Knowledge on the fleet (Flight Deck, ADR-0043)** — the Flight Deck is a driverless worker type
-(`deploy/configs-example/worker-types/flightdeck.toml`) whose `~/.claude` knowledge dirs are a
-**live symlinked git clone**, shared by all Flight Decks of the same type on a node (one
-`knowledge-<type>` volume). Edit a skill in a Flight Deck and it is live in its siblings after an
-agent-CLI restart — no sync step. To make an edit reach the pipeline's Runs (**promote**):
+**Knowledge on the fleet (ADR-0048)** — deployment knowledge lives IN the Config Repo: a
+`knowledge/<name>/` directory holds one knowledge root (`skills/`, `agents/`, `workflows/`,
+`AGENTS.md`), referenced from worker types as `knowledge = "knowledge/<name>"`. Ingest compiles
+it and pins its content hash. Driver workers **bake** the compiled tree into their derived
+images (an edit re-tags exactly the types that reference the tree → nodes rebuild → new Runs
+carry it). The **Flight Deck** (a driverless worker type,
+`deploy/configs-example/worker-types/flightdeck.toml`) never bakes: its `knowledge` field
+selects which node-applied tree its read-only `/var/lib/theozolith/knowledge` mount serves,
+and the deck fails loud until the node has converged that tree. One edit → commit → ingest
+reaches every deck on every node; a running session keeps what it loaded and picks up the new
+trees on agent-CLI restart — no rebuild, no recreate, no sync step. Changing which tree a deck
+*selects* recreates it.
 
-```sh
-# in the Flight Deck:
-cd ~/knowledge && git add -A && git commit && git push && git rev-parse HEAD
-# on the Control Node: bump the worker type's knowledge_pin to that SHA and commit
-#   -> the deterministic image tag changes -> nodes rebuild -> new Runs carry it.
-```
-
-> **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude` — it breaks the
-> symlink carve-out and writes through the link into the shared clone. Cross-node transport is
-> plain git (commit/push here, `git pull` there); there is no auto-sync daemon.
+> **Never** run `theozolith-knowledge sync` against a Flight Deck's `~/.claude` — it replaces
+> the symlinks into the applied tree with detached copies (the mount itself is read-only, so
+> nothing can write through the links). There is no writable clone and no promote workflow
+> anymore; the Config Repo commit + ingest IS the promotion.
 
 **Custom workers (ADR-0042)** — a worker type can name a driver that lives in your Config Repo
 instead of a built-in one: a new pipeline worker with no product fork. Author `drivers/<name>.py`
 exporting a top-level `Driver` class subclassing `theozolith_worker.api.Worker` (`api` is the one
 stable import), point a worker type at it with `driver = "drivers/<name>"`, and place it with a
 Stack exactly like a built-in. The `drivers/` tree ships to nodes as a hash-pinned artifact the
-daemon verifies and unpacks; editing the driver + committing changes the hash and the node
-restarts the driver on the new code (queued behind any in-flight Run). See
+daemon verifies and unpacks; editing the driver, committing, and ingesting changes the hash and
+the node restarts the driver on the new code (queued behind any in-flight Run). See
 `deploy/configs-example/drivers/hello_logger.py` and its `worker-types/`/`stacks/` wiring for a
 complete staged example.
 
@@ -179,8 +192,10 @@ complete staged example.
 > access equals code execution with driver credentials on nodes** (ADR-0042). Treat it exactly as
 > you treat merge access to product code.
 
-Full depth — promote/rebuild mechanics, volume cardinality, custom-driver dispatch gate and
-skew — is in [deploy/README.md](deploy/README.md).
+Full depth — ingest/rebuild mechanics, volume cardinality, custom-driver dispatch gate and
+skew, and the upgrade path for pre-ingest deployments (the retired
+`knowledge_source`/`knowledge_pin` era — `theozolith config migrate`) — is in
+[deploy/README.md](deploy/README.md).
 
 ### 5. Start, stop, and monitor workers
 

@@ -802,10 +802,12 @@ hash-pinned, verified config distribution and runs without forking the product.
 there is code execution with driver credentials on every node that runs it.
 
 **Knowledge** (ADR-0048): a `knowledge/<name>/` directory here holds one
-knowledge root (skills/, agents/, workflows/, AGENTS.md). Ingest compiles it;
-driver workers bake the compiled tree into their images, and Flight Decks
-read-only-mount the node's applied copy — restart the agent CLI to pick up
-changes.
+knowledge root (skills/, agents/, workflows/, AGENTS.md). Reference it from a
+worker type with `knowledge = "knowledge/<name>"`. Ingest compiles it and pins
+its content hash; driver workers bake the compiled tree into their images,
+and a Flight Deck's field selects which applied tree its read-only mount
+serves (content edits reach running decks on agent-CLI restart; changing the
+selected tree recreates the deck).
 """
 
 
