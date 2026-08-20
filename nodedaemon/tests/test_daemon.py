@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -2536,6 +2537,43 @@ def test_dockerctl_no_command_preserves_the_inherited_entrypoint_and_cmd():
     run = next(c for c in calls if c[1] == "run")
     assert "--entrypoint" not in run
     assert run[-1] == "ghcr.io/x/svc:1"
+
+
+def test_dockerctl_build_threads_docker_config_into_the_subprocess_env():
+    """The deterministic proof that the registry pull credential reaches the
+    build subprocess (ADR-0049): ``build(docker_config=dir)`` runs ``docker
+    build`` with a real environment that INHERITS the daemon's environment and
+    adds ``DOCKER_CONFIG`` pointed at the tmpfs credential dir; the default
+    build passes ``env=None``, so docker inherits the daemon environment
+    unchanged and resolves a public base anonymously.
+
+    A real-engine variant cannot assert this: the docker CLI treats a
+    config-load error as a non-fatal warning (never failing the build), and it
+    consults DOCKER_CONFIG only on a registry round-trip that a build of a
+    locally present base never makes — so the env plumbing is proven here, at
+    the exact seam, against the real DockerCtl."""
+    calls: list[tuple[list[str], dict | None]] = []
+
+    def runner(args, timeout=None, env=None):
+        calls.append((list(args), env))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    config_dir = Path("/run/theozolith/docker")
+    ctl.build(Path("/state/ctx"), "ozolith/dev:abc", docker_config=config_dir)
+    ctl.build(Path("/state/ctx"), "ozolith/dev:abc")
+
+    (cfg_args, cfg_env), (plain_args, plain_env) = calls
+    # The build argv is identical with or without the credential — only the
+    # environment differs, so the tag the image is built under never changes.
+    assert cfg_args == plain_args == ["docker", "build", "--tag", "ozolith/dev:abc", "/state/ctx"]
+    # DOCKER_CONFIG points at the tmpfs dir, and the whole daemon environment is
+    # inherited (a wiped env would drop PATH and break the docker invocation).
+    assert cfg_env is not None
+    assert cfg_env["DOCKER_CONFIG"] == str(config_dir)
+    assert all(cfg_env[key] == value for key, value in os.environ.items())
+    # No credential: env is None, so docker inherits the daemon environment.
+    assert plain_env is None
 
 
 # -- removed-runtime teardown failures are isolated (task 4) -----------------------

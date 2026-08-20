@@ -6,6 +6,14 @@ through a read-only bind mount.
 Skips ONLY when a Docker engine is genuinely unavailable (the dev container
 has none — no socket, and seccomp denies namespaces); GitHub CI's ubuntu
 runners have one, so both tests run on every PR.
+
+The ADR-0049 registry-credential plumbing is NOT proven here: the docker CLI
+treats a config.json load error as a non-fatal warning (so a malformed config
+never fails a build), and it consults DOCKER_CONFIG only on a registry
+round-trip that a build of a locally present base never makes — there is no
+reliable real-engine signal to assert. The build subprocess genuinely
+receiving DOCKER_CONFIG is proven deterministically at the DockerCtl seam in
+test_daemon.py (test_dockerctl_build_threads_docker_config_into_the_subprocess_env).
 """
 
 from __future__ import annotations
@@ -16,7 +24,7 @@ import time
 import uuid
 
 import pytest
-from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
+from theozolith_nodedaemon.dockerctl import DockerCtl
 from theozolith_nodedaemon.stacks import materialize_secrets
 
 BASE_IMAGE = "busybox:stable"
@@ -121,30 +129,6 @@ def test_no_command_runs_the_inherited_entrypoint_unchanged(entrypoint_image, st
     assert inspect.returncode == 0, inspect.stderr
     assert inspect.stdout.strip() == "/bin/echo"
     _logs_containing(container, "inherited-harness-entrypoint")
-
-
-def test_build_honors_the_docker_config_env(tmp_path):
-    """Against a real engine: DockerCtl.build genuinely plumbs DOCKER_CONFIG
-    into the build subprocess (ADR-0049). A malformed config.json in the
-    pointed-at dir makes the docker CLI fail at config load — before any
-    build — so a private-base pull credential written there is truly in
-    effect; the same trivial context builds fine with no DOCKER_CONFIG."""
-    context = tmp_path / "ctx"
-    context.mkdir()
-    (context / "Dockerfile").write_text(f"FROM {BASE_IMAGE}\n")
-    tag = f"ozolith-test-dockercfg:{uuid.uuid4().hex[:12]}"
-    bad = tmp_path / "docker"
-    bad.mkdir()
-    (bad / "config.json").write_text("this is not valid json")
-    try:
-        # Baseline: the ambient (or empty) config builds the trivial context.
-        DockerCtl().build(context, tag)
-        # With DOCKER_CONFIG pointed at the malformed dir, the CLI errors at
-        # config load — proof the env var reached the build subprocess.
-        with pytest.raises(DockerError):
-            DockerCtl().build(context, tag, docker_config=bad)
-    finally:
-        _docker("rmi", "--force", tag, timeout=60)
 
 
 def test_materialized_secret_is_readable_by_uid_1000_through_a_ro_bind_mount(tmp_path):
