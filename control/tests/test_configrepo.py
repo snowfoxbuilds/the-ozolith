@@ -1693,21 +1693,36 @@ def test_registry_credential_is_scoped_per_node(tmp_path):
     assert config.secret_names_for("box3") == set()
 
 
-@pytest.mark.parametrize("site", ["worker-type", "stack"])
+@pytest.mark.parametrize("site", ["worker-type", "stack", "generic-process", "generic-container"])
 def test_registry_prefixed_binding_value_is_rejected(tmp_path, site):
     """A `registry:`-prefixed name can never be a workload [secrets] binding
     value — an infra pull credential must not be routed into a Stack's env
-    (ADR-0049), at either declaration site."""
+    (ADR-0049), at every declaration site: worker-type defaults, thin-Stack
+    rebindings, and plain (workerless) process/container Stacks."""
     if site == "worker-type":
         driver_type(tmp_path, secrets={"GITHUB_TOKEN": "registry:ghcr.io"})
         thin_stack(tmp_path, "implementer", "claude-dev")
-    else:
+    elif site == "stack":
         driver_type(tmp_path)
         write(
             tmp_path,
             "stacks/implementer.toml",
             'worker_type = "claude-dev"\nnode = "box1"\n'
             '[secrets]\nGITHUB_TOKEN = "registry:ghcr.io"\n',
+        )
+    elif site == "generic-process":
+        write(
+            tmp_path,
+            "stacks/job.toml",
+            'kind = "process"\nnode = "box9"\nstate = "running"\n'
+            'command = "python3 -m job"\n[secrets]\nPULL_CRED = "registry:ghcr.io"\n',
+        )
+    else:  # generic-container
+        write(
+            tmp_path,
+            "stacks/web.toml",
+            'kind = "container"\nnode = "box9"\nstate = "running"\n'
+            'image = "ghcr.io/acme/web:1"\n[secrets]\nPULL_CRED = "registry:ghcr.io"\n',
         )
     with pytest.raises(ConfigRepoError, match="pull credential is infrastructure"):
         load_config(tmp_path)

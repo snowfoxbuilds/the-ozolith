@@ -771,12 +771,24 @@ class FakeRegistry:
     bearer challenge until a token is presented; the realm mints a token
     (recording whether HTTP Basic was sent). A PRIVATE base 403s the authorized
     HEAD when the token was minted anonymously (GHCR's failure mode) or when the
-    credential lacks pull scope (accept_credential=False)."""
+    credential lacks pull scope (accept_credential=False). A realm that REJECTS
+    the request outright (a registry account rejecting Basic at token-mint
+    time) is scripted with realm_status; a broken realm with realm_body."""
 
-    def __init__(self, *, private: bool = False, accept_credential: bool = True, digest=None):
+    def __init__(
+        self,
+        *,
+        private: bool = False,
+        accept_credential: bool = True,
+        digest=None,
+        realm_status: int = 0,
+        realm_body: bytes = b'{"token": "T"}',
+    ):
         self.private = private
         self.accept_credential = accept_credential
         self.digest = digest or ("sha256:" + "c" * 64)
+        self.realm_status = realm_status
+        self.realm_body = realm_body
         self.calls: list[tuple[str, str]] = []
         self.token_auth = None
         self.minted_authenticated = False
@@ -788,7 +800,11 @@ class FakeRegistry:
         if url.startswith(_TOKEN_REALM):
             self.token_auth = request.get_header("Authorization")
             self.minted_authenticated = self.token_auth is not None
-            return _FakeResp(body=b'{"token": "T"}')
+            if self.realm_status:
+                raise urllib.error.HTTPError(
+                    url, self.realm_status, "Denied", email.message.Message(), None
+                )
+            return _FakeResp(body=self.realm_body)
         # manifest HEAD
         if request.get_header("Authorization") is None:
             raise urllib.error.HTTPError(url, 401, "Unauthorized", _challenge(), None)
@@ -860,6 +876,47 @@ def test_a_refused_credential_says_the_credential_was_refused(monkeypatch):
     with pytest.raises(IngestError, match="credential was refused"):
         ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2", {"ghcr.io": "octocat:bad"})
     assert reg.minted_authenticated  # the credential WAS sent to the realm
+
+
+def test_a_realm_that_rejects_basic_auth_is_an_actionable_ingest_error(monkeypatch):
+    """The token realm itself 401s the Basic credential (rejection at
+    token-mint time, before any second manifest attempt): an IngestError
+    naming the host and the refused credential — never a raw HTTPError, and
+    never the Authorization header or credential material."""
+    reg = FakeRegistry(private=True, realm_status=401)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError) as exc:
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2", {"ghcr.io": "octocat:bad"})
+    msg = str(exc.value)
+    assert "registry:ghcr.io" in msg
+    assert "credential was refused" in msg
+    assert "Basic " not in msg
+    assert base64.b64encode(b"octocat:bad").decode() not in msg
+    # The realm rejection is terminal — no second manifest attempt.
+    assert [m for m, _ in reg.calls] == ["HEAD", "GET"]
+
+
+def test_an_anonymous_realm_rejection_names_the_secret_set_command(monkeypatch):
+    """A realm that refuses even the anonymous token request (some registries
+    401 the mint itself for private repos) points at `secret set` and the
+    digest-pin escape, same as the manifest-403 path."""
+    reg = FakeRegistry(private=True, realm_status=401)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError) as exc:
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
+    msg = str(exc.value)
+    assert "theozolith secret set registry:ghcr.io" in msg
+    assert "pin the base by digest" in msg
+    assert reg.token_auth is None  # the request really was anonymous
+
+
+def test_a_malformed_realm_response_is_an_actionable_ingest_error(monkeypatch):
+    """A realm answering 200 with a non-JSON body (an HTML error page) stays
+    inside the IngestError contract instead of leaking a JSONDecodeError."""
+    reg = FakeRegistry(realm_body=b"<html>oops</html>")
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError, match="malformed response"):
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
 
 
 def test_a_malformed_credential_is_rejected_loudly(monkeypatch):

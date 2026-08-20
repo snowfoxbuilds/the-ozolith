@@ -992,7 +992,36 @@ def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) ->
                 return digest
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and attempt == 1:
-                token = _registry_token(exc.headers.get("WWW-Authenticate", "") or "", credential)
+                # The token-realm round trip happens INSIDE this handler, so
+                # its failures would escape the sibling except clauses — wrap
+                # them here, where ref/registry/credential are known. A realm
+                # 401/403 is the credential refused at token-mint time (vs the
+                # manifest 403, where the anonymous token lacked pull scope);
+                # both get the same actionable hint because the operator
+                # remedy is the same. Never echo the Authorization header.
+                try:
+                    token = _registry_token(
+                        exc.headers.get("WWW-Authenticate", "") or "", credential
+                    )
+                except urllib.error.HTTPError as token_exc:
+                    if token_exc.code in (401, 403):
+                        raise IngestError(
+                            _resolve_http_hint(ref, registry, token_exc.code, credential)
+                        ) from token_exc
+                    raise IngestError(
+                        f"cannot resolve base tag {ref!r}: registry token endpoint"
+                        f" HTTP {token_exc.code}"
+                    ) from token_exc
+                except urllib.error.URLError as token_exc:
+                    raise IngestError(
+                        f"cannot resolve base tag {ref!r}: registry token endpoint"
+                        f" unreachable: {token_exc.reason}"
+                    ) from token_exc
+                except ValueError as token_exc:  # json.JSONDecodeError / UnicodeDecodeError
+                    raise IngestError(
+                        f"cannot resolve base tag {ref!r}: registry token endpoint"
+                        " returned a malformed response"
+                    ) from token_exc
                 continue
             raise IngestError(_resolve_http_hint(ref, registry, exc.code, credential)) from exc
         except urllib.error.URLError as exc:

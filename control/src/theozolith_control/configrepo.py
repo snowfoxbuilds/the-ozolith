@@ -844,13 +844,15 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
     state = _require_str(data, "state", context, default="running")
     if state not in DESIRED_STATES:
         raise ConfigRepoError(f"{context}: state must be one of {DESIRED_STATES}, got {state!r}")
+    secrets = _str_map(data, "secrets", context)
+    _guard_secret_bindings(secrets, context)
     stack = StackDef(
         name=name,
         kind=kind,
         node=_require_str(data, "node", context),
         state=state,
         env=_str_map(data, "env", context),
-        secrets=_str_map(data, "secrets", context),
+        secrets=secrets,
         command=_require_str(data, "command", context, default=""),
         image=_require_str(data, "image", context, default=""),
         ports=_str_list(data, "ports", context),
