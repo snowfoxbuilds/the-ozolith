@@ -1396,9 +1396,7 @@ def test_registry_secret_pull_404_when_scoped_but_unstored(control: ControlRig):
 def test_put_registry_secret_enforces_the_shape_guard(control: ControlRig):
     """The write surface rejects a malformed registry credential with an
     actionable 400; a well-formed one and any normal secret store fine."""
-    bad_value = control.admin(
-        "PUT", "/api/v1/secrets/registry:ghcr.io", body={"value": "no-colon"}
-    )
+    bad_value = control.admin("PUT", "/api/v1/secrets/registry:ghcr.io", body={"value": "no-colon"})
     assert bad_value.status_code == 400
     bad_name = control.admin("PUT", "/api/v1/secrets/registry:", body={"value": "u:t"})
     assert bad_name.status_code == 400

@@ -168,6 +168,7 @@ def validate_registry_secret(name: str, value: str) -> None:
             " GitHub username and a PAT with read:packages)"
         )
 
+
 # Where a node keeps per-Stack jobs directories unless a Stack's env says
 # otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
 # injects <base>/<stack-name> per process Stack; this module enforces that

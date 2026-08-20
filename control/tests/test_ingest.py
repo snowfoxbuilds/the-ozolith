@@ -743,8 +743,7 @@ _TOKEN_REALM = "https://auth.example/token"
 def _challenge() -> email.message.Message:
     hdrs = email.message.Message()
     hdrs["WWW-Authenticate"] = (
-        f'Bearer realm="{_TOKEN_REALM}",service="registry.example",'
-        'scope="repository:acme/run:pull"'
+        f'Bearer realm="{_TOKEN_REALM}",service="registry.example",scope="repository:acme/run:pull"'
     )
     return hdrs
 

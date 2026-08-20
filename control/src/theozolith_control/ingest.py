@@ -992,9 +992,7 @@ def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) ->
                 return digest
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and attempt == 1:
-                token = _registry_token(
-                    exc.headers.get("WWW-Authenticate", "") or "", credential
-                )
+                token = _registry_token(exc.headers.get("WWW-Authenticate", "") or "", credential)
                 continue
             raise IngestError(_resolve_http_hint(ref, registry, exc.code, credential)) from exc
         except urllib.error.URLError as exc:
