@@ -33,7 +33,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
-from theozolith_control import configdist, controltoml, joinstring, product, tls
+from theozolith_control import configdist, configrepo, controltoml, joinstring, product, tls
 from theozolith_control.configrepo import ConfigRepoError, DeployConfig, load_config
 from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
@@ -239,6 +239,24 @@ def create_app(
         # in-flight Run ride the heartbeat as deferrals (NODE-SUBSTRATE).
         store.record_deferrals(node, _list_of_dicts(body, "deferred_commands"))
         config_doc = _config().desired_state_for(node)
+        # Registry pull credentials (ADR-0049): names-only references so a node
+        # building a private-base recipe knows which stored credential feeds
+        # `docker build`. Derived from the running recipes' bases (the images
+        # already scoped into config_doc), filtered to credentials ACTUALLY
+        # STORED — a public-base fleet sees no new key, and the channel
+        # invariant holds (the value rides the node-scoped secrets pull, never
+        # the heartbeat). Scoping for the pull is secret_names_for's union.
+        registry_secrets: dict[str, str] = {}
+        for image in config_doc.get("images", []):
+            base = str(image.get("base", ""))
+            if not base:
+                continue
+            host = configrepo.registry_host(base)
+            secret_name = configrepo.REGISTRY_SECRET_PREFIX + host
+            if secret_store.get_secret_token(secret_name) is not None:
+                registry_secrets[host] = secret_name
+        if registry_secrets:
+            config_doc["registry_secrets"] = registry_secrets
         # Tier-2 cadence settings ride desired state (ADR-0023: control.toml
         # replaces per-node env files) — declarations, never values.
         config_doc["heartbeat_seconds"] = settings.heartbeat_seconds
@@ -449,6 +467,13 @@ def create_app(
         _secrets_channel_guard()
         body = await _json_body(request)
         value = _require(body, "value", str)
+        # A managed registry pull credential (ADR-0049) must be shape-valid —
+        # a plausible host in the name, a `<user>:<token>` value — or ingest
+        # and the node cannot use it; every other name stays shape-blind.
+        try:
+            configrepo.validate_registry_secret(name, value)
+        except ConfigRepoError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Encrypted before it touches the store; write-only entry — no API
         # returns a stored value to an admin (values are pull-only, to nodes).
         secret_store.put_secret(name, box.encrypt(value))

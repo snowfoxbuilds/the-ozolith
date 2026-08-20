@@ -52,6 +52,7 @@ from theozolith_worker.config import ConfigError, env_value
 from theozolith_control import (
     bearerhttp,
     bootstrap,
+    configrepo,
     controltoml,
     ingest,
     janitor,
@@ -731,7 +732,12 @@ def _init(args) -> int:
         )
     else:
         try:
-            ingest.ingest(str(settings.config_source), settings.config_repo, log=_log)
+            ingest.ingest(
+                str(settings.config_source),
+                settings.config_repo,
+                registry_credentials=_registry_credentials(settings),
+                log=_log,
+            )
         except ingest.IngestError as exc:
             raise SystemExit(f"error: initial ingest failed: {exc}") from exc
 
@@ -785,7 +791,12 @@ def _resume_local_node(settings: ControlSettings, nodedaemon_exec: str) -> int:
     _git_init(settings.config_source)
     localnode.write_scaffold(settings.config_source, node_name, log=_log)
     try:
-        ingest.ingest(str(settings.config_source), settings.config_repo, log=_log)
+        ingest.ingest(
+            str(settings.config_source),
+            settings.config_repo,
+            registry_credentials=_registry_credentials(settings),
+            log=_log,
+        )
     except ingest.IngestError as exc:
         raise SystemExit(f"error: initial ingest failed: {exc}") from exc
     _install_systemd_unit(settings, settings.control_port)
@@ -1174,6 +1185,51 @@ def _janitor_once(args) -> int:
 # -- operator subcommands (HTTP) -------------------------------------------------
 
 
+def _registry_credentials(settings) -> dict[str, str]:
+    """Stored ``registry:<host>`` pull credentials, decrypted for ingest's
+    authenticated base resolution (ADR-0049), keyed by host. Discovery is
+    strictly READ-ONLY: no store, or a store with no ``registry:`` secrets,
+    is ``{}`` without touching key material — reading must never create
+    ``store.db`` or the master key as a side effect of an ingest (fresh init
+    creates the key explicitly in ``_init``; a lost key must stay lost until
+    the operator restores it, never be silently replaced). The key loads only
+    when a registry credential actually exists — THEOZOLITH_MASTER_KEY(_FILE)
+    when set, else the EXISTING key file. A stored credential that will not
+    decrypt is FATAL: a corrupt credential must fail loud here, never silently
+    degrade to anonymous resolution that then 403s on the private base with a
+    misleading message."""
+    if not settings.store_db_path.is_file():
+        return {}
+    store = SecretStore(settings.store_db_path)
+    names = [n for n in store.secret_names() if n.startswith(configrepo.REGISTRY_SECRET_PREFIX)]
+    if not names:
+        return {}
+    key = env_value(os.environ, "THEOZOLITH_MASTER_KEY")
+    if not key:
+        if not settings.key_path.is_file():
+            raise SystemExit(
+                "error: registry credentials are stored but the master key is missing"
+                f" ({settings.key_path}) — restore the key file (it is never"
+                " regenerated here) or set THEOZOLITH_MASTER_KEY(_FILE)"
+            )
+        key = settings.key_path.read_text(encoding="utf-8").strip()
+    try:
+        box = SecretBox(key)
+    except CryptoError as exc:
+        raise SystemExit(f"error: {exc} — restore the master key") from exc
+    credentials: dict[str, str] = {}
+    for name in names:
+        host = name[len(configrepo.REGISTRY_SECRET_PREFIX) :]
+        try:
+            credentials[host] = box.decrypt(store.get_secret_token(name) or "")
+        except CryptoError as exc:
+            raise SystemExit(
+                f"error: registry credential {name!r} does not decrypt under the"
+                " master key — restore the key or re-store the credential"
+            ) from exc
+    return credentials
+
+
 def _config_ingest(args) -> int:
     """`theozolith config ingest` (ADR-0048): the only write path into the
     pinned build. Runs locally against the data dir — no server round-trip;
@@ -1183,7 +1239,13 @@ def _config_ingest(args) -> int:
     settings = load_settings()
     source = args.source or str(settings.config_source)
     try:
-        ingest.ingest(source, settings.config_repo, dry_run=args.dry_run, log=_log)
+        ingest.ingest(
+            source,
+            settings.config_repo,
+            dry_run=args.dry_run,
+            registry_credentials=_registry_credentials(settings),
+            log=_log,
+        )
     except ingest.IngestError as exc:
         raise SystemExit(f"error: {exc}") from exc
     if not args.dry_run:

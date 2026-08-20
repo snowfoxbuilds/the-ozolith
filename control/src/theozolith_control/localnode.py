@@ -766,7 +766,12 @@ The finish line, three steps:
        docker inspect --format '{{{{index .RepoDigests 0}}}}' {ref}
 
    or drop the `@sha256:...` suffix entirely and let ingest resolve the tag
-   against the registry (ADR-0048).
+   against the registry (ADR-0048). The scaffolded base
+   (`{SCAFFOLD_BASE_IMAGE}`) is a **private** first-party image: to let ingest
+   resolve it (and nodes pull it at build time) store a GHCR pull credential
+   once (ADR-0049) — value `<github-user>:<PAT with read:packages>`:
+
+       sudo theozolith secret set registry:ghcr.io
 
 2. **Enter the secrets** the worker type references (values go to the
    encrypted store on the Control Node, never into this repo):

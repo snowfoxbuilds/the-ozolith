@@ -185,3 +185,180 @@ def test_config_ingest_refusal_exits_nonzero(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(ingest, "ingest", refuse)
     with pytest.raises(SystemExit, match="uncommitted changes"):
         cli_main(["config", "ingest"])
+
+
+# -- registry pull credentials for ingest (ADR-0049) ---------------------------
+
+
+def test_registry_credentials_decrypts_only_registry_prefixed_secrets(tmp_path, monkeypatch):
+    """`_registry_credentials` returns host -> `<user>:<token>` for stored
+    `registry:` secrets, ignores every other name, and NEVER creates store.db
+    as a side effect when none exists."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    settings = make_settings(tmp_path)
+    assert cli._registry_credentials(settings) == {}
+    assert not settings.store_db_path.exists()  # reading created nothing
+    assert not settings.key_path.exists()  # ... and no master key either
+
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    key = generate_key()
+    settings.key_path.write_text(key + "\n", encoding="utf-8")
+    box = SecretBox(key)
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+    store.put_secret("registry:localhost:5000", box.encrypt("u:t"))
+    store.put_secret("github-implementer", box.encrypt("ghp_ignored"))
+
+    assert cli._registry_credentials(settings) == {
+        "ghcr.io": "octocat:ghp_token",
+        "localhost:5000": "u:t",
+    }
+
+
+def test_registry_credentials_fails_loud_on_a_corrupt_credential(tmp_path, monkeypatch):
+    """A stored credential that will not decrypt is FATAL — never a silent
+    degrade to anonymous resolution that then 403s with a misleading message."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(generate_key())  # a DIFFERENT key than the one on disk
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+    settings.key_path.write_text(generate_key() + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="does not decrypt"):
+        cli._registry_credentials(settings)
+
+
+def test_registry_credentials_without_registry_secrets_never_touches_the_key(tmp_path, monkeypatch):
+    """A store holding only ordinary secrets is the common public-base
+    deployment: discovery returns {} WITHOUT loading — or creating — any key
+    material (the throwaway box below never touches disk)."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY_FILE", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(generate_key())
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("github-implementer", box.encrypt("ghp_ordinary"))
+
+    assert cli._registry_credentials(settings) == {}
+    assert not settings.key_path.exists()  # no key was read OR generated
+
+
+def test_registry_credentials_missing_key_fails_without_creating_one(tmp_path, monkeypatch):
+    """A registry secret with no master key anywhere is FATAL and actionable —
+    and the read path must never manufacture a replacement key: a lost key
+    stays lost until the operator restores it (recovery material is sacred)."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY_FILE", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(generate_key())
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+
+    with pytest.raises(SystemExit, match="master key is missing"):
+        cli._registry_credentials(settings)
+    assert not settings.key_path.exists()  # nothing was created or replaced
+
+
+def test_registry_credentials_invalid_key_material_is_a_clean_exit(tmp_path, monkeypatch):
+    """Garbage in master.key surfaces as an actionable SystemExit, never a raw
+    CryptoError traceback — and the file is left exactly as found."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY_FILE", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(generate_key())
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+    settings.key_path.write_text("not-a-fernet-key\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="invalid master key"):
+        cli._registry_credentials(settings)
+    assert settings.key_path.read_text(encoding="utf-8") == "not-a-fernet-key\n"
+
+
+def test_registry_credentials_env_key_needs_no_key_file(tmp_path, monkeypatch):
+    """THEOZOLITH_MASTER_KEY alone decrypts stored registry credentials — the
+    key-file read is the fallback, and the env path writes no file either."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    key = generate_key()
+    monkeypatch.setenv("THEOZOLITH_MASTER_KEY", key)
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY_FILE", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(key)
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+
+    assert cli._registry_credentials(settings) == {"ghcr.io": "octocat:ghp_token"}
+    assert not settings.key_path.exists()
+
+
+def test_config_ingest_dry_run_discovery_leaves_the_filesystem_untouched(tmp_path, monkeypatch):
+    """`config ingest --dry-run` on a fresh data dir: credential discovery must
+    change NOTHING — no store.db, no master.key, no pinned build. The whole
+    data-dir tree is byte-listed before and after."""
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY_FILE", raising=False)
+    data_dir = tmp_path / "home"
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(data_dir))
+
+    digest = "a" * 64
+    src = tmp_path / "config-src"
+    for relpath, text in {
+        "worker-types/claude-dev.toml": (
+            'driver = "builtin:implementer"\nadapter = "claude"\n'
+            'model = "claude-sonnet-5"\nworkspace = "acme/sandbox"\n'
+            f'base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{digest}"\n'
+            '[secrets]\nGITHUB_TOKEN = "github-implementer"\n'
+        ),
+        "stacks/implementer.toml": 'worker_type = "claude-dev"\nnode = "box1"\nstate = "stopped"\n',
+        "control.toml": "[settings]\nheartbeat_seconds = 30\n",
+        "product.toml": '[product]\nversion = "0.3.0"\n',
+    }.items():
+        target = src / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def tree(root: Path) -> set[str]:
+        if not root.exists():
+            return set()
+        return {str(p.relative_to(root)) for p in root.rglob("*")}
+
+    before = tree(data_dir)
+    assert cli_main(["config", "ingest", "--dry-run", str(src)]) == 0
+    assert tree(data_dir) == before
+    assert not (data_dir / "secrets").exists()  # in particular: no key, no store
+    assert not (data_dir / "configs").exists()  # ... and no pinned build

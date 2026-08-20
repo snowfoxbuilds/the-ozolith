@@ -12,9 +12,19 @@ every Stack staged at `state = "stopped"`. `base` images are tag-only: this
 repo carries no computed pins (ADR-0048) — ingest resolves each tag to its
 digest and records it in the pinned build's pins.toml (digest-pin a base
 yourself only when the digest is a human decision, e.g. no registry access
-at ingest time). What stays yours to fill in before flipping a Stack to
-running: the tailscale checksum (a fail-closed placeholder ingest refuses on
-a running Stack), secret values, and real workspaces.
+at ingest time). The four example bases are
+`ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0`, a **private** first-party
+image; before the first ingest, store a GHCR pull credential so ingest can
+resolve its digest (and so nodes can pull it at build time, ADR-0049):
+
+```sh
+theozolith secret set registry:ghcr.io   # value: <github-user>:<PAT with read:packages>
+```
+
+Public bases need no credential (ingest resolves them anonymously). What
+stays yours to fill in before flipping a Stack to running: the tailscale
+checksum (a fail-closed placeholder ingest refuses on a running Stack),
+secret values, and real workspaces.
 
 ## Knowledge (`knowledge/`, ADR-0048)
 

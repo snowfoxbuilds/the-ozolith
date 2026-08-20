@@ -1314,3 +1314,95 @@ def test_no_desired_distribution_stays_eligible_for_every_report(control: Contro
     assert control.dispatch(worker="w", node="box1").json()["issue"]
     state = control.admin("GET", "/api/v1/state").json()
     assert state["config_drivers_hash"] is None
+
+
+# -- managed registry pull credentials (ADR-0049) ------------------------------
+
+import json  # noqa: E402
+
+REGISTRY_SECRET = "registry:ghcr.io"  # WORKER_TYPE_TOML's base is ghcr.io/x/run
+
+
+def _store_secret(control: ControlRig, name: str, value: str) -> None:
+    control.secret_store.put_secret(name, control.box.encrypt(value))
+
+
+def _running_worker_on_box1(control: ControlRig) -> None:
+    control.write_config("worker-types/claude-dev.toml", WORKER_TYPE_TOML)
+    control.write_config("stacks/worker.toml", STACK_TOML)  # defaults to running
+
+
+def test_heartbeat_carries_registry_secret_names_only_when_stored(control: ControlRig):
+    """The heartbeat references a stored `registry:<host>` credential by NAME
+    only (the value rides the node-scoped pull), and only when it is stored."""
+    _running_worker_on_box1(control)
+    assert "registry_secrets" not in control.heartbeat(node="box1").json()["config"]
+
+    _store_secret(control, REGISTRY_SECRET, "octocat:ghp_token")
+    config = control.heartbeat(node="box1").json()["config"]
+    assert config["registry_secrets"] == {"ghcr.io": REGISTRY_SECRET}
+    # Channel invariant: the value never rides the heartbeat.
+    assert "octocat" not in json.dumps(config)
+
+
+def test_registry_secret_for_a_different_host_never_rides(control: ControlRig):
+    """A stored credential for a host this node builds no base from is not
+    referenced — box1's base is ghcr.io, a Hub credential stays off the wire."""
+    _running_worker_on_box1(control)
+    _store_secret(control, "registry:registry-1.docker.io", "u:t")
+    assert "registry_secrets" not in control.heartbeat(node="box1").json()["config"]
+
+
+def test_stopped_worker_stack_carries_no_registry_secret(control: ControlRig):
+    """A stopped Stack builds no image, so no base is pulled and no credential
+    is referenced (mirrors the images scoping)."""
+    control.write_config("worker-types/claude-dev.toml", WORKER_TYPE_TOML)
+    control.write_config("stacks/worker.toml", STACK_TOML + 'state = "stopped"\n')
+    _store_secret(control, REGISTRY_SECRET, "octocat:ghp_token")
+    assert "registry_secrets" not in control.heartbeat(node="box1").json()["config"]
+
+
+def test_registry_secret_pull_allowed_when_scoped_and_stored(control: ControlRig):
+    _running_worker_on_box1(control)
+    _store_secret(control, REGISTRY_SECRET, "octocat:ghp_token")
+    resp = control.node_post(
+        "/api/v1/secrets/pull", {"node": "box1", "names": [REGISTRY_SECRET]}, node="box1"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["secrets"] == {REGISTRY_SECRET: "octocat:ghp_token"}
+
+
+def test_registry_secret_pull_forbidden_off_the_running_node(control: ControlRig):
+    """A node with nothing placed on it may not pull the credential (403) — the
+    same node-scoping the workload secrets get."""
+    _running_worker_on_box1(control)
+    _store_secret(control, REGISTRY_SECRET, "octocat:ghp_token")
+    resp = control.node_post(
+        "/api/v1/secrets/pull", {"node": "box2", "names": [REGISTRY_SECRET]}, node="box2"
+    )
+    assert resp.status_code == 403
+
+
+def test_registry_secret_pull_404_when_scoped_but_unstored(control: ControlRig):
+    """Scoped (running type's base host) but never stored -> the ordinary 404,
+    not a scoping 403."""
+    _running_worker_on_box1(control)
+    resp = control.node_post(
+        "/api/v1/secrets/pull", {"node": "box1", "names": [REGISTRY_SECRET]}, node="box1"
+    )
+    assert resp.status_code == 404
+
+
+def test_put_registry_secret_enforces_the_shape_guard(control: ControlRig):
+    """The write surface rejects a malformed registry credential with an
+    actionable 400; a well-formed one and any normal secret store fine."""
+    bad_value = control.admin("PUT", "/api/v1/secrets/registry:ghcr.io", body={"value": "no-colon"})
+    assert bad_value.status_code == 400
+    bad_name = control.admin("PUT", "/api/v1/secrets/registry:", body={"value": "u:t"})
+    assert bad_name.status_code == 400
+    good = control.admin("PUT", "/api/v1/secrets/registry:ghcr.io", body={"value": "octo:tok"})
+    assert good.status_code == 200
+    normal = control.admin(
+        "PUT", "/api/v1/secrets/github-implementer", body={"value": "opaque-value"}
+    )
+    assert normal.status_code == 200
