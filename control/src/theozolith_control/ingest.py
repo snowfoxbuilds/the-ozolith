@@ -932,8 +932,10 @@ def _registry_token(www_authenticate: str, credential: str = "") -> str:
         request.add_header("Authorization", f"Basic {basic}")
     with _urlopen(request, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    token = data.get("token") or data.get("access_token") or ""
-    if not token:
+    if not isinstance(data, dict):
+        raise IngestError("registry token endpoint returned a malformed response")
+    token = data.get("token") or data.get("access_token")
+    if not isinstance(token, str) or not token:
         raise IngestError("registry token endpoint returned no token")
     return token
 

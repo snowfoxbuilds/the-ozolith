@@ -1187,22 +1187,38 @@ def _janitor_once(args) -> int:
 
 def _registry_credentials(settings) -> dict[str, str]:
     """Stored ``registry:<host>`` pull credentials, decrypted for ingest's
-    authenticated base resolution (ADR-0049), keyed by host. Empty when no
-    secret store exists yet — reading the store must NEVER create ``store.db``
-    as a side effect of an ingest (a fresh init's initial ingest resolves
-    anonymously). A stored credential that will not decrypt is FATAL: a corrupt
-    credential must fail loud here, never silently degrade to anonymous
-    resolution that then 403s on the private base with a misleading message."""
+    authenticated base resolution (ADR-0049), keyed by host. Discovery is
+    strictly READ-ONLY: no store, or a store with no ``registry:`` secrets,
+    is ``{}`` without touching key material — reading must never create
+    ``store.db`` or the master key as a side effect of an ingest (fresh init
+    creates the key explicitly in ``_init``; a lost key must stay lost until
+    the operator restores it, never be silently replaced). The key loads only
+    when a registry credential actually exists — THEOZOLITH_MASTER_KEY(_FILE)
+    when set, else the EXISTING key file. A stored credential that will not
+    decrypt is FATAL: a corrupt credential must fail loud here, never silently
+    degrade to anonymous resolution that then 403s on the private base with a
+    misleading message."""
     if not settings.store_db_path.is_file():
         return {}
-    box = SecretBox(
-        env_value(os.environ, "THEOZOLITH_MASTER_KEY") or ensure_key_file(settings.key_path)
-    )
     store = SecretStore(settings.store_db_path)
+    names = [n for n in store.secret_names() if n.startswith(configrepo.REGISTRY_SECRET_PREFIX)]
+    if not names:
+        return {}
+    key = env_value(os.environ, "THEOZOLITH_MASTER_KEY")
+    if not key:
+        if not settings.key_path.is_file():
+            raise SystemExit(
+                "error: registry credentials are stored but the master key is missing"
+                f" ({settings.key_path}) — restore the key file (it is never"
+                " regenerated here) or set THEOZOLITH_MASTER_KEY(_FILE)"
+            )
+        key = settings.key_path.read_text(encoding="utf-8").strip()
+    try:
+        box = SecretBox(key)
+    except CryptoError as exc:
+        raise SystemExit(f"error: {exc} — restore the master key") from exc
     credentials: dict[str, str] = {}
-    for name in store.secret_names():
-        if not name.startswith(configrepo.REGISTRY_SECRET_PREFIX):
-            continue
+    for name in names:
         host = name[len(configrepo.REGISTRY_SECRET_PREFIX) :]
         try:
             credentials[host] = box.decrypt(store.get_secret_token(name) or "")

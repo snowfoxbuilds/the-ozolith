@@ -919,6 +919,38 @@ def test_a_malformed_realm_response_is_an_actionable_ingest_error(monkeypatch):
         ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
 
 
+@pytest.mark.parametrize("body", [b"[]", b"null", b'"tok"', b"7"])
+def test_realm_json_that_is_not_an_object_is_an_actionable_ingest_error(monkeypatch, body):
+    """Valid JSON that is not an object (an array, null, or a scalar) is the
+    same malformed-realm story — never an AttributeError escaping the
+    IngestError contract."""
+    reg = FakeRegistry(realm_body=body)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError, match="malformed response"):
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
+
+
+@pytest.mark.parametrize(
+    "body", [b'{"token": 123}', b'{"token": {"v": "x"}}', b'{"token": ""}', b"{}"]
+)
+def test_a_realm_token_that_is_not_a_nonempty_string_is_rejected(monkeypatch, body):
+    """The minted token must be a non-empty string before it rides a Bearer
+    header: numbers, nested objects, empty strings, and absent keys all get
+    the actionable no-token message, never a TypeError downstream."""
+    reg = FakeRegistry(realm_body=body)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError, match="returned no token"):
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
+
+
+def test_the_access_token_alias_remains_accepted(monkeypatch):
+    """Registries that answer with `access_token` instead of `token` (the
+    OAuth2 spelling) keep working."""
+    reg = FakeRegistry(realm_body=b'{"access_token": "T"}')
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    assert ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2") == reg.digest
+
+
 def test_a_malformed_credential_is_rejected_loudly(monkeypatch):
     """A stored credential missing the `<user>:<token>` colon fails loud at the
     token step, naming the contract."""
