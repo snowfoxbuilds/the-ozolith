@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from theozolith_control import controltoml, joinstring, tls
+from theozolith_control import configrepo, controltoml, joinstring, tls
 from theozolith_control.crypto import SecretBox
 from theozolith_control.origin import derive_origin, parse_browser_origin
 from theozolith_control.secretstore import SecretStore
@@ -345,6 +345,13 @@ def mount_web(
         value = str(form.get("value", ""))
         if not name or not value:
             return HTMLResponse("both a name and a value are required", status_code=400)
+        # Same shape guard as PUT /api/v1/secrets/{name} (ADR-0049): a
+        # `registry:<host>` pull credential must name a plausible host and
+        # carry a `<user>:<token>` value; every other name stays shape-blind.
+        try:
+            configrepo.validate_registry_secret(name, value)
+        except configrepo.ConfigRepoError as exc:
+            return HTMLResponse(str(exc), status_code=400)
         # The same write as PUT /api/v1/secrets/{name}: encrypted before it
         # touches the store; nothing ever reads it back out to a browser.
         secret_store.put_secret(name, box.encrypt(value))

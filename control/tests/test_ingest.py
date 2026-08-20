@@ -727,3 +727,205 @@ def test_resolve_image_digest_ref_parsing():
     with pytest.raises(IngestError, match="already carries a digest"):
         _split_image_ref(f"ghcr.io/acme/run@sha256:{'a' * 64}")
     assert callable(resolve_image_digest)
+
+
+# -- authenticated base resolution (ADR-0049) -----------------------------------
+
+import base64  # noqa: E402
+import email.message  # noqa: E402
+import urllib.error  # noqa: E402
+
+from theozolith_control import ingest as ingest_mod  # noqa: E402
+
+_TOKEN_REALM = "https://auth.example/token"
+
+
+def _challenge() -> email.message.Message:
+    hdrs = email.message.Message()
+    hdrs["WWW-Authenticate"] = (
+        f'Bearer realm="{_TOKEN_REALM}",service="registry.example",'
+        'scope="repository:acme/run:pull"'
+    )
+    return hdrs
+
+
+class _FakeResp:
+    """A context-manager response over ingest._urlopen: dict headers for the
+    manifest HEAD, a JSON body for the token realm."""
+
+    def __init__(self, *, headers=None, body: bytes = b""):
+        self.headers = headers or {}
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class FakeRegistry:
+    """A scripted registry over ingest._urlopen. The manifest HEAD 401s with a
+    bearer challenge until a token is presented; the realm mints a token
+    (recording whether HTTP Basic was sent). A PRIVATE base 403s the authorized
+    HEAD when the token was minted anonymously (GHCR's failure mode) or when the
+    credential lacks pull scope (accept_credential=False)."""
+
+    def __init__(self, *, private: bool = False, accept_credential: bool = True, digest=None):
+        self.private = private
+        self.accept_credential = accept_credential
+        self.digest = digest or ("sha256:" + "c" * 64)
+        self.calls: list[tuple[str, str]] = []
+        self.token_auth = None
+        self.minted_authenticated = False
+
+    def __call__(self, request, timeout=None):
+        url = request.full_url
+        method = request.get_method()
+        self.calls.append((method, url))
+        if url.startswith(_TOKEN_REALM):
+            self.token_auth = request.get_header("Authorization")
+            self.minted_authenticated = self.token_auth is not None
+            return _FakeResp(body=b'{"token": "T"}')
+        # manifest HEAD
+        if request.get_header("Authorization") is None:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", _challenge(), None)
+        if self.private and (not self.minted_authenticated or not self.accept_credential):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", email.message.Message(), None)
+        return _FakeResp(headers={"Docker-Content-Digest": self.digest})
+
+
+def test_public_base_resolves_anonymously_over_the_url_seam(monkeypatch):
+    """Regression: the anonymous 401 -> token -> digest fast path public bases
+    keep, exercised through the _urlopen seam."""
+    reg = FakeRegistry(private=False)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    assert ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2") == reg.digest
+    assert reg.token_auth is None  # anonymous token, no Basic header
+    assert [m for m, _ in reg.calls] == ["HEAD", "GET", "HEAD"]
+
+
+def test_private_base_resolves_with_a_registry_credential(monkeypatch):
+    """The realm request carries the stored credential as HTTP Basic, so GHCR
+    mints a token that can pull the private manifest."""
+    reg = FakeRegistry(private=True)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    digest = ingest_mod.resolve_image_digest(
+        "ghcr.io/acme/run:1.2", {"ghcr.io": "octocat:ghp_token"}
+    )
+    assert digest == reg.digest
+    assert reg.token_auth == "Basic " + base64.b64encode(b"octocat:ghp_token").decode()
+
+
+def test_a_200_on_the_first_head_skips_the_token_round_trip(monkeypatch):
+    """A registry that serves the manifest with no challenge never hits the
+    token realm — attempt 1 is authoritative."""
+
+    class OpenRegistry:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def __call__(self, request, timeout=None):
+            self.calls.append(request.get_method())
+            return _FakeResp(headers={"Docker-Content-Digest": "sha256:" + "d" * 64})
+
+    reg = OpenRegistry()
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    assert ingest_mod.resolve_image_digest("registry.example/acme/run:1") == "sha256:" + "d" * 64
+    assert reg.calls == ["HEAD"]
+
+
+def test_private_base_without_a_credential_names_the_secret_set_command(monkeypatch):
+    """The actionable message: the exact host, the exact `secret set` command,
+    read:packages, and the digest-pin escape hatch."""
+    reg = FakeRegistry(private=True)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError) as exc:
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2")
+    msg = str(exc.value)
+    assert "theozolith secret set registry:ghcr.io" in msg
+    assert "read:packages" in msg
+    assert "pin the base by digest" in msg
+    # No third manifest attempt after the 403.
+    assert [m for m, _ in reg.calls] == ["HEAD", "GET", "HEAD"]
+
+
+def test_a_refused_credential_says_the_credential_was_refused(monkeypatch):
+    """A credential that authenticates but lacks pull scope yields a distinct
+    message that points at the stored value, not `secret set`."""
+    reg = FakeRegistry(private=True, accept_credential=False)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError, match="credential was refused"):
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2", {"ghcr.io": "octocat:bad"})
+    assert reg.minted_authenticated  # the credential WAS sent to the realm
+
+
+def test_a_malformed_credential_is_rejected_loudly(monkeypatch):
+    """A stored credential missing the `<user>:<token>` colon fails loud at the
+    token step, naming the contract."""
+    reg = FakeRegistry(private=True)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    with pytest.raises(IngestError, match="<user>:<token>"):
+        ingest_mod.resolve_image_digest("ghcr.io/acme/run:1.2", {"ghcr.io": "no-colon"})
+
+
+def test_ingest_resolves_a_private_tag_only_base_with_a_credential(tmp_path, monkeypatch):
+    """End to end: `ingest(registry_credentials=...)` drives the default
+    resolver to pin a private tag-only base."""
+    src = source_repo(tmp_path, knowledge=False)
+    write(
+        src,
+        "worker-types/claude-dev.toml",
+        'driver = "builtin:implementer"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{TAG_ONLY_BASE}"\n',
+    )
+    _commit_all(src, "tag only")
+    reg = FakeRegistry(private=True)
+    monkeypatch.setattr(ingest_mod, "_urlopen", reg)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(
+        str(src),
+        pinned,
+        registry_credentials={"ghcr.io": "octocat:tok"},
+        log=lambda *_: None,
+    )
+    assert report.resolved_bases == {TAG_ONLY_BASE: reg.digest}
+    assert reg.minted_authenticated
+    wt = configrepo.load_config(pinned).worker_types["claude-dev"]
+    assert wt.base == f"{TAG_ONLY_BASE}@{reg.digest}"
+
+
+def test_an_injected_resolver_ignores_registry_credentials(tmp_path, monkeypatch):
+    """The injected resolver seam wins — registry_credentials never reaches the
+    network path, so every existing fake keeps working."""
+    src = source_repo(tmp_path, knowledge=False)
+    write(
+        src,
+        "worker-types/claude-dev.toml",
+        'driver = "builtin:implementer"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{TAG_ONLY_BASE}"\n',
+    )
+    _commit_all(src, "tag only")
+
+    def boom(*a, **k):
+        raise AssertionError("_urlopen must not be called when a resolver is injected")
+
+    monkeypatch.setattr(ingest_mod, "_urlopen", boom)
+    seen: list[str] = []
+
+    def resolver(ref: str) -> str:
+        seen.append(ref)
+        return "sha256:" + "e" * 64
+
+    report = ingest(
+        str(src),
+        pinned_dir(tmp_path),
+        resolve_digest=resolver,
+        registry_credentials={"ghcr.io": "octocat:tok"},
+        log=lambda *_: None,
+    )
+    assert seen == [TAG_ONLY_BASE]
+    assert report.resolved_bases == {TAG_ONLY_BASE: "sha256:" + "e" * 64}

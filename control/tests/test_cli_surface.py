@@ -185,3 +185,55 @@ def test_config_ingest_refusal_exits_nonzero(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(ingest, "ingest", refuse)
     with pytest.raises(SystemExit, match="uncommitted changes"):
         cli_main(["config", "ingest"])
+
+
+# -- registry pull credentials for ingest (ADR-0049) ---------------------------
+
+
+def test_registry_credentials_decrypts_only_registry_prefixed_secrets(tmp_path, monkeypatch):
+    """`_registry_credentials` returns host -> `<user>:<token>` for stored
+    `registry:` secrets, ignores every other name, and NEVER creates store.db
+    as a side effect when none exists."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    settings = make_settings(tmp_path)
+    assert cli._registry_credentials(settings) == {}
+    assert not settings.store_db_path.exists()  # reading created nothing
+
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    key = generate_key()
+    settings.key_path.write_text(key + "\n", encoding="utf-8")
+    box = SecretBox(key)
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+    store.put_secret("registry:localhost:5000", box.encrypt("u:t"))
+    store.put_secret("github-implementer", box.encrypt("ghp_ignored"))
+
+    assert cli._registry_credentials(settings) == {
+        "ghcr.io": "octocat:ghp_token",
+        "localhost:5000": "u:t",
+    }
+
+
+def test_registry_credentials_fails_loud_on_a_corrupt_credential(tmp_path, monkeypatch):
+    """A stored credential that will not decrypt is FATAL — never a silent
+    degrade to anonymous resolution that then 403s with a misleading message."""
+    from controlrig import make_settings
+    from theozolith_control import cli
+    from theozolith_control.crypto import SecretBox, generate_key
+    from theozolith_control.secretstore import SecretStore
+
+    monkeypatch.delenv("THEOZOLITH_MASTER_KEY", raising=False)
+    settings = make_settings(tmp_path)
+    settings.secrets_dir.mkdir(parents=True, exist_ok=True)
+    box = SecretBox(generate_key())  # a DIFFERENT key than the one on disk
+    store = SecretStore(settings.store_db_path)
+    store.put_secret("registry:ghcr.io", box.encrypt("octocat:ghp_token"))
+    settings.key_path.write_text(generate_key() + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="does not decrypt"):
+        cli._registry_credentials(settings)

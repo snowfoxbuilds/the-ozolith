@@ -122,6 +122,52 @@ DRIVER_LAUNCHER = "theozolith-driver"
 CUSTOM_DRIVER_PREFIX = "drivers/"
 CUSTOM_DRIVER_NAME = re.compile(r"[a-z_][a-z0-9_]*")
 
+# A managed registry pull credential (ADR-0049): the stored secret named
+# ``registry:<host>`` (value ``<user>:<token>``) that ingest uses to resolve a
+# PRIVATE base image digest and the container-host uses to pull it. The prefix
+# is reserved: a ``registry:``-prefixed name can never be a workload [secrets]
+# binding value (an infra pull credential must never be routed into a Stack's
+# environment by a config edit) — enforced by _guard_secret_bindings.
+REGISTRY_SECRET_PREFIX = "registry:"
+
+
+def registry_host(ref: str) -> str:
+    """The registry host of a base image ref — the key its ``registry:<host>``
+    pull credential is stored under (ADR-0049). Accepts a digest-pinned ref
+    (loaded ``base`` values carry ``@sha256:…``): the digest is stripped, then
+    the ingest resolver's first-component rule applies — a dotted, ported, or
+    ``localhost`` first path element IS the registry; anything else is Docker
+    Hub shorthand, normalized to ``registry-1.docker.io`` (the node-side
+    ``config.json`` writer duplicates the Hub auth under docker's legacy key)."""
+    ref = ref.split("@", 1)[0]
+    head, _, rest = ref.partition("/")
+    if rest and ("." in head or ":" in head or head == "localhost"):
+        return head
+    return "registry-1.docker.io"
+
+
+def validate_registry_secret(name: str, value: str) -> None:
+    """Shape-check a secret at the WRITE surface (PUT /api/v1/secrets and the
+    web form, ADR-0049). Only ``registry:``-prefixed names are constrained —
+    a managed registry pull credential must name a plausible host and carry a
+    ``<user>:<token>`` value, or ingest and the node cannot use it. Every
+    other name stays shape-blind (secret values are opaque). Raises
+    ``ConfigRepoError`` with an actionable message on a malformed credential."""
+    if not name.startswith(REGISTRY_SECRET_PREFIX):
+        return
+    host = name[len(REGISTRY_SECRET_PREFIX) :]
+    if not host or "/" in host or any(ch.isspace() for ch in host):
+        raise ConfigRepoError(
+            f"secret name {name!r} is not a usable registry credential — "
+            f"'{REGISTRY_SECRET_PREFIX}<host>' needs a plausible registry host"
+            " (e.g. registry:ghcr.io, registry:localhost:5000)"
+        )
+    if ":" not in value:
+        raise ConfigRepoError(
+            f"registry credential {name!r} must be '<user>:<token>' (e.g. a"
+            " GitHub username and a PAT with read:packages)"
+        )
+
 # Where a node keeps per-Stack jobs directories unless a Stack's env says
 # otherwise — must match nodedaemon.daemon.DEFAULT_JOBS_BASE. The daemon
 # injects <base>/<stack-name> per process Stack; this module enforces that
@@ -480,10 +526,20 @@ class DeployConfig:
 
     def secret_names_for(self, node: str) -> set[str]:
         """The node-scoping rule: only secrets referenced by Stacks placed
-        on the node may be pulled by it (NODE-SUBSTRATE.md)."""
+        on the node may be pulled by it (NODE-SUBSTRATE.md). This includes the
+        managed ``registry:<host>`` pull credential (ADR-0049) for every
+        worker type behind a RUNNING worker-type Stack on the node — the same
+        running-recipe rule ``desired_state_for`` uses for ``images``, so a
+        node may pull only the pull credential of a base it will actually
+        build."""
         names: set[str] = set()
         for stack in self.stacks_for(node):
             names.update(stack.secrets.values())
+        for stack in self.stacks_for(node):
+            if stack.worker_type and stack.state == "running":
+                wt = self.worker_types.get(stack.worker_type)
+                if wt is not None:
+                    names.add(REGISTRY_SECRET_PREFIX + registry_host(wt.base))
         return names
 
     def _compose_files(self, stack: StackDef) -> list[dict[str, str]]:
@@ -640,6 +696,22 @@ def _guard_secret_slots(secrets: dict[str, str], context: str) -> None:
             )
 
 
+def _guard_secret_bindings(secrets: dict[str, str], context: str) -> None:
+    """A [secrets] binding VALUE (the stored secret name) may not name a
+    managed registry pull credential (ADR-0049): ``registry:<host>`` is
+    infrastructure delivered to container *builds*, never routed into workload
+    env by a config edit. Guarded at both declaration sites (worker-type
+    default bindings and per-Stack rebindings)."""
+    for slot, stored_name in secrets.items():
+        if stored_name.startswith(REGISTRY_SECRET_PREFIX):
+            raise ConfigRepoError(
+                f"{context}: [secrets] {slot} binds {stored_name!r} — a"
+                f" '{REGISTRY_SECRET_PREFIX}' pull credential is infrastructure"
+                " (ADR-0049), never a workload secret; it cannot be routed into"
+                " a Stack's environment"
+            )
+
+
 # Fields that a fat pre-ADR-0044 Stack carried but that now live in the worker
 # type. A thin worker-type Stack that still declares one is rejected by name.
 # ``secrets`` moved back OUT of this list (ADR-0047): the type declares the
@@ -709,6 +781,7 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
     # enter the Config Repo (ADR-0006).
     secrets = _str_map(data, "secrets", context)
     _guard_secret_slots(secrets, context)
+    _guard_secret_bindings(secrets, context)
     env = _str_map(data, "env", context)
     # Exact names, not a *_MODEL glob: a worker-type Stack's [env] was the
     # last per-placement override of the type's identity fields; with model
@@ -924,6 +997,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
     # a required slot every instantiating Stack must bind.
     secrets = _str_map(data, "secrets", context)
     _guard_secret_slots(secrets, context)
+    _guard_secret_bindings(secrets, context)
     return WorkerTypeDef(
         name=name,
         base=base,

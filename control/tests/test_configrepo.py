@@ -119,8 +119,13 @@ def test_driver_worker_type_and_thin_stack_resolve_end_to_end(tmp_path):
         "GITHUB_TOKEN": "github-implementer",
         "ANTHROPIC_API_KEY": "anthropic-api-key",
     }
-    # Type-owned secrets are node-scoped through the resolved Stack.
-    assert config.secret_names_for("box1") == {"github-implementer", "anthropic-api-key"}
+    # Type-owned secrets are node-scoped through the resolved Stack, plus the
+    # running type's registry pull credential (ADR-0049).
+    assert config.secret_names_for("box1") == {
+        "github-implementer",
+        "anthropic-api-key",
+        "registry:ghcr.io",
+    }
 
 
 def test_stack_env_overrides_injected_worker_type_env(tmp_path):
@@ -290,11 +295,13 @@ def test_stack_secrets_rebind_a_worker_type_slot(tmp_path):
         "GITHUB_TOKEN": "github-impl-b",
         "ANTHROPIC_API_KEY": "anthropic-api-key",
     }
-    # Node scoping unions the RESOLVED bindings (issue #60 invariant #3).
+    # Node scoping unions the RESOLVED bindings (issue #60 invariant #3),
+    # plus the running type's registry pull credential (ADR-0049).
     assert config.secret_names_for("box1") == {
         "github-impl-a",
         "github-impl-b",
         "anthropic-api-key",
+        "registry:ghcr.io",
     }
 
 
@@ -308,7 +315,11 @@ def test_stack_secrets_augment_with_a_new_slot(tmp_path):
     config = load_config(tmp_path)
     stack = next(s for s in config.stacks if s.name == "implementer")
     assert stack.secrets == {"GITHUB_TOKEN": "github-implementer", "EXTRA_TOKEN": "extra"}
-    assert config.secret_names_for("box1") == {"github-implementer", "extra"}
+    assert config.secret_names_for("box1") == {
+        "github-implementer",
+        "extra",
+        "registry:ghcr.io",  # running type's base pull credential (ADR-0049)
+    }
 
 
 def test_type_empty_secret_declares_a_required_slot(tmp_path):
@@ -359,7 +370,7 @@ def test_stack_empty_secret_unbinds_an_inherited_default(tmp_path):
     config = load_config(tmp_path)
     stack = next(s for s in config.stacks if s.name == "implementer")
     assert stack.secrets == {"GITHUB_TOKEN": "github-implementer"}
-    assert config.secret_names_for("box1") == {"github-implementer"}
+    assert config.secret_names_for("box1") == {"github-implementer", "registry:ghcr.io"}
 
 
 def test_stack_empty_secret_for_undeclared_slot_is_rejected(tmp_path):
@@ -1617,3 +1628,108 @@ def test_refuse_ui_write_allows_other_paths(tmp_path):
     configrepo.refuse_ui_write("drivers.toml")  # a top-level file merely NAMED drivers*
     configrepo.refuse_ui_write("stacks/pins.toml")  # only the ROOT pins.toml is machine-owned
     configrepo.refuse_ui_write("compose/app/overlay.yaml")
+
+
+# -- managed registry pull credentials (ADR-0049) -------------------------------
+
+
+def test_registry_host_grammar():
+    """The host key a `registry:<host>` credential is stored under. Accepts a
+    pinned ref (loaded `base` values carry a digest) and the Docker Hub
+    shorthand (normalized to registry-1.docker.io)."""
+    from theozolith_control.configrepo import registry_host
+
+    assert registry_host("ghcr.io/acme/run:1.2") == "ghcr.io"
+    assert registry_host(f"ghcr.io/acme/run:1.2@sha256:{'a' * 64}") == "ghcr.io"
+    assert registry_host("localhost:5000/run:1") == "localhost:5000"
+    assert registry_host("ubuntu:24.04") == "registry-1.docker.io"
+    assert registry_host("acme/run:1") == "registry-1.docker.io"
+
+
+def test_running_worker_type_stack_scopes_its_base_pull_credential(tmp_path):
+    """A running worker-type Stack scopes in `registry:<host>` for its base —
+    the same running-recipe rule desired_state_for uses for images."""
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": "github-implementer"})
+    thin_stack(tmp_path, "implementer", "claude-dev", state='"running"')
+    config = load_config(tmp_path)
+    assert config.secret_names_for("box1") == {"github-implementer", "registry:ghcr.io"}
+
+
+def test_stopped_worker_type_stack_scopes_no_registry_credential(tmp_path):
+    """A stopped Stack builds no image (ADR-0037), so no base is pulled and its
+    registry credential is NOT scoped in — the workload bindings still are."""
+    driver_type(tmp_path, secrets={"GITHUB_TOKEN": "github-implementer"})
+    thin_stack(tmp_path, "implementer", "claude-dev", state='"stopped"')
+    config = load_config(tmp_path)
+    assert config.secret_names_for("box1") == {"github-implementer"}
+
+
+def test_generic_stack_node_scopes_no_registry_credential(tmp_path):
+    """A node running only a plain (workerless) container Stack pulls no base
+    through the substrate, so no registry credential is scoped in."""
+    write(
+        tmp_path,
+        "stacks/web.toml",
+        'kind = "container"\nnode = "box9"\nstate = "running"\n'
+        'image = "ghcr.io/acme/web:1"\n[secrets]\nWEB_TOKEN = "web-token"\n',
+    )
+    config = load_config(tmp_path)
+    assert config.secret_names_for("box9") == {"web-token"}
+
+
+def test_registry_credential_is_scoped_per_node(tmp_path):
+    """The pull credential rides only to nodes that run the type — a node with
+    nothing placed pulls nothing."""
+    driver_type(tmp_path)
+    thin_stack(tmp_path, "impl-box1", "claude-dev", state='"running"')
+    write(
+        tmp_path,
+        "stacks/impl-box2.toml",
+        'worker_type = "claude-dev"\nnode = "box2"\nstate = "running"\n',
+    )
+    config = load_config(tmp_path)
+    assert config.secret_names_for("box1") == {"registry:ghcr.io"}
+    assert config.secret_names_for("box2") == {"registry:ghcr.io"}
+    assert config.secret_names_for("box3") == set()
+
+
+@pytest.mark.parametrize("site", ["worker-type", "stack"])
+def test_registry_prefixed_binding_value_is_rejected(tmp_path, site):
+    """A `registry:`-prefixed name can never be a workload [secrets] binding
+    value — an infra pull credential must not be routed into a Stack's env
+    (ADR-0049), at either declaration site."""
+    if site == "worker-type":
+        driver_type(tmp_path, secrets={"GITHUB_TOKEN": "registry:ghcr.io"})
+        thin_stack(tmp_path, "implementer", "claude-dev")
+    else:
+        driver_type(tmp_path)
+        write(
+            tmp_path,
+            "stacks/implementer.toml",
+            'worker_type = "claude-dev"\nnode = "box1"\n'
+            '[secrets]\nGITHUB_TOKEN = "registry:ghcr.io"\n',
+        )
+    with pytest.raises(ConfigRepoError, match="pull credential is infrastructure"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "ok"),
+    [
+        ("registry:ghcr.io", "octocat:ghp_x", True),
+        ("registry:localhost:5000", "u:t", True),  # a ported host keeps its colon
+        ("github-implementer", "anything-opaque", True),  # normal names shape-blind
+        ("registry:", "u:t", False),  # no host
+        ("registry:ghcr.io/acme", "u:t", False),  # a path is not a host
+        ("registry:gh cr.io", "u:t", False),  # whitespace in host
+        ("registry:ghcr.io", "no-colon-value", False),  # value must be <user>:<token>
+    ],
+)
+def test_validate_registry_secret_shape(name, value, ok):
+    from theozolith_control.configrepo import validate_registry_secret
+
+    if ok:
+        validate_registry_secret(name, value)  # no raise
+    else:
+        with pytest.raises(ConfigRepoError):
+            validate_registry_secret(name, value)

@@ -72,7 +72,9 @@ crash.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -117,6 +119,12 @@ _MANIFEST_ACCEPT = ", ".join(
         "application/vnd.oci.image.manifest.v1+json",
     )
 )
+
+# The single choke point for every registry HTTP request (token realm and
+# manifest HEAD). Tests monkeypatch this seam to script a fake registry
+# without a network; a module attribute is the smallest diff over threading an
+# ``opener=`` parameter through the resolver.
+_urlopen = urllib.request.urlopen
 
 
 class IngestError(RuntimeError):
@@ -601,6 +609,7 @@ def ingest(
     pinned_dir: Path,
     *,
     resolve_digest: Callable[[str], str] | None = None,
+    registry_credentials: dict[str, str] | None = None,
     dry_run: bool = False,
     runner=None,
     log=print,
@@ -614,7 +623,13 @@ def ingest(
     preview must read one consistent build, and a refusal on contention is
     itself an honest preview (a real ingest would be refused right now too) —
     but writes nothing, not even the empty repository a first real ingest
-    would initialize."""
+    would initialize.
+
+    ``registry_credentials`` (host -> ``<user>:<token>``, ADR-0049) authorizes
+    the default resolver's private-base resolution; it is IGNORED when
+    ``resolve_digest`` is injected (a test's fake resolver stands in for the
+    whole registry). A dry run resolves live too, so it also validates the
+    credential."""
     # Resolved at call time (not as a def-time default) so test rigs that
     # monkeypatch subprocess.run fake the git layer here too.
     runner = runner or subprocess.run
@@ -623,12 +638,28 @@ def ingest(
         # No pinned build at all: nothing to lock or race (taking the lock
         # would CREATE the directory), and the preview is simply "everything
         # would be added".
-        return _ingest_locked(source, pinned_dir, resolve_digest, runner, log, dry_run=True)
+        return _ingest_locked(
+            source,
+            pinned_dir,
+            resolve_digest,
+            runner,
+            log,
+            dry_run=True,
+            registry_credentials=registry_credentials,
+        )
     pinned_dir.mkdir(parents=True, exist_ok=True)
     writer = "theozolith config ingest" + (" --dry-run" if dry_run else "")
     try:
         with repolock.pinned_write_lock(pinned_dir, writer=writer):
-            return _ingest_locked(source, pinned_dir, resolve_digest, runner, log, dry_run=dry_run)
+            return _ingest_locked(
+                source,
+                pinned_dir,
+                resolve_digest,
+                runner,
+                log,
+                dry_run=dry_run,
+                registry_credentials=registry_credentials,
+            )
     except repolock.RepoLockError as exc:
         raise IngestError(str(exc)) from exc
 
@@ -640,9 +671,15 @@ def _ingest_locked(
     runner,
     log,
     dry_run: bool = False,
+    registry_credentials: dict[str, str] | None = None,
 ) -> IngestReport:
     report = IngestReport(dry_run=dry_run)
-    resolve = resolve_digest or resolve_image_digest
+    # The injected resolver seam is untouched (every existing fake keeps
+    # working); the default resolver is bound to the stored credentials so a
+    # private base resolves (ADR-0049).
+    resolve = resolve_digest or functools.partial(
+        resolve_image_digest, credentials=registry_credentials
+    )
 
     # The pinned build must exist as a clean git repo before anything is
     # staged. A marker left by an interrupted ingest is repaired FIRST — that
@@ -870,8 +907,12 @@ def _split_image_ref(ref: str) -> tuple[str, str, str]:
     return registry, repo, tag
 
 
-def _anonymous_token(www_authenticate: str) -> str:
-    """The anonymous bearer-token flow a public registry answers 401 with."""
+def _registry_token(www_authenticate: str, credential: str = "") -> str:
+    """The bearer-token flow a registry answers 401 with. Anonymous by
+    default (the public-pull fast path); when a ``<user>:<token>`` credential
+    is supplied it is sent to the token realm as HTTP Basic (ADR-0049) — which
+    is how GHCR mints a token carrying pull rights for a PRIVATE package
+    (anonymously it mints a token fine, then the manifest HEAD 403s)."""
     if not www_authenticate.lower().startswith("bearer "):
         raise IngestError(f"registry auth challenge not understood: {www_authenticate!r}")
     params = dict(re.findall(r'(\w+)="([^"]*)"', www_authenticate[len("bearer ") :]))
@@ -880,7 +921,16 @@ def _anonymous_token(www_authenticate: str) -> str:
         raise IngestError(f"registry auth realm not https: {realm!r}")
     query = {k: v for k, v in params.items() if k in ("service", "scope")}
     url = realm + ("?" + urllib.parse.urlencode(query) if query else "")
-    with urllib.request.urlopen(url, timeout=30) as resp:
+    request = urllib.request.Request(url)
+    if credential:
+        if ":" not in credential:
+            raise IngestError(
+                "registry credential must be '<user>:<token>' (e.g. a GitHub"
+                " username and a PAT with read:packages)"
+            )
+        basic = base64.b64encode(credential.encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", f"Basic {basic}")
+    with _urlopen(request, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     token = data.get("token") or data.get("access_token") or ""
     if not token:
@@ -888,12 +938,42 @@ def _anonymous_token(www_authenticate: str) -> str:
     return token
 
 
-def resolve_image_digest(ref: str) -> str:
+def _resolve_http_hint(ref: str, registry: str, code: int, credential: str) -> str:
+    """The terminal HTTP-error message for a failed base resolution. The hint
+    lives HERE (not in ``_resolve_bases``) so it names the exact host and the
+    exact ``secret set`` command — the host is known only at the resolver
+    (this fixes the pre-ADR-0049 bug where ``_resolve_bases`` re-raised
+    ``IngestError`` verbatim and the pin-by-digest hint never fired)."""
+    base = f"cannot resolve base tag {ref!r}: HTTP {code}"
+    if code not in (401, 403):
+        return base
+    if credential:
+        return (
+            f"{base} — the stored {configrepo.REGISTRY_SECRET_PREFIX}{registry} credential was"
+            " refused; check the value and its pull scope"
+        )
+    return (
+        f"{base} — the image may be private; store a pull credential with"
+        f" `theozolith secret set {configrepo.REGISTRY_SECRET_PREFIX}{registry}` (value"
+        " `<user>:<token>`, e.g. a GHCR PAT with read:packages) or pin the base"
+        " by digest in the Config Repo"
+    )
+
+
+def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) -> str:
     """Resolve a tag-only image ref to its manifest digest via the registry
-    HTTP API (anonymous pull scope). This is MECHANICAL pin resolution
-    (ADR-0048): the registry is the same authority ``docker pull`` trusts, and
-    the resulting digest-pinned ref is what every node build verifies against."""
+    HTTP API. This is MECHANICAL pin resolution (ADR-0048): the registry is
+    the same authority ``docker pull`` trusts, and the resulting digest-pinned
+    ref is what every node build verifies against.
+
+    Attempt 1 is ALWAYS unauthenticated (the anonymous fast path public bases
+    keep). On the 401 challenge, when a ``registry:<host>`` credential is
+    stored for the challenged host (ADR-0049), the token-realm request carries
+    it as HTTP Basic; anonymous otherwise. There is never a third manifest
+    attempt — by a 403 the challenge is already gone (GHCR's private-package
+    failure mode), so a refused credential surfaces an actionable message."""
     registry, repo, tag = _split_image_ref(ref)
+    credential = (credentials or {}).get(registry, "")
     url = f"https://{registry}/v2/{repo}/manifests/{urllib.parse.quote(tag, safe='')}"
     token = ""
     for attempt in (1, 2):
@@ -901,7 +981,7 @@ def resolve_image_digest(ref: str) -> str:
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         try:
-            with urllib.request.urlopen(request, timeout=30) as resp:
+            with _urlopen(request, timeout=30) as resp:
                 digest = resp.headers.get("Docker-Content-Digest", "")
                 if not (
                     digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
@@ -912,9 +992,11 @@ def resolve_image_digest(ref: str) -> str:
                 return digest
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and attempt == 1:
-                token = _anonymous_token(exc.headers.get("WWW-Authenticate", "") or "")
+                token = _registry_token(
+                    exc.headers.get("WWW-Authenticate", "") or "", credential
+                )
                 continue
-            raise IngestError(f"cannot resolve base tag {ref!r}: HTTP {exc.code}") from exc
+            raise IngestError(_resolve_http_hint(ref, registry, exc.code, credential)) from exc
         except urllib.error.URLError as exc:
             raise IngestError(f"cannot resolve base tag {ref!r}: {exc.reason}") from exc
     raise IngestError(f"cannot resolve base tag {ref!r}")  # pragma: no cover

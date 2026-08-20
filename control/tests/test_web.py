@@ -843,3 +843,24 @@ def test_settings_form_write_path_is_retired(control: ControlRig):
         assert "config ingest" in answer.text
     assert not (control.settings.config_repo / "drivers").exists()
     assert not (control.settings.config_repo / "control.toml").exists()
+
+
+def test_web_secret_form_enforces_the_registry_shape_guard(control: ControlRig):
+    """Form parity with PUT /api/v1/secrets (ADR-0049): a malformed registry
+    credential is a 400 and stores nothing; a well-formed one is accepted."""
+    login(control)
+    bad = control.client.post(
+        "/secrets",
+        data={"name": "registry:ghcr.io", "value": "no-colon"},
+        follow_redirects=False,
+    )
+    assert bad.status_code == 400
+    assert control.secret_store.secret_names() == []
+
+    good = control.client.post(
+        "/secrets",
+        data={"name": "registry:ghcr.io", "value": "octocat:ghp_token"},
+        follow_redirects=False,
+    )
+    assert good.status_code == 303
+    assert "registry:ghcr.io" in control.secret_store.secret_names()

@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment)
 
 Date: 2026-08-18
 
@@ -170,3 +170,20 @@ types, and worker types are cheap.
 - **Cross-node shared live mount (NFS-shaped)**: rejected — adds an
   availability dependency to every deck and reintroduces the sync
   daemon ADR-0043 refused.
+
+## Amendment (2026-08-20, ADR-0049 — authenticated base resolution)
+
+- **The resolve step gains an authenticated path.** As written, base
+  tag→digest resolution spoke only anonymous pull scope, so a **private**
+  base failed ingest with a bare `403` (GHCR mints the anonymous token,
+  then 403s the manifest HEAD). ADR-0049 threads a managed
+  `registry:<host>` pull credential (a reserved-name secret in the
+  existing Fernet store, value `<user>:<token>`) into `resolve_image_digest`:
+  attempt 1 stays anonymous (public bases resolve with no credential), and
+  the stored credential rides the token-realm request as HTTP Basic on the
+  401 challenge. The mechanical-pin doctrine here is **preserved** — the
+  human Config Repo still carries tag-only bases and no computed pins; the
+  credential is simply what lets ingest resolve the digest of a private
+  one. The digest pin (and the fleet-skew visibility and git-revert
+  reproducibility that ride on it) is unchanged. See ADR-0049 for the flow,
+  the scoping extension, and the node-side base pull.
