@@ -23,12 +23,19 @@ def example_config(tmp_path_factory):
     """configs-example is a HUMAN Config Repo (ADR-0048): it becomes loadable
     by going through the real `theozolith config ingest` pipeline — which is
     itself the assertion that the shipped example ingests cleanly (knowledge
-    compiles, lints pass, pins resolve)."""
+    compiles, lints pass, pins resolve). The example bases are tag-only, so
+    the registry round-trip is the one faked seam (the suite stays hermetic);
+    everything else runs for real."""
     from theozolith_control.configrepo import load_config
     from theozolith_control.ingest import ingest
 
     pinned = tmp_path_factory.mktemp("pinned-build")
-    ingest(str(DEPLOY / "configs-example"), pinned, log=lambda *_: None)
+    ingest(
+        str(DEPLOY / "configs-example"),
+        pinned,
+        resolve_digest=lambda ref: "sha256:" + "f" * 64,
+        log=lambda *_: None,
+    )
     return load_config(pinned)
 
 

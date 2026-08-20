@@ -38,11 +38,11 @@
 # No `driver` -> Flight Deck. Driverless types may carry `command` and
 # `volumes`; both are rejected when a driver is set.
 #
-# `base` is the product run image, digest-pinned: it already ships `claude`,
-# git, and `theozolith-knowledge`. It deliberately has NO tmux (the headless
-# doctrine binds run containers, ADR-0019), so setup adds it. Replace the
-# placeholder digest with the one you build/pull.
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# `base` is the product run image: it already ships `claude`, git, and
+# `theozolith-knowledge`. It deliberately has NO tmux (the headless doctrine
+# binds run containers, ADR-0019), so setup adds it. Tag-only: ingest
+# resolves and pins the digest (ADR-0048; see claude-dev.toml).
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
 
 # NOTHING is ever baked under /home/ozolith/.claude — not knowledge, not the
 # agent CLI's native config. The {stack}-claude-state volume copies image

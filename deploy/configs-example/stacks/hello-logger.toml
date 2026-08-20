@@ -6,11 +6,12 @@
 # containers are headless and never attach targets (ADR-0019).
 #
 # Bringing it up: enter the secrets the worker type references, set a real
-# `workspace` and `base` digest in worker-types/hello-logger.toml, flip this to
-# "running", and commit. The node converges the config distribution over its
-# heartbeat and starts `theozolith-driver drivers/hello_logger`. Edit
-# drivers/hello_logger.py, commit, and the hash changes → the node restarts the
-# driver on the new code, no daemon or product change.
+# `workspace` in worker-types/hello-logger.toml (ingest resolves the base
+# tag's digest, ADR-0048), flip this to "running", and commit. The node
+# converges the config distribution over its heartbeat and starts
+# `theozolith-driver drivers/hello_logger`. Edit drivers/hello_logger.py,
+# commit, and the hash changes → the node restarts the driver on the new
+# code, no daemon or product change.
 
 worker_type = "hello-logger"
 node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)

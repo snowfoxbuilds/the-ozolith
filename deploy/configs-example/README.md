@@ -8,10 +8,13 @@ machine-owned pinned build the service loads. Never edit the pinned build
 (`configs/`) itself. The example declares two pipeline workers (Implementer,
 Reviewer) as process Stacks, one **Flight Deck** as an interactive container
 Stack, and one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
-every Stack staged at `state = "stopped"`. Everything with a placeholder —
-image digests (or use tag-only bases and let ingest resolve them), the
-tailscale checksum, secret values — is yours to fill in before flipping a
-Stack to running (ingest refuses live placeholders).
+every Stack staged at `state = "stopped"`. `base` images are tag-only: this
+repo carries no computed pins (ADR-0048) — ingest resolves each tag to its
+digest and records it in the pinned build's pins.toml (digest-pin a base
+yourself only when the digest is a human decision, e.g. no registry access
+at ingest time). What stays yours to fill in before flipping a Stack to
+running: the tailscale checksum (a fail-closed placeholder ingest refuses on
+a running Stack), secret values, and real workspaces.
 
 ## Knowledge (`knowledge/`, ADR-0048)
 

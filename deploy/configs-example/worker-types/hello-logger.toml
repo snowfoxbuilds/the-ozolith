@@ -11,12 +11,11 @@ adapter = "claude"               # the Agent adapter the harness invokes
 model = "claude-sonnet-5"
 workspace = "you/your-repo"      # target repository (owner/name); required with a driver
 
-# The derived run image the container-host builds locally. Pin by digest
-# (ADR-0006) — the zeros are a placeholder; replace with a real digest:
-#     docker pull ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0
-#     docker inspect --format '{{index .RepoDigests 0}}' \
-#         ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# The derived run image the container-host builds locally. Tag-only:
+# `theozolith config ingest` resolves the tag to its digest and records it
+# in the pinned build's pins.toml (ADR-0048; the digest-pinned form stays
+# legal when the digest is a human decision — see claude-dev.toml).
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
 
 # Secret NAMES only — values live encrypted on the Control Node (never in this
 # repo, ADR-0024/0042: a Config Repo write here is code execution on nodes),
