@@ -73,10 +73,13 @@ class FakeDocker:
         # paths (never an empty file list), not merely that state mutated.
         self.compose_calls: list[tuple[str, list[str], str]] = []
         # Failure injection for isolation tests: a remove of a name here, or a
-        # compose `down`/`up` of a project here, raises DockerError.
+        # compose `down`/`up` of a project here, raises DockerError; an
+        # `image_exists` of a tag here raises DockerError (a Docker daemon that
+        # is unreachable/timed out during the pending-build scan, ADR-0049).
         self.fail_remove: set[str] = set()
         self.fail_compose_down: set[str] = set()
         self.fail_compose_up: set[str] = set()
+        self.fail_image_exists: set[str] = set()
         # Compose projects that are present but NOT running (stopped/exited): a
         # `compose_ps` for one of these reports a non-running row, so the daemon's
         # liveness check treats it as down and brings it up again.
@@ -157,12 +160,14 @@ class FakeDocker:
     # -- images -----------------------------------------------------------------
 
     def image_exists(self, tag: str) -> bool:
+        if tag in self.fail_image_exists:
+            raise DockerError(f"image inspect failed for {tag}")
         return tag in self.images
 
     def image_labels(self, tag: str) -> dict[str, str]:
         return dict(self.images.get(tag, {}))
 
-    def build(self, context_dir: Path, tag: str, *, no_cache: bool = False) -> None:
+    def build(self, context_dir: Path, tag: str, *, no_cache: bool = False, docker_config=None):
         dockerfile = (Path(context_dir) / "Dockerfile").read_text(encoding="utf-8")
         labels = {}
         for line in dockerfile.splitlines():
@@ -170,7 +175,23 @@ class FakeDocker:
                 key, _, value = line.removeprefix("LABEL ").partition("=")
                 labels[key.strip()] = value.strip().strip('"')
         self.images[tag] = labels
-        self.builds.append({"tag": tag, "no_cache": no_cache, "dockerfile": dockerfile})
+        # Snapshot the DOCKER_CONFIG handed to THIS build (ADR-0049): the dir,
+        # and — since the tmpfs config.json is overwritten on later passes — the
+        # auths it decoded to at build time, so assertions read a stable value.
+        auths = None
+        if docker_config is not None:
+            auths = json.loads(
+                (Path(docker_config) / "config.json").read_text(encoding="utf-8")
+            ).get("auths")
+        self.builds.append(
+            {
+                "tag": tag,
+                "no_cache": no_cache,
+                "dockerfile": dockerfile,
+                "docker_config": docker_config,
+                "auths": auths,
+            }
+        )
 
 
 class ScriptedControl:

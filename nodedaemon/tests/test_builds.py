@@ -3,6 +3,9 @@ the ADR-0048 knowledge gate (COPY from the verified applied distribution)."""
 
 from __future__ import annotations
 
+import base64
+import json
+
 from daemonrig import FakeDocker, image_recipe
 from theozolith_nodedaemon import configdist
 from theozolith_nodedaemon.builds import dockerfile_for, ensure_image, image_status
@@ -110,6 +113,29 @@ def test_knowledge_recipe_defers_when_the_tree_is_absent(tmp_path):
     recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin=pin)
     assert ensure_image(docker, recipe, log=logs.append, dist_root=root) is False
     assert any("no knowledge/dev" in line for line in logs)
+
+
+def test_ensure_image_threads_the_docker_config_to_build(tmp_path):
+    """A private base needs the registry pull credential at build time
+    (ADR-0049): ensure_image forwards the DOCKER_CONFIG dir to docker.build;
+    None (the default) builds anonymously."""
+    docker = FakeDocker()
+    config_dir = tmp_path / "docker"
+    config_dir.mkdir()
+    # Compute the auth rather than embed the base64 literal — the encoded form
+    # is exactly the daemon's `b64(user:token)`, and a static high-entropy
+    # blob would trip the secret scanner on a throwaway fixture.
+    auth = base64.b64encode(b"user:token").decode()
+    (config_dir / "config.json").write_text(
+        json.dumps({"auths": {"ghcr.io": {"auth": auth}}}), encoding="utf-8"
+    )
+    assert ensure_image(docker, image_recipe(), log=lambda *_: None, docker_config=config_dir)
+    assert docker.builds[0]["docker_config"] == config_dir
+    assert docker.builds[0]["auths"] == {"ghcr.io": {"auth": auth}}
+
+    plain = FakeDocker()
+    ensure_image(plain, image_recipe(setup=["pip install other"]), log=lambda *_: None)
+    assert plain.builds[0]["docker_config"] is None
 
 
 def test_image_status_reads_the_stamped_labels():

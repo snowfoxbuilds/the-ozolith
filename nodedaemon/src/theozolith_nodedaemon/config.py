@@ -106,6 +106,15 @@ class DaemonConfig:
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 
+    @property
+    def docker_config_dir(self) -> Path:
+        # DOCKER_CONFIG dir for build-time registry auth (ADR-0049): a tmpfs
+        # sibling of secrets_dir under the runtime dir, holding one config.json
+        # with the private-base pull credential. The daemon is the only reader
+        # (it points a `docker build` at it via env), so 0700 dir / 0600 leaf —
+        # no cross-UID 0444 like a container-mounted Stack secret.
+        return self.runtime_dir / "docker"
+
 
 def _provisioned(state_dir: Path, name: str) -> str | None:
     """One file persisted by `provision` (ADR-0023), or None."""

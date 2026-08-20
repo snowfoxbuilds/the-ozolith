@@ -10,6 +10,7 @@ whole daemon against a fake docker.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -38,15 +39,23 @@ class DockerCtl:
     def __init__(self, runner: Runner | None = None, binary: str = "docker"):
         self._binary = binary
         self._runner = runner or (
-            lambda args, timeout=None: subprocess.run(
-                args, capture_output=True, text=True, check=False, timeout=timeout
+            lambda args, timeout=None, env=None: subprocess.run(
+                args, capture_output=True, text=True, check=False, timeout=timeout, env=env
             )
         )
 
     def _run(
-        self, args: list[str], *, check: bool = True, timeout: float | None = 300
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        timeout: float | None = 300,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
-        proc = self._runner([self._binary, *args], timeout=timeout)
+        # env=None inherits the daemon's environment (the default for every
+        # docker call); a build carrying a registry pull credential passes a
+        # copy with DOCKER_CONFIG pointed at its tmpfs config dir (ADR-0049).
+        proc = self._runner([self._binary, *args], timeout=timeout, env=env)
         if check and proc.returncode != 0:
             raise DockerError(f"docker {args[0]} failed: {(proc.stderr or '').strip()}")
         return proc
@@ -247,9 +256,23 @@ class DockerCtl:
             return {}
         return labels if isinstance(labels, dict) else {}
 
-    def build(self, context_dir: Path, tag: str, *, no_cache: bool = False) -> None:
+    def build(
+        self,
+        context_dir: Path,
+        tag: str,
+        *,
+        no_cache: bool = False,
+        docker_config: Path | None = None,
+    ) -> None:
         args = ["build", "--tag", tag]
         if no_cache:
             args.append("--no-cache")
         args.append(str(context_dir))
-        self._run(args, timeout=3600)
+        # A private base needs a pull credential at build time (ADR-0049):
+        # DOCKER_CONFIG names a tmpfs dir holding a config.json with the
+        # registry auth, scoped to this one build. None inherits the daemon's
+        # environment (public bases resolve anonymously).
+        env = None
+        if docker_config is not None:
+            env = {**os.environ, "DOCKER_CONFIG": str(docker_config)}
+        self._run(args, timeout=3600, env=env)
