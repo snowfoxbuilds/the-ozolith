@@ -12,9 +12,9 @@
 
 worker_type = "claude-dev"
 node = "box1"                # exact node name (THEOZOLITH_NODE_NAME)
-# Staged at "stopped": the worker-type carries fill-in placeholders (base
-# digest, tailscale sha256) that ingest refuses for a RUNNING Stack
-# (ADR-0048) — fill them in, flip to "running", commit, ingest.
+# Staged at "stopped": point the worker-type's `workspace` at a real
+# repository and enter the referenced secrets first — nothing deploys or
+# builds until you flip to "running", commit, and ingest (ADR-0037/0048).
 state = "stopped"
 
 # Optional per-placement bindings (ADR-0047): repoint the target repo and

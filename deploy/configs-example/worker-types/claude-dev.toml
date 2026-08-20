@@ -43,11 +43,12 @@ adapter = "claude"               # the Agent adapter the harness invokes
 model = "claude-sonnet-5"
 workspace = "acme/sandbox"       # the repository (owner/name) it works
 
-# Digest-pinned, or tag-only — `theozolith config ingest` resolves a tag to
-# its digest and records it in the pinned build's pins.toml (ADR-0048). The
-# zeros below are the fail-closed placeholder: fine while every referencing
-# Stack is stopped, refused by ingest once one runs.
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# Tag-only — `theozolith config ingest` resolves the tag to its digest and
+# records it in the pinned build's pins.toml (ADR-0048): the Config Repo
+# carries no computed pins. Appending @sha256:<digest> here stays legal for
+# the cases where the digest IS the human decision — no registry access at
+# ingest time, or holding a type on an older build than the tag points at.
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
 
 setup = [
     "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",
