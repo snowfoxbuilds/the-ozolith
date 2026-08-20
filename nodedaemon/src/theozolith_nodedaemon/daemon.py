@@ -1295,17 +1295,14 @@ class NodeDaemon:
         # knowledge-referencing recipe until the node converges.
         applied = self._current_drivers_hash()
         dist_root = self._config.config_dist_dir / applied if applied else None
-        # Fetch the registry pull credential (ADR-0049) ONCE per pass and only
-        # when a build is actually pending — the steady-state no-op pass (every
-        # tag already built) makes no control round-trip. A private base needs
-        # it at `docker build`; None (no credential mapped, or a pull failure
-        # with nothing cached) builds anonymously and lets a private base fail
-        # loud per image, never deferred.
-        pending = any(
-            name in self._rebuild_targets or not self._docker.image_exists(image["tag"])
-            for name, image in images.items()
-        )
-        docker_config = self._registry_docker_config() if pending else None
+        # Prepare the private-base pull credential (ADR-0049) for this pass's
+        # builds. This is the only fallible preflight between reading desired
+        # state and the per-image loop, and it is fully isolated: a Docker
+        # availability check or docker-config materialization that fails is
+        # reported and swallowed into None, never allowed to abort the pass —
+        # public bases, unrelated Stacks, orphan reaping, and cleanup all still
+        # run, and a private base fails loud through its own per-image path.
+        docker_config = self._build_docker_config(images)
         for name, image in images.items():
             try:
                 # Discard a rebuild target only when a build actually ran: a
@@ -1446,30 +1443,77 @@ class NodeDaemon:
             )
             return False
 
-    def _registry_docker_config(self) -> Path | None:
-        """A DOCKER_CONFIG dir carrying the private-base pull credential for
-        `docker build`, or None (ADR-0049).
+    def _build_docker_config(self, images: dict[str, dict[str, Any]]) -> Path | None:
+        """The DOCKER_CONFIG dir this pass's derived-image builds run under, or
+        None to build with the daemon's own environment (ADR-0049).
 
-        The credential is a ``registry:<host>`` reserved-name secret (value
-        ``<user>:<token>``); desired state carries a names-only mapping
-        (``registry_secrets``: ``{host: name}``, filtered control-side to
-        credentials actually stored). Absent/empty → None (a public-base
-        fleet, or a pre-0049 control that never sends the key). Otherwise the
-        mapped names are pulled and written as a docker CLI ``config.json``
-        (``{"auths": {host: {"auth": b64(user:token)}}}``) into a 0700 tmpfs
-        dir, atomically, leaf 0600 (the daemon is the only reader).
+        This is the sole fallible preflight between reading desired state and
+        the per-image build loop, and it is isolated from the rest of the
+        reconcile pass so a fault here can never abort convergence. It runs a
+        Docker availability check (the lazy-pending scan) and materializes a
+        tmpfs docker config — either can raise (Docker unreachable; a full or
+        read-only runtime dir). Any failure is logged and reported as a
+        ``theozolith.error`` carrying node/component context but never a
+        credential value, then swallowed into None: a private base still fails
+        loud through its own per-image ``docker build`` path, while public bases
+        and every unrelated Stack, orphan reap, and cleanup stage keep running.
 
-        Fallback mirrors ``_pull_stack_secrets``: a pull failure with a
-        previously written ``config.json`` reuses it (the credential lives in
-        tmpfs for exactly this degraded window); with nothing cached, None —
-        the build runs unauthenticated and a private base fails loud into the
-        per-image ``_emit_error`` path. A missing pull credential can only
-        produce an accurate per-image failure, never wrong bits under the right
-        tag, so it is never deferred like knowledge staging (deferral would
-        also block public-base builds during a control outage)."""
+        The credential is fetched at most once per pass and only when a build is
+        actually pending, so the steady-state no-op pass makes no control
+        round-trip; a public-base fleet (no ``registry_secrets`` key) short-
+        circuits before any Docker call at all."""
         mapping = self._desired.get("registry_secrets")
         if not isinstance(mapping, dict) or not mapping:
             return None
+        try:
+            if not self._pending_build(images):
+                return None
+            return self._registry_docker_config(mapping)
+        except Exception as exc:
+            # Docker unreachable during the pending scan, or docker-config
+            # materialization failed: build without the managed credential. A
+            # private base then fails loud per image; nothing else is blocked.
+            self._log(f"registry docker config unavailable ({exc}); building without it")
+            self._emit_error(
+                type(exc).__name__,
+                f"registry docker config unavailable ({exc}); building without it",
+            )
+            return None
+
+    def _pending_build(self, images: dict[str, dict[str, Any]]) -> bool:
+        """Whether any declared image needs a build this pass — a queued rebuild
+        target (known without touching Docker) or a declared tag not present on
+        the host. Used only to keep the ADR-0049 credential fetch lazy; a Docker
+        availability failure raised here propagates to ``_build_docker_config``'s
+        isolation (the per-image loop re-checks each tag under its own handling,
+        so no image is suppressed)."""
+        if any(name in self._rebuild_targets for name in images):
+            return True
+        return any(not self._docker.image_exists(image["tag"]) for image in images.values())
+
+    def _registry_docker_config(self, mapping: dict[str, Any]) -> Path | None:
+        """A DOCKER_CONFIG dir carrying the private-base pull credential for
+        `docker build`, or None (ADR-0049). Called by ``_build_docker_config``
+        with the validated, non-empty names-only ``registry_secrets`` mapping
+        (``{host: name}``, filtered control-side to credentials actually stored)
+        and only when a build is pending; its own failures are isolated there.
+
+        The credential is a ``registry:<host>`` reserved-name secret (value
+        ``<user>:<token>``). The mapped names are pulled and written as a docker
+        CLI ``config.json`` (``{"auths": {host: {"auth": b64(user:token)}}}``)
+        into a 0700 tmpfs dir, atomically, leaf 0600 (the daemon is the only
+        reader).
+
+        Pull failure mirrors ``_pull_stack_secrets``' degraded path: a
+        previously written ``config.json`` is reused (the credential lives in
+        tmpfs for exactly this window); with nothing cached, None — the build
+        runs unauthenticated and a private base fails loud into the per-image
+        path. A missing pull credential can only produce an accurate per-image
+        failure, never wrong bits under the right tag, so it is never deferred
+        like knowledge staging (deferral would also block public-base builds
+        during a control outage). A materialization fault (full/read-only
+        runtime dir) raises to ``_build_docker_config``, which reports it and
+        builds without the managed config."""
         config_dir = self._config.docker_config_dir
         config_path = config_dir / "config.json"
         hosts_by_name = {str(name): str(host) for host, name in mapping.items()}

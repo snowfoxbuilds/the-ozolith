@@ -7,24 +7,27 @@ Skips ONLY when a Docker engine is genuinely unavailable (the dev container
 has none — no socket, and seccomp denies namespaces); GitHub CI's ubuntu
 runners have one, so both tests run on every PR.
 
-The ADR-0049 registry-credential plumbing is NOT proven here: the docker CLI
-treats a config.json load error as a non-fatal warning (so a malformed config
-never fails a build), and it consults DOCKER_CONFIG only on a registry
-round-trip that a build of a locally present base never makes — there is no
-reliable real-engine signal to assert. The build subprocess genuinely
-receiving DOCKER_CONFIG is proven deterministically at the DockerCtl seam in
-test_daemon.py (test_dockerctl_build_threads_docker_config_into_the_subprocess_env).
+The ADR-0049 registry-credential plumbing IS proven here, with a deterministic
+signal that needs no registry round-trip and does not rely on a config-load
+error (which the docker CLI treats as a non-fatal warning): the CLI reads a
+client-side ``proxies.default.httpProxy`` from the config.json under
+DOCKER_CONFIG and injects it as the ``HTTP_PROXY`` build arg, so a build whose
+RUN asserts a unique marker succeeds only when the configured DOCKER_CONFIG is
+consumed. The build subprocess genuinely receiving the env is also proven at
+the DockerCtl seam in test_daemon.py
+(test_dockerctl_build_threads_docker_config_into_the_subprocess_env).
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
 import uuid
 
 import pytest
-from theozolith_nodedaemon.dockerctl import DockerCtl
+from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
 from theozolith_nodedaemon.stacks import materialize_secrets
 
 BASE_IMAGE = "busybox:stable"
@@ -167,3 +170,40 @@ def test_materialized_secret_is_readable_by_uid_1000_through_a_ro_bind_mount(tmp
         "echo overwrite > /run/secrets/dummy-cross-uid",
     )
     assert write.returncode != 0  # read-only means read-only, even at 0444
+
+
+def test_build_honors_the_docker_config_env(tmp_path):
+    """Against a real engine, the selected DOCKER_CONFIG genuinely shapes the
+    build (ADR-0049): the docker CLI reads ``proxies.default.httpProxy`` from
+    the config.json it points at and injects it as the ``HTTP_PROXY`` build
+    arg, so a build whose RUN asserts a unique marker succeeds ONLY when
+    DockerCtl passes ``docker_config=`` — and fails without it. This is the
+    end-to-end proof the DockerCtl-seam unit test cannot give: no config-load
+    error is needed (the CLI would only warn), and no registry round-trip."""
+    marker = f"ozolith-docker-config-{uuid.uuid4().hex}"
+    config_dir = tmp_path / "docker"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text(
+        json.dumps({"proxies": {"default": {"httpProxy": marker}}}), encoding="utf-8"
+    )
+    context = tmp_path / "context"
+    context.mkdir()
+    # HTTP_PROXY is a predefined proxy build arg the CLI sets from the config
+    # above; the marker-gated RUN passes only when it is present. --no-cache on
+    # both builds forces the RUN to re-execute — proxy args are excluded from
+    # the build cache, so a cached layer would otherwise mask the difference.
+    (context / "Dockerfile").write_text(
+        f'FROM {BASE_IMAGE}\nARG HTTP_PROXY\nRUN test "$HTTP_PROXY" = "{marker}"\n',
+        encoding="utf-8",
+    )
+    tag = f"ozolith-test-dockerconfig:{uuid.uuid4().hex[:12]}"
+    ctl = DockerCtl()
+    try:
+        # With the config the RUN sees HTTP_PROXY == marker and the build passes.
+        ctl.build(context, tag, no_cache=True, docker_config=config_dir)
+        # Without it HTTP_PROXY is unset (or not the marker), the RUN fails, and
+        # DockerCtl surfaces the non-zero `docker build` as DockerError.
+        with pytest.raises(DockerError):
+            ctl.build(context, tag, no_cache=True)
+    finally:
+        _docker("rmi", "--force", tag, timeout=60)

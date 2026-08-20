@@ -165,12 +165,12 @@ def test_changed_instructions_trigger_a_rebuild_under_a_new_tag(rig: Rig):
 # -- registry pull credential for private bases (acceptance 3, ADR-0049) ------------
 
 
-def _reg_response(images, secrets, *, stacks=None):
+def _reg_response(images, secrets, *, stacks=None, commands=None):
     """A heartbeat answer whose desired state carries the ADR-0049 names-only
     registry-secrets mapping (`{host: name}`), as control's heartbeat handler
     appends it beside images."""
     return {
-        "commands": [],
+        "commands": commands or [],
         "config": desired(stacks or [], images, registry_secrets=secrets),
     }
 
@@ -271,6 +271,109 @@ def test_pull_failure_without_cache_builds_anonymously(rig: Rig):
     rig.daemon.once()
     assert rig.docker.builds[0]["docker_config"] is None
     assert not (rig.config.docker_config_dir / "config.json").exists()
+
+
+def test_forced_rebuild_is_pending_and_pulls_the_credential(rig: Rig):
+    """A queued rebuild target is pending even though its tag already exists, so
+    the credential fetch still runs (``_pending_build`` reads the rebuild set
+    without a Docker call). Proves the lazy gate does not swallow forced
+    rebuilds (ADR-0049)."""
+    recipe = image_recipe()
+    rig.control.secrets["registry:ghcr.io"] = "u:t"
+    mapping = {"ghcr.io": "registry:ghcr.io"}
+    rig.control.heartbeat_answers.append(_reg_response([recipe], mapping))
+    rig.daemon.once()  # first build -> one pull
+    assert len([e for e in rig.control.transcript if e[1] == "/secrets/pull"]) == 1
+
+    rig.control.heartbeat_answers.append(
+        _reg_response(
+            [recipe], mapping, commands=[{"id": 3, "verb": "rebuild", "target": "claude-dev"}]
+        )
+    )
+    rig.daemon.once()  # tag exists, but the rebuild target makes it pending -> a fresh pull
+    assert len([e for e in rig.control.transcript if e[1] == "/secrets/pull"]) == 2
+    rebuild = [b for b in rig.docker.builds if b["no_cache"]]
+    assert rebuild and rebuild[0]["docker_config"] == rig.config.docker_config_dir
+
+
+# -- registry credential preparation is isolated from the reconcile pass (ADR-0049) ----
+
+
+def _find_error(rig: Rig, needle: str) -> dict | None:
+    for event in rig.control.events:
+        if event.get("type") == "theozolith.error" and needle in event.get("message", ""):
+            return event
+    return None
+
+
+def test_docker_config_materialization_failure_is_isolated(rig: Rig):
+    """A tmpfs docker-config write that fails must NOT abort the pass: it is
+    logged and reported as a theozolith.error (no credential value), then the
+    build runs without the managed config (a private base would fail loud per
+    image), and every unrelated stage — a buildable image, an unrelated Stack,
+    orphan reaping — still runs (ADR-0049 failure isolation)."""
+    token = "ozolith-bot:ghp_MATFAIL"
+    rig.control.secrets["registry:ghcr.io"] = token
+    # Block docker-config materialization deterministically (independent of
+    # uid, so it fails under the root test user too): occupy the config dir
+    # path with a plain file, so `config_dir.mkdir()` raises FileExistsError.
+    rig.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+    (rig.config.runtime_dir / "docker").write_text("not a dir", encoding="utf-8")
+    rig.docker.add_run_container("ozolith-run-ghost", "r-ghost", "ghost")  # an orphan to reap
+
+    rig.control.heartbeat_answers.append(
+        _reg_response(
+            [image_recipe()],
+            {"ghcr.io": "registry:ghcr.io"},
+            stacks=[process_stack("worker")],
+        )
+    )
+    rig.daemon.once()
+
+    # The failure surfaced as an actionable error, and no credential value rode
+    # any event or log line.
+    error = _find_error(rig, "registry docker config unavailable")
+    assert error is not None and error["error_class"] == "FileExistsError"
+    haystack = json.dumps(rig.control.events) + "\n".join(rig.logs)
+    assert "ghp_MATFAIL" not in haystack and token not in haystack
+    # The buildable image still reached its per-image path (without the config)…
+    assert rig.docker.builds and rig.docker.builds[0]["docker_config"] is None
+    # …the unrelated process Stack still converged…
+    assert rig.daemon._supervisor.alive("worker")
+    # …and orphan reaping (a later reconcile stage) still ran.
+    assert "ozolith-run-ghost" in rig.docker.removed
+
+
+def test_one_images_existence_check_failure_is_isolated(rig: Rig):
+    """A Docker availability failure while scanning ONE image for pending work
+    must not abort the pass or suppress the others: the pass gives up the
+    managed credential (Docker is unreachable, so builds fail anyway) but every
+    other image and unrelated Stack still reconcile (ADR-0049 failure
+    isolation)."""
+    broken = image_recipe(name="claude-dev", setup=["pip install a"])
+    healthy = image_recipe(name="claude-rev", setup=["pip install b"])
+    rig.control.secrets["registry:ghcr.io"] = "u:t"
+    rig.docker.fail_image_exists.add(broken["tag"])  # its inspect raises
+
+    rig.control.heartbeat_answers.append(
+        _reg_response(
+            [broken, healthy],
+            {"ghcr.io": "registry:ghcr.io"},
+            stacks=[process_stack("worker")],
+        )
+    )
+    rig.daemon.once()
+
+    # The broken image failed in its own per-image path; the healthy image built.
+    assert _find_error(rig, "image claude-dev: build failed") is not None
+    built = {b["tag"] for b in rig.docker.builds}
+    assert healthy["tag"] in built and broken["tag"] not in built
+    # The credential was given up for the pass (no reliable pending signal), so
+    # the healthy build ran anonymously — but it was NOT suppressed.
+    healthy_build = next(b for b in rig.docker.builds if b["tag"] == healthy["tag"])
+    assert healthy_build["docker_config"] is None
+    # The unrelated Stack still converged.
+    assert rig.daemon._supervisor.alive("worker")
 
 
 # -- commands (acceptance 5) ---------------------------------------------------------
@@ -2540,18 +2643,15 @@ def test_dockerctl_no_command_preserves_the_inherited_entrypoint_and_cmd():
 
 
 def test_dockerctl_build_threads_docker_config_into_the_subprocess_env():
-    """The deterministic proof that the registry pull credential reaches the
-    build subprocess (ADR-0049): ``build(docker_config=dir)`` runs ``docker
-    build`` with a real environment that INHERITS the daemon's environment and
-    adds ``DOCKER_CONFIG`` pointed at the tmpfs credential dir; the default
-    build passes ``env=None``, so docker inherits the daemon environment
-    unchanged and resolves a public base anonymously.
-
-    A real-engine variant cannot assert this: the docker CLI treats a
-    config-load error as a non-fatal warning (never failing the build), and it
-    consults DOCKER_CONFIG only on a registry round-trip that a build of a
-    locally present base never makes — so the env plumbing is proven here, at
-    the exact seam, against the real DockerCtl."""
+    """The exact-seam proof that the registry pull credential reaches the build
+    subprocess (ADR-0049): ``build(docker_config=dir)`` runs ``docker build``
+    with a real environment that INHERITS the daemon's environment and adds
+    ``DOCKER_CONFIG`` pointed at the tmpfs credential dir; the default build
+    passes ``env=None``, so docker inherits the daemon environment unchanged and
+    resolves a public base anonymously; and an unrelated docker call carries no
+    env override at all. That the selected DOCKER_CONFIG genuinely shapes the
+    build is proven end-to-end against a real engine in
+    test_docker_integration.py (test_build_honors_the_docker_config_env)."""
     calls: list[tuple[list[str], dict | None]] = []
 
     def runner(args, timeout=None, env=None):
@@ -2562,8 +2662,9 @@ def test_dockerctl_build_threads_docker_config_into_the_subprocess_env():
     config_dir = Path("/run/theozolith/docker")
     ctl.build(Path("/state/ctx"), "ozolith/dev:abc", docker_config=config_dir)
     ctl.build(Path("/state/ctx"), "ozolith/dev:abc")
+    ctl.image_exists("ozolith/dev:abc")  # an unrelated docker call
 
-    (cfg_args, cfg_env), (plain_args, plain_env) = calls
+    (cfg_args, cfg_env), (plain_args, plain_env), (probe_args, probe_env) = calls
     # The build argv is identical with or without the credential — only the
     # environment differs, so the tag the image is built under never changes.
     assert cfg_args == plain_args == ["docker", "build", "--tag", "ozolith/dev:abc", "/state/ctx"]
@@ -2574,6 +2675,8 @@ def test_dockerctl_build_threads_docker_config_into_the_subprocess_env():
     assert all(cfg_env[key] == value for key, value in os.environ.items())
     # No credential: env is None, so docker inherits the daemon environment.
     assert plain_env is None
+    # And unrelated docker calls never carry the credential env (scoped to build).
+    assert probe_args[:2] == ["docker", "image"] and probe_env is None
 
 
 # -- removed-runtime teardown failures are isolated (task 4) -----------------------

@@ -73,10 +73,13 @@ class FakeDocker:
         # paths (never an empty file list), not merely that state mutated.
         self.compose_calls: list[tuple[str, list[str], str]] = []
         # Failure injection for isolation tests: a remove of a name here, or a
-        # compose `down`/`up` of a project here, raises DockerError.
+        # compose `down`/`up` of a project here, raises DockerError; an
+        # `image_exists` of a tag here raises DockerError (a Docker daemon that
+        # is unreachable/timed out during the pending-build scan, ADR-0049).
         self.fail_remove: set[str] = set()
         self.fail_compose_down: set[str] = set()
         self.fail_compose_up: set[str] = set()
+        self.fail_image_exists: set[str] = set()
         # Compose projects that are present but NOT running (stopped/exited): a
         # `compose_ps` for one of these reports a non-running row, so the daemon's
         # liveness check treats it as down and brings it up again.
@@ -157,6 +160,8 @@ class FakeDocker:
     # -- images -----------------------------------------------------------------
 
     def image_exists(self, tag: str) -> bool:
+        if tag in self.fail_image_exists:
+            raise DockerError(f"image inspect failed for {tag}")
         return tag in self.images
 
     def image_labels(self, tag: str) -> dict[str, str]:
