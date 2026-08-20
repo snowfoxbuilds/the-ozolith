@@ -114,6 +114,7 @@ def ensure_image(
     force: bool = False,
     log,
     dist_root: Path | None = None,
+    docker_config: Path | None = None,
 ) -> bool:
     """Build the recipe unless its deterministic tag already exists.
 
@@ -122,7 +123,8 @@ def ensure_image(
     node's VERIFIED applied config-distribution tree; a recipe referencing
     knowledge is built only when that tree carries the referenced tree at
     exactly the recipe's pin (ADR-0048) — otherwise the build defers to a
-    later pass.
+    later pass. ``docker_config`` is a DOCKER_CONFIG dir carrying a registry
+    pull credential for a private base (ADR-0049); None builds anonymously.
     """
     tag = image["tag"]
     if not force and docker.image_exists(tag):
@@ -135,7 +137,7 @@ def ensure_image(
             return False
         (Path(context) / "Dockerfile").write_text(dockerfile_for(image, built_at), encoding="utf-8")
         log(f"building derived image {tag} (base {image['base_digest'][:19]}…)")
-        docker.build(Path(context), tag, no_cache=force)
+        docker.build(Path(context), tag, no_cache=force, docker_config=docker_config)
     return True
 
 

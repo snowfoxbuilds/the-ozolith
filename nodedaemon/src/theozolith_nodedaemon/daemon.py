@@ -31,6 +31,7 @@ across daemon restarts until a recycle clears it (ADR-0015).
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -1294,6 +1295,17 @@ class NodeDaemon:
         # knowledge-referencing recipe until the node converges.
         applied = self._current_drivers_hash()
         dist_root = self._config.config_dist_dir / applied if applied else None
+        # Fetch the registry pull credential (ADR-0049) ONCE per pass and only
+        # when a build is actually pending — the steady-state no-op pass (every
+        # tag already built) makes no control round-trip. A private base needs
+        # it at `docker build`; None (no credential mapped, or a pull failure
+        # with nothing cached) builds anonymously and lets a private base fail
+        # loud per image, never deferred.
+        pending = any(
+            name in self._rebuild_targets or not self._docker.image_exists(image["tag"])
+            for name, image in images.items()
+        )
+        docker_config = self._registry_docker_config() if pending else None
         for name, image in images.items():
             try:
                 # Discard a rebuild target only when a build actually ran: a
@@ -1305,6 +1317,7 @@ class NodeDaemon:
                     force=name in self._rebuild_targets,
                     log=self._log,
                     dist_root=dist_root,
+                    docker_config=docker_config,
                 ):
                     self._rebuild_targets.discard(name)
             except Exception as exc:
@@ -1432,6 +1445,73 @@ class NodeDaemon:
                 type(exc).__name__, f"stack {stack.name}: cannot deploy, secrets unavailable: {exc}"
             )
             return False
+
+    def _registry_docker_config(self) -> Path | None:
+        """A DOCKER_CONFIG dir carrying the private-base pull credential for
+        `docker build`, or None (ADR-0049).
+
+        The credential is a ``registry:<host>`` reserved-name secret (value
+        ``<user>:<token>``); desired state carries a names-only mapping
+        (``registry_secrets``: ``{host: name}``, filtered control-side to
+        credentials actually stored). Absent/empty → None (a public-base
+        fleet, or a pre-0049 control that never sends the key). Otherwise the
+        mapped names are pulled and written as a docker CLI ``config.json``
+        (``{"auths": {host: {"auth": b64(user:token)}}}``) into a 0700 tmpfs
+        dir, atomically, leaf 0600 (the daemon is the only reader).
+
+        Fallback mirrors ``_pull_stack_secrets``: a pull failure with a
+        previously written ``config.json`` reuses it (the credential lives in
+        tmpfs for exactly this degraded window); with nothing cached, None —
+        the build runs unauthenticated and a private base fails loud into the
+        per-image ``_emit_error`` path. A missing pull credential can only
+        produce an accurate per-image failure, never wrong bits under the right
+        tag, so it is never deferred like knowledge staging (deferral would
+        also block public-base builds during a control outage)."""
+        mapping = self._desired.get("registry_secrets")
+        if not isinstance(mapping, dict) or not mapping:
+            return None
+        config_dir = self._config.docker_config_dir
+        config_path = config_dir / "config.json"
+        hosts_by_name = {str(name): str(host) for host, name in mapping.items()}
+        names = sorted(hosts_by_name)
+        try:
+            if self._client is None:
+                raise ControlUnreachable("no CONTROL_NODE_URL configured")
+            values = self._client.pull_secrets(self._config.node, names)
+        except (ControlUnreachable, ControlError) as exc:
+            if config_path.is_file():
+                self._log(f"registry credential pull failed ({exc}); using cached docker config")
+                return config_dir
+            self._log(f"registry credential pull failed ({exc}); building without it")
+            return None
+        auths: dict[str, dict[str, str]] = {}
+        for name, host in hosts_by_name.items():
+            value = values.get(name)
+            if value is None:
+                continue
+            auth = base64.b64encode(value.encode()).decode()
+            auths[host] = {"auth": auth}
+            # Docker Hub's normalized host key is registry-1.docker.io, but the
+            # docker CLI reads Hub auth under its legacy index key too — write
+            # the twin so a Hub credential is honored at build time (ADR-0049).
+            if host == "registry-1.docker.io":
+                auths["https://index.docker.io/v1/"] = {"auth": auth}
+        if not auths:
+            return None
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_dir.chmod(0o700)
+        tmp = config_dir / ".config.json.tmp"
+        # A crash between fchmod and replace can leave a 0600 temp behind;
+        # O_TRUNC alone would then fail EACCES for a non-owner, so clear first.
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # os.open's mode is umask-masked; pin 0600 explicitly.
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump({"auths": auths}, handle)
+            handle.flush()
+        os.replace(tmp, config_path)
+        return config_dir
 
     def _process_env(self, stack: WireStack) -> dict[str, str]:
         """The full effective environment a process Stack's child launches with.

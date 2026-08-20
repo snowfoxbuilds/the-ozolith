@@ -26,6 +26,7 @@ from theozolith_nodedaemon.daemon import NodeDaemon
 from theozolith_nodedaemon.stacks import ProcessSupervisor
 
 SECRET_VALUE = "ghp_THEACTUALSECRETVALUE999"
+REGISTRY_VALUE = "ozolith-bot:ghp_REGISTRYCREDENTIAL777"
 
 KNOWN_CHANNEL_PATHS = {
     "/api/v1/heartbeats",
@@ -163,3 +164,102 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     assert (config.secrets_dir / "github-implementer").read_text() == SECRET_VALUE
     env = popen.spawned[-1].env
     assert env["IMPLEMENTER_GITHUB_TOKEN_FILE"] == str(config.secrets_dir / "github-implementer")
+
+
+def test_registry_credential_value_only_crosses_on_the_pull(tmp_path: Path, monkeypatch):
+    """The channel invariant extends to the ADR-0049 registry pull credential:
+    the heartbeat carries the names-only ``registry_secrets`` reference, and
+    the ``<user>:<token>`` value crosses ONLY inside the node-scoped
+    secrets-pull response — the same boundary every Stack secret obeys."""
+    import base64
+
+    settings = ControlSettings(
+        data_dir=tmp_path / "data",
+        config_repo=tmp_path / "configs",
+        admin_token="admin-token",
+        repo=None,
+        github_token=None,
+        api_url="",
+        secrets_channel_ok=True,
+    )
+    # A running worker-type Stack with a PRIVATE ghcr.io base: its derived image
+    # rides desired state, so the node builds it and needs the pull credential.
+    wt_toml = tmp_path / "configs" / "worker-types" / "claude-dev.toml"
+    wt_toml.parent.mkdir(parents=True)
+    wt_toml.write_text(
+        'driver = "builtin:implementer"\nadapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        'workspace = "acme/sandbox"\n'
+        f'base = "ghcr.io/snowfoxbuilds/run:1.0@sha256:{"0" * 64}"\n'
+        '[secrets]\nIMPLEMENTER_GITHUB_TOKEN = "github-implementer"\n',
+        encoding="utf-8",
+    )
+    stack_toml = tmp_path / "configs" / "stacks" / "worker.toml"
+    stack_toml.parent.mkdir(parents=True)
+    stack_toml.write_text('worker_type = "claude-dev"\nnode = "box1"\n', encoding="utf-8")
+    store = Store(settings.cache_db_path)
+    secret_store = SecretStore(settings.store_db_path)
+    box = SecretBox(generate_key())
+    secret_store.put_secret("github-implementer", box.encrypt(SECRET_VALUE))
+    secret_store.put_secret("registry:ghcr.io", box.encrypt(REGISTRY_VALUE))
+    node_token = secret_store.mint_node_token("box1")
+    web = TestClient(create_app(settings, store, secret_store, box))
+
+    transcript: list[tuple[str, str, bytes, bytes]] = []
+
+    def tapped_transport(method: str, url: str, headers: dict, body: bytes | None):
+        path = url.removeprefix("http://control.test")
+        response = web.request(method, path, content=body, headers=headers)
+        transcript.append((method, path, body or b"", response.content))
+        return response.status_code, response.content
+
+    popen = FakePopen()
+    monkeypatch.setattr(
+        "theozolith_nodedaemon.stacks.os.killpg",
+        lambda pid, sig: popen.registry[pid].__setattr__("returncode", -sig),
+    )
+    config = DaemonConfig(
+        node="box1",
+        control_url="http://control.test",
+        node_token=node_token,
+        tls_ca=None,
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "run",
+        heartbeat_seconds=60,
+        stop_grace_seconds=0.2,
+        insecure_dev=True,
+        version="0.3.0",
+    )
+    daemon = NodeDaemon(
+        config,
+        docker=FakeDocker(),  # type: ignore[arg-type]
+        client=ControlClient(
+            "http://control.test", node_token, insecure_dev=True, transport=tapped_transport
+        ),
+        supervisor=ProcessSupervisor(popen=popen, log=lambda *_: None),
+        log=lambda *_: None,
+    )
+    daemon.once()
+
+    # The value crosses ONLY on a secrets-pull response, never up, never on any
+    # other path (heartbeat/events included).
+    for _method, path, request, response in transcript:
+        assert REGISTRY_VALUE.encode() not in request
+        if path != "/api/v1/secrets/pull":
+            assert REGISTRY_VALUE.encode() not in response
+
+    # The heartbeat answer references the credential by NAME only.
+    heartbeats = [e for e in transcript if e[1] == "/api/v1/heartbeats"]
+    reg = json.loads(heartbeats[0][3])["config"]["registry_secrets"]
+    assert reg == {"ghcr.io": "registry:ghcr.io"}
+
+    # The value crossed exactly once, in the node-scoped pull response.
+    reg_pulls = [
+        e for e in transcript if e[1] == "/api/v1/secrets/pull" and b"registry:ghcr.io" in e[2]
+    ]
+    assert len(reg_pulls) == 1
+    assert json.loads(reg_pulls[0][3]) == {"secrets": {"registry:ghcr.io": REGISTRY_VALUE}}
+
+    # And the daemon built the derived image under a DOCKER_CONFIG that decodes
+    # to the credential — the acceptance-3 path end to end.
+    auth = base64.b64encode(REGISTRY_VALUE.encode()).decode()
+    assert daemon._docker.builds[-1]["auths"] == {"ghcr.io": {"auth": auth}}

@@ -9,9 +9,11 @@ the deletion test's daemon half (boots with no config at all).
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -157,6 +159,117 @@ def test_changed_instructions_trigger_a_rebuild_under_a_new_tag(rig: Rig):
     rig.daemon.once()
 
     assert [b["tag"] for b in rig.docker.builds] == [old["tag"], new["tag"]]
+
+
+# -- registry pull credential for private bases (acceptance 3, ADR-0049) ------------
+
+
+def _reg_response(images, secrets, *, stacks=None):
+    """A heartbeat answer whose desired state carries the ADR-0049 names-only
+    registry-secrets mapping (`{host: name}`), as control's heartbeat handler
+    appends it beside images."""
+    return {
+        "commands": [],
+        "config": desired(stacks or [], images, registry_secrets=secrets),
+    }
+
+
+def test_private_base_build_pulls_and_writes_the_registry_credential(rig: Rig):
+    recipe = image_recipe()  # base host ghcr.io
+    rig.control.secrets["registry:ghcr.io"] = "ozolith-bot:ghp_TOKEN"
+    rig.control.heartbeat_answers.append(_reg_response([recipe], {"ghcr.io": "registry:ghcr.io"}))
+    rig.daemon.once()
+
+    # Exactly the mapped name is pulled — names only cross up, the value down.
+    pulls = [e for e in rig.control.transcript if e[1] == "/secrets/pull"]
+    assert len(pulls) == 1
+    assert pulls[0][2] == {"node": "box1", "names": ["registry:ghcr.io"]}
+
+    # The build ran under a DOCKER_CONFIG whose config.json decodes to the auth.
+    auth = base64.b64encode(b"ozolith-bot:ghp_TOKEN").decode()
+    build = rig.docker.builds[0]
+    assert build["docker_config"] == rig.config.docker_config_dir
+    assert build["auths"] == {"ghcr.io": {"auth": auth}}
+
+    # Daemon-only reader: 0700 dir, 0600 leaf (no cross-UID 0444).
+    cfg_dir = rig.config.docker_config_dir
+    assert stat.S_IMODE(cfg_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((cfg_dir / "config.json").stat().st_mode) == 0o600
+
+
+def test_docker_hub_credential_writes_the_legacy_index_twin(rig: Rig):
+    """Hub's normalized host key is registry-1.docker.io, but the docker CLI
+    reads Hub auth under https://index.docker.io/v1/ too — the writer emits
+    both so a Hub credential is honored (ADR-0049)."""
+    rig.control.secrets["registry:registry-1.docker.io"] = "dhuser:dhtok"
+    rig.control.heartbeat_answers.append(
+        _reg_response(
+            [image_recipe()],
+            {"registry-1.docker.io": "registry:registry-1.docker.io"},
+        )
+    )
+    rig.daemon.once()
+    auth = base64.b64encode(b"dhuser:dhtok").decode()
+    assert rig.docker.builds[0]["auths"] == {
+        "registry-1.docker.io": {"auth": auth},
+        "https://index.docker.io/v1/": {"auth": auth},
+    }
+
+
+def test_no_registry_secrets_key_pulls_nothing(rig: Rig):
+    """A pre-0049 control (or a public-base fleet) sends no registry_secrets
+    key: the build runs anonymously and no credential is pulled."""
+    rig.control.heartbeat_answers.append(heartbeat_response([], [image_recipe()]))
+    rig.daemon.once()
+    assert rig.docker.builds[0]["docker_config"] is None
+    assert not any(e[1] == "/secrets/pull" for e in rig.control.transcript)
+
+
+def test_credential_pull_is_lazy_no_build_pending_no_pull(rig: Rig):
+    recipe = image_recipe()
+    rig.control.secrets["registry:ghcr.io"] = "u:t"
+    mapping = {"ghcr.io": "registry:ghcr.io"}
+    rig.control.heartbeat_answers.append(_reg_response([recipe], mapping))
+    rig.daemon.once()  # first pass builds -> one pull
+    assert len([e for e in rig.control.transcript if e[1] == "/secrets/pull"]) == 1
+
+    rig.control.heartbeat_answers.append(_reg_response([recipe], mapping))
+    rig.daemon.once()  # tag already built -> nothing pending -> no round-trip
+    assert len([e for e in rig.control.transcript if e[1] == "/secrets/pull"]) == 1
+
+
+def test_pull_failure_reuses_the_cached_docker_config(rig: Rig):
+    """A control outage during a pending build reuses the tmpfs config.json a
+    prior pass wrote — the credential survives the degraded window."""
+    first = image_recipe(setup=["pip install a"])
+    second = image_recipe(name="claude-rev", setup=["pip install b"])
+    rig.control.secrets["registry:ghcr.io"] = "u:t"
+    mapping = {"ghcr.io": "registry:ghcr.io"}
+    rig.control.heartbeat_answers.append(_reg_response([first], mapping))
+    rig.daemon.once()  # writes config.json
+    assert (rig.config.docker_config_dir / "config.json").is_file()
+
+    rig.control.denied_secrets = True  # control now refuses the pull
+    rig.control.heartbeat_answers.append(_reg_response([second], mapping))
+    rig.daemon.once()
+
+    build = next(b for b in rig.docker.builds if b["tag"] == second["tag"])
+    assert build["docker_config"] == rig.config.docker_config_dir  # cached dir reused
+    assert build["auths"] == {"ghcr.io": {"auth": base64.b64encode(b"u:t").decode()}}
+
+
+def test_pull_failure_without_cache_builds_anonymously(rig: Rig):
+    """No prior credential written and the pull fails: the build runs without a
+    DOCKER_CONFIG and a private base fails loud at `docker build`, never
+    deferred — a missing credential can only cause an accurate per-image
+    failure, and deferral would block public-base builds during an outage."""
+    rig.control.denied_secrets = True
+    rig.control.heartbeat_answers.append(
+        _reg_response([image_recipe()], {"ghcr.io": "registry:ghcr.io"})
+    )
+    rig.daemon.once()
+    assert rig.docker.builds[0]["docker_config"] is None
+    assert not (rig.config.docker_config_dir / "config.json").exists()
 
 
 # -- commands (acceptance 5) ---------------------------------------------------------
@@ -2302,7 +2415,7 @@ def test_dockerctl_compose_builds_valid_file_scoped_commands():
     coverage)."""
     calls: list[list[str]] = []
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         calls.append(list(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -2349,7 +2462,7 @@ def test_dockerctl_configured_command_overrides_the_inherited_entrypoint():
     tokens follow the image as that entrypoint's argv."""
     calls: list[list[str]] = []
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         calls.append(list(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -2380,7 +2493,7 @@ def test_dockerctl_single_token_command_runs_alone_after_entrypoint():
     the entrypoint's first argument)."""
     calls: list[list[str]] = []
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         calls.append(list(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -2405,7 +2518,7 @@ def test_dockerctl_no_command_preserves_the_inherited_entrypoint_and_cmd():
     override must never fire for command-less container Stacks)."""
     calls: list[list[str]] = []
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         calls.append(list(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -3923,7 +4036,7 @@ def test_dockerctl_remove_raises_on_a_genuine_failure():
     DockerError — a suppressed failure would let a caller start a successor beside
     a still-running predecessor."""
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(
                 args, 1, "", "Error response from daemon: cannot remove container"
@@ -3940,7 +4053,7 @@ def test_dockerctl_remove_raises_on_a_genuine_failure():
 def test_dockerctl_remove_absent_container_is_idempotent_success():
     """``no such container`` classifies as already-absent: idempotent success."""
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(args, 1, "", "Error: No such container: ghost")
         raise AssertionError("no postcondition ps needed when classified absent")
@@ -3953,7 +4066,7 @@ def test_dockerctl_remove_postcondition_absence_is_success():
     """An opaque non-zero result whose container is nonetheless gone is treated as
     idempotent success via the postcondition existence check."""
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         if args[1] == "rm":
             return subprocess.CompletedProcess(args, 1, "", "some transient noise")
         if args[1] == "ps":
@@ -3968,7 +4081,7 @@ def test_dockerctl_remove_success_is_a_no_op_raise():
     """A zero return code is plain success — no postcondition ps, no raise."""
     seen = []
 
-    def runner(args, timeout=None):
+    def runner(args, timeout=None, env=None):
         seen.append(args[1])
         return subprocess.CompletedProcess(args, 0, "", "")
 

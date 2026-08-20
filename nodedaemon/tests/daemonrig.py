@@ -162,7 +162,7 @@ class FakeDocker:
     def image_labels(self, tag: str) -> dict[str, str]:
         return dict(self.images.get(tag, {}))
 
-    def build(self, context_dir: Path, tag: str, *, no_cache: bool = False) -> None:
+    def build(self, context_dir: Path, tag: str, *, no_cache: bool = False, docker_config=None):
         dockerfile = (Path(context_dir) / "Dockerfile").read_text(encoding="utf-8")
         labels = {}
         for line in dockerfile.splitlines():
@@ -170,7 +170,23 @@ class FakeDocker:
                 key, _, value = line.removeprefix("LABEL ").partition("=")
                 labels[key.strip()] = value.strip().strip('"')
         self.images[tag] = labels
-        self.builds.append({"tag": tag, "no_cache": no_cache, "dockerfile": dockerfile})
+        # Snapshot the DOCKER_CONFIG handed to THIS build (ADR-0049): the dir,
+        # and — since the tmpfs config.json is overwritten on later passes — the
+        # auths it decoded to at build time, so assertions read a stable value.
+        auths = None
+        if docker_config is not None:
+            auths = json.loads(
+                (Path(docker_config) / "config.json").read_text(encoding="utf-8")
+            ).get("auths")
+        self.builds.append(
+            {
+                "tag": tag,
+                "no_cache": no_cache,
+                "dockerfile": dockerfile,
+                "docker_config": docker_config,
+                "auths": auths,
+            }
+        )
 
 
 class ScriptedControl:
