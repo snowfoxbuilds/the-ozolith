@@ -15,9 +15,6 @@ dev = [
     "pytest>=8",
     "ruff>=0.8",
     "pyyaml>=6",
-    # for scripts/sync_notion.py (project tooling)
-    "requests>=2.32",
-    "python-dotenv>=1",
 ]
 
 [tool.ruff]

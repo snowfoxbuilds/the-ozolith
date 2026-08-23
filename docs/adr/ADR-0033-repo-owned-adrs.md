@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended 2026-08-23 by ADR-0050 (all project docs move to repo authorship; the "Specs remain Notion-owned" clause and the Notion-side spec-amendment debt are retired)
 
 Date: 2026-07-30
 
@@ -14,7 +14,7 @@ ADR-0001 made Notion the source of truth for all project docs, synced one-way in
 
 - **`docs/adr/` is repo-authored as of 2026-07-30.** New ADRs and amendments to existing ADRs are written directly in the repo and reviewed in the PR that carries them. ADR-0001's split becomes: repo owns configs **and ADRs**; Notion keeps `AGENTS.md`, `CONTEXT.md`, and `Specs/`.
 - **`sync_notion.py` no longer exports ADRs.** Notion's ADR pages and index freeze as a historical mirror; an export would clobber repo-side rulings.
-- **Specs remain Notion-owned.** A repo ADR that changes a spec's content still owes the Notion-side spec amendment (for ADR-0032: NODE-SUBSTRATE.md's CLI-surface entry), landing in the repo through the normal spec sync.
+- **Specs remain Notion-owned.** A repo ADR that changes a spec's content still owes the Notion-side spec amendment (for ADR-0032: NODE-SUBSTRATE.md's CLI-surface entry), landing in the repo through the normal spec sync. *(Retired by ADR-0050, 2026-08-23: specs, the glossary, and the index are repo-authored; a spec amendment lands in the same PR as the ADR that motivates it.)*
 
 ## Alternatives rejected
 

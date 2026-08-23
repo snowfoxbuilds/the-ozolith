@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-08-16
+Last updated: 2026-08-23
 
 # Agentic Coding Pipeline
 
@@ -14,7 +14,7 @@ Models, agents, and skills improve constantly; the pipeline must allow swapping 
 
 ### Core principle
 
-Runs are stateless, disposable executions; Workers are long-lived but hold no authoritative state. Everything durable is a file or a GitHub object. No agent memory, vendor config format, or vendor-exclusive feature is load-bearing. Canonical terms are defined in [CONTEXT.md](http://context.md/).
+Runs are stateless, disposable executions; Workers are long-lived but hold no authoritative state. Everything durable is a file or a GitHub object. No agent memory, vendor config format, or vendor-exclusive feature is load-bearing. Canonical terms are defined in [CONTEXT.md](../../CONTEXT.md).
 
 ### Stages
 
@@ -24,7 +24,7 @@ Runs are stateless, disposable executions; Workers are long-lived but hold no au
 | Implementation | Implementer (one Run per round) | Branch + first-party Implementer-side gate | Best-effort PR with a Decisions Section |
 | Review | Reviewer actor + CI + human | PR | Approved (needs_human), revised (next round), or escalated PR |
 
-- Notion anchor documents ([AGENTS.md](http://agents.md/), [CONTEXT.md](http://context.md/), Specs, ADRs) govern the project and sync one-way into the repo (ADR-0001). Anchor documents do not govern individual changes.
+- Repo-authored anchor documents ([AGENTS.md](../../AGENTS.md), [CONTEXT.md](../../CONTEXT.md), Specs, ADRs) govern the project (ADR-0050). Anchor documents do not govern individual changes.
 - All per-change planning lives in GitHub issues. Applying plan_ready is the act of issue approval and asserts the two hard artifacts: acceptance criteria and a baseline risk label. Other template fields (objective, out of scope, pointers) are issue-form prompts, never enforced — the human is the lint. Acceptance criteria are authored at planning time so the Reviewer judges against pre-existing criteria, never tests authored by the implementing side in the same Run.
 - V1 planning: the human writes issues through GitHub issue forms, optionally drafting with the Flight Deck (or any agent out-of-band). The Initializer (specified 2026-07-21, deferred past the current testing scope; ADR-0021) sharpens human drafts: it analyzes draft issues lacking the initialized label and publishes one structured analysis comment plus the initialized label; the human rules on its questions and still applies plan_ready. No automated issue generation in V1. A future planning worker type (the reserved "Planner") enters through the same gate: agent-drafted issues land as draft, and plan_ready is applied by the human — or by the agent itself where the human has explicitly granted that permission.
 - Integration (merge sequencing across parallel PRs) is handled by the human merge gate; parallel PRs are serialized via issue dependencies.
@@ -49,7 +49,7 @@ PR:    pr_ready               -> ready for the automated Reviewer (under round b
 - On round-budget exhaustion the Reviewer escalates: blocked + needs_human with the evidence bundle link. The Reviewer also escalates early when a Decisions Section surfaces a call only a human may make; the human answers with a comment and re-queues the issue to plan_ready.
 ### Execution model
 
-- Every worker — Implementer, Reviewer, Initializer (ADR-0020) — is a long-lived **driver process** on a container-host, bound to one Agent config: a supervised Node Daemon child declared as a process-kind Stack (see [NODE-SUBSTRATE.md](http://node-substrate.md/)). The Implementer requests work from the Control Node (ADR-0017) and executes Implementer Runs sequentially, one at a time. Workers are not containers — the long-lived-container design is retracted (ADR-0013).
+- Every worker — Implementer, Reviewer, Initializer (ADR-0020) — is a long-lived **driver process** on a container-host, bound to one Agent config: a supervised Node Daemon child declared as a process-kind Stack (see [NODE-SUBSTRATE.md](NODE-SUBSTRATE.md)). The Implementer requests work from the Control Node (ADR-0017) and executes Implementer Runs sequentially, one at a time. Workers are not containers — the long-lived-container design is retracted (ADR-0013).
 - The driver is the trusted, credentialed half: it runs the Claim Protocol, materializes job inputs, sequences gate steps, creates run containers, and performs every GitHub read and write. It never executes repo code or model output.
 - Each Run executes as an **ephemeral run container** created by the driver from the Agent config's image; container lifetime = Run lifetime. PID 1 is the **agent harness** — credential-free plumbing that invokes the agent headless (one-shot), treats process exit as completion (timeout backstop; ADR-0019), writes outputs, and exits. Driver and harness communicate only through the per-Run job directory (inputs, outputs, transcript, status) — no network channel (ADR-0013).
 - Gate steps run agent-authored code, so they execute as harness jobs on the credential-free side — never inside the credentialed driver.
@@ -99,9 +99,9 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 - The human combines the three labels (baseline risk on the issue; reviewer risk and deviation on the PR) to budget review depth (all low = skim; high on any axis = line-by-line). The final merge judgment is never automated.
 ### Agent swap boundary
 
-- Contract: input = issue ref + repo checkout + repo-resident instructions ([AGENTS.md](http://agents.md/), [CONTEXT.md](http://context.md/), specs, skills). Output = branch pushed through the gate + evidence bundle. Everything between is a black box.
+- Contract: input = issue ref + repo checkout + repo-resident instructions ([AGENTS.md](../../AGENTS.md), [CONTEXT.md](../../CONTEXT.md), specs, skills). Output = branch pushed through the gate + evidence bundle. Everything between is a black box.
 - One run-container image per Agent config, with the agent harness as its entrypoint. Vendor-specific flags, permissions, and invocation details are contained in the per-image adapter; Runs invoke the adapter's headless one-shot mode (ADR-0019).
-- [AGENTS.md](http://agents.md/) is the canonical instruction file; vendor files (e.g. [CLAUDE.md](http://claude.md/)) are generated copies, never sources.
+- [AGENTS.md](../../AGENTS.md) is the canonical instruction file; vendor files (e.g. [CLAUDE.md](../../CLAUDE.md)) are generated copies, never sources.
 - Skills are files in the repo; the knowledge machinery (knowledge/) generates per-tool placement and format. Two scopes: global skills live in the private config repo and travel with the operator; project skills live in the target project's repo and travel with the project.
 - No code-level LLM abstraction layer — it would couple to every vendor's API churn; the process-level boundary ages better. The swap boundary is the process/artifact contract above.
 ### Agent session contract (headless Runs, interactive Flight Deck)
@@ -118,7 +118,7 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 - Compare gate pass rate, retry count, escalation rate, and cost per merged PR from evidence bundles and GitHub data. Promote on wins.
 ### Deployment and substrate
 
-The Control Node, Node Daemon, Config Repo, secrets, extension points, and the deployment boundary are specified in [NODE-SUBSTRATE.md](http://node-substrate.md/). The pipeline is one consumer of that substrate; nothing pipeline-side may depend on private deployment specifics.
+The Control Node, Node Daemon, Config Repo, secrets, extension points, and the deployment boundary are specified in [NODE-SUBSTRATE.md](NODE-SUBSTRATE.md). The pipeline is one consumer of that substrate; nothing pipeline-side may depend on private deployment specifics.
 
 ## Decision history
 

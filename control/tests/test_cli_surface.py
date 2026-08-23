@@ -40,10 +40,10 @@ _SKIP_PARTS = {
     "build",
     "node_modules",
 }
-# Not repo-authored: synced from Notion (AGENTS.md, CLAUDE.md, CONTEXT.md)
-# or generated (uv.lock names the distribution). The guard covers what the
-# repo owns — a stale spelling in a synced doc is a Notion follow-up, not a
-# repo edit.
+# Skipped like docs/ above: the index and glossary quote historical ADR
+# summaries where the old surface legitimately appears (repo-authored since
+# ADR-0050; CLAUDE.md is generated from AGENTS.md). uv.lock is generated
+# and names the distribution.
 _SKIP_FILES = {"AGENTS.md", "CLAUDE.md", "CONTEXT.md", "uv.lock"}
 
 

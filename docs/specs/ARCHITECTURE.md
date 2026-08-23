@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-08-09
+Last updated: 2026-08-23
 
 # Architecture
 
@@ -16,23 +16,21 @@ TheOzolith consolidates the coding pipeline, the cluster substrate, and the agen
 
 ```javascript
 theozolith/
-├── AGENTS.md            # project index    (synced from Notion)
-├── CONTEXT.md           # domain glossary  (synced from Notion)
+├── AGENTS.md            # project index    (repo-authored; ADR-0050)
+├── CONTEXT.md           # domain glossary  (repo-authored; ADR-0050)
 ├── knowledge/           # agent-knowledge machinery: config format (skills, subagents, workflows), per-tool compilers (AGENTS.md -> CLAUDE.md, skill placement), sync engine (~/.claude etc.)
 ├── worker/              # Worker + Reviewer actors: node-resident drivers, agent harness + run-container Dockerfiles, per-Agent adapters, first-party gate
 ├── control/             # Control Node: dashboard, heartbeat/command + run-event API, janitor jobs
 ├── nodedaemon/          # Node Daemon: uncontainerized host daemon (systemd unit) — heartbeat, command reconciliation, local builds, stack + driver supervision
 ├── deploy/              # compose files + .env.example (full config surface)
-├── scripts/
-│   └── sync_notion.py   # Notion -> repo docs (project tooling, not product)
 └── docs/
-    ├── specs/           # <- Notion Specs/
-    └── adr/             # repo-authored (ADR-0033); frozen mirror in Notion
+    ├── specs/           # repo-authored (ADR-0050)
+    └── adr/             # repo-authored (ADR-0033)
 ```
 
 ### Components
 
-- Every top-level component is independently installable. knowledge/ has no dependency on the cluster components and vice versa; the only coupling is that worker-type setup instructions may invoke the knowledge machinery to bake a Knowledge Source into a derived image (see [NODE-SUBSTRATE.md](http://node-substrate.md/)).
+- Every top-level component is independently installable. knowledge/ has no dependency on the cluster components and vice versa; the only coupling is that worker-type setup instructions may invoke the knowledge machinery to bake a Knowledge Source into a derived image (see [NODE-SUBSTRATE.md](NODE-SUBSTRATE.md)).
 ### Private side
 
 - One private config repo holds all operator content: deployment declarations (Stacks, worker types, overlays, secret names — the Config Repo of ADR-0006), agent knowledge (skills, subagents, workflows), and custom driver code (`drivers/`, delivered to nodes as a hash-pinned config distribution; ADR-0042). Pure operator content, no machinery — ADR-0042 narrows the former "pure data" charter: driver code is operator content; machinery still never lives here.
@@ -40,7 +38,7 @@ theozolith/
 ### Sync flows
 
 - knowledge sync: private config repo -> local tool config dirs (~/.claude, etc.) via the knowledge machinery. One-way. The private repo is the source of truth. Two skill scopes: global skills live in the private repo and travel with the operator; project skills live in the target project's repo and travel with the project.
-- sync_notion: Notion project docs -> repo ([CONTEXT.md](http://context.md/), [AGENTS.md](http://agents.md/), docs/specs/). One-way. Notion is the source of truth. docs/adr/ is repo-authored since 2026-07-30 and no longer exported; Notion's ADR pages are a frozen historical mirror (ADR-0033).
+- Project docs have no sync flow (ADR-0050): [AGENTS.md](../../AGENTS.md), [CONTEXT.md](../../CONTEXT.md), docs/specs/, and docs/adr/ are authored in the repo and reviewed in PRs. The Notion workspace is a read-only mirror; a Notion-side agent reads the repo for documentation and contributes changes via PR. (docs/adr/ has been repo-authored since 2026-07-30, ADR-0033; the former `scripts/sync_notion.py` is deleted.)
 ## Decision history
 
 Settled rulings are integrated into the sections above; decision records live in docs/adr/ (repo-authored since ADR-0033). Specs no longer carry a grilling log (ruled 2026-08-09).

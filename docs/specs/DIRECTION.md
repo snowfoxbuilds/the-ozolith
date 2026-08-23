@@ -1,6 +1,6 @@
 # TheOzolith — Motivation & Direction
 
-Why the system exists, what it optimizes for, and what it deliberately is not. Companion to [CONTEXT.md](http://context.md/) (canonical terms) and the ADR index (individual decisions). This page governs direction; when a proposed change conflicts with a thesis here, the conflict must be resolved explicitly — by amending this page or rejecting the change — never silently.
+Why the system exists, what it optimizes for, and what it deliberately is not. Companion to [CONTEXT.md](../../CONTEXT.md) (canonical terms) and the ADR index (individual decisions). This page governs direction; when a proposed change conflicts with a thesis here, the conflict must be resolved explicitly — by amending this page or rejecting the change — never silently.
 
 Updated 2026-08-09.
 
