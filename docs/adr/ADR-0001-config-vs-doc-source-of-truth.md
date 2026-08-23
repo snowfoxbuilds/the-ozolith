@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — docs half superseded 2026-08-23 by ADR-0050 (all project docs are repo-authored; the Notion sync is retired); the config half stands
 
 Date: 2026-06-08
 
@@ -10,7 +10,7 @@ TheOzolith holds two kinds of content: agent configs (skills, subagents, workflo
 
 ## Decision
 
-Configs are authored in a source repo and synced one-way into local tool config dirs (e.g. `~/.claude`); as of ADR-0007 the source for personal configs is the private config repo, with the machinery in TheOzolith's knowledge/ component. Project docs are authored in Notion and synced one-way into the repo. Neither sync target is ever hand-edited. *(Amended by ADR-0033, 2026-07-30: ADRs move to repo authorship — `docs/adr/` is written and amended directly in the repo, and the Notion ADR mirror is frozen; Notion keeps AGENTS.md, CONTEXT.md, and Specs.)*
+Configs are authored in a source repo and synced one-way into local tool config dirs (e.g. `~/.claude`); as of ADR-0007 the source for personal configs is the private config repo, with the machinery in TheOzolith's knowledge/ component. Project docs are authored in Notion and synced one-way into the repo. Neither sync target is ever hand-edited. *(Amended by ADR-0033, 2026-07-30: ADRs move to repo authorship — `docs/adr/` is written and amended directly in the repo, and the Notion ADR mirror is frozen; Notion keeps AGENTS.md, CONTEXT.md, and Specs.)* *(Superseded in part by ADR-0050, 2026-08-23: the remaining docs move to repo authorship too and the Notion sync is retired; the config half of this decision — one-way sync from a source repo into tool config dirs, sync targets never hand-edited — stands.)*
 
 ## Consequences
 

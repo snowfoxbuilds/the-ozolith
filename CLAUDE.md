@@ -2,40 +2,40 @@
 
 # TheOzolith
 
-TheOzolith is an open-source agent-orchestration monorepo with three separable concerns: agent-knowledge machinery (skills, subagents, workflows, per-tool compilation and sync), a staged autonomous coding pipeline (planning, execution, review, monitoring) built on GitHub issues and PRs, and the cluster substrate that runs it (Control Node, Node Daemons, Stacks). It consolidates the former snow-maker and, by reduction, the former homeserver (ADR-0007); all personal content lives in one private config repo. Project docs (this index, the glossary, specs, and ADRs) are authored in Notion and synced down into the repo.
+TheOzolith is an open-source agent-orchestration monorepo with three separable concerns: agent-knowledge machinery (skills, subagents, workflows, per-tool compilation and sync), a staged autonomous coding pipeline (planning, execution, review, monitoring) built on GitHub issues and PRs, and the cluster substrate that runs it (Control Node, Node Daemons, Stacks). It consolidates the former snow-maker and, by reduction, the former homeserver (ADR-0007); all personal content lives in one private config repo. Project docs (this index, the glossary, specs, and ADRs) are repo-authored (ADR-0050); the Notion workspace is a read-only mirror.
 
 ## Conventions
 
 - Personal agent configs are data in the private config repo, synced one-way into local tool config dirs (e.g. `~/.claude`) by the knowledge machinery. Never hand-edit the local config.
-- Project docs are authored in Notion and synced one-way into the repo. Never hand-edit synced docs in the repo.
+- Project docs (this index, `CONTEXT.md`, `docs/specs/`, `docs/adr/`) are authored in the repo and reviewed in the PR that carries them; a PR whose ADR changes a spec's content updates the spec in the same PR (ADR-0050). Notion no longer syncs into the repo — a Notion-side agent reads the repo and contributes via PR.
 - Monorepo with separable, independently installable components: `knowledge/`, `worker/`, `control/`, `nodedaemon/`, `deploy/`. A laptop-only knowledge user never installs the cluster manager.
 ## Domain Language
 
-See [CONTEXT.md](http://context.md/) for the project's domain glossary. All specs, code, and agent instructions use these terms exactly.
+See [CONTEXT.md](CONTEXT.md) for the project's domain glossary. All specs, code, and agent instructions use these terms exactly.
 
 ## Specs
 
 | File | Summary |
 | --- | --- |
-| docs/specs/[ARCHITECTURE.md](http://architecture.md/) | Monorepo layout, components, and sync model |
-| docs/specs/[AGENTIC-CODING-PIPELINE.md](http://agentic-coding-pipeline.md/) | Staged autonomous development: issues, gate, human merge |
-| docs/specs/[NODE-SUBSTRATE.md](http://node-substrate.md/) | Cluster substrate: Control Node, Node Daemon, Config Repo, secrets, extension points |
+| docs/specs/ARCHITECTURE.md | Monorepo layout, components, and sync model |
+| docs/specs/AGENTIC-CODING-PIPELINE.md | Staged autonomous development: issues, gate, human merge |
+| docs/specs/NODE-SUBSTRATE.md | Cluster substrate: Control Node, Node Daemon, Config Repo, secrets, extension points |
 
 ## ADRs
 
 | File | Summary |
 | --- | --- |
-| docs/adr/[ADR-0001-config-vs-doc-source-of-truth.md](http://adr-0001-config-vs-doc-source-of-truth.md/) | Repo owns configs, Notion owns docs; one-way sync |
-| docs/adr/[ADR-0002-advisory-control-node.md](http://adr-0002-advisory-control-node.md/) | GitHub owns coordination state; Control Node is advisory |
-| docs/adr/[ADR-0003-handoff-doc-over-session-restore.md](http://adr-0003-handoff-doc-over-session-restore.md/) | Externalized handoff schema, not vendor sessions (amended by ADR-0008: schema lives in the PR Decisions Section) |
-| docs/adr/[ADR-0004-private-public-repo-boundary.md](http://adr-0004-private-public-repo-boundary.md/) | snow-maker self-contained; homeserver hosts pinned releases |
-| docs/adr/[ADR-0005-theozolith-owns-node-substrate.md](http://adr-0005-theozolith-owns-node-substrate.md/) | The product owns the node substrate; the private deployment extends it |
-| docs/adr/[ADR-0006-config-repo-source-of-truth.md](http://adr-0006-config-repo-source-of-truth.md/) | Git-backed Config Repo is the deployment source of truth (amended by ADR-0048: control loads and distributes the machine-built pinned build, produced only by `theozolith config ingest`) |
-| docs/adr/[ADR-0007-consolidate-into-theozolith.md](http://adr-0007-consolidate-into-theozolith.md/) | One public monorepo (TheOzolith); snow-maker renamed, homeserver reduces to a private config repo |
-| docs/adr/[ADR-0008-reviewer-owned-state-best-effort-pr.md](http://adr-0008-reviewer-owned-state-best-effort-pr.md/) | Best-effort PRs with Decisions Sections; a separate Reviewer actor owns all post-PR state and drives review rounds |
+| docs/adr/ADR-0001-config-vs-doc-source-of-truth.md | Repo owns configs, Notion owns docs; one-way sync (docs half superseded by ADR-0050: repo owns docs too) |
+| docs/adr/ADR-0002-advisory-control-node.md | GitHub owns coordination state; Control Node is advisory |
+| docs/adr/ADR-0003-handoff-doc-over-session-restore.md | Externalized handoff schema, not vendor sessions (amended by ADR-0008: schema lives in the PR Decisions Section) |
+| docs/adr/ADR-0004-private-public-repo-boundary.md | snow-maker self-contained; homeserver hosts pinned releases |
+| docs/adr/ADR-0005-theozolith-owns-node-substrate.md | The product owns the node substrate; the private deployment extends it |
+| docs/adr/ADR-0006-config-repo-source-of-truth.md | Git-backed Config Repo is the deployment source of truth (amended by ADR-0048: control loads and distributes the machine-built pinned build, produced only by `theozolith config ingest`) |
+| docs/adr/ADR-0007-consolidate-into-theozolith.md | One public monorepo (TheOzolith); snow-maker renamed, homeserver reduces to a private config repo |
+| docs/adr/ADR-0008-reviewer-owned-state-best-effort-pr.md | Best-effort PRs with Decisions Sections; a separate Reviewer actor owns all post-PR state and drives review rounds |
 | docs/adr/ADR-0009-knowledge-format-compiler-sync.md | Knowledge-root layout, Claude compiler mapping, manifest-based mirror sync (source wins on hand-edits) (amended by ADR-0048: deployment knowledge lives in the Config Repo `knowledge/` tree and compiles at ingest time) |
 | docs/adr/ADR-0010-python-tooling-and-packaging.md | uv workspace, per-component hatchling packages, ruff + pytest; bootstrap CLI lives in worker/ |
-| docs/adr/[ADR-0013-node-resident-drivers-per-run-containers.md](http://adr-0013-node-resident-drivers-per-run-containers.md/) | Actors split into node-resident drivers (Node Daemon children) and credential-free agent harnesses; Runs execute in ephemeral, attachable containers |
+| docs/adr/ADR-0013-node-resident-drivers-per-run-containers.md | Actors split into node-resident drivers (Node Daemon children) and credential-free agent harnesses; Runs execute in ephemeral, attachable containers |
 | docs/adr/ADR-0014-m2-execution-contracts.md | M2 execution contracts: job directory, harness, gate-as-jobs, strict one-strike verdict validation, run outcomes (empty PR / failed-Run retry), evidence bundles (retry path amended by ADR-0016) |
 | docs/adr/ADR-0015-m3-substrate-contracts.md | M3 substrate contracts: control-plane API, TOML Config Repo, Fernet secret store, liveness/janitor defaults, daemon packaging; records control/'s runtime-dependency amendment of ADR-0010 (amended by ADR-0016/0017; amended by ADR-0049: a managed `registry:<host>` reserved-name pull-credential class, `secret_names_for` scopes buildable bases, write-surface shape guard — derived-image "no registry" doctrine unchanged) |
 | docs/adr/ADR-0016-failure-handling.md | Failure handling: local retry with uniform budget, failed + needs_human label, control-side node quarantine, progress telemetry, cache-not-archive control DB, boot-time evidence sweep, evidence-first zombie escalation (amended by ADR-0046: the one-shot, Implementer-only completion-retry class — worktree + proposal carryover for a completed session with an invalid Output Proposal) |
@@ -57,3 +57,4 @@ See [CONTEXT.md](http://context.md/) for the project's domain glossary. All spec
 | docs/adr/ADR-0047-per-stack-secret-and-workspace-bindings.md | Per-Stack secret and workspace bindings: the worker type declares the slot contract (`""` = required slot every instantiating Stack must bind, fail-loud at config load), the Stack rebinds per placement (`workspace`, `[secrets]`; Stack `""` unbinds a default); key-wise merge, Stack wins; reserved identity slot names rejected at both sites; rebinding never rebuilds an image; driver⇒workspace enforced at resolution (workspace-less types are multi-repo templates); amends ADR-0044 |
 | docs/adr/ADR-0048-config-ingestion-pinned-build.md | Config ingestion: the human Config Repo (path or git URL) stays the source of truth; `theozolith config ingest` — the only write path, settings included — lints, resolves mechanical pins (knowledge per-tree content hashes, base tag→digest; the tailscale sha256 stays human-entered, never computed), compiles knowledge (ADR-0009 at ingest), and commits the machine-owned PINNED BUILD (configs/, git, source-SHA-stamped; rollback = revert there) then reloads; knowledge moves into the Config Repo `knowledge/` tree (`knowledge = "knowledge/<name>"`, KNOWLEDGE_GIT_TOKEN retired) with two delivery paths — HOTL workers keep baking (standalone images, selective re-tag via per-tree pins), HITL Flight Decks read-only bind-mount the applied tree (ADR-0043 writable clone/promote retired; restart = pick up); per-Stack knowledge rejected; amends ADR-0006/0009/0024/0043/0044 (amended by ADR-0049: a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved) |
 | docs/adr/ADR-0049-managed-registry-credentials.md | Managed registry credentials: a private base image digest resolves at ingest (and pulls at node build time) via a `registry:<host>` reserved-name secret in the Fernet store (value `<user>:<token>`, e.g. a GHCR PAT with read:packages), discovered by prefix — no new settings surface; authenticated at the TOKEN step (attempt 1 anonymous fast-path preserved; on the 401 challenge the credential rides the realm request as HTTP Basic; never a third attempt — by a 403 the challenge is gone, GHCR's private-package failure mode; bare-403-no-challenge is the documented limitation); resolution stays at ingest (control needs the digest before the deterministic tag, or fleet skew goes invisible); `secret_names_for` scopes `registry:<host>` for running worker-type bases and the heartbeat carries `registry_secrets` names-only when stored (channel invariant intact); `registry:`-prefixed names rejected as workload `[secrets]` binding values + write-surface shape guard; PR2 injects the same credential as node build-time `DOCKER_CONFIG` (tmpfs, Hub legacy-key twin, cache fallback); amends ADR-0048/0015 |
+| docs/adr/ADR-0050-repo-owned-project-docs.md | All project docs (index, glossary, specs, ADRs) are repo-authored and PR-reviewed; the Notion sync and `scripts/sync_notion.py` are retired — the Notion workspace is a read-only mirror whose agent reads the repo and contributes via PR; spec amendments land in the same PR as the ADR that motivates them; supersedes ADR-0001 in part, amends ADR-0033; the config-sync half of ADR-0001 stands |
