@@ -491,6 +491,9 @@ async def test_changing_a_filter_resets_the_feed_and_requeries():
         await pilot.press("enter")
         await pilot.pause()
         assert app.events_filters["type"] == "acme.custom"
+        # The requery runs in a worker (on_input_submitted -> run_worker);
+        # pause() alone does not guarantee it has fired on a slow runner.
+        await app.workers.wait_for_complete()
         typed = [c for c in fake.events_calls if c.get("type") == "acme.custom"]
         assert typed  # the new conjunction was queried
 
