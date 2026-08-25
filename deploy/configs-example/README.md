@@ -55,6 +55,51 @@ product never carries (the guardrail test enforces that boundary): network
 transports, site-specific wiring, and the Flight Deck's baked start sequence
 all live here, never in product code or images.
 
+## Flight Deck GitHub identity & workspace
+
+The deck mirrors a snow-maker dev container (`dev-dockers/setup.sh`): a
+GitHub-authenticated session with the target repo checked out and every
+shell opening inside it. Two bindings make that happen, both consumed by
+`flightdeck-start` on **every container start**:
+
+1. **The machine identity.** Create a dedicated machine account, mint a
+   fine-grained PAT scoped to issues, PRs, and contents — **no merge
+   permission** (never a driver PAT, never a personal token) — and store it
+   once:
+
+   ```sh
+   theozolith secret set flightdeck-github-token   # paste the PAT
+   ```
+
+   At start, `gh auth login` consumes the delivered `GITHUB_TOKEN_FILE`,
+   `gh auth setup-git` makes gh the git credential helper, and the git
+   commit identity (user.name/user.email) is **derived from the token's
+   account** — deck commits are machine-account-authored by doctrine.
+   Unlike snow-maker, no human git identity is ever copied in. gh keeps
+   the token in `~/.config/gh/hosts.yml` (0600) in the **container layer**
+   — rewritten each start, gone on recreate, never on a volume; the
+   durable copies remain the encrypted store and the tmpfs leaf only.
+
+2. **The workspace.** `workspace = "owner/name"` on the deck's Stack
+   (per-placement, ADR-0047) is cloned **on first start** to
+   `/workspace/<name>` on the per-instance `{stack}-workspace` volume — the
+   cluster analogue of snow-maker's host bind mount. Branches and
+   uncommitted work survive container recreation and image rebuilds; later
+   starts leave the checkout alone (never an automatic fetch — the session
+   owns the working tree), and anything at the target that is not a git
+   checkout fails the start loudly. ssh/mosh login shells and the tmux
+   session open inside the checkout (`~/.flightdeck-env`, rewritten each
+   start, carries the path to login shells).
+
+Failure is loud, per the start-lifecycle doctrine below: a bound workspace
+without the token secret, a bad token, or a failed clone each fail the
+container before `tailscaled` launches. A deck with **neither** binding
+starts bare with a logged note — `gh` stays unauthenticated and you clone
+by hand. Rebinding `workspace` recreates the deck (changed env); the old
+checkout stays on the volume beside the new one until you remove it.
+Treat `{stack}-workspace` as durable working state: it can hold unpushed
+commits, so delete it only when decommissioning the deck.
+
 ## Flight Deck one-hop access (tailscale)
 
 SSH/VSCode into a Flight Deck normally takes two hops: into the node's host,

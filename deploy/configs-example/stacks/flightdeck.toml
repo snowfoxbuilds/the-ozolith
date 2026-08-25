@@ -13,6 +13,15 @@ node = "box1"
 # ingest.
 state = "stopped"
 
+# The repo THIS deck works on (per-placement binding, ADR-0047): owner/name
+# on github.com, cloned on first start to /workspace/<name> on the deck's
+# {stack}-workspace volume by flightdeck-start under the no-merge machine
+# identity (snow-maker repo-mount parity — branches and uncommitted work
+# survive recreation). ssh/mosh sessions and the tmux session open inside
+# it. Requires the GITHUB_TOKEN binding; omit the key for a bare deck that
+# clones by hand.
+workspace = "acme/sandbox"
+
 # Web-terminal attach command, executed by the Control Node's PTY bridge as
 # a structured argv array ({host}/{container} only as complete arguments,
 # validated before launch). Attach and detach are audit-logged. `attach`
