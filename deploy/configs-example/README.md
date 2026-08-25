@@ -64,9 +64,31 @@ hop:
 
 ```sh
 ssh ozolith@flightdeck-box1          # Tailscale SSH; lands as ozolith in the container
+ssh flightdeck-box1                  # bare form — needs FLIGHTDECK_SSH_USER (below)
+mosh flightdeck-box1                 # same session, roaming/lag-tolerant (UDP grant below)
 ```
 
 and in VSCode: **Remote-SSH → Connect to Host → `ozolith@flightdeck-box1`**.
+
+The bare `ssh <hostname>` form sends your LAPTOP username, and the non-root
+`tailscaled` can only start sessions whose /etc/passwd entry has its own uid —
+so the worker type's setup carries an operator-edited `FLIGHTDECK_SSH_USER`
+variable that bakes your username as a second passwd entry at the ozolith uid
+(same home, same `~/.claude`). Set it, re-ingest, and the changed instruction
+hash rebuilds the image; also add the name to the ssh ACL's `users` list
+(below). This is a build-time choice by design — the container runs
+unprivileged, so no Stack `[env]` could create a user at start time.
+
+mosh bootstraps over that same Tailscale SSH connection, then switches to
+direct UDP (ports 60000–61000), which needs its own network-layer grant in
+the ACL (below). Inside, tmux ships the snow-maker `tmux.conf` verbatim:
+wheel scrolls history, drag-select copies to your local clipboard via OSC 52
+(mosh ≥ 1.4 on your machine, and a terminal that permits OSC 52). Hold Shift
+while selecting to bypass tmux and use the terminal's native copy. Note the
+ssh path is gate-verified (issue #31); mosh's inbound UDP rides the userspace
+daemon's netstack forwarding and has not been through a gate — verify it once
+on your own tailnet (checklist below); if it fails, plain `ssh` plus the same
+tmux clipboard settings is the supported fallback.
 The hostname is the Stack's `FLIGHTDECK_TS_HOSTNAME` (`stacks/flightdeck.toml`),
 convention `flightdeck-<name>`; MagicDNS resolves it on your tailnet. Userspace
 networking needs no TUN device, no `NET_ADMIN`, and no `devices`/`cap_add`
@@ -161,6 +183,8 @@ allow-all grant is removed. In your tailnet policy file:
     "tag:flightdeck": ["autogroup:admin"]   // who may mint tag:flightdeck keys
   },
   // Layer 1 — network access: least-privilege grant, the SSH port only.
+  // Using mosh? Add "udp:60000-61000" — mosh bootstraps over tcp:22, then
+  // switches to direct UDP in that range.
   "grants": [
     {
       "src": ["autogroup:member"],          // tighten: a dedicated operator group
@@ -168,7 +192,10 @@ allow-all grant is removed. In your tailnet policy file:
       "ip":  ["tcp:22"]
     }
   ],
-  // Layer 2 — SSH authorization: who lands, and as which user.
+  // Layer 2 — SSH authorization: who lands, and as which user. If you set
+  // FLIGHTDECK_SSH_USER in the worker type, list that name here too (or
+  // instead) — both names are the same uid-1000 account in the container,
+  // and this list, not /etc/passwd, is the authorization boundary.
   "ssh": [
     {
       "action": "accept",                    // the deliberate tradeoff — see below
@@ -199,6 +226,35 @@ radius small with a tight `src` and the `tag:flightdeck` ACLs.
 
 MagicDNS must be enabled for `ssh ozolith@flightdeck-<name>` to resolve; without
 it, use the tailnet IP.
+
+### Verify the interactive surface (operator checklist)
+
+The ssh path is gate-verified (issue #31); mosh over the userspace daemon is
+**not** — unit tests and source inspection say it should work, only this
+checklist run on a real tailnet says it does. From a laptop on the tailnet,
+against a running deck:
+
+1. `ssh <your-name>@flightdeck-<name>` — and the bare `ssh flightdeck-<name>`
+   form once `FLIGHTDECK_SSH_USER` is baked and the name is in the ssh ACL's
+   `users` list;
+2. inside the deck: `command -v mosh-server` prints a path, and
+   `locale -a | grep -i en_US` lists the generated UTF-8 locale
+   (`en_US.utf8`) — mosh-server refuses to start without it;
+3. `mosh flightdeck-<name>` reaches a prompt. The bootstrap itself rides
+   tcp:22, so a hang at "waiting for a reply" after a successful bootstrap
+   means the UDP session never established — check the `udp:60000-61000`
+   grant; a working prompt proves the session runs through the userspace
+   netstack;
+4. tmux is up (the `flightdeck` session), the mouse wheel scrolls history,
+   and a drag-select lands in your LOCAL clipboard (OSC 52 — your terminal
+   must permit it);
+5. change the client's network (toggle Wi-Fi, switch networks): the mosh
+   session freezes and resumes without a reconnect;
+6. fallback: with UDP unavailable, plain `ssh flightdeck-<name>` still works
+   with the same tmux scroll/clipboard behavior.
+
+Until this passes on your tailnet, treat mosh as expected-to-work and ssh as
+the verified path.
 
 ### Start lifecycle: every failure is a failed container
 
@@ -239,3 +295,25 @@ If you applied the hardening (unbound or removed the `TS_AUTHKEY` binding)
 message: restore the binding — drop the Stack's `TS_AUTHKEY = ""` unbind, or
 re-add the line to the worker type's `[secrets]` — restart the Stack to
 re-enroll, then re-apply the hardening.
+
+### The claude-state volume carries a login credential
+
+`{stack}-claude-state` (`/home/ozolith/.claude`) holds the agent CLI's own
+config, `.claude.json` — the `/login` credential and the onboarding flag —
+because the image bakes `CLAUDE_CONFIG_DIR=/home/ozolith/.claude`. A `/login`
+therefore survives container and image recreation for as long as the volume is
+retained. `flightdeck-start` seeds a **fresh** volume with only the onboarding
+flag (`0600`, written via same-directory temp + atomic rename); an existing
+file — zero-byte included — is never rewritten, and an unexpected symlink or
+directory at that path fails the start loudly rather than being followed.
+
+Treat the volume as **secret-bearing** durable state: protect any backup or
+export of it like a credential store, restore with `ozolith` ownership and
+the restrictive file modes intact, never copy its contents into images, logs,
+or ordinary config repositories, and delete the volume when permanently
+decommissioning the deck — or to deliberately revoke everything it retains.
+
+**Upgrading a deck that predates this layout:** the old credential lived
+container-local at `~/.claude.json`, outside every volume, and is gone with
+the replaced container — it cannot be migrated. Run one deliberate `/login`
+in the first session on the new layout; every recreation after that keeps it.

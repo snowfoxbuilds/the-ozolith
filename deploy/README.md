@@ -947,12 +947,28 @@ daemon and no shared network filesystem, ever**.
   it replaces the symlinks with copied files, silently detaching the deck from
   the applied tree (the mount itself is read-only, so nothing can write
   through the links).
-- `~/.claude.json` lives *outside* `~/.claude` and is not on the state volume, so
-  it regenerates when the container recycles (accepted v0 gap). The deck's model
-  preference is NOT part of this gap: a `/model` choice persists to
-  `~/.claude/settings.json` *on* the state volume and survives recycles — it is
-  the baked `--model` flag (see the Flight Deck section) that resets every
-  container start to the definition's default.
+- The agent CLI's own config (`.claude.json` — the `/login` credential and the
+  onboarding flag) lives at `~/.claude/.claude.json` **on** `<stack>-claude-state`:
+  the image bakes `CLAUDE_CONFIG_DIR=/home/ozolith/.claude`, so a `/login`
+  survives container and image recreation for as long as the volume is
+  retained. (The former accepted v0 gap — `~/.claude.json` outside every
+  volume, regenerating on every recycle — is closed.) **Upgrading an existing
+  deck:** the credential in the old container-local `~/.claude.json` cannot be
+  migrated once that container has been replaced, so the first session on the
+  new layout needs one deliberate `/login`; there is no automatic migration.
+  A fresh volume is seeded with only the onboarding flag (`0600`, atomic write;
+  an existing file — zero-byte included — is never rewritten, and an unexpected
+  symlink or directory at that path fails the start loudly). A `/model` choice
+  keeps persisting to `~/.claude/settings.json` on the same volume — it is the
+  baked `--model` flag (see the Flight Deck section) that resets every container
+  start to the definition's default.
+- **`<stack>-claude-state` is secret-bearing.** It now carries a live login
+  credential alongside session state: protect any backup or export of it like
+  a credential store, restore with `ozolith` ownership and the restrictive
+  file modes intact, never copy its contents into images, logs, or ordinary
+  config repositories, and delete the volume when you permanently
+  decommission the deck — or when you deliberately want to revoke everything
+  it retains.
 
 ## Custom drivers (ADR-0042)
 

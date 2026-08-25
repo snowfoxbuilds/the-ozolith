@@ -34,6 +34,19 @@
 # the uid-1000 capability-free path is gate-verified (evidence on issue #31).
 # The web terminal and the two-hop `attach` in stacks/flightdeck.toml remain
 # as the audited fallback paths.
+#
+# Bare `ssh <FLIGHTDECK_TS_HOSTNAME>` (no user@): set FLIGHTDECK_SSH_USER in
+# setup step (3) to your LAPTOP username. The ssh client sends your local
+# username, and Tailscale SSH under a non-root tailscaled resolves it in the
+# container's /etc/passwd and requires its uid to EQUAL the daemon's — a
+# numeric check (tailssh.go, pinned v1.102.2), so an extra NAME at the
+# ozolith uid is all it takes. /etc/passwd is root-owned and the container
+# runs unprivileged, which is why the name is a build-time setup variable and
+# NOT a Stack [env]: env arrives at container start, after the last moment a
+# user can be created. Session ergonomics (mosh + tmux mouse/clipboard) ride
+# steps (1), (5), and (6); mosh additionally needs a udp:60000-61000 grant in
+# the tailnet policy (README) and, unlike the ssh path, is not yet
+# gate-verified over the userspace daemon.
 
 # No `driver` -> Flight Deck. Driverless types may carry `command` and
 # `volumes`; both are rejected when a driver is set.
@@ -82,8 +95,12 @@ knowledge = "knowledge/claude-dev"
 model = "claude-fable-5"
 
 setup = [
-    # (1) tmux (the named attach session) + curl (fetch the tailscale binaries).
-    "apt-get update && apt-get install -y --no-install-recommends tmux curl && rm -rf /var/lib/apt/lists/*",
+    # (1) tmux (the named attach session) + curl (fetch the tailscale binaries)
+    #     + mosh and locales (snow-maker parity): mosh-server needs a UTF-8
+    #     native locale generated SERVER-side, because the mosh client
+    #     forwards its own LANG (commonly en_US.UTF-8) and refuses to start
+    #     without a matching UTF-8 locale on this end.
+    "apt-get update && apt-get install -y --no-install-recommends tmux curl mosh locales && sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen && rm -rf /var/lib/apt/lists/*",
 
     # (2) Tailscale static binaries, pinned TWICE — by version in the URL AND by
     #     sha256. The pinned version is the exact release the #31 gate evidence
@@ -106,14 +123,97 @@ install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscale"  /usr/local/
 install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscaled" /usr/local/bin/tailscaled && \
 rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 
-    # (3) Seed the named-volume mountpoints ozolith-owned. setup runs as root;
+    # (3) One-hop ssh username (see the header): EDIT FLIGHTDECK_SSH_USER to
+    #     your laptop username so bare `ssh <FLIGHTDECK_TS_HOSTNAME>` lands
+    #     here — the alias is a SECOND /etc/passwd entry at the ozolith
+    #     uid/gid (derived, never hardcoded — the base image accepts an
+    #     OZOLITH_UID build arg), sharing /home/ozolith so ~/.claude state
+    #     and the knowledge symlinks apply identically. The shipped "ozolith"
+    #     value is the documented no-op. Changing the value changes the
+    #     instruction hash -> deterministic-tag rebuild + deck recreate. A
+    #     name that already exists in the base image (root, daemon, ...)
+    #     fails the useradd, and with it the build — loudly, by design. The
+    #     tailnet ssh ACL must also allow the name in its "users" list
+    #     (README); the ACL, not this entry, is the authorization boundary.
+    '''FLIGHTDECK_SSH_USER=ozolith; \
+if [ "$FLIGHTDECK_SSH_USER" != ozolith ]; then \
+  useradd --non-unique --uid "$(id -u ozolith)" --gid "$(id -g ozolith)" \
+    --home-dir /home/ozolith --no-create-home --shell /bin/bash "$FLIGHTDECK_SSH_USER"; \
+fi''',
+
+    # (4) Seed the named-volume mountpoints ozolith-owned. setup runs as root;
     #     an absent mountpoint would otherwise be created root-owned, and its
     #     ownership is copied onto the volume on first mount. /var/lib/tailscale
     #     ownership is what lets the uid-1000 daemon write its state. (The
     #     knowledge bind mount needs no seeding: it is read-only host content.)
     "mkdir -p /home/ozolith/.claude /var/lib/tailscale && chown ozolith:ozolith /home/ozolith/.claude /var/lib/tailscale",
 
-    # (4) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
+    # (5) /etc/tmux.conf, VERBATIM from snow-maker dev-dockers/tmux.conf (only
+    #     the provenance header differs). These exact lines are what make
+    #     mosh+tmux scroll and copy work — wheel scrolls tmux history instead
+    #     of sending arrow keys, drag-select reaches the LOCAL clipboard via
+    #     OSC 52 — and the Ms override in particular is fragile (the obvious
+    #     simpler form silently emits nothing; see the baked comments). Do
+    #     not "clean up" this file: drift here is exactly the copy/scroll
+    #     breakage the verbatim rule exists to prevent. System-wide default;
+    #     a session can still override with ~/.tmux.conf on the state volume.
+    '''printf '%s\n' \
+'# Baked into the image as /etc/tmux.conf by the flightdeck worker-type setup.' \
+'# Source: snow-maker dev-dockers/tmux.conf, kept VERBATIM below (only this' \
+'# provenance header differs) - the mouse and OSC 52 lines are load-bearing' \
+'# for scroll and copy over mosh, and easy to get subtly wrong.' \
+'' \
+'# Wheel scrolls tmux history and drag selects text. Without mouse mode the' \
+'# terminal falls back to "alternate scroll" and the wheel sends arrow keys.' \
+'set -g mouse on' \
+'' \
+'# Copy selections to the local system clipboard via OSC 52, which mosh >= 1.4' \
+'# forwards. The terminal-features line makes tmux emit OSC 52 even though' \
+"# mosh's plain xterm-256color terminfo lacks the Ms capability." \
+'set -g set-clipboard on' \
+"set -as terminal-features ',*:clipboard'" \
+'' \
+"# tmux's own copies (copy-mode, load-buffer -w) emit OSC 52 with an empty" \
+'# selection-target field ("\e]52;;..."), which mosh 1.4 discards — only an' \
+"# explicit target (\"\e]52;c;...\") survives. This Ms override prints tmux's" \
+'# flags when present and falls back to a literal "c" when they are empty.' \
+'# The simpler "Ms=\E]52;c;%p2%s\007" does NOT work: tparm silently fails on a' \
+'# format that never references %p1, and tmux then emits nothing at all.' \
+"set -as terminal-overrides ',*:Ms=\E]52;%?%p1%l%t%p1%s%ec%;;%p2%s\007'" \
+'' \
+'set -g mode-keys vi' \
+'set -g history-limit 50000' \
+'' \
+'bind -T copy-mode-vi v     send-keys -X begin-selection' \
+'bind -T copy-mode-vi y     send-keys -X copy-selection-and-cancel' \
+'bind -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel' \
+'bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel' \
+'' \
+'# Middle-click pastes the most recent tmux buffer' \
+'bind -T root MouseDown2Pane paste-buffer -p' \
+> /etc/tmux.conf''',
+
+    # (6) Interactive-shell defaults (snow-maker parity): a tailscale ssh
+    #     login shell reads /etc/profile.d, a tmux window's non-login shell
+    #     reads /etc/bash.bashrc — the appended source line covers the
+    #     second path, so BOTH match the env flightdeck-start gives the
+    #     session it launches. CLAUDE_CONFIG_DIR is the load-bearing one:
+    #     it moves .claude.json inside ~/.claude, onto the per-deck
+    #     claude-state volume, so a /login and the onboarding flag survive
+    #     container recreation (the home dir itself is no volume). LANG is a
+    #     default only — the := form never clobbers what a mosh client
+    #     forwarded. claude-long is the snow-maker convenience alias.
+    '''printf '%s\n' \
+'# Baked by the flightdeck worker-type setup (snow-maker parity): defaults' \
+'# for every interactive shell, so a tailscale ssh login and a tmux window' \
+'# see the same claude environment as the flightdeck-start session.' \
+'export CLAUDE_CONFIG_DIR=/home/ozolith/.claude' \
+': "${LANG:=en_US.UTF-8}"; export LANG' \
+"alias claude-long='claude --dangerously-skip-permissions'" \
+> /etc/profile.d/flightdeck.sh \
+&& printf '%s\n' '. /etc/profile.d/flightdeck.sh' >> /etc/bash.bashrc''',
+
+    # (7) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
     #     content baked by setup — never product source — which is how the
     #     no-tailscale-in-product constraint is honored. The knowledge tree
     #     name is NOT a literal here (ADR-0048 amendment): the script reads
@@ -184,6 +284,36 @@ rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
 'for entry in skills agents workflows CLAUDE.md; do' \
 '  link_knowledge "$KNOWLEDGE_TREE_DIR/$entry" "/home/ozolith/.claude/$entry"' \
 'done' \
+'# Claude session env (snow-maker parity, mirrored in /etc/profile.d): the' \
+'# CLI config dir lives INSIDE ~/.claude so .claude.json - login credential,' \
+'# onboarding flag - rides the per-deck state volume with settings.json;' \
+'# LANG backs the UTF-8 locale mosh and tmux expect. Exported here so the' \
+'# tmux server and the claude session inherit them from PID 1.' \
+'export CLAUDE_CONFIG_DIR=/home/ozolith/.claude' \
+'[ -n "${LANG:-}" ] || export LANG=en_US.UTF-8' \
+'# Seed onboarding-complete ONLY when no .claude.json path exists at all:' \
+'# after a /login this file IS the credential store, so an existing regular' \
+'# file - zero-byte included - is never rewritten, and a symlink, directory,' \
+'# or other irregular object is refused loudly rather than followed or' \
+'# replaced. The seed is created 0600 (mktemp, umask-independent) in the' \
+'# same directory and published by one atomic mv; the subshell keeps its' \
+'# cleanup trap away from the tailscaled supervision traps set below, and' \
+'# set -e is suspended inside a ||-guarded subshell, hence explicit exits.' \
+'CLAUDE_CONFIG=/home/ozolith/.claude/.claude.json' \
+'if [ -e "$CLAUDE_CONFIG" ] || [ -L "$CLAUDE_CONFIG" ]; then' \
+'  if [ -L "$CLAUDE_CONFIG" ] || [ ! -f "$CLAUDE_CONFIG" ]; then' \
+'    echo "flightdeck-start: $CLAUDE_CONFIG exists but is not a regular file (symlink, directory, ...); refusing to follow or replace it" >&2' \
+'    exit 1' \
+'  fi' \
+'else' \
+'  (' \
+'    tmp=$(mktemp "$CLAUDE_CONFIG.seed.XXXXXX") || exit 1' \
+'    trap "rm -f \"$tmp\"" EXIT' \
+'    chmod 0600 "$tmp" || exit 1' \
+'    printf "%s\n" "{\"hasCompletedOnboarding\": true}" > "$tmp" || exit 1' \
+'    mv "$tmp" "$CLAUDE_CONFIG" || exit 1' \
+'  ) || { echo "flightdeck-start: seeding $CLAUDE_CONFIG failed; leaving the state volume untouched" >&2; exit 1; }' \
+'fi' \
 '# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled' \
 ': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
 '# Enrollment is decided BEFORE the daemon can touch the statedir — from the' \
