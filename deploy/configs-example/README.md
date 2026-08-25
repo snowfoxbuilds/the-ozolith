@@ -64,9 +64,30 @@ hop:
 
 ```sh
 ssh ozolith@flightdeck-box1          # Tailscale SSH; lands as ozolith in the container
+ssh flightdeck-box1                  # bare form — needs FLIGHTDECK_SSH_USER (below)
+mosh flightdeck-box1                 # same session, roaming/lag-tolerant (UDP grant below)
 ```
 
 and in VSCode: **Remote-SSH → Connect to Host → `ozolith@flightdeck-box1`**.
+
+The bare `ssh <hostname>` form sends your LAPTOP username, and the non-root
+`tailscaled` can only start sessions whose /etc/passwd entry has its own uid —
+so the worker type's setup carries an operator-edited `FLIGHTDECK_SSH_USER`
+variable that bakes your username as a second passwd entry at the ozolith uid
+(same home, same `~/.claude`). Set it, re-ingest, and the changed instruction
+hash rebuilds the image; also add the name to the ssh ACL's `users` list
+(below). This is a build-time choice by design — the container runs
+unprivileged, so no Stack `[env]` could create a user at start time.
+
+mosh bootstraps over that same Tailscale SSH connection, then switches to
+direct UDP (ports 60000–61000), which needs its own network-layer grant in
+the ACL (below). Inside, tmux ships the snow-maker `tmux.conf` verbatim:
+wheel scrolls history, drag-select copies to your local clipboard via OSC 52
+(mosh ≥ 1.4 on your machine, and a terminal that permits OSC 52). Hold Shift
+while selecting to bypass tmux and use the terminal's native copy. Note the
+ssh path is gate-verified (issue #31); mosh's inbound UDP rides the userspace
+daemon's netstack forwarding and has not been through a gate — if it fails,
+plain `ssh` plus the same tmux clipboard settings is the supported fallback.
 The hostname is the Stack's `FLIGHTDECK_TS_HOSTNAME` (`stacks/flightdeck.toml`),
 convention `flightdeck-<name>`; MagicDNS resolves it on your tailnet. Userspace
 networking needs no TUN device, no `NET_ADMIN`, and no `devices`/`cap_add`
@@ -161,6 +182,8 @@ allow-all grant is removed. In your tailnet policy file:
     "tag:flightdeck": ["autogroup:admin"]   // who may mint tag:flightdeck keys
   },
   // Layer 1 — network access: least-privilege grant, the SSH port only.
+  // Using mosh? Add "udp:60000-61000" — mosh bootstraps over tcp:22, then
+  // switches to direct UDP in that range.
   "grants": [
     {
       "src": ["autogroup:member"],          // tighten: a dedicated operator group
@@ -168,7 +191,10 @@ allow-all grant is removed. In your tailnet policy file:
       "ip":  ["tcp:22"]
     }
   ],
-  // Layer 2 — SSH authorization: who lands, and as which user.
+  // Layer 2 — SSH authorization: who lands, and as which user. If you set
+  // FLIGHTDECK_SSH_USER in the worker type, list that name here too (or
+  // instead) — both names are the same uid-1000 account in the container,
+  // and this list, not /etc/passwd, is the authorization boundary.
   "ssh": [
     {
       "action": "accept",                    // the deliberate tradeoff — see below

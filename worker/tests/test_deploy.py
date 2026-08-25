@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -331,6 +332,97 @@ def test_configs_example_flightdeck_tailscale_wiring(example_config):
     assert "TS_AUTHKEY_FILE" in setup
 
 
+def test_configs_example_flightdeck_ssh_username_alias(example_config):
+    """Bare `ssh <hostname>` support: the worker type carries an operator-
+    edited FLIGHTDECK_SSH_USER setup variable that bakes the name as a
+    SECOND /etc/passwd entry at the ozolith uid — non-root Tailscale SSH
+    compares uids numerically (tailssh.go, the pinned v1.102.2 release), so
+    an alias suffices, and a runtime env never could (the deck runs
+    unprivileged per the #31 doctrine and /etc/passwd is root-owned, so the
+    name must exist before the build drops back to USER ozolith)."""
+    setup = "\n".join(example_config.worker_types["flightdeck"].setup)
+    assert "FLIGHTDECK_SSH_USER=ozolith" in setup  # the shipped no-op default
+    assert 'if [ "$FLIGHTDECK_SSH_USER" != ozolith ]' in setup
+    # The alias shares the ozolith uid/gid and home — DERIVED, never
+    # hardcoded (the base image accepts an OZOLITH_UID build arg).
+    assert "useradd --non-unique" in setup
+    assert '--uid "$(id -u ozolith)"' in setup
+    assert '--gid "$(id -g ozolith)"' in setup
+    assert "--home-dir /home/ozolith" in setup
+    assert "--no-create-home" in setup
+
+
+def test_configs_example_flightdeck_tmux_conf_is_verbatim_snow_maker(tmp_path, example_config):
+    """The baked /etc/tmux.conf carries the snow-maker mosh+tmux settings
+    VERBATIM — the Ms terminal-override in particular is fragile (the
+    obvious simpler form makes tparm fail silently and tmux emits nothing),
+    so the directives are pinned byte-exact by EXECUTING the generator step,
+    never by grepping fragments."""
+    setup = example_config.worker_types["flightdeck"].setup
+    generators = [s for s in setup if "/etc/tmux.conf" in s]
+    assert len(generators) == 1
+    dest = tmp_path / "tmux.conf"
+    command = generators[0].replace("/etc/tmux.conf", str(dest))
+    subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
+    directives = [
+        line for line in dest.read_text().splitlines() if line and not line.startswith("#")
+    ]
+    assert directives == [
+        "set -g mouse on",
+        "set -g set-clipboard on",
+        "set -as terminal-features ',*:clipboard'",
+        r"set -as terminal-overrides ',*:Ms=\E]52;%?%p1%l%t%p1%s%ec%;;%p2%s\007'",
+        "set -g mode-keys vi",
+        "set -g history-limit 50000",
+        "bind -T copy-mode-vi v     send-keys -X begin-selection",
+        "bind -T copy-mode-vi y     send-keys -X copy-selection-and-cancel",
+        "bind -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel",
+        "bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel",
+        "bind -T root MouseDown2Pane paste-buffer -p",
+    ]
+
+
+def test_configs_example_flightdeck_shell_defaults_and_mosh(tmp_path, example_config):
+    """snow-maker parity for the interactive surface: mosh plus a
+    server-side UTF-8 locale (mosh-server refuses to start without one
+    matching the client's forwarded LANG), and a baked profile whose
+    CLAUDE_CONFIG_DIR puts .claude.json on the claude-state volume. The
+    profile generator is EXECUTED, and the result sourced under set -eu —
+    the LANG default must neither error when LANG is unset nor clobber a
+    client-forwarded value."""
+    setup = example_config.worker_types["flightdeck"].setup
+    for needed in ("mosh", "locales", "locale-gen", "en_US.UTF-8"):
+        assert needed in setup[0], needed
+    generators = [s for s in setup if "/etc/profile.d/flightdeck.sh" in s]
+    assert len(generators) == 1
+    profile = tmp_path / "flightdeck.sh"
+    bashrc = tmp_path / "bash.bashrc"
+    command = generators[0].replace("/etc/profile.d/flightdeck.sh", str(profile))
+    command = command.replace("/etc/bash.bashrc", str(bashrc))
+    subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
+    # tmux windows run non-login shells: bash.bashrc must source the SAME
+    # file the login-shell profile.d path serves.
+    assert bashrc.read_text() == f". {profile}\n"
+    content = profile.read_text()
+    assert "export CLAUDE_CONFIG_DIR=/home/ozolith/.claude" in content
+    assert "alias claude-long='claude --dangerously-skip-permissions'" in content
+    source_fresh = f'set -eu; unset LANG; . "{profile}"; printf %s "$LANG:$CLAUDE_CONFIG_DIR"'
+    probe = subprocess.run(
+        ["/bin/sh", "-c", source_fresh],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.stdout == "en_US.UTF-8:/home/ozolith/.claude"
+    probe = subprocess.run(
+        ["/bin/sh", "-c", f'set -eu; LANG=de_DE.UTF-8; . "{profile}"; printf %s "$LANG"'],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.stdout == "de_DE.UTF-8"  # forwarded locale wins over the default
+
+
 def test_flightdeck_tailscale_version_matches_the_gate_harness(example_config):
     """The version the example ships must be the version the #31 gate harness
     (spikes/issue-31-tailscale-uid1000, PR #34) actually tested — gate evidence
@@ -561,12 +653,14 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         "tmux new-session -d -s flightdeck"
         ' "claude --model \\"$(cat /etc/theozolith/model)\\""' in script
     )
-    # ... and the only variables in the script are its own runtime ones.
+    # ... and the only variables in the script are its own runtime ones
+    # (LANG is the default-only probe of the client-forwarded locale).
     assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
         "FLIGHTDECK_TS_HOSTNAME",
         "THEOZOLITH_KNOWLEDGE_TREE",
         "KNOWLEDGE_TREE_DIR",
         "entry",
+        "LANG",
         "TS_AUTHKEY_FILE",
         "TS_ENROLL",
         "TS_TRIES",
@@ -836,6 +930,50 @@ def test_flightdeck_start_marker_present_reuses_identity_without_the_key(tmp_pat
     up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
     assert len(up_lines) == 1
     assert "--auth-key" not in up_lines[0]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_seeds_claude_config_and_env(tmp_path, example_config):
+    """snow-maker parity in the start script: CLAUDE_CONFIG_DIR and a LANG
+    default are exported BEFORE the session launches (the tmux server, and
+    with it every window, inherits them), and a FRESH state volume is seeded
+    with an onboarding-complete .claude.json — while an existing config is
+    NEVER rewritten: after a /login it is the credential store."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    # A tmux stand-in that records the environment the server would inherit.
+    env_file = bin_dir / "tmux.env"
+    stub = bin_dir / "tmux"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in new-session) env > "{env_file}" ;; has-session) exit 1 ;; esac\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", LANG=None)
+    assert proc.returncode == 0, proc.stderr
+    session_env = env_file.read_text().splitlines()
+    assert f"CLAUDE_CONFIG_DIR={sandbox / 'home' / '.claude'}" in session_env
+    assert "LANG=en_US.UTF-8" in session_env
+    config = sandbox / "home" / ".claude" / ".claude.json"
+    assert json.loads(config.read_text()) == {"hasCompletedOnboarding": True}
+    _assert_daemon_reaped(daemon_pid)
+
+    # Second start over the same volume: the seed is fresh-volume-only, so a
+    # config with real state survives byte-meaningfully, and a forwarded
+    # LANG outranks the default.
+    config.write_text('{"hasCompletedOnboarding": true, "custom": 1}')
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", LANG="de_DE.UTF-8")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(config.read_text()) == {"hasCompletedOnboarding": True, "custom": 1}
+    assert "LANG=de_DE.UTF-8" in env_file.read_text().splitlines()
     _assert_daemon_reaped(daemon_pid)
 
 

@@ -26,6 +26,11 @@ attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux",
 # `ssh ozolith@flightdeck-box1` (or VSCode Remote-SSH to the same host) lands
 # as ozolith inside THIS container. Per-placement by design — every Flight
 # Deck Stack picks a distinct name, convention flightdeck-<something>.
+# Bare `ssh flightdeck-box1` (and `mosh flightdeck-box1`) work once the
+# worker type's FLIGHTDECK_SSH_USER setup variable is set to your laptop
+# username — a BUILD-time /etc/passwd alias at the ozolith uid, deliberately
+# not a Stack [env] (env arrives only at container start; see the worker
+# type). mosh also needs a udp:60000-61000 grant in the tailnet policy.
 [env]
 FLIGHTDECK_TS_HOSTNAME = "flightdeck-box1"
 
