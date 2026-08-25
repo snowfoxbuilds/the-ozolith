@@ -654,12 +654,15 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         ' "claude --model \\"$(cat /etc/theozolith/model)\\""' in script
     )
     # ... and the only variables in the script are its own runtime ones
-    # (LANG is the default-only probe of the client-forwarded locale).
+    # (LANG is the default-only probe of the client-forwarded locale;
+    # CLAUDE_CONFIG/tmp are the seed path and its atomic-publish temp).
     assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
         "FLIGHTDECK_TS_HOSTNAME",
         "THEOZOLITH_KNOWLEDGE_TREE",
         "KNOWLEDGE_TREE_DIR",
         "entry",
+        "CLAUDE_CONFIG",
+        "tmp",
         "LANG",
         "TS_AUTHKEY_FILE",
         "TS_ENROLL",
@@ -676,6 +679,7 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
     assert (
         script.index("KNOWLEDGE_TREE_DIR=")
         < script.index("link_knowledge")
+        < script.index("CLAUDE_CONFIG=")  # the seed decides before the tailnet path
         < script.index(".theozolith-enrolled-v1 ]")
         < script.index("tailscaled --tun=userspace-networking")
         < script.index(" up --ssh")
@@ -688,14 +692,15 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
     # false success marker, and tailscaled.state is never deleted or rewritten.
     assert "if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]" in script
     assert "-s /var/lib/tailscale/tailscaled.state ]" not in script
-    # Nothing on the TAILNET-IDENTITY volume is ever deleted; the only rm in
-    # the script is the portable symlink replace under ~/.claude (never a
+    # Nothing on the TAILNET-IDENTITY volume is ever deleted; the only rms in
+    # the script are the portable symlink replace under ~/.claude (never a
     # real directory — the guard above it refuses those), which GNU ln -sfnT
-    # performed implicitly before.
+    # performed implicitly before, and the seed subshell's cleanup trap on its
+    # own mktemp file (the published .claude.json itself is never removed).
     for line in lines:
         if "rm " in line:
             assert "tailscale" not in line, line
-            assert 'rm -f "$2"' in line, line
+            assert 'rm -f "$2"' in line or 'rm -f \\"$tmp\\"' in line, line
     assert (
         script.index(" up --ssh")
         < script.index("> /var/lib/tailscale/.theozolith-enrolled-v1.tmp")
@@ -937,8 +942,10 @@ def test_flightdeck_start_seeds_claude_config_and_env(tmp_path, example_config):
     """snow-maker parity in the start script: CLAUDE_CONFIG_DIR and a LANG
     default are exported BEFORE the session launches (the tmux server, and
     with it every window, inherits them), and a FRESH state volume is seeded
-    with an onboarding-complete .claude.json — while an existing config is
-    NEVER rewritten: after a /login it is the credential store."""
+    with an onboarding-complete .claude.json — PRIVATE (0600 regardless of
+    the caller's umask: after a /login this file is the credential store) —
+    while an existing config is NEVER rewritten: a restart over retained
+    state preserves it byte-for-byte, mode included."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
@@ -957,24 +964,120 @@ def test_flightdeck_start_seeds_claude_config_and_env(tmp_path, example_config):
     )
     stub.chmod(0o755)
 
-    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", LANG=None)
+    # The widest-open umask the script could inherit: a plain redirection
+    # would land the seed world-writable, so the 0600 below proves the
+    # mktemp+chmod path, not the process default.
+    old_umask = os.umask(0)
+    try:
+        proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", LANG=None)
+    finally:
+        os.umask(old_umask)
     assert proc.returncode == 0, proc.stderr
     session_env = env_file.read_text().splitlines()
     assert f"CLAUDE_CONFIG_DIR={sandbox / 'home' / '.claude'}" in session_env
     assert "LANG=en_US.UTF-8" in session_env
     config = sandbox / "home" / ".claude" / ".claude.json"
+    assert config.read_text() == '{"hasCompletedOnboarding": true}\n'
     assert json.loads(config.read_text()) == {"hasCompletedOnboarding": True}
+    assert config.stat().st_mode & 0o777 == 0o600
+    assert list(config.parent.glob(".claude.json.seed.*")) == []  # temp published, not left
     _assert_daemon_reaped(daemon_pid)
 
-    # Second start over the same volume: the seed is fresh-volume-only, so a
-    # config with real state survives byte-meaningfully, and a forwarded
-    # LANG outranks the default.
-    config.write_text('{"hasCompletedOnboarding": true, "custom": 1}')
+    # Second start over the same volume: the seed runs only when NO path
+    # exists, so a config with real credential state survives byte-for-byte
+    # with its mode, and a forwarded LANG outranks the default.
+    raw = '{"hasCompletedOnboarding": true, "custom": 1}'
+    config.write_text(raw)
+    config.chmod(0o640)
     proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", LANG="de_DE.UTF-8")
     assert proc.returncode == 0, proc.stderr
-    assert json.loads(config.read_text()) == {"hasCompletedOnboarding": True, "custom": 1}
+    assert config.read_text() == raw
+    assert config.stat().st_mode & 0o777 == 0o640
     assert "LANG=de_DE.UTF-8" in env_file.read_text().splitlines()
     _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_claude_seed_preserves_a_zero_byte_config(tmp_path, example_config):
+    """A zero-byte .claude.json is an EXISTING regular file (say, truncated
+    by an interrupted CLI write), never a fresh volume: the seed must leave
+    it exactly alone — the retired `! -s` predicate would have rewritten it."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+    config = sandbox / "home" / ".claude" / ".claude.json"
+    config.touch()
+    config.chmod(0o644)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert config.read_bytes() == b""
+    assert config.stat().st_mode & 0o777 == 0o644
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_claude_seed_refuses_irregular_paths(tmp_path, example_config):
+    """A pre-existing symlink (a credential-write redirection target), a
+    dangling symlink, or a directory at the .claude.json path fails the
+    start non-zero with a clear message BEFORE tailscaled ever launches —
+    never followed, never replaced — and a symlink target is untouched."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    config = sandbox / "home" / ".claude" / ".claude.json"
+    target = sandbox / "elsewhere.json"
+    target.write_text("innocent bystander")
+
+    def clear() -> None:
+        if config.is_symlink():
+            config.unlink()
+        elif config.is_dir():
+            config.rmdir()
+
+    for shape in ("symlink", "dangling-symlink", "directory"):
+        clear()
+        if shape == "symlink":
+            config.symlink_to(target)
+        elif shape == "dangling-symlink":
+            config.symlink_to(sandbox / "nonexistent")
+        else:
+            config.mkdir()
+        proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+        assert proc.returncode == 1, shape
+        assert "is not a regular file" in proc.stderr, shape
+    assert target.read_text() == "innocent bystander"  # never written through
+    assert not daemon_calls.exists()  # refused before the tailnet lifecycle
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_start_claude_seed_publication_failure_cleans_up(tmp_path, example_config):
+    """An injected publication failure (mv stubbed to fail) exits non-zero
+    with the seeding error, creates NO final config, leaves NO temp debris
+    (the subshell EXIT trap owns cleanup), and never reaches the tailnet
+    lifecycle."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    _stub(bin_dir, "mv", exit_code=1)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 1
+    assert "seeding" in proc.stderr and "failed" in proc.stderr
+    state_dir = sandbox / "home" / ".claude"
+    assert not (state_dir / ".claude.json").exists()
+    assert list(state_dir.glob(".claude.json.seed.*")) == []
+    assert not daemon_calls.exists()
 
 
 def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_path, example_config):

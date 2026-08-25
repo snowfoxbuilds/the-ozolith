@@ -291,10 +291,28 @@ fi''',
 '# tmux server and the claude session inherit them from PID 1.' \
 'export CLAUDE_CONFIG_DIR=/home/ozolith/.claude' \
 '[ -n "${LANG:-}" ] || export LANG=en_US.UTF-8' \
-'# Seed onboarding-complete on a FRESH state volume only - never rewrite an' \
-'# existing config: the first interactive session lands ready for /login.' \
-'if [ ! -s /home/ozolith/.claude/.claude.json ]; then' \
-'  printf "%s\n" "{\"hasCompletedOnboarding\": true}" > /home/ozolith/.claude/.claude.json' \
+'# Seed onboarding-complete ONLY when no .claude.json path exists at all:' \
+'# after a /login this file IS the credential store, so an existing regular' \
+'# file - zero-byte included - is never rewritten, and a symlink, directory,' \
+'# or other irregular object is refused loudly rather than followed or' \
+'# replaced. The seed is created 0600 (mktemp, umask-independent) in the' \
+'# same directory and published by one atomic mv; the subshell keeps its' \
+'# cleanup trap away from the tailscaled supervision traps set below, and' \
+'# set -e is suspended inside a ||-guarded subshell, hence explicit exits.' \
+'CLAUDE_CONFIG=/home/ozolith/.claude/.claude.json' \
+'if [ -e "$CLAUDE_CONFIG" ] || [ -L "$CLAUDE_CONFIG" ]; then' \
+'  if [ -L "$CLAUDE_CONFIG" ] || [ ! -f "$CLAUDE_CONFIG" ]; then' \
+'    echo "flightdeck-start: $CLAUDE_CONFIG exists but is not a regular file (symlink, directory, ...); refusing to follow or replace it" >&2' \
+'    exit 1' \
+'  fi' \
+'else' \
+'  (' \
+'    tmp=$(mktemp "$CLAUDE_CONFIG.seed.XXXXXX") || exit 1' \
+'    trap "rm -f \"$tmp\"" EXIT' \
+'    chmod 0600 "$tmp" || exit 1' \
+'    printf "%s\n" "{\"hasCompletedOnboarding\": true}" > "$tmp" || exit 1' \
+'    mv "$tmp" "$CLAUDE_CONFIG" || exit 1' \
+'  ) || { echo "flightdeck-start: seeding $CLAUDE_CONFIG failed; leaving the state volume untouched" >&2; exit 1; }' \
 'fi' \
 '# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled' \
 ': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
