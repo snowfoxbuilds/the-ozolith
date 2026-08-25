@@ -240,6 +240,7 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
         "flightdeck-claude-state:/home/ozolith/.claude",
         "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
         "flightdeck-tailscale-state:/var/lib/tailscale",
+        "flightdeck-workspace:/workspace",
     }
 
     wt = config.worker_types["flightdeck"]
@@ -262,7 +263,12 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
     # replace idiom is portable (no GNU-only ln -T): a real directory at a
     # destination is refused, a stale link or file is relinked.
     assert "clone-init" not in script
-    assert "github.com" not in script
+    # github.com may appear ONLY for the workspace/identity wiring (the gh
+    # apt source and the derived noreply commit identity) — knowledge itself
+    # is never fetched from a remote (the retired ADR-0043 clone).
+    for line in script.splitlines():
+        if "github.com" in line:
+            assert "cli.github.com" in line or "users.noreply.github.com" in line, line
     assert "ln -sfnT" not in script and "ln -sfn" not in script
     assert "knowledge/claude-dev" not in script  # the selection is env, not a literal
     assert '"${THEOZOLITH_KNOWLEDGE_TREE:?' in script
@@ -288,6 +294,48 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
         for volume in other.volumes:
             assert "knowledge" not in volume and ".claude" not in volume, (name, volume)
             assert "tailscale" not in volume, (name, volume)
+
+
+def test_configs_example_flightdeck_github_workspace_wiring(example_config):
+    """snow-maker container-setup parity (dev-dockers/setup.sh + Dockerfile):
+    the deck ships the GitHub CLI from GitHub's own apt repo plus the
+    interactive tool set, authenticates the dedicated no-merge machine
+    identity from the delivered secret FILE on every start (the value never
+    enters argv or env), derives the commit identity from the token account,
+    and clones the Stack-bound workspace once onto the per-instance volume."""
+    config = example_config
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+    wt = config.worker_types["flightdeck"]
+    setup = "\n".join(wt.setup)
+
+    # The Stack's per-placement workspace binding (ADR-0047) resolves into
+    # the deck's env; the checkout target volume is per-instance and its
+    # mountpoint is seeded ozolith-owned (setup runs as root).
+    assert flightdeck.env["THEOZOLITH_REPO"] == "acme/sandbox"
+    assert "flightdeck-workspace:/workspace" in flightdeck.volumes
+    seed = next(s for s in wt.setup if s.startswith("mkdir -p"))
+    assert "/workspace" in seed and "chown ozolith:ozolith" in seed
+
+    # gh rides GitHub's own apt repo (keyring over TLS, signature-verified
+    # packages), alongside the snow-maker interactive tool set.
+    assert "cli.github.com/packages/githubcli-archive-keyring.gpg" in wt.setup[0]
+    for tool in ("gh", "jq", "ripgrep", "less", "procps", "vim", "nano", "openssh-client"):
+        assert f" {tool}" in wt.setup[0], tool
+
+    # Identity + workspace wiring in the start script: auth by FILE path
+    # only, gh as the git credential helper, machine-derived commit
+    # identity, clone only when the checkout is absent, and the fail-loud
+    # misconfiguration (workspace bound, token not).
+    for needed in (
+        'gh auth login --with-token < "$GITHUB_TOKEN_FILE"',
+        "gh auth setup-git",
+        "gh auth status",
+        'git config --global user.name "$GH_LOGIN"',
+        '"${GH_ID}+${GH_LOGIN}@users.noreply.github.com"',
+        'gh repo clone "$THEOZOLITH_REPO" "$WORKSPACE_DIR"',
+        "restore the flightdeck-github-token binding",
+    ):
+        assert needed in setup, needed
 
 
 def test_configs_example_flightdeck_tailscale_wiring(example_config):
@@ -318,11 +366,18 @@ def test_configs_example_flightdeck_tailscale_wiring(example_config):
     assert version.group(0) == "TS_VERSION=1.102.2"
     assert tuple(map(int, version.groups())) >= (1, 98, 9)
 
-    # Userspace daemon, uid-1000 statedir, no privilege words anywhere.
+    # Userspace daemon, uid-1000 statedir, no capability grant anywhere.
+    # sudo itself is sanctioned in the deck for in-session installs
+    # (snow-maker parity — see the dedicated test), but the tailnet
+    # lifecycle must never be escalated: the #31 gate evidence covers the
+    # unprivileged uid-1000 daemon only.
     assert "--tun=userspace-networking" in setup
     assert "chown ozolith:ozolith" in setup and "/var/lib/tailscale" in setup
-    for forbidden in ("cap_add", "NET_ADMIN", "/dev/net/tun", "privileged", "sudo"):
+    for forbidden in ("cap_add", "NET_ADMIN", "/dev/net/tun", "privileged"):
         assert forbidden not in setup, forbidden
+    for line in setup.splitlines():
+        if "tailscale" in line:
+            assert "sudo" not in line, f"tailscale must never run under sudo: {line}"
 
     # The key is a named secret delivered as TS_AUTHKEY_FILE; the hostname is
     # per-placement Stack env, present on the example Stack.
@@ -330,6 +385,23 @@ def test_configs_example_flightdeck_tailscale_wiring(example_config):
     assert flightdeck.env["FLIGHTDECK_TS_HOSTNAME"] == "flightdeck-box1"
     # Only the file path is ever referenced — the value has no other route in.
     assert "TS_AUTHKEY_FILE" in setup
+
+
+def test_configs_example_flightdeck_sudo_for_in_session_installs(example_config):
+    """snow-maker parity: ozolith gets PASSWORDLESS sudo via a 0440
+    sudoers.d drop-in baked with the base tooling, so a session installs
+    software (build-essential included) without an operator round-trip.
+    This is root within the container NAMESPACE only — the substrate grants
+    no capability (pinned by the tailscale-wiring test, which also pins
+    that the tailnet daemon itself is never escalated)."""
+    setup = example_config.worker_types["flightdeck"].setup
+    assert " sudo " in setup[0]
+    assert 'echo "ozolith ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ozolith' in setup[0]
+    assert "chmod 0440 /etc/sudoers.d/ozolith" in setup[0]
+    # snow-maker's networking pair rides along (inspection works; netfilter
+    # mutation still needs a capability the schema cannot grant).
+    for pkg in ("iproute2", "iptables"):
+        assert pkg in setup[0], pkg
 
 
 def test_configs_example_flightdeck_ssh_username_alias(example_config):
@@ -397,8 +469,10 @@ def test_configs_example_flightdeck_shell_defaults_and_mosh(tmp_path, example_co
     assert len(generators) == 1
     profile = tmp_path / "flightdeck.sh"
     bashrc = tmp_path / "bash.bashrc"
+    runtime_env = tmp_path / "flightdeck-env"
     command = generators[0].replace("/etc/profile.d/flightdeck.sh", str(profile))
     command = command.replace("/etc/bash.bashrc", str(bashrc))
+    command = command.replace("/home/ozolith/.flightdeck-env", str(runtime_env))
     subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
     # tmux windows run non-login shells: bash.bashrc must source the SAME
     # file the login-shell profile.d path serves.
@@ -421,6 +495,31 @@ def test_configs_example_flightdeck_shell_defaults_and_mosh(tmp_path, example_co
         text=True,
     )
     assert probe.stdout == "de_DE.UTF-8"  # forwarded locale wins over the default
+    # The profile sources the runtime env file flightdeck-start rewrites on
+    # every start (the workspace checkout path), and interactive LOGIN
+    # shells — a tailscale ssh/mosh session — open in the workspace, like
+    # snow-maker's dev-env.sh. Plain sh / non-login shells never cd (tmux
+    # windows already start in the checkout via new-session -c), and the
+    # guard stays set -eu-safe with the env file absent (probes above).
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    runtime_env.write_text(f"export WORKSPACE_DIR={workspace}\n")
+    probe = subprocess.run(
+        ["/bin/sh", "-c", f'set -eu; . "{profile}"; printf %s "$WORKSPACE_DIR:$PWD"'],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert probe.stdout == f"{workspace}:{tmp_path}"  # exported, but no cd
+    probe = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-lic", f'. "{profile}"; printf %s "$PWD"'],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert probe.stdout == str(workspace)  # login+interactive shells cd in
 
 
 def test_flightdeck_tailscale_version_matches_the_gate_harness(example_config):
@@ -465,11 +564,13 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
     content = content.replace("/var/lib/theozolith/knowledge", str(sandbox / "knowledge"))
     content = content.replace("/etc/theozolith", str(sandbox / "etc"))
+    content = content.replace("/workspace", str(sandbox / "workspace"))
     rewritten = sandbox / "start"
     rewritten.write_text(content)
     rewritten.chmod(0o755)
     (sandbox / "home" / ".claude").mkdir(parents=True)  # the state-volume mountpoint
     (sandbox / "tsstate").mkdir()  # the tailscale-state volume mountpoint
+    (sandbox / "workspace").mkdir()  # the workspace volume mountpoint
     # The applied knowledge tree the deck's selection resolves to (ADR-0048):
     # present by default so the fail-loud gate passes; the unavailable-tree
     # test removes it.
@@ -550,6 +651,29 @@ def _tailscaled_stub(
     return calls, pid_file
 
 
+def _gh_stub(bin_dir: Path, *, auth_code: int = 0, clone_code: int = 0) -> Path:
+    """A `gh` CLI stand-in: records every argv, captures the token piped to
+    `auth login` from STDIN (the real flow — the value must never ride argv),
+    answers the identity queries with a fixed machine account, and emulates
+    `repo clone` by materializing (or, on failure, not materializing) the
+    target checkout."""
+    calls = bin_dir / "gh.calls"
+    stub = bin_dir / "gh"
+    clone_action = f"exit {clone_code}" if clone_code else 'mkdir -p "$4/.git"'
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls}"\n'
+        'case "$1 $2" in\n'
+        f'"auth login") cat > "{bin_dir}/gh.token"; exit {auth_code} ;;\n'
+        '"api user") case "$*" in *login*) echo testbot ;; *) echo 12345 ;; esac ;;\n'
+        f'"repo clone") {clone_action} ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return calls
+
+
 def _tmux_stub(bin_dir: Path, *, has_session_code: int) -> Path:
     """A `tmux` stand-in; has-session's exit code drives the supervisor loop
     (0 = session alive, 1 = session gone). Besides the flat `tmux.calls`
@@ -609,6 +733,8 @@ def _run_start(
         "THEOZOLITH_KNOWLEDGE_TREE": "claude-dev",
     }
     env.pop("TS_AUTHKEY_FILE", None)
+    env.pop("GITHUB_TOKEN_FILE", None)
+    env.pop("THEOZOLITH_REPO", None)
     for key, value in extra_env.items():
         if value is None:
             env.pop(key, None)
@@ -651,11 +777,14 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
     assert "if [ -s /etc/theozolith/model ]; then" in script
     assert (
         "tmux new-session -d -s flightdeck"
+        ' -c "${WORKSPACE_DIR:-/home/ozolith}"'
         ' "claude --model \\"$(cat /etc/theozolith/model)\\""' in script
     )
     # ... and the only variables in the script are its own runtime ones
     # (LANG is the default-only probe of the client-forwarded locale;
-    # CLAUDE_CONFIG/tmp are the seed path and its atomic-publish temp).
+    # CLAUDE_CONFIG/tmp are the seed path and its atomic-publish temp;
+    # GITHUB_TOKEN_FILE/THEOZOLITH_REPO arrive from the secret machinery and
+    # the resolved Stack env, GH_*/WORKSPACE_DIR are derived at start).
     assert set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", script)) == {
         "FLIGHTDECK_TS_HOSTNAME",
         "THEOZOLITH_KNOWLEDGE_TREE",
@@ -664,6 +793,11 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         "CLAUDE_CONFIG",
         "tmp",
         "LANG",
+        "GITHUB_TOKEN_FILE",
+        "THEOZOLITH_REPO",
+        "WORKSPACE_DIR",
+        "GH_LOGIN",
+        "GH_ID",
         "TS_AUTHKEY_FILE",
         "TS_ENROLL",
         "TS_TRIES",
@@ -680,6 +814,8 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         script.index("KNOWLEDGE_TREE_DIR=")
         < script.index("link_knowledge")
         < script.index("CLAUDE_CONFIG=")  # the seed decides before the tailnet path
+        < script.index("gh auth login")  # identity + workspace before the tailnet path
+        < script.index("gh repo clone")
         < script.index(".theozolith-enrolled-v1 ]")
         < script.index("tailscaled --tun=userspace-networking")
         < script.index(" up --ssh")
@@ -1113,6 +1249,8 @@ def test_flightdeck_start_baked_model_launches_the_session_with_the_flag(tmp_pat
         "-d",
         "-s",
         "flightdeck",
+        "-c",
+        str(sandbox / "home"),  # no workspace bound -> the session opens at home
         'claude --model "claude-fable-5"',
     ]
     assert invocations[1][:4] == ["pipe-pane", "-o", "-t", "flightdeck"]
@@ -1138,7 +1276,15 @@ def test_flightdeck_start_absent_model_file_launches_bare_claude(tmp_path, examp
 
     proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
     assert proc.returncode == 0, proc.stderr
-    assert _tmux_invocations(bin_dir)[0] == ["new-session", "-d", "-s", "flightdeck", "claude"]
+    assert _tmux_invocations(bin_dir)[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        "-c",
+        str(sandbox / "home"),
+        "claude",
+    ]
     _assert_daemon_reaped(daemon_pid)
 
 
@@ -1160,7 +1306,15 @@ def test_flightdeck_start_empty_model_file_launches_bare_claude(tmp_path, exampl
 
     proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
     assert proc.returncode == 0, proc.stderr
-    assert _tmux_invocations(bin_dir)[0] == ["new-session", "-d", "-s", "flightdeck", "claude"]
+    assert _tmux_invocations(bin_dir)[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        "-c",
+        str(sandbox / "home"),
+        "claude",
+    ]
     _assert_daemon_reaped(daemon_pid)
 
 
@@ -1410,6 +1564,206 @@ def test_flightdeck_start_daemon_death_after_start_fails_the_container(tmp_path,
     )
     assert proc.returncode == 1
     assert "tailscaled exited" in proc.stderr
+
+
+def test_flightdeck_start_github_auth_and_first_start_clone(tmp_path, example_config):
+    """snow-maker setup.sh parity, end-to-end in a real /bin/sh: with the
+    GITHUB_TOKEN secret bound and a workspace resolved, the start
+    authenticates gh from the secret FILE (the token rides stdin, never
+    argv), wires gh as the git credential helper, derives the machine
+    commit identity from the token account, clones the workspace ONCE onto
+    the volume, hands the path to interactive shells via ~/.flightdeck-env,
+    and opens the tmux session inside the checkout. A second start over the
+    same volume re-authenticates but never re-clones."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    token_file = sandbox / "ghtoken"
+    token_file.write_text("github_pat_SECRETTOKEN\n")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)  # session already over
+    gh_calls = _gh_stub(bin_dir)
+    git_calls = _stub(bin_dir, "git", exit_code=0)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        GITHUB_TOKEN_FILE=str(token_file),
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 0, proc.stderr
+    workspace = sandbox / "workspace" / "sandbox"
+    gh_lines = gh_calls.read_text().splitlines()
+    assert gh_lines == [
+        "auth login --with-token",
+        "auth setup-git",
+        "auth status",
+        "api user --jq .login",
+        "api user --jq .id",
+        f"repo clone acme/sandbox {workspace}",
+    ]
+    # The token reached gh via STDIN and appears in no recorded argv.
+    assert (bin_dir / "gh.token").read_text() == "github_pat_SECRETTOKEN\n"
+    assert "SECRETTOKEN" not in gh_calls.read_text()
+    assert "SECRETTOKEN" not in git_calls.read_text()
+    # Machine-derived commit identity — never a human's.
+    git_lines = git_calls.read_text().splitlines()
+    assert "config --global user.name testbot" in git_lines
+    assert "config --global user.email 12345+testbot@users.noreply.github.com" in git_lines
+    assert (workspace / ".git").is_dir()
+    env_file = sandbox / "home" / ".flightdeck-env"
+    assert env_file.read_text() == f"export WORKSPACE_DIR={workspace}\n"
+    assert _tmux_invocations(bin_dir)[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        "-c",
+        str(workspace),
+        "claude",
+    ]
+    _assert_daemon_reaped(daemon_pid)
+
+    # Second start, same volume: the checkout exists -> auth again, clone
+    # never (the session owns the working tree; no automatic fetch either).
+    gh_calls.unlink()
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        GITHUB_TOKEN_FILE=str(token_file),
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 0, proc.stderr
+    rerun_lines = gh_calls.read_text().splitlines()
+    assert "auth login --with-token" in rerun_lines
+    assert not any(line.startswith("repo clone") for line in rerun_lines)
+    assert not any("fetch" in line or "pull" in line for line in git_calls.read_text().splitlines())
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_workspace_without_token_fails_before_the_daemon(tmp_path, example_config):
+    """A bound workspace with no GITHUB_TOKEN secret is a refused
+    misconfiguration (the clone could not authenticate): fail loud with a
+    restore-the-binding message BEFORE tailscaled ever launches — never a
+    deck that silently starts without its repo."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    gh_calls = _gh_stub(bin_dir)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 1
+    assert "GITHUB_TOKEN" in proc.stderr and "flightdeck-github-token" in proc.stderr
+    assert not gh_calls.exists()  # nothing to authenticate with
+    assert not daemon_calls.exists()
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_start_tokenless_repoless_deck_starts_bare(tmp_path, example_config):
+    """With NEITHER binding, the deck starts bare with a logged note: no gh
+    invocation at all (no `gh` stub is on PATH — a stray call would fail the
+    run loudly), an empty runtime env file, and the session opens at home."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert "no GITHUB_TOKEN bound" in proc.stderr
+    assert (sandbox / "home" / ".flightdeck-env").read_text() == ""
+    assert _tmux_invocations(bin_dir)[0][4:6] == ["-c", str(sandbox / "home")]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_workspace_debris_is_refused_not_deleted(tmp_path, example_config):
+    """Non-checkout debris at the workspace target (volume leftovers, a
+    half-removed tree) fails the start loudly BEFORE the tailnet lifecycle —
+    never deleted, never cloned over, never silently adopted."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    token_file = sandbox / "ghtoken"
+    token_file.write_text("github_pat_x\n")
+    debris = sandbox / "workspace" / "sandbox"
+    debris.mkdir(parents=True)
+    (debris / "leftover.txt").write_text("precious")
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    _gh_stub(bin_dir)
+    _stub(bin_dir, "git", exit_code=0)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        GITHUB_TOKEN_FILE=str(token_file),
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 1
+    assert "not a git checkout" in proc.stderr
+    assert (debris / "leftover.txt").read_text() == "precious"  # untouched
+    assert not daemon_calls.exists()
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_start_failed_auth_or_clone_fails_the_container(tmp_path, example_config):
+    """gh failures are container failures (docker restart policy owns the
+    retry): a rejected token stops the start at auth, a failed clone stops
+    it at the clone — both BEFORE tailscaled launches, so a deck never runs
+    half-authenticated or half-materialized."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    token_file = sandbox / "ghtoken"
+    token_file.write_text("github_pat_x\n")
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    _stub(bin_dir, "git", exit_code=0)
+
+    _gh_stub(bin_dir, auth_code=1)  # rejected token
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        GITHUB_TOKEN_FILE=str(token_file),
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 1
+    assert not daemon_calls.exists()
+
+    gh_calls = _gh_stub(bin_dir, clone_code=1)  # auth fine, clone fails
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        GITHUB_TOKEN_FILE=str(token_file),
+        THEOZOLITH_REPO="acme/sandbox",
+    )
+    assert proc.returncode == 1
+    assert any(line.startswith("repo clone") for line in gh_calls.read_text().splitlines())
+    assert not (sandbox / "workspace" / "sandbox").exists()
+    assert not daemon_calls.exists()
 
 
 # -- repo mirror cache provisioning + retention (#51 amendment) ---------------------

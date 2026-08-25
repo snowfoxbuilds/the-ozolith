@@ -861,8 +861,17 @@ refuses to delete what it cannot prove is its own.
   machine identity** — a fine-grained PAT scoped to issues, PRs, and contents with
   **no merge permission**, stored under the dedicated secret name
   `flightdeck-github-token`. Never reuse a driver PAT and never use a personal token
-  here; the human merge gate stays human by construction. Do not leave Flight Deck
-  sessions running unattended.
+  here; the human merge gate stays human by construction. The deck user has
+  passwordless sudo — root within the container namespace only, for in-session
+  software installs; the substrate grants no extra kernel capability, so the
+  container boundary and the no-merge identity remain the walls. Do not leave
+  Flight Deck sessions running unattended. `flightdeck-start` wires the identity on every
+  container start (snow-maker parity): `gh auth login` from the delivered secret
+  file, gh as the git credential helper, commit identity derived from the token's
+  account — and clones the Stack's `workspace` (owner/name) on first start to
+  `/workspace/<name>` on the per-deck `<stack>-workspace` volume, where ssh logins
+  and the tmux session open (see `configs-example/README.md`, "Flight Deck GitHub
+  identity & workspace").
 - **Flight Deck default model** (ADR-0045 §4): set `model` on the deck's worker type
   and the derived image carries the validated ID at the well-known file
   `/etc/theozolith/model` — materialized atomically as a root-owned, non-user-writable
@@ -890,10 +899,12 @@ same-type Flight Decks on one node get distinct per-instance volumes):
 | `<stack>-claude-state` (named volume) | `/home/ozolith/.claude` | **one per Flight Deck** — runtime state (sessions, transcripts, `--resume`); never shared, never worker-visible |
 | `<state-dir>/knowledge` (read-only bind) | `/var/lib/theozolith/knowledge` | **one per node** — the applied pinned knowledge trees the Node Daemon exports; every deck on the node reads the same content |
 | `<stack>-logs` (named volume) | `/var/log/flightdeck` | one per Flight Deck |
+| `<stack>-workspace` (named volume) | `/workspace` | **one per Flight Deck** — the working tree(s); the Stack's `workspace` repo is cloned here on first start, and branches/uncommitted work survive recreation (may hold unpushed commits — delete only on decommission) |
 
-(One-hop remote access into a Flight Deck — and the per-instance machine-identity
-volume it will add — is split out and tracked separately; see
-`configs-example/README.md` for status and the ways in today.)
+(One-hop remote access into a Flight Deck — and its per-instance
+machine-identity volume — lives entirely in the Config Repo surface; see
+`configs-example/README.md` for the transport, ACLs, and enrollment
+lifecycle.)
 
 **Knowledge is the applied pinned tree, mounted read-only — not a clone, not a
 bake** (ADR-0048; the ADR-0043 writable clone and its promote workflow are

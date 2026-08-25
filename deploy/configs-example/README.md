@@ -55,6 +55,64 @@ product never carries (the guardrail test enforces that boundary): network
 transports, site-specific wiring, and the Flight Deck's baked start sequence
 all live here, never in product code or images.
 
+## Flight Deck GitHub identity & workspace
+
+The deck mirrors a snow-maker dev container (`dev-dockers/setup.sh`): a
+GitHub-authenticated session with the target repo checked out and every
+shell opening inside it. Two bindings make that happen, both consumed by
+`flightdeck-start` on **every container start**:
+
+1. **The machine identity.** Create a dedicated machine account, mint a
+   fine-grained PAT scoped to issues, PRs, and contents — **no merge
+   permission** (never a driver PAT, never a personal token) — and store it
+   once:
+
+   ```sh
+   theozolith secret set flightdeck-github-token   # paste the PAT
+   ```
+
+   At start, `gh auth login` consumes the delivered `GITHUB_TOKEN_FILE`,
+   `gh auth setup-git` makes gh the git credential helper, and the git
+   commit identity (user.name/user.email) is **derived from the token's
+   account** — deck commits are machine-account-authored by doctrine.
+   Unlike snow-maker, no human git identity is ever copied in. gh keeps
+   the token in `~/.config/gh/hosts.yml` (0600) in the **container layer**
+   — rewritten each start, gone on recreate, never on a volume; the
+   durable copies remain the encrypted store and the tmpfs leaf only.
+
+2. **The workspace.** `workspace = "owner/name"` on the deck's Stack
+   (per-placement, ADR-0047) is cloned **on first start** to
+   `/workspace/<name>` on the per-instance `{stack}-workspace` volume — the
+   cluster analogue of snow-maker's host bind mount. Branches and
+   uncommitted work survive container recreation and image rebuilds; later
+   starts leave the checkout alone (never an automatic fetch — the session
+   owns the working tree), and anything at the target that is not a git
+   checkout fails the start loudly. ssh/mosh login shells and the tmux
+   session open inside the checkout (`~/.flightdeck-env`, rewritten each
+   start, carries the path to login shells).
+
+Failure is loud, per the start-lifecycle doctrine below: a bound workspace
+without the token secret, a bad token, or a failed clone each fail the
+container before `tailscaled` launches. A deck with **neither** binding
+starts bare with a logged note — `gh` stays unauthenticated and you clone
+by hand. Rebinding `workspace` recreates the deck (changed env); the old
+checkout stays on the volume beside the new one until you remove it.
+Treat `{stack}-workspace` as durable working state: it can hold unpushed
+commits, so delete it only when decommissioning the deck.
+
+The session is also **privileged inside the container** (snow-maker
+parity): `ozolith` has passwordless sudo, so installing whatever the work
+needs is `sudo apt-get install …` away — heavier toolchains like
+`build-essential` (the gcc/g++/make/libc-dev metapackage for compiling
+native pip/npm dependencies) are installed on demand instead of baked.
+sudo grants **no kernel capability**: the container stays capability-free
+(no `NET_ADMIN`, no TUN — `iptables` mutation is unavailable by
+construction), the tailnet daemon still runs unprivileged (never run it
+under sudo), and the read-only knowledge mount cannot be remounted from
+inside. Remember the flip side: a prompt-injected session is root in the
+container too — the container boundary and the no-merge identity are the
+walls, which is why deck sessions stay attended.
+
 ## Flight Deck one-hop access (tailscale)
 
 SSH/VSCode into a Flight Deck normally takes two hops: into the node's host,
@@ -92,8 +150,13 @@ tmux clipboard settings is the supported fallback.
 The hostname is the Stack's `FLIGHTDECK_TS_HOSTNAME` (`stacks/flightdeck.toml`),
 convention `flightdeck-<name>`; MagicDNS resolves it on your tailnet. Userspace
 networking needs no TUN device, no `NET_ADMIN`, and no `devices`/`cap_add`
-passthrough — `tailscaled` itself runs as the unprivileged `ozolith` uid, so a
-tailnet ACL mistake can never yield more than an `ozolith` session. The
+passthrough — `tailscaled` itself runs as the unprivileged `ozolith` uid. Note
+what a session is worth: `ozolith` carries passwordless sudo (see the identity
+& workspace section), so a tailnet ACL mistake yields root **inside the
+container namespace** — still capability-free, with the container boundary,
+the read-only knowledge mount, and the no-merge GitHub identity as the
+blast-radius walls — which is exactly why the `src` lists below should stay
+tight. The
 uid-1000 capability-free path is gate-verified (issue #31 evidence). Note the
 deliberate scope: **inbound** Tailscale SSH is the use case; outbound dials
 from inside the container to the tailnet would need the userspace SOCKS5/HTTP
