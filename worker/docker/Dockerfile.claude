@@ -15,10 +15,14 @@
 # The optional Knowledge Source is baked at BUILD time by the M1 bake CLI;
 # nothing syncs or executes at container start (NODE-SUBSTRATE.md).
 #
-# No GitHub credential ever enters this image or its containers: the driver
-# holds the PAT and performs all GitHub I/O. The only secret a run container
-# sees is the model credential — an API key (a rotatable spend credential,
-# ADR-0013) or a `claude setup-token` OAuth token.
+# No GitHub credential ever enters this image or its RUN containers: the
+# driver holds the PAT and performs all GitHub I/O. The only secret a run
+# container sees is the model credential — an API key (a rotatable spend
+# credential, ADR-0013) or a `claude setup-token` OAuth token. The Flight
+# Deck derives from this image and is the deliberate exception (ADR-0019):
+# its containers receive their OWN no-merge machine-identity token at
+# container start through the secret machinery — still never baked into
+# this or any derived image.
 
 FROM python:3.13-slim
 

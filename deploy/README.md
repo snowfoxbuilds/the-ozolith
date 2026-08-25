@@ -861,8 +861,11 @@ refuses to delete what it cannot prove is its own.
   machine identity** — a fine-grained PAT scoped to issues, PRs, and contents with
   **no merge permission**, stored under the dedicated secret name
   `flightdeck-github-token`. Never reuse a driver PAT and never use a personal token
-  here; the human merge gate stays human by construction. Do not leave Flight Deck
-  sessions running unattended. `flightdeck-start` wires the identity on every
+  here; the human merge gate stays human by construction. The deck user has
+  passwordless sudo — root within the container namespace only, for in-session
+  software installs; the substrate grants no extra kernel capability, so the
+  container boundary and the no-merge identity remain the walls. Do not leave
+  Flight Deck sessions running unattended. `flightdeck-start` wires the identity on every
   container start (snow-maker parity): `gh auth login` from the delivered secret
   file, gh as the git credential helper, commit identity derived from the token's
   account — and clones the Stack's `workspace` (owner/name) on first start to

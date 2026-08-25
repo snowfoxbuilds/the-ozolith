@@ -27,6 +27,15 @@
 # without a bound GITHUB_TOKEN fails the start loudly; a deck with neither
 # starts bare (clone by hand in the session).
 #
+# Privilege (snow-maker parity): ozolith has PASSWORDLESS SUDO — root inside
+# the container namespace, so a session installs whatever it needs without
+# an operator round-trip. sudo adds no kernel capability (the substrate
+# grants none — no NET_ADMIN, no TUN device) and tailscaled still runs as
+# the unprivileged uid-1000 userspace daemon the #31 gate verified. It DOES
+# mean every deck session — a prompt-injected one included — is root in the
+# container: the blast-radius walls are the container boundary, the
+# read-only knowledge mount, and the no-merge GitHub identity, not the uid.
+#
 # Knowledge & state (ADR-0043 as amended by ADR-0048): ~/.claude is split by
 # class. Runtime state (sessions/transcripts/--resume) lives on the
 # per-Flight-Deck `{stack}-claude-state` volume — never shared, never
@@ -117,16 +126,26 @@ setup = [
     #     through, installed from GitHub's own apt repo — the keyring rides
     #     TLS from cli.github.com and every package is signature-verified
     #     against it. The rest (jq, ripgrep, less, procps, vim, nano,
-    #     unzip/zip, openssh-client) are the day-to-day utilities a snow-maker
-    #     dev container ships, so a deck session is not a downgrade from one.
-    #     mosh-server needs a UTF-8 native locale generated SERVER-side,
-    #     because the mosh client forwards its own LANG (commonly en_US.UTF-8)
-    #     and refuses to start without a matching UTF-8 locale on this end.
+    #     unzip/zip, openssh-client, iproute2/iptables) are the day-to-day
+    #     utilities a snow-maker dev container ships, so a deck session is
+    #     not a downgrade from one. sudo + the 0440 sudoers drop-in give
+    #     ozolith PASSWORDLESS ROOT INSIDE THE CONTAINER NAMESPACE (snow-maker
+    #     parity), so sessions install software on demand (`sudo apt-get
+    #     install ...`, build-essential included). sudo grants no kernel
+    #     capability: the container stays capability-free (no NET_ADMIN, no
+    #     TUN — netfilter mutation via iptables still needs a capability the
+    #     worker-type schema deliberately cannot grant), and tailscaled MUST
+    #     stay the unprivileged uid-1000 userspace daemon the #31 gate
+    #     verified — never run it under sudo. mosh-server needs a UTF-8
+    #     native locale generated SERVER-side, because the mosh client
+    #     forwards its own LANG (commonly en_US.UTF-8) and refuses to start
+    #     without a matching UTF-8 locale on this end.
     '''apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
 apt-get update && \
-apt-get install -y --no-install-recommends tmux mosh locales gh jq ripgrep less procps vim nano unzip zip openssh-client && \
+apt-get install -y --no-install-recommends tmux mosh locales gh jq ripgrep less procps vim nano unzip zip openssh-client sudo iproute2 iptables && \
+echo "ozolith ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ozolith && chmod 0440 /etc/sudoers.d/ozolith && \
 sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen && \
 rm -rf /var/lib/apt/lists/*''',
 

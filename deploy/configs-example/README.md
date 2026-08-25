@@ -100,6 +100,19 @@ checkout stays on the volume beside the new one until you remove it.
 Treat `{stack}-workspace` as durable working state: it can hold unpushed
 commits, so delete it only when decommissioning the deck.
 
+The session is also **privileged inside the container** (snow-maker
+parity): `ozolith` has passwordless sudo, so installing whatever the work
+needs is `sudo apt-get install …` away — heavier toolchains like
+`build-essential` (the gcc/g++/make/libc-dev metapackage for compiling
+native pip/npm dependencies) are installed on demand instead of baked.
+sudo grants **no kernel capability**: the container stays capability-free
+(no `NET_ADMIN`, no TUN — `iptables` mutation is unavailable by
+construction), the tailnet daemon still runs unprivileged (never run it
+under sudo), and the read-only knowledge mount cannot be remounted from
+inside. Remember the flip side: a prompt-injected session is root in the
+container too — the container boundary and the no-merge identity are the
+walls, which is why deck sessions stay attended.
+
 ## Flight Deck one-hop access (tailscale)
 
 SSH/VSCode into a Flight Deck normally takes two hops: into the node's host,
@@ -137,8 +150,13 @@ tmux clipboard settings is the supported fallback.
 The hostname is the Stack's `FLIGHTDECK_TS_HOSTNAME` (`stacks/flightdeck.toml`),
 convention `flightdeck-<name>`; MagicDNS resolves it on your tailnet. Userspace
 networking needs no TUN device, no `NET_ADMIN`, and no `devices`/`cap_add`
-passthrough — `tailscaled` itself runs as the unprivileged `ozolith` uid, so a
-tailnet ACL mistake can never yield more than an `ozolith` session. The
+passthrough — `tailscaled` itself runs as the unprivileged `ozolith` uid. Note
+what a session is worth: `ozolith` carries passwordless sudo (see the identity
+& workspace section), so a tailnet ACL mistake yields root **inside the
+container namespace** — still capability-free, with the container boundary,
+the read-only knowledge mount, and the no-merge GitHub identity as the
+blast-radius walls — which is exactly why the `src` lists below should stay
+tight. The
 uid-1000 capability-free path is gate-verified (issue #31 evidence). Note the
 deliberate scope: **inbound** Tailscale SSH is the use case; outbound dials
 from inside the container to the tailnet would need the userspace SOCKS5/HTTP

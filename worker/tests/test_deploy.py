@@ -366,11 +366,18 @@ def test_configs_example_flightdeck_tailscale_wiring(example_config):
     assert version.group(0) == "TS_VERSION=1.102.2"
     assert tuple(map(int, version.groups())) >= (1, 98, 9)
 
-    # Userspace daemon, uid-1000 statedir, no privilege words anywhere.
+    # Userspace daemon, uid-1000 statedir, no capability grant anywhere.
+    # sudo itself is sanctioned in the deck for in-session installs
+    # (snow-maker parity — see the dedicated test), but the tailnet
+    # lifecycle must never be escalated: the #31 gate evidence covers the
+    # unprivileged uid-1000 daemon only.
     assert "--tun=userspace-networking" in setup
     assert "chown ozolith:ozolith" in setup and "/var/lib/tailscale" in setup
-    for forbidden in ("cap_add", "NET_ADMIN", "/dev/net/tun", "privileged", "sudo"):
+    for forbidden in ("cap_add", "NET_ADMIN", "/dev/net/tun", "privileged"):
         assert forbidden not in setup, forbidden
+    for line in setup.splitlines():
+        if "tailscale" in line:
+            assert "sudo" not in line, f"tailscale must never run under sudo: {line}"
 
     # The key is a named secret delivered as TS_AUTHKEY_FILE; the hostname is
     # per-placement Stack env, present on the example Stack.
@@ -378,6 +385,23 @@ def test_configs_example_flightdeck_tailscale_wiring(example_config):
     assert flightdeck.env["FLIGHTDECK_TS_HOSTNAME"] == "flightdeck-box1"
     # Only the file path is ever referenced — the value has no other route in.
     assert "TS_AUTHKEY_FILE" in setup
+
+
+def test_configs_example_flightdeck_sudo_for_in_session_installs(example_config):
+    """snow-maker parity: ozolith gets PASSWORDLESS sudo via a 0440
+    sudoers.d drop-in baked with the base tooling, so a session installs
+    software (build-essential included) without an operator round-trip.
+    This is root within the container NAMESPACE only — the substrate grants
+    no capability (pinned by the tailscale-wiring test, which also pins
+    that the tailnet daemon itself is never escalated)."""
+    setup = example_config.worker_types["flightdeck"].setup
+    assert " sudo " in setup[0]
+    assert 'echo "ozolith ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ozolith' in setup[0]
+    assert "chmod 0440 /etc/sudoers.d/ozolith" in setup[0]
+    # snow-maker's networking pair rides along (inspection works; netfilter
+    # mutation still needs a capability the schema cannot grant).
+    for pkg in ("iproute2", "iptables"):
+        assert pkg in setup[0], pkg
 
 
 def test_configs_example_flightdeck_ssh_username_alias(example_config):
