@@ -25,30 +25,47 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run pytest
 
-  # The run-container image must always build (M2 brief: image rot is caught
-  # here, not at the first Run on a box). buildx + a GitHub Actions layer cache
-  # keeps the costly apt (node/npm) and npm-install layers warm across runs;
-  # the image is neither loaded nor pushed — building it is the whole check.
+  # The run-container images must always build (M2 brief: image rot is caught
+  # here, not at the first Run on a box). One matrix leg per Agent adapter's
+  # base image (ADR-0052) — the machinery is written once. buildx + a GitHub
+  # Actions layer cache keeps the costly apt (node/npm) and npm-install
+  # layers warm across runs, one scope per image so the legs never evict
+  # each other's layers (claude keeps the historical bare scope name); the
+  # images are neither loaded nor pushed — building them is the whole check.
   run-image:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: claude
+            dockerfile: worker/docker/Dockerfile.claude
+            cache_scope: run-image
+          - agent: codex
+            dockerfile: worker/docker/Dockerfile.codex
+            cache_scope: run-image-codex
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: worker/docker/Dockerfile.claude
-          tags: theozolith-run-claude:ci
-          cache-from: type=gha,scope=run-image
-          cache-to: type=gha,mode=max,scope=run-image
+          file: ${{ matrix.dockerfile }}
+          tags: theozolith-run-${{ matrix.agent }}:ci
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
 
-  # Publish the base run image on merges to main (ADR-0051): the moving
+  # Publish the base run images on merges to main (ADR-0051): the moving
   # :main tag every worker type and Flight Deck derives from, plus a
-  # WRITE-ONCE :sha-<sha> for hand digest-pinning and rollback. A separate
-  # job so `packages: write` never rides a job that runs on pull_request
+  # WRITE-ONCE :sha-<sha> for hand digest-pinning and rollback. One matrix
+  # leg per Agent adapter's image (ADR-0052) — the write-once/tip-check/
+  # repair machinery below is written once and parameterized; the legs
+  # serialize independently (ADR-0051's monotonic ordering is per registry
+  # ref, and the packages are independent). A separate job so
+  # `packages: write` never rides a job that runs on pull_request
   # or non-main pushes; the workflow trigger stays unfiltered (secret-scan
   # invariant above), so path relevance is decided inside the job. The
-  # package stays private; each `theozolith config ingest` re-resolves the
+  # packages stay private; each `theozolith config ingest` re-resolves the
   # tag to a digest (ADR-0048/0049), so fleets move bases only on ingest.
   #
   # Publication is MONOTONIC with main: registry writes are serialized by
@@ -77,6 +94,16 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: claude
+            dockerfile: worker/docker/Dockerfile.claude
+            cache_scope: run-image
+          - agent: codex
+            dockerfile: worker/docker/Dockerfile.codex
+            cache_scope: run-image-codex
     # Serialize, never cancel, never drop: a running publication may be
     # the current tip's (job creation order can lag push order), so
     # cancellation could kill the one run that should publish. An obsolete
@@ -84,12 +111,14 @@ jobs:
     # EVERY pending run in FIFO order rather than retaining only the
     # newest, so the current tip's run is never displaced from the queue —
     # it always gets its turn and either publishes fresh or repairs :main.
+    # One group per image: each registry ref's monotonic ordering is its
+    # own; cross-image serialization would only couple failure domains.
     concurrency:
-      group: publish-run-image-main
+      group: publish-run-image-main-${{ matrix.agent }}
       cancel-in-progress: false
       queue: max
     env:
-      IMAGE: ghcr.io/snowfoxbuilds/theozolith-run-claude
+      IMAGE: ghcr.io/snowfoxbuilds/theozolith-run-${{ matrix.agent }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,13 +196,13 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: worker/docker/Dockerfile.claude
+          file: ${{ matrix.dockerfile }}
           push: false
           load: true
           tags: |
-            ghcr.io/snowfoxbuilds/theozolith-run-claude:main
-            ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}
-          cache-from: type=gha,scope=run-image
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
       - name: Is this run still the tip of main? (monotonic publish)
         id: tip
         if: steps.relevant.outputs.publish == 'true'

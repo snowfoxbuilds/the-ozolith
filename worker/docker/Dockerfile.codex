@@ -1,0 +1,65 @@
+# The Codex run-container image (ADR-0052): what a codex-adapter driver
+# launches for every Run and review round (ADR-0013). PID 1 is the agent
+# harness — credential-free plumbing that invokes the Codex session headless
+# (`codex exec`, ADR-0019), serves driver-sequenced gate jobs, and exits;
+# container lifetime = Run lifetime. The driver bind-mounts the per-Run job
+# directory at /job. Run containers are never attach targets.
+#
+# Build from the repo root:
+#   docker build -f worker/docker/Dockerfile.codex \
+#     [--build-arg OZOLITH_UID=1000] \
+#     -t theozolith-run-codex:local .
+#
+# The Codex CLI is PINNED to an exact version, unlike the Claude image's
+# floating install: the `codex exec --json` event schema and the session
+# rollout journal are experimental surfaces the adapter's parsers speak
+# (worker/src/theozolith_worker/codexidentity.py), and the spike (#76)
+# evidence is only valid for the version it ran against.
+# CodexAdapter.MIN_ENFORCING_CLI is the fail-loud backstop; this pin is the
+# policy. Bump both together, re-running the spike's fixture captures.
+#
+# No knowledge bake block yet: derived images bake the compiled per-tool
+# knowledge tree at the node (builds.py COPY to /home/ozolith/.codex/,
+# ADR-0052); this standalone image carries none.
+#
+# No GitHub credential ever enters this image or its RUN containers: the
+# driver holds the PAT and performs all GitHub I/O. The only secret a run
+# container sees is the model credential — the ChatGPT-plan auth.json
+# document (CODEX_AUTH_JSON, a rotatable spend credential in the ADR-0013
+# sense), which CodexAdapter.prepare() writes 0600 into a per-Run throwaway
+# CODEX_HOME. Never a PAT, never baked.
+
+FROM python:3.13-slim
+
+# git: the agent inspects the checkout (the driver does all pushes).
+# nodejs/npm: the Codex CLI. No terminal multiplexer: sessions are headless
+# one-shot processes (ADR-0019).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @openai/codex@0.150.0
+
+# The agent must not run as root (the Run needs no privileges; the container
+# is the sandbox — the harness passes --sandbox danger-full-access because
+# codex's own Landlock sandbox is unavailable inside Docker). Match
+# OZOLITH_UID to the driver user's uid so files written to the mounted job
+# directory stay owned by the driver (deploy/README.md).
+ARG OZOLITH_UID=1000
+RUN useradd --create-home --shell /bin/bash --uid "${OZOLITH_UID}" ozolith
+
+# Install the knowledge machinery and the worker component (for the
+# theozolith-harness entrypoint, theozolith-adapter, and format-output)
+# from the build context.
+COPY knowledge /opt/theozolith/knowledge
+COPY worker /opt/theozolith/worker
+RUN pip install --no-cache-dir /opt/theozolith/knowledge /opt/theozolith/worker
+
+# Keep the home usable when the driver overrides the container user to its
+# own uid (THEOZOLITH_CONTAINER_USER).
+RUN chmod -R a+rwX /home/ozolith
+
+USER ozolith
+ENV HOME=/home/ozolith
+WORKDIR /job
+
+ENTRYPOINT ["theozolith-harness"]
