@@ -238,9 +238,10 @@ jobs:
           cache-from: type=gha,scope=control-image
           cache-to: type=gha,mode=max,scope=control-image
 
-  # The #31 spike harness's shell regression suite (stubbed docker/tailscale;
-  # no engine, tailnet, or key needed): the out-of-band gate's credibility
-  # rests on these checks, so the PR's green check must include them.
+  # The spike harnesses' shell regression suites (stubbed docker/tailscale/
+  # codex; no engine, tailnet, or credential needed): each out-of-band gate's
+  # credibility rests on these checks, so the PR's green check must include
+  # them.
   spike-harness:
     runs-on: ubuntu-latest
     steps:
@@ -248,6 +249,9 @@ jobs:
       - run: bash -n spikes/issue-31-tailscale-uid1000/run-spike.sh
       - run: sh -n spikes/issue-31-tailscale-uid1000/entrypoint.sh
       - run: spikes/issue-31-tailscale-uid1000/test-run-spike.sh
+      - run: bash -n spikes/issue-76-codex-plan-auth/run-spike.sh
+      - run: sh -n spikes/issue-76-codex-plan-auth/entrypoint.sh
+      - run: spikes/issue-76-codex-plan-auth/test-run-spike.sh
 
   # Secret scanning (the repo is public). This is post-push DETECTION and a
   # merge gate, not prevention: a credential a failed scan reports has
