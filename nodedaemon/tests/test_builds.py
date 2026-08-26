@@ -152,3 +152,122 @@ def test_image_status_reads_the_stamped_labels():
 
     missing = image_status(docker, image_recipe(setup=["something else"]))
     assert missing["tag"] == "" and missing["instruction_hash"] == ""
+
+
+def _applied_per_tool_tree(tmp_path, name: str = "dev"):
+    """A per-tool (ADR-0052) applied distribution: the claude and codex
+    compiles of one tree under their tool subdirs; returns
+    (dist_root, claude_pin, codex_pin)."""
+    root = tmp_path / "config-dist" / ("f" * 64)
+    files = {
+        f"{name}/claude/CLAUDE.md": "# k\n",
+        f"{name}/claude/skills/s/SKILL.md": "s\n",
+        f"{name}/codex/AGENTS.md": "# k\n",
+        f"{name}/codex/skills/s/SKILL.md": "s\n",
+    }
+    for relpath, text in files.items():
+        target = root / configdist.KNOWLEDGE_DIR / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return (
+        root,
+        configdist.knowledge_tree_hash(root, f"{name}/claude"),
+        configdist.knowledge_tree_hash(root, f"{name}/codex"),
+    )
+
+
+def test_dockerfile_renders_the_codex_knowledge_target():
+    recipe = image_recipe(
+        knowledge="knowledge/dev",
+        knowledge_pin="a" * 64,
+        knowledge_tool="codex",
+        knowledge_target="/home/ozolith/.codex/",
+    )
+    text = dockerfile_for(recipe, built_at="t")
+    assert "COPY --chown=ozolith:ozolith knowledge/ /home/ozolith/.codex/" in text
+    assert ".claude" not in text
+
+
+def test_per_tool_staging_selects_the_recipes_tool(tmp_path):
+    """The recipe's knowledge_tool picks which compiled view stages; each
+    tool's pin gates its own build (ADR-0052)."""
+    root, claude_pin, codex_pin = _applied_per_tool_tree(tmp_path)
+    docker = FakeDocker()
+    codex_recipe = image_recipe(
+        name="codex-review",
+        knowledge="knowledge/dev",
+        knowledge_pin=codex_pin,
+        knowledge_tool="codex",
+        knowledge_target="/home/ozolith/.codex/",
+    )
+    assert ensure_image(docker, codex_recipe, log=lambda *_: None, dist_root=root) is True
+    claude_recipe = image_recipe(
+        knowledge="knowledge/dev",
+        knowledge_pin=claude_pin,
+        knowledge_tool="claude",
+        knowledge_target="/home/ozolith/.claude/",
+    )
+    assert ensure_image(docker, claude_recipe, log=lambda *_: None, dist_root=root) is True
+    # Cross-wiring defers: the codex pin over the claude view disagrees.
+    logs: list[str] = []
+    crossed = image_recipe(
+        name="crossed",
+        knowledge="knowledge/dev",
+        knowledge_pin=codex_pin,
+        knowledge_tool="claude",
+        knowledge_target="/home/ozolith/.claude/",
+    )
+    assert ensure_image(FakeDocker(), crossed, log=logs.append, dist_root=root) is False
+    assert any("disagree" in line for line in logs)
+
+
+def test_tooled_recipe_falls_back_to_a_legacy_bare_tree(tmp_path):
+    """New control + pre-ADR-0052 dist: the tool subdir is absent, the bare
+    tree stages, and the pin verification stays the correctness gate."""
+    root, pin = _applied_tree(tmp_path)  # legacy layout: files at the root
+    recipe = image_recipe(
+        knowledge="knowledge/dev",
+        knowledge_pin=pin,
+        knowledge_tool="claude",
+        knowledge_target="/home/ozolith/.claude/",
+    )
+    assert ensure_image(FakeDocker(), recipe, log=lambda *_: None, dist_root=root) is True
+
+
+def test_toolless_recipe_on_a_per_tool_dist_defers(tmp_path):
+    """Old control (no knowledge_tool) + per-tool dist: the parent dir
+    stages, its hash cannot match any per-tool pin, and the build defers —
+    visible skew, never a wrong bake (ADR-0042 advisory doctrine)."""
+    root, claude_pin, _ = _applied_per_tool_tree(tmp_path)
+    logs: list[str] = []
+    recipe = image_recipe(knowledge="knowledge/dev", knowledge_pin=claude_pin)
+    assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False
+    assert any("disagree" in line for line in logs)
+
+
+def test_bogus_knowledge_target_defers_fail_closed(tmp_path):
+    root, pin = _applied_tree(tmp_path)
+    for target in ("/etc/", "/home/ozolith/../../etc/", "relative/", "/home/ozolith/x"):
+        logs: list[str] = []
+        recipe = image_recipe(
+            knowledge="knowledge/dev",
+            knowledge_pin=pin,
+            knowledge_tool="claude",
+            knowledge_target=target,
+        )
+        assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False, target
+        assert any("knowledge target" in line for line in logs), target
+
+
+def test_bogus_knowledge_tool_defers_fail_closed(tmp_path):
+    root, pin = _applied_tree(tmp_path)
+    for tool in ("../dev", "a/b", ".."):
+        logs: list[str] = []
+        recipe = image_recipe(
+            knowledge="knowledge/dev",
+            knowledge_pin=pin,
+            knowledge_tool=tool,
+            knowledge_target="/home/ozolith/.claude/",
+        )
+        assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False, tool
+        assert any("knowledge tool" in line for line in logs), tool

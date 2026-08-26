@@ -420,6 +420,8 @@ def image_recipe(
     setup: list[str] | None = None,
     knowledge: str = "",
     knowledge_pin: str = "",
+    knowledge_tool: str = "",
+    knowledge_target: str = "",
 ) -> dict:
     setup = setup if setup is not None else ["pip install uv"]
     import hashlib
@@ -440,6 +442,8 @@ def image_recipe(
         "setup": setup,
         "knowledge": knowledge,
         "knowledge_pin": knowledge_pin,
+        "knowledge_tool": knowledge_tool,
+        "knowledge_target": knowledge_target,
         "tag": f"theozolith/{name}:1.0-{digest[:12]}",
         "base_digest": "sha256:" + "0" * 64,
         "instruction_hash": digest,
