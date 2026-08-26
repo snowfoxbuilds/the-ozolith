@@ -608,7 +608,7 @@ def test_driverless_knowledge_validation_is_not_weakened(tmp_path):
         "worker-types/flightdeck.toml",
         f'base = "{BASE}"\nknowledge = "knowledge/missing"\n',
     )
-    with pytest.raises(ConfigRepoError, match="no compiled tree in the pinned build"):
+    with pytest.raises(ConfigRepoError, match="no compiled claude tree in the pinned build"):
         load_config(tmp_path)
 
 
@@ -651,7 +651,7 @@ def test_knowledge_reference_requires_an_ingested_pin(tmp_path):
 def test_knowledge_reference_requires_the_compiled_tree(tmp_path):
     write_pins(tmp_path, knowledge={"dev": "c" * 64})
     driver_type(tmp_path, knowledge='"knowledge/dev"')
-    with pytest.raises(ConfigRepoError, match="no compiled tree in the pinned build"):
+    with pytest.raises(ConfigRepoError, match="no compiled claude tree in the pinned build"):
         load_config(tmp_path)
 
 
@@ -1032,8 +1032,9 @@ def test_full_model_ids_produce_no_warnings(tmp_path):
 
 
 def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
-    """The synthesized instruction rides the recipe's ``setup`` — same 8 wire
-    keys, daemon adapter-blind — with managed scope for driver run images."""
+    """The synthesized instruction rides the recipe's ``setup`` — the 10
+    wire keys (ADR-0052 added knowledge_tool/knowledge_target), daemon
+    adapter-blind — with managed scope for driver run images."""
     driver_type(tmp_path, effort='"high"')
     thin_stack(tmp_path, "implementer", "claude-dev")
     recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
@@ -1047,6 +1048,8 @@ def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
         "setup",
         "knowledge",
         "knowledge_pin",
+        "knowledge_tool",
+        "knowledge_target",
         "tag",
         "base_digest",
         "instruction_hash",
