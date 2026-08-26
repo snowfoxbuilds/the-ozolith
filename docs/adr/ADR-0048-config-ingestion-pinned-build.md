@@ -201,4 +201,10 @@ types, and worker types are cheap.
   an explicit report note in both the real and dry-run paths. A source
   that **does** carry `product.toml` still wins, with the existing
   divergence note — declarative release pinning is unchanged. Absent in
-  both trees stays absent. See ADR-0051.
+  both trees stays absent. A present `product.toml` must be a REGULAR
+  FILE: a directory, symlink, or other shape at that path is refused
+  loudly (preservation must never commit into a `product.toml/`
+  directory). Under a pending marker, the dry run reads the old pinned
+  state — the preserved pin included — from a read-only snapshot of the
+  committed HEAD, never from a worktree the interrupted ingest left
+  behind. See ADR-0051.

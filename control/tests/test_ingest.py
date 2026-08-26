@@ -579,6 +579,31 @@ def test_a_declared_product_toml_still_wins_over_the_update_flow_pin(tmp_path):
     assert not any("preserved the pinned build's" in note for note in report.notes)
 
 
+def test_a_non_regular_product_toml_is_refused(tmp_path):
+    """product.toml has exactly two valid states — absent, or a regular
+    file. A committed DIRECTORY at that path is refused loudly with nothing
+    committed: silently preserving the update-flow pin INTO it would ship a
+    `product.toml/product.toml` no loader reads while the report claims the
+    pin survived. HEAD, the worktree, and the deployed pin stay untouched."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    product.write_pin(pinned, "0.5.0+gdeadbeef1234", log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    (src / "product.toml").unlink()
+    write(src, "product.toml/product.toml", '[product]\nversion = "6.6.6"\n')
+    _commit_all(src, "a directory where the pin file goes")
+
+    with pytest.raises(IngestError, match=r"product\.toml is a directory"):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert 'version = "0.5.0+gdeadbeef1234"' in (pinned / "product.toml").read_text()
+    # The dry run — the config linter — refuses with the same message.
+    with pytest.raises(IngestError, match=r"product\.toml is a directory"):
+        ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+
+
 # -- dry run: the config linter (lint + preview, nothing committed) ------------
 
 
@@ -730,6 +755,67 @@ def test_dry_run_notes_an_interrupted_ingest_and_previews_against_head(tmp_path)
     assert not report.changed  # same source vs HEAD: a no-op
     assert (pinned / ".git" / PENDING_MARKER).exists()  # not repaired
     assert (pinned / "half-published.toml").exists()  # not touched
+
+
+def _tree_fingerprint(root: Path) -> list[tuple[str, int, bytes]]:
+    """Every path under ``root`` — the ``.git`` internals included — with
+    mode and content: the byte-for-byte "the dry run touched nothing"
+    witness."""
+    entries = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.is_file() and not path.is_symlink():
+            entries.append((rel, path.stat().st_mode, path.read_bytes()))
+        else:
+            entries.append((rel, path.lstat().st_mode, b""))
+    return entries
+
+
+def test_pending_marker_dry_run_preserves_the_committed_pin_not_the_lagging_worktree(tmp_path):
+    """The full interrupted lifecycle (ADR-0051): (1) an ingest of a DECLARED
+    pin bump dies between update-ref and the worktree publish — HEAD carries
+    the new pin, the worktree still the old one, the pending marker stays;
+    (2) the source then stops declaring product.toml; (3) the dry run must
+    read the COMMITTED pin (what the real ingest's repair-then-preserve
+    lands), report no product.toml change or movement, and leave the pinned
+    repo byte-for-byte untouched; (4) the real ingest repairs and converges
+    on exactly that pin."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)  # the source declares 0.3.0
+    write(src, "product.toml", '[product]\nversion = "0.6.0"\n')
+    _commit_all(src, "declared pin bump")
+    with pytest.raises(IngestError, match="git reset failed"):
+        ingest(str(src), pinned, runner=_failing_git("reset"), log=lambda *_: None)
+    # The split state the marker brackets: HEAD 0.6.0, worktree still 0.3.0.
+    assert (pinned / ".git" / PENDING_MARKER).exists()
+    assert 'version = "0.6.0"' in _git(pinned, "show", "HEAD:product.toml")
+    assert 'version = "0.3.0"' in (pinned / "product.toml").read_text()
+
+    (src / "product.toml").unlink()
+    _commit_all(src, "stop declaring the pin")
+    before = _tree_fingerprint(pinned)
+
+    report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert report.dry_run
+    assert any("interrupted ingest" in note for note in report.notes)
+    # The preserved pin is HEAD's 0.6.0 — never the lagging worktree's 0.3.0
+    # — so the preview shows NO product.toml change and no movement.
+    assert any(
+        "a real ingest preserves the pinned build's product pin 0.6.0" in note
+        for note in report.notes
+    )
+    assert not any("product.toml" in change for change in report.changes)
+    assert not any("product version would move" in note for note in report.notes)
+    assert _tree_fingerprint(pinned) == before  # byte-for-byte untouched
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert any("recovered an interrupted ingest" in note for note in report.notes)
+    assert any("preserved the pinned build's product pin 0.6.0" in note for note in report.notes)
+    assert 'version = "0.6.0"' in (pinned / "product.toml").read_text()
+    assert configrepo.load_config(pinned).product_version == "0.6.0"
+    assert not (pinned / ".git" / PENDING_MARKER).exists()
+    assert _git(pinned, "status", "--porcelain") == ""
 
 
 def test_dry_run_holds_the_shared_writer_lock(tmp_path):

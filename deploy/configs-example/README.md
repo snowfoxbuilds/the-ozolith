@@ -47,7 +47,9 @@ version = "0.4.0"
 ```
 
 A declared pin wins on every ingest, and the report calls out any
-divergence from a pin the update flow wrote since the last one.
+divergence from a pin the update flow wrote since the last one. When
+present, `product.toml` must be a regular file — a directory or link at
+that path is refused at ingest.
 
 ## Knowledge (`knowledge/`, ADR-0048)
 

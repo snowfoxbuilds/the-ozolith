@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
@@ -94,22 +95,214 @@ def test_ci_builds_the_run_container_image():
     assert "file: worker/docker/Dockerfile.claude" in ci
 
 
+def _publish_job() -> dict:
+    return yaml.safe_load(CI.read_text())["jobs"]["publish-run-image"]
+
+
+def _publish_step(job: dict, name_prefix: str) -> dict:
+    steps = [s for s in job["steps"] if str(s.get("name", "")).startswith(name_prefix)]
+    assert len(steps) == 1, (name_prefix, [s.get("name") for s in job["steps"]])
+    return steps[0]
+
+
+def _run_step_script(
+    script: str, cwd: Path, env: dict[str, str]
+) -> tuple[int, str, dict[str, str]]:
+    """Execute a workflow step's `run:` script the way Actions does on Linux
+    (bash -e, outputs collected via GITHUB_OUTPUT) — the publish-safety tests
+    cover the scripts' BEHAVIOR, not their string shape."""
+    output = cwd / "github-output"
+    output.write_text("")
+    proc = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-c", script],
+        cwd=str(cwd),
+        env={**os.environ, "GITHUB_OUTPUT": str(output), **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    outputs = {}
+    for line in output.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            outputs[key] = value
+    return proc.returncode, proc.stdout + proc.stderr, outputs
+
+
+def _git(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def _commit(cwd: Path, message: str) -> str:
+    _git(cwd, "add", "-A")
+    _git(cwd, "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q", "-m", message)
+    return _git(cwd, "rev-parse", "HEAD")
+
+
 def test_ci_publishes_the_run_image_from_main_only():
-    """ADR-0051: merges to main push the moving :main tag (plus an immutable
-    :sha-<sha>) so the base image is never hand-pushed again. The publish is
-    a SEPARATE job gated to main pushes — `packages: write` must never ride
-    the check job, which runs on every PR and branch push — and the check
-    jobs stay pure checks: the only `push: true` in the workflow lives
-    inside the publish job."""
+    """ADR-0051: merges to main publish the moving :main tag plus a
+    WRITE-ONCE :sha-<sha>. The publish is a SEPARATE job gated to main
+    pushes — `packages: write` must never ride the check jobs, which run on
+    every PR and branch push — and publication is serialized and monotonic:
+    a main-specific concurrency group over registry writes, a write-once
+    existence check before any build, and a live tip re-resolution
+    immediately before the push. build-push-action never pushes anywhere in
+    the workflow; the only registry write is the guarded `docker push`
+    step, commit tag first."""
     ci = CI.read_text()
-    assert "publish-run-image:" in ci
-    assert "docker/login-action" in ci
-    assert "packages: write" in ci
-    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:main" in ci
-    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}" in ci
-    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in ci
-    assert ci.count("push: true") == 1
-    assert ci.index("push: true") > ci.index("publish-run-image:")
+    workflow = yaml.safe_load(ci)
+    # The workflow-level push trigger stays unfiltered — the secret-scan job
+    # must run on every branch and tag push (path relevance for the publish
+    # lives INSIDE the job instead).
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers == {"push": None, "pull_request": None}
+
+    job = _publish_job()
+    assert job["needs"] == "run-image"
+    assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    # No other job — PR check jobs included — is granted packages access.
+    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    granted = [
+        name
+        for name, spec in workflow["jobs"].items()
+        if isinstance(spec.get("permissions"), dict) and "packages" in spec["permissions"]
+    ]
+    assert granted == ["publish-run-image"]
+    # Serialized publication that never cancels a possibly-current run
+    # (obsolete runs supersede themselves at the tip check instead).
+    assert job["concurrency"] == {"group": "publish-run-image-main", "cancel-in-progress": False}
+    # No job in the workflow lets build-push-action push.
+    assert "push: true" not in ci
+    build = [s for s in job["steps"] if str(s.get("uses", "")).startswith("docker/build-push")]
+    assert len(build) == 1
+    assert build[0]["with"]["push"] is False and build[0]["with"]["load"] is True
+    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:main" in build[0]["with"]["tags"]
+    assert (
+        "ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}"
+        in (build[0]["with"]["tags"])
+    )
+    # Ordering: relevance -> write-once -> build -> tip -> login -> push.
+    names = [str(s.get("name") or s.get("uses")) for s in job["steps"]]
+    order = [
+        next(i for i, name in enumerate(names) if name.startswith(prefix))
+        for prefix in (
+            "Did anything the image is built from change?",
+            "Is the commit tag already published?",
+            "docker/build-push-action",
+            "Is this run still the tip of main?",
+            "docker/login-action",
+            "Push the commit tag",
+        )
+    ]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    # Everything past the write-once check is gated on fresh=true; the
+    # registry write additionally on the tip check.
+    tip = _publish_step(job, "Is this run still the tip of main?")
+    assert "steps.writeonce.outputs.fresh == 'true'" in tip["if"]
+    push = _publish_step(job, "Push the commit tag")
+    assert "steps.relevant.outputs.publish == 'true'" in push["if"]
+    assert "steps.writeonce.outputs.fresh == 'true'" in push["if"]
+    assert "steps.tip.outputs.current == 'true'" in push["if"]
+    # The commit tag (the immutable record) lands before :main moves.
+    assert push["run"].index("sha-${GITHUB_SHA}") < push["run"].index(":main")
+
+
+def test_ci_publish_relevance_check_skips_doc_only_pushes(tmp_path):
+    """The in-job path check EXECUTED: a doc-only main push produces
+    publish=false, a worker/ change publishes, and an unresolvable diff base
+    (force-push, first push) fails open to publish."""
+    script = _publish_step(_publish_job(), "Did anything the image is built from change?")["run"]
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "worker").mkdir()
+    (repo / "worker" / "f.py").write_text("x\n")
+    base = _commit(repo, "base")
+    (repo / "README.md").write_text("docs only\n")
+    doc_only = _commit(repo, "docs")
+    (repo / "worker" / "f.py").write_text("y\n")
+    relevant = _commit(repo, "worker change")
+
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": base, "GITHUB_SHA": doc_only})
+    assert rc == 0 and outputs == {"publish": "false"}
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": doc_only, "GITHUB_SHA": relevant})
+    assert rc == 0 and outputs == {"publish": "true"}
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": "0" * 40, "GITHUB_SHA": relevant})
+    assert rc == 0 and outputs == {"publish": "true"}  # fail-open
+
+
+def test_ci_publish_write_once_check_never_republishes_a_commit_tag(tmp_path):
+    """The write-once step EXECUTED against a scripted registry: an existing
+    sha-<sha> manifest (HTTP 200) answers fresh=false — a rerun of the same
+    commit never rebuilds or overwrites the tag — a 404 lets the first
+    publication proceed, and any other answer (or a failed token mint) fails
+    the job loudly instead of publishing blind."""
+    step = _publish_step(_publish_job(), "Is the commit tag already published?")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *ghcr.io/token*) [ -n "$FAKE_TOKEN_FAIL" ] && exit 22;'
+        " printf '%s' '{\"token\": \"t\"}' ;;\n"
+        "  */manifests/*) printf '%s' \"$FAKE_MANIFEST_CODE\" ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n"
+    )
+    curl.chmod(0o755)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GH_TOKEN": "t",
+        "IMAGE": "ghcr.io/snowfoxbuilds/theozolith-run-claude",
+        "GITHUB_SHA": "a" * 40,
+    }
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "200"})
+    assert rc == 0 and outputs == {"fresh": "false"} and "write-once" in out
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "404"})
+    assert rc == 0 and outputs == {"fresh": "true"}
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "503"})
+    assert rc != 0 and "refusing to publish blind" in out and outputs == {}
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_TOKEN_FAIL": "1"})
+    assert rc != 0 and "refusing to publish blind" in out and outputs == {}
+
+
+def test_ci_publish_tip_check_blocks_a_stale_run(tmp_path):
+    """The monotonic-publish step EXECUTED: once origin/main has advanced
+    past the run's commit the step answers current=false (the push step is
+    gated on it — a stale run can push neither :main nor its commit tag),
+    the tip's own run answers current=true, and an unresolvable main ref
+    fails loudly."""
+    script = _publish_step(_publish_job(), "Is this run still the tip of main?")["run"]
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "-q", "--bare", "-b", "main")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    (seed / "f").write_text("1\n")
+    first = _commit(seed, "one")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "-q", "origin", "main")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    (seed / "f").write_text("2\n")
+    second = _commit(seed, "two")
+    _git(seed, "push", "-q", "origin", "main")
+
+    rc, out, outputs = _run_step_script(script, clone, {"GITHUB_SHA": first})
+    assert rc == 0 and outputs == {"current": "false"} and "stale" in out
+    rc, _, outputs = _run_step_script(script, clone, {"GITHUB_SHA": second})
+    assert rc == 0 and outputs == {"current": "true"}
+
+    empty_origin = tmp_path / "empty.git"
+    empty_origin.mkdir()
+    _git(empty_origin, "init", "-q", "--bare", "-b", "main")
+    lonely = tmp_path / "lonely"
+    _git(tmp_path, "clone", "-q", str(empty_origin), str(lonely))
+    rc, out, _ = _run_step_script(script, lonely, {"GITHUB_SHA": first})
+    assert rc != 0 and "refusing to publish blind" in out
 
 
 def test_configs_example_bases_ride_the_moving_main_tag():
