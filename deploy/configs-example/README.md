@@ -13,9 +13,14 @@ repo carries no computed pins (ADR-0048) — ingest resolves each tag to its
 digest and records it in the pinned build's pins.toml (digest-pin a base
 yourself only when the digest is a human decision, e.g. no registry access
 at ingest time). The four example bases are
-`ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0`, a **private** first-party
-image; before the first ingest, store a GHCR pull credential so ingest can
-resolve its digest (and so nodes can pull it at build time, ADR-0049):
+`ghcr.io/snowfoxbuilds/theozolith-run-claude:main`, a **private** first-party
+image CI republishes on every merge to main that touches `worker/` or
+`knowledge/` (ADR-0051) — so each ingest re-resolves the tag to the
+then-current digest, and your fleet moves bases exactly when you ingest,
+never before. Immutable `…:sha-<sha>` tags are pushed alongside for hand
+digest-pinning and rollback. Before the first ingest, store a GHCR pull
+credential so ingest can resolve the digest (and so nodes can pull the
+image at build time, ADR-0049):
 
 ```sh
 theozolith secret set registry:ghcr.io   # value: <github-user>:<PAT with read:packages>
@@ -25,6 +30,26 @@ Public bases need no credential (ingest resolves them anonymously). What
 stays yours to fill in before flipping a Stack to running: the tailscale
 checksum (a fail-closed placeholder ingest refuses on a running Stack),
 secret values, and real workspaces.
+
+## The product pin (`product.toml`)
+
+This example deliberately ships **no** `product.toml` — the ownership mode
+where the update flow owns the pin: `theozolith build` (a clean checkout's
+git SHA) and `theozolith update` (a published release) write the pin into
+the pinned build, and ingest carries it forward untouched (ADR-0051; a
+fresh install with no pin resolves the latest release at Control Node
+startup). Declare one only when you want the Config Repo to own the fleet's
+product version — declarative release pinning:
+
+```toml
+[product]
+version = "0.4.0"
+```
+
+A declared pin wins on every ingest, and the report calls out any
+divergence from a pin the update flow wrote since the last one. When
+present, `product.toml` must be a regular file — a directory or link at
+that path is refused at ingest.
 
 ## Knowledge (`knowledge/`, ADR-0048)
 

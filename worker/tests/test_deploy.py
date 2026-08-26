@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).parents[2]
 DEPLOY = REPO_ROOT / "deploy"
@@ -92,6 +93,439 @@ def test_ci_builds_the_run_container_image():
     ci = CI.read_text()
     assert "docker/build-push-action" in ci
     assert "file: worker/docker/Dockerfile.claude" in ci
+
+
+def _publish_job() -> dict:
+    return yaml.safe_load(CI.read_text())["jobs"]["publish-run-image"]
+
+
+def _publish_step(job: dict, name_prefix: str) -> dict:
+    steps = [s for s in job["steps"] if str(s.get("name", "")).startswith(name_prefix)]
+    assert len(steps) == 1, (name_prefix, [s.get("name") for s in job["steps"]])
+    return steps[0]
+
+
+def _run_step_script(
+    script: str, cwd: Path, env: dict[str, str]
+) -> tuple[int, str, dict[str, str]]:
+    """Execute a workflow step's `run:` script the way Actions does on Linux
+    (bash -e, outputs collected via GITHUB_OUTPUT) — the publish-safety tests
+    cover the scripts' BEHAVIOR, not their string shape."""
+    output = cwd / "github-output"
+    output.write_text("")
+    proc = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-c", script],
+        cwd=str(cwd),
+        env={**os.environ, "GITHUB_OUTPUT": str(output), **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    outputs = {}
+    for line in output.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            outputs[key] = value
+    return proc.returncode, proc.stdout + proc.stderr, outputs
+
+
+def _git(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def _commit(cwd: Path, message: str) -> str:
+    _git(cwd, "add", "-A")
+    _git(cwd, "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q", "-m", message)
+    return _git(cwd, "rev-parse", "HEAD")
+
+
+def _gate_holds(condition: str, outputs: dict[str, dict[str, str]]) -> bool:
+    """Evaluate a step-level `if` of the exact shape the publish job uses —
+    `steps.<id>.outputs.<key> == '<value>'` clauses joined by && — against
+    the outputs the EXECUTED scripts actually produced (a skipped step's
+    outputs read as empty, as on Actions)."""
+    for clause in condition.split("&&"):
+        left, sep, right = clause.partition("==")
+        assert sep, clause
+        m = re.fullmatch(r"steps\.(\w+)\.outputs\.(\w+)", left.strip())
+        assert m, clause
+        if outputs.get(m.group(1), {}).get(m.group(2), "") != right.strip().strip("'"):
+            return False
+    return True
+
+
+def _publish_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    """A bare `origin` plus a working clone, seeded with one commit on main
+    — the ls-remote target the tip check resolves against."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "-q", "--bare", "-b", "main")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    (seed / "f").write_text("1\n")
+    _commit(seed, "one")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "-q", "origin", "main")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    return seed, clone
+
+
+def _fake_registry(tmp_path: Path) -> tuple[Path, Path]:
+    """A STATEFUL fake registry shared by fake `docker` and fake `curl`:
+    `docker push` records the ref (a :main push fails under
+    FAKE_MAIN_PUSH_FAIL — the lost-move scenario), `docker buildx
+    imagetools create` re-points :main only at a recorded manifest (an
+    unknown one fails like an unreadable manifest), and `curl` answers the
+    write-once manifest HEAD from the same recorded state."""
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  push)\n"
+        '    case "$2" in\n'
+        '      *:main) if [ -n "$FAKE_MAIN_PUSH_FAIL" ]; then\n'
+        '        echo "connection reset while pushing $2" >&2; exit 1\n'
+        "      fi ;;\n"
+        "    esac\n"
+        '    echo "$2" >> "$FAKE_REGISTRY/pushed"\n'
+        "    ;;\n"
+        "  buildx)\n"
+        '    if [ "$2" != "imagetools" ] || [ "$3" != "create" ] || [ "$4" != "--tag" ]; then\n'
+        "      exit 9\n"
+        "    fi\n"
+        '    if ! grep -qxF "$6" "$FAKE_REGISTRY/pushed" 2>/dev/null; then\n'
+        '      echo "manifest unknown: $6" >&2; exit 1\n'
+        "    fi\n"
+        '    echo "$5 -> $6" > "$FAKE_REGISTRY/main"\n'
+        "    ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *ghcr.io/token*) printf '%s' '{\"token\": \"t\"}' ;;\n"
+        "  */manifests/*)\n"
+        '    ref="${*##*/manifests/}"\n'
+        '    if grep -qxF "${IMAGE}:${ref}" "$FAKE_REGISTRY/pushed" 2>/dev/null; then\n'
+        "      printf '200'\n"
+        "    else\n"
+        "      printf '404'\n"
+        "    fi ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n"
+    )
+    curl.chmod(0o755)
+    return fake_bin, registry
+
+
+def test_ci_publishes_the_run_image_from_main_only():
+    """ADR-0051: merges to main publish the moving :main tag plus a
+    WRITE-ONCE :sha-<sha>. The publish is a SEPARATE job gated to main
+    pushes — `packages: write` must never ride the check jobs, which run on
+    every PR and branch push — and publication is serialized and monotonic:
+    a main-specific concurrency group that QUEUES every pending run (FIFO,
+    never replacing the pending publisher), a write-once existence check
+    before any build, and a live tip re-resolution gating every registry
+    write. An existing commit tag is recoverable state: the repair step
+    re-points :main at it (current-tip runs only) instead of rebuilding.
+    build-push-action never pushes anywhere in the workflow; the registry
+    writes are the guarded `docker push` step (commit tag first) and the
+    registry-side repair re-tag."""
+    ci = CI.read_text()
+    workflow = yaml.safe_load(ci)
+    # The workflow-level push trigger stays unfiltered — the secret-scan job
+    # must run on every branch and tag push (path relevance for the publish
+    # lives INSIDE the job instead).
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers == {"push": None, "pull_request": None}
+
+    job = _publish_job()
+    assert job["needs"] == "run-image"
+    assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    # No other job — PR check jobs included — is granted packages access.
+    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    granted = [
+        name
+        for name, spec in workflow["jobs"].items()
+        if isinstance(spec.get("permissions"), dict) and "packages" in spec["permissions"]
+    ]
+    assert granted == ["publish-run-image"]
+    # Serialized publication that never cancels a possibly-current run
+    # (obsolete runs supersede themselves at the tip check instead) and
+    # never drops one from the queue: queue: max keeps every pending run
+    # in FIFO order, so the current tip's run always gets its turn.
+    assert job["concurrency"] == {
+        "group": "publish-run-image-main",
+        "cancel-in-progress": False,
+        "queue": "max",
+    }
+    # No job in the workflow lets build-push-action push.
+    assert "push: true" not in ci
+    build = [s for s in job["steps"] if str(s.get("uses", "")).startswith("docker/build-push")]
+    assert len(build) == 1
+    assert build[0]["with"]["push"] is False and build[0]["with"]["load"] is True
+    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:main" in build[0]["with"]["tags"]
+    assert (
+        "ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}"
+        in (build[0]["with"]["tags"])
+    )
+    # Ordering: relevance -> write-once -> build -> tip -> login -> push
+    # -> repair.
+    names = [str(s.get("name") or s.get("uses")) for s in job["steps"]]
+    order = [
+        next(i for i, name in enumerate(names) if name.startswith(prefix))
+        for prefix in (
+            "Did anything the image is built from change?",
+            "Is the commit tag already published?",
+            "docker/build-push-action",
+            "Is this run still the tip of main?",
+            "docker/login-action",
+            "Push the commit tag",
+            "Point :main at the already-published commit tag",
+        )
+    ]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    # The build path is gated on fresh=true; the tip check runs on BOTH the
+    # fresh and the already-published path (it gates every registry write),
+    # so it must not itself require fresh.
+    assert "steps.writeonce.outputs.fresh == 'true'" in build[0]["if"]
+    tip = _publish_step(job, "Is this run still the tip of main?")
+    assert tip["if"] == "steps.relevant.outputs.publish == 'true'"
+    login = job["steps"][order[4]]
+    assert "steps.tip.outputs.current == 'true'" in login["if"]
+    push = _publish_step(job, "Push the commit tag")
+    assert "steps.relevant.outputs.publish == 'true'" in push["if"]
+    assert "steps.writeonce.outputs.fresh == 'true'" in push["if"]
+    assert "steps.tip.outputs.current == 'true'" in push["if"]
+    repair = _publish_step(job, "Point :main at the already-published commit tag")
+    assert "steps.relevant.outputs.publish == 'true'" in repair["if"]
+    assert "steps.writeonce.outputs.fresh == 'false'" in repair["if"]
+    assert "steps.tip.outputs.current == 'true'" in repair["if"]
+    # The commit tag (the immutable record) lands before :main moves, and
+    # the repair path re-tags registry-side — it never rebuilds or pushes
+    # the commit tag.
+    assert push["run"].index("sha-${GITHUB_SHA}") < push["run"].index(":main")
+    assert "imagetools create" in repair["run"] and "docker push" not in repair["run"]
+
+
+def test_ci_publish_relevance_check_skips_doc_only_pushes(tmp_path):
+    """The in-job path check EXECUTED: a doc-only main push produces
+    publish=false, a worker/ change publishes, and an unresolvable diff base
+    (force-push, first push) fails open to publish."""
+    script = _publish_step(_publish_job(), "Did anything the image is built from change?")["run"]
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "worker").mkdir()
+    (repo / "worker" / "f.py").write_text("x\n")
+    base = _commit(repo, "base")
+    (repo / "README.md").write_text("docs only\n")
+    doc_only = _commit(repo, "docs")
+    (repo / "worker" / "f.py").write_text("y\n")
+    relevant = _commit(repo, "worker change")
+
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": base, "GITHUB_SHA": doc_only})
+    assert rc == 0 and outputs == {"publish": "false"}
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": doc_only, "GITHUB_SHA": relevant})
+    assert rc == 0 and outputs == {"publish": "true"}
+    rc, _, outputs = _run_step_script(script, repo, {"BEFORE": "0" * 40, "GITHUB_SHA": relevant})
+    assert rc == 0 and outputs == {"publish": "true"}  # fail-open
+
+
+def test_ci_publish_write_once_check_never_republishes_a_commit_tag(tmp_path):
+    """The write-once step EXECUTED against a scripted registry: an existing
+    sha-<sha> manifest (HTTP 200) answers fresh=false — a rerun of the same
+    commit never rebuilds or overwrites the tag; the repair lane re-points
+    :main at it instead (covered end to end below) — a 404 lets the first
+    publication proceed, and any other answer (or a failed token mint) fails
+    the job loudly instead of publishing blind."""
+    step = _publish_step(_publish_job(), "Is the commit tag already published?")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *ghcr.io/token*) [ -n "$FAKE_TOKEN_FAIL" ] && exit 22;'
+        " printf '%s' '{\"token\": \"t\"}' ;;\n"
+        "  */manifests/*) printf '%s' \"$FAKE_MANIFEST_CODE\" ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n"
+    )
+    curl.chmod(0o755)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GH_TOKEN": "t",
+        "IMAGE": "ghcr.io/snowfoxbuilds/theozolith-run-claude",
+        "GITHUB_SHA": "a" * 40,
+    }
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "200"})
+    assert rc == 0 and outputs == {"fresh": "false"} and "write-once" in out
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "404"})
+    assert rc == 0 and outputs == {"fresh": "true"}
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_MANIFEST_CODE": "503"})
+    assert rc != 0 and "refusing to publish blind" in out and outputs == {}
+    rc, out, outputs = _run_step_script(step["run"], tmp_path, {**env, "FAKE_TOKEN_FAIL": "1"})
+    assert rc != 0 and "refusing to publish blind" in out and outputs == {}
+
+
+def test_ci_publish_tip_check_blocks_a_stale_run(tmp_path):
+    """The monotonic-publish step EXECUTED: once origin/main has advanced
+    past the run's commit the step answers current=false (every registry
+    write is gated on it — a stale run can push neither :main nor its
+    commit tag, and cannot repair :main either), the tip's own run answers
+    current=true, and an unresolvable main ref fails loudly."""
+    script = _publish_step(_publish_job(), "Is this run still the tip of main?")["run"]
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "-q", "--bare", "-b", "main")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    (seed / "f").write_text("1\n")
+    first = _commit(seed, "one")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "-q", "origin", "main")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    (seed / "f").write_text("2\n")
+    second = _commit(seed, "two")
+    _git(seed, "push", "-q", "origin", "main")
+
+    rc, out, outputs = _run_step_script(script, clone, {"GITHUB_SHA": first})
+    assert rc == 0 and outputs == {"current": "false"} and "stale" in out
+    rc, _, outputs = _run_step_script(script, clone, {"GITHUB_SHA": second})
+    assert rc == 0 and outputs == {"current": "true"}
+
+    empty_origin = tmp_path / "empty.git"
+    empty_origin.mkdir()
+    _git(empty_origin, "init", "-q", "--bare", "-b", "main")
+    lonely = tmp_path / "lonely"
+    _git(tmp_path, "clone", "-q", str(empty_origin), str(lonely))
+    rc, out, _ = _run_step_script(script, lonely, {"GITHUB_SHA": first})
+    assert rc != 0 and "refusing to publish blind" in out
+
+
+def test_ci_publish_rerun_repairs_main_after_a_lost_move(tmp_path):
+    """The recovery lane EXECUTED end to end against the stateful fake
+    registry: run 1 publishes the commit tag but loses the :main move (the
+    :main push dies mid-step); the rerun's write-once check answers
+    fresh=false, the tip check still answers current=true, the push gate
+    closes while the repair gate opens, and the repair step re-points :main
+    at the published commit tag WITHOUT pushing it again. Repairing against
+    a manifest the registry cannot serve fails loudly."""
+    job = _publish_job()
+    writeonce = _publish_step(job, "Is the commit tag already published?")["run"]
+    tip = _publish_step(job, "Is this run still the tip of main?")["run"]
+    push = _publish_step(job, "Push the commit tag")
+    repair = _publish_step(job, "Point :main at the already-published commit tag")
+    _, clone = _publish_fixture(tmp_path)
+    sha = _git(clone, "rev-parse", "HEAD")
+    fake_bin, registry = _fake_registry(tmp_path)
+    image = "ghcr.io/snowfoxbuilds/theozolith-run-claude"
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GH_TOKEN": "t",
+        "IMAGE": image,
+        "GITHUB_SHA": sha,
+        "FAKE_REGISTRY": str(registry),
+    }
+
+    # Run 1: first publication — fresh and current, but the :main move dies
+    # after the commit tag already landed.
+    rc, _, once = _run_step_script(writeonce, clone, env)
+    assert rc == 0 and once == {"fresh": "true"}
+    rc, _, tips = _run_step_script(tip, clone, env)
+    assert rc == 0 and tips == {"current": "true"}
+    outputs = {"relevant": {"publish": "true"}, "writeonce": once, "tip": tips}
+    assert _gate_holds(push["if"], outputs) and not _gate_holds(repair["if"], outputs)
+    rc, out, _ = _run_step_script(push["run"], clone, {**env, "FAKE_MAIN_PUSH_FAIL": "1"})
+    assert rc != 0 and "connection reset" in out
+    assert (registry / "pushed").read_text() == f"{image}:sha-{sha}\n"
+    assert not (registry / "main").exists()
+
+    # Run 2 (rerun): the existing tag is recoverable state — never rebuilt
+    # or re-pushed, and :main converges on it.
+    rc, out, once = _run_step_script(writeonce, clone, env)
+    assert rc == 0 and once == {"fresh": "false"} and "write-once" in out
+    rc, _, tips = _run_step_script(tip, clone, env)
+    assert rc == 0 and tips == {"current": "true"}
+    outputs = {"relevant": {"publish": "true"}, "writeonce": once, "tip": tips}
+    assert _gate_holds(repair["if"], outputs) and not _gate_holds(push["if"], outputs)
+    rc, out, _ = _run_step_script(repair["run"], clone, env)
+    assert rc == 0 and "repair" in out
+    assert (registry / "main").read_text() == f"{image}:main -> {image}:sha-{sha}\n"
+    # Across both runs the commit tag was pushed exactly once.
+    assert (registry / "pushed").read_text() == f"{image}:sha-{sha}\n"
+
+    # A repair whose source manifest the registry cannot serve fails loudly
+    # instead of moving :main onto nothing.
+    (registry / "pushed").write_text("")
+    rc, out, _ = _run_step_script(repair["run"], clone, env)
+    assert rc != 0 and "manifest unknown" in out
+
+
+def test_ci_publish_existing_sha_for_a_stale_commit_writes_nothing(tmp_path):
+    """An already-published commit tag on a run that is NO LONGER the tip:
+    fresh=false and current=false, so the login gate and BOTH write gates
+    (first publication and repair) evaluate closed — a stale run performs
+    no registry write even on the recovery lane."""
+    job = _publish_job()
+    writeonce = _publish_step(job, "Is the commit tag already published?")["run"]
+    tip = _publish_step(job, "Is this run still the tip of main?")["run"]
+    push = _publish_step(job, "Push the commit tag")
+    repair = _publish_step(job, "Point :main at the already-published commit tag")
+    login = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("docker/login"))
+    seed, clone = _publish_fixture(tmp_path)
+    first = _git(clone, "rev-parse", "HEAD")
+    (seed / "f").write_text("2\n")
+    _commit(seed, "two")
+    _git(seed, "push", "-q", "origin", "main")
+    fake_bin, registry = _fake_registry(tmp_path)
+    image = "ghcr.io/snowfoxbuilds/theozolith-run-claude"
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GH_TOKEN": "t",
+        "IMAGE": image,
+        "GITHUB_SHA": first,
+        "FAKE_REGISTRY": str(registry),
+    }
+    # The stale commit's tag is already published (its own run pushed it
+    # before losing the :main move, say) — then main advanced.
+    (registry / "pushed").write_text(f"{image}:sha-{first}\n")
+
+    rc, _, once = _run_step_script(writeonce, clone, env)
+    assert rc == 0 and once == {"fresh": "false"}
+    rc, out, tips = _run_step_script(tip, clone, env)
+    assert rc == 0 and tips == {"current": "false"} and "stale" in out
+    outputs = {"relevant": {"publish": "true"}, "writeonce": once, "tip": tips}
+    assert not _gate_holds(login["if"], outputs)
+    assert not _gate_holds(push["if"], outputs)
+    assert not _gate_holds(repair["if"], outputs)
+    # Nothing wrote: the recorded state is exactly what the test seeded.
+    assert (registry / "pushed").read_text() == f"{image}:sha-{first}\n"
+    assert not (registry / "main").exists()
+
+
+def test_configs_example_bases_ride_the_moving_main_tag():
+    """ADR-0051: every starter base references the CI-republished moving tag,
+    tag-only (ADR-0048) — each ingest re-resolves the digest. A future bump
+    that reverts SOME bases to a frozen tag would silently split the fleet's
+    bases, so the sweep covers every worker type."""
+    for toml_path in sorted((DEPLOY / "configs-example" / "worker-types").glob("*.toml")):
+        for line in toml_path.read_text().splitlines():
+            if line.startswith("base = "):
+                assert line.rstrip().endswith(':main"'), (toml_path.name, line)
 
 
 # -- M3 substrate artifacts -------------------------------------------------------
@@ -178,7 +612,10 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
         # resolves to process kind and the generic launcher, staged stopped.
         "hello-logger": "process",
     }
-    assert config.product_version
+    # The starter ships PIN-LESS (ADR-0051): the update flow (`theozolith
+    # build`/`update`) owns the product pin, and ingest preserves it —
+    # declaring product.toml here would revert real deployments' pins.
+    assert config.product_version == ""
     assert "claude-dev" in config.worker_types
     # The example knowledge tree compiled at ingest and pinned per tree; both
     # claude types share it, so they share the pin (ADR-0048).

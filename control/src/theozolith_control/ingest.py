@@ -7,9 +7,11 @@ distributes. This module is the ONLY path between them:
 1. HARVEST the Config Repo at its current commit (a dirty git source is
    refused — the pinned build stamps the source commit, so the stamp must be
    truthful; a plain folder harvests under a content hash).
-2. STAGE a candidate tree: config files copied verbatim, ``knowledge/<name>``
-   trees compiled by the ADR-0009 compiler (compile errors surface HERE, not
-   at image build or container start), ``control.toml`` merged (the machine-
+2. STAGE a candidate tree: config files copied verbatim (with the pinned
+   build's ``product.toml`` carried forward when the source declares none —
+   the update flow owns the pin, ADR-0051), ``knowledge/<name>`` trees
+   compiled by the ADR-0009 compiler (compile errors surface HERE, not at
+   image build or container start), ``control.toml`` merged (the machine-
    written [control] address block is preserved from the pinned build; the
    [settings] surface is harvested from the source), and ``pins.toml``
    written with the resolved pins.
@@ -41,7 +43,11 @@ mechanism. Two deliberate deviations, both reported loudly in the notes: a
 dirty LOCAL git source is previewed from its working tree (linting
 uncommitted edits is the dry run's home case — a real ingest still
 refuses), and the ignored-leftover purge and pending-marker repair are
-reported, never performed.
+reported, never performed. Under a pending marker the worktree may trail
+HEAD, so every old-state read the preview depends on — the preserved
+product pin, control.toml, worker tags — comes from a read-only snapshot
+of the committed HEAD (exactly the state the real ingest's repair would
+restore before staging), never from the lagging worktree.
 
 The whole transaction — from the initial clean check through the commit and
 working-tree publish — runs under the exclusive pinned-build WRITE LOCK
@@ -80,7 +86,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tarfile
 import tempfile
 import tomllib
 import urllib.error
@@ -253,6 +261,33 @@ def _recover_pending(pinned_dir: Path, runner, report: IngestReport) -> None:
     )
 
 
+def _snapshot_committed_head(pinned_dir: Path, head: str, dest: Path, runner) -> None:
+    """A read-only extraction of the committed HEAD tree into ``dest``, for
+    the dry run's old-state reads when a pending marker means the worktree
+    may trail HEAD: a real ingest repairs the tree to HEAD before reading
+    it, so the preview must read what that repair would produce — never the
+    lagging worktree. ``git archive`` only READS objects (no index, worktree,
+    ref, or object write), keeping the dry run's nothing-touched guarantee
+    intact. An unborn HEAD snapshots to an empty tree — nothing was ever
+    committed, so the old state is empty."""
+    dest.mkdir()
+    if not head:
+        return
+    tar_path = dest.parent / "pinned-head.tar"
+    _require_git(
+        ["archive", "--format=tar", "-o", str(tar_path), head],
+        pinned_dir,
+        runner,
+        f"{pinned_dir} (dry run)",
+    )
+    with tarfile.open(tar_path) as archive:
+        if hasattr(tarfile, "data_filter"):
+            archive.extractall(dest, filter="data")
+        else:  # pragma: no cover — Python < 3.11.4
+            archive.extractall(dest)
+    tar_path.unlink()
+
+
 def _is_git_url(source: str) -> bool:
     return "://" in source or source.startswith("git@")
 
@@ -344,6 +379,68 @@ def _copy_config_files(source_dir: Path, staging: Path) -> None:
                 shutil.copy2(entry, target)
             else:
                 raise IngestError(f"Config Repo entry {relpath} is not a regular file — refused")
+
+
+def _path_shape(mode: int) -> str:
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if stat.S_ISLNK(mode):
+        return "a symlink"
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        return "a device node"
+    return "not a regular file"
+
+
+def _preserve_product_pin(
+    source_dir: Path, pinned_state: Path, staging: Path, report: IngestReport
+) -> None:
+    """A pin-less source never deletes the pin (ADR-0051): when the Config
+    Repo carries no ``product.toml``, the update flow (``theozolith build``/
+    ``theozolith update``) owns the product pin, so the pinned build's
+    current file is carried forward into staging verbatim. A source that HAS
+    ``product.toml`` still wins (ADR-0048; the divergence note downstream
+    covers it) — but "has" means a REGULAR FILE: the pin's two valid states
+    are absent (update flow owns it) or a plain TOML file (the Config Repo
+    declares it), and any other shape is refused loudly BEFORE the pinned
+    copy — silently preserving into e.g. a ``product.toml/`` directory would
+    ship a ``product.toml/product.toml`` no loader reads while this note
+    claims the pin survived. ``pinned_state`` is the old pinned state to
+    preserve from: the worktree normally (a real ingest reset it to HEAD
+    under the shared write lock before staging), or the dry run's read-only
+    committed-HEAD snapshot when a pending marker means the worktree may
+    trail HEAD."""
+    source_pin = source_dir / "product.toml"
+    try:
+        mode = source_pin.lstat().st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None:
+        if not stat.S_ISREG(mode):
+            raise IngestError(
+                f"Config Repo product.toml is {_path_shape(mode)} — product.toml"
+                " has exactly two valid states: absent (the update flow owns the"
+                " pin, ADR-0051) or a regular TOML file (the Config Repo declares"
+                " the pin); replace it with a plain file or delete it"
+            )
+        return
+    pinned_product = pinned_state / "product.toml"
+    if not pinned_product.is_file():
+        return  # absent in both trees stays absent
+    shutil.copy2(pinned_product, staging / "product.toml")
+    version = ""
+    with contextlib.suppress(OSError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(pinned_product.read_text(encoding="utf-8"))
+        version = str(data.get("product", {}).get("version", ""))
+    verb = "a real ingest preserves" if report.dry_run else "preserved"
+    report.notes.append(
+        f"source has no product.toml — {verb} the pinned build's product pin"
+        f" {version or '(unversioned)'} (the update flow owns it; declare"
+        " product.toml in the Config Repo for declarative release pinning)"
+    )
 
 
 def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
@@ -691,7 +788,8 @@ def _ingest_locked(
     if not git_exists and not dry_run:
         _require_git(["init", "--quiet"], pinned_dir, runner, str(pinned_dir))
         git_exists = True
-    if git_exists and dry_run and (pinned_dir / ".git" / PENDING_MARKER).exists():
+    pending_preview = git_exists and dry_run and (pinned_dir / ".git" / PENDING_MARKER).exists()
+    if pending_preview:
         report.notes.append(
             "an interrupted ingest left the working tree behind HEAD — a real"
             " ingest repairs this first; the preview is computed against the"
@@ -736,15 +834,27 @@ def _ingest_locked(
     if git_exists:
         head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD"], pinned_dir, runner)
         original_head = (head.stdout or "").strip() if head.returncode == 0 else ""
-    old_control_toml = ""
-    control_path = pinned_dir / controltoml.CONTROL_TOML
-    if control_path.is_file():
-        old_control_toml = control_path.read_text(encoding="utf-8")
-    old_tags = _tags_of(pinned_dir)
-    old_product = _product_version_of(pinned_dir)
 
     with tempfile.TemporaryDirectory(prefix="theozolith-ingest-") as workdir:
         work = Path(workdir)
+        # The OLD pinned state every preservation read and preview comparison
+        # uses. Normally the worktree IS that state (above, a real ingest
+        # repaired or reset it to HEAD under the shared lock). The one
+        # exception: a dry run over a pending marker, where the worktree may
+        # trail HEAD — the real ingest would repair first, so the preview
+        # reads a read-only committed-HEAD snapshot instead of the lagging
+        # tree (and mutates nothing).
+        pinned_state = pinned_dir
+        if pending_preview:
+            pinned_state = work / "pinned-head"
+            _snapshot_committed_head(pinned_dir, original_head, pinned_state, runner)
+        old_control_toml = ""
+        old_control_path = pinned_state / controltoml.CONTROL_TOML
+        if old_control_path.is_file():
+            old_control_toml = old_control_path.read_text(encoding="utf-8")
+        old_tags = _tags_of(pinned_state)
+        old_product = _product_version_of(pinned_state)
+
         source_dir, report.source_commit, worktree_preview = _harvest_source(
             source, work, runner, dirty_ok=dry_run
         )
@@ -757,11 +867,12 @@ def _ingest_locked(
         staging = work / "staging"
         staging.mkdir()
         _copy_config_files(source_dir, staging)
+        _preserve_product_pin(source_dir, pinned_state, staging, report)
         report.knowledge_pins = _compile_knowledge(source_dir, staging)
         _refuse_live_placeholders(staging)
         report.resolved_bases = _resolve_bases(staging, resolve)
         _write_pins(staging, report.source_commit, report.resolved_bases, report.knowledge_pins)
-        _merge_control_toml(source_dir, pinned_dir, staging)
+        _merge_control_toml(source_dir, pinned_state, staging)
 
         # LINT: the staged tree must load under the exact fail-loud checks the
         # server applies — a config that would not load is never committed.
@@ -863,14 +974,19 @@ def _ingest_locked(
     new_product = _product_version_of(pinned_dir)
     if new_product != old_product:
         # The product-update flow (`theozolith update`) also writes the
-        # product.toml pin into the pinned build; ingest overwrites it with
-        # the source's value, so a divergence is surfaced, never silent.
+        # product.toml pin into the pinned build; when the Config Repo has
+        # one, ingest overwrites it with the source's value, so a divergence
+        # is surfaced, never silent. A pin-less source preserves the pinned
+        # build's pin instead (ADR-0051; _preserve_product_pin) — an absent
+        # declaration never deletes the deployed pin, so this note only
+        # fires for a declared file that actually moved the version.
         report.notes.append(
             f"product version: {old_product or '(none)'} -> {new_product or '(none)'}"
             " — the Config Repo's product.toml wins over any pin the update"
             " flow wrote since the last ingest"
         )
-    new_control = control_path.read_text(encoding="utf-8") if control_path.is_file() else ""
+    new_control_path = pinned_dir / controltoml.CONTROL_TOML
+    new_control = new_control_path.read_text(encoding="utf-8") if new_control_path.is_file() else ""
     if new_control != old_control_toml:
         report.notes.append(
             "control.toml changed: tier-2 settings apply on the next service restart"

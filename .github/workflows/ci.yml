@@ -42,6 +42,186 @@ jobs:
           cache-from: type=gha,scope=run-image
           cache-to: type=gha,mode=max,scope=run-image
 
+  # Publish the base run image on merges to main (ADR-0051): the moving
+  # :main tag every worker type and Flight Deck derives from, plus a
+  # WRITE-ONCE :sha-<sha> for hand digest-pinning and rollback. A separate
+  # job so `packages: write` never rides a job that runs on pull_request
+  # or non-main pushes; the workflow trigger stays unfiltered (secret-scan
+  # invariant above), so path relevance is decided inside the job. The
+  # package stays private; each `theozolith config ingest` re-resolves the
+  # tag to a digest (ADR-0048/0049), so fleets move bases only on ingest.
+  #
+  # Publication is MONOTONIC with main: registry writes are serialized by
+  # the concurrency group below, and the moment before writing, the run
+  # re-resolves refs/heads/main — if the tip is no longer this run's
+  # commit, a newer push owns the publication and this run skips (fail
+  # closed: never write, never move :main backward). A commit tag, once
+  # published, is never rebuilt or replaced: the write-once check answers
+  # exists/absent/unknown, and "unknown" fails the job rather than
+  # claiming immutability blind. An EXISTING commit tag is recoverable
+  # state, not a terminal skip — if this run is still the tip, :main is
+  # re-pointed at the published image registry-side (no rebuild), so a
+  # rerun heals an interrupted first publication. On the first
+  # publication both tags are pushed together, :sha-<sha> first (the
+  # immutable record), then :main (the moving pointer) — an interruption
+  # between the two leaves :main consistently old until a rerun or the
+  # queued next run repairs it.
+  #
+  # If a registry call 403s: the GHCR package must grant this repo access
+  # (Package settings -> Manage Actions access) — a one-time step for a
+  # package first created by a hand push.
+  publish-run-image:
+    needs: run-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # Serialize, never cancel, never drop: a running publication may be
+    # the current tip's (job creation order can lag push order), so
+    # cancellation could kill the one run that should publish. An obsolete
+    # run supersedes ITSELF at the tip check instead. queue: max keeps
+    # EVERY pending run in FIFO order rather than retaining only the
+    # newest, so the current tip's run is never displaced from the queue —
+    # it always gets its turn and either publishes fresh or repairs :main.
+    concurrency:
+      group: publish-run-image-main
+      cancel-in-progress: false
+      queue: max
+    env:
+      IMAGE: ghcr.io/snowfoxbuilds/theozolith-run-claude
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Did anything the image is built from change?
+        id: relevant
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Fail open on an unresolvable diff base (force-push, first
+          # push): an extra image push is harmless, a silent skip is not.
+          # (The write-once check below still keeps an existing commit tag
+          # untouched even on this path.)
+          if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- \
+              worker/ knowledge/ .github/workflows/ci.yml)"
+          else
+            changed="unknown-diff-base"
+          fi
+          if [ -n "$changed" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Is the commit tag already published? (write-once)
+        id: writeonce
+        if: steps.relevant.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # sha-<sha> is write-once: the first successful publication is
+          # authoritative, and a rerun/retry of this workflow must never
+          # replace its digest with rebuilt bytes. An existing tag is
+          # RECOVERABLE state, not a terminal skip: the build is skipped,
+          # but the run still re-resolves the live tip and, if current,
+          # re-points :main at the already-published image (the repair
+          # step below) — a rerun heals a first publication that lost the
+          # :main move. Tri-state on the manifest HEAD: 200 = exists
+          # (never rebuild), 404 = absent (first publication proceeds),
+          # anything else = unknown — fail loudly rather than claim
+          # immutability blind.
+          ref="sha-${GITHUB_SHA}"
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -fsS -u "x:${GH_TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')" || {
+            echo "cannot mint a GHCR pull token to check ${ref} — refusing to publish blind" >&2
+            echo "(first workflow publish on a hand-created package? grant this repo access" >&2
+            echo " under Package settings -> Manage Actions access, then re-run)" >&2
+            exit 1
+          }
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --head \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${repo}/manifests/${ref}")"
+          case "$code" in
+            200) echo "${ref} is already published — its digest stays untouched (write-once);"
+                 echo "if this run is still the tip of main, :main is re-pointed at it below"
+                 echo "fresh=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "fresh=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "cannot tell whether ${ref} exists (manifest HEAD answered HTTP ${code})" >&2
+                 echo "— refusing to publish blind. If this is the first workflow publish," >&2
+                 echo "grant this repo access to the package (Package settings -> Manage" >&2
+                 echo "Actions access), then re-run." >&2
+                 exit 1 ;;
+          esac
+      - if: steps.relevant.outputs.publish == 'true' && steps.writeonce.outputs.fresh == 'true'
+        uses: docker/setup-buildx-action@v3
+      # cache-from only: run-image already writes mode=max on this scope
+      # every run, so this rebuild is fully warm and a second writer would
+      # only thrash the scope. Built WITHOUT pushing (load into the local
+      # daemon): the registry write happens in the guarded push step below,
+      # after the tip check.
+      - if: steps.relevant.outputs.publish == 'true' && steps.writeonce.outputs.fresh == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/docker/Dockerfile.claude
+          push: false
+          load: true
+          tags: |
+            ghcr.io/snowfoxbuilds/theozolith-run-claude:main
+            ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}
+          cache-from: type=gha,scope=run-image
+      - name: Is this run still the tip of main? (monotonic publish)
+        id: tip
+        if: steps.relevant.outputs.publish == 'true'
+        run: |
+          # Resolved from the live remote immediately before the registry
+          # write: if main has advanced past this run's commit, the newer
+          # push's run owns the publication — skipping is the fail-closed
+          # choice (an obsolete run must never move :main backward or
+          # publish its commit tag after being superseded). Gates BOTH
+          # registry writes: the first-publication push and the :main
+          # repair for an already-published commit tag.
+          tip="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ -z "$tip" ]; then
+            echo "cannot resolve refs/heads/main on origin — refusing to publish blind" >&2
+            exit 1
+          fi
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale: main is now ${tip}, not ${GITHUB_SHA} — the newer push's run owns the publish"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Both write paths (first publication and :main repair) authenticate;
+      # a stale run never reaches the registry at all.
+      - if: steps.relevant.outputs.publish == 'true' && steps.tip.outputs.current == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the commit tag, then move :main
+        if: steps.relevant.outputs.publish == 'true' && steps.writeonce.outputs.fresh == 'true' && steps.tip.outputs.current == 'true'
+        run: |
+          docker push "${IMAGE}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE}:main"
+      - name: Point :main at the already-published commit tag (repair)
+        if: steps.relevant.outputs.publish == 'true' && steps.writeonce.outputs.fresh == 'false' && steps.tip.outputs.current == 'true'
+        run: |
+          # Registry-side manifest copy: read the published sha-<sha>
+          # manifest and re-tag it as :main — no rebuild, no pull, the
+          # commit tag's digest untouched. Heals a first publication that
+          # pushed the commit tag but lost the :main move, and makes a
+          # rerun of the current tip converge :main instead of skipping.
+          # Fails loudly (bash -e) if the published image cannot be read
+          # or the tag write is refused.
+          echo "repair: pointing :main at the published ${IMAGE}:sha-${GITHUB_SHA}"
+          docker buildx imagetools create --tag "${IMAGE}:main" "${IMAGE}:sha-${GITHUB_SHA}"
+
   # Same rule for the Control Node image (the hand-run compose flow —
   # control is never a Stack; ADR-0035). Cached the same way as run-image,
   # under its own scope so the two images never evict each other's layers.

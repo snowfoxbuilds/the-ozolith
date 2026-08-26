@@ -267,12 +267,21 @@ def test_upload_reports_an_unreachable_control_node_cleanly(tmp_path, monkeypatc
         product._upload_artifact("https://10.0.0.2:8443", "t", None, "0.3.0", wheel)
 
 
+def _build_args(**overrides) -> argparse.Namespace:
+    """`theozolith build`'s full parsed-argument surface, defaulted."""
+    defaults: dict = {"source": ".", "url": None, "ca": None, "dist": None, "if_initialized": False}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
 def test_build_pre_flights_the_control_node_before_building(monkeypatch):
     """Four wheels take minutes; none of them are worth building if the
     Control Node that would serve them is down."""
-    from theozolith_control import cli
+    from theozolith_control import cli, statuscli
 
-    monkeypatch.setattr(cli, "_admin_env", lambda args: ("https://10.0.0.2:8443", "t", None))
+    monkeypatch.setattr(
+        statuscli, "resolve_target", lambda url, ca: ("https://10.0.0.2:8443", "t", None)
+    )
 
     def unreachable(url, path, **kw):
         assert path == "/api/v1/healthz"
@@ -284,4 +293,96 @@ def test_build_pre_flights_the_control_node_before_building(monkeypatch):
     )
 
     with pytest.raises(SystemExit, match="cannot reach"):
-        product._cmd_build(argparse.Namespace(source="."))
+        product._cmd_build(_build_args())
+
+
+def test_build_dist_reuses_prebuilt_wheels(tmp_path, monkeypatch):
+    """--dist (ADR-0051): the bootstrap shim's wheels upload as-is — the
+    build must NOT run a second time — selected by the checkout's exact
+    version in COMPONENTS order (a stale prior-SHA wheel in the persistent
+    dist/ is simply never matched), then the pin update fires."""
+    from theozolith_control import cli, statuscli
+
+    version = "0.3.0+gabc123def456"
+    monkeypatch.setattr(
+        statuscli, "resolve_target", lambda url, ca: ("https://10.0.0.2:8443", "t", None)
+    )
+    dialed: list[str] = []
+    monkeypatch.setattr(cli, "_call", lambda url, path, **kw: dialed.append(path) or {})
+    monkeypatch.setattr(product, "source_version", lambda source: version)
+    monkeypatch.setattr(
+        product, "build_distribution", lambda *a, **kw: pytest.fail("must not rebuild")
+    )
+    uploads: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        product,
+        "_upload_artifact",
+        lambda url, token, ca, ver, path: uploads.append((ver, path.name)),
+    )
+    monkeypatch.setattr(product, "_update_via_api", lambda args, ver: 0)
+    for component in product.COMPONENTS:
+        (tmp_path / f"theozolith_{component}-{version}-py3-none-any.whl").write_bytes(b"w")
+    stale = "theozolith_worker-0.3.0+gdeadbeef0000-py3-none-any.whl"
+    (tmp_path / stale).write_bytes(b"old")
+
+    assert product._cmd_build(_build_args(dist=str(tmp_path))) == 0
+    assert dialed == ["/api/v1/healthz"]
+    assert uploads == [
+        (version, f"theozolith_{c}-{version}-py3-none-any.whl") for c in product.COMPONENTS
+    ]
+
+
+def test_build_dist_refuses_wheels_off_the_checkout_version(tmp_path, monkeypatch):
+    """A dist dir that does not carry this checkout's wheels is refused
+    loudly BEFORE any upload — never "upload whatever is lying around"."""
+    from theozolith_control import cli, statuscli
+
+    monkeypatch.setattr(
+        statuscli, "resolve_target", lambda url, ca: ("https://10.0.0.2:8443", "t", None)
+    )
+    monkeypatch.setattr(cli, "_call", lambda *a, **kw: {})
+    monkeypatch.setattr(product, "source_version", lambda source: "0.3.0+gabc123def456")
+    monkeypatch.setattr(
+        product, "_upload_artifact", lambda *a, **kw: pytest.fail("uploaded a mismatched wheel")
+    )
+    for component in product.COMPONENTS:
+        wheel = f"theozolith_{component}-0.3.0+gdeadbeef0000-py3-none-any.whl"
+        (tmp_path / wheel).write_bytes(b"w")
+
+    with pytest.raises(product.ProductError, match="does not match the checkout"):
+        product._cmd_build(_build_args(dist=str(tmp_path)))
+
+
+def test_build_if_initialized_skips_on_an_uninitialized_box(monkeypatch, capsys):
+    """--if-initialized (ADR-0051): exactly statuscli's TargetError — the two
+    uninitialized-box shapes, no URL / no admin token — becomes a printed
+    skip with exit 0, so the bootstrap shim's chained publish is safe on the
+    Control Node box being born; nothing is dialed, built, or uploaded."""
+    from theozolith_control import cli, statuscli
+
+    def unresolved(url, ca):
+        raise statuscli.TargetError("no admin token — on the Control Node run this under sudo")
+
+    monkeypatch.setattr(statuscli, "resolve_target", unresolved)
+    monkeypatch.setattr(cli, "_call", lambda *a, **kw: pytest.fail("dialed while skipping"))
+    monkeypatch.setattr(
+        product, "build_distribution", lambda *a, **kw: pytest.fail("built while skipping")
+    )
+
+    assert product._cmd_build(_build_args(if_initialized=True)) == 0
+    assert "publish skipped" in capsys.readouterr().out
+
+
+def test_build_still_fails_loud_without_the_flag(monkeypatch):
+    """Without --if-initialized the CLI contract is unchanged: an
+    unresolvable target is a SystemExit refusal (the _admin_env shape) —
+    a human running `theozolith build` on an uninitialized box must not
+    get a silent success."""
+    from theozolith_control import statuscli
+
+    def unresolved(url, ca):
+        raise statuscli.TargetError("no Control Node URL — set CONTROL_NODE_URL")
+
+    monkeypatch.setattr(statuscli, "resolve_target", unresolved)
+    with pytest.raises(SystemExit, match="no Control Node URL"):
+        product._cmd_build(_build_args())

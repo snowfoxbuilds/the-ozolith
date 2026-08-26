@@ -48,7 +48,7 @@ workspace = "acme/sandbox"       # the repository (owner/name) it works
 # carries no computed pins. Appending @sha256:<digest> here stays legal for
 # the cases where the digest IS the human decision — no registry access at
 # ingest time, or holding a type on an older build than the tag points at.
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 
 setup = [
     "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",

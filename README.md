@@ -23,9 +23,11 @@ daemon-less one-box dev shape, and cleanup live in [deploy/README.md](deploy/REA
 is the orientation path.
 
 > **No published releases yet — everything builds from a checkout of this repo.** Bootstrap the
-> CLI with `sudo python3 build.py`, and push updates to the fleet with `theozolith build` from a
-> clean source checkout. The release-based paths (`theozolith update`'s version pin and the
-> fresh-box `curl … | sudo bash` installer) activate once releases are cut.
+> CLI with `sudo python3 build.py` — on a box already running an initialized Control Node the
+> same command also publishes the build to the fleet (ADR-0051; `--no-publish` defers).
+> `theozolith build` remains the publish-without-reinstall fast path from a clean source
+> checkout. The release-based paths (`theozolith update`'s version pin and the fresh-box
+> `curl … | sudo bash` installer) activate once releases are cut.
 
 Prerequisites:
 
@@ -48,7 +50,8 @@ docker compose -f deploy/compose/control.yml up -d
 ```
 
 Or bare metal (root-mediated). First bootstrap the CLI from the checkout — `sudo python3
-build.py` puts `theozolith` at a system path (full sequence: *Build / rebuild from the repo* in
+build.py` puts `theozolith` at a system path, printing a publish-skipped notice on this
+not-yet-initialized box (full sequence: *Build / rebuild from the repo* in
 [deploy/README.md](deploy/README.md)) — then:
 
 ```sh
@@ -87,7 +90,8 @@ theozolith join-token create      # on the Control Node (sudo on a root install)
 
 The printed fresh-box installer line (`curl … | sudo bash`) pulls from GitHub releases, which
 don't exist yet — so for now, clone this repo on each node and bootstrap the CLI first
-(`sudo python3 build.py`, exactly as on the Control Node), then run the printed
+(`sudo python3 build.py`, exactly as on the Control Node; its chained publish skips itself
+here — a node box has no Control Node), then run the printed
 `sudo theozolith-nodedaemon provision 'ozjoin1:…'` line alone.
 
 `provision` verifies the CA against the join string's pinned fingerprint **before transmitting
@@ -253,9 +257,11 @@ web terminal. Its GitHub credential is a dedicated **no-merge** machine identity
 (`flightdeck-github-token`) — never a driver or personal PAT — so the human merge gate stays human
 by construction. Don't leave Flight Deck sessions running unattended.
 
-Updating the product across the fleet (with no releases yet, `theozolith build` from a clean
-source checkout; `theozolith update`'s release-pin path activates once releases exist), backup
-and recovery, and the daemon-less dev shape are covered in [deploy/README.md](deploy/README.md).
+Updating the product across the fleet (with no releases yet, `sudo python3 build.py` — one
+command to update this box's CLI and publish, ADR-0051 — or `theozolith build` to publish
+without reinstalling; `theozolith update`'s release-pin path activates once releases exist),
+backup and recovery, and the daemon-less dev shape are covered in
+[deploy/README.md](deploy/README.md).
 
 ## Further Reading
 

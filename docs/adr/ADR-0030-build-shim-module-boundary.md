@@ -1,4 +1,4 @@
-Status: ACCEPTED (amended by ADR-0041: the shim now also owns the bootstrap environment — managed `/opt/theozolith` venv, re-exec, atomically published entry-point links — and the managed invocation is `sudo python3 build.py`; the entry file and the build-logic boundary below are unchanged)
+Status: ACCEPTED (amended by ADR-0041: the shim now also owns the bootstrap environment — managed `/opt/theozolith` venv, re-exec, atomically published entry-point links — and the managed invocation is `sudo python3 build.py`; the entry file and the build-logic boundary below are unchanged) (amended by ADR-0051: after the install the shim invokes the venv's own `theozolith build --dist … --if-initialized` as a subprocess — the rejected "shelling out" alternative below was rejected for its unconditional Control-Node dependency, which `--if-initialized` removes; the shared-implementation boundary and the identity test are unchanged)
 
 Date: 2026-07-28
 

@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment)
+Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment) — amended 2026-08-26 by ADR-0051 (a source Config Repo without `product.toml` no longer deletes the pinned build's product pin: ingest carries the current pin forward — the update flow owns it unless the Config Repo declares one) (see Amendment)
 
 Date: 2026-08-18
 
@@ -187,3 +187,24 @@ types, and worker types are cheap.
   one. The digest pin (and the fleet-skew visibility and git-revert
   reproducibility that ride on it) is unchanged. See ADR-0049 for the flow,
   the scoping extension, and the node-side base pull.
+
+## Amendment (2026-08-26, ADR-0051 — an undeclared product pin is preserved)
+
+- **The commit step no longer round-trips the product pin destructively.**
+  As written, ingest copied the source's config files verbatim and
+  committed the whole staging tree, so a Config Repo without
+  `product.toml` *deleted* the pin the update flow (`theozolith build`/
+  `theozolith update`) had written into the pinned build — including for
+  the Config Repo `theozolith init` scaffolds, which ships none. ADR-0051:
+  when the source carries no `product.toml`, ingest carries the pinned
+  build's current one forward into staging (preserve, never delete), with
+  an explicit report note in both the real and dry-run paths. A source
+  that **does** carry `product.toml` still wins, with the existing
+  divergence note — declarative release pinning is unchanged. Absent in
+  both trees stays absent. A present `product.toml` must be a REGULAR
+  FILE: a directory, symlink, or other shape at that path is refused
+  loudly (preservation must never commit into a `product.toml/`
+  directory). Under a pending marker, the dry run reads the old pinned
+  state — the preserved pin included — from a read-only snapshot of the
+  committed HEAD, never from a worktree the interrupted ingest left
+  behind. See ADR-0051.
