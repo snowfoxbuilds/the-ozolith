@@ -101,8 +101,8 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 
 - Contract: input = issue ref + repo checkout + repo-resident instructions ([AGENTS.md](../../AGENTS.md), [CONTEXT.md](../../CONTEXT.md), specs, skills). Output = branch pushed through the gate + evidence bundle. Everything between is a black box.
 - One run-container image per Agent config, with the agent harness as its entrypoint. Vendor-specific flags, permissions, and invocation details are contained in the per-image adapter; Runs invoke the adapter's headless one-shot mode (ADR-0019).
-- [AGENTS.md](../../AGENTS.md) is the canonical instruction file; vendor files (e.g. [CLAUDE.md](../../CLAUDE.md)) are generated copies, never sources.
-- Skills are files in the repo; the knowledge machinery (knowledge/) generates per-tool placement and format. Two scopes: global skills live in the private config repo and travel with the operator; project skills live in the target project's repo and travel with the project.
+- [AGENTS.md](../../AGENTS.md) is the canonical instruction file; vendor files are generated copies, never sources — [CLAUDE.md](../../CLAUDE.md) carries a generated marker, while codex's AGENTS.md ships verbatim (the vendor format IS the canonical format; ADR-0052).
+- Skills are files in the repo; the knowledge machinery (knowledge/) generates per-tool placement and format (one compiler per tool — claude and codex ship, codex consuming the same skills format natively; ADR-0052). Two scopes: global skills live in the private config repo and travel with the operator; project skills live in the target project's repo and travel with the project.
 - No code-level LLM abstraction layer — it would couple to every vendor's API churn; the process-level boundary ages better. The swap boundary is the process/artifact contract above.
 ### Agent session contract (headless Runs, interactive Flight Deck)
 

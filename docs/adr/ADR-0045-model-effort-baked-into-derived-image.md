@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED — amended by ADR-0052 (2026-08-26): a second adapter (codex) exists at a deliberately weaker enforcement ceiling — PROBE + STATIC only (baked theozolith-owned config, one driver-boot probe reading the CLI's session rollout journal, per-Run static checks, a benign post-exit observer; no live kill, no effort pairs until proven) — and the identity-hash formula gains a `knowledge_target` key ONLY when it differs from the historical claude default (the "exactly these four keys" clause is amended; every pre-ADR-0052 identity hashes byte-identically).
 Date: 2026-08-10 (consolidated 2026-08-14)
 
 # ADR-0045: Model and reasoning effort are typed fields baked into the derived image, held by best effort
