@@ -94,6 +94,35 @@ def test_ci_builds_the_run_container_image():
     assert "file: worker/docker/Dockerfile.claude" in ci
 
 
+def test_ci_publishes_the_run_image_from_main_only():
+    """ADR-0051: merges to main push the moving :main tag (plus an immutable
+    :sha-<sha>) so the base image is never hand-pushed again. The publish is
+    a SEPARATE job gated to main pushes — `packages: write` must never ride
+    the check job, which runs on every PR and branch push — and the check
+    jobs stay pure checks: the only `push: true` in the workflow lives
+    inside the publish job."""
+    ci = CI.read_text()
+    assert "publish-run-image:" in ci
+    assert "docker/login-action" in ci
+    assert "packages: write" in ci
+    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:main" in ci
+    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}" in ci
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in ci
+    assert ci.count("push: true") == 1
+    assert ci.index("push: true") > ci.index("publish-run-image:")
+
+
+def test_configs_example_bases_ride_the_moving_main_tag():
+    """ADR-0051: every starter base references the CI-republished moving tag,
+    tag-only (ADR-0048) — each ingest re-resolves the digest. A future bump
+    that reverts SOME bases to a frozen tag would silently split the fleet's
+    bases, so the sweep covers every worker type."""
+    for toml_path in sorted((DEPLOY / "configs-example" / "worker-types").glob("*.toml")):
+        for line in toml_path.read_text().splitlines():
+            if line.startswith("base = "):
+                assert line.rstrip().endswith(':main"'), (toml_path.name, line)
+
+
 # -- M3 substrate artifacts -------------------------------------------------------
 
 
@@ -178,7 +207,10 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
         # resolves to process kind and the generic launcher, staged stopped.
         "hello-logger": "process",
     }
-    assert config.product_version
+    # The starter ships PIN-LESS (ADR-0051): the update flow (`theozolith
+    # build`/`update`) owns the product pin, and ingest preserves it —
+    # declaring product.toml here would revert real deployments' pins.
+    assert config.product_version == ""
     assert "claude-dev" in config.worker_types
     # The example knowledge tree compiled at ingest and pinned per tree; both
     # claude types share it, so they share the pin (ADR-0048).

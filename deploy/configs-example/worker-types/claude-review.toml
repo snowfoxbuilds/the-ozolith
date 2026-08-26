@@ -13,7 +13,7 @@ model = "claude-fable-5"
 workspace = "acme/sandbox"
 
 # Tag-only: ingest resolves and pins the digest (see claude-dev.toml).
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 
 setup = [
     "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",

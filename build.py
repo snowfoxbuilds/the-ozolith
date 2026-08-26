@@ -14,9 +14,14 @@ that interpreter, builds every component wheel from the CLEAN checkout into
 ``dist/``, installs them there, and publishes the human entry points into
 ``/usr/local/bin`` (validated first, linked atomically, foreign paths
 refused — never overwritten) — so ``sudo python3 build.py`` is the whole
-managed bootstrap. From then on, source-based updates are ``theozolith
-build``. ``--venv PATH`` is the unmanaged escape hatch (dev checkouts,
-tests): same build and install, no root, no links.
+managed bootstrap. It then chains into the fleet publish (ADR-0051): the
+just-installed venv CLI runs ``theozolith build --dist dist/
+--if-initialized`` as a subprocess, reusing this run's wheels — a box with
+no Control Node yet skips with a notice (the bootstrap-first-boot case),
+an initialized box that fails to publish fails THIS command, and
+``--no-publish`` opts out. ``--venv PATH`` is the unmanaged escape hatch
+(dev checkouts, tests): same build, install, and publish attempt, no root,
+no links.
 """
 
 from __future__ import annotations
@@ -273,6 +278,12 @@ def main(argv: list[str] | None = None) -> int:
         help="unmanaged escape hatch: build and install into this venv instead"
         f" of the managed {MANAGED_VENV} (no root, no {LINK_DIR} links)",
     )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="install only: skip the chained 'theozolith build' publish to"
+        " the Control Node (ADR-0051)",
+    )
     args = parser.parse_args(argv)
     managed = args.venv is None
     venv = MANAGED_VENV if managed else Path(args.venv).resolve()
@@ -307,8 +318,44 @@ def main(argv: list[str] | None = None) -> int:
     if managed:
         link_entry_points(venv)
     print(f"built and installed {len(wheels)} wheel(s) at version {version} into {venv}")
-    print("next: 'sudo theozolith init' on the Control Node box, then 'theozolith build'")
-    print("for future source updates (this shim was only the bootstrap).")
+    if args.no_publish:
+        print("publish skipped (--no-publish); run 'theozolith build' to serve")
+        print("the wheels and pin the version when you are ready.")
+        return 0
+    # The chained publish (ADR-0051) runs the just-installed venv CLI as a
+    # SUBPROCESS — never an in-process import: the checkout's modules (this
+    # shim's sys.path) and the installed ones must not mix — reusing the
+    # wheels this run built (--dist skips the second multi-minute build).
+    # --if-initialized keeps the ADR-0030 bootstrap case: a box with no
+    # Control Node target yet skips with a notice inside the subprocess; an
+    # initialized box that fails to publish fails THIS command.
+    cli = venv / "bin" / "theozolith"
+    publish_argv = [
+        str(cli),
+        "build",
+        "--source",
+        str(REPO_ROOT),
+        "--dist",
+        str(out_dir),
+        "--if-initialized",
+    ]
+    try:
+        proc = subprocess.run(publish_argv, check=False)
+    except OSError as exc:
+        print(
+            f"error: could not run {cli} ({exc.strerror or exc}) — the install"
+            " looks incomplete; re-run the bootstrap",
+            file=sys.stderr,
+        )
+        return 1
+    if proc.returncode != 0:
+        print(
+            "error: the wheels installed on this box but the publish failed —"
+            " the fleet was NOT updated; fix the cause above and run"
+            " 'sudo theozolith build' (or re-run with --no-publish to defer)",
+            file=sys.stderr,
+        )
+        return proc.returncode
     return 0
 
 

@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: ACCEPTED (amended by ADR-0051: after installing the wheels and publishing the links, the shim chains into `theozolith build --dist … --if-initialized` — `sudo python3 build.py` publishes to the fleet when this box runs an initialized Control Node, and skips with a notice when it does not; `--no-publish` opts out)
 
 Date: 2026-08-05
 

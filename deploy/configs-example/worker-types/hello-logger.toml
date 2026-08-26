@@ -15,7 +15,7 @@ workspace = "you/your-repo"      # target repository (owner/name); required with
 # `theozolith config ingest` resolves the tag to its digest and records it
 # in the pinned build's pins.toml (ADR-0048; the digest-pinned form stays
 # legal when the digest is a human decision — see claude-dev.toml).
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 
 # Secret NAMES only — values live encrypted on the Control Node (never in this
 # repo, ADR-0024/0042: a Config Repo write here is code execution on nodes),

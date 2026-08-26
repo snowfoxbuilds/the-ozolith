@@ -389,20 +389,71 @@ def _cmd_test(args) -> int:
     return 0
 
 
+def _wheels_from_dist(dist_dir: Path, version: str) -> list[Path]:
+    """The component wheels at EXACTLY the checkout's version: a persistent
+    ``dist/`` (the bootstrap shim's) accumulates prior SHAs' wheels, so
+    selection is by version — stale wheels simply never match (the ``+`` in
+    the PEP 440 local version is glob-inert) — and a missing or ambiguous
+    component wheel refuses loudly."""
+    wheels: list[Path] = []
+    for component in COMPONENTS:
+        matches = sorted(dist_dir.glob(f"theozolith_{component}-{version}-*.whl"))
+        if len(matches) != 1:
+            raise ProductError(
+                f"--dist {dist_dir}: expected exactly one theozolith_{component}"
+                f" wheel at version {version}, found {len(matches)} — the dist"
+                " dir does not match the checkout; re-run the build (or drop"
+                " --dist)"
+            )
+        wheels.append(matches[0])
+    return wheels
+
+
 def _cmd_build(args) -> int:
-    from theozolith_control.cli import _admin_env, _call
+    # Lazy imports: this module stays stdlib-only at import time (ADR-0030).
+    from theozolith_control import statuscli
+    from theozolith_control.cli import _call
 
     source = Path(args.source).resolve()
-    url, token, ca = _admin_env(args)
+    # Target resolution has ONE implementation (statuscli.resolve_target,
+    # ADR-0039); --if-initialized converts exactly its refusal — the two
+    # uninitialized-box shapes, no URL / no admin token — into a skip, so
+    # the bootstrap shim's chained publish (ADR-0051) never needs to probe
+    # init state itself. Every failure AFTER resolution stays loud.
+    try:
+        url, token, ca = statuscli.resolve_target(args.url, args.ca)
+    except statuscli.TargetError as exc:
+        if args.if_initialized:
+            _log(f"publish skipped: {exc}")
+            _log(
+                "(no Control Node on this box yet — after 'sudo theozolith"
+                " init', 'sudo theozolith build' serves the wheels and pins"
+                " the version)"
+            )
+            return 0
+        raise SystemExit(f"error: {exc}") from exc
     # Pre-flight: building four wheels takes minutes, and every one of them
     # is wasted if the Control Node is not up. Fail here, before the work.
     _call(url, "/api/v1/healthz", token=token, ca=ca)
-    with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
-        out_dir = Path(staging)
-        version, wheels = build_distribution(source, out_dir)
-        for name in wheels:
-            _upload_artifact(url, token, ca, version, out_dir / name)
-        _log(f"uploaded {len(wheels)} wheel(s); the Control Node serves them for node pulls")
+    if args.dist:
+        # The bootstrap shim's one-step path (ADR-0051): upload the wheels
+        # the shim just built instead of building them a second time.
+        # source_version still runs first — the clean-tree refusal and the
+        # version the wheels must carry come from the same place.
+        version = source_version(source)
+        for path in _wheels_from_dist(Path(args.dist).resolve(), version):
+            _upload_artifact(url, token, ca, version, path)
+        _log(
+            f"uploaded {len(COMPONENTS)} pre-built wheel(s); the Control Node"
+            " serves them for node pulls"
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
+            out_dir = Path(staging)
+            version, wheels = build_distribution(source, out_dir)
+            for name in wheels:
+                _upload_artifact(url, token, ca, version, out_dir / name)
+            _log(f"uploaded {len(wheels)} wheel(s); the Control Node serves them for node pulls")
     return _update_via_api(args, version)
 
 
@@ -465,6 +516,18 @@ def register(commands) -> None:
         ),
     )
     build.add_argument("--source", default=".", help="source checkout (default: current directory)")
+    build.add_argument(
+        "--dist",
+        help="upload the pre-built wheels in this directory (they must match"
+        " the checkout's clean-tree version) instead of rebuilding — the"
+        " bootstrap shim's one-step publish path (ADR-0051)",
+    )
+    build.add_argument(
+        "--if-initialized",
+        action="store_true",
+        help="skip with a notice (exit 0) when this box has no Control Node"
+        " target yet (bootstrap first boot) instead of failing",
+    )
     build.set_defaults(func=_cmd_build)
 
     test = commands.add_parser(

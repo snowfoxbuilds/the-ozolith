@@ -79,7 +79,7 @@
 # `theozolith-knowledge`. It deliberately has NO tmux (the headless doctrine
 # binds run containers, ADR-0019), so setup adds it. Tag-only: ingest
 # resolves and pins the digest (ADR-0048; see claude-dev.toml).
-base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0"
+base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 
 # NOTHING is ever baked under /home/ozolith/.claude — not knowledge, not the
 # agent CLI's native config. The {stack}-claude-state volume copies image

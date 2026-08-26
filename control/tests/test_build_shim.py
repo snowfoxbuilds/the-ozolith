@@ -550,6 +550,8 @@ def sandbox(monkeypatch, tmp_path):
         "pip": [],
         "pip_checks": [],
         "pip_check_rc": 0,
+        "publishes": [],
+        "publish_rc": 0,
         "euid": 0,
     }
     monkeypatch.setattr(os, "environ", state["environ"])
@@ -566,6 +568,9 @@ def sandbox(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(argv, state["pip_check_rc"], "", stderr)
         elif argv[1:4] == ["-m", "pip", "install"]:
             state["pip"].append(argv)
+        elif argv[0].endswith("/bin/theozolith") and argv[1:2] == ["build"]:
+            state["publishes"].append(argv)
+            return subprocess.CompletedProcess(argv, state["publish_rc"])
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -673,3 +678,77 @@ def test_main_unmanaged_venv_needs_no_root_and_links_nothing(sandbox, tmp_path):
     shim.inside = lambda venv: True
     assert shim.main(["--venv", str(dev)]) == 0
     assert state["pip"] and not bin_dir.exists()  # installed, but no links anywhere
+
+
+# -- main(): the chained publish (ADR-0051) ------------------------------------
+
+
+def test_main_publishes_via_the_venv_cli_after_install(sandbox):
+    """ADR-0051: pass two chains into the fleet publish — the JUST-INSTALLED
+    venv CLI as a subprocess (never an in-process import: checkout modules
+    and installed modules must not mix), reusing this run's dist/ wheels,
+    with the uninitialized-box skip living inside the CLI
+    (--if-initialized), never in the shim."""
+    shim, opt, _bin_dir, state = sandbox
+    _fake_venv(opt)
+    _entry_points(shim, opt)
+    shim.inside = lambda venv: True
+    assert shim.main([]) == 0
+    cli = str(opt / "bin" / "theozolith")
+    assert state["publishes"] == [
+        [
+            cli,
+            "build",
+            "--source",
+            str(shim.REPO_ROOT),
+            "--dist",
+            str(shim.REPO_ROOT / "dist"),
+            "--if-initialized",
+        ]
+    ]
+    assert state["pip"]  # the publish chains AFTER the install, never replaces it
+
+
+def test_main_no_publish_skips_the_subprocess(sandbox):
+    shim, opt, _bin_dir, state = sandbox
+    _fake_venv(opt)
+    _entry_points(shim, opt)
+    shim.inside = lambda venv: True
+    assert shim.main(["--no-publish"]) == 0
+    assert state["publishes"] == []
+    assert state["pip"]  # the install is unchanged — only the publish is deferred
+
+
+def test_main_a_failed_publish_fails_the_bootstrap_loudly(sandbox, capsys):
+    """An initialized box that fails to publish fails the whole command with
+    the subprocess's exit code: the wheels ARE installed, but the operator
+    must know the fleet was NOT updated (ADR-0051 — never a silent
+    half-success)."""
+    shim, opt, bin_dir, state = sandbox
+    _fake_venv(opt)
+    _entry_points(shim, opt)
+    shim.inside = lambda venv: True
+    state["publish_rc"] = 3
+    assert shim.main([]) == 3
+    err = capsys.readouterr().err
+    assert "the fleet was NOT updated" in err
+    assert "sudo theozolith build" in err
+    for name in shim.LINKED_ENTRY_POINTS:  # the install itself completed first
+        assert os.readlink(bin_dir / name) == str(opt / "bin" / name)
+
+
+def test_main_unmanaged_venv_publishes_through_its_own_cli(sandbox, tmp_path):
+    """The --venv escape hatch chains the same publish through ITS venv's
+    CLI: an unconfigured dev box skips inside the CLI (TargetError ->
+    --if-initialized), an env-configured one publishes — and still no
+    /usr/local/bin links either way."""
+    shim, _, bin_dir, state = sandbox
+    state["euid"] = 1000  # never root — the escape hatch must not need it
+    dev = tmp_path / "dev-venv"
+    _fake_venv(dev)
+    shim.inside = lambda venv: True
+    assert shim.main(["--venv", str(dev)]) == 0
+    (publish,) = state["publishes"]
+    assert publish[0] == str(dev / "bin" / "theozolith")
+    assert "--if-initialized" in publish and "--dist" in publish
+    assert not bin_dir.exists()

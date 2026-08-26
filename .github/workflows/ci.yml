@@ -42,6 +42,68 @@ jobs:
           cache-from: type=gha,scope=run-image
           cache-to: type=gha,mode=max,scope=run-image
 
+  # Publish the base run image on merges to main (ADR-0051): the moving
+  # :main tag every worker type and Flight Deck derives from, plus an
+  # immutable :sha-<sha> for hand digest-pinning and rollback. A separate
+  # job so `packages: write` never rides a job that runs on pull_request
+  # or non-main pushes; the workflow trigger stays unfiltered (secret-scan
+  # invariant above), so path relevance is decided inside the job. The
+  # package stays private; each `theozolith config ingest` re-resolves the
+  # tag to a digest (ADR-0048/0049), so fleets move bases only on ingest.
+  # If the push 403s: the GHCR package must grant this repo write access
+  # (Package settings -> Manage Actions access) — a one-time step for a
+  # package first created by a hand push.
+  publish-run-image:
+    needs: run-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Did anything the image is built from change?
+        id: relevant
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Fail open on an unresolvable diff base (force-push, first
+          # push): an extra image push is harmless, a silent skip is not.
+          if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- \
+              worker/ knowledge/ .github/workflows/ci.yml)"
+          else
+            changed="unknown-diff-base"
+          fi
+          if [ -n "$changed" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.relevant.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@v3
+      - if: steps.relevant.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # cache-from only: run-image already writes mode=max on this scope
+      # every run, so the publish rebuild is fully warm and a second
+      # writer would only thrash the scope.
+      - if: steps.relevant.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/docker/Dockerfile.claude
+          push: true
+          tags: |
+            ghcr.io/snowfoxbuilds/theozolith-run-claude:main
+            ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}
+          cache-from: type=gha,scope=run-image
+
   # Same rule for the Control Node image (the hand-run compose flow —
   # control is never a Stack; ADR-0035). Cached the same way as run-image,
   # under its own scope so the two images never evict each other's layers.

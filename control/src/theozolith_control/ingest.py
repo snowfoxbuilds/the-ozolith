@@ -7,9 +7,11 @@ distributes. This module is the ONLY path between them:
 1. HARVEST the Config Repo at its current commit (a dirty git source is
    refused — the pinned build stamps the source commit, so the stamp must be
    truthful; a plain folder harvests under a content hash).
-2. STAGE a candidate tree: config files copied verbatim, ``knowledge/<name>``
-   trees compiled by the ADR-0009 compiler (compile errors surface HERE, not
-   at image build or container start), ``control.toml`` merged (the machine-
+2. STAGE a candidate tree: config files copied verbatim (with the pinned
+   build's ``product.toml`` carried forward when the source declares none —
+   the update flow owns the pin, ADR-0051), ``knowledge/<name>`` trees
+   compiled by the ADR-0009 compiler (compile errors surface HERE, not at
+   image build or container start), ``control.toml`` merged (the machine-
    written [control] address block is preserved from the pinned build; the
    [settings] surface is harvested from the source), and ``pins.toml``
    written with the resolved pins.
@@ -344,6 +346,36 @@ def _copy_config_files(source_dir: Path, staging: Path) -> None:
                 shutil.copy2(entry, target)
             else:
                 raise IngestError(f"Config Repo entry {relpath} is not a regular file — refused")
+
+
+def _preserve_product_pin(
+    source_dir: Path, pinned_dir: Path, staging: Path, report: IngestReport
+) -> None:
+    """A pin-less source never deletes the pin (ADR-0051): when the Config
+    Repo carries no ``product.toml``, the update flow (``theozolith build``/
+    ``theozolith update``) owns the product pin, so the pinned build's
+    current file is carried forward into staging verbatim. A source that HAS
+    ``product.toml`` still wins (ADR-0048; the divergence note downstream
+    covers it). Reading the pinned worktree is safe here: a real ingest
+    reset it to HEAD under the shared write lock before staging — the same
+    lock every pin writer holds — and a dry run's possible pending-marker
+    deviation is already reported as such."""
+    if (source_dir / "product.toml").is_file():
+        return
+    pinned_product = pinned_dir / "product.toml"
+    if not pinned_product.is_file():
+        return  # absent in both trees stays absent
+    shutil.copy2(pinned_product, staging / "product.toml")
+    version = ""
+    with contextlib.suppress(OSError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(pinned_product.read_text(encoding="utf-8"))
+        version = str(data.get("product", {}).get("version", ""))
+    verb = "a real ingest preserves" if report.dry_run else "preserved"
+    report.notes.append(
+        f"source has no product.toml — {verb} the pinned build's product pin"
+        f" {version or '(unversioned)'} (the update flow owns it; declare"
+        " product.toml in the Config Repo for declarative release pinning)"
+    )
 
 
 def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
@@ -757,6 +789,7 @@ def _ingest_locked(
         staging = work / "staging"
         staging.mkdir()
         _copy_config_files(source_dir, staging)
+        _preserve_product_pin(source_dir, pinned_dir, staging, report)
         report.knowledge_pins = _compile_knowledge(source_dir, staging)
         _refuse_live_placeholders(staging)
         report.resolved_bases = _resolve_bases(staging, resolve)
@@ -863,8 +896,12 @@ def _ingest_locked(
     new_product = _product_version_of(pinned_dir)
     if new_product != old_product:
         # The product-update flow (`theozolith update`) also writes the
-        # product.toml pin into the pinned build; ingest overwrites it with
-        # the source's value, so a divergence is surfaced, never silent.
+        # product.toml pin into the pinned build; when the Config Repo has
+        # one, ingest overwrites it with the source's value, so a divergence
+        # is surfaced, never silent. A pin-less source preserves the pinned
+        # build's pin instead (ADR-0051; _preserve_product_pin) — an absent
+        # declaration never deletes the deployed pin, so this note only
+        # fires for a declared file that actually moved the version.
         report.notes.append(
             f"product version: {old_product or '(none)'} -> {new_product or '(none)'}"
             " — the Config Repo's product.toml wins over any pin the update"
