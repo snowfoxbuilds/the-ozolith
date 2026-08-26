@@ -396,6 +396,26 @@ def project_identity_keys(document: object) -> list[str]:
     return sorted(keys)
 
 
+def project_settings_baseline(workdir: Path) -> dict[str, list[str]]:
+    """The launch-time identity-shaped keys of the checkout's Claude
+    settings files ({absolute path: [keys]}) — the ConfigChange hook
+    subtracts these, so only keys a mid-session change ADDED can kill the
+    Run (a checkout that ships an inert identity key is not killed for a
+    benign edit). A file absent or unparseable at launch contributes
+    nothing; a later change to it is judged on its own content."""
+    baseline: dict[str, list[str]] = {}
+    for name in ("settings.json", "settings.local.json"):
+        path = workdir / ".claude" / name
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        keys = project_identity_keys(document)
+        if keys:
+            baseline[str(path)] = keys
+    return baseline
+
+
 def scan_process_environment(environ: Mapping[str, str]) -> list[str]:
     """Identity-affecting variables in the RUN CONTAINER's own process
     environment, as conflict strings naming the variable (never the value).

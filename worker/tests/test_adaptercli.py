@@ -348,3 +348,77 @@ def test_policy_helper_fails_the_build(tmp_path, capsys):
     )
     assert rc == 1
     assert "policyHelper" in capsys.readouterr().err
+
+
+# -- the codex adapter through the CLI (ADR-0052) -------------------------------
+
+
+@pytest.fixture
+def codex_cli_version(monkeypatch):
+    from theozolith_worker.adapters import CodexAdapter
+
+    monkeypatch.setattr(CodexAdapter, "_cli_version", lambda self: "codex-cli 0.150.0")
+
+
+def test_codex_materialize_managed_writes_the_baked_config(tmp_path, capsys, codex_cli_version):
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "codex",
+            "--model",
+            "gpt-5.2-codex",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    assert (tmp_path / "etc/theozolith/model").read_text() == "gpt-5.2-codex\n"
+    config = tomllib.loads((tmp_path / "etc/theozolith/codex/config.toml").read_text())
+    assert config == {"model": "gpt-5.2-codex"}
+    assert re.search(r"agent CLI: codex-cli \d+\.\d+\.\d+", capsys.readouterr().out)
+
+
+def test_codex_materialize_interactive_scope_fails_the_build(tmp_path, capsys, codex_cli_version):
+    """The in-image backstop (ADR-0052): control refuses driverless codex
+    types upstream, and an instruction that reaches the build anyway fails
+    it loudly with nothing written."""
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "codex",
+            "--model",
+            "gpt-5.2-codex",
+            "--scope",
+            "interactive",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    assert "no interactive-scope" in capsys.readouterr().err
+    assert not (tmp_path / "etc").exists()
+
+
+def test_codex_materialize_unproven_effort_exits_2(tmp_path, capsys, codex_cli_version):
+    rc = adaptercli.main(
+        [
+            "materialize",
+            "--adapter",
+            "codex",
+            "--model",
+            "gpt-5.2-codex",
+            "--effort",
+            "high",
+            "--scope",
+            "managed",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert "no proven effort capability" in capsys.readouterr().err
+    assert not (tmp_path / "etc").exists()

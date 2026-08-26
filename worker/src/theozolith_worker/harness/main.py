@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import signal
 import subprocess
@@ -53,11 +52,8 @@ from theozolith_worker.identity import (
     CATEGORY_EFFORT_CLAMPED,
     CATEGORY_INCONSISTENT,
     CATEGORY_UNVERIFIABLE,
-    CONFIG_CHANGE_HOOK_SOURCE,
     IDENTITY_ERROR_PREFIX,
-    STOP_HOOK_SOURCE,
     MonitorHooks,
-    project_identity_keys,
     read_last_journal_effort,
 )
 from theozolith_worker.jobdir import (
@@ -349,26 +345,6 @@ def serve_jobs(
         last_activity = clock()
 
 
-def _project_settings_baseline(workdir: Path) -> dict[str, list[str]]:
-    """The launch-time identity-shaped keys of the checkout's settings files
-    ({absolute path: [keys]}) — the ConfigChange hook subtracts these, so
-    only keys a mid-session change ADDED can kill the Run (a checkout that
-    ships an inert identity key is not killed for a benign edit). A file
-    absent or unparseable at launch contributes nothing; a later change to
-    it is judged on its own content."""
-    baseline: dict[str, list[str]] = {}
-    for name in ("settings.json", "settings.local.json"):
-        path = workdir / ".claude" / name
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        keys = project_identity_keys(document)
-        if keys:
-            baseline[str(path)] = keys
-    return baseline
-
-
 def _run_identity_dryrun(job: Path, adapter, identity_root: Path, scratch_root: Path | None) -> int:
     """The setup dry-run (ADR-0045): the identity checks, the CLI version
     floor, and the one-time neutral probe session — no task file, no
@@ -479,7 +455,15 @@ def run_harness(
     transcript.touch()
     # THEOZOLITH_JOB lets in-session tools (format-output / view-output)
     # find the manifest and outputs from inside the workdir.
-    env = {**adapter.prepare(workdir, job), "THEOZOLITH_JOB": str(job)}
+    try:
+        agent_env = adapter.prepare(workdir, job, identity_root=identity_root)
+    except (AgentAdapterError, OSError) as exc:
+        # A prepare that cannot deliver its session preconditions (the codex
+        # adapter's missing credential, an unassemblable CODEX_HOME) is a
+        # pre-session infra failure with a clean status, never a crash.
+        write_status(job, Status(phase=PHASE_FAILED, error=f"agent prepare failed: {exc}"))
+        return 1
+    env = {**agent_env, "THEOZOLITH_JOB": str(job)}
     pointer = POINTER_PROMPT.format(path=task_file)
 
     identity_record: dict = {
@@ -539,18 +523,7 @@ def run_harness(
                 else Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
             )
             scratch.mkdir(parents=True, exist_ok=True)
-            hooks = MonitorHooks(
-                stop_capture=scratch / "stop.jsonl",
-                config_capture=scratch / "config-change.jsonl",
-                config_baseline=scratch / "config-baseline.json",
-                config_hook_script=scratch / "configchange_hook.py",
-                stop_hook_script=scratch / "stop_hook.py",
-            )
-            hooks.config_hook_script.write_text(CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8")
-            hooks.stop_hook_script.write_text(STOP_HOOK_SOURCE, encoding="utf-8")
-            hooks.config_baseline.write_text(
-                json.dumps(_project_settings_baseline(workdir)), encoding="utf-8"
-            )
+            hooks = adapter.materialize_hooks(scratch, workdir)
         except OSError as exc:
             return fail_identity(
                 CATEGORY_UNVERIFIABLE,

@@ -1739,3 +1739,45 @@ def test_identity_gate_failures_are_a_distinct_class_with_identity_evidence(harn
         assert identity["category"] == "substituted"
         assert identity["violation"] == violation
         assert "model-key" not in json.dumps(record)  # the credential never leaks
+
+
+def test_reviewer_is_adapter_indifferent_with_codex(harness: Harness):
+    """ADR-0052: the Reviewer driver path is adapter-agnostic — a codex
+    reviewer config changes only the manifest's adapter field and the
+    forwarded credential; discovery, the review round, verdict application,
+    and labels behave identically to Claude's."""
+    import dataclasses
+
+    harness.reviewer_config = dataclasses.replace(
+        harness.reviewer_config,
+        adapter="codex",
+        agent_env={"CODEX_AUTH_JSON": '{"tokens": {"access_token": "a"}}'},
+    )
+    # Capture in-session state at launch time (retry paths mask behavior
+    # asserts — capture in-session, assert at test level).
+    seen: list[tuple[str, str]] = []
+    original_factory = harness.session_factory
+
+    def recording_factory(spec, job, manifest):
+        seen.append((manifest.mode, manifest.adapter))
+        return original_factory(spec, job, manifest)
+
+    harness.session_factory = recording_factory  # instance attr wins over the method
+
+    number = harness.file_issue("Add change.txt", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+    (pr_number,) = harness.fake.open_pr_numbers()
+
+    harness.reviewer_replies.append(approve_reply())
+    assert harness.reviewer_once() == 1
+
+    assert PR_READY in harness.fake.labels_of(pr_number)
+    parsed = verdict.parse_comment(harness.fake.comments[pr_number][-1]["body"])
+    assert parsed is not None and parsed.verdict == verdict.APPROVE
+    assert number  # the claim flow ran end to end
+    # The adapter reached the review session's manifest verbatim while the
+    # implementer stayed on its own adapter.
+    review_adapters = {adapter for mode, adapter in seen if mode == jobdir_module.MODE_REVIEW}
+    assert review_adapters == {"codex"}
+    run_adapters = {adapter for mode, adapter in seen if mode == jobdir_module.MODE_RUN}
+    assert run_adapters == {"claude"}
