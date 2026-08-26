@@ -1061,6 +1061,16 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
             f" {adapter_name!r} — extend _KNOWLEDGE_TARGETS when adding an"
             " adapter whose worker types bake knowledge (ADR-0052)"
         )
+    # A driverless type is a Flight Deck, and the deck machinery is
+    # Claude-shaped end to end (ADR-0043; the interactive materialize scope
+    # exists only on the Claude adapter). Refuse here rather than at the
+    # image build the daemon would fail on.
+    if not driver and adapter_name != "claude" and (data.get("model") or data.get("effort")):
+        raise ConfigRepoError(
+            f"{context}: a driverless (Flight Deck) type with adapter"
+            f" {adapter_name!r} cannot bake a model/effort — no"
+            f" {adapter_name} Flight Deck exists (ADR-0052)"
+        )
     if workspace and not _valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"

@@ -1751,3 +1751,154 @@ def test_validate_registry_secret_shape(name, value, ok):
     else:
         with pytest.raises(ConfigRepoError):
             validate_registry_secret(name, value)
+
+
+# -- the codex adapter through config load (ADR-0052) ----------------------------
+
+
+def test_codex_driver_type_joins_the_per_tool_pin_and_targets(tmp_path):
+    """A codex worker type joins the ``<tree>/codex`` pin and derives its
+    knowledge tool/target from the adapter; the wire recipe carries both so
+    the daemon stays adapter-blind."""
+    write(tmp_path, "knowledge/dev/codex/AGENTS.md", "# k\n")
+    write_pins(tmp_path, knowledge={"dev/claude": "a" * 64, "dev/codex": "b" * 64})
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        knowledge='"knowledge/dev"',
+    )
+    wt = load_config(tmp_path).worker_types["codex-review"]
+    assert wt.knowledge_pin == "b" * 64
+    assert wt.knowledge_tool == "codex"
+    assert wt.knowledge_target == "/home/ozolith/.codex/"
+    recipe = wt.recipe_wire()
+    assert recipe["knowledge_tool"] == "codex"
+    assert recipe["knowledge_target"] == "/home/ozolith/.codex/"
+    assert recipe["setup"][-1] == (
+        "theozolith-adapter materialize --adapter codex --model gpt-5.2-codex --scope managed"
+    )
+
+
+def test_claude_recipes_carry_the_default_knowledge_targets(tmp_path):
+    write_knowledge_tree(tmp_path, "dev")
+    write_pins(tmp_path, knowledge={"dev": "a" * 64})
+    driver_type(tmp_path, knowledge='"knowledge/dev"')
+    recipe = load_config(tmp_path).worker_types["claude-dev"].recipe_wire()
+    assert recipe["knowledge_tool"] == "claude"
+    assert recipe["knowledge_target"] == "/home/ozolith/.claude/"
+
+
+def test_missing_per_tool_pin_is_actionable(tmp_path):
+    """A tree pinned only for claude fails a codex type's join with the
+    re-ingest pointer (either no codex-consumable content, or a pre-ADR-0052
+    pinned build)."""
+    write(tmp_path, "knowledge/dev/claude/CLAUDE.md", "# k\n")
+    write_pins(tmp_path, knowledge={"dev/claude": "a" * 64})
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        knowledge='"knowledge/dev"',
+    )
+    with pytest.raises(ConfigRepoError, match="compiled\\n? ?for 'codex'"):
+        load_config(tmp_path)
+
+
+def test_codex_type_requires_the_compiled_codex_tree(tmp_path):
+    """The presence check is per tool: a claude-only compiled tree does not
+    satisfy a codex type even when the pin exists."""
+    write(tmp_path, "knowledge/dev/claude/CLAUDE.md", "# k\n")
+    write_pins(tmp_path, knowledge={"dev/claude": "a" * 64, "dev/codex": "b" * 64})
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        knowledge='"knowledge/dev"',
+    )
+    with pytest.raises(ConfigRepoError, match="no compiled codex tree"):
+        load_config(tmp_path)
+
+
+def test_driverless_codex_knowledge_is_refused(tmp_path):
+    """The node's knowledge export serves the claude view only — a codex
+    Flight Deck cannot be given knowledge it could read (ADR-0052)."""
+    write(tmp_path, "knowledge/dev/codex/AGENTS.md", "# k\n")
+    write_pins(tmp_path, knowledge={"dev/codex": "b" * 64})
+    write(
+        tmp_path,
+        "worker-types/codexdeck.toml",
+        f'base = "{BASE}"\nadapter = "codex"\nknowledge = "knowledge/dev"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="claude view only"):
+        load_config(tmp_path)
+
+
+def test_driverless_codex_model_is_refused(tmp_path):
+    """No codex Flight Deck exists: a driverless codex type baking a model
+    would render an interactive-scope instruction the codex adapter refuses
+    at build — fail at config load instead (ADR-0052)."""
+    write(
+        tmp_path,
+        "worker-types/codexdeck.toml",
+        f'base = "{BASE}"\nadapter = "codex"\nmodel = "gpt-5.2-codex"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="no codex Flight Deck exists"):
+        load_config(tmp_path)
+
+
+def test_codex_effort_is_rejected_until_proven(tmp_path):
+    """The codex capability table is empty until spike #76 S7 proves a
+    model honors a level — config load rejects every nonempty effort with
+    the actionable message."""
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        effort='"high"',
+    )
+    with pytest.raises(ConfigRepoError, match="no proven effort capability"):
+        load_config(tmp_path)
+
+
+def test_knowledge_target_enters_the_identity_only_when_non_default():
+    """The no-fleet-retag contract (ADR-0052): a claude type's identity is
+    byte-identical to the pre-ADR-0052 four-key formula; a codex type's
+    differs exactly because the non-default COPY destination is a
+    Dockerfile byte."""
+    import dataclasses
+    import hashlib
+    import json
+
+    from theozolith_control.configrepo import WorkerTypeDef
+
+    claude = WorkerTypeDef(
+        name="t",
+        base=BASE,
+        knowledge="knowledge/dev",
+        knowledge_pin="c" * 64,
+        driver="builtin:reviewer",
+        adapter="claude",
+    )
+    legacy_formula = hashlib.sha256(
+        json.dumps(
+            {
+                "base": BASE,
+                "setup": [],
+                "knowledge": "knowledge/dev",
+                "knowledge_pin": "c" * 64,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert claude.instruction_hash == legacy_formula
+    codex = dataclasses.replace(claude, adapter="codex")
+    assert codex.instruction_hash != legacy_formula
