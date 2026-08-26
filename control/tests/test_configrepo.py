@@ -1805,7 +1805,7 @@ def test_missing_per_tool_pin_is_actionable(tmp_path):
         model='"gpt-5.2-codex"',
         knowledge='"knowledge/dev"',
     )
-    with pytest.raises(ConfigRepoError, match="compiled\\n? ?for 'codex'"):
+    with pytest.raises(ConfigRepoError, match=r"compiled\n? ?for 'codex'"):
         load_config(tmp_path)
 
 

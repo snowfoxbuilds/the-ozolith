@@ -54,15 +54,34 @@ that path is refused at ingest.
 ## Knowledge (`knowledge/`, ADR-0048)
 
 `knowledge/claude-dev/` is a knowledge root (ADR-0009 layout: `AGENTS.md`,
-`skills/`, optionally `agents/`, `workflows/`) referenced by the claude worker
-types as `knowledge = "knowledge/claude-dev"`. Ingest compiles it and pins its
-content hash (the pin covers each file's executable state too — a chmod
-redistributes like any edit); driver workers bake the compiled tree into
-their derived images (editing it re-tags exactly the types that reference
-it). The Flight Deck's own `knowledge` field selects which node-applied tree
-its read-only mount serves — the deck fails loud until the node has converged
-that tree, content edits reach it on agent-CLI restart, and changing the
-selected tree recreates the deck.
+`skills/`, optionally `agents/<tool>/`, `workflows/`) referenced by worker
+types as `knowledge = "knowledge/claude-dev"` — the name is an arbitrary
+label. Ingest compiles the tree **once per tool** (ADR-0052): the claude
+view (`AGENTS.md` → `CLAUDE.md`, skills, `agents/claude/`, workflows) and
+the codex view (`AGENTS.md` verbatim, skills shared, `agents/codex/` →
+prompts; codex has no workflows target) each get their own content-hash pin
+(covering each file's executable state too — a chmod redistributes like any
+edit), so one tree serves both adapters and an edit re-tags exactly the
+types whose view changed. Driver workers bake their adapter's view into
+their derived images. The Flight Deck's own `knowledge` field selects which
+node-applied tree its read-only mount serves (always the claude view) — the
+deck fails loud until the node has converged that tree, content edits reach
+it on agent-CLI restart, and changing the selected tree recreates the deck.
+
+After updating the product across the ADR-0052 layout change, re-run
+`theozolith config ingest` once (a no-op source re-ingest migrates the
+pinned build to the per-tool layout; claude pins and tags stay put).
+
+## Two reviewers (`codex-review`, ADR-0052)
+
+`worker-types/codex-review.toml` is the same Reviewer driver on the codex
+adapter — a review by a non-Claude model, with its own GitHub identity and
+the ChatGPT-plan credential as its model secret. Reviewer discovery has no
+per-PR claim: every **running** Reviewer Stack polls the same pr_ready pool,
+so two live reviewer Stacks race (first launcher wins a PR; simultaneous
+polls can double-review one). That is accepted, not routed — run one
+reviewer Stack at a time for deterministic coverage, or run both and treat
+a double review as a second opinion.
 
 ## Custom drivers (`drivers/`, ADR-0042)
 

@@ -638,6 +638,9 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
     assert kinds == {
         "implementer": "process",
         "reviewer": "process",
+        # The second-adapter reviewer (ADR-0052), staged stopped beside the
+        # claude one (the pr_ready race is documented, not routed).
+        "codex-review": "process",
         "flightdeck": "container",
         # The custom-driver example (ADR-0042): a drivers/<name> worker type
         # resolves to process kind and the generic launcher, staged stopped.
@@ -648,14 +651,23 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
     # declaring product.toml here would revert real deployments' pins.
     assert config.product_version == ""
     assert "claude-dev" in config.worker_types
-    # The example knowledge tree compiled at ingest and pinned per tree; both
-    # claude types share it, so they share the pin (ADR-0048).
+    # The example knowledge tree compiled at ingest, pinned PER TOOL
+    # (ADR-0052); both claude types share the claude-view pin, the codex
+    # reviewer joins the codex-view pin of the SAME tree.
     assert config.worker_types["claude-dev"].knowledge == "knowledge/claude-dev"
     assert (
         config.worker_types["claude-dev"].knowledge_pin
         == config.worker_types["claude-review"].knowledge_pin
         != ""
     )
+    codex_review = config.worker_types["codex-review"]
+    assert codex_review.knowledge == "knowledge/claude-dev"
+    assert codex_review.knowledge_pin not in ("", config.worker_types["claude-dev"].knowledge_pin)
+    # The recipe carries the adapter-derived bake target; the daemon COPYs
+    # where it is told (ADR-0052).
+    recipe = codex_review.recipe_wire()
+    assert recipe["knowledge_tool"] == "codex"
+    assert recipe["knowledge_target"] == "/home/ozolith/.codex/"
     # The custom driver resolves to the one launcher with a drivers/<name> ref
     # (ADR-0042), and its module is present so the load did not fault.
     hello = next(s for s in config.stacks if s.name == "hello-logger")

@@ -2,6 +2,11 @@
 # GitHub identity — no self-grading by construction (ADR-0008). The driver,
 # model, and default bindings live in worker-types/claude-review.toml;
 # rebind `workspace` or `[secrets]` per Stack here (ADR-0047).
+#
+# If you also run stacks/codex-review.toml: Reviewer discovery has no
+# per-PR claim, so two live Reviewer Stacks race on the same pr_ready pool
+# (first launcher wins; simultaneous polls can double-review). Accepted,
+# not routed (ADR-0052) — run one at a time for deterministic coverage.
 
 worker_type = "claude-review"
 node = "box1"

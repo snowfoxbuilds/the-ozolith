@@ -1,0 +1,15 @@
+# The Codex Reviewer as a thin Stack (ADR-0052/0044).
+#
+# RUNNING THIS BESIDE THE CLAUDE REVIEWER: Reviewer discovery has no per-PR
+# claim — every running Reviewer Stack polls the same pr_ready pool, and
+# whichever launches first reviews a PR (simultaneous polls can even
+# double-review one). That race is ACCEPTED behavior, not routed (ADR-0052):
+# run one reviewer Stack at a time for deterministic coverage, or run both
+# and accept occasional double reviews as a second opinion.
+
+worker_type = "codex-review"
+node = "box1"
+# Staged at "stopped": capture the codex plan credential (see the worker
+# type's [secrets]), point `workspace` at a real repository, then flip to
+# "running", commit, and ingest (ADR-0037/0048).
+state = "stopped"

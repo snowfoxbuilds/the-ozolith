@@ -1,0 +1,41 @@
+# A Codex Reviewer worker type (ADR-0052): the same Reviewer driver on the
+# second Agent adapter — a review by a non-Claude model. Like every
+# Reviewer it carries its OWN GitHub identity (no self-grading by
+# construction, ADR-0008), distinct from both the Implementer's and the
+# Claude Reviewer's.
+
+driver = "builtin:reviewer"
+adapter = "codex"
+# The model bakes into the derived image exactly as with Claude (ADR-0045):
+# CodexAdapter.materialize writes the theozolith-owned config every session's
+# throwaway CODEX_HOME receives. No `effort`: no (model, effort) pair is
+# proven enforceable for codex yet (the capability table unlocks per model
+# on spike #76 S7 evidence).
+model = "gpt-5.2-codex"
+workspace = "acme/sandbox"
+
+# Tag-only: ingest resolves and pins the digest (ADR-0048). The codex base
+# image pins its CLI version — the --json schema the adapter parses is
+# experimental, so base bumps are deliberate acts.
+base = "ghcr.io/snowfoxbuilds/theozolith-run-codex:main"
+
+setup = [
+    "apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*",
+    "pip install --no-cache-dir uv",
+]
+
+# Tree names are arbitrary labels (this one predates the second adapter):
+# ingest compiles every tree once per tool (ADR-0052), so one tree serves
+# both adapters — this type bakes the codex view (AGENTS.md verbatim,
+# skills shared, agents/codex/ as prompts) while claude-dev and
+# claude-review bake the claude view of the SAME tree. Editing the tree
+# re-tags exactly the types whose view changed.
+knowledge = "knowledge/claude-dev"
+
+[secrets]
+GITHUB_TOKEN = "github-codex-reviewer"
+# The ChatGPT-plan credential: the full auth.json document captured by a
+# one-time `codex login --device-auth` (see spikes/issue-76-codex-plan-auth
+# and its issue for the capture procedure). Store it whole:
+#   theozolith secret set codex-auth-json < auth.json
+CODEX_AUTH_JSON = "codex-auth-json"

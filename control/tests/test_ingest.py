@@ -221,9 +221,7 @@ def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
 
     legacy = tmp_path / "legacy-shaped"
     shutil.copytree(pinned / "knowledge/dev/claude", legacy / "knowledge/dev")
-    assert (
-        configdist.knowledge_tree_hash(legacy, "dev") == report.knowledge_pins["dev/claude"]
-    )
+    assert configdist.knowledge_tree_hash(legacy, "dev") == report.knowledge_pins["dev/claude"]
 
 
 def test_per_tool_compile_skips_empty_filesets(tmp_path):
