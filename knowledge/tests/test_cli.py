@@ -5,7 +5,31 @@ from theozolith_knowledge.cli import main
 
 def test_validate_ok(sample_knowledge, capsys):
     assert main(["validate", "--source", str(sample_knowledge)]) == 0
-    assert "skills: 2" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "skills: 2" in out
+    # Per-tool section counts are the visibility for content a compiler
+    # drops (codex has no workflows target, ADR-0052).
+    assert "claude agents: 2" in out
+    assert "codex agents: 1" in out
+
+
+def test_sync_tool_codex(tmp_path, sample_knowledge):
+    target = tmp_path / "codex"
+    args = [
+        "sync",
+        "--source",
+        str(sample_knowledge),
+        "--scope",
+        "global",
+        "--target",
+        str(target),
+        "--tool",
+        "codex",
+    ]
+    assert main(args) == 0
+    assert (target / "AGENTS.md").is_file()
+    assert (target / "prompts" / "triage.md").is_file()
+    assert not (target / "CLAUDE.md").exists()
 
 
 def test_validate_rejects_non_root(tmp_path, capsys):

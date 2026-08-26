@@ -51,6 +51,26 @@ def test_project_scope_layout(tmp_path, sample_knowledge):
     assert (project / ".claude" / MANIFEST_NAME).is_file()
 
 
+def test_golden_codex_global_sync(tmp_path, sample_knowledge):
+    """The same fixture root compiled for codex: verbatim AGENTS.md, skills
+    verbatim, agents/codex as prompts, workflows dropped."""
+    target = tmp_path / "codex"
+    report = sync(sample_knowledge, "global", target, tool="codex")
+
+    assert not report.hand_edited
+    assert tree_snapshot(target, IGNORE_MANIFEST) == tree_snapshot(GOLDEN / "codex_global")
+
+
+def test_codex_project_scope_is_rejected(tmp_path, sample_knowledge):
+    with pytest.raises(KnowledgeError, match="global-scope only"):
+        sync(sample_knowledge, "project", tmp_path / "project", tool="codex")
+
+
+def test_unknown_tool_is_rejected(tmp_path, sample_knowledge):
+    with pytest.raises(KnowledgeError, match="no compiler for tool 'pi'"):
+        sync(sample_knowledge, "global", tmp_path / "pi", tool="pi")
+
+
 def test_hand_edit_is_warned_and_overwritten(tmp_path, sample_knowledge):
     target = tmp_path / "claude"
     sync(sample_knowledge, "global", target)

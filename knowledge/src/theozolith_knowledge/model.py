@@ -5,7 +5,8 @@ A knowledge root is a directory of pure data — no machinery (ADR-0007):
     <root>/
     ├── AGENTS.md            # optional: canonical instruction file
     ├── skills/<name>/       # each a folder containing SKILL.md (+ scripts, references)
-    ├── agents/<tool>/*.md   # subagent files, namespaced per tool ("claude" in V1)
+    ├── agents/<tool>/*.md   # subagent files, namespaced per tool (claude and
+    │                        # codex load; unknown namespaces are tolerated)
     └── workflows/<name>     # one file or folder per workflow
 
 Every section is optional, but a root with no knowledge at all is rejected.
@@ -41,6 +42,12 @@ class ClaudeAgent:
 
 
 @dataclass(frozen=True)
+class CodexAgent:
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
 class Workflow:
     name: str
     path: Path
@@ -52,6 +59,7 @@ class KnowledgeRoot:
     agents_md: Path | None
     skills: tuple[Skill, ...]
     claude_agents: tuple[ClaudeAgent, ...]
+    codex_agents: tuple[CodexAgent, ...]
     workflows: tuple[Workflow, ...]
 
 
@@ -88,21 +96,27 @@ def load_knowledge_root(path: Path | str) -> KnowledgeRoot:
             skills.append(Skill(_checked_name("skill", entry.name, skills_dir), entry))
 
     claude_agents: list[ClaudeAgent] = []
+    codex_agents: list[CodexAgent] = []
     agents_dir = root / "agents"
+
+    def _tool_agents(tool: str, kind: str) -> list[tuple[str, Path]]:
+        tool_dir = agents_dir / tool
+        agents: list[tuple[str, Path]] = []
+        if tool_dir.is_dir():
+            for entry in _visible(list(tool_dir.iterdir())):
+                if not entry.is_file() or entry.suffix != ".md":
+                    raise KnowledgeError(f"agents/{tool}/ entry is not a .md file: {entry}")
+                agents.append((_checked_name(kind, entry.stem, tool_dir), entry))
+        return agents
+
     if agents_dir.is_dir():
         for entry in _visible(list(agents_dir.iterdir())):
             # agents/ holds one namespace folder per tool; unknown tools are
             # tolerated (data may serve compilers this version doesn't have).
             if not entry.is_dir():
                 raise KnowledgeError(f"agents/ entry is not a tool namespace folder: {entry}")
-        claude_dir = agents_dir / "claude"
-        if claude_dir.is_dir():
-            for entry in _visible(list(claude_dir.iterdir())):
-                if not entry.is_file() or entry.suffix != ".md":
-                    raise KnowledgeError(f"agents/claude/ entry is not a .md file: {entry}")
-                claude_agents.append(
-                    ClaudeAgent(_checked_name("Claude agent", entry.stem, claude_dir), entry)
-                )
+        claude_agents = [ClaudeAgent(n, p) for n, p in _tool_agents("claude", "Claude agent")]
+        codex_agents = [CodexAgent(n, p) for n, p in _tool_agents("codex", "Codex agent")]
 
     workflows: list[Workflow] = []
     workflows_dir = root / "workflows"
@@ -110,7 +124,8 @@ def load_knowledge_root(path: Path | str) -> KnowledgeRoot:
         for entry in _visible(list(workflows_dir.iterdir())):
             workflows.append(Workflow(_checked_name("workflow", entry.name, workflows_dir), entry))
 
-    if agents_md is None and not skills and not claude_agents and not workflows:
+    sections = (skills, claude_agents, codex_agents, workflows)
+    if agents_md is None and not any(sections):
         raise KnowledgeError(
             f"not a knowledge root (no AGENTS.md, skills/, agents/, or workflows/ content): {root}"
         )
@@ -120,5 +135,6 @@ def load_knowledge_root(path: Path | str) -> KnowledgeRoot:
         agents_md=agents_md,
         skills=tuple(skills),
         claude_agents=tuple(claude_agents),
+        codex_agents=tuple(codex_agents),
         workflows=tuple(workflows),
     )

@@ -177,7 +177,10 @@ def apply_fileset(
 
 
 def manifest_location(target_root: Path, scope: str) -> Path:
-    """Where the manifest lives: inside the Claude dir for both scopes."""
+    """Where the manifest lives: the target root in global scope, inside the
+    tool dir in project scope. The project branch is Claude-specific by
+    construction — the only compiler that accepts project scope is Claude's
+    (the codex compiler is global-only, ADR-0052)."""
     target_root = Path(target_root)
     if scope == "project":
         return target_root / ".claude" / MANIFEST_NAME
@@ -194,13 +197,11 @@ def sync(
     strict: bool = False,
 ) -> SyncReport:
     """Load, compile, and apply a knowledge root into a target directory."""
-    from theozolith_knowledge.claude import compile_claude
+    from theozolith_knowledge.compilers import get_compiler
     from theozolith_knowledge.model import load_knowledge_root
 
-    if tool != "claude":
-        raise KnowledgeError(f"no compiler for tool {tool!r} (V1 is Claude-only)")
     root = load_knowledge_root(source)
-    files = compile_claude(root, scope)
+    files = get_compiler(tool)(root, scope)
     return apply_fileset(
         Path(target),
         files,

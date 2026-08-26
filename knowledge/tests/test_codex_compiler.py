@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import pytest
+from theozolith_knowledge.claude import compile_claude
+from theozolith_knowledge.codex import compile_codex
+from theozolith_knowledge.compilers import COMPILERS, get_compiler
+from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
+
+EXPECTED_GLOBAL_PATHS = {
+    "AGENTS.md",
+    "prompts/triage.md",
+    "skills/code-review/SKILL.md",
+    "skills/code-review/references/checklist.md",
+    "skills/greet/SKILL.md",
+    "skills/greet/scripts/hello.sh",
+}
+
+
+def test_global_scope_placement(sample_knowledge):
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    assert set(files) == EXPECTED_GLOBAL_PATHS
+
+
+def test_agents_md_is_verbatim_with_no_marker(sample_knowledge):
+    # Claude's CLAUDE.md is a generated derivative and carries a marker; for
+    # Codex the vendor file IS the canonical format, so it ships byte-exact.
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    assert files["AGENTS.md"].content == (sample_knowledge / "AGENTS.md").read_bytes()
+
+
+def test_codex_agents_become_prompts(sample_knowledge):
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    source = sample_knowledge / "agents" / "codex" / "triage.md"
+    assert files["prompts/triage.md"].content == source.read_bytes()
+
+
+def test_workflows_are_dropped(sample_knowledge):
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    assert not any(path.startswith("workflows/") for path in files)
+
+
+def test_executable_bit_is_preserved(sample_knowledge):
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    assert files["skills/greet/scripts/hello.sh"].executable
+    assert not files["skills/greet/SKILL.md"].executable
+
+
+def test_project_scope_is_rejected(sample_knowledge):
+    with pytest.raises(KnowledgeError, match="global-scope only"):
+        compile_codex(load_knowledge_root(sample_knowledge), "project")
+
+
+def test_unknown_scope_is_rejected(sample_knowledge):
+    with pytest.raises(KnowledgeError, match="unknown scope"):
+        compile_codex(load_knowledge_root(sample_knowledge), "everywhere")
+
+
+def test_claude_output_is_codex_blind(sample_knowledge):
+    # Adding agents/codex/ to a tree must not change what the claude compiler
+    # emits (per-tool selective retag depends on this).
+    files = compile_claude(load_knowledge_root(sample_knowledge), "global")
+    assert not any("triage" in path or path.startswith("prompts/") for path in files)
+
+
+def test_registry_dispatch():
+    assert set(COMPILERS) == {"claude", "codex"}
+    assert get_compiler("codex") is compile_codex
+    with pytest.raises(KnowledgeError, match="no compiler for tool 'pi'"):
+        get_compiler("pi")
