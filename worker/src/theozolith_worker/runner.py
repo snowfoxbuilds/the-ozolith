@@ -824,7 +824,25 @@ def _run_to_pr(
     # dependency chain live. A completion retry keeps its carryover base
     # and skips all of it: the preserved worktree embodies the base.
     existing_pr = client.find_open_pr_by_head(branch)
-    closure = _walk_closure(client, issue.number)
+    if completion is None:
+        closure = _walk_closure(client, issue.number)
+    else:
+        # The one-shot completion retry is terminal (ADR-0016 as amended):
+        # it needs no base derivation (the carryover embodies the base) and
+        # the closure feeds only the advisory input/deps tree — a graph a
+        # human malformed mid-claim must not discard preserved completed
+        # work, so the walk degrades to edge-less with a recorded note
+        # instead of failing the retry.
+        try:
+            closure = deps.walk_closure(client, issue.number)
+        except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
+            closure = deps.DependencyClosure(
+                order=(issue.number,), edges={issue.number: ()}, issues={}
+            )
+            report.notes.append(
+                f"dependency closure unresolvable on the completion retry ({exc});"
+                " input/deps omitted"
+            )
     if completion is not None:
         context.base_branch = completion.base_branch
         context.base_sha = completion.base_sha

@@ -202,18 +202,22 @@ def fetch_deps(
 
 def _dep_pr_commits(workdir: Path | None, pr: PullRequest) -> tuple[list[PrCommit], str]:
     """Best-effort commit enumeration for a dependency PR (ADR-0053): a
-    merged PR reads its merge commit's second-parent range; a live PR needs
-    both of its endpoints present in the checkout. Anything unresolvable
-    yields ``([], reason)`` for commits.md to state."""
+    merged PR reads its merge commit's parent range ``^1..^2`` — exactly
+    the PR-side commits, the merge commit itself excluded. A squash- or
+    rebase-produced merge_commit_sha has no second parent, and enumerating
+    a guessed range would silently misstate the PR, so it becomes a stated
+    gap instead. A live PR needs both of its endpoints present in the
+    checkout. Anything unresolvable yields ``([], reason)`` for commits.md
+    to state."""
     deleted_note = (
         f"(commit enumeration unavailable — branch deleted; merged as {pr.merge_commit_sha})"
     )
     try:
         if workdir is not None:
             if pr.merged and pr.merge_commit_sha:
-                if gitops.commit_exists(workdir, pr.merge_commit_sha):
+                if gitops.commit_exists(workdir, f"{pr.merge_commit_sha}^2"):
                     range_commits = git_pr_commits(
-                        workdir, f"{pr.merge_commit_sha}^1", pr.merge_commit_sha
+                        workdir, f"{pr.merge_commit_sha}^1", f"{pr.merge_commit_sha}^2"
                     )
                     return range_commits, ""
                 return [], deleted_note
@@ -634,9 +638,11 @@ def _pr_body_md(pr: PullRequest) -> str:
     fields: list[tuple[str, object]] = [
         ("state", pr.state),
         # Merged dependencies carry the fact and the merge SHA (ADR-0053);
-        # both fields vanish on the unmerged shape.
+        # both fields vanish on the unmerged shape. merge-sha is gated on
+        # merged, not on presence: real GitHub fills merge_commit_sha with
+        # a throwaway test-merge SHA on OPEN PRs.
         ("merged", "yes" if pr.merged else None),
-        ("merge-sha", pr.merge_commit_sha or None),
+        ("merge-sha", pr.merge_commit_sha if pr.merged else None),
         ("head", f"{pr.head_ref} @ {pr.head_sha}"),
         ("base", pr.base_ref),
         ("labels", ", ".join(sorted(pr.labels))),

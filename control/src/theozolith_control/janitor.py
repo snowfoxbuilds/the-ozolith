@@ -212,7 +212,14 @@ def sweep_base_drift(
     holds — cache, never authority."""
     acted: list[int] = []
     seen: set[int] = set()
-    prs = client.list_open_prs()
+    try:
+        prs = client.list_open_prs()
+    except Exception as exc:
+        # A GitHub outage must not abort the whole janitor pass (the
+        # telemetry eviction runs after this sweep in _sweep_pass); the
+        # lane simply waits for the next pass.
+        log(f"janitor: base-drift listing failed: {exc}")
+        return []
     for pr in prs:
         seen.add(pr.number)
         try:
@@ -268,16 +275,24 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
         return False
 
     # Idempotency first: the dependent already escalated (label present), or
-    # this exact drift already acted. The SHA-pair key lets a NEW drift
-    # after a human unblock act again while the same drift never
+    # this exact drift already completed its act. The SHA-pair key lets a
+    # NEW drift after a human unblock act again while the same drift never
     # double-writes.
     key = f"base-drift-{based.sha[:12]}-{tip[:12]}"
     if BLOCKED in pr.labels or store.janitor_acted(pr.number, key):
         return False
 
     # The comment lands first: no observable blocked state without the
-    # forensics that explain it (the reviewer's publish order).
-    client.add_comment(pr.number, _drift_comment(based, blocker_pr.number, tip))
+    # forensics that explain it (the reviewer's publish order). The comment
+    # is recorded under its own sub-key the moment it lands, so a label
+    # write that fails mid-sequence retries next pass WITHOUT re-posting
+    # the forensics; the full key is recorded only once the labels landed —
+    # a later human unblock is then final for this drift.
+    if not store.janitor_acted(pr.number, f"{key}-comment"):
+        client.add_comment(pr.number, _drift_comment(based, blocker_pr.number, tip))
+        store.record_janitor_action(
+            pr.number, f"{key}-comment", "", f"base-drift forensic comment on PR #{pr.number}"
+        )
     client.add_labels(pr.number, BLOCKED, NEEDS_HUMAN)
     reason = (
         f"base drift on PR #{pr.number}: blocker #{based.issue} (PR"

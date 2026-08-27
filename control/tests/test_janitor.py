@@ -410,3 +410,26 @@ def test_one_broken_pr_never_starves_the_drift_pass(control, github):
     assert drift_sweep(control, github) == [23]
     assert ("add_labels", 23, BLOCKED, NEEDS_HUMAN) in github.writes
     assert not any(w[1] == 9 for w in github.writes)
+
+
+def test_a_failed_label_write_retries_without_reposting_the_comment(control, github):
+    """The comment is recorded under its own sub-key the moment it lands:
+    a label write that fails mid-sequence retries next pass and completes
+    the escalation with exactly one forensic comment ever posted."""
+    chained_pair(github, tip=MOVED)
+    original = github.add_labels
+    calls = {"n": 0}
+
+    def flaky(number: int, *labels: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("502 from GitHub")
+        original(number, *labels)
+
+    github.add_labels = flaky
+    assert drift_sweep(control, github) == []  # the label write failed
+    assert len(github.comments[9]) == 1
+
+    assert drift_sweep(control, github) == [9]  # completes, no re-comment
+    assert len(github.comments[9]) == 1
+    assert BLOCKED in github.pulls[9]["labels"]

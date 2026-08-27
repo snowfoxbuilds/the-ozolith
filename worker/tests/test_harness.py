@@ -96,7 +96,9 @@ def make_job(
     timeout: float = 100.0,
 ) -> tuple[Path, jobdir.Manifest]:
     job = jobdir.create_job_dir(tmp_path, "r1")
-    workdir = jobdir.CHECKOUT_DIR if mode == jobdir.MODE_RUN else jobdir.WORK_DIR
+    # Both modes run in checkout/ since ADR-0053's Review Run workspace
+    # parity; the harness honors whatever workdir the manifest names.
+    workdir = jobdir.CHECKOUT_DIR
     (job / workdir).mkdir(parents=True, exist_ok=True)
     manifest = jobdir.Manifest(
         run_id="r1",

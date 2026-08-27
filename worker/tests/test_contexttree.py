@@ -1205,6 +1205,9 @@ def test_merged_dep_commits_enumerate_through_the_merge_commit(harness: Harness)
     commits = harness.evidence_file(f"{prefix}/input/deps/issue-{blocker}/pr/commits.md")
     assert f"blocker work for #{blocker}" in commits
     assert "unavailable" not in commits
+    # The ^1..^2 range is exactly the PR side: the merge commit (authored
+    # by the merging human) is never listed as a PR commit.
+    assert f"Merge #{blocker}" not in commits
     body = harness.evidence_file(f"{prefix}/input/deps/issue-{blocker}/pr/body.md")
     assert "- merged: yes" in body
     index = harness.evidence_file(f"{prefix}/input/deps/INDEX.md")
