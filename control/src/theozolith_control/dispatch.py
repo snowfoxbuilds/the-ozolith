@@ -170,6 +170,8 @@ class Dispatcher:
                 if FAILED in issue.labels:
                     detail = "carries failed + plan_ready; dispatch refuses to grant (ADR-0016)"
                     self._store.record_malformed(issue.number, detail)
+                    if issue.number in waiting:
+                        self._store.clear_wait(issue.number)  # superseded by the flag
                     self._log(f"dispatch: issue #{issue.number} {detail}")
                     continue
                 if issue.assignees or IN_PROGRESS in issue.labels:
@@ -179,10 +181,17 @@ class Dispatcher:
                 block = self._dependency_block(issue.number, settings_cache)
                 if block is not None:
                     lane, detail = block
+                    # The lanes reconcile each other: an issue is malformed
+                    # OR waiting, never both — a waiting dependent whose
+                    # blocker was closed not_planned moves lanes cleanly.
                     if lane == "malformed":
                         self._store.record_malformed(issue.number, detail)
+                        if issue.number in waiting:
+                            self._store.clear_wait(issue.number)
                     else:
                         self._store.record_wait(issue.number, detail)
+                        if issue.number in flagged:
+                            self._store.clear_malformed(issue.number)
                     self._log(f"dispatch: issue #{issue.number} {lane}: {detail}")
                     continue
                 # The candidate passed every malformed and wait lane: stale

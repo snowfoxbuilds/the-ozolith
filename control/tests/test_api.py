@@ -380,6 +380,31 @@ def test_squash_enabled_settings_turn_chaining_off_with_a_visible_reason(control
     assert control.admin("GET", "/api/v1/flags").json()["dispatch_waits"] == []
 
 
+def test_wait_and_malformed_lanes_reconcile_each_other(control: ControlRig):
+    """An issue is waiting OR malformed, never both: a waiting dependent
+    whose blocker gets closed not_planned moves lanes cleanly, and moves
+    back when the human repairs the graph."""
+    control.github.add_issue(1, labels=set(), assignees=[])
+    control.github.add_issue(2, labels={"plan_ready"}, assignees=[])
+    control.github.add_blocked_by(2, 1)
+
+    control.dispatch()  # open blocker, no PR -> wait
+    flags = control.admin("GET", "/api/v1/flags").json()
+    assert [w["issue"] for w in flags["dispatch_waits"]] == [2]
+
+    control.github.issues[1].update(state="closed", state_reason="not_planned")
+    control.dispatch()  # -> malformed; the stale wait row goes with it
+    flags = control.admin("GET", "/api/v1/flags").json()
+    assert flags["dispatch_waits"] == []
+    assert [m["issue"] for m in flags["malformed_states"]] == [2]
+
+    control.github.issues[1].update(state="open", state_reason="")
+    control.dispatch()  # reopened blocker -> back to a healthy wait
+    flags = control.admin("GET", "/api/v1/flags").json()
+    assert [w["issue"] for w in flags["dispatch_waits"]] == [2]
+    assert flags["malformed_states"] == []
+
+
 def test_review_targets_passes_the_creation_order_through(control: ControlRig):
     """Oldest-first Reviewer discovery is load-bearing for chains
     (ADR-0053): the client sorts created-asc and dispatch must not
