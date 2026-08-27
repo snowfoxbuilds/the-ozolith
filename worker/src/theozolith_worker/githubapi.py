@@ -256,15 +256,6 @@ class CommitStatus:
     creator: str = ""
 
 
-@dataclass(frozen=True)
-class PrFile:
-    path: str
-    status: str
-    additions: int
-    deletions: int
-    patch: str
-
-
 def _login_of(data: dict[str, Any]) -> str:
     """The payload's author login, defensively: deleted accounts arrive as
     ``"user": null`` and must parse (the authority filter decides what
@@ -794,19 +785,6 @@ class GitHubClient:
                 target_url=item.get("target_url") or "",
                 created_at=item.get("created_at") or "",
                 creator=_login_of({"user": item.get("creator")}),
-            )
-            for item in items
-        ]
-
-    def pr_files(self, number: int) -> list[PrFile]:
-        items = self._paged(self._repo_path(f"/pulls/{number}/files"))
-        return [
-            PrFile(
-                path=item["filename"],
-                status=item.get("status", "modified"),
-                additions=item.get("additions", 0),
-                deletions=item.get("deletions", 0),
-                patch=item.get("patch") or "",
             )
             for item in items
         ]

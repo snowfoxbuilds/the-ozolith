@@ -158,7 +158,7 @@ renames, references)
 `body.md`, `conversation/` (maintainer PR comments, verdicts included), \
 `review-comments/` (inline file/line comments), `reviews/`, `commits.md` \
 (every PR commit), `checks.md` (check runs and commit statuses)
-
+{deps_bullet}
 Read each surface's `INDEX.md` first and open only the items you need. \
 Comments may answer open questions, record human decisions, or narrow the \
 scope — a human decision in a comment outranks the issue body above.
@@ -206,6 +206,17 @@ explicitly asks for it.
 - When you are done, simply finish your reply and exit; the pipeline treats \
 your process exit as completion and runs the quality gate.
 """
+
+# The navigation-guide bullet for input/deps/, present only when the issue
+# carries Dependency Edges (ADR-0053). Ends with the newline the template
+# slot omits, so the edge-less prompt stays byte-identical.
+DEPS_BULLET = (
+    "- `{job}/input/deps/INDEX.md` — this issue's dependency closure "
+    "(ADR-0053): every blocker issue and its PR, serialized like the "
+    "surfaces above, in topological order. The Decisions Section in an "
+    "unmerged blocker's PR body is the closest thing to that work's "
+    "documentation.\n"
+)
 
 REVISED_PLAN_CONTEXT = """\
 ## Revised plan (round {round})
@@ -345,13 +356,14 @@ def _build_prompt(
     revised: verdict.Verdict | None,
     *,
     chained: str = "",
+    deps_present: bool = False,
 ) -> str:
     """Both round shapes (#52): rules + issue body + the navigation guide,
     plus the revised plan and resume commit on resume rounds, plus the
     Chained-base section when the base is a blocker branch (``chained``,
-    pre-rendered from CHAINED_BASE_CONTEXT; ADR-0053). Discussion content
-    is never injected — every authorized comment lives in the Context
-    Tree."""
+    pre-rendered from CHAINED_BASE_CONTEXT; ADR-0053) and the input/deps
+    bullet when the issue carries Dependency Edges. Discussion content is
+    never injected — every authorized comment lives in the Context Tree."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
         round_context = REVISED_PLAN_CONTEXT.format(
@@ -359,6 +371,7 @@ def _build_prompt(
             resume=revised.resume_commit or "(the branch head)",
             plan=revised.revised_plan,
         )
+    deps_bullet = DEPS_BULLET.format(job=jobdir.CONTAINER_JOB_PATH) if deps_present else ""
     return (
         PROMPT_TEMPLATE.format(
             number=issue.number,
@@ -366,6 +379,7 @@ def _build_prompt(
             body=issue.body or "(no body)",
             round_context=round_context,
             job=jobdir.CONTAINER_JOB_PATH,
+            deps_bullet=deps_bullet,
         )
         + chained
     )
@@ -672,7 +686,19 @@ def _stash_completion_carryover(
     )
 
 
-def _derive_checkout_base(client: GitHubClient, issue_number: int) -> str:
+def _walk_closure(client: GitHubClient, issue_number: int) -> deps.DependencyClosure:
+    """The one closure walk per Run (ADR-0053), shared by base derivation
+    and the input/deps Context Tree. Its typed errors — a cycle, a
+    cross-repo edge — fail the Run loudly as infra on EVERY round shape:
+    the driver-side backstop against a graph a human malformed after
+    dispatch."""
+    try:
+        return deps.walk_closure(client, issue_number)
+    except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
+        raise _RunFailed(f"dependency closure unresolvable at checkout: {exc}", "infra") from exc
+
+
+def _derive_checkout_base(client: GitHubClient, closure: deps.DependencyClosure) -> str:
     """The fresh-round checkout base (ADR-0053): the dependency chain is
     re-resolved live at checkout and the Run proceeds with current truth —
     every blocker merged means the default branch; a live approved chain
@@ -682,12 +708,8 @@ def _derive_checkout_base(client: GitHubClient, issue_number: int) -> str:
     base. Chain preconditions are deliberately NOT re-checked here: the
     grant already asserted them (deps.chain_preconditions is dispatch's
     job)."""
-    try:
-        closure = deps.walk_closure(client, issue_number)
-    except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
-        raise _RunFailed(f"dependency closure unresolvable at checkout: {exc}", "infra") from exc
     default = client.default_branch()
-    if closure.order == (issue_number,):
+    if len(closure.order) == 1:
         return default  # edge-less: the exact pre-ADR-0053 base
     decision = deps.resolve(client, closure, default)
     if decision.kind in (deps.WAIT, deps.MALFORMED):
@@ -802,13 +824,32 @@ def _run_to_pr(
     # dependency chain live. A completion retry keeps its carryover base
     # and skips all of it: the preserved worktree embodies the base.
     existing_pr = client.find_open_pr_by_head(branch)
+    if completion is None:
+        closure = _walk_closure(client, issue.number)
+    else:
+        # The one-shot completion retry is terminal (ADR-0016 as amended):
+        # it needs no base derivation (the carryover embodies the base) and
+        # the closure feeds only the advisory input/deps tree — a graph a
+        # human malformed mid-claim must not discard preserved completed
+        # work, so the walk degrades to edge-less with a recorded note
+        # instead of failing the retry.
+        try:
+            closure = deps.walk_closure(client, issue.number)
+        except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
+            closure = deps.DependencyClosure(
+                order=(issue.number,), edges={issue.number: ()}, issues={}
+            )
+            report.notes.append(
+                f"dependency closure unresolvable on the completion retry ({exc});"
+                " input/deps omitted"
+            )
     if completion is not None:
         context.base_branch = completion.base_branch
         context.base_sha = completion.base_sha
     elif existing_pr is not None:
         context.base_branch = existing_pr.base_ref
     else:
-        context.base_branch = _derive_checkout_base(client, issue.number)
+        context.base_branch = _derive_checkout_base(client, closure)
     context.force = completion.force if completion is not None else False
 
     if completion is None:
@@ -917,6 +958,17 @@ def _run_to_pr(
             context.force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
     contexttree.write_tree(job / "input", snapshot)
+    # The dependency closure as Context Tree (ADR-0053): every closure
+    # member serialized like the primary under input/deps/, from the same
+    # walk that derived the base — the Decisions Section of an unmerged
+    # blocker's PR is the closest thing to that work's documentation.
+    has_deps = len(closure.order) > 1
+    if has_deps:
+        contexttree.write_deps(
+            job / "input",
+            contexttree.fetch_deps(client, closure, issue.number, workdir=workdir),
+            closure,
+        )
 
     # A non-default base names a blocker branch: this is a Chained-Base Run
     # (ADR-0053) — the prompt carries the blocker-interfaces contract and
@@ -937,7 +989,9 @@ def _run_to_pr(
             pr_ref=f" (PR #{blocker_pr.number})" if blocker_pr is not None else "",
         )
 
-    prompt = _build_prompt(issue, report.round, revised, chained=chained_section)
+    prompt = _build_prompt(
+        issue, report.round, revised, chained=chained_section, deps_present=has_deps
+    )
     if completion is not None:
         # Main prompt plus the machine-generated error appendix (ADR-0016 as
         # amended): fill-only instruction, soft enforcement.

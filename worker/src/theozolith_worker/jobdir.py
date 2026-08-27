@@ -27,9 +27,15 @@ Layout::
         issue/           the Context Tree (#52): the issue snapshot — body,
                          authorized (OWNER/MEMBER) comments, timeline —
                          re-read at checkout
-        pr/              Context Tree, resume rounds only: PR body, plus
-                         authorized conversation/review comments/reviews,
-                         commits, checks + statuses
+        pr/              Context Tree: PR body, authorized conversation/
+                         review comments/reviews, commits, checks +
+                         statuses (run mode: resume rounds only; review
+                         mode: always, plus the driver-supplied base.md,
+                         changed-files.md, and signals.md)
+        deps/            Context Tree (ADR-0053), only when the issue
+                         carries Dependency Edges: the transitive
+                         blocked-by closure, one issue-N/ tree per
+                         dependency plus a topological INDEX.md
         jobs/            driver-sequenced job requests (gate steps, shutdown)
       output/
         status.json      harness phase + agent outcome (atomic writes)
@@ -38,8 +44,11 @@ Layout::
                          agent proposes, written via the format-output CLI,
                          validated and applied post-exit by the driver
         jobs/            job results, one file per answered request
-      checkout/          run mode: the token-free repo checkout (driver-made)
-      work/              review mode: the session workspace (driver-seeded)
+      checkout/          the token-free repo checkout (driver-made): run
+                         mode checks out the work branch; review mode the
+                         PR branch pinned at the reviewed head (ADR-0053
+                         workspace parity — the curated work/ seeding is
+                         retired)
 
 Writes that the other side polls for (status, job files) are atomic:
 tmp file + rename, so a reader never sees a partial JSON document.

@@ -34,7 +34,7 @@
 </table>
 {% else %}<p class="muted">No Runs on record.</p>{% endif %}
 
-{% if flags.zombies or flags.malformed or flags.waits or flags.quarantines %}
+{% if flags.zombies or flags.malformed or flags.waits or flags.chained or flags.quarantines %}
 <h3>Needs attention</h3>
 <ul class="flags">
   {% for z in flags.zombies %}
@@ -50,6 +50,12 @@
   <li><span class="badge b-warning">● waiting</span>
       issue #{{ w.issue }}: {{ w.reason }} <span class="muted">(dependency wait, ADR-0053;
       seen {{ w.last_seen }})</span></li>
+  {% endfor %}
+  {% for c in flags.chained %}
+  <li><span class="badge b-serious">● chained dependent</span>
+      PR #{{ c.dependent_pr }} is based on issue #{{ c.blocker_issue }}, whose
+      PR #{{ c.blocker_pr }} is {{ c.blocker_state }} — blocker rejected/abandoned;
+      human call, no automated write (ADR-0053) <span class="muted">(seen {{ c.last_seen }})</span></li>
   {% endfor %}
   {% for q in flags.quarantines %}
   <li><span class="badge b-critical">● quarantined</span>

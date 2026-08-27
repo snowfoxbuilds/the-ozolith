@@ -890,6 +890,10 @@ def create_app(
             # Why a plan_ready dependent is not being granted (ADR-0053):
             # advisory display, rebuilt from GitHub every dispatch pass.
             "dispatch_waits": store.dispatch_waits(),
+            # Chained dependents of a rejected/abandoned blocker (ADR-0053):
+            # a human call the janitor surfaces without any GitHub write;
+            # cache rows re-verified every base-drift pass.
+            "chained_dependents": store.chained_dependents(),
             "quarantines": store.quarantines(),
             # Advisory config-distribution stamp skew (ADR-0042): a node's
             # applied distribution was built against a product version other

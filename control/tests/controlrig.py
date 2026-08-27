@@ -203,6 +203,9 @@ class FakeGitHubLite:
         )
         # Paths that exist on the evidence branch (janitor phase 2).
         self.evidence: set[str] = set()
+        # Branch tips for branch_head (ADR-0053 base drift): a branch
+        # absent from the map reads as deleted (None).
+        self.branch_tips: dict[str, str] = {}
         self.writes: list[tuple] = []
 
     def add_issue(
@@ -227,12 +230,18 @@ class FakeGitHubLite:
         labels: set[str],
         head_sha: str = "a" * 40,
         base_ref: str = "main",
+        body: str = "",
+        state: str = "open",
+        merged: bool = False,
     ):
         self.pulls[number] = {
             "head_ref": head_ref,
             "labels": set(labels),
             "head_sha": head_sha,
             "base_ref": base_ref,
+            "body": body,
+            "state": state,
+            "merged": merged,
         }
 
     def add_blocked_by(self, dependent: int, blocker: int, repo: str | None = None) -> None:
@@ -283,28 +292,51 @@ class FakeGitHubLite:
         return PullRequest(
             number=number,
             title="",
-            body="",
+            body=data.get("body", ""),
             head_ref=data["head_ref"],
             head_sha=data["head_sha"],
             base_ref=data.get("base_ref", "main"),
             labels=set(data["labels"]),
-            state="open",
+            state=data.get("state", "open"),
+            merged=data.get("merged", False),
         )
 
     def get_pull(self, number: int) -> PullRequest:
         return self._pull(number)
 
+    def branch_head(self, branch: str) -> str | None:
+        return self.branch_tips.get(branch)
+
     def find_open_pr_by_head(self, head_ref: str) -> PullRequest | None:
         for number, data in self.pulls.items():
-            if data["head_ref"] == head_ref:
+            if data["head_ref"] == head_ref and data.get("state", "open") == "open":
                 return self._pull(number)
         return None
+
+    def find_pr_by_head(self, head_ref: str, state: str = "all") -> PullRequest | None:
+        matches = [
+            self._pull(number)
+            for number, data in self.pulls.items()
+            if data["head_ref"] == head_ref
+            and (state == "all" or data.get("state", "open") == state)
+        ]
+        for pull in matches:
+            if pull.state == "open":
+                return pull
+        return max(matches, key=lambda pull: pull.number, default=None)
+
+    def list_open_prs(self) -> list[PullRequest]:
+        return [
+            self._pull(number)
+            for number in sorted(self.pulls)
+            if self.pulls[number].get("state", "open") == "open"
+        ]
 
     def list_open_prs_by_label(self, label: str) -> list[Issue]:
         return [
             Issue(number=n, title="", body="", labels=set(d["labels"]), assignees=[], is_pr=True)
             for n, d in sorted(self.pulls.items())
-            if label in d["labels"]
+            if label in d["labels"] and d.get("state", "open") == "open"
         ]
 
     def list_open_issues(self, label: str) -> list[Issue]:
@@ -329,13 +361,19 @@ class FakeGitHubLite:
         self.writes.append(("add_assignees", number, *logins))
         self.issues[number]["assignees"].extend(logins)
 
+    def _labels_of(self, number: int) -> set[str]:
+        """Label writes address issues and PRs alike (the base-drift lane
+        labels dependent PRs, ADR-0053); an issue number wins on overlap."""
+        record = self.issues.get(number)
+        return record["labels"] if record is not None else self.pulls[number]["labels"]
+
     def remove_label(self, number: int, label: str) -> None:
         self.writes.append(("remove_label", number, label))
-        self.issues[number]["labels"].discard(label)
+        self._labels_of(number).discard(label)
 
     def add_labels(self, number: int, *labels: str) -> None:
         self.writes.append(("add_labels", number, *labels))
-        self.issues[number]["labels"].update(labels)
+        self._labels_of(number).update(labels)
 
     def add_comment(self, number: int, body: str) -> None:
         self.writes.append(("add_comment", number))

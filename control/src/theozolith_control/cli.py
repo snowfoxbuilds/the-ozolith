@@ -130,11 +130,13 @@ EVICTION_EVERY_SECONDS = 3600.0  # scanning progress payloads is not a per-minut
 
 def _sweep_pass(settings: ControlSettings, store: Store, client, *, evict: bool = True) -> None:
     """One janitor pass: zombie escalation, never-activated grant release,
-    and (on its slower cadence) progress-telemetry eviction (ADR-0016/0017)."""
+    the base-drift lane (ADR-0053), and (on its slower cadence)
+    progress-telemetry eviction (ADR-0016/0017)."""
     janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
     janitor.release_never_activated(
         store, client, window_seconds=settings.activation_window_seconds, log=_log
     )
+    janitor.sweep_base_drift(store, client, log=_log)
     if evict:
         evicted = store.evict_progress(settings.tail_budget_bytes)
         if evicted:
