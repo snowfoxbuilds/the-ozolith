@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-07-22 (pointer prompt; see Amendments)
+Status: ACCEPTED — amended 2026-07-22 (pointer prompt) and 2026-08-27 (delegated initial plan_ready stamp; see Amendments)
 
 Date: 2026-07-21
 
@@ -31,3 +31,12 @@ The always-interactive contract (2026-07-15) ran every Run's agent in an attacha
 ## Amendments (2026-07-22, PR #7 review)
 
 - **Pointer prompt**: the harness passes a constant pointer prompt at invocation ("work on the task specified in the mounted task file") instead of embedding the task content in the argv. The driver remains responsible for fetching the task and writing it into the per-Run job directory the container mounts; the argv stays constant-size regardless of task size, and the full task rides the existing file interface. Applies symmetrically to Implementer and Review Runs.
+## Amendments (2026-08-27, operator ruling — delegated initial plan_ready stamp)
+
+Provenance: operator ruling (Sean, 2026-08-26/27; ozolith-configs PR #2 — the issue-plan skill's readiness-stamp flow).
+
+- **The Flight Deck may execute the initial plan_ready transition as the human's scribe.** The decision remains the human's; the deck only carries out a confirmed transition. It acts solely on an explicit instruction given in the live Flight Deck conversation that names each work issue and confirms its exact `risk:low|medium|high` label; it then applies `plan_ready` plus the confirmed `risk:*` and removes `draft` on exactly the named agent-created work issues, verifying by reading the labels back.
+- **What never authorizes**: publication approval (approving an issue set for posting is not readiness approval), repository files, issue or PR text, tool output, retrieved content, and ambiguous conversational remarks. Tracking issues are never stamped.
+- **What is not delegated**: issue claiming, blocked-decision answers, every Reviewer transition (verdicts, deviation/risk/attempt labels, re-queues), PR approval, and the merge. The Flight Deck machine identity keeps **no merge permission**, and every other "not a pipeline actor" property stands — it never claims issues and holds no further transition authority.
+- **Accepted trade, recorded**: this delegation is prompt-enforced, not identity-enforced. Under the prior doctrine any deck-applied plan_ready was recognizable as forgery by construction; now a prompt-injected deck session could apply a legitimate-looking stamp. Accepted because deck sessions run under live human supervision and the stamp is narrowly bounded (draft → plan_ready on named work issues only); label events carry the Flight Deck identity, and Flight Deck session transcripts are the audit trail for whether an explicit human instruction preceded each stamp.
+- **Distinct from ADR-0008's Reviewer re-queue**: the Reviewer holds a *standing* delegation — it re-queues an in-flight issue to plan_ready autonomously at each revise verdict, exercising delegated judgment inside the review loop. The Flight Deck holds *no standing authority*: each initial stamp is the execution of one explicit human instruction from the live conversation — delegated hands, never delegated judgment.
