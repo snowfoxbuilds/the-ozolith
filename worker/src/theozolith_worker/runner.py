@@ -74,8 +74,10 @@ from pathlib import Path
 
 from theozolith_worker import (
     adapters,
+    basedon,
     contexttree,
     decisions,
+    deps,
     events,
     evidence,
     gitops,
@@ -97,13 +99,12 @@ from theozolith_worker.containers import (
     container_labels,
     run_container_name,
 )
+from theozolith_worker.deps import branch_for, issue_for_branch
 from theozolith_worker.gate.pipeline import Finding, GateResult, run_gate
 from theozolith_worker.githubapi import GitHubClient, Issue
 from theozolith_worker.identity import identity_error_detail
 from theozolith_worker.sessions import SessionError, SessionFactory
 from theozolith_worker.sweep import TOMBSTONE_PREFIX, park_job_dir, pending_dir
-
-BRANCH_PREFIX = "ozolith/issue-"
 
 # Paths in the checkout that are pipeline metadata, never repo content.
 # (The in-worktree decisions file is gone — the Output Proposal lives in the
@@ -126,15 +127,6 @@ def new_run_id(config: DriverConfig) -> str:
 
 def _log(message: str) -> None:
     print(message, flush=True)
-
-
-def branch_for(issue_number: int) -> str:
-    return f"{BRANCH_PREFIX}{issue_number}"
-
-
-def issue_for_branch(head_ref: str) -> int | None:
-    suffix = head_ref.removeprefix(BRANCH_PREFIX)
-    return int(suffix) if head_ref != suffix and suffix.isdigit() else None
 
 
 PROMPT_TEMPLATE = """\
@@ -225,6 +217,23 @@ revised plan exactly:
 
 """
 
+# Appended when the checkout base is an unmerged blocker's branch (a
+# Chained-Base Run, ADR-0053): the blocker's work is present but under its
+# own separate review — the prompt contract keeps this session from
+# "fixing" it out from under that review.
+CHAINED_BASE_CONTEXT = """\
+
+
+## Chained base
+
+Your checkout is based on `{base_branch}` — it includes UNMERGED work from \
+issue #{blocker}{pr_ref}, which is under its own separate review. Treat that \
+work's interfaces as authoritative: build on them exactly as they stand. Do \
+not refactor, restyle, or "fix" the blocker's code — even where it looks \
+wrong. If a defect there genuinely blocks you, record it as a Decisions \
+Section entry (`decisions` or `open-questions`) and proceed best-effort.
+"""
+
 # The machine-generated error appendix on a completion retry (ADR-0016 as
 # amended by ADR-0046): fill-only instruction, soft enforcement — churn the
 # retry session does make is reviewable like anything else.
@@ -258,6 +267,10 @@ class CompletionCarryover:
     proposal_text: str | None  # the pending proposal file, byte-for-byte
     errors: list[str]  # what validation rejected — quoted in the appendix
     base_branch: str
+    # The base tip recorded at the original checkout: the retry re-ships
+    # against the carried base — worktree and Based-on zone alike — and
+    # never re-resolves the chain (the worktree embodies the base; ADR-0053).
+    base_sha: str
     force: bool  # push disposition the preserved worktree embodies
 
 
@@ -307,6 +320,9 @@ class _RunContext:
     """What the failure path needs from however far the Run body got."""
 
     base_branch: str = ""
+    # The base branch's tip as this Run checked it out — the Based-on
+    # zone's recorded SHA when the base is a blocker branch (ADR-0053).
+    base_sha: str = ""
     gate: GateResult = field(default_factory=GateResult)
     section: decisions.DecisionsSection | None = None
     # The push disposition the checkout ended up with (reviewer-designated
@@ -322,11 +338,19 @@ class _RunContext:
     trusted_input: dict[str, bytes] | None = None
 
 
-def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | None) -> str:
+def _build_prompt(
+    issue: Issue,
+    round_number: int,
+    revised: verdict.Verdict | None,
+    *,
+    chained: str = "",
+) -> str:
     """Both round shapes (#52): rules + issue body + the navigation guide,
-    plus the revised plan and resume commit on resume rounds. Discussion
-    content is never injected — every authorized comment lives in the
-    Context Tree."""
+    plus the revised plan and resume commit on resume rounds, plus the
+    Chained-base section when the base is a blocker branch (``chained``,
+    pre-rendered from CHAINED_BASE_CONTEXT; ADR-0053). Discussion content
+    is never injected — every authorized comment lives in the Context
+    Tree."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
         round_context = REVISED_PLAN_CONTEXT.format(
@@ -334,12 +358,15 @@ def _build_prompt(issue: Issue, round_number: int, revised: verdict.Verdict | No
             resume=revised.resume_commit or "(the branch head)",
             plan=revised.revised_plan,
         )
-    return PROMPT_TEMPLATE.format(
-        number=issue.number,
-        title=issue.title,
-        body=issue.body or "(no body)",
-        round_context=round_context,
-        job=jobdir.CONTAINER_JOB_PATH,
+    return (
+        PROMPT_TEMPLATE.format(
+            number=issue.number,
+            title=issue.title,
+            body=issue.body or "(no body)",
+            round_context=round_context,
+            job=jobdir.CONTAINER_JOB_PATH,
+        )
+        + chained
     )
 
 
@@ -639,8 +666,35 @@ def _stash_completion_carryover(
         proposal_text=proposal.raw_text(job),
         errors=list(context.completion_errors),
         base_branch=context.base_branch,
+        base_sha=context.base_sha,
         force=context.force,
     )
+
+
+def _derive_checkout_base(client: GitHubClient, issue_number: int) -> str:
+    """The fresh-round checkout base (ADR-0053): the dependency chain is
+    re-resolved live at checkout and the Run proceeds with current truth —
+    every blocker merged means the default branch; a live approved chain
+    means its current tip. A closure or chain that does not resolve to a
+    base (dispatch-to-checkout drift, or a driver launched outside
+    dispatch) fails the Run loudly as infra — the driver never guesses a
+    base. Chain preconditions are deliberately NOT re-checked here: the
+    grant already asserted them (deps.chain_preconditions is dispatch's
+    job)."""
+    try:
+        closure = deps.walk_closure(client, issue_number)
+    except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
+        raise _RunFailed(f"dependency closure unresolvable at checkout: {exc}", "infra") from exc
+    default = client.default_branch()
+    if closure.order == (issue_number,):
+        return default  # edge-less: the exact pre-ADR-0053 base
+    decision = deps.resolve(client, closure, default)
+    if decision.kind in (deps.WAIT, deps.MALFORMED):
+        raise _RunFailed(
+            f"dependency chain unresolvable at checkout ({decision.kind}): {decision.reason}",
+            "infra",
+        )
+    return decision.base_branch
 
 
 def _run_to_pr(
@@ -663,18 +717,37 @@ def _run_to_pr(
     email = f"{login}@users.noreply.github.com"
     auth = gitops.auth_env(config.token)
 
+    # The checkout base is derived BEFORE the clone (ADR-0053), so the PR
+    # lookup moves ahead of it. Resume rounds take the base from the PR's
+    # own base_ref — GitHub retargets a chained PR to the default branch
+    # when its blocker merges, and the checkout (and evidence diffstat)
+    # must follow — never from clone HEAD. Fresh rounds re-resolve the
+    # dependency chain live. A completion retry keeps its carryover base
+    # and skips all of it: the preserved worktree embodies the base.
+    existing_pr = client.find_open_pr_by_head(branch)
+    if completion is not None:
+        context.base_branch = completion.base_branch
+        context.base_sha = completion.base_sha
+    elif existing_pr is not None:
+        context.base_branch = existing_pr.base_ref
+    else:
+        context.base_branch = _derive_checkout_base(client, issue.number)
+    context.force = completion.force if completion is not None else False
+
     if completion is None:
         # Reference clone off the node-local mirror (#51): same disposable,
         # self-contained checkout a full clone produced — --dissociate severs
         # every tie to the mirror — but the per-Run download is a ref
-        # advertisement instead of the whole history. Mirror failures — trust
-        # validation refusals, git failures, and per-operation timeout expiry
-        # alike — raise GitError and land in the pre-session infra lane
-        # (ADR-0016).
+        # advertisement instead of the whole history. The mirror update
+        # precedes the reference clone, so a freshly pushed blocker tip is
+        # present for a chained base. Mirror failures — trust validation
+        # refusals, git failures, and per-operation timeout expiry alike —
+        # raise GitError and land in the pre-session infra lane (ADR-0016).
         gitops.clone_with_mirror(
             config.clone_url,
             config.mirrors_dir,
             workdir,
+            branch=context.base_branch,
             env=auth,
             timeout=config.git_timeout_seconds,
         )
@@ -688,15 +761,11 @@ def _run_to_pr(
         shutil.rmtree(completion.checkout.parent, ignore_errors=True)
     gitops.sanitize_checkout(workdir, config.clone_url)
     _exclude_metadata(workdir)
+    if completion is None:
+        # The base tip exactly as this Run checked it out, recorded before
+        # any branch dance: the Based-on zone's SHA (ADR-0053).
+        context.base_sha = gitops.head_sha(workdir)
     report.phase = "checkout"
-
-    context.base_branch = (
-        completion.base_branch
-        if completion is not None
-        else gitops.git(["rev-parse", "--abbrev-ref", "HEAD"], workdir)
-    )
-    context.force = completion.force if completion is not None else False
-    existing_pr = client.find_open_pr_by_head(branch)
     # The grant carried claim authority only (ADR-0017 as amended, #52): the
     # issue and PR context is re-read here, fresh, on every Run — local
     # retries and the completion retry included — authority-filtered to
@@ -752,7 +821,26 @@ def _run_to_pr(
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
     contexttree.write_tree(job / "input", snapshot)
 
-    prompt = _build_prompt(issue, report.round, revised)
+    # A non-default base names a blocker branch: this is a Chained-Base Run
+    # (ADR-0053) — the prompt carries the blocker-interfaces contract and
+    # the ship path records the Based-on zone. Uniform across round shapes:
+    # fresh rounds resolved the chain above; resume rounds read the PR's
+    # base_ref; a completion retry carries its base.
+    chained_tip = (
+        issue_for_branch(context.base_branch)
+        if context.base_branch != client.default_branch()
+        else None
+    )
+    chained_section = ""
+    if chained_tip is not None:
+        blocker_pr = client.find_open_pr_by_head(context.base_branch)
+        chained_section = CHAINED_BASE_CONTEXT.format(
+            base_branch=context.base_branch,
+            blocker=chained_tip,
+            pr_ref=f" (PR #{blocker_pr.number})" if blocker_pr is not None else "",
+        )
+
+    prompt = _build_prompt(issue, report.round, revised, chained=chained_section)
     if completion is not None:
         # Main prompt plus the machine-generated error appendix (ADR-0016 as
         # amended): fill-only instruction, soft enforcement.
@@ -899,6 +987,15 @@ def _run_to_pr(
 
     gitops.push(workdir, branch, force=context.force, env=auth)
 
+    # The Based-on zone (ADR-0053) is driver-owned — composed from the
+    # checkout's own base record, never from the Output Proposal — and
+    # refreshed (or removed, when a retargeted round is main-based again)
+    # on EVERY ship round.
+    based_on = (
+        basedon.BasedOn(issue=chained_tip, sha=context.base_sha)
+        if chained_tip is not None
+        else None
+    )
     intro = _no_change_intro(section) if empty else ""
     if existing_pr is None:
         pr = client.create_pr(
@@ -906,10 +1003,24 @@ def _run_to_pr(
             base=context.base_branch,
             # The driver owns the number prefix; the proposal owns the words.
             title=f"#{issue.number}: {validated.pr_title}",
-            body=compose_pr_body(
-                issue.number, validated.pr_description, section, no_change_intro=intro
+            body=basedon.upsert_zone(
+                compose_pr_body(
+                    issue.number, validated.pr_description, section, no_change_intro=intro
+                ),
+                based_on,
             ),
         )
+        if pr.base_ref != context.base_branch:
+            # The 422 fallback reused an existing PR (a lookup-to-create
+            # race) whose base predates this Run's derived base: retarget
+            # it rather than silently shipping against a stale base. Safe —
+            # resume rounds never reach create_pr, so this PR predates any
+            # review round (ADR-0053).
+            client.update_pr(pr.number, base=context.base_branch)
+            report.notes.append(
+                f"create-PR fallback found PR #{pr.number} based on {pr.base_ref};"
+                f" retargeted to the derived base {context.base_branch}"
+            )
     else:
         pr = existing_pr
         # Absent field = no-op, never clear (ADR-0046): a resume round that
@@ -923,7 +1034,7 @@ def _run_to_pr(
         client.update_pr(
             pr.number,
             title=f"#{issue.number}: {validated.pr_title}" if validated.pr_title else None,
-            body=body,
+            body=basedon.upsert_zone(body, based_on),
         )
     report.pr_number = pr.number
     client.add_labels(pr.number, PR_READY)

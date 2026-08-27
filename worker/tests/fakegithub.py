@@ -46,10 +46,24 @@ class FakeGitHub:
         self.repo = repo
         self.default_branch = "main"
         self.git_dir = git_dir
+        # Rendered into the bare-repo payload (repo_merge_settings). The
+        # default is the chain-enabled posture (ADR-0053 preconditions);
+        # tests mutate or clear entries to model other workspaces — a
+        # missing key models a token that cannot see the field.
+        self.merge_settings: dict[str, bool] = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": False,
+            "allow_rebase_merge": False,
+            "delete_branch_on_merge": True,
+        }
         self.tokens: dict[str, str] = {}
         # login -> author_association stamped on comments/reviews (#52).
         self.associations: dict[str, str] = {}
         self.issues: dict[int, dict[str, Any]] = {}
+        # dependent -> [(blocker number, repo)]: the blocked-by relations
+        # (ADR-0053). Same-repo entries name issues in ``issues``;
+        # cross-repo entries carry a foreign repo and no local record.
+        self.blocked_by: dict[int, list[tuple[int, str]]] = {}
         self.comments: dict[int, list[dict[str, Any]]] = {}
         self.events: dict[int, list[dict[str, Any]]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
@@ -85,12 +99,27 @@ class FakeGitHub:
             "title": title,
             "body": body,
             "state": "open",
+            "state_reason": None,
+            "created_at": self._timestamp(),
             "labels": [{"name": name} for name in sorted(labels or set())],
             "assignees": [],
         }
         self.comments[number] = []
         self.events[number] = []
         return number
+
+    def close_issue(self, number: int, state_reason: str = "completed") -> None:
+        """Close an issue the way GitHub records it: ``state_reason`` is
+        ``completed`` (satisfies a Dependency Edge) or ``not_planned``
+        (does not; ADR-0053)."""
+        self.issues[number]["state"] = "closed"
+        self.issues[number]["state_reason"] = state_reason
+
+    def add_blocked_by(self, dependent: int, blocker: int, repo: str | None = None) -> None:
+        """Declare a Dependency Edge: ``dependent`` is blocked by
+        ``blocker``. ``repo`` names a foreign repo for a cross-repo edge;
+        None means this repo (the blocker must exist in ``issues``)."""
+        self.blocked_by.setdefault(dependent, []).append((blocker, repo or self.repo))
 
     def labels_of(self, number: int) -> set[str]:
         return {label["name"] for label in self.issues[number]["labels"]}
@@ -264,6 +293,22 @@ class FakeGitHub:
         """Land another actor's concurrent self-assign (race simulation)."""
         self._assign(number, login)
 
+    def merge_pr(self, number: int) -> None:
+        """Mark a PR merged the way GitHub records it (API state only; a
+        test that needs the git-side merge performs it on the remote)."""
+        pr = self.pulls[number]
+        pr["state"] = "closed"
+        pr["merged"] = True
+        pr["merged_at"] = self._timestamp()
+        pr["merge_commit_sha"] = f"merge-of-{pr['head']}"
+
+    def close_pr(self, number: int) -> None:
+        """Close a PR without merging."""
+        pr = self.pulls[number]
+        pr["state"] = "closed"
+        pr["merged"] = False
+        pr["merged_at"] = None
+
     # -- internal state transitions -----------------------------------------
 
     def _timestamp(self) -> str:
@@ -297,10 +342,10 @@ class FakeGitHub:
             return f"fake-sha-{branch}"
         return self._git(["rev-parse", f"refs/heads/{branch}"])
 
-    def _pr_payload(self, number: int) -> dict[str, Any]:
+    def _pr_payload(self, number: int, *, single: bool = False) -> dict[str, Any]:
         pr = self.pulls[number]
         issue = self.issues[number]
-        return {
+        payload = {
             "number": number,
             "title": issue["title"],
             "body": issue["body"],
@@ -308,7 +353,15 @@ class FakeGitHub:
             "labels": issue["labels"],
             "head": {"ref": pr["head"], "sha": self._head_sha(pr["head"])},
             "base": {"ref": pr["base"], "sha": self._head_sha(pr["base"])},
+            "merged_at": pr.get("merged_at"),
+            "merge_commit_sha": pr.get("merge_commit_sha"),
         }
+        if single:
+            # Real GitHub sends the ``merged`` boolean only on the single-PR
+            # endpoint; list endpoints omit it (the client derives it from
+            # merged_at there — keeping the fake honest keeps that tested).
+            payload["merged"] = bool(pr.get("merged"))
+        return payload
 
     def _pr_files(self, number: int) -> list[dict[str, Any]]:
         pr = self.pulls[number]
@@ -376,7 +429,9 @@ class FakeGitHub:
         if path == "/graphql":
             return self._h_graphql(payload)
         if path == prefix:
-            return _json_response(200, {"default_branch": self.default_branch})
+            return _json_response(
+                200, {"default_branch": self.default_branch, **self.merge_settings}
+            )
         if not path.startswith(prefix):
             return _json_response(404, {"message": "Not Found"})
         tail = path.removeprefix(prefix)
@@ -391,6 +446,8 @@ class FakeGitHub:
         return [
             (r"/issues", self._h_issues),
             (r"/issues/(\d+)", self._h_issue),
+            (r"/issues/(\d+)/dependencies/blocked_by", self._h_blocked_by),
+            (r"/branches/([^/]+)", self._h_branch),
             (r"/issues/(\d+)/labels", self._h_labels),
             (r"/issues/(\d+)/labels/([^/]+)", self._h_label_one),
             (r"/issues/(\d+)/assignees", self._h_assignees),
@@ -477,8 +534,9 @@ class FakeGitHub:
         page = int(params.get("page", "1"))
         return items[(page - 1) * per_page : page * per_page]
 
-    def _issue_payload(self, number: int) -> dict[str, Any]:
+    def _issue_payload(self, number: int, repo: str | None = None) -> dict[str, Any]:
         data = dict(self.issues[number])
+        data["repository_url"] = f"https://api.github.invalid/repos/{repo or self.repo}"
         if number in self.pulls:
             data["pull_request"] = {"url": f"fake://pulls/{number}"}
         return data
@@ -486,12 +544,50 @@ class FakeGitHub:
     def _h_issues(self, actor, method, match, params, payload) -> Response:
         wanted = {name for name in params.get("labels", "").split(",") if name}
         state = params.get("state", "open")
-        items = [
-            self._issue_payload(n)
-            for n, issue in sorted(self.issues.items())
+        numbers = sorted(
+            n
+            for n, issue in self.issues.items()
             if issue["state"] == state and wanted <= {la["name"] for la in issue["labels"]}
-        ]
+        )
+        # Real GitHub's default order is newest-first; the fake mirrors it
+        # so a listing that drops sort=created&direction=asc (ADR-0053) is
+        # an observable bug, not an accident the fake papers over.
+        if not (params.get("sort") == "created" and params.get("direction") == "asc"):
+            numbers.reverse()
+        items = [self._issue_payload(n) for n in numbers]
         return _json_response(200, self._page(items, params))
+
+    def _h_blocked_by(self, actor, method, match, params, payload) -> Response:
+        number = int(match.group(1))
+        if number not in self.issues:
+            return _json_response(404, {"message": "Not Found"})
+        items = []
+        for blocker, repo in self.blocked_by.get(number, []):
+            if repo == self.repo:
+                items.append(self._issue_payload(blocker))
+            else:
+                # A cross-repo edge: the blocker lives elsewhere, so only a
+                # minimal foreign payload exists here.
+                items.append(
+                    {
+                        "number": blocker,
+                        "title": "",
+                        "body": "",
+                        "state": "open",
+                        "state_reason": None,
+                        "labels": [],
+                        "assignees": [],
+                        "repository_url": f"https://api.github.invalid/repos/{repo}",
+                    }
+                )
+        return _json_response(200, self._page(items, params))
+
+    def _h_branch(self, actor, method, match, params, payload) -> Response:
+        branch = urllib.parse.unquote(match.group(1))
+        sha = self._git(["rev-parse", f"refs/heads/{branch}"]) if self.git_dir else ""
+        if not sha:
+            return _json_response(404, {"message": "Branch not found"})
+        return _json_response(200, {"name": branch, "commit": {"sha": sha}})
 
     def _h_issue(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
@@ -586,6 +682,8 @@ class FakeGitHub:
                 "title": payload["title"],
                 "body": payload.get("body") or "",
                 "state": "open",
+                "state_reason": None,
+                "created_at": self._timestamp(),
                 "labels": [],
                 "assignees": [],
             }
@@ -593,16 +691,20 @@ class FakeGitHub:
             self.events[number] = []
             self.pulls[number] = {"state": "open", "head": head, "base": payload["base"]}
             return _json_response(201, self._pr_payload(number))
-        # GET /pulls?state=open&head=owner:branch
+        # GET /pulls?state=open|closed|all&head=owner:branch
         state = params.get("state", "open")
         head_filter = params.get("head", "")
         branch = head_filter.split(":", 1)[1] if ":" in head_filter else head_filter
-        items = [
-            self._pr_payload(n)
-            for n, pr in sorted(self.pulls.items())
-            if pr["state"] == state and (not branch or pr["head"] == branch)
-        ]
-        return _json_response(200, items)
+        numbers = sorted(
+            n
+            for n, pr in self.pulls.items()
+            if (state == "all" or pr["state"] == state) and (not branch or pr["head"] == branch)
+        )
+        # Same default order as real GitHub: newest-first unless asked.
+        if not (params.get("sort") == "created" and params.get("direction") == "asc"):
+            numbers.reverse()
+        items = [self._pr_payload(n) for n in numbers]
+        return _json_response(200, self._page(items, params))
 
     def _h_pull(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))
@@ -613,8 +715,10 @@ class FakeGitHub:
                 self.issues[number]["title"] = payload["title"]
             if "body" in payload:
                 self.issues[number]["body"] = payload["body"]
-            return _json_response(200, self._pr_payload(number))
-        return _json_response(200, self._pr_payload(number))
+            if "base" in payload:
+                self.pulls[number]["base"] = payload["base"]
+            return _json_response(200, self._pr_payload(number, single=True))
+        return _json_response(200, self._pr_payload(number, single=True))
 
     def _h_pull_files(self, actor, method, match, params, payload) -> Response:
         number = int(match.group(1))

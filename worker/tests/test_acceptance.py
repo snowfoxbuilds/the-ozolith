@@ -28,7 +28,7 @@ from conftest import (
     write_proposal,
 )
 from fakegithub import rate_limited_response
-from theozolith_worker import decisions, evidence, proposal, verdict
+from theozolith_worker import basedon, decisions, evidence, proposal, verdict
 from theozolith_worker import jobdir as jobdir_module
 from theozolith_worker.bootstrap.vocabulary import (
     ATTEMPT_PREFIX,
@@ -1781,3 +1781,201 @@ def test_reviewer_is_adapter_indifferent_with_codex(harness: Harness):
     assert review_adapters == {"codex"}
     run_adapters = {adapter for mode, adapter in seen if mode == jobdir_module.MODE_RUN}
     assert run_adapters == {"claude"}
+
+
+# -- Dependency Edges and Chained-Base Runs (ADR-0053) --------------------------
+
+
+def _pr_for_head(harness: Harness, head: str) -> int:
+    return next(n for n, p in harness.fake.pulls.items() if p["head"] == head)
+
+
+def test_chained_base_run_targets_the_blocker_branch_with_a_based_on_zone(harness: Harness):
+    """The go-ahead end to end: the Run clones the blocker tip, its PR
+    targets the blocker branch, the body carries a parseable Based-on zone
+    recording issue and tip SHA, the prompt carries the blocker-interfaces
+    contract, and the evidence diffstat is against the blocker branch."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    blocker_branch = branch_for(blocker)
+    tip = harness.remote_sha(blocker_branch)
+
+    assert harness.worker_once() == 1
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == blocker_branch
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) == basedon.BasedOn(issue=blocker, sha=tip)
+    assert f"merge #{blocker} first" in body  # the human-gate warning
+    assert decisions.parse(body) is not None  # zone composes with Decisions
+
+    # The checkout really was the blocker tip: its work is on the branch.
+    assert harness.remote_file(branch_for(number), "blocker.txt") == "blocker work"
+    assert harness.remote_file(branch_for(number), "change.txt") == "run 1"
+
+    # The prompt carries the chained-base contract, naming issue and PR.
+    prompt = harness.worker_calls[-1][0]
+    assert "## Chained base" in prompt
+    assert f"issue #{blocker} (PR #{blocker_pr})" in prompt
+    assert "authoritative" in prompt
+
+    # The evidence diffstat is against the blocker branch: the blocker's
+    # own work never shows up as this Run's diff.
+    (diffstat_path,) = [
+        p
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/diffstat.txt")
+    ]
+    diffstat = harness.evidence_file(diffstat_path)
+    assert "change.txt" in diffstat and "blocker.txt" not in diffstat
+
+
+def test_an_unchained_run_prompt_has_no_chained_base_section(harness: Harness):
+    harness.file_issue("Plain", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+    assert "## Chained base" not in harness.worker_calls[-1][0]
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert basedon.parse_zone(harness.fake.issues[pr_number]["body"]) is None
+
+
+def test_a_merged_blocker_before_checkout_means_main_base_and_no_zone(harness: Harness):
+    """The chain is re-resolved fresh at checkout: a blocker merged (and
+    branch-deleted) between grant and checkout means a default-branch base
+    and no zone — the healthy retarget path, not an error."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    harness.merge_blocker(blocker, blocker_pr)
+
+    assert harness.worker_once() == 1
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
+    assert "## Chained base" not in harness.worker_calls[-1][0]
+    # The blocker's work arrived through main, not through a chained base.
+    assert harness.remote_file(branch_for(number), "blocker.txt") == "blocker work"
+
+
+def test_resume_round_uses_the_prs_retargeted_base_and_removes_the_zone(harness: Harness):
+    """Resume rounds derive the base from the PR's own base_ref — after
+    GitHub's retarget-on-branch-delete moved a chained PR to main, the next
+    round checks out main, ships against it, and removes the zone."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    assert harness.worker_once() == 1
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is not None
+
+    # The human merges the blocker; GitHub retargets the dependent PR.
+    harness.merge_blocker(blocker, blocker_pr)
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+
+    harness.reviewer_replies.append(revise_reply("1. improve change.txt"))
+    assert harness.reviewer_once() == 1
+    harness.worker_behaviors.append(behavior_write({"change.txt": "improved\n"}))
+    assert harness.worker_once() == 1
+
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) is None
+    assert "Based on" not in body  # warning gone with the zone
+    assert harness.remote_file(branch_for(number), "change.txt") == "improved"
+    # The round-2 evidence diffstat is against main (the PR's own base):
+    # main now contains the blocker's work, so only this issue's change shows.
+    run_jsons = [
+        p
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    ]
+    round2 = next(p for p in run_jsons if json.loads(harness.evidence_file(p))["round"] == 2)
+    diffstat = harness.evidence_file(round2.replace("run.json", "diffstat.txt"))
+    assert "change.txt" in diffstat and "blocker.txt" not in diffstat
+
+
+def test_a_checkout_time_cycle_fails_the_run_loudly_as_infra(harness: Harness):
+    """The driver's pre-Run closure walk is the fail-loud infra backstop
+    (ADR-0053): dispatch-to-checkout drift lands in the infra lane with
+    the cycle named — never a guessed base."""
+    number = harness.file_issue("Cyclic", CRITERIA_BODY)
+    other = harness.fake.create_issue("cycle partner", "", set())
+    harness.fake.add_blocked_by(number, other)
+    harness.fake.add_blocked_by(other, number)
+
+    assert harness.worker_once() == 2  # the original and the one local retry
+
+    _assert_escalated(harness, number, "infra", "dependency cycle")
+    (comment,) = harness.fake.comments[number]
+    assert f"#{other}" in comment["body"]  # the cycle path is named
+    assert harness.fake.open_pr_numbers() == []  # no PR from a guessed base
+
+
+def test_create_pr_race_fallback_retargets_a_stale_base_with_a_note(harness: Harness):
+    """The 422 fallback no longer silently reuses a PR on a stale base: a
+    PR that appeared between the head lookup and create lands on this
+    Run's derived base via PATCH, with a note in the evidence."""
+    number = harness.file_issue("Raced", CRITERIA_BODY)
+    old_blocker = harness.fake.create_issue("old blocker", "", set())
+    harness.fake.close_issue(old_blocker, "completed")
+    harness.fake.add_blocked_by(number, old_blocker)  # completed -> base main
+    dep_branch = branch_for(number)
+    planted: list[int] = []
+
+    def plant(actor: str, method: str, path: str) -> None:
+        # After the FIRST head lookup answers (empty), an out-of-band PR
+        # appears for the head, based on the stale blocker branch.
+        if method == "GET" and path.endswith("/pulls") and not planted:
+            pr = harness.fake.create_issue(f"#{number}: raced", "raced body", set())
+            harness.fake.pulls[pr] = {
+                "state": "open",
+                "head": dep_branch,
+                "base": branch_for(old_blocker),
+            }
+            planted.append(pr)
+
+    harness.fake.after_request = plant
+    assert harness.worker_once() == 1
+    harness.fake.after_request = None
+
+    (raced_pr,) = planted
+    assert harness.fake.pulls[raced_pr]["base"] == "main"  # retargeted
+    patches = [
+        w for w in harness.fake.write_log if w[1] == "PATCH" and w[2].endswith(f"/pulls/{raced_pr}")
+    ]
+    assert any(w[3].get("base") == "main" for w in patches)
+    run_json_path = next(
+        p
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    )
+    notes = json.loads(harness.evidence_file(run_json_path))["notes"]
+    assert any("retargeted" in note and "main" in note for note in notes)
+
+
+def test_completion_retry_re_ships_against_the_carried_chained_base(harness: Harness):
+    """The carryover path never re-resolves the chain — the worktree
+    embodies the base (ADR-0053): even after the blocker's go-ahead is
+    revoked mid-claim, the completion retry ships against the carried
+    chained base and its zone records the original tip."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    blocker_branch = branch_for(blocker)
+    tip = harness.remote_sha(blocker_branch)
+
+    def forgets_commit_message(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("chained work\n")
+        write_proposal(cwd, pr_title="chained title", skip={"commit-message"})
+        # The go-ahead is revoked while the claim is in flight: a fresh
+        # resolution would now refuse — the retry must not re-resolve.
+        harness.fake.issues[blocker_pr]["labels"] = [{"name": "pr_ready"}]
+
+    def fills_in(prompt: str, cwd: Path) -> None:
+        format_output(cwd.parent, "commit-message", "chained work\n\nwhat and why")
+
+    harness.worker_behaviors.extend([forgets_commit_message, fills_in])
+    assert harness.worker_once() == 2  # the original and the completion retry
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == blocker_branch
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) == basedon.BasedOn(issue=blocker, sha=tip)
+    assert harness.remote_file(branch_for(number), "change.txt") == "chained work"
+    assert harness.remote_file(branch_for(number), "blocker.txt") == "blocker work"

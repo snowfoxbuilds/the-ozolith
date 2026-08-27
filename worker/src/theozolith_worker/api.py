@@ -19,7 +19,13 @@ from theozolith_worker.containers import ContainerSpec, DockerEngine
 from theozolith_worker.dispatch import DispatchClient, WorkDispatch
 from theozolith_worker.drivercli import run_driver
 from theozolith_worker.events import EventSink, emit_error, run_event
-from theozolith_worker.githubapi import Comment, GitHubClient, Issue, PullRequest
+from theozolith_worker.githubapi import (
+    Comment,
+    GitHubClient,
+    Issue,
+    PullRequest,
+    RepoMergeSettings,
+)
 from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import (
     CONTAINER_JOB_PATH,
@@ -81,6 +87,7 @@ __all__ = [
     "JobResult",
     "Manifest",
     "PullRequest",
+    "RepoMergeSettings",
     "Reviewer",
     "RunReport",
     "SessionError",

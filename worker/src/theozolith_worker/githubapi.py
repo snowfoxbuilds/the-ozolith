@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 MAX_RETRIES = 8
@@ -96,7 +96,13 @@ def _retry_delay(response: Response, attempt: int, now: float) -> float | None:
 
 @dataclass(frozen=True)
 class Issue:
-    """An issue — or a PR seen through the issues API (labels, assignees)."""
+    """An issue — or a PR seen through the issues API (labels, assignees).
+
+    ``state``/``state_reason`` distinguish a blocker closed as completed
+    (satisfies its Dependency Edge) from one closed as not_planned (does
+    not; ADR-0053). ``repo`` is empty for the client's own repo and is
+    populated only by ``list_blocked_by`` — a cross-repo edge on a claimable
+    issue is a malformed state the caller must detect."""
 
     number: int
     title: str
@@ -104,6 +110,9 @@ class Issue:
     labels: set[str]
     assignees: list[str]
     is_pr: bool
+    state: str = "open"
+    state_reason: str = ""
+    repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,25 @@ class PullRequest:
     base_ref: str
     labels: set[str]
     state: str
+    # List endpoints omit the ``merged`` boolean, so it is derived from
+    # ``merged_at`` there; ``merge_commit_sha`` is the durable merge record
+    # a chained dependent's history builds on (ADR-0053).
+    merged: bool = False
+    merge_commit_sha: str = ""
+
+
+@dataclass(frozen=True)
+class RepoMergeSettings:
+    """The repo merge-method settings the Chained Base preconditions read
+    (ADR-0053). ``complete`` is False when GitHub omitted any field — the
+    token cannot see them — and callers must treat that as preconditions
+    failed (chaining off with a visible reason), never a silent pass."""
+
+    merge_commit_allowed: bool
+    squash_allowed: bool
+    rebase_allowed: bool
+    delete_branch_on_merge: bool
+    complete: bool
 
 
 @dataclass(frozen=True)
@@ -261,6 +289,9 @@ def _issue_from(data: dict[str, Any]) -> Issue:
         labels={label["name"] for label in data.get("labels", [])},
         assignees=[a["login"] for a in data.get("assignees", [])],
         is_pr="pull_request" in data,
+        state=data.get("state") or "open",
+        # GitHub sends null for an open issue's state_reason.
+        state_reason=data.get("state_reason") or "",
     )
 
 
@@ -274,6 +305,9 @@ def _pull_from(data: dict[str, Any]) -> PullRequest:
         base_ref=data["base"]["ref"],
         labels={label["name"] for label in data.get("labels", [])},
         state=data.get("state", "open"),
+        # List endpoints omit ``merged``; ``merged_at`` is present on both.
+        merged=bool(data.get("merged")) or bool(data.get("merged_at")),
+        merge_commit_sha=data.get("merge_commit_sha") or "",
     )
 
 
@@ -405,19 +439,75 @@ class GitHubClient:
             self._default_branch = self._json("GET", self._repo_path(""))["default_branch"]
         return self._default_branch
 
+    def repo_merge_settings(self) -> RepoMergeSettings:
+        """The merge-method settings the Chained Base preconditions consume
+        (ADR-0053). GitHub omits the allow_* fields for tokens that cannot
+        see them; ``complete`` records whether every field was present."""
+        data = self._json("GET", self._repo_path("")) or {}
+        fields = (
+            "allow_merge_commit",
+            "allow_squash_merge",
+            "allow_rebase_merge",
+            "delete_branch_on_merge",
+        )
+        return RepoMergeSettings(
+            merge_commit_allowed=bool(data.get("allow_merge_commit")),
+            squash_allowed=bool(data.get("allow_squash_merge")),
+            rebase_allowed=bool(data.get("allow_rebase_merge")),
+            delete_branch_on_merge=bool(data.get("delete_branch_on_merge")),
+            complete=all(name in data for name in fields),
+        )
+
+    def branch_head(self, branch: str) -> str | None:
+        """The branch's tip SHA, or None when the branch does not exist —
+        for a chained dependent's blocker branch, deletion is the healthy
+        post-merge retarget signal, not an error (ADR-0053)."""
+        query = urllib.parse.quote(branch, safe="")
+        try:
+            data = self._json("GET", self._repo_path(f"/branches/{query}"))
+        except GitHubError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return ((data or {}).get("commit") or {}).get("sha") or ""
+
     # -- issues (and PRs through the issues API) --------------------------
 
+    # Both listings drain in creation (= plan) order (ADR-0053): GitHub's
+    # default sort is newest-first, which would grant the LAST issue of a
+    # plan first; oldest-first Reviewer discovery is load-bearing for
+    # chains (a blocker must be reviewed before its dependents' go-ahead).
+    _CREATION_ORDER = "&sort=created&direction=asc"
+
     def list_open_issues(self, label: str) -> list[Issue]:
-        """Open true issues (not PRs) carrying ``label``."""
+        """Open true issues (not PRs) carrying ``label``, oldest first."""
         query = urllib.parse.quote(label)
-        items = self._paged(self._repo_path(f"/issues?state=open&labels={query}"))
+        items = self._paged(
+            self._repo_path(f"/issues?state=open&labels={query}{self._CREATION_ORDER}")
+        )
         return [_issue_from(item) for item in items if "pull_request" not in item]
 
     def list_open_prs_by_label(self, label: str) -> list[Issue]:
-        """Open PRs carrying ``label``, issue-shaped (labels + assignees)."""
+        """Open PRs carrying ``label``, issue-shaped, oldest first."""
         query = urllib.parse.quote(label)
-        items = self._paged(self._repo_path(f"/issues?state=open&labels={query}"))
+        items = self._paged(
+            self._repo_path(f"/issues?state=open&labels={query}{self._CREATION_ORDER}")
+        )
         return [_issue_from(item) for item in items if "pull_request" in item]
+
+    def list_blocked_by(self, number: int) -> list[Issue]:
+        """The issues blocking ``number`` — its Dependency Edges (ADR-0053).
+        Each item is a full issue object; ``repo`` is parsed from its
+        ``repository_url`` so a cross-repo edge is detectable. A 404 (the
+        dependencies feature unavailable on this GitHub) raises — fail
+        loud, never silently edge-less."""
+        items = self._paged(self._repo_path(f"/issues/{number}/dependencies/blocked_by"))
+        blockers: list[Issue] = []
+        for item in items:
+            url = str(item.get("repository_url") or "")
+            repo = url.split("/repos/", 1)[1] if "/repos/" in url else ""
+            blockers.append(replace(_issue_from(item), repo=repo))
+        return blockers
 
     def get_issue(self, number: int) -> Issue:
         return _issue_from(self._json("GET", self._repo_path(f"/issues/{number}")))
@@ -503,6 +593,24 @@ class GitHubClient:
         items = self._json("GET", self._repo_path(f"/pulls?state=open&head={query}")) or []
         return _pull_from(items[0]) if items else None
 
+    def find_pr_by_head(self, head_ref: str, state: str = "all") -> PullRequest | None:
+        """Like :meth:`find_open_pr_by_head` across PR states: an open match
+        wins, else the newest match — how a chained base is traced after
+        its blocker PR closed (ADR-0053)."""
+        owner = self.repo.split("/")[0]
+        query = urllib.parse.quote(f"{owner}:{head_ref}")
+        items = self._json("GET", self._repo_path(f"/pulls?state={state}&head={query}")) or []
+        pulls = [_pull_from(item) for item in items]
+        for pull in pulls:
+            if pull.state == "open":
+                return pull
+        return max(pulls, key=lambda pull: pull.number, default=None)
+
+    def list_open_prs(self) -> list[PullRequest]:
+        """Every open PR, oldest first (creation order, ADR-0053)."""
+        items = self._paged(self._repo_path(f"/pulls?state=open{self._CREATION_ORDER}"))
+        return [_pull_from(item) for item in items]
+
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> PullRequest:
         try:
             data = self._json(
@@ -518,12 +626,21 @@ class GitHubClient:
                     return existing
             raise
 
-    def update_pr(self, number: int, *, title: str | None = None, body: str | None = None) -> None:
+    def update_pr(
+        self,
+        number: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        base: str | None = None,
+    ) -> None:
         patch: dict[str, str] = {}
         if title is not None:
             patch["title"] = title
         if body is not None:
             patch["body"] = body
+        if base is not None:
+            patch["base"] = base
         if patch:
             self._json("PATCH", self._repo_path(f"/pulls/{number}"), patch)
 

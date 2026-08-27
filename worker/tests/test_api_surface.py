@@ -44,6 +44,7 @@ EXPECTED_API = [
     "JobResult",
     "Manifest",
     "PullRequest",
+    "RepoMergeSettings",
     "Reviewer",
     "RunReport",
     "SessionError",

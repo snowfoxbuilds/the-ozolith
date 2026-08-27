@@ -249,6 +249,16 @@ CREATE TABLE IF NOT EXISTS malformed_states (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL
 );
+-- Why a plan_ready dependent is not being granted (ADR-0053): an open
+-- blocker chain still waiting for its go-ahead, or chaining switched off
+-- by the repo's merge settings. Advisory display cache, rebuilt from
+-- GitHub every dispatch pass — never authority.
+CREATE TABLE IF NOT EXISTS dispatch_waits (
+    issue INTEGER PRIMARY KEY,
+    reason TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
 -- Pin-convergence tracking (revision ruling amending ADR-0015): consecutive
 -- off-pin heartbeats per node; a row exists only while the node is off-pin.
 CREATE TABLE IF NOT EXISTS version_health (
@@ -1357,6 +1367,27 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT issue, detail, first_seen, last_seen FROM malformed_states ORDER BY issue"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_wait(self, issue: int, reason: str) -> None:
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO dispatch_waits (issue, reason, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (issue) DO UPDATE SET reason = ?, last_seen = ?",
+                (issue, reason, now, now, reason, now),
+            )
+
+    def clear_wait(self, issue: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM dispatch_waits WHERE issue = ?", (issue,))
+
+    def dispatch_waits(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT issue, reason, first_seen, last_seen FROM dispatch_waits ORDER BY issue"
             ).fetchall()
         return [dict(r) for r in rows]
 
