@@ -87,7 +87,14 @@ def walk_closure(client: GitHubClient, number: int) -> DependencyClosure:
     """DFS over ``list_blocked_by``, live per call — the reads are the
     authority (ADR-0053). Raises :class:`DependencyCycleError` on a back
     edge (carrying the cycle path) and :class:`CrossRepoEdgeError` on a
-    blocker outside ``client.repo``; a diamond is walked once."""
+    blocker outside ``client.repo``; a diamond is walked once.
+
+    The walk PRUNES beneath closed blockers: a closed blocker's own edges
+    constrained work that is over — its subtree must not judge (or chain)
+    a live dependent, or historical edges under long-completed blockers
+    would poison new work forever. The closed blocker itself stays in the
+    closure (``resolve`` judges its state_reason); its edges are recorded
+    empty and never fetched."""
     order: list[int] = []
     edges: dict[int, tuple[int, ...]] = {}
     issues: dict[int, Issue] = {}
@@ -108,6 +115,13 @@ def walk_closure(client: GitHubClient, number: int) -> DependencyClosure:
             issues.setdefault(blocker.number, blocker)
         edges[current] = tuple(blocker.number for blocker in blockers)
         for blocker in blockers:
+            if blocker.state == "closed":
+                # Pruned leaf: judged by resolve, never descended into.
+                if blocker.number not in done:
+                    done.add(blocker.number)
+                    edges.setdefault(blocker.number, ())
+                    order.append(blocker.number)
+                continue
             visit(blocker.number)
         on_path.pop()
         done.add(current)

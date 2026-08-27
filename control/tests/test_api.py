@@ -405,6 +405,24 @@ def test_wait_and_malformed_lanes_reconcile_each_other(control: ControlRig):
     assert flags["malformed_states"] == []
 
 
+def test_advisory_rows_clear_when_the_issue_leaves_the_pool(control: ControlRig):
+    """Wait/malformed rows describe the plan_ready pool: an issue that
+    departs it (closed, label stripped, claimed) takes its advisory rows
+    with it on the next pass — a departed issue must not show as
+    'waiting' on the dashboard forever."""
+    control.github.add_issue(1, labels=set(), assignees=[])
+    control.github.add_issue(2, labels={"plan_ready"}, assignees=[])
+    control.github.add_blocked_by(2, 1)
+    control.dispatch()
+    flags = control.admin("GET", "/api/v1/flags").json()
+    assert [w["issue"] for w in flags["dispatch_waits"]] == [2]
+
+    # The human strips plan_ready (or closes the issue): the row departs.
+    control.github.issues[2]["labels"] = set()
+    control.dispatch()
+    assert control.admin("GET", "/api/v1/flags").json()["dispatch_waits"] == []
+
+
 def test_review_targets_passes_the_creation_order_through(control: ControlRig):
     """Oldest-first Reviewer discovery is load-bearing for chains
     (ADR-0053): the client sorts created-asc and dispatch must not

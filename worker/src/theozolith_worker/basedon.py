@@ -25,14 +25,17 @@ class BasedOn:
     sha: str  # that branch's tip at checkout
 
 
-ZONE_RE = re.compile(r"<!-- theozolith:based-on\n(.*?)\n-->", re.DOTALL)
+# Newlines are \r?\n-tolerant throughout: a human edit in GitHub's web UI
+# can round-trip the body to CRLF, and a zone the regexes stop matching
+# would stack a duplicate per ship round instead of replacing.
+ZONE_RE = re.compile(r"<!-- theozolith:based-on\r?\n(.*?)\r?\n-->", re.DOTALL)
 
-# The whole zone for removal/replacement: the human-facing warning line (if
-# still adjacent) plus the machine block and trailing blank lines.
-_ZONE_STRIP_RE = re.compile(
-    r"(?:\*\*Based on #\d+ at `[^`\n]*`\*\*[^\n]*\n+)?<!-- theozolith:based-on\n.*?\n-->\n*",
-    re.DOTALL,
-)
+# Removal/replacement strips warning lines and machine blocks
+# INDEPENDENTLY (all occurrences): a human edit can separate or reword
+# around them, and a stale "merge #N first" instruction surviving on a
+# retargeted-to-main PR would direct the human gate in the wrong order.
+_WARNING_STRIP_RE = re.compile(r"\*\*Based on #\d+ at `[^`\n]*`\*\*[^\n]*(?:\r?\n)*")
+_BLOCK_STRIP_RE = re.compile(r"<!-- theozolith:based-on\r?\n.*?\r?\n-->(?:\r?\n)*", re.DOTALL)
 
 
 def render_zone(issue: int, sha: str) -> str:
@@ -51,7 +54,8 @@ def upsert_zone(body: str, based_on: BasedOn | None) -> str:
     healthy retarget-to-main shape after the blocker merges (ADR-0053).
     The zone leads the body so the merge-order warning is the first thing
     a human reads."""
-    remainder = _ZONE_STRIP_RE.sub("", body or "", count=1).lstrip("\n")
+    remainder = _BLOCK_STRIP_RE.sub("", _WARNING_STRIP_RE.sub("", body or ""))
+    remainder = remainder.lstrip("\r\n")
     if based_on is None:
         return remainder
     zone = render_zone(based_on.issue, based_on.sha)

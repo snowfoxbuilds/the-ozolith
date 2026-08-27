@@ -779,6 +779,15 @@ def _run_to_pr(
         report.round = attempts_on(existing_pr.labels) + 1
         report.pr_number = existing_pr.number
         gitops.fetch(workdir, branch, env=auth)
+        if completion is None:
+            # The zone SHA a resume round records is the base commit the
+            # PR's history actually CONTAINS — the merge base of the base
+            # tip (clone HEAD) and the fetched PR head — never the base
+            # branch's current tip: the branch is resumed, not rebased, so
+            # a blocker that advanced since the last round must still read
+            # as drift against the recorded SHA (the janitor lane, #82),
+            # not be silently masked by a refreshed value.
+            context.base_sha = gitops.git(["merge-base", "HEAD", "FETCH_HEAD"], workdir)
         # The PR commit snapshot comes from this trusted checkout, not the
         # 250-capped REST endpoint (#52 amendment) — enumerated at the
         # fetched PR head, BEFORE any reviewer-designated reset, so the
@@ -816,7 +825,18 @@ def _run_to_pr(
         gitops.checkout_branch(workdir, branch, create=True)
         if gitops.ref_exists(workdir, f"origin/{branch}"):
             # A previous Run pushed but crashed before opening the PR.
-            # That state was never Reviewer-designated: overwrite it.
+            # That state was never Reviewer-designated: overwrite it — but
+            # re-verify first. The pre-clone PR lookup is now strictly
+            # older than the clone's refs, so a resurfaced zombie Run
+            # (the residual ADR-0016 hole) can push AND open its PR inside
+            # the clone window; a branch a live PR references must never
+            # be force-overwritten on a stale reading.
+            if client.find_open_pr_by_head(branch) is not None:
+                raise _RunFailed(
+                    f"a PR for {branch} appeared during checkout; refusing to overwrite"
+                    " — the retry resumes it",
+                    "infra",
+                )
             context.force = True
             report.notes.append("stale branch from a crashed Run overwritten (no PR referenced it)")
     contexttree.write_tree(job / "input", snapshot)
@@ -987,6 +1007,26 @@ def _run_to_pr(
 
     gitops.push(workdir, branch, force=context.force, env=auth)
 
+    # The blocker can merge (branch auto-deleted: the delete-branch-on-merge
+    # posture chaining requires) DURING the agent session — the EXPECTED
+    # human act, since chained dispatch demands an approved-and-awaiting-
+    # merge blocker. Creating the PR against the deleted branch would 422
+    # and discard the whole completed session as infra, so a fresh chained
+    # Run re-checks its base at ship: gone means the healthy retarget shape
+    # — default-branch base, no zone; the checkout's content is unchanged
+    # (the blocker's commits are in the default branch now). Resume rounds
+    # need no check: their PR already exists and GitHub retargeted it.
+    if (
+        chained_tip is not None
+        and existing_pr is None
+        and client.branch_head(context.base_branch) is None
+    ):
+        report.notes.append(
+            f"chained base {context.base_branch} was merged and deleted during the"
+            f" session; the PR opens against {client.default_branch()}"
+        )
+        context.base_branch = client.default_branch()
+        chained_tip = None
     # The Based-on zone (ADR-0053) is driver-owned — composed from the
     # checkout's own base record, never from the Output Proposal — and
     # refreshed (or removed, when a retargeted round is main-based again)
@@ -998,28 +1038,33 @@ def _run_to_pr(
     )
     intro = _no_change_intro(section) if empty else ""
     if existing_pr is None:
-        pr = client.create_pr(
-            head=branch,
-            base=context.base_branch,
-            # The driver owns the number prefix; the proposal owns the words.
-            title=f"#{issue.number}: {validated.pr_title}",
-            body=basedon.upsert_zone(
-                compose_pr_body(
-                    issue.number, validated.pr_description, section, no_change_intro=intro
-                ),
-                based_on,
-            ),
+        # The driver owns the number prefix; the proposal owns the words.
+        title = f"#{issue.number}: {validated.pr_title}"
+        composed = basedon.upsert_zone(
+            compose_pr_body(issue.number, validated.pr_description, section, no_change_intro=intro),
+            based_on,
         )
-        if pr.base_ref != context.base_branch:
+        pr = client.create_pr(head=branch, base=context.base_branch, title=title, body=composed)
+        if pr.base_ref != context.base_branch or pr.body != composed:
             # The 422 fallback reused an existing PR (a lookup-to-create
-            # race) whose base predates this Run's derived base: retarget
-            # it rather than silently shipping against a stale base. Safe —
-            # resume rounds never reach create_pr, so this PR predates any
+            # race): converge it on this Run's composed content — base,
+            # title, AND body, so a raced chained PR never enters review
+            # without its Based-on zone and merge-order warning. Safe:
+            # resume rounds never reach create_pr, so the PR predates any
             # review round (ADR-0053).
-            client.update_pr(pr.number, base=context.base_branch)
+            retargeted = pr.base_ref != context.base_branch
+            client.update_pr(
+                pr.number,
+                title=title,
+                body=composed,
+                base=context.base_branch if retargeted else None,
+            )
             report.notes.append(
                 f"create-PR fallback found PR #{pr.number} based on {pr.base_ref};"
-                f" retargeted to the derived base {context.base_branch}"
+                f" retargeted to the derived base {context.base_branch} and converged"
+                " title/body"
+                if retargeted
+                else f"create-PR fallback found PR #{pr.number}; converged title/body"
             )
     else:
         pr = existing_pr

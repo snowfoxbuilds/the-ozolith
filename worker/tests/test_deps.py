@@ -328,3 +328,66 @@ def test_zone_survives_an_agent_mangled_warning_line():
     replaced = basedon.upsert_zone(mangled, basedon.BasedOn(5, "e" * 40))
     assert replaced.count("theozolith:based-on") == 1
     assert basedon.parse_zone(replaced) == basedon.BasedOn(5, "e" * 40)
+
+
+def test_walk_closure_prunes_beneath_closed_blockers():
+    """A closed blocker's own edges constrained work that is over: its
+    subtree never judges a live dependent, so historical edges beneath
+    long-completed blockers cannot poison new work."""
+    fake, client = make_env()
+    ancient = fake.create_issue("ancient", "", set())
+    done = fake.create_issue("done", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, done)
+    fake.add_blocked_by(done, ancient)
+    fake.close_issue(done, "completed")
+    fake.close_issue(ancient, "not_planned")  # would malform if walked
+
+    closure = deps.walk_closure(client, dependent)
+
+    assert closure.order == (done, dependent)
+    assert ancient not in closure.issues
+    assert closure.edges[done] == ()  # pruned, never fetched
+    assert deps.resolve(client, closure, "main").kind == deps.READY
+
+
+def test_a_stale_cycle_beneath_a_completed_blocker_never_raises():
+    fake, client = make_env()
+    a = fake.create_issue("a", "", set())
+    b = fake.create_issue("b", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, a)
+    fake.add_blocked_by(a, b)
+    fake.add_blocked_by(b, a)
+    fake.close_issue(a, "completed")
+    closure = deps.walk_closure(client, dependent)
+    assert deps.resolve(client, closure, "main").kind == deps.READY
+
+
+def test_zone_round_trips_a_crlf_body():
+    """GitHub's web editor can round-trip a body to CRLF; the zone must
+    keep parsing and keep REPLACING — a non-matching regex would stack a
+    duplicate zone per ship round."""
+    sha = "f" * 40
+    body = basedon.upsert_zone("Closes #9.", basedon.BasedOn(7, sha))
+    crlf = body.replace("\n", "\r\n")
+    assert basedon.parse_zone(crlf) == basedon.BasedOn(7, sha)
+    replaced = basedon.upsert_zone(crlf, basedon.BasedOn(7, "0" * 40))
+    assert replaced.count("theozolith:based-on") == 1
+    assert basedon.parse_zone(replaced) == basedon.BasedOn(7, "0" * 40)
+    removed = basedon.upsert_zone(crlf, None)
+    assert "Based on" not in removed and "theozolith:based-on" not in removed
+    assert "Closes #9." in removed
+
+
+def test_removal_strips_a_warning_separated_from_its_block():
+    """A human edit between warning and block must not let a stale
+    'merge #N first' instruction survive the retarget-to-main removal."""
+    body = basedon.upsert_zone("Closes #9.", basedon.BasedOn(7, "a" * 40))
+    edited = body.replace(
+        "\n\n<!-- theozolith:based-on", "\n\nA human note.\n\n<!-- theozolith:based-on"
+    )
+    removed = basedon.upsert_zone(edited, None)
+    assert "merge #7 first" not in removed
+    assert "theozolith:based-on" not in removed
+    assert "A human note." in removed and "Closes #9." in removed

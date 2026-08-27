@@ -50,13 +50,44 @@ from theozolith_worker.bootstrap.vocabulary import (
     PR_READY,
     reviewable,
 )
-from theozolith_worker.githubapi import GitHubClient, RepoMergeSettings
+from theozolith_worker.githubapi import (
+    GitHubClient,
+    GitHubError,
+    Issue,
+    PullRequest,
+    RepoMergeSettings,
+)
 
 from theozolith_control.store import Store
 
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+class _PassReads:
+    """Pass-scoped memo over the dependency reads deps.walk_closure and
+    deps.resolve perform. ADR-0053 forbids cross-pass storage (the graph
+    is read live per grant pass), not per-pass reuse: candidates sharing a
+    blocker chain would otherwise re-fetch the same edges and PRs once per
+    dependent — all while holding the lock that serializes every worker's
+    grants."""
+
+    def __init__(self, client: GitHubClient):
+        self._client = client
+        self.repo = client.repo
+        self._blocked: dict[int, list[Issue]] = {}
+        self._prs: dict[str, PullRequest | None] = {}
+
+    def list_blocked_by(self, number: int) -> list[Issue]:
+        if number not in self._blocked:
+            self._blocked[number] = self._client.list_blocked_by(number)
+        return self._blocked[number]
+
+    def find_open_pr_by_head(self, head_ref: str) -> PullRequest | None:
+        if head_ref not in self._prs:
+            self._prs[head_ref] = self._client.find_open_pr_by_head(head_ref)
+        return self._prs[head_ref]
 
 
 class Dispatcher:
@@ -106,20 +137,33 @@ class Dispatcher:
         )
 
     def _dependency_block(
-        self, issue_number: int, settings_cache: list[RepoMergeSettings]
+        self, issue_number: int, reads: _PassReads, settings_cache: list[RepoMergeSettings]
     ) -> tuple[str, str] | None:
         """The ADR-0053 eligibility lanes: None when every Dependency Edge
         is satisfied (or none exist); otherwise ``("malformed" | "wait",
         detail)``. Claim selection only — no coordination write happens
         here — and the reads are live per pass: GitHub is the authority,
-        the recorded rows are advisory display."""
+        the recorded rows are advisory display.
+
+        A failing dependency READ (not a malformed graph) re-raises with
+        the issue named: granting with unknown ordering is never an
+        option, so dispatch pauses loudly — the same posture as a failing
+        issue listing, and the deliberate fail-loud ruling for a GitHub
+        without the dependencies feature (issue #81: never silently
+        edge-less)."""
         try:
-            closure = deps.walk_closure(self._client, issue_number)
+            closure = deps.walk_closure(reads, issue_number)
         except (deps.DependencyCycleError, deps.CrossRepoEdgeError) as exc:
             return ("malformed", str(exc))
+        except GitHubError as exc:
+            raise GitHubError(
+                f"dependency read for issue #{issue_number} failed — dispatch pauses"
+                f" rather than granting with unknown ordering (ADR-0053): {exc}",
+                status=exc.status,
+            ) from exc
         if closure.order == (issue_number,):
             return None  # edge-less: the exact pre-ADR-0053 path
-        decision = deps.resolve(self._client, closure, self._client.default_branch())
+        decision = deps.resolve(reads, closure, self._client.default_branch())
         if decision.kind == deps.MALFORMED:
             return ("malformed", decision.reason)
         if decision.kind == deps.WAIT:
@@ -160,13 +204,28 @@ class Dispatcher:
 
             granted = self._store.granted_issues()
             live = {claim.issue for claim in self._store.live_claims()}
+            candidates = self._client.list_open_issues(PLAN_READY)
+            # Advisory rows describe the plan_ready pool: an issue that
+            # left it (closed, label removed, claimed) takes its wait and
+            # malformed rows with it — otherwise the dashboard shows a
+            # departed issue "waiting" forever. Rows for issues still in
+            # the pool are reconciled lane by lane below.
+            listed = {candidate.number for candidate in candidates}
+            for row in self._store.malformed_states():
+                if row["issue"] not in listed:
+                    self._store.clear_malformed(row["issue"])
+            for row in self._store.dispatch_waits():
+                if row["issue"] not in listed:
+                    self._store.clear_wait(row["issue"])
             flagged = {row["issue"] for row in self._store.malformed_states()}
             waiting = {row["issue"] for row in self._store.dispatch_waits()}
-            # The merge settings are fetched lazily, at most once per pass:
-            # only a pass that actually reaches a chained candidate reads
-            # them (the chain_preconditions gate, ADR-0053).
+            # Pass-scoped read caches: the merge settings are fetched
+            # lazily at most once per pass (only a pass that reaches a
+            # chained candidate reads them), and dependency reads are
+            # memoized across candidates sharing a blocker chain.
             settings_cache: list[RepoMergeSettings] = []
-            for issue in self._client.list_open_issues(PLAN_READY):
+            reads = _PassReads(self._client)
+            for issue in candidates:
                 if FAILED in issue.labels:
                     detail = "carries failed + plan_ready; dispatch refuses to grant (ADR-0016)"
                     self._store.record_malformed(issue.number, detail)
@@ -178,7 +237,7 @@ class Dispatcher:
                     continue  # spoken for on GitHub (hand-edited labels stay meaningful)
                 if issue.number in granted or issue.number in live:
                     continue
-                block = self._dependency_block(issue.number, settings_cache)
+                block = self._dependency_block(issue.number, reads, settings_cache)
                 if block is not None:
                     lane, detail = block
                     # The lanes reconcile each other: an issue is malformed

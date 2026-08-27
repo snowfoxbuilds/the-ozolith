@@ -1948,6 +1948,13 @@ def test_create_pr_race_fallback_retargets_a_stale_base_with_a_note(harness: Har
     )
     notes = json.loads(harness.evidence_file(run_json_path))["notes"]
     assert any("retargeted" in note and "main" in note for note in notes)
+    # The fallback converged the whole composition, not just the base: the
+    # raced PR enters review with the driver-composed title and body
+    # (Decisions Section — and, when chained, the Based-on zone) instead
+    # of whatever the raced twin carried.
+    assert harness.fake.issues[raced_pr]["title"].startswith(f"#{number}: ")
+    assert decisions.parse(harness.fake.issues[raced_pr]["body"]) is not None
+    assert "raced body" not in harness.fake.issues[raced_pr]["body"]
 
 
 def test_completion_retry_re_ships_against_the_carried_chained_base(harness: Harness):
@@ -1979,3 +1986,103 @@ def test_completion_retry_re_ships_against_the_carried_chained_base(harness: Har
     assert basedon.parse_zone(body) == basedon.BasedOn(issue=blocker, sha=tip)
     assert harness.remote_file(branch_for(number), "change.txt") == "chained work"
     assert harness.remote_file(branch_for(number), "blocker.txt") == "blocker work"
+
+
+def test_a_blocker_merged_mid_session_retargets_the_new_pr_at_ship(harness: Harness):
+    """Merging the approved blocker is the EXPECTED human act and can land
+    during the dependent's agent session: the ship path re-checks the base
+    and opens against main with no zone, instead of 422-discarding the
+    whole completed session as infra."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+
+    def merges_blocker_mid_session(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("done\n")
+        write_proposal(cwd)
+        harness.merge_blocker(blocker, blocker_pr)
+
+    harness.worker_behaviors.append(merges_blocker_mid_session)
+    assert harness.worker_once() == 1  # shipped first try — never infra
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
+    assert harness.remote_file(branch_for(number), "change.txt") == "done"
+
+
+def test_resume_round_zone_keeps_the_sha_the_history_contains(harness: Harness):
+    """A blocker that advances between rounds must read as drift against
+    the recorded SHA (#82's janitor lane), not be silently masked by a
+    zone refreshed to a tip the PR's history does not contain."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, _blocker_pr = harness.approved_blocker(number)
+    blocker_branch = branch_for(blocker)
+    original_tip = harness.remote_sha(blocker_branch)
+    assert harness.worker_once() == 1
+    dep_pr = _pr_for_head(harness, branch_for(number))
+
+    # The blocker's own revise round advances its branch.
+    work = harness.remote.parent / "blocker-advance"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", blocker_branch, f"file://{harness.remote}", str(work)],
+        check=True,
+    )
+    (work / "more.txt").write_text("more\n")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qm", "more"],
+        cwd=work,
+        check=True,
+    )
+    subprocess.run(["git", "push", "-q", "origin", blocker_branch], cwd=work, check=True)
+    assert harness.remote_sha(blocker_branch) != original_tip
+
+    harness.reviewer_replies.append(revise_reply("1. improve change.txt"))
+    assert harness.reviewer_once() == 1
+    harness.worker_behaviors.append(behavior_write({"change.txt": "improved\n"}))
+    assert harness.worker_once() == 1
+
+    zone = basedon.parse_zone(harness.fake.issues[dep_pr]["body"])
+    assert zone == basedon.BasedOn(issue=blocker, sha=original_tip)
+
+
+def test_a_pr_appearing_mid_checkout_is_never_force_overwritten(harness: Harness):
+    """The pre-clone PR lookup is strictly older than the clone's refs: a
+    branch whose PR appeared in between (the residual zombie shape,
+    ADR-0016) is refused as infra, and the retry resumes that PR instead
+    of force-overwriting a reviewable branch."""
+    number = harness.file_issue("Zombie race", CRITERIA_BODY)
+    branch = branch_for(number)
+    # The branch exists on the remote (the zombie's push)...
+    stale = harness.remote.parent / "zombie"
+    subprocess.run(["git", "clone", "-q", f"file://{harness.remote}", str(stale)], check=True)
+    (stale / "zombie.txt").write_text("zombie work\n")
+    subprocess.run(["git", "checkout", "-qb", branch], cwd=stale, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=stale, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=z", "-c", "user.email=z@z", "commit", "-qm", "zombie"],
+        cwd=stale,
+        check=True,
+    )
+    subprocess.run(["git", "push", "-q", "origin", branch], cwd=stale, check=True)
+    # ...and its PR lands only AFTER this Run's pre-clone lookup answered.
+    planted: list[int] = []
+
+    def plant(actor: str, method: str, path: str) -> None:
+        if method == "GET" and path.endswith("/pulls") and not planted:
+            pr = harness.fake.create_issue(f"#{number}: zombie", "zombie body", set())
+            harness.fake.pulls[pr] = {"state": "open", "head": branch, "base": "main"}
+            planted.append(pr)
+
+    harness.fake.after_request = plant
+    count = harness.worker_once()
+    harness.fake.after_request = None
+    assert count == 2  # the refused Run and the resuming retry
+
+    (raced_pr,) = planted
+    failed = [e for e in harness.sink.run_events(number) if e["phase"] == "failed"]
+    assert [e["failure_class"] for e in failed] == ["infra"]
+    # The zombie's pushed work survived, and the retry resumed its PR.
+    assert harness.remote_file(branch, "zombie.txt") == "zombie work"
+    assert PR_READY in harness.fake.labels_of(raced_pr)
+    assert harness.fake.open_pr_numbers() == [raced_pr]

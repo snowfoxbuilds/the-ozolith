@@ -435,6 +435,11 @@ class GitHubClient:
         return self._login
 
     def default_branch(self) -> str:
+        """Cached for the client's lifetime. A default-branch rename while
+        a driver is up therefore fails fresh checkouts loudly (the cached
+        name no longer clones) until the driver restarts — accepted: the
+        rename is a rare deliberate operator act, and the failure is
+        infra-classed and visible, never a silently wrong base."""
         if self._default_branch is None:
             self._default_branch = self._json("GET", self._repo_path(""))["default_branch"]
         return self._default_branch
