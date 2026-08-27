@@ -2169,6 +2169,53 @@ def test_a_deleted_unmerged_blocker_base_fails_loudly_as_infra(harness: Harness)
     )  # no PR from a guessed base
 
 
+def test_a_claimed_merge_whose_content_is_absent_fails_the_containment_proof(harness: Harness):
+    """The API can claim merged while the git graph disagrees (history
+    rewritten after this Run's checkout): the recorded base commit must be
+    contained in the resolved target, or the PR diff would fold blocker
+    work into the dependent — refused as infra, never published. The local
+    retry then re-resolves at checkout with current truth and ships."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+
+    def api_merge_without_content(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("done\n")
+        write_proposal(cwd)
+        # Merged per the API and closed completed — but main never received
+        # the blocker's commits, and the branch is gone.
+        harness.fake.merge_pr(blocker_pr)
+        harness.fake.close_issue(blocker, "completed")
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(harness.remote),
+                "update-ref",
+                "-d",
+                f"refs/heads/{branch_for(blocker)}",
+            ],
+            check=True,
+        )
+
+    harness.worker_behaviors.append(api_merge_without_content)
+    assert harness.worker_once() == 2  # the refused ship and the local retry
+
+    failed = [e for e in harness.sink.run_events(number) if e["phase"] == "failed"]
+    assert [e["failure_class"] for e in failed] == ["infra"]
+    run_jsons = [
+        p
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    ]
+    reasons = [json.loads(harness.evidence_file(p))["reason"] for p in run_jsons]
+    assert any("not contained" in reason for reason in reasons)
+    # The retry saw the blocker closed completed, re-resolved to main at
+    # checkout, and shipped clean work — never the round-1 guessed base.
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
+
+
 def test_resume_round_retargeted_mid_session_refreshes_base_and_zone(harness: Harness):
     """GitHub can retarget the dependent PR while a resume round's session
     runs (the blocker merges mid-round): the ship path reloads the PR and
