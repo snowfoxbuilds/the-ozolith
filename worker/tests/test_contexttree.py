@@ -1065,3 +1065,147 @@ def test_failed_run_evidence_preserves_exact_input(harness: Harness):
         assert _evidence_bytes(harness, f"{prefix}/input/prompt.md") == prompt
         comment = harness.evidence_file(f"{prefix}/input/issue/comments/0001-sean.md")
         assert "the human constraint" in comment and "PWNED" not in comment
+
+
+# -- the dependency closure as Context Tree (input/deps/, ADR-0053) ------------
+
+
+def _deps_fake() -> tuple[FakeGitHub, GitHubClient, int, int, int, int, int]:
+    """A two-level closure — A blocked by B blocked by C — where C is
+    closed as completed with a merged PR and B is open with an open PR.
+    Returns (fake, client, a, b, c, b_pr, c_pr)."""
+    fake = FakeGitHub()
+    fake.register("tok", "worker")
+    a = fake.create_issue("The dependent", "a body", {"plan_ready"})
+    b = fake.create_issue("The middle blocker", "b body", {"in_progress"})
+    c = fake.create_issue("The finished blocker", "c body", set())
+    b_pr = fake.create_issue(f"#{b}: middle", "middle PR body")
+    fake.pulls[b_pr] = {"state": "open", "head": branch_for(b), "base": "main"}
+    c_pr = fake.create_issue(f"#{c}: finished", "finished PR body")
+    fake.pulls[c_pr] = {"state": "open", "head": branch_for(c), "base": "main"}
+    fake.merge_pr(c_pr, merge_commit_sha="cafe" * 10)
+    fake.close_issue(c, "completed")
+    fake.add_blocked_by(a, b)
+    fake.add_blocked_by(b, c)
+    client = GitHubClient(fake.repo, "tok", transport=fake, sleep=lambda s: None)
+    return fake, client, a, b, c, b_pr, c_pr
+
+
+def test_deps_tree_is_topological_deterministic_and_state_bearing(tmp_path):
+    """input/deps/ carries the full closure — one issue-N tree per member,
+    serialized through the primary's own write path — with a topological
+    INDEX.md (deepest blocker first) whose lines carry issue state, PR
+    disposition (merge SHA included), and direct blockers. Two writes of
+    the same snapshots are byte-identical."""
+    from theozolith_worker import deps as deps_module
+
+    _fake, client, a, b, c, b_pr, c_pr = _deps_fake()
+    closure = deps_module.walk_closure(client, a)
+    dep_snapshots = contexttree.fetch_deps(client, closure, a)
+
+    one, two = tmp_path / "one", tmp_path / "two"
+    contexttree.write_deps(one, dep_snapshots, closure)
+    contexttree.write_deps(two, dep_snapshots, closure)
+    assert _tree_bytes(one) == _tree_bytes(two)
+
+    index = (one / "deps" / "INDEX.md").read_text()
+    c_line, b_line = [line for line in index.splitlines() if line.startswith("- ")]
+    # Topological: the deepest blocker leads.
+    assert f"issue-{c}" in c_line and f"issue-{b}" in b_line
+    assert f"closed (completed); PR #{c_pr} merged as {'cafe' * 10}" in c_line
+    assert f"open; PR #{b_pr} open" in b_line
+    assert "blocked by: none" in c_line
+    assert f"blocked by: #{c}" in b_line
+
+    # Structural parity with the primary: the same tree shape per dep.
+    for number in (b, c):
+        root = one / "deps" / f"issue-{number}"
+        assert (root / "issue" / "body.md").is_file()
+        assert (root / "issue" / "comments" / "INDEX.md").is_file()
+        assert (root / "pr" / "body.md").is_file()
+        assert (root / "pr" / "commits.md").is_file()
+
+    # Closed/merged state rides the dep's own body files.
+    c_issue = (one / "deps" / f"issue-{c}" / "issue" / "body.md").read_text()
+    assert "- state: closed" in c_issue and "- state-reason: completed" in c_issue
+    c_pr_body = (one / "deps" / f"issue-{c}" / "pr" / "body.md").read_text()
+    assert "- merged: yes" in c_pr_body and f"- merge-sha: {'cafe' * 10}" in c_pr_body
+    # No checkout was offered: the commit gap is stated, never invented.
+    c_commits = (one / "deps" / f"issue-{c}" / "pr" / "commits.md").read_text()
+    assert "commit enumeration unavailable" in c_commits
+    b_issue = (one / "deps" / f"issue-{b}" / "issue" / "body.md").read_text()
+    assert "- state:" not in b_issue  # open deps keep the pre-deps shape
+
+
+def test_authority_boundary_holds_inside_deps(tmp_path):
+    """The dependency trees pass through the same fetch-time and
+    serialization-time authority filter as the primary: an unauthorized
+    comment on a blocker leaves no trace anywhere under input/deps/."""
+    fake, client, a, b, _c, b_pr, _c_pr = _deps_fake()
+    from theozolith_worker import deps as deps_module
+
+    fake.add_issue_comment(b, "sean", "owner-marker", association="OWNER")
+    fake.add_issue_comment(b, "driveby", "driveby-marker", association="NONE")
+    fake.add_issue_comment(b_pr, "driveby", "driveby-convo-marker", association="CONTRIBUTOR")
+
+    closure = deps_module.walk_closure(client, a)
+    contexttree.write_deps(tmp_path, contexttree.fetch_deps(client, closure, a), closure)
+
+    everything = b"".join(_tree_bytes(tmp_path).values())
+    assert b"owner-marker" in everything
+    assert b"driveby" not in everything
+
+
+def test_deps_commits_enumerate_from_the_dependent_checkout(harness: Harness):
+    """A dependent Run's deps tree enumerates its live blocker's PR commits
+    from the Run's own checkout (the blocker branch is in the clone), and a
+    merged blocker's commits through its merge commit's second-parent range
+    — the evidence bundle carries the whole input/deps tree, and an
+    edge-less issue produces no input/deps at all."""
+    plain = harness.file_issue("Plain issue first", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, _blocker_pr = harness.approved_blocker(number)
+
+    assert harness.worker_once() == 1
+    paths = harness.evidence_paths()
+    (run_json,) = [
+        p for p in paths if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    ]
+    prefix = run_json.removesuffix("/run.json")
+    index = harness.evidence_file(f"{prefix}/input/deps/INDEX.md")
+    assert f"issue-{blocker}" in index and "open" in index
+    commits = harness.evidence_file(f"{prefix}/input/deps/issue-{blocker}/pr/commits.md")
+    assert f"blocker work for #{blocker}" in commits
+
+    # The plain issue's bundle carries no deps tree.
+    (plain_json,) = [
+        p for p in paths if p.startswith(f"runs/issue-{plain}/") and p.endswith("/run.json")
+    ]
+    plain_prefix = plain_json.removesuffix("/run.json")
+    assert not any(p.startswith(f"{plain_prefix}/input/deps") for p in paths)
+
+
+def test_merged_dep_commits_enumerate_through_the_merge_commit(harness: Harness):
+    """After the blocker merges (branch deleted), a fresh dependent Run
+    still enumerates the blocker PR's commits — via merge_commit_sha's
+    second-parent range from the checkout — and the dep records the merge
+    disposition."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    harness.merge_blocker(blocker, blocker_pr)
+
+    assert harness.worker_once() == 1
+    paths = harness.evidence_paths()
+    (run_json,) = [
+        p for p in paths if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    ]
+    prefix = run_json.removesuffix("/run.json")
+    commits = harness.evidence_file(f"{prefix}/input/deps/issue-{blocker}/pr/commits.md")
+    assert f"blocker work for #{blocker}" in commits
+    assert "unavailable" not in commits
+    body = harness.evidence_file(f"{prefix}/input/deps/issue-{blocker}/pr/body.md")
+    assert "- merged: yes" in body
+    index = harness.evidence_file(f"{prefix}/input/deps/INDEX.md")
+    assert "closed (completed)" in index and f"PR #{blocker_pr} merged as " in index

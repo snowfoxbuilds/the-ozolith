@@ -259,6 +259,20 @@ CREATE TABLE IF NOT EXISTS dispatch_waits (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL
 );
+-- Chained dependents of a rejected or abandoned blocker (ADR-0053): the
+-- blocker PR a dependent's Based-on zone names is closed-unmerged or
+-- carries blocked — a human act the janitor surfaces but never writes
+-- GitHub over. Cache-only display rows, re-verified and self-clearing
+-- every base-drift pass.
+CREATE TABLE IF NOT EXISTS chained_dependents (
+    dependent_pr INTEGER PRIMARY KEY,
+    blocker_issue INTEGER NOT NULL,
+    blocker_pr INTEGER NOT NULL,
+    blocker_state TEXT NOT NULL,
+    recorded_sha TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
 -- Pin-convergence tracking (revision ruling amending ADR-0015): consecutive
 -- off-pin heartbeats per node; a row exists only while the node is off-pin.
 CREATE TABLE IF NOT EXISTS version_health (
@@ -1388,6 +1402,54 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT issue, reason, first_seen, last_seen FROM dispatch_waits ORDER BY issue"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_chained_dependent(
+        self,
+        dependent_pr: int,
+        blocker_issue: int,
+        blocker_pr: int,
+        blocker_state: str,
+        recorded_sha: str,
+    ) -> None:
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO chained_dependents"
+                " (dependent_pr, blocker_issue, blocker_pr, blocker_state,"
+                "  recorded_sha, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (dependent_pr) DO UPDATE SET blocker_issue = ?,"
+                "  blocker_pr = ?, blocker_state = ?, recorded_sha = ?, last_seen = ?",
+                (
+                    dependent_pr,
+                    blocker_issue,
+                    blocker_pr,
+                    blocker_state,
+                    recorded_sha,
+                    now,
+                    now,
+                    blocker_issue,
+                    blocker_pr,
+                    blocker_state,
+                    recorded_sha,
+                    now,
+                ),
+            )
+
+    def clear_chained_dependent(self, dependent_pr: int) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "DELETE FROM chained_dependents WHERE dependent_pr = ?", (dependent_pr,)
+            )
+
+    def chained_dependents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT dependent_pr, blocker_issue, blocker_pr, blocker_state,"
+                " recorded_sha, first_seen, last_seen"
+                " FROM chained_dependents ORDER BY dependent_pr"
             ).fetchall()
         return [dict(r) for r in rows]
 

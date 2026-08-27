@@ -5,8 +5,8 @@ with its own token, the fake maps tokens to logins, and every write is logged
 with its actor — the transcript the authority test audits (M2 acceptance 7).
 
 When ``git_dir`` points at a local bare repo (the test remote), PR head SHAs
-and the /pulls/{n}/files listing are derived live from real git state, so the
-pipeline under test runs against genuine branches and diffs.
+and branch tips are derived live from real git state, so the pipeline under
+test runs against genuine branches and diffs.
 """
 
 from __future__ import annotations
@@ -293,14 +293,15 @@ class FakeGitHub:
         """Land another actor's concurrent self-assign (race simulation)."""
         self._assign(number, login)
 
-    def merge_pr(self, number: int) -> None:
+    def merge_pr(self, number: int, merge_commit_sha: str | None = None) -> None:
         """Mark a PR merged the way GitHub records it (API state only; a
-        test that needs the git-side merge performs it on the remote)."""
+        test that needs the git-side merge performs it on the remote and
+        passes the real merge commit's SHA)."""
         pr = self.pulls[number]
         pr["state"] = "closed"
         pr["merged"] = True
         pr["merged_at"] = self._timestamp()
-        pr["merge_commit_sha"] = f"merge-of-{pr['head']}"
+        pr["merge_commit_sha"] = merge_commit_sha or f"merge-of-{pr['head']}"
 
     def close_pr(self, number: int) -> None:
         """Close a PR without merging."""
@@ -345,13 +346,19 @@ class FakeGitHub:
     def _pr_payload(self, number: int, *, single: bool = False) -> dict[str, Any]:
         pr = self.pulls[number]
         issue = self.issues[number]
+        # Real GitHub keeps reporting a PR's last head SHA after the branch
+        # is deleted (merge with delete-branch-on-merge); the fake mirrors
+        # that by remembering the last resolvable tip.
+        head_sha = self._head_sha(pr["head"])
+        if head_sha:
+            pr["head_sha"] = head_sha
         payload = {
             "number": number,
             "title": issue["title"],
             "body": issue["body"],
             "state": pr["state"],
             "labels": issue["labels"],
-            "head": {"ref": pr["head"], "sha": self._head_sha(pr["head"])},
+            "head": {"ref": pr["head"], "sha": pr.get("head_sha", "")},
             "base": {"ref": pr["base"], "sha": self._head_sha(pr["base"])},
             "merged_at": pr.get("merged_at"),
             "merge_commit_sha": pr.get("merge_commit_sha"),
@@ -362,30 +369,6 @@ class FakeGitHub:
             # merged_at there — keeping the fake honest keeps that tested).
             payload["merged"] = bool(pr.get("merged"))
         return payload
-
-    def _pr_files(self, number: int) -> list[dict[str, Any]]:
-        pr = self.pulls[number]
-        if self.git_dir is None:
-            return []
-        numstat = self._git(
-            ["diff", "--numstat", f"refs/heads/{pr['base']}...refs/heads/{pr['head']}"]
-        )
-        files = []
-        for line in numstat.splitlines():
-            added, deleted, path = line.split("\t", 2)
-            patch = self._git(
-                ["diff", f"refs/heads/{pr['base']}...refs/heads/{pr['head']}", "--", path]
-            )
-            files.append(
-                {
-                    "filename": path,
-                    "status": "modified",
-                    "additions": 0 if added == "-" else int(added),
-                    "deletions": 0 if deleted == "-" else int(deleted),
-                    "patch": patch,
-                }
-            )
-        return files
 
     # -- the Transport interface --------------------------------------------
 
@@ -456,7 +439,6 @@ class FakeGitHub:
             (r"/issues/(\d+)/comments", self._h_comments),
             (r"/pulls", self._h_pulls),
             (r"/pulls/(\d+)", self._h_pull),
-            (r"/pulls/(\d+)/files", self._h_pull_files),
             (r"/pulls/(\d+)/comments", self._h_review_comments),
             (r"/pulls/(\d+)/reviews", self._h_reviews),
             (r"/commits/([^/]+)/check-runs", self._h_check_runs),
@@ -719,7 +701,3 @@ class FakeGitHub:
                 self.pulls[number]["base"] = payload["base"]
             return _json_response(200, self._pr_payload(number, single=True))
         return _json_response(200, self._pr_payload(number, single=True))
-
-    def _h_pull_files(self, actor, method, match, params, payload) -> Response:
-        number = int(match.group(1))
-        return _json_response(200, self._page(self._pr_files(number), params))

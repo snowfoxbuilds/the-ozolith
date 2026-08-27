@@ -2397,3 +2397,149 @@ def test_a_pr_appearing_mid_checkout_is_never_force_overwritten(harness: Harness
     assert harness.remote_file(branch, "zombie.txt") == "zombie work"
     assert PR_READY in harness.fake.labels_of(raced_pr)
     assert harness.fake.open_pr_numbers() == [raced_pr]
+
+
+# -- Review Run workspace parity (ADR-0053, #82) -------------------------------
+
+
+def _run_git(args: list[str], cwd: Path) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def test_review_run_gets_workspace_parity(harness: Harness):
+    """Every Review Run judges from a real sanitized checkout of the PR
+    branch pinned at the reviewed head, base ref fetched, with Context Tree
+    inputs plus the driver-supplied base commit, changed-file list, and
+    git-derived signals — and the truncated diff blob is gone."""
+    number = harness.file_issue("Add change.txt", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+    (pr_number,) = harness.fake.open_pr_numbers()
+    head_sha = harness.remote_sha(branch_for(number))
+    main_sha = harness.remote_sha("main")
+    seen: dict = {}
+
+    def judging_agent(prompt: str, cwd: Path) -> dict:
+        job = cwd.parent
+        seen["prompt"] = prompt
+        seen["workdir_name"] = cwd.name
+        seen["head"] = _run_git(["rev-parse", "HEAD"], cwd)
+        seen["origin_main"] = _run_git(["rev-parse", "origin/main"], cwd)
+        seen["log_count"] = _run_git(["rev-list", "--count", "HEAD"], cwd)
+        seen["base_md"] = (job / "input" / "pr" / "base.md").read_text()
+        base_commit = next(
+            line.split(": ", 1)[1]
+            for line in seen["base_md"].splitlines()
+            if line.startswith("- base-commit: ")
+        )
+        # The diff is the agent's to compute, against the named base commit.
+        seen["diff_files"] = _run_git(["diff", "--name-only", base_commit, "HEAD"], cwd)
+        seen["changed"] = (job / "input" / "pr" / "changed-files.md").read_text()
+        seen["signals"] = (job / "input" / "pr" / "signals.md").read_text()
+        seen["pr_body_md"] = (job / "input" / "pr" / "body.md").read_text()
+        seen["issue_body_md"] = (job / "input" / "issue" / "body.md").read_text()
+        seen["input_files"] = {
+            str(p.relative_to(job)) for p in (job / "input").rglob("*") if p.is_file()
+        }
+        seen["work_dir_exists"] = (job / "work").exists()
+        return approve_reply()
+
+    harness.reviewer_replies.append(judging_agent)
+    assert harness.reviewer_once() == 1
+    assert NEEDS_HUMAN in harness.fake.labels_of(pr_number)
+
+    # A real pinned checkout with history and the base ref fetched.
+    assert seen["workdir_name"] == "checkout"
+    assert seen["head"] == head_sha
+    assert seen["origin_main"] == main_sha
+    assert int(seen["log_count"]) >= 2
+    # Driver-supplied facts, verified from git: the base commit is the
+    # merge base (main's tip here), the changed list carries the Run's file.
+    assert "- base-ref: main" in seen["base_md"]
+    assert f"- base-commit: {main_sha}" in seen["base_md"]
+    assert "based-on-issue" not in seen["base_md"]  # unchained PR
+    assert seen["diff_files"] == "change.txt"
+    assert seen["changed"] == "A\tchange.txt\n"
+    assert "- files changed: 1 (+1 / -0)" in seen["signals"]
+    # Context Tree parity; the curated blob inputs are gone.
+    assert f"# Issue #{number}" in seen["issue_body_md"]
+    assert "Decisions" in seen["pr_body_md"]
+    assert not seen["work_dir_exists"]
+    assert not any(p.endswith("diff.patch") for p in seen["input_files"])
+    assert not any(p.endswith("decisions.md") for p in seen["input_files"])
+    # The prompt: inlined issue, diff-it-yourself, discretionary tests.
+    assert f"## Issue #{number}: Add change.txt" in seen["prompt"]
+    assert f"full checkout of the PR branch at `{head_sha}`" in seen["prompt"]
+    assert "git diff <base-commit>" in seen["prompt"]
+    assert "tests are a permission, not a required step" in seen["prompt"]
+    assert "## Chained base" not in seen["prompt"]
+    assert "diff.patch" not in seen["prompt"]
+
+
+def test_chained_pr_review_sees_only_the_dependents_changes(harness: Harness):
+    """A Review Run on a chained PR (based on an unmerged blocker branch)
+    frames against the chained base: base.md names the blocker, the deps
+    tree is present, the prompt carries the chained grading contract, and
+    the agent's own diff shows exactly the dependent's changes — the
+    blocker's work is base, not subject."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, _blocker_pr = harness.approved_blocker(number)
+    blocker_branch = branch_for(blocker)
+    tip = harness.remote_sha(blocker_branch)
+    assert harness.worker_once() == 1
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    seen: dict = {}
+
+    def judging_agent(prompt: str, cwd: Path) -> dict:
+        job = cwd.parent
+        seen["prompt"] = prompt
+        seen["base_md"] = (job / "input" / "pr" / "base.md").read_text()
+        base_commit = next(
+            line.split(": ", 1)[1]
+            for line in seen["base_md"].splitlines()
+            if line.startswith("- base-commit: ")
+        )
+        seen["diff_files"] = _run_git(["diff", "--name-only", base_commit, "HEAD"], cwd)
+        seen["blocker_file"] = (cwd / "blocker.txt").read_text()
+        seen["deps_index"] = (job / "input" / "deps" / "INDEX.md").read_text()
+        return approve_reply()
+
+    harness.reviewer_replies.append(judging_agent)
+    assert harness.reviewer_once() == 1
+
+    assert f"- base-ref: {blocker_branch}" in seen["base_md"]
+    assert f"- base-commit: {tip}" in seen["base_md"]
+    assert f"- based-on-issue: {blocker}" in seen["base_md"]
+    assert f"- based-on-sha: {tip}" in seen["base_md"]
+    # Only the dependent's change is the subject; the blocker's work is in
+    # the working tree as base.
+    assert seen["diff_files"] == "change.txt"
+    assert seen["blocker_file"] == "blocker work\n"
+    assert f"issue-{blocker}" in seen["deps_index"]
+    assert "## Chained base" in seen["prompt"]
+    assert f"#{blocker}'s UNMERGED branch (recorded at `{tip}`)" in seen["prompt"]
+    assert "input/deps/INDEX.md" in seen["prompt"]
+    assert NEEDS_HUMAN in harness.fake.labels_of(dep_pr)
+
+
+def test_review_container_holds_no_github_credential(harness: Harness):
+    """Capability parity includes the isolation rule: the review container's
+    env carries no GitHub PAT and the mounted checkout has no tokened
+    remote or live hooks — same boundary as an Implementer Run."""
+    harness.file_issue("Add change.txt", CRITERIA_BODY)
+    assert harness.worker_once() == 1
+    seen: dict = {}
+
+    def probing_agent(prompt: str, cwd: Path) -> dict:
+        seen["git_config"] = (cwd / ".git" / "config").read_text()
+        return approve_reply()
+
+    harness.reviewer_replies.append(probing_agent)
+    assert harness.reviewer_once() == 1
+
+    spec = next(s for s in harness.record.specs if s.name.startswith("ozolith-review-"))
+    assert set(spec.env) == {"ANTHROPIC_API_KEY"}
+    assert "tok-reviewer" not in json.dumps([spec.env, spec.labels, list(spec.mounts)])
+    assert "tok-reviewer" not in seen["git_config"]
+    assert "x-access-token" not in seen["git_config"]
+    assert "hooksPath" in seen["git_config"]

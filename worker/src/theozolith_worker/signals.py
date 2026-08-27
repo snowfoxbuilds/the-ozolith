@@ -3,14 +3,15 @@
 Diff size, files touched, dependency-manifest changes, and sensitive paths
 are computed here and fed to the Reviewer as evidence — they inform the
 grades but are never an independent grader (AGENTIC-CODING-PIPELINE.md,
-two-layer risk assessment).
+two-layer risk assessment). Since ADR-0053's workspace parity the inputs
+are the driver's own git reads against the PR's base commit (``--numstat``
+and ``--name-status``), never the PR-files API: the workspace is complete,
+so the "file without a patch" concept died with the truncated diff blob.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
-from theozolith_worker.githubapi import PrFile
 
 DEPENDENCY_MANIFESTS = {
     "pyproject.toml",
@@ -48,34 +49,49 @@ class DiffSignals:
     deletions: int = 0
     dependency_files: list[str] = field(default_factory=list)
     sensitive_files: list[str] = field(default_factory=list)
-    # Entries the PR-files API returned without a patch (binary or very
-    # large): diff.patch is partial for these, and the Reviewer must say so
-    # rather than guess (ADR-0014).
-    patchless_files: list[str] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
             f"- files changed: {self.files_changed} (+{self.additions} / -{self.deletions})",
             "- dependency manifests touched: " + (", ".join(self.dependency_files) or "none"),
             "- sensitive paths touched: " + (", ".join(self.sensitive_files) or "none"),
-            "- files without patches (binary/very large; diff.patch omits their "
-            "content — the diff is partial for these): "
-            + (", ".join(self.patchless_files) or "none"),
         ]
         return "\n".join(lines)
 
 
-def compute_signals(files: list[PrFile]) -> DiffSignals:
-    signals = DiffSignals(files_changed=len(files))
-    for entry in files:
-        signals.additions += entry.additions
-        signals.deletions += entry.deletions
-        name = entry.path.rsplit("/", 1)[-1]
-        if name in DEPENDENCY_MANIFESTS:
-            signals.dependency_files.append(entry.path)
-        lowered = entry.path.lower()
-        if any(fragment in lowered for fragment in SENSITIVE_FRAGMENTS):
-            signals.sensitive_files.append(entry.path)
-        if not entry.patch:
-            signals.patchless_files.append(entry.path)
+def _classify(signals: DiffSignals, path: str) -> None:
+    name = path.rsplit("/", 1)[-1]
+    if name in DEPENDENCY_MANIFESTS and path not in signals.dependency_files:
+        signals.dependency_files.append(path)
+    lowered = path.lower()
+    if (
+        any(fragment in lowered for fragment in SENSITIVE_FRAGMENTS)
+        and path not in signals.sensitive_files
+    ):
+        signals.sensitive_files.append(path)
+
+
+def signals_from_git(numstat_lines: list[str], name_status_lines: list[str]) -> DiffSignals:
+    """Signals from the driver's own diff reads (ADR-0053): ``numstat_lines``
+    carry per-file adds/deletes ("-" for binary entries — counted as zero,
+    the file still counts as changed); ``name_status_lines`` carry status
+    plus path(s) — renames and copies carry both endpoints, and each is
+    classified (a file moved OUT of a sensitive path matters as much as one
+    moved in)."""
+    signals = DiffSignals()
+    for line in numstat_lines:
+        if not line.strip():
+            continue
+        added, deleted, _path = line.split("\t", 2)
+        if added != "-":
+            signals.additions += int(added)
+        if deleted != "-":
+            signals.deletions += int(deleted)
+    for line in name_status_lines:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        signals.files_changed += 1
+        for path in parts[1:]:
+            _classify(signals, path)
     return signals

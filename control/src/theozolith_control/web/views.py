@@ -292,6 +292,9 @@ def flags_view(store: Store, *, now: float | None = None) -> dict[str, Any]:
         "waits": [
             {**row, "last_seen": ago(now - row["last_seen"])} for row in store.dispatch_waits()
         ],
+        "chained": [
+            {**row, "last_seen": ago(now - row["last_seen"])} for row in store.chained_dependents()
+        ],
         "quarantines": [
             {**row, "since": ago(now - row["since"]) if row["since"] else ""}
             for row in store.quarantines()

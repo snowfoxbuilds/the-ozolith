@@ -18,6 +18,11 @@ job directory as per-item files with a per-surface ``INDEX.md``::
         reviews/INDEX.md + per-item files
         commits.md                   every PR commit, from the trusted checkout
         checks.md                    check runs AND legacy commit statuses
+      deps/                          present only when the issue carries
+        INDEX.md                     Dependency Edges (ADR-0053): the full
+        issue-<N>/...                transitive blocked-by closure, one tree
+                                     per dependency, serialized exactly like
+                                     the primary (issue/ + pr/ layout above)
 
 Authority boundary (#52 amendment — the one deliberate exception to "never
 relevance-filter"): the tree contains comments, reviews, and review payloads
@@ -49,11 +54,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from theozolith_worker import gitops, jobdir
+from theozolith_worker.deps import DependencyClosure, branch_for
 from theozolith_worker.githubapi import (
     CheckRun,
     Comment,
@@ -68,6 +74,7 @@ from theozolith_worker.githubapi import (
 
 ISSUE_DIR = "issue"
 PR_DIR = "pr"
+DEPS_DIR = "deps"
 INDEX_FILE = "INDEX.md"
 
 # The authority boundary (#52 amendment): the only author associations whose
@@ -120,6 +127,11 @@ class ContextSnapshot:
     # only for authorized comments at serialization, so an all-unauthorized
     # thread leaves no trace.
     pr_review_threads: list[ReviewThread] = field(default_factory=list)
+    # A stated commit-enumeration gap, rendered in commits.md when the list
+    # is empty (ADR-0053): a dependency PR whose branch is gone cannot be
+    # enumerated from the checkout — the tree says so instead of failing
+    # the Run or silently showing "(none)".
+    pr_commits_note: str = ""
 
 
 def authorized(items: Iterable) -> list:
@@ -153,10 +165,70 @@ def fetch_snapshot(
         pr_conversation=authorized(client.list_comments(pr.number)),
         pr_review_comments=authorized(client.list_review_comments(pr.number)),
         pr_reviews=authorized(client.list_reviews(pr.number)),
-        pr_checks=client.list_check_runs(pr.head_sha),
-        pr_statuses=client.list_statuses(pr.head_sha),
+        # An empty head SHA (defensive parsing of a degenerate payload)
+        # cannot carry checks; never query GitHub with it.
+        pr_checks=client.list_check_runs(pr.head_sha) if pr.head_sha else [],
+        pr_statuses=client.list_statuses(pr.head_sha) if pr.head_sha else [],
         pr_review_threads=client.list_review_threads(pr.number),
     )
+
+
+def fetch_deps(
+    client: GitHubClient,
+    closure: DependencyClosure,
+    primary: int,
+    workdir: Path | None = None,
+) -> list[tuple[int, ContextSnapshot]]:
+    """One full :class:`ContextSnapshot` per closure member except the
+    primary, in topological order (ADR-0053): the dependency context is
+    fetched exactly like the primary's — same surfaces, same OWNER/MEMBER
+    authority boundary — with closed and merged dependencies included. The
+    dependency's PR (any state, merged included) resolves deterministically
+    by branch naming; its commits enumerate best-effort from the caller's
+    trusted checkout, and anything unenumerable becomes a stated gap in
+    commits.md — a dependency's commits never fail the Run."""
+    snapshots: list[tuple[int, ContextSnapshot]] = []
+    for number in closure.order:
+        if number == primary:
+            continue
+        pr = client.find_pr_by_head(branch_for(number), state="all")
+        snapshot = fetch_snapshot(client, number, pr)
+        if pr is not None:
+            commits, note = _dep_pr_commits(workdir, pr)
+            snapshot = replace(snapshot, pr_commits=commits, pr_commits_note=note)
+        snapshots.append((number, snapshot))
+    return snapshots
+
+
+def _dep_pr_commits(workdir: Path | None, pr: PullRequest) -> tuple[list[PrCommit], str]:
+    """Best-effort commit enumeration for a dependency PR (ADR-0053): a
+    merged PR reads its merge commit's second-parent range; a live PR needs
+    both of its endpoints present in the checkout. Anything unresolvable
+    yields ``([], reason)`` for commits.md to state."""
+    deleted_note = (
+        f"(commit enumeration unavailable — branch deleted; merged as {pr.merge_commit_sha})"
+    )
+    try:
+        if workdir is not None:
+            if pr.merged and pr.merge_commit_sha:
+                if gitops.commit_exists(workdir, pr.merge_commit_sha):
+                    range_commits = git_pr_commits(
+                        workdir, f"{pr.merge_commit_sha}^1", pr.merge_commit_sha
+                    )
+                    return range_commits, ""
+                return [], deleted_note
+            head = ""
+            if pr.head_sha and gitops.commit_exists(workdir, pr.head_sha):
+                head = pr.head_sha
+            elif gitops.ref_exists(workdir, f"origin/{pr.head_ref}"):
+                head = f"origin/{pr.head_ref}"
+            if head and gitops.ref_exists(workdir, f"origin/{pr.base_ref}"):
+                return git_pr_commits(workdir, f"origin/{pr.base_ref}", head), ""
+    except gitops.GitError:
+        pass
+    if pr.merged and pr.merge_commit_sha:
+        return [], deleted_note
+    return [], "(commit enumeration unavailable from this checkout)"
 
 
 def git_pr_commits(workdir: Path, base_ref: str, head: str) -> list[PrCommit]:
@@ -545,7 +617,13 @@ def _timeline_md(timeline: list[dict[str, Any]]) -> str:
 
 
 def _issue_body_md(issue: Issue) -> str:
+    # state/state-reason render only when closed (ADR-0053: closed
+    # dependencies carry their disposition); an open issue's file is
+    # byte-identical to the pre-deps shape.
+    closed = issue.state == "closed"
     fields: list[tuple[str, object]] = [
+        ("state", issue.state if closed else None),
+        ("state-reason", issue.state_reason if closed else None),
         ("labels", ", ".join(sorted(issue.labels))),
         ("assignees", ", ".join(issue.assignees)),
     ]
@@ -555,6 +633,10 @@ def _issue_body_md(issue: Issue) -> str:
 def _pr_body_md(pr: PullRequest) -> str:
     fields: list[tuple[str, object]] = [
         ("state", pr.state),
+        # Merged dependencies carry the fact and the merge SHA (ADR-0053);
+        # both fields vanish on the unmerged shape.
+        ("merged", "yes" if pr.merged else None),
+        ("merge-sha", pr.merge_commit_sha or None),
         ("head", f"{pr.head_ref} @ {pr.head_sha}"),
         ("base", pr.base_ref),
         ("labels", ", ".join(sorted(pr.labels))),
@@ -562,10 +644,10 @@ def _pr_body_md(pr: PullRequest) -> str:
     return _item_file(f"PR #{pr.number}: {pr.title}", fields, pr.body)
 
 
-def _commits_md(commits: list[PrCommit]) -> str:
+def _commits_md(commits: list[PrCommit], note: str = "") -> str:
     lines = [f"# PR commits ({len(commits)})", ""]
     if not commits:
-        lines.append("(none)")
+        lines.append(note or "(none)")
     for commit in commits:
         meta = [("author", commit.author), ("authored", commit.authored_at)]
         lines += [f"## {commit.sha}", ""]
@@ -641,5 +723,42 @@ def write_tree(input_dir: Path, snapshot: ContextSnapshot) -> None:
         _review_comment_items(authorized(snapshot.pr_review_comments), snapshot.pr_review_threads),
     )
     _write_items(pr_root, "reviews", "PR reviews", _review_items(authorized(snapshot.pr_reviews)))
-    _write(pr_root, "commits.md", _commits_md(snapshot.pr_commits))
+    _write(pr_root, "commits.md", _commits_md(snapshot.pr_commits, snapshot.pr_commits_note))
     _write(pr_root, "checks.md", _checks_md(snapshot.pr, snapshot.pr_checks, snapshot.pr_statuses))
+
+
+def _dep_index_line(number: int, snapshot: ContextSnapshot, blockers: tuple[int, ...]) -> str:
+    issue = snapshot.issue
+    state = f"closed ({issue.state_reason or 'no reason'})" if issue.state == "closed" else "open"
+    if snapshot.pr is None:
+        pr_part = "no PR"
+    elif snapshot.pr.merged:
+        sha = f" as {snapshot.pr.merge_commit_sha}" if snapshot.pr.merge_commit_sha else ""
+        pr_part = f"PR #{snapshot.pr.number} merged{sha}"
+    else:
+        pr_part = f"PR #{snapshot.pr.number} {snapshot.pr.state}"
+    blocked_by = ", ".join(f"#{n}" for n in blockers) or "none"
+    return (
+        f"- [issue-{number}](issue-{number}/) #{number} {issue.title} — {state};"
+        f" {pr_part}; blocked by: {blocked_by}"
+    )
+
+
+def write_deps(
+    input_dir: Path,
+    dep_snapshots: list[tuple[int, ContextSnapshot]],
+    closure: DependencyClosure,
+) -> None:
+    """Materialize ``input/deps/`` (ADR-0053): one ``issue-N/`` tree per
+    dependency, written through :func:`write_tree` — structural parity with
+    the primary and the authority boundary hold by construction — plus a
+    top-level INDEX.md, one line per dependency in topological order
+    (number, title, state or PR disposition, direct blockers)."""
+    root = input_dir / DEPS_DIR
+    lines = [f"# Dependency closure ({len(dep_snapshots)})", ""]
+    if not dep_snapshots:
+        lines.append("(none)")
+    for number, snapshot in dep_snapshots:
+        write_tree(root / f"issue-{number}", snapshot)
+        lines.append(_dep_index_line(number, snapshot, closure.edges.get(number, ())))
+    _write(root, INDEX_FILE, "\n".join(lines) + "\n")

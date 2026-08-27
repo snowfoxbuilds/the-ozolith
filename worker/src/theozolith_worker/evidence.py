@@ -25,7 +25,7 @@ PUSH_ATTEMPTS = 3
 # enumerated paths are the ONLY things collected recursively — never the
 # checkout, credentials, or unrelated job data.
 INPUT_ARTIFACT_FILES = ("input/issue.json", "input/prompt.md")
-INPUT_ARTIFACT_TREES = ("input/issue", "input/pr")
+INPUT_ARTIFACT_TREES = ("input/issue", "input/pr", "input/deps")
 
 # The trusted input snapshots live in a dot-prefixed directory INSIDE the
 # jobs dir: same filesystem (atomic renames), but outside every job dir —

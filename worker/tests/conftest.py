@@ -460,9 +460,10 @@ class Harness:
             ],
             work,
         )
+        merge_sha = _git(["rev-parse", "HEAD"], work)
         _git(["push", "--quiet", "origin", f"HEAD:refs/heads/{target}"], work)
         _git(["push", "--quiet", "origin", "--delete", branch], work)
-        self.fake.merge_pr(pr_number)
+        self.fake.merge_pr(pr_number, merge_commit_sha=merge_sha)
         self.fake.close_issue(blocker, "completed")
         for pull in self.fake.pulls.values():
             if pull["state"] == "open" and pull["base"] == branch:

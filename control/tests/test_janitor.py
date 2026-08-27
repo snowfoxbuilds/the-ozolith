@@ -220,3 +220,193 @@ def test_a_driver_dead_between_failed_run_and_retry_stays_visible(control, githu
     assert sweep(control, github) == [5]
     labels = github.get_issue(5).labels
     assert "failed" in labels and "needs_human" in labels
+
+
+# -- the base-drift lane (ADR-0053, the second enumerated exception) -----------
+
+from theozolith_worker import basedon  # noqa: E402
+from theozolith_worker.bootstrap.vocabulary import BLOCKED, NEEDS_HUMAN  # noqa: E402
+
+RECORDED = "a" * 40
+MOVED = "b" * 40
+
+
+def drift_sweep(control: ControlRig, github: FakeGitHubLite) -> list[int]:
+    return janitor.sweep_base_drift(control.store, github, log=lambda *_: None)
+
+
+def _zone_body(blocker: int, sha: str) -> str:
+    return basedon.upsert_zone("The dependent PR narrative.", basedon.BasedOn(blocker, sha))
+
+
+def chained_pair(
+    github: FakeGitHubLite,
+    *,
+    recorded: str = RECORDED,
+    tip: str | None = RECORDED,
+    blocker_labels: set[str] | None = None,
+    blocker_state: str = "open",
+    blocker_merged: bool = False,
+) -> None:
+    """Blocker issue #3 with PR #7 on its branch; dependent PR #9 based on
+    that branch with a Based-on zone recording ``recorded``. ``tip`` is the
+    blocker branch's current head (None = deleted)."""
+    github.add_pr(
+        7,
+        "ozolith/issue-3",
+        blocker_labels if blocker_labels is not None else {"pr_ready", "needs_human"},
+        state=blocker_state,
+        merged=blocker_merged,
+    )
+    github.add_pr(
+        9,
+        "ozolith/issue-5",
+        {"pr_ready"},
+        base_ref="ozolith/issue-3",
+        body=_zone_body(3, recorded),
+    )
+    if tip is not None:
+        github.branch_tips["ozolith/issue-3"] = tip
+
+
+def test_base_drift_escalates_with_forensics_and_nothing_else(control, github):
+    """The exact three-way trigger: dependent open with a zone, blocker PR
+    still open, tip off the recorded SHA — one comment naming the blocker
+    and both SHAs, then blocked + needs_human; the write log proves nothing
+    else reached GitHub."""
+    chained_pair(github, tip=MOVED)
+
+    assert drift_sweep(control, github) == [9]
+    assert github.writes == [
+        ("add_comment", 9),
+        ("add_labels", 9, BLOCKED, NEEDS_HUMAN),
+    ]
+    (comment,) = github.comments[9]
+    assert "#3" in comment and "#7" in comment
+    assert RECORDED in comment and MOVED in comment
+    assert "No auto-repair" in comment
+
+
+def test_the_same_drift_never_double_writes(control, github):
+    """Idempotent per drift: the applied label short-circuits, and after a
+    human unblock the SHA-pair key still remembers this exact drift."""
+    chained_pair(github, tip=MOVED)
+    assert drift_sweep(control, github) == [9]
+    writes = list(github.writes)
+
+    assert drift_sweep(control, github) == []  # the label guard
+    github.pulls[9]["labels"].discard(BLOCKED)  # human unblocks, same drift
+    github.pulls[9]["labels"].discard(NEEDS_HUMAN)
+    assert drift_sweep(control, github) == []  # the SHA-pair key
+    assert github.writes == writes
+
+
+def test_a_new_drift_after_a_human_unblock_acts_again(control, github):
+    chained_pair(github, tip=MOVED)
+    assert drift_sweep(control, github) == [9]
+    github.pulls[9]["labels"].discard(BLOCKED)
+    github.pulls[9]["labels"].discard(NEEDS_HUMAN)
+    github.branch_tips["ozolith/issue-3"] = "c" * 40  # the blocker moved AGAIN
+
+    assert drift_sweep(control, github) == [9]
+    assert github.writes[-1] == ("add_labels", 9, BLOCKED, NEEDS_HUMAN)
+    assert len(github.comments[9]) == 2
+
+
+def test_a_matching_tip_is_untouched(control, github):
+    chained_pair(github, tip=RECORDED)
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    assert control.store.chained_dependents() == []
+
+
+def test_a_merged_blocker_is_the_healthy_retarget_never_drift(control, github):
+    """Blocker merged and branch deleted: GitHub retargets the dependent —
+    no write, no drift, and no chained-dependents row (merged is not
+    rejected)."""
+    chained_pair(github, tip=None, blocker_state="closed", blocker_merged=True)
+
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    assert control.store.chained_dependents() == []
+
+
+def test_a_deleted_branch_on_an_open_blocker_is_not_drift(control, github):
+    chained_pair(github, tip=None)  # branch gone, retarget in flight
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+
+
+def test_a_rejected_blocker_lists_the_chained_dependent_without_writes(control, github):
+    """A blocker PR closed unmerged is a human act: the dependent is listed
+    via /api/v1/flags and the dashboard — never a GitHub write — and the
+    row clears when the condition no longer holds."""
+    chained_pair(github, tip=RECORDED, blocker_state="closed")
+
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    (row,) = control.admin("GET", "/api/v1/flags").json()["chained_dependents"]
+    assert row["dependent_pr"] == 9 and row["blocker_issue"] == 3
+    assert row["blocker_pr"] == 7 and row["blocker_state"] == "closed unmerged"
+    assert row["recorded_sha"] == RECORDED
+
+    github.pulls[7]["state"] = "open"  # the human reopens the blocker
+    assert drift_sweep(control, github) == []
+    assert control.store.chained_dependents() == []
+
+
+def test_a_blocked_blocker_also_lists_its_dependent(control, github):
+    chained_pair(github, tip=RECORDED, blocker_labels={"pr_ready", "needs_human", BLOCKED})
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    (row,) = control.store.chained_dependents()
+    assert row["blocker_state"] == "blocked"
+
+
+def test_a_departed_dependent_clears_its_row(control, github):
+    chained_pair(github, tip=RECORDED, blocker_state="closed")
+    drift_sweep(control, github)
+    assert control.store.chained_dependents() != []
+
+    github.pulls[9]["state"] = "closed"  # the dependent leaves the pool
+    assert drift_sweep(control, github) == []
+    assert control.store.chained_dependents() == []
+
+
+def test_zoneless_and_mangled_bodies_are_skipped_silently(control, github):
+    github.add_pr(11, "ozolith/issue-8", {"pr_ready"}, body="No zone at all.")
+    github.add_pr(
+        12,
+        "ozolith/issue-9",
+        {"pr_ready"},
+        body="<!-- theozolith:based-on\nnot json at all\n-->",
+    )
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    assert control.store.chained_dependents() == []
+
+
+def test_one_broken_pr_never_starves_the_drift_pass(control, github):
+    """A throwing read on one dependent is logged and skipped; the drifted
+    sibling still escalates."""
+    chained_pair(github, tip=MOVED)
+    github.add_pr(21, "ozolith/issue-13", {"pr_ready", "needs_human"})
+    github.branch_tips["ozolith/issue-13"] = MOVED
+    github.add_pr(
+        23,
+        "ozolith/issue-14",
+        {"pr_ready"},
+        base_ref="ozolith/issue-13",
+        body=_zone_body(13, RECORDED),
+    )
+    original = github.branch_head
+
+    def flaky(branch: str):
+        if branch == "ozolith/issue-3":
+            raise RuntimeError("boom")
+        return original(branch)
+
+    github.branch_head = flaky
+    assert drift_sweep(control, github) == [23]
+    assert ("add_labels", 23, BLOCKED, NEEDS_HUMAN) in github.writes
+    assert not any(w[1] == 9 for w in github.writes)
