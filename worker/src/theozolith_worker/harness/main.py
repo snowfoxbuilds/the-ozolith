@@ -561,23 +561,31 @@ def run_harness(
                 sleep=sleep,
                 poll_seconds=poll_seconds,
             )
-            # The applied-effort observation (Stop journal): a DETECTED
-            # clamp fails loud; a missing observation is a recorded gap —
-            # never a silent pass, never a blocked Run (ADR-0045).
-            observed_effort = read_last_journal_effort(hooks.stop_capture)
-            if not violation and identity.effort:
-                if observed_effort and observed_effort != identity.effort:
-                    violation = (
-                        f"the session applied effort {observed_effort!r}, not"
-                        f" the baked {identity.effort!r} — an effort surface or"
-                        " organization cap superseded the pin"
-                    )
-                    category = CATEGORY_EFFORT_CLAMPED
-                elif not observed_effort:
-                    identity_record["notes"].append(
-                        "no applied-effort observation (the Stop hook produced"
-                        " no record) — gap recorded, not failed (ADR-0045)"
-                    )
+            # The applied-effort observation. A monitor that carries its own
+            # ``observed_effort`` owns the channel (codex: the benign
+            # observer already read the rollout turn_context, which echoes
+            # the CONFIGURED effort, not a proven post-clamp value) — that
+            # reading is the authoritative evidence, no Stop journal is
+            # consulted, and no Stop-hook gap applies (ADR-0052). Otherwise
+            # the channel is Claude's Stop-hook journal: a DETECTED clamp
+            # fails loud; a missing observation is a recorded gap — never a
+            # silent pass, never a blocked Run (ADR-0045).
+            observed_effort = getattr(monitor, "observed_effort", None)
+            if observed_effort is None:
+                observed_effort = read_last_journal_effort(hooks.stop_capture)
+                if not violation and identity.effort:
+                    if observed_effort and observed_effort != identity.effort:
+                        violation = (
+                            f"the session applied effort {observed_effort!r}, not"
+                            f" the baked {identity.effort!r} — an effort surface or"
+                            " organization cap superseded the pin"
+                        )
+                        category = CATEGORY_EFFORT_CLAMPED
+                    elif not observed_effort:
+                        identity_record["notes"].append(
+                            "no applied-effort observation (the Stop hook produced"
+                            " no record) — gap recorded, not failed (ADR-0045)"
+                        )
             if not monitor.observed_model and not violation:
                 identity_record["notes"].append(
                     "no main-agent turn signal in the stream — gap recorded, not failed (ADR-0045)"

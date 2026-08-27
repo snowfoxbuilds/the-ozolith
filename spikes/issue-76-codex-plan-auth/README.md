@@ -1,10 +1,15 @@
 # Issue #76 spike: Codex plan-auth viability + headless exec fixtures
 
-Gate spike for the Codex Reviewer (ADR-0052). Three questions, answered with
-evidence on issue #76:
+Observation procedure for the Codex Reviewer's credential design (ADR-0052
+§5). **Pre-merge execution was intentionally waived** (operator ruling):
+production rollout is the validation environment, and these checks are
+post-deployment observations — run them (or record the equivalent from
+production Run evidence) so the answers land durably on issue #76. Three
+questions:
 
 1. **Does ChatGPT-plan (subscription) auth work for headless `codex exec` in
-   a Run-container posture?** (S2 — the go/no-go)
+   a Run-container posture?** (S2 — if not, plan auth is unsupported
+   headless and ADR-0052 §5's API-key question opens)
 2. **How does `auth.json` behave under use** — which fields rotate, does the
    refresh token itself rotate, does a stale stored copy recover? (S3/S4 —
    picks credential design (a) Fernet-secret-per-Run vs (b) persistent auth
@@ -43,7 +48,7 @@ blocks the needed namespaces — run this on the host, like #31).
 ```sh
 ./run-spike.sh build
 ./run-spike.sh s1-login          # interactive device-code login (one time)
-./run-spike.sh s2-headless       # GO/NO-GO: headless exec with materialized auth
+./run-spike.sh s2-headless       # headless exec with materialized auth (the credential-design question)
 ./run-spike.sh s3-rotation 4 1800   # 4 runs, 30 min apart; prints rotated fields
 ./run-spike.sh s4-stale          # original S1 copy still authenticates?
 ./run-spike.sh s5-fixtures       # success / auth-fail / bad-model / tool-call streams
@@ -66,7 +71,7 @@ Re-run `s4-stale` again after a multi-day gap before calling S4 passed.
 - [ ] S6: which sandbox flags a Run container needs
 - [ ] S7: config binding verdict per candidate (model, effort) pair
 - [ ] S8: `codex --version` output shape
-- [ ] Decision: credential design (a) or (b), per the gate in issue #76
+- [ ] Decision: design (a) confirmed, or the design-(b) amendment filed (ADR-0052 §5)
 
 Copy the relevant `evidence/*.log` files into the comment — they are
 sanitized by construction, but read them before posting anyway.

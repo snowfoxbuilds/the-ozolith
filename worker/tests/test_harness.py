@@ -1043,6 +1043,29 @@ def test_codex_harness_never_kills_on_an_off_model_rollout(tmp_path, monkeypatch
     assert ident["observed_model"] == "o3"  # the mismatch IS in evidence
 
 
+def test_codex_harness_records_the_rollout_effort_without_a_stop_hook_gap(tmp_path, monkeypatch):
+    """The codex effort evidence channel (ADR-0052): the benign observer's
+    rollout reading is the authoritative ``observed_effort`` in the final
+    identity record — the Claude Stop-hook journal is never consulted for a
+    codex session, so its missing-observation gap note must not appear."""
+    root = _bake_codex_root(tmp_path)
+    home = _codex_home(tmp_path, monkeypatch)
+    _plant_rollout(home, CODEX_PIN, effort="high")
+    job = _codex_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=3.0))
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 0
+    ident = jobdir.read_identity(job)
+    assert ident["observed_model"] == CODEX_PIN
+    assert ident["observed_effort"] == "high"
+    assert ident["violation"] == "" and ident["category"] == ""
+    assert not any("Stop hook" in note for note in ident["notes"])
+
+
 def test_codex_harness_missing_rollout_is_a_gap(tmp_path, monkeypatch):
     root = _bake_codex_root(tmp_path)
     _codex_home(tmp_path, monkeypatch)  # no rollout planted

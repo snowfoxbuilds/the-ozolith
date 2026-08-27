@@ -334,7 +334,11 @@ class AgentAdapter(Protocol):
         """The stream watcher for a monitored task session: fail-loud for
         Claude (see ``identity.ClaudeSessionMonitor`` for the duck-typed
         contract), a benign evidence observer for codex (ADR-0052's
-        PROBE + STATIC doctrine)."""
+        PROBE + STATIC doctrine). A monitor exposing an ``observed_effort``
+        attribute owns the applied-effort observation channel (codex: the
+        rollout turn_context) — the harness records it as the authoritative
+        evidence and never consults the Claude Stop-hook journal for that
+        session."""
         ...
 
 
@@ -778,8 +782,10 @@ class CodexAdapter:
     name = "codex"
 
     # Full OpenAI model IDs, shape-checked (the CLI passes them through to
-    # the provider). No family aliases: codex has no verified alias-to-
-    # family expansion, so nothing floats.
+    # the provider). No hand-curated family aliases like Claude's — but the
+    # provider's ``-latest`` IDs (e.g. codex-mini-latest) are moving
+    # pointers, so they classify as floating aliases: mappable, and the
+    # control-side lint warns exactly as it does for Claude's (ADR-0045).
     _PINNED = re.compile(r"gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*|codex-[a-z0-9.-]+")
     # The vocabulary config.toml's model_reasoning_effort accepts. Which
     # models provably HONOR a level is the capability table's question
@@ -797,16 +803,18 @@ class CodexAdapter:
     # 0.150.0, which is therefore the floor (and the base image pins the
     # same version: the schema is experimental, the pin is the policy).
     MIN_ENFORCING_CLI = (0, 150, 0)
-    model_shapes = "full OpenAI model IDs (gpt-*, o*, codex-*); no family aliases"
+    model_shapes = "full OpenAI model IDs (gpt-*, o*, codex-*); '-latest' IDs float"
 
     def __init__(self, binary: str = "codex"):
         self._binary = binary
         self._home: Path | None = None
 
     def classify_model(self, model: str) -> str:
-        if self._PINNED.fullmatch(model):
-            return MODEL_PINNED
-        return MODEL_UNMAPPABLE
+        if not self._PINNED.fullmatch(model):
+            return MODEL_UNMAPPABLE
+        if model.endswith("-latest"):
+            return MODEL_ALIAS
+        return MODEL_PINNED
 
     def mappable_efforts(self) -> frozenset[str]:
         return self.EFFORTS

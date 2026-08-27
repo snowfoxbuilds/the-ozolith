@@ -14,6 +14,7 @@ import tomllib
 import pytest
 from theozolith_worker import codexidentity, jobdir
 from theozolith_worker.adapters import (
+    MODEL_ALIAS,
     MODEL_PINNED,
     MODEL_UNMAPPABLE,
     AgentAdapterError,
@@ -57,10 +58,15 @@ def test_codex_adapter_monitored_command_is_the_plain_command(tmp_path):
 
 def test_codex_adapter_model_classification():
     adapter = CodexAdapter()
-    for model in ("gpt-5.2-codex", "gpt-5.1-codex-max", "o3", "codex-mini-latest"):
+    for model in ("gpt-5.2-codex", "gpt-5.1-codex-max", "o3"):
         assert adapter.classify_model(model) == MODEL_PINNED, model
-    # No aliases, no foreign or empty shapes.
-    for model in ("", "sonnet", "claude-fable-5", "davinci", "GPT-5"):
+    # The provider's -latest IDs are moving pointers: mappable, but they
+    # classify as floating aliases so the control-side lint warns (ADR-0045)
+    # instead of the value passing as a pin.
+    for model in ("codex-mini-latest", "gpt-4o-latest", "o3-latest"):
+        assert adapter.classify_model(model) == MODEL_ALIAS, model
+    # No foreign or empty shapes.
+    for model in ("", "sonnet", "claude-fable-5", "davinci", "GPT-5", "-latest"):
         assert adapter.classify_model(model) == MODEL_UNMAPPABLE, model
 
 

@@ -1853,6 +1853,25 @@ def test_driverless_codex_model_is_refused(tmp_path):
         load_config(tmp_path)
 
 
+def test_codex_latest_model_warns_but_loads(tmp_path):
+    """The provider's -latest IDs are moving pointers, not pins: the codex
+    adapter classifies them as floating aliases, so config load keeps the
+    exact behavior claude aliases get — a lint warning, never an error
+    (ADR-0045)."""
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"codex-mini-latest"',
+    )
+    config = load_config(tmp_path)
+    assert config.worker_types["codex-review"].model == "codex-mini-latest"
+    assert any(
+        "floating" in warning and "codex-mini-latest" in warning for warning in config.warnings
+    )
+
+
 def test_codex_effort_is_rejected_until_proven(tmp_path):
     """The codex capability table is empty until spike #76 S7 proves a
     model honors a level — config load rejects every nonempty effort with
