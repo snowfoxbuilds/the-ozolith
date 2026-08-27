@@ -22,6 +22,12 @@ The credential-free half of any worker (Implementer, Reviewer, Initializer): PID
 
 *Avoid*: "driver" (the credentialed node-resident half); giving the harness any credential or decision authority; interactive tmux sessions (retired 2026-07-21 — interactivity lives only in the Flight Deck; ADR-0019).
 
+**Chained Base**
+
+The early-start mechanism for dependent work (grilling 2026-08-27; ADR-0053): when every open blocker of a plan_ready issue has an approved-and-awaiting-merge PR (`pr_ready` + `needs_human`, no `blocked`) and those PRs form a single chain by base_ref linkage, dispatch grants the dependent and the driver bases its checkout and PR on the chain's tip branch — recorded in the driver-owned "Based on #N at `<sha>`" PR-body zone and re-resolved fresh at checkout. Requires a merge-commit workspace with delete-branch-on-merge (checked mechanically from repo settings; otherwise dependents wait for full merge); GitHub retargets the dependent to main when the blocker merges. Nothing auto-merges or auto-closes — the go-ahead only overlaps the human merge stamp.
+
+*Avoid*: "stacked base" / "stacking" (Stack is the workload unit); "based-on" as the mechanism's name (that is the PR-body zone); chaining on unreviewed pr_ready (rejected for now); fan-in chaining (parallel open blocker lines wait).
+
 **Claim Protocol**
 
 How an Implementer takes exclusive ownership of a plan_ready issue: the Implementer requests work from the Control Node; the Control Node selects an issue, writes the claim to GitHub itself (assigns the Implementer's GitHub login, adds in_progress), and returns the issue in the same response — claim-write-through, single serialized claim-writer (ADR-0017). GitHub remains the sole source of coordination truth. A granted claim that never activates (no claimed event within the activation window) is released by the Control Node. The grant carries claim authority only, never context: each Run — including the local retry — re-reads the full issue and PR context fresh at checkout (grilling 2026-08-16, amending ADR-0017's no-re-read clause). Control Node down = new claims pause; in-flight Runs are unaffected.
@@ -75,6 +81,12 @@ The product's central service, shipped in TheOzolith's control/ component (deplo
 The mandatory section of every best-effort PR description. Fixed schema (inherited from the former Handoff Doc; ADR-0003 as amended by ADR-0008): decisions made with rationale, open questions, remaining work, dead ends tried, and optional process issues (pipeline friction + suggested fix — advisory, human-harvested; never review findings). A first-class review input: the Reviewer judges the Implementer's decisions, not just the diff. Entries are proposed through the format-output CLI into the worker's Output Proposal; the separate hand-written decisions file is retired (grilling 2026-08-16).
 
 *Avoid*: "Handoff Doc" (retired term — the schema now lives in the PR description); relying on agent-native session files (never load-bearing).
+
+**Dependency Edge**
+
+The GitHub-native `blocked by` relation between two issues in the workspace repo — the machine-readable source of ordering truth (grilling 2026-08-27). Declared at planning time, hand-editable in the UI, rebuildable from GitHub alone. Carries ordering only, and only true build-on dependencies; sub-issue links carry grouping/progress and never ordering. Dispatch consumes edges for claim eligibility — a blocker satisfies its edge when closed as completed, or through the Chained Base go-ahead; the Context Tree walks the transitive closure into `input/deps/`. A cross-repo edge on a claimable work issue is a malformed state; cross-repo work enters ordering only through a locally created stand-in sub-issue in the workspace repo.
+
+*Avoid*: the `blocked` label (a human decision is owed — unrelated to ordering); prose "depends on #N" as a source (body prose mirrors the edges); over-chaining (an edge that is not a true build-on dependency serializes parallelizable work).
 
 **Driver**
 
@@ -150,9 +162,9 @@ The machine-owned git tree at the control data dir's `configs/` that only `theoz
 
 **Review Run**
 
-The Run kind that executes one review round: a fresh container reads the PR, diff, evidence, and Decisions Section, and emits a verdict file that the reviewer driver publishes. The round (attempt-N, 3 max per PR) is the budget unit; the Review Run is its execution. One invalid verdict = immediate escalation, no retry.
+The Run kind that executes one review round, with full workspace parity (grilling 2026-08-27; ADR-0053): a fresh container holding a sanitized PR-branch checkout with history (base ref fetched) plus the same Context Tree as an Implementer Run (`input/issue/`, `input/pr/`, `input/deps/`). The driver supplies the PR's base commit and the cumulative changed-file list (driver-side git); the judging agent runs `git diff` itself and may build or run tests at its discretion — inside the container it can do everything an Implementer Run can; the asymmetry is the Output Proposal schema (a verdict, never applied code) and the driver boundary. Emits a verdict the reviewer driver publishes. The round (attempt-N, 3 max per PR) is the budget unit; the Review Run is its execution. One invalid verdict = immediate escalation, no retry.
 
-*Avoid*: conflating with "review round" (the round is the budget unit; the Review Run is its execution).
+*Avoid*: conflating with "review round" (the round is the budget unit; the Review Run is its execution); the retired curated inputs (truncated diff blob, driver-picked file contents — retired 2026-08-27).
 
 **Reviewer**
 
@@ -231,5 +243,7 @@ A configuration that involves multiple agents working together.
 - A worker-type definition names exactly one driver: `builtin:<name>` from the product distribution or `drivers/<name>` from the Config Distribution (ADR-0042).
 - A worker-type definition is the complete customization unit — base image + setup instructions, Knowledge Source, driver reference, Agent adapter, model + reasoning effort, workspace, secret names; a worker Stack instantiates exactly one (grilling 2026-08-09; model/effort fields added 2026-08-10); workspace and secret bindings are per-Stack overridable (ADR-0047).
 - The heartbeat/command channel carries desired state, references, and advisory telemetry (typed, size-capped, never coordination authority; ADR-0016); the only secret payload it ever carries is node-scoped secret values, pull-only over mandatory TLS.
+- Dependency Edges (GitHub `blocked by` relations) are the machine-readable ordering truth consumed by dispatch; sub-issue links group issues under a parent and never order them; issues and PRs are never auto-closed by the pipeline (grilling 2026-08-27).
+- A Chained-Base Run's PR targets its blocker's branch, carries the driver-owned "Based on #N at `<sha>`" zone, and retargets to main when the blocker merges and its branch is deleted (ADR-0053).
 - Labels are the coordination vocabulary: plan_ready (claimable), in_progress, attempt-N (on the PR, per review round), pr_ready (ready for the Reviewer), pr_ready + needs_human (awaiting human stamp), blocked + needs_human (awaiting a human decision), failed + needs_human (on the issue: execution failure escalated with evidence; only the human removes failed, and failed overrides plan_ready at dispatch — ADR-0016). Issues and PRs carry separate label sets; each actor polls exactly one label.
 - TheOzolith is one public monorepo with separable components (knowledge machinery, worker, control, nodedaemon, deploy); all private content lives in one private config repo (ADR-0007) — declarations and knowledge as data, plus custom driver code under `drivers/` (ADR-0042).
