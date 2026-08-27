@@ -289,6 +289,9 @@ def flags_view(store: Store, *, now: float | None = None) -> dict[str, Any]:
         "malformed": [
             {**row, "last_seen": ago(now - row["last_seen"])} for row in store.malformed_states()
         ],
+        "waits": [
+            {**row, "last_seen": ago(now - row["last_seen"])} for row in store.dispatch_waits()
+        ],
         "quarantines": [
             {**row, "since": ago(now - row["since"]) if row["since"] else ""}
             for row in store.quarantines()

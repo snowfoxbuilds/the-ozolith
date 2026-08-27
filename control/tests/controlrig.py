@@ -24,7 +24,7 @@ from theozolith_control.passwords import hash_password
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
 from theozolith_control.store import Store
-from theozolith_worker.githubapi import Issue, PullRequest
+from theozolith_worker.githubapi import Issue, PullRequest, RepoMergeSettings
 
 ADMIN_TOKEN = "admin-token"
 ADMIN_PASSWORD = "rig-password"
@@ -177,24 +177,74 @@ def control(tmp_path: Path) -> ControlRig:
 class FakeGitHubLite:
     """Duck-typed GitHubClient surface for dispatch and the janitor. Every
     mutation lands in ``writes`` — the janitor tests prove it contains only
-    the sanctioned moves; the dispatch tests prove write-through ordering."""
+    the sanctioned moves; the dispatch tests prove write-through ordering.
+
+    Listings return ascending issue numbers: the created-asc contract the
+    real client now guarantees on both dispatch listings (ADR-0053,
+    sort=created&direction=asc), which the dispatcher relies on to drain
+    plans in creation order."""
 
     def __init__(self):
         self.repo = "acme/sandbox"
         self.issues: dict[int, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[str]] = {}
+        # dependent -> [(blocker number, repo)]: Dependency Edges
+        # (ADR-0053); a foreign repo entry models a cross-repo edge.
+        self.blocked_by: dict[int, list[tuple[int, str]]] = {}
+        # The chain-enabled posture by default (ADR-0053 preconditions);
+        # tests swap in other settings to model squash/rebase workspaces.
+        self.merge_settings = RepoMergeSettings(
+            merge_commit_allowed=True,
+            squash_allowed=False,
+            rebase_allowed=False,
+            delete_branch_on_merge=True,
+            complete=True,
+        )
         # Paths that exist on the evidence branch (janitor phase 2).
         self.evidence: set[str] = set()
         self.writes: list[tuple] = []
 
-    def add_issue(self, number: int, labels: set[str], assignees: list[str]) -> None:
-        self.issues[number] = {"labels": set(labels), "assignees": list(assignees)}
+    def add_issue(
+        self,
+        number: int,
+        labels: set[str],
+        assignees: list[str],
+        state: str = "open",
+        state_reason: str = "",
+    ) -> None:
+        self.issues[number] = {
+            "labels": set(labels),
+            "assignees": list(assignees),
+            "state": state,
+            "state_reason": state_reason,
+        }
 
-    def add_pr(self, number: int, head_ref: str, labels: set[str], head_sha: str = "a" * 40):
-        self.pulls[number] = {"head_ref": head_ref, "labels": set(labels), "head_sha": head_sha}
+    def add_pr(
+        self,
+        number: int,
+        head_ref: str,
+        labels: set[str],
+        head_sha: str = "a" * 40,
+        base_ref: str = "main",
+    ):
+        self.pulls[number] = {
+            "head_ref": head_ref,
+            "labels": set(labels),
+            "head_sha": head_sha,
+            "base_ref": base_ref,
+        }
+
+    def add_blocked_by(self, dependent: int, blocker: int, repo: str | None = None) -> None:
+        self.blocked_by.setdefault(dependent, []).append((blocker, repo or self.repo))
 
     # -- reads ----------------------------------------------------------------
+
+    def default_branch(self) -> str:
+        return "main"
+
+    def repo_merge_settings(self) -> RepoMergeSettings:
+        return self.merge_settings
 
     def get_issue(self, number: int) -> Issue:
         data = self.issues[number]
@@ -205,7 +255,28 @@ class FakeGitHubLite:
             labels=set(data["labels"]),
             assignees=list(data["assignees"]),
             is_pr=False,
+            state=data.get("state", "open"),
+            state_reason=data.get("state_reason", ""),
         )
+
+    def list_blocked_by(self, number: int) -> list[Issue]:
+        blockers = []
+        for blocker, repo in self.blocked_by.get(number, []):
+            if repo == self.repo:
+                blockers.append(self.get_issue(blocker))
+            else:
+                blockers.append(
+                    Issue(
+                        number=blocker,
+                        title="",
+                        body="",
+                        labels=set(),
+                        assignees=[],
+                        is_pr=False,
+                        repo=repo,
+                    )
+                )
+        return blockers
 
     def _pull(self, number: int) -> PullRequest:
         data = self.pulls[number]
@@ -215,7 +286,7 @@ class FakeGitHubLite:
             body="",
             head_ref=data["head_ref"],
             head_sha=data["head_sha"],
-            base_ref="main",
+            base_ref=data.get("base_ref", "main"),
             labels=set(data["labels"]),
             state="open",
         )
@@ -237,7 +308,11 @@ class FakeGitHubLite:
         ]
 
     def list_open_issues(self, label: str) -> list[Issue]:
-        return [self.get_issue(n) for n, d in sorted(self.issues.items()) if label in d["labels"]]
+        return [
+            self.get_issue(n)
+            for n, d in sorted(self.issues.items())
+            if label in d["labels"] and d.get("state", "open") == "open"
+        ]
 
     def path_exists(self, path: str, *, ref: str) -> bool:
         return path in self.evidence

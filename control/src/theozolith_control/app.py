@@ -887,6 +887,9 @@ def create_app(
             "zombie_flags": store.zombie_flags(),
             "janitor_actions": store.janitor_actions(),
             "malformed_states": store.malformed_states(),
+            # Why a plan_ready dependent is not being granted (ADR-0053):
+            # advisory display, rebuilt from GitHub every dispatch pass.
+            "dispatch_waits": store.dispatch_waits(),
             "quarantines": store.quarantines(),
             # Advisory config-distribution stamp skew (ADR-0042): a node's
             # applied distribution was built against a product version other

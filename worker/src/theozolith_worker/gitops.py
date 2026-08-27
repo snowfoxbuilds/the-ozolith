@@ -534,21 +534,25 @@ def clone_with_mirror(
     mirrors_dir: Path,
     dest: Path,
     *,
+    branch: str | None = None,
     env: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> None:
     """The Run checkout (#51): ensure + update the mirror, then reference-
     clone off it with ``--dissociate``, all under the per-repo lock. The
     result is byte-for-byte the disposable, self-contained checkout a full
-    clone produced — only the download shrinks. Any failure here — a trust
-    validation refusal, a git failure, or a ``timeout`` expiry on the lock
-    wait or any single git operation — is a pre-session infra failure
+    clone produced — only the download shrinks. ``branch`` selects the
+    checkout base (a Chained-Base Run clones its blocker's branch,
+    ADR-0053); the mirror update precedes the reference clone, so a
+    freshly pushed blocker tip is always present. Any failure here — a
+    trust validation refusal, a git failure, or a ``timeout`` expiry on the
+    lock wait or any single git operation — is a pre-session infra failure
     (ADR-0016): the caller's Run fails and burns the normal retry; a
     half-context checkout is never handed to an agent."""
     with mirror_lock(mirrors_dir, url, timeout=timeout):
         mirror = _ensure_mirror_locked(mirrors_dir, url, env, timeout)
         _update_mirror_locked(mirror, url, env, timeout)
-        clone(url, dest, reference=mirror, env=env, timeout=timeout)
+        clone(url, dest, branch=branch, reference=mirror, env=env, timeout=timeout)
 
 
 def sanitize_checkout(workdir: Path, remote_url: str) -> None:
@@ -645,6 +649,21 @@ def commit_exists(cwd: Path, sha: str) -> bool:
     return (
         subprocess.run(
             ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+            cwd=str(cwd),
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
+    """Is ``ancestor`` reachable from ``descendant``? False on any failure
+    (unknown commit or ref included) — callers treat containment as a proof
+    obligation, so an unverifiable ancestry is a plain no."""
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
             cwd=str(cwd),
             capture_output=True,
             check=False,
