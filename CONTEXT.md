@@ -12,7 +12,7 @@ The entire configuration for one coding tool — Claude, Codex, or Pi. Tool-scop
 
 **Agent Adapter**
 
-The per-tool invocation layer the Agent Harness calls to run one headless session (Claude Code, Pi). Ships in the product distribution; the worker-type definition selects which adapter a worker uses (grilling 2026-08-09 — the "default harnesses" of early design talk are really default adapters). Each adapter declares the models and reasoning-effort values it can map; the derived-image build fails on an undeclared value (grilling 2026-08-10).
+The per-tool invocation layer the Agent Harness calls to run one headless session (Claude Code, Codex; Pi reserved). Ships in the product distribution; the worker-type definition selects which adapter a worker uses (grilling 2026-08-09 — the "default harnesses" of early design talk are really default adapters). Each adapter declares the models and reasoning-effort values it can map; the derived-image build fails on an undeclared value (grilling 2026-08-10).
 
 *Avoid*: "harness" (immutable product plumbing, never a per-type variable); "Agent" (an Agent is the whole tool config the adapter invokes).
 

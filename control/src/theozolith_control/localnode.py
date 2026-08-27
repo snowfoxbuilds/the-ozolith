@@ -712,7 +712,7 @@ def _scaffold_worker_type() -> str:
 # step 1 replaces them.
 
 driver = "builtin:implementer"   # the staged pipeline Implementer
-adapter = "claude"               # the Agent adapter the harness invokes
+adapter = "claude"               # the Agent adapter the harness invokes ("claude" | "codex")
 # Required with a driver, validated against the adapter, and BAKED into the
 # derived image at build time (ADR-0045) — changing it rebuilds the image;
 # the pipeline passes no model at invocation, and a detected off-model Run
@@ -807,9 +807,10 @@ hash-pinned, verified config distribution and runs without forking the product.
 there is code execution with driver credentials on every node that runs it.
 
 **Knowledge** (ADR-0048): a `knowledge/<name>/` directory here holds one
-knowledge root (skills/, agents/, workflows/, AGENTS.md). Reference it from a
-worker type with `knowledge = "knowledge/<name>"`. Ingest compiles it and pins
-its content hash; driver workers bake the compiled tree into their images,
+knowledge root (skills/, agents/<tool>/, workflows/, AGENTS.md). Reference it
+from a worker type with `knowledge = "knowledge/<name>"`. Ingest compiles it
+once per tool (ADR-0052) and pins each view's content hash; driver workers
+bake their adapter's compiled view into their images,
 and a Flight Deck's field selects which applied tree its read-only mount
 serves (content edits reach running decks on agent-CLI restart; changing the
 selected tree recreates the deck).

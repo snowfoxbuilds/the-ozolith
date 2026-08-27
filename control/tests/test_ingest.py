@@ -5,6 +5,7 @@ BEFORE committing, stamp source provenance, and never leave a partial state."""
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -81,14 +82,21 @@ def test_ingest_compiles_pins_commits_and_the_result_loads(tmp_path):
     # Provenance is stamped in the commit message and in pins.toml.
     assert report.source_commit in _git(pinned, "log", "-1", "--format=%s")
     assert report.source_commit in (pinned / "pins.toml").read_text()
-    # The knowledge tree is COMPILED output (AGENTS.md became CLAUDE.md).
-    assert (pinned / "knowledge/dev/CLAUDE.md").is_file()
-    assert (pinned / "knowledge/dev/skills/hello/SKILL.md").is_file()
-    assert not (pinned / "knowledge/dev/AGENTS.md").exists()
-    assert report.knowledge_pins == {"dev": configdist.knowledge_tree_hash(pinned, "dev")}
-    # The pinned build loads under the real validator, pin joined.
+    # The knowledge tree is COMPILED output, once per tool (ADR-0052):
+    # the claude view (AGENTS.md became CLAUDE.md) and the codex view
+    # (AGENTS.md verbatim, skills shared) each under their tool subdir.
+    assert (pinned / "knowledge/dev/claude/CLAUDE.md").is_file()
+    assert (pinned / "knowledge/dev/claude/skills/hello/SKILL.md").is_file()
+    assert not (pinned / "knowledge/dev/claude/AGENTS.md").exists()
+    assert (pinned / "knowledge/dev/codex/AGENTS.md").is_file()
+    assert (pinned / "knowledge/dev/codex/skills/hello/SKILL.md").is_file()
+    assert report.knowledge_pins == {
+        "dev/claude": configdist.knowledge_tree_hash(pinned, "dev/claude"),
+        "dev/codex": configdist.knowledge_tree_hash(pinned, "dev/codex"),
+    }
+    # The pinned build loads under the real validator, pin joined per tool.
     config = configrepo.load_config(pinned)
-    assert config.worker_types["claude-dev"].knowledge_pin == report.knowledge_pins["dev"]
+    assert config.worker_types["claude-dev"].knowledge_pin == report.knowledge_pins["dev/claude"]
     # control.toml went through ingest: the settings surface arrived.
     assert controltoml.read_values(pinned)["heartbeat_seconds"] == 30.0
     # The working tree is clean — everything ingested is committed.
@@ -202,6 +210,72 @@ def test_a_bad_resolver_answer_is_refused(tmp_path):
         )
 
 
+def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
+    """The migration's no-retag proof (ADR-0052): knowledge_tree_hash is
+    computed with relpaths RELATIVE TO THE TREE ROOT, so the claude compile
+    moving from knowledge/dev/ to knowledge/dev/claude/ keeps the pin value
+    byte-identical — no claude worker type re-tags on the layout change."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, log=lambda *_: None)
+
+    legacy = tmp_path / "legacy-shaped"
+    shutil.copytree(pinned / "knowledge/dev/claude", legacy / "knowledge/dev")
+    assert configdist.knowledge_tree_hash(legacy, "dev") == report.knowledge_pins["dev/claude"]
+
+
+def test_per_tool_compile_skips_empty_filesets(tmp_path):
+    """A tree with content for only one tool records only that tool's pin
+    and writes only that tool's directory (ADR-0052): workflows compile for
+    claude alone; agents/codex compiles for codex alone."""
+    src = source_repo(tmp_path)
+    write(src, "knowledge/wf-only/workflows/pair.md", "review in pairs\n")
+    write(src, "knowledge/cdx-only/agents/codex/triage.md", "triage first\n")
+    _commit_all(src, "single-tool trees")
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, log=lambda *_: None)
+
+    assert "wf-only/claude" in report.knowledge_pins
+    assert "wf-only/codex" not in report.knowledge_pins
+    assert not (pinned / "knowledge/wf-only/codex").exists()
+    assert "cdx-only/codex" in report.knowledge_pins
+    assert "cdx-only/claude" not in report.knowledge_pins
+    assert not (pinned / "knowledge/cdx-only/claude").exists()
+    assert (pinned / "knowledge/cdx-only/codex/prompts/triage.md").is_file()
+
+
+def test_reingest_migrates_a_legacy_layout_pinned_build(tmp_path):
+    """A pre-ADR-0052 pinned build (bare knowledge/<name>/ claude compile,
+    bare pins keys) converts on the operator's next ingest of the UNCHANGED
+    source — the recommended post-update step. Until then the legacy layout
+    loads through the compat shims (exercised by the configrepo goldens)."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+
+    # Reshape the pinned build into its pre-ADR-0052 form by hand: claude
+    # compile bare under knowledge/dev/, bare pins key, committed.
+    claude_tree = pinned / "knowledge/dev/claude"
+    staged = pinned / "knowledge/.legacy-stage"
+    claude_tree.rename(staged)
+    shutil.rmtree(pinned / "knowledge/dev")
+    staged.rename(pinned / "knowledge/dev")
+    pin = configdist.knowledge_tree_hash(pinned, "dev")
+    pins_text = (pinned / "pins.toml").read_text()
+    pins_text = pins_text[: pins_text.index("[knowledge]")] + f'[knowledge]\n"dev" = "{pin}"\n'
+    (pinned / "pins.toml").write_text(pins_text)
+    _commit_all(pinned, "hand-shaped legacy layout")
+    assert configrepo.load_config(pinned).worker_types["claude-dev"].knowledge_pin == pin
+
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert report.changed
+    assert (pinned / "knowledge/dev/claude/CLAUDE.md").is_file()
+    assert (pinned / "knowledge/dev/codex/AGENTS.md").is_file()
+    assert not (pinned / "knowledge/dev/CLAUDE.md").exists()
+    # Pin value unchanged for claude (no-retag), now under the per-tool key.
+    assert report.knowledge_pins["dev/claude"] == pin
+
+
 def test_knowledge_edit_retags_only_the_referencing_type(tmp_path):
     """Selective rebuild (ADR-0048): per-tree pins mean an edit to one
     knowledge tree moves exactly the worker types that reference it."""
@@ -243,11 +317,11 @@ def test_chmod_only_knowledge_edit_repins_and_retags(tmp_path):
     _commit_all(src, "chmod +x only")
     after = ingest(str(src), pinned, log=lambda *_: None)
     assert after.changed
-    assert after.knowledge_pins["dev"] != before.knowledge_pins["dev"]
+    assert after.knowledge_pins["dev/claude"] != before.knowledge_pins["dev/claude"]
     assert set(after.retagged) == {"claude-dev"}
     assert configrepo.load_config(pinned).worker_types["claude-dev"].tag != before_tag
     assert configdist.dist_hash(pinned) != before_dist
-    assert (pinned / "knowledge/dev/skills/hello/run.sh").stat().st_mode & 0o111
+    assert (pinned / "knowledge/dev/claude/skills/hello/run.sh").stat().st_mode & 0o111
 
 
 def test_chmod_only_folder_source_edit_changes_the_provenance_stamp(tmp_path):
@@ -270,7 +344,7 @@ def test_knowledge_that_does_not_compile_is_refused_at_ingest(tmp_path):
     start (ADR-0048). An empty knowledge root is the simplest reject."""
     src = source_repo(tmp_path, git=False)
     (src / "knowledge" / "empty").mkdir()
-    with pytest.raises(IngestError, match="does not compile"):
+    with pytest.raises(IngestError, match="is not a knowledge root"):
         ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
 
 
@@ -332,9 +406,10 @@ def test_ingested_distribution_round_trips_to_the_node_side(tmp_path):
     dest.mkdir()
     node_configdist.extract_zip(path.read_bytes(), dest)
     assert node_configdist.manifest_hash_of_tree(dest) == digest
-    assert node_configdist.knowledge_tree_hash(dest, "dev") == configdist.knowledge_tree_hash(
-        pinned, "dev"
-    )
+    for tree in ("dev/claude", "dev/codex"):
+        assert node_configdist.knowledge_tree_hash(dest, tree) == configdist.knowledge_tree_hash(
+            pinned, tree
+        )
 
 
 def test_executable_skill_scripts_survive_the_round_trip(tmp_path):
@@ -348,13 +423,13 @@ def test_executable_skill_scripts_survive_the_round_trip(tmp_path):
     script.chmod(0o755)
     pinned = pinned_dir(tmp_path)
     ingest(str(src), pinned, log=lambda *_: None)
-    assert (pinned / "knowledge/dev/skills/hello/run.sh").stat().st_mode & 0o111
+    assert (pinned / "knowledge/dev/claude/skills/hello/run.sh").stat().st_mode & 0o111
 
     digest, path = configdist.build_artifact(pinned, tmp_path / "out", built_against="0.3.0")
     dest = tmp_path / "node-tree"
     dest.mkdir()
     node_configdist.extract_zip(path.read_bytes(), dest)
-    assert (dest / "knowledge/dev/skills/hello/run.sh").stat().st_mode & 0o111
+    assert (dest / "knowledge/dev/claude/skills/hello/run.sh").stat().st_mode & 0o111
     assert node_configdist.manifest_hash_of_tree(dest) == digest
 
 
@@ -463,7 +538,7 @@ def test_unsupported_concurrent_commit_fails_the_publish_and_is_preserved(tmp_pa
     report = ingest(str(src), pinned, log=lambda *_: None)
     assert report.changed
     assert "interloper" in _git(pinned, "log", "--format=%s")
-    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "v2" in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
 
 
 def test_ignored_leftovers_are_purged_and_the_worktree_is_exactly_head(tmp_path):
@@ -622,7 +697,7 @@ def test_dry_run_previews_changes_without_committing(tmp_path):
 
     report = ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
     assert report.dry_run and report.changed and not report.pinned_commit
-    assert "update knowledge/dev/CLAUDE.md" in report.changes
+    assert "update knowledge/dev/claude/CLAUDE.md" in report.changes
     assert "update product.toml" in report.changes
     assert "update pins.toml" in report.changes  # the source stamp moved
     # The knowledge pin moved, so the referencing type WOULD re-tag.
@@ -634,7 +709,7 @@ def test_dry_run_previews_changes_without_committing(tmp_path):
     assert _git(pinned, "status", "--porcelain", "--ignored") == ""
     assert not (pinned / ".git" / PENDING_MARKER).exists()
     assert _git(pinned, "count-objects", "-v") == objects_before
-    assert "# team knowledge" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "# team knowledge" in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
 
 
 def test_dry_run_previews_the_preserved_pin_not_a_delete(tmp_path):
@@ -720,7 +795,7 @@ def test_dry_run_against_a_missing_pinned_build_creates_nothing(tmp_path):
     assert report.changed
     assert not pinned.exists()
     assert "add worker-types/claude-dev.toml" in report.changes
-    assert "add knowledge/dev/CLAUDE.md" in report.changes
+    assert "add knowledge/dev/claude/CLAUDE.md" in report.changes
     assert report.retagged["claude-dev"][0] == ""  # every type is (new)
 
 
@@ -850,13 +925,13 @@ def test_git_failure_before_the_publish_leaves_the_pinned_build_untouched(tmp_pa
     assert _git(pinned, "status", "--porcelain") == ""
     assert not (pinned / ".git" / PENDING_MARKER).exists()
     assert first.source_commit in (pinned / "pins.toml").read_text()
-    assert "v2" not in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "v2" not in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
 
     report = ingest(str(src), pinned, log=lambda *_: None)
     assert report.changed and report.source_commit == edited
     assert edited in _git(pinned, "log", "-1", "--format=%s")
     assert edited in (pinned / "pins.toml").read_text()
-    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "v2" in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
 
 
 def test_interrupted_publish_is_recovered_by_the_next_ingest(tmp_path):
@@ -877,7 +952,7 @@ def test_interrupted_publish_is_recovered_by_the_next_ingest(tmp_path):
     # Commit-first: the ref moved, the publish did not — the marker brackets it.
     assert (pinned / ".git" / PENDING_MARKER).exists()
     assert _git(pinned, "rev-parse", "HEAD") != head_before
-    assert "v2" not in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "v2" not in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
 
     report = ingest(str(src), pinned, log=lambda *_: None)
     assert any("recovered an interrupted ingest" in note for note in report.notes)
@@ -887,7 +962,7 @@ def test_interrupted_publish_is_recovered_by_the_next_ingest(tmp_path):
     assert _git(pinned, "status", "--porcelain") == ""
     assert edited in _git(pinned, "log", "-1", "--format=%s")
     assert edited in (pinned / "pins.toml").read_text()
-    assert "v2" in (pinned / "knowledge/dev/CLAUDE.md").read_text()
+    assert "v2" in (pinned / "knowledge/dev/claude/CLAUDE.md").read_text()
     assert configrepo.load_config(pinned).worker_types["claude-dev"].knowledge_pin
 
 

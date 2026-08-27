@@ -28,13 +28,13 @@ def test_cache_volumes_reject_a_claude_target():
     Run — a cache volume aimed at a .claude path is refused, closing the
     prompt-injection persistence channel. The Flight-Deck symlink carve-out is
     the only exception and never touches run containers."""
-    with pytest.raises(ConfigError, match=r"\.claude path.*ADR-0043"):
+    with pytest.raises(ConfigError, match=r"\.claude or \.codex path.*ADR-0043"):
         load_config(
             {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude"},
             role="implementer",
         )
     # A .claude segment anywhere in the path is refused, not only the leaf.
-    with pytest.raises(ConfigError, match=r"\.claude path"):
+    with pytest.raises(ConfigError, match=r"\.claude or \.codex path"):
         load_config(
             {**_BASE_ENV, "THEOZOLITH_CACHE_VOLUMES": "poison:/home/ozolith/.claude/skills"},
             role="implementer",

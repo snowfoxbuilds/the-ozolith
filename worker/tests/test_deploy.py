@@ -85,14 +85,40 @@ def test_run_image_contract():
     assert "theozolith-knowledge bake" in dockerfile
 
 
-def test_ci_builds_the_run_container_image():
-    """M2 brief: the CI must build the run-container image so image rot is
-    caught (a PR #2 review finding, absorbed here). The build runs through
-    buildx (docker/build-push-action) with a GHA layer cache; what the
-    image-rot guarantee needs is that this Dockerfile is still built."""
+def test_codex_run_image_contract():
+    """The codex base image (ADR-0052) mirrors the run-image posture with
+    its deliberate divergences: the CLI is PINNED to exactly the adapter's
+    enforcement floor (the --json schema and rollout journal the parsers
+    speak are experimental — the pin is the policy, the floor the
+    backstop), and no knowledge bakes standalone (derived images bake the
+    per-tool tree at the node)."""
+    from theozolith_worker.adapters import CodexAdapter
+
+    dockerfile = (REPO_ROOT / "worker" / "docker" / "Dockerfile.codex").read_text()
+    assert 'ENTRYPOINT ["theozolith-harness"]' in dockerfile
+    assert "tmux" not in dockerfile
+    assert "USER ozolith" in dockerfile
+    assert "OZOLITH_UID" in dockerfile
+    pinned = re.search(r"npm install -g @openai/codex@(\d+\.\d+\.\d+)", dockerfile)
+    assert pinned is not None, "the codex CLI install must be version-pinned"
+    floor = ".".join(str(part) for part in CodexAdapter.MIN_ENFORCING_CLI)
+    assert pinned.group(1) == floor  # bump both together, re-running spike #76
+    assert "theozolith-knowledge bake" not in dockerfile
+
+
+def test_ci_builds_the_run_container_images():
+    """M2 brief: the CI must build the run-container images so image rot is
+    caught (a PR #2 review finding, absorbed here; one matrix leg per Agent
+    adapter since ADR-0052). The build runs through buildx
+    (docker/build-push-action) with a GHA layer cache, one scope per image
+    so the legs never evict each other's layers."""
     ci = CI.read_text()
     assert "docker/build-push-action" in ci
-    assert "file: worker/docker/Dockerfile.claude" in ci
+    job = yaml.safe_load(ci)["jobs"]["run-image"]
+    legs = {leg["agent"]: leg for leg in job["strategy"]["matrix"]["include"]}
+    assert legs["claude"]["dockerfile"] == "worker/docker/Dockerfile.claude"
+    assert legs["codex"]["dockerfile"] == "worker/docker/Dockerfile.codex"
+    assert legs["claude"]["cache_scope"] != legs["codex"]["cache_scope"]
 
 
 def _publish_job() -> dict:
@@ -264,21 +290,26 @@ def test_ci_publishes_the_run_image_from_main_only():
     # (obsolete runs supersede themselves at the tip check instead) and
     # never drops one from the queue: queue: max keeps every pending run
     # in FIFO order, so the current tip's run always gets its turn.
+    # One concurrency group per image (ADR-0052 matrix): each registry
+    # ref's monotonic FIFO ordering is its own.
     assert job["concurrency"] == {
-        "group": "publish-run-image-main",
+        "group": "publish-run-image-main-${{ matrix.agent }}",
         "cancel-in-progress": False,
         "queue": "max",
     }
+    legs = {leg["agent"]: leg for leg in job["strategy"]["matrix"]["include"]}
+    assert set(legs) == {"claude", "codex"}
+    assert legs["claude"]["dockerfile"] == "worker/docker/Dockerfile.claude"
+    assert legs["codex"]["dockerfile"] == "worker/docker/Dockerfile.codex"
+    assert job["env"]["IMAGE"] == "ghcr.io/snowfoxbuilds/theozolith-run-${{ matrix.agent }}"
     # No job in the workflow lets build-push-action push.
     assert "push: true" not in ci
     build = [s for s in job["steps"] if str(s.get("uses", "")).startswith("docker/build-push")]
     assert len(build) == 1
     assert build[0]["with"]["push"] is False and build[0]["with"]["load"] is True
-    assert "ghcr.io/snowfoxbuilds/theozolith-run-claude:main" in build[0]["with"]["tags"]
-    assert (
-        "ghcr.io/snowfoxbuilds/theozolith-run-claude:sha-${{ github.sha }}"
-        in (build[0]["with"]["tags"])
-    )
+    assert build[0]["with"]["file"] == "${{ matrix.dockerfile }}"
+    assert "${{ env.IMAGE }}:main" in build[0]["with"]["tags"]
+    assert "${{ env.IMAGE }}:sha-${{ github.sha }}" in build[0]["with"]["tags"]
     # Ordering: relevance -> write-once -> build -> tip -> login -> push
     # -> repair.
     names = [str(s.get("name") or s.get("uses")) for s in job["steps"]]
@@ -607,6 +638,9 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
     assert kinds == {
         "implementer": "process",
         "reviewer": "process",
+        # The second-adapter reviewer (ADR-0052), staged stopped beside the
+        # claude one (the pr_ready race is documented, not routed).
+        "codex-review": "process",
         "flightdeck": "container",
         # The custom-driver example (ADR-0042): a drivers/<name> worker type
         # resolves to process kind and the generic launcher, staged stopped.
@@ -617,14 +651,23 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
     # declaring product.toml here would revert real deployments' pins.
     assert config.product_version == ""
     assert "claude-dev" in config.worker_types
-    # The example knowledge tree compiled at ingest and pinned per tree; both
-    # claude types share it, so they share the pin (ADR-0048).
+    # The example knowledge tree compiled at ingest, pinned PER TOOL
+    # (ADR-0052); both claude types share the claude-view pin, the codex
+    # reviewer joins the codex-view pin of the SAME tree.
     assert config.worker_types["claude-dev"].knowledge == "knowledge/claude-dev"
     assert (
         config.worker_types["claude-dev"].knowledge_pin
         == config.worker_types["claude-review"].knowledge_pin
         != ""
     )
+    codex_review = config.worker_types["codex-review"]
+    assert codex_review.knowledge == "knowledge/claude-dev"
+    assert codex_review.knowledge_pin not in ("", config.worker_types["claude-dev"].knowledge_pin)
+    # The recipe carries the adapter-derived bake target; the daemon COPYs
+    # where it is told (ADR-0052).
+    recipe = codex_review.recipe_wire()
+    assert recipe["knowledge_tool"] == "codex"
+    assert recipe["knowledge_target"] == "/home/ozolith/.codex/"
     # The custom driver resolves to the one launcher with a drivers/<name> ref
     # (ADR-0042), and its module is present so the load did not fault.
     hello = next(s for s in config.stacks if s.name == "hello-logger")

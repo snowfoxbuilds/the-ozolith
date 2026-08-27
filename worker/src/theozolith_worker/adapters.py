@@ -31,11 +31,14 @@ import secrets
 import shlex
 import stat
 import subprocess
+import tempfile
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from theozolith_worker import codexidentity
 from theozolith_worker import identity as identity_mod
 from theozolith_worker.identity import (
     BakedIdentity,
@@ -237,8 +240,13 @@ class AgentAdapter(Protocol):
         constant-size pointer at the mounted task file, never the task."""
         ...
 
-    def prepare(self, workdir: Path, job: Path) -> dict[str, str]:
-        """Extra environment for the agent process."""
+    def prepare(
+        self, workdir: Path, job: Path, *, identity_root: Path = Path("/")
+    ) -> dict[str, str]:
+        """Extra environment for the agent process. ``identity_root`` is the
+        filesystem the baked identity lives under (``/`` in a real
+        container; a tmp root in tests) — the codex adapter copies its
+        baked config out of it into the per-Run CODEX_HOME."""
         ...
 
     def collect(self, workdir: Path, job: Path, mode: str) -> None:
@@ -305,16 +313,32 @@ class AgentAdapter(Protocol):
         selects the baked model (and applies the baked effort)."""
         ...
 
+    def materialize_hooks(self, scratch: Path, workdir: Path) -> MonitorHooks:
+        """The observation-hook filesystem contract for a monitored task
+        session, materialized under ``scratch`` (outside the job mount):
+        the MonitorHooks paths plus whatever hook scripts and launch-time
+        baselines this adapter's monitor consumes — an adapter with no hook
+        surface returns the paths and writes nothing. May raise OSError;
+        the harness converts it into an identity failure (the observation
+        channel would be silently absent)."""
+        ...
+
     def monitored_command(self, manifest: Manifest, prompt: str, hooks: MonitorHooks) -> list[str]:
-        """The ordinary one-shot argv plus the observation hooks (Stop
-        applied-effort journal, ConfigChange recorder) riding ``--settings``
-        — the session keeps its full normal capabilities, checkout
-        CLAUDE.md and skills included."""
+        """The ordinary one-shot argv plus this adapter's observation hooks
+        (for Claude: the Stop applied-effort journal and the ConfigChange
+        recorder riding ``--settings``) — the session keeps its full normal
+        capabilities, checkout instruction files and skills included."""
         ...
 
     def session_monitor(self, identity: BakedIdentity, hooks: MonitorHooks):
-        """The fail-loud stream watcher for a monitored task session (see
-        ``identity.ClaudeSessionMonitor`` for the contract)."""
+        """The stream watcher for a monitored task session: fail-loud for
+        Claude (see ``identity.ClaudeSessionMonitor`` for the duck-typed
+        contract), a benign evidence observer for codex (ADR-0052's
+        PROBE + STATIC doctrine). A monitor exposing an ``observed_effort``
+        attribute owns the applied-effort observation channel (codex: the
+        rollout turn_context) — the harness records it as the authoritative
+        evidence and never consults the Claude Stop-hook journal for that
+        session."""
         ...
 
 
@@ -554,6 +578,28 @@ class ClaudeAdapter:
             run=run,
         )
 
+    def materialize_hooks(self, scratch: Path, workdir: Path) -> MonitorHooks:
+        # The Claude observation channel: the two hook helper scripts plus
+        # the launch-time baseline of the checkout's identity-shaped
+        # settings keys (so the ConfigChange hook reports only keys a
+        # mid-session change ADDED — a checkout that legitimately ships an
+        # inert identity key is not killed for a benign edit).
+        hooks = MonitorHooks(
+            stop_capture=scratch / "stop.jsonl",
+            config_capture=scratch / "config-change.jsonl",
+            config_baseline=scratch / "config-baseline.json",
+            config_hook_script=scratch / "configchange_hook.py",
+            stop_hook_script=scratch / "stop_hook.py",
+        )
+        hooks.config_hook_script.write_text(
+            identity_mod.CONFIG_CHANGE_HOOK_SOURCE, encoding="utf-8"
+        )
+        hooks.stop_hook_script.write_text(identity_mod.STOP_HOOK_SOURCE, encoding="utf-8")
+        hooks.config_baseline.write_text(
+            json.dumps(identity_mod.project_settings_baseline(workdir)), encoding="utf-8"
+        )
+        return hooks
+
     def monitored_command(self, manifest: Manifest, prompt: str, hooks: MonitorHooks) -> list[str]:
         # The ordinary one-shot launch plus two observation hooks riding
         # --settings (managed settings outrank it, so nothing here can
@@ -618,7 +664,9 @@ class ClaudeAdapter:
             "--verbose",
         ]
 
-    def prepare(self, workdir: Path, job: Path) -> dict[str, str]:
+    def prepare(
+        self, workdir: Path, job: Path, *, identity_root: Path = Path("/")
+    ) -> dict[str, str]:
         return {}
 
     def collect(self, workdir: Path, job: Path, mode: str) -> None:
@@ -710,6 +758,320 @@ class ClaudeAdapter:
         )
 
 
+class CodexAdapter:
+    """Drives the OpenAI Codex CLI (ADR-0052). All codex-specific mechanics
+    live here and in ``codexidentity``.
+
+    The session runs headless: ``codex exec`` with the pointer prompt as
+    the argument and ``--json``, so stdout is a line-per-event JSONL stream
+    (thread.started / turn.started / item.* / turn.completed / turn.failed
+    / error — verified against codex-cli 0.150.0). That stream is the
+    transcript and the usage source; it carries NO model signal — the
+    observed model comes from the session rollout journal in the throwaway
+    per-Run ``CODEX_HOME`` (see codexidentity). ``--sandbox
+    danger-full-access`` is the codex spelling of Claude's
+    ``--dangerously-skip-permissions``: the run container IS the sandbox
+    (ADR-0013), and codex's own Landlock sandbox is unavailable inside it.
+
+    Identity doctrine is PROBE + STATIC only (weaker than Claude's by the
+    CLI's construction — there is no managed-policy tier and no hook
+    surface): baked config + one driver-boot probe + per-Run static checks
+    + a benign evidence observer. No live mid-run kill; undetected
+    steering is a recorded gap (ADR-0052)."""
+
+    name = "codex"
+
+    # Full OpenAI model IDs, shape-checked (the CLI passes them through to
+    # the provider). No hand-curated family aliases like Claude's — but the
+    # provider's ``-latest`` IDs (e.g. codex-mini-latest) are moving
+    # pointers, so they classify as floating aliases: mappable, and the
+    # control-side lint warns exactly as it does for Claude's (ADR-0045).
+    _PINNED = re.compile(r"gpt-[a-z0-9.-]+|o[0-9][a-z0-9.-]*|codex-[a-z0-9.-]+")
+    # The vocabulary config.toml's model_reasoning_effort accepts. Which
+    # models provably HONOR a level is the capability table's question
+    # (codexidentity — empty until spike #76 S7 proves entries), so today
+    # every nonempty effort fails the pair gate with an actionable message.
+    EFFORTS = codexidentity.CODEX_EFFORT_VOCABULARY
+    # Items in the event stream that represent executed tool-ish work.
+    _TOOL_ITEM_TYPES = frozenset(
+        {"command_execution", "mcp_tool_call", "web_search", "file_change"}
+    )
+    # The oldest codex CLI whose exact behavior this adapter relies on: the
+    # --json v2 event schema the parsers speak, the rollout turn_context
+    # journal carrying (model, effort), config-key binding in exec mode,
+    # and the sandbox/skip-git-repo-check flags — all verified live on
+    # 0.150.0, which is therefore the floor (and the base image pins the
+    # same version: the schema is experimental, the pin is the policy).
+    MIN_ENFORCING_CLI = (0, 150, 0)
+    model_shapes = "full OpenAI model IDs (gpt-*, o*, codex-*); '-latest' IDs float"
+
+    def __init__(self, binary: str = "codex"):
+        self._binary = binary
+        self._home: Path | None = None
+
+    def classify_model(self, model: str) -> str:
+        if not self._PINNED.fullmatch(model):
+            return MODEL_UNMAPPABLE
+        if model.endswith("-latest"):
+            return MODEL_ALIAS
+        return MODEL_PINNED
+
+    def mappable_efforts(self) -> frozenset[str]:
+        return self.EFFORTS
+
+    def pair_error(self, model: str, effort: str) -> str:
+        return codexidentity.pair_error(model, effort)
+
+    def _cli_version(self) -> str:
+        try:
+            probe = subprocess.run(
+                [self._binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AgentAdapterError(
+                f"cannot run '{self._binary} --version': {exc} — the base image"
+                " must ship the Codex CLI beside theozolith-adapter (ADR-0052)"
+            ) from exc
+        if probe.returncode != 0:
+            raise AgentAdapterError(
+                f"'{self._binary} --version' exited {probe.returncode}:"
+                f" {probe.stderr.strip() or probe.stdout.strip()}"
+            )
+        return probe.stdout.strip()
+
+    def verify_enforceable(self) -> str:
+        raw = self._cli_version()
+        match = re.match(r"codex-cli (\d+)\.(\d+)\.(\d+)", raw)
+        if not match:
+            raise AgentAdapterError(
+                f"cannot parse a version from '{self._binary} --version' output {raw!r}"
+            )
+        version = tuple(int(part) for part in match.groups())
+        if version < self.MIN_ENFORCING_CLI:
+            floor = ".".join(str(part) for part in self.MIN_ENFORCING_CLI)
+            raise AgentAdapterError(
+                f"codex {raw} predates the behavior this machinery relies on"
+                " (the --json event schema, the rollout turn_context journal,"
+                f" config-key binding in exec mode; CLI >= {floor}) — the"
+                " baked identity would not bind; bump the worker type's base"
+                " to a release with a newer CLI (ADR-0052)"
+            )
+        return raw
+
+    def materialize(self, model: str, effort: str, *, root: Path, scope: str) -> list[Path]:
+        """Bake ``model``/``effort`` into the image filesystem under
+        ``root``: the well-known files plus the theozolith-owned
+        ``etc/theozolith/codex/config.toml`` every session's throwaway
+        ``CODEX_HOME`` receives a copy of.
+
+        ``interactive`` scope is REJECTED outright: no codex Flight Deck
+        worker type exists (the deck machinery is Claude-shaped, ADR-0043),
+        and control refuses the config upstream — this is the in-image
+        backstop. A pre-existing baked config is conflict-scanned: any
+        selection key fails the build naming it (operator content is never
+        overwritten); identity keys are then emitted as a header block
+        PREPENDED before the preserved operator bytes, and the merged text
+        is re-parsed before landing. Same symlink-safe atomic write
+        discipline as the Claude bake."""
+        if scope == SCOPE_INTERACTIVE:
+            raise AgentAdapterError(
+                "the codex adapter has no interactive-scope materialization —"
+                " no codex Flight Deck worker type exists (ADR-0052)"
+            )
+        pair = codexidentity.pair_error(model, effort)
+        if pair:
+            raise AgentAdapterError(pair)
+        if not model:
+            raise AgentAdapterError(
+                "the codex adapter materializes nothing without a model —"
+                " effort alone is not an identity (ADR-0045)"
+            )
+        config_parts = Path(codexidentity.BAKED_CONFIG_FILE).parts
+        plan: list[tuple[str, str]] = []
+        for relpath, value in ((WELL_KNOWN_MODEL_FILE, model), (WELL_KNOWN_EFFORT_FILE, effort)):
+            if value:
+                plan.append((relpath, value + "\n"))
+        written: list[Path] = []
+        with contextlib.ExitStack() as stack:
+            resolved: list[tuple[int, str, Path, str]] = []
+            for relpath, content in plan:
+                parts = Path(relpath).parts
+                dir_fd = stack.enter_context(_bake_dir(root, parts[:-1]))
+                _refuse_irregular_destination(dir_fd, parts[-1], root / relpath)
+                resolved.append((dir_fd, parts[-1], root / relpath, content))
+            config_fd = stack.enter_context(_bake_dir(root, config_parts[:-1]))
+            config_target = root / codexidentity.BAKED_CONFIG_FILE
+            _refuse_irregular_destination(config_fd, config_parts[-1], config_target)
+            existing = _read_regular_at(config_fd, config_parts[-1]) or ""
+            if existing:
+                try:
+                    document = tomllib.loads(existing)
+                except ValueError as exc:
+                    raise AgentAdapterError(
+                        f"{config_target}: existing baked config is not valid"
+                        f" TOML ({exc}) — refusing to merge into an unknowable document"
+                    ) from exc
+                conflicts = [
+                    key for key in codexidentity.CODEX_CONFIG_IDENTITY_KEYS if key in document
+                ]
+                if conflicts:
+                    raise AgentAdapterError(
+                        "existing baked codex config would supersede the baked"
+                        " identity — refusing to overwrite operator content;"
+                        f" remove the conflicting keys from {config_target}:"
+                        f" {', '.join(conflicts)}"
+                    )
+            header = [
+                "# Materialized by theozolith-adapter (ADR-0052) — the baked",
+                "# identity every session's CODEX_HOME receives. Never hand-edit.",
+                f'model = "{model}"',
+            ]
+            if effort:
+                header.append(f'model_reasoning_effort = "{effort}"')
+            merged = "\n".join(header) + "\n" + (("\n" + existing) if existing else "")
+            try:
+                tomllib.loads(merged)
+            except ValueError as exc:  # pragma: no cover - defense in depth
+                raise AgentAdapterError(
+                    f"{config_target}: merged baked config does not parse ({exc})"
+                ) from exc
+            resolved.append((config_fd, config_parts[-1], config_target, merged))
+            for dir_fd, name, target, content in resolved:
+                _replace_file_at(dir_fd, name, content.encode("utf-8"), where=target)
+                written.append(target)
+        return written
+
+    # -- the identity machinery (ADR-0052, PROBE + STATIC doctrine) -----------
+
+    def baked_identity(self, root: Path) -> BakedIdentity | None:
+        try:
+            return codexidentity.read_baked_identity(root)
+        except IdentityError as exc:
+            raise AgentAdapterError(str(exc)) from exc
+
+    def static_checks(self, identity: BakedIdentity, *, root: Path) -> PreflightReport:
+        return codexidentity.static_identity_report(identity, root=root)
+
+    def preflight(
+        self, identity: BakedIdentity, *, root: Path, scratch: Path, run=subprocess.run
+    ) -> PreflightReport:
+        scratch.mkdir(parents=True, exist_ok=True)
+        return codexidentity.run_preflight(
+            identity,
+            binary=self._binary,
+            root=root,
+            scratch=scratch,
+            min_cli=self.MIN_ENFORCING_CLI,
+            run=run,
+        )
+
+    def materialize_hooks(self, scratch: Path, workdir: Path) -> MonitorHooks:
+        # No hook surface: the paths exist to satisfy the contract, nothing
+        # is written, and no capture file ever appears — the harness's
+        # missing-observation paths record gaps, which is the doctrine.
+        return MonitorHooks(
+            stop_capture=scratch / "stop.jsonl",
+            config_capture=scratch / "config-change.jsonl",
+            config_baseline=scratch / "config-baseline.json",
+            config_hook_script=scratch / "configchange_hook.py",
+            stop_hook_script=scratch / "stop_hook.py",
+        )
+
+    def monitored_command(self, manifest: Manifest, prompt: str, hooks: MonitorHooks) -> list[str]:
+        # No observation hooks to ride: the monitored launch IS the
+        # ordinary launch (the benign observer reads the rollout journal
+        # after exit instead).
+        return self.command(manifest, prompt)
+
+    def session_monitor(
+        self, identity: BakedIdentity, hooks: MonitorHooks
+    ) -> codexidentity.CodexSessionMonitor:
+        return codexidentity.CodexSessionMonitor(identity, hooks, self._home)
+
+    def command(self, manifest: Manifest, prompt: str) -> list[str]:
+        # Headless on purpose (ADR-0019). No -m/-c/--profile (ADR-0045:
+        # nothing at invocation selects a model — the baked config in the
+        # prepared CODEX_HOME does). --skip-git-repo-check is belt and
+        # braces for non-checkout working directories.
+        return [
+            self._binary,
+            "exec",
+            prompt,
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "danger-full-access",
+        ]
+
+    def prepare(
+        self, workdir: Path, job: Path, *, identity_root: Path = Path("/")
+    ) -> dict[str, str]:
+        """Assemble the throwaway per-Run ``CODEX_HOME`` (baked config +
+        0600 auth.json from the delivered ``CODEX_AUTH_JSON``) and point the
+        agent process at it. The only side-effecting ``prepare`` in the
+        codebase — codex reads config only from ``CODEX_HOME``, which must
+        be writable (the CLI stores session rollouts and state there; the
+        temp home dies with the container). The raw credential value also
+        remains visible in the agent process env — equivalent exposure to
+        the auth file inside the same container (ADR-0013's rotatable
+        spend-credential posture)."""
+        home = Path(tempfile.mkdtemp(prefix="theozolith-codex-home-"))
+        try:
+            codexidentity.assemble_codex_home(home, root=identity_root, environ=os.environ)
+        except IdentityError as exc:
+            raise AgentAdapterError(str(exc)) from exc
+        self._home = home
+        return {"CODEX_HOME": str(home)}
+
+    def collect(self, workdir: Path, job: Path, mode: str) -> None:
+        return
+
+    def stream_stats(self, transcript: Path) -> StreamStats:
+        """Scan the codex JSONL transcript: executed tool-ish items
+        (command_execution / mcp_tool_call / web_search / file_change on
+        item.completed) and per-turn usage summed across turn.completed
+        events. The stream carries no model signal — the observed model
+        reaches evidence through the session monitor's rollout read, so
+        ``model`` is empty here with the note saying why."""
+        tool_calls = 0
+        tokens: int | None = None
+        try:
+            with transcript.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "item.completed":
+                        item = event.get("item")
+                        if isinstance(item, dict) and item.get("type") in self._TOOL_ITEM_TYPES:
+                            tool_calls += 1
+                    elif event.get("type") == "turn.completed":
+                        turn = _usage_total(event.get("usage"))
+                        if turn is not None:
+                            tokens = (tokens or 0) + turn
+        except OSError:
+            return StreamStats()
+        return StreamStats(
+            tool_calls=tool_calls,
+            tokens=tokens,
+            model="",
+            model_note=(
+                "codex exec --json carries no model signal; the observed model"
+                " comes from the session rollout journal"
+            ),
+        )
+
+
 def _reconcile_models(
     init_model: str, turn_models: list[str], usage_models: list[str]
 ) -> tuple[str, str]:
@@ -773,7 +1135,9 @@ def _usage_total(usage: object) -> int | None:
 def make_agent_adapter(name: str) -> AgentAdapter:
     if name == "claude":
         return ClaudeAdapter()
-    raise AgentAdapterError(f"unknown Agent adapter {name!r} (M2 ships: claude)")
+    if name == "codex":
+        return CodexAdapter()
+    raise AgentAdapterError(f"unknown Agent adapter {name!r} (known: claude, codex)")
 
 
 def materialize_instruction(adapter: str, model: str, effort: str, scope: str) -> str:

@@ -51,12 +51,38 @@ def test_loose_file_in_agents_rejected(tmp_path):
 
 
 def test_unknown_tool_namespace_tolerated(tmp_path):
-    codex = tmp_path / "agents" / "codex"
-    codex.mkdir(parents=True)
-    (codex / "helper.md").write_text("future tool\n")
+    pi = tmp_path / "agents" / "pi"
+    pi.mkdir(parents=True)
+    (pi / "helper.md").write_text("future tool\n")
     (tmp_path / "AGENTS.md").write_text("# Root\n")
     root = load_knowledge_root(tmp_path)
     assert root.claude_agents == ()
+    assert root.codex_agents == ()
+
+
+def test_codex_agents_load(tmp_path):
+    codex = tmp_path / "agents" / "codex"
+    codex.mkdir(parents=True)
+    (codex / "helper.md").write_text("codex subagent\n")
+    root = load_knowledge_root(tmp_path)
+    assert [a.name for a in root.codex_agents] == ["helper"]
+    assert root.claude_agents == ()
+
+
+def test_codex_only_root_is_loadable(tmp_path):
+    # agents/codex content counts as knowledge: a codex-only tree is a root.
+    codex = tmp_path / "agents" / "codex"
+    codex.mkdir(parents=True)
+    (codex / "solo.md").write_text("x\n")
+    assert load_knowledge_root(tmp_path).codex_agents[0].name == "solo"
+
+
+def test_non_md_codex_agent_rejected(tmp_path):
+    codex = tmp_path / "agents" / "codex"
+    codex.mkdir(parents=True)
+    (codex / "helper.txt").write_text("x\n")
+    with pytest.raises(KnowledgeError, match=r"not a \.md file"):
+        load_knowledge_root(tmp_path)
 
 
 def test_non_md_claude_agent_rejected(tmp_path):

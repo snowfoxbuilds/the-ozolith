@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from theozolith_knowledge.bake import bake
+from theozolith_knowledge.compilers import COMPILERS, DEFAULT_GLOBAL_TARGETS
 from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
 from theozolith_knowledge.sync import SyncReport, sync
 
@@ -38,16 +39,21 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         f"AGENTS.md: {'yes' if root.agents_md else 'no'}, "
         f"skills: {len(root.skills)}, "
         f"claude agents: {len(root.claude_agents)}, "
+        f"codex agents: {len(root.codex_agents)}, "
         f"workflows: {len(root.workflows)}"
     )
     return 0
+
+
+def _default_target(tool: str) -> Path:
+    return Path(DEFAULT_GLOBAL_TARGETS[tool]).expanduser()
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
     if args.scope == "project" and args.target is None:
         print("error: --scope project requires --target <project-root>", file=sys.stderr)
         return 2
-    target = Path(args.target).expanduser() if args.target else Path.home() / ".claude"
+    target = Path(args.target).expanduser() if args.target else _default_target(args.tool)
     report = sync(
         args.source,
         args.scope,
@@ -63,8 +69,10 @@ def _cmd_sync(args: argparse.Namespace) -> int:
 
 
 def _cmd_bake(args: argparse.Namespace) -> int:
-    target = Path(args.target).expanduser() if args.target else Path.home() / ".claude"
-    result = bake(args.source, args.pin, target, scope=args.scope, subdir=args.subdir)
+    target = Path(args.target).expanduser() if args.target else _default_target(args.tool)
+    result = bake(
+        args.source, args.pin, target, scope=args.scope, subdir=args.subdir, tool=args.tool
+    )
     print(f"baked {result.source} @ {result.pin} ({result.commit}) into {target}")
     _print_report(result.report)
     return 0
@@ -91,12 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         required=True,
         choices=("global", "project"),
-        help="global: target is the Claude config dir (default ~/.claude). "
-        "project: target is the project repo root (CLAUDE.md at the root, "
-        "assets under .claude/).",
+        help="global: target is the tool's config dir (default ~/.claude or "
+        "~/.codex per --tool). project: target is the project repo root "
+        "(CLAUDE.md at the root, assets under .claude/; Claude-only — the "
+        "codex compiler is global-scope only).",
     )
     p.add_argument("--target", help="Target root (see --scope).")
-    p.add_argument("--tool", default="claude", choices=("claude",), help="Target tool.")
+    p.add_argument(
+        "--tool", default="claude", choices=tuple(sorted(COMPILERS)), help="Target tool."
+    )
     p.add_argument(
         "--check",
         action="store_true",
@@ -120,9 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Commit SHA, tag, or branch. Required: Knowledge Sources are always pinned.",
     )
-    p.add_argument("--target", help="Claude config dir to bake into (default ~/.claude).")
+    p.add_argument(
+        "--target",
+        help="Tool config dir to bake into (default ~/.claude or ~/.codex per --tool).",
+    )
     p.add_argument("--scope", default="global", choices=("global", "project"))
     p.add_argument("--subdir", help="Knowledge root within the repo, if not the repo root.")
+    p.add_argument(
+        "--tool", default="claude", choices=tuple(sorted(COMPILERS)), help="Target tool."
+    )
     p.set_defaults(func=_cmd_bake)
     return parser
 

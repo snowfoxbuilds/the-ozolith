@@ -936,3 +936,164 @@ def test_dryrun_mode_corrupt_declaration_fails(tmp_path):
     status = jobdir.read_status(job)
     assert "[identity-inconsistent]" in status.error
     assert jobdir.read_identity(job)["dry_run"] == "failed:identity-inconsistent"
+
+
+# -- the codex adapter through the harness (ADR-0052, PROBE + STATIC) -----------
+
+CODEX_PIN = "gpt-5.2-codex"
+
+
+def _bake_codex_root(tmp_path: Path, model: str = CODEX_PIN) -> Path:
+    """A codex derived-image filesystem exactly as CodexAdapter.materialize
+    writes it: the well-known files plus the theozolith-owned config.toml."""
+    root = tmp_path / "idroot"
+    (root / "etc/theozolith/codex").mkdir(parents=True, exist_ok=True)
+    (root / "etc/theozolith/model").write_text(model + "\n")
+    (root / "etc/theozolith/codex/config.toml").write_text(f'model = "{model}"\n')
+    return root
+
+
+def _codex_job(tmp_path: Path) -> Path:
+    job, manifest = make_job(tmp_path)
+    manifest = jobdir.Manifest(
+        run_id=manifest.run_id,
+        mode=manifest.mode,
+        adapter="codex",
+        workdir=manifest.workdir,
+        agent_timeout_seconds=manifest.agent_timeout_seconds,
+        jobs_idle_timeout_seconds=manifest.jobs_idle_timeout_seconds,
+        schema_version=manifest.schema_version,
+    )
+    jobdir.write_manifest(job, manifest)
+    return job
+
+
+def _codex_home(tmp_path: Path, monkeypatch) -> Path:
+    """Pin the adapter's throwaway CODEX_HOME to a known path and deliver
+    the credential — the two runtime preconditions prepare() consumes."""
+    import tempfile as tempfile_mod
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setattr(tempfile_mod, "mkdtemp", lambda prefix="": str(home))
+    monkeypatch.setenv("CODEX_AUTH_JSON", '{"tokens": {"access_token": "a"}}')
+    return home
+
+
+def _plant_rollout(home: Path, model: str, effort: str = "") -> None:
+    sessions = home / "sessions" / "2026" / "08" / "26"
+    sessions.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"turn_id": "t1", "model": model}
+    if effort:
+        payload["effort"] = effort
+    (sessions / "rollout-x.jsonl").write_text(
+        json.dumps({"type": "turn_context", "payload": payload}) + "\n"
+    )
+
+
+def test_codex_harness_runs_and_records_the_rollout_model(tmp_path, monkeypatch):
+    root = _bake_codex_root(tmp_path)
+    home = _codex_home(tmp_path, monkeypatch)
+    _plant_rollout(home, CODEX_PIN)
+    job = _codex_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    agent = FakeAgent(clock, exit_code=0, exits_at=3.0)
+    launcher = FakeLauncher(agent)
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 0
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_DONE and status.agent.completed
+    # The codex launch: exec argv, prepared CODEX_HOME in the agent env,
+    # no --settings hook blob (no hook surface), 0600 credential leaf.
+    call = launcher.calls[0]
+    assert call["argv"][:2] == ["codex", "exec"]
+    assert "--settings" not in call["argv"]
+    assert call["env"]["CODEX_HOME"] == str(home)
+    assert (home / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (home / "config.toml").read_text() == f'model = "{CODEX_PIN}"\n'
+    # The identity record: checks passed, the rollout model observed.
+    ident = jobdir.read_identity(job)
+    assert ident["checks"] == "passed"
+    assert ident["violation"] == ""
+    assert ident["observed_model"] == CODEX_PIN
+
+
+def test_codex_harness_never_kills_on_an_off_model_rollout(tmp_path, monkeypatch):
+    """The doctrine test at harness level (ADR-0052): an off-identity codex
+    session is NOT killed — the mismatch lands in evidence (observed_model)
+    while the Run completes normally. Contrast the Claude monitor's
+    fail-loud kill."""
+    root = _bake_codex_root(tmp_path)
+    home = _codex_home(tmp_path, monkeypatch)
+    _plant_rollout(home, "o3")
+    job = _codex_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=3.0))
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 0
+    assert jobdir.read_status(job).phase == jobdir.PHASE_DONE
+    ident = jobdir.read_identity(job)
+    assert ident["violation"] == "" and ident["category"] == ""
+    assert ident["observed_model"] == "o3"  # the mismatch IS in evidence
+
+
+def test_codex_harness_records_the_rollout_effort_without_a_stop_hook_gap(tmp_path, monkeypatch):
+    """The codex effort evidence channel (ADR-0052): the benign observer's
+    rollout reading is the authoritative ``observed_effort`` in the final
+    identity record — the Claude Stop-hook journal is never consulted for a
+    codex session, so its missing-observation gap note must not appear."""
+    root = _bake_codex_root(tmp_path)
+    home = _codex_home(tmp_path, monkeypatch)
+    _plant_rollout(home, CODEX_PIN, effort="high")
+    job = _codex_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=3.0))
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 0
+    ident = jobdir.read_identity(job)
+    assert ident["observed_model"] == CODEX_PIN
+    assert ident["observed_effort"] == "high"
+    assert ident["violation"] == "" and ident["category"] == ""
+    assert not any("Stop hook" in note for note in ident["notes"])
+
+
+def test_codex_harness_missing_rollout_is_a_gap(tmp_path, monkeypatch):
+    root = _bake_codex_root(tmp_path)
+    _codex_home(tmp_path, monkeypatch)  # no rollout planted
+    job = _codex_job(tmp_path)
+    jobdir.write_job_request(job, jobdir.JobRequest("001-shutdown", ""))
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=3.0))
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 0
+    ident = jobdir.read_identity(job)
+    assert ident["observed_model"] == ""
+    assert any("gap recorded" in note for note in ident["notes"])
+
+
+def test_codex_harness_missing_credential_fails_before_launch(tmp_path, monkeypatch):
+    root = _bake_codex_root(tmp_path)
+    monkeypatch.delenv("CODEX_AUTH_JSON", raising=False)
+    job = _codex_job(tmp_path)
+    clock = ScriptedClock()
+    launcher = FakeLauncher(FakeAgent(clock, exit_code=0, exits_at=3.0))
+
+    code = _run_identity(job, launcher, clock, root, tmp_path)
+
+    assert code == 1
+    status = jobdir.read_status(job)
+    assert status.phase == jobdir.PHASE_FAILED
+    assert "agent prepare failed" in status.error
+    assert "CODEX_AUTH_JSON" in status.error
+    assert launcher.calls == []  # the session was never launched

@@ -1242,7 +1242,20 @@ class NodeDaemon:
             if source_root is not None and source_root.is_dir() and not source_root.is_symlink():
                 with os.scandir(source_root) as it:
                     for entry in sorted(it, key=lambda e: e.name):
-                        if entry.is_dir(follow_symlinks=False):
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        # The export serves the CLAUDE view of each tree
+                        # (ADR-0052): Flight Decks bind-mount it, and decks
+                        # are claude-only. Per-tool dists keep the claude
+                        # compile under <name>/claude/; a pre-ADR-0052 dist
+                        # keeps it bare under <name>/ (exported as before).
+                        # A tree with no claude view (codex-only content)
+                        # exports its bare form too — harmless: no deck can
+                        # select it (control refuses the pin join).
+                        claude_view = Path(entry.path) / "claude"
+                        if claude_view.is_dir() and not claude_view.is_symlink():
+                            desired[entry.name] = claude_view
+                        else:
                             desired[entry.name] = Path(entry.path)
             if not desired and not export.is_dir():
                 return  # nothing to export and nothing stale to retire

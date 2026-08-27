@@ -261,3 +261,22 @@ def test_fake_rejects_unknown_token():
     with pytest.raises(GitHubError) as excinfo:
         client.viewer_login()
     assert excinfo.value.status == 401
+
+
+def test_config_forwards_the_codex_plan_credential():
+    """The codex adapter's single credential is the plan-auth document; only
+    the resolved adapter's names are forwarded — a codex worker never
+    receives a Claude token and vice versa (ADR-0013/0052)."""
+    config = load_config(
+        {
+            "THEOZOLITH_REPO": "acme/sandbox",
+            "GITHUB_TOKEN": "x",
+            "THEOZOLITH_ADAPTER": "codex",
+            "CODEX_AUTH_JSON": '{"tokens": {}}',
+            "ANTHROPIC_API_KEY": "sk-ant",
+            **CONTROL_ENV,
+        },
+        role="reviewer",
+    )
+    assert config.adapter == "codex"
+    assert config.agent_env == {"CODEX_AUTH_JSON": '{"tokens": {}}'}

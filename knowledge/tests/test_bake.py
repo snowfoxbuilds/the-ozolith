@@ -54,6 +54,18 @@ def test_bake_installs_the_pinned_commit(tmp_path, sample_knowledge):
     assert receipt["pin"] == first
 
 
+def test_bake_tool_codex(tmp_path, sample_knowledge):
+    repo, first, _second = make_pinned_repo(sample_knowledge, tmp_path)
+    target = tmp_path / "codex"
+
+    result = bake(str(repo), first, target, tool="codex")
+
+    assert result.commit == first
+    assert tree_snapshot(target, IGNORE_BOOKKEEPING) == tree_snapshot(GOLDEN / "codex_global")
+    receipt = json.loads((target / RECEIPT_NAME).read_text())
+    assert receipt["tool"] == "codex"
+
+
 def test_bake_branch_pin_resolves_to_head(tmp_path, sample_knowledge):
     repo, _first, second = make_pinned_repo(sample_knowledge, tmp_path)
     target = tmp_path / "claude"

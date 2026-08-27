@@ -18,7 +18,7 @@ TheOzolith consolidates the coding pipeline, the cluster substrate, and the agen
 theozolith/
 ├── AGENTS.md            # project index    (repo-authored; ADR-0050)
 ├── CONTEXT.md           # domain glossary  (repo-authored; ADR-0050)
-├── knowledge/           # agent-knowledge machinery: config format (skills, subagents, workflows), per-tool compilers (AGENTS.md -> CLAUDE.md, skill placement), sync engine (~/.claude etc.)
+├── knowledge/           # agent-knowledge machinery: config format (skills, subagents, workflows), per-tool compilers (claude: AGENTS.md -> CLAUDE.md; codex: AGENTS.md verbatim, agents/codex/ -> prompts; ADR-0052), sync engine (~/.claude, ~/.codex)
 ├── worker/              # Worker + Reviewer actors: node-resident drivers, agent harness + run-container Dockerfiles, per-Agent adapters, first-party gate
 ├── control/             # Control Node: dashboard, heartbeat/command + run-event API, janitor jobs
 ├── nodedaemon/          # Node Daemon: uncontainerized host daemon (systemd unit) — heartbeat, command reconciliation, local builds, stack + driver supervision
@@ -38,7 +38,7 @@ theozolith/
 ### Sync flows
 
 - knowledge sync: private config repo -> local tool config dirs (~/.claude, etc.) via the knowledge machinery. One-way. The private repo is the source of truth. Two skill scopes: global skills live in the private repo and travel with the operator; project skills live in the target project's repo and travel with the project.
-- config ingest: human Config Repo -> machine-owned pinned build (`theozolith config ingest`, the only write path — settings included; ADR-0048). Ingest lints, resolves mechanical pins (per-tree knowledge content hashes; base tag -> digest, credentialed for private bases per ADR-0049; the tailscale sha256 stays human-entered), compiles knowledge (the ADR-0009 compiler runs at ingest), and commits stamped with the source commit SHA. Control loads and config distribution serve only the pinned build; rollback is `git revert` there.
+- config ingest: human Config Repo -> machine-owned pinned build (`theozolith config ingest`, the only write path — settings included; ADR-0048). Ingest lints, resolves mechanical pins (per-tree knowledge content hashes; base tag -> digest, credentialed for private bases per ADR-0049; the tailscale sha256 stays human-entered), compiles knowledge once per registered tool compiler into `knowledge/<name>/<tool>/` (ADR-0009 at ingest; per-tool since ADR-0052), and commits stamped with the source commit SHA. Control loads and config distribution serve only the pinned build; rollback is `git revert` there.
 - Project docs have no sync flow (ADR-0050): [AGENTS.md](../../AGENTS.md), [CONTEXT.md](../../CONTEXT.md), docs/specs/, and docs/adr/ are authored in the repo and reviewed in PRs. The Notion workspace is a read-only mirror; a Notion-side agent reads the repo for documentation and contributes changes via PR. (docs/adr/ has been repo-authored since 2026-07-30, ADR-0033; the former `scripts/sync_notion.py` is deleted.)
 ## Decision history
 

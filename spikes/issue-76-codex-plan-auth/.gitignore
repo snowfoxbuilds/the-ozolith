@@ -1,0 +1,3 @@
+# Sanitized run evidence stays local; it reaches issue #76 as a reviewed
+# comment, never as a commit.
+evidence/

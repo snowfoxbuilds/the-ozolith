@@ -35,9 +35,17 @@ LABEL_INSTRUCTION_HASH = "theozolith.instruction-hash"
 LABEL_BUILT_AT = "theozolith.built-at"
 
 # The build-context directory the compiled knowledge tree is copied into and
-# the in-image destination it lands at (the agent CLI's config root).
+# the default in-image destination it lands at. Since ADR-0052 the recipe
+# may carry its own ``knowledge_target`` (computed control-side from the
+# worker type's adapter — this module stays adapter-blind and COPYs to the
+# path it is told); recipes that omit it (older control) get the historical
+# claude default, byte-for-byte the pre-ADR-0052 behavior.
 _CONTEXT_KNOWLEDGE = "knowledge"
 _KNOWLEDGE_TARGET = "/home/ozolith/.claude/"
+
+
+def _knowledge_target(image: dict[str, Any]) -> str:
+    return str(image.get("knowledge_target", "") or _KNOWLEDGE_TARGET)
 
 
 def dockerfile_for(image: dict[str, Any], built_at: str) -> str:
@@ -53,8 +61,11 @@ def dockerfile_for(image: dict[str, Any], built_at: str) -> str:
     if image.get("knowledge", ""):
         # The compiled tree was staged into the build context by ensure_image
         # after verifying its content hash against the recipe's knowledge_pin
-        # (ADR-0048). COPY of a directory copies its contents.
-        lines.append(f"COPY --chown=ozolith:ozolith {_CONTEXT_KNOWLEDGE}/ {_KNOWLEDGE_TARGET}")
+        # (ADR-0048). COPY of a directory copies its contents. The target was
+        # shape-checked by stage_knowledge before this renders.
+        lines.append(
+            f"COPY --chown=ozolith:ozolith {_CONTEXT_KNOWLEDGE}/ {_knowledge_target(image)}"
+        )
     lines += [
         # Keep the home usable under THEOZOLITH_CONTAINER_USER overrides,
         # exactly like the base image does.
@@ -84,11 +95,34 @@ def stage_knowledge(image: dict[str, Any], dist_root: Path | None, context: Path
     name = ref[len(prefix) :]
     if not ref.startswith(prefix) or not name or "/" in name:
         return f"recipe knowledge reference {ref!r} is not knowledge/<name>"
+    # Fail-closed target shape check (ADR-0052): the COPY destination is a
+    # Dockerfile byte — never render a bake to a path outside the runtime
+    # user's home or with a traversal in it.
+    target = _knowledge_target(image)
+    if (
+        not target.startswith("/home/ozolith/")
+        or not target.endswith("/")
+        or ".." in target.split("/")
+    ):
+        return (
+            f"recipe knowledge target {target!r} is not an absolute /home/ozolith/ directory path"
+        )
     if dist_root is None:
         return "no verified config-distribution tree is applied yet"
+    # Which compiled view of the tree to stage: the recipe's knowledge_tool
+    # subtree (per-tool layout, ADR-0052), falling back to the bare tree for
+    # a pre-ADR-0052 dist (or an older control that sent no tool). Either
+    # way the pin verification below is the correctness gate: control pinned
+    # exactly the bytes it expects this build to consume.
+    source = dist_root / configdist.KNOWLEDGE_DIR / name
+    tool = str(image.get("knowledge_tool", "") or "")
+    if tool and ("/" in tool or tool in (".", "..")):
+        return f"recipe knowledge tool {tool!r} is not a plain tool name"
+    if tool and (source / tool).is_dir():
+        source = source / tool
     staged = context / _CONTEXT_KNOWLEDGE
     try:
-        shutil.copytree(dist_root / configdist.KNOWLEDGE_DIR / name, staged, symlinks=False)
+        shutil.copytree(source, staged, symlinks=False)
     except FileNotFoundError:
         return f"applied config-distribution tree has no knowledge/{name}"
     except OSError as exc:

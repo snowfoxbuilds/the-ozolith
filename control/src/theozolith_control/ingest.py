@@ -98,7 +98,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from theozolith_knowledge import KnowledgeError, compile_claude, load_knowledge_root
+from theozolith_knowledge import COMPILERS, KnowledgeError, load_knowledge_root
 
 from theozolith_control import configdist, configrepo, controltoml, repolock
 
@@ -147,7 +147,7 @@ class IngestReport:
     pinned_commit: str = ""  # the pinned build's new HEAD ("" when unchanged)
     changed: bool = False  # in a dry run: whether a real ingest WOULD commit
     resolved_bases: dict[str, str] = field(default_factory=dict)  # ref -> digest
-    knowledge_pins: dict[str, str] = field(default_factory=dict)  # tree -> hash
+    knowledge_pins: dict[str, str] = field(default_factory=dict)  # "tree/tool" -> hash
     retagged: dict[str, tuple[str, str]] = field(default_factory=dict)  # type -> (old, new)
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False  # lint + preview only — nothing was committed
@@ -444,8 +444,14 @@ def _preserve_product_pin(
 
 
 def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
-    """Compile every ``knowledge/<name>`` source tree into the staging tree
-    (ADR-0009 at ingest) and return the per-tree content pins."""
+    """Compile every ``knowledge/<name>`` source tree once per registered
+    compiler into the staging tree (ADR-0009 at ingest; per-tool layout
+    ``knowledge/<name>/<tool>/`` since ADR-0052) and return the per-tree
+    content pins keyed ``<name>/<tool>``. The pinned build stays a pure
+    function of the knowledge source: ingest never inspects which worker
+    types reference a tree. An empty per-tool fileset writes no directory
+    and records no pin — a worker type joining an absent pin fails config
+    load with an actionable error instead."""
     source_root = source_dir / configdist.KNOWLEDGE_DIR
     pins: dict[str, str] = {}
     if not source_root.is_dir():
@@ -464,19 +470,29 @@ def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
                 " ^[A-Za-z0-9][A-Za-z0-9._-]*$ (ADR-0048)"
             )
         try:
-            fileset = compile_claude(load_knowledge_root(entry), scope="global")
+            root = load_knowledge_root(entry)
         except KnowledgeError as exc:
-            raise IngestError(f"knowledge/{entry.name} does not compile: {exc}") from exc
-        for relpath, file_entry in fileset.items():
-            target = staging / configdist.KNOWLEDGE_DIR / entry.name / relpath
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(file_entry.content)
-            if file_entry.executable:
-                target.chmod(0o755)
-        try:
-            pins[entry.name] = configdist.knowledge_tree_hash(staging, entry.name)
-        except configdist.ConfigDistError as exc:
-            raise IngestError(f"knowledge/{entry.name}: {exc}") from exc
+            raise IngestError(f"knowledge/{entry.name} is not a knowledge root: {exc}") from exc
+        for tool, compiler in sorted(COMPILERS.items()):
+            try:
+                fileset = compiler(root, "global")
+            except KnowledgeError as exc:
+                raise IngestError(
+                    f"knowledge/{entry.name} does not compile for {tool}: {exc}"
+                ) from exc
+            if not fileset:
+                continue
+            tree = f"{entry.name}/{tool}"
+            for relpath, file_entry in fileset.items():
+                target = staging / configdist.KNOWLEDGE_DIR / tree / relpath
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(file_entry.content)
+                if file_entry.executable:
+                    target.chmod(0o755)
+            try:
+                pins[tree] = configdist.knowledge_tree_hash(staging, tree)
+            except configdist.ConfigDistError as exc:
+                raise IngestError(f"knowledge/{tree}: {exc}") from exc
     return pins
 
 

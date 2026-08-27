@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): for deployments, knowledge lives in the Config Repo's `knowledge/` tree and the compiler runs at INGEST time — the pinned build carries compiled per-tool output for both delivery paths (baked into worker images, bind-mounted by Flight Decks).
+Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): for deployments, knowledge lives in the Config Repo's `knowledge/` tree and the compiler runs at INGEST time — the pinned build carries compiled per-tool output for both delivery paths (baked into worker images, bind-mounted by Flight Decks). Amended by ADR-0052 (2026-08-26): the codex compiler joins claude in a per-tool registry (AGENTS.md verbatim with no marker, skills verbatim, agents/codex/ as prompts, workflows dropped; global scope only), and `agents/codex/` now loads as root content — the reserved per-tool namespacing is cashed in.
 
 Date: 2026-07-14
 

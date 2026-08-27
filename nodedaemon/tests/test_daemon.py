@@ -5596,3 +5596,61 @@ def test_knowledge_recipe_defers_then_builds_once_converged(rig: Rig):
     )
     rig.daemon.once()
     assert recipe["tag"] in rig.docker.images
+
+
+def test_knowledge_export_serves_the_claude_view_of_a_per_tool_dist(rig: Rig):
+    """ADR-0052: per-tool dists keep each compile under <name>/<tool>/; the
+    deck-facing export flattens to the CLAUDE view (decks are claude-only),
+    so the deck's mount contract — CLAUDE.md at the tree root — never
+    changes across the layout migration."""
+    digest, data = make_config_dist(
+        {
+            "knowledge/dev/claude/CLAUDE.md": "# claude view\n",
+            "knowledge/dev/claude/skills/s/SKILL.md": "skill\n",
+            "knowledge/dev/codex/AGENTS.md": "# codex view\n",
+        }
+    )
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# claude view\n"
+    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
+    assert not (export / "dev" / "claude").exists()  # flattened, not nested
+    assert not (export / "dev" / "codex").exists()  # the codex view never exports
+
+
+def test_knowledge_export_keeps_the_legacy_bare_layout_working(rig: Rig):
+    """A pre-ADR-0052 dist (claude compile bare under the tree root) exports
+    exactly as before — the compat window until the operator's next ingest."""
+    digest, data = _knowledge_dist("# legacy\n")
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+
+
+def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
+    """The layout migration is one ordinary export update: same child name,
+    new content, parent inode (the deck bind anchor) untouched."""
+    a_hash, a_data = _knowledge_dist("# legacy\n")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.knowledge_export_dir
+    parent_inode = export.stat().st_ino
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+
+    b_hash, b_data = make_config_dist(
+        {
+            "knowledge/dev/claude/CLAUDE.md": "# migrated\n",
+            "knowledge/dev/codex/AGENTS.md": "# codex\n",
+        }
+    )
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert (export / "dev" / "CLAUDE.md").read_text() == "# migrated\n"
+    assert not (export / "dev" / "codex").exists()
+    assert export.stat().st_ino == parent_inode

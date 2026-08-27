@@ -25,12 +25,16 @@ Layout::
                               (interactive containers). model/effort are
                               validated against the adapter and baked into the
                               image (ADR-0045).
-    knowledge/<name>/         one COMPILED knowledge tree per name (ADR-0048):
-                              the ADR-0009 compiler's output, written at ingest,
-                              distributed to nodes alongside drivers/
+    knowledge/<name>/<tool>/  one COMPILED knowledge tree per (name, tool)
+                              (ADR-0048, per-tool since ADR-0052): each
+                              registered ADR-0009 compiler's output, written
+                              at ingest, distributed to nodes alongside
+                              drivers/ (a pre-ADR-0052 build keeps the claude
+                              compile bare under knowledge/<name>/ until the
+                              next ingest migrates it)
     pins.toml                 machine-written by ingest: source-commit stamp,
                               base tag->digest resolutions, per-knowledge-tree
-                              content-hash pins
+                              content-hash pins keyed "<name>/<tool>"
     product.toml              optional [product] version pin for the update command
 
 An empty or missing repo is a legal deployment (the deletion test): every
@@ -90,6 +94,18 @@ MACHINE_OWNED_FILES = ("pins.toml",)
 
 # The ingest-written pins file at the pinned-build root (ADR-0048).
 PINS_FILE = "pins.toml"
+
+# Where a driver type's baked knowledge lands in the derived image, derived
+# from the type's adapter (ADR-0052). Control computes this — the daemon
+# stays adapter-blind and COPYs to the path it is told. The claude entry is
+# the historical default: recipes that omit the field (and old daemons that
+# ignore it) behave exactly as before, which is also why only a NON-default
+# target enters the image identity (see instruction_hash).
+_KNOWLEDGE_TARGETS = {
+    "claude": "/home/ozolith/.claude/",
+    "codex": "/home/ozolith/.codex/",
+}
+_DEFAULT_KNOWLEDGE_TARGET = _KNOWLEDGE_TARGETS["claude"]
 
 # An in-repo knowledge reference is ``knowledge/<name>`` (ADR-0048). The name
 # rule matches the knowledge package's entry-name rule and — by requiring a
@@ -250,9 +266,12 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 class Pins:
     """The ingest-resolved pins (pins.toml, ADR-0048): the decisions that exist
     nowhere else. ``base`` maps a tag-only base ref to its resolved
-    ``sha256:<hex>`` digest; ``knowledge`` maps a tree name to its per-tree
-    content hash; ``source_commit`` stamps the Config Repo commit the pinned
-    build was ingested from."""
+    ``sha256:<hex>`` digest; ``knowledge`` maps a per-tool compiled tree key
+    ``<name>/<tool>`` to its content hash (ADR-0052 — a legacy bare
+    ``<name>`` key from a pre-per-tool pinned build normalizes to
+    ``<name>/claude`` at load, the only compiler that could have written it);
+    ``source_commit`` stamps the Config Repo commit the pinned build was
+    ingested from."""
 
     source_commit: str = ""
     base: dict[str, str] = field(default_factory=dict)
@@ -284,13 +303,24 @@ def load_pins(repo_dir: Path) -> Pins:
             raise ConfigRepoError(
                 f"{PINS_FILE}: [base] {ref!r} must map to 'sha256:<64 hex>', got {digest!r}"
             )
+    normalized: dict[str, str] = {}
     for name, tree_hash in knowledge.items():
         if not isinstance(tree_hash, str) or not _HEX64.fullmatch(tree_hash):
             raise ConfigRepoError(
                 f"{PINS_FILE}: [knowledge] {name!r} must map to a 64-hex content"
                 f" hash, got {tree_hash!r}"
             )
-    return Pins(source_commit=commit, base=dict(base), knowledge=dict(knowledge))
+        parts = name.split("/")
+        if len(parts) > 2 or not all(KNOWLEDGE_TREE_NAME.fullmatch(part) for part in parts):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [knowledge] key {name!r} must be '<name>/<tool>'"
+                " (or a legacy bare '<name>') with slug components (ADR-0052)"
+            )
+        # A bare key predates per-tool compiles; only the claude compiler
+        # could have written it. Unknown tool suffixes are tolerated: a
+        # newer ingest may pin tools this control version has no use for.
+        normalized[name if len(parts) == 2 else f"{name}/claude"] = tree_hash
+    return Pins(source_commit=commit, base=dict(base), knowledge=normalized)
 
 
 @dataclass(frozen=True)
@@ -366,6 +396,18 @@ class WorkerTypeDef:
         return self.knowledge_pin if self.is_driver else ""
 
     @property
+    def knowledge_tool(self) -> str:
+        """Which per-tool compile of the tree the node stages for the bake
+        (ADR-0052): the adapter name, for a baking (driver) type only."""
+        return self.adapter if self.baked_knowledge else ""
+
+    @property
+    def knowledge_target(self) -> str:
+        """Where the baked tree lands in the derived image ("" when nothing
+        bakes). Parse time guarantees the adapter is mapped."""
+        return _KNOWLEDGE_TARGETS[self.adapter] if self.baked_knowledge else ""
+
+    @property
     def base_digest(self) -> str:
         return self.base.rsplit("@", 1)[1]
 
@@ -393,30 +435,35 @@ class WorkerTypeDef:
 
     @property
     def instruction_hash(self) -> str:
-        # CRITICAL (ADR-0044 as amended by ADR-0045): exactly these four
-        # keys, canonical JSON with sort_keys, over the MATERIALIZED setup —
-        # the hash covers the exact bytes that build the image, including the
-        # baked model/effort config, so candidate identity equals image
-        # identity. driver/workspace/secrets never enter (they change no
-        # image bytes; adding them would rebuild the fleet for nothing) —
-        # which is what makes their per-Stack rebinding free (ADR-0047) — and
-        # a type with no model/effort hashes byte-identically to pre-ADR-0045.
-        # The knowledge keys are the BAKED values: a Flight Deck's reference
-        # selects a mount, changes no image bytes, and so hashes as empty —
-        # a knowledge-content edit must never rebuild or recreate a deck
-        # (ADR-0048 amendment); the selection change recreates it through the
-        # injected env instead. The rendered materialize instruction is
+        # CRITICAL (ADR-0044 as amended by ADR-0045/0052): exactly these
+        # four keys — plus ``knowledge_target`` ONLY when it differs from
+        # the historical claude default — canonical JSON with sort_keys,
+        # over the MATERIALIZED setup: the hash covers the exact bytes that
+        # build the image, including the baked model/effort config, so
+        # candidate identity equals image identity. driver/workspace/secrets
+        # never enter (they change no image bytes; adding them would rebuild
+        # the fleet for nothing) — which is what makes their per-Stack
+        # rebinding free (ADR-0047) — and a type with no model/effort hashes
+        # byte-identically to pre-ADR-0045. The knowledge keys are the BAKED
+        # values: a Flight Deck's reference selects a mount, changes no
+        # image bytes, and so hashes as empty — a knowledge-content edit
+        # must never rebuild or recreate a deck (ADR-0048 amendment); the
+        # selection change recreates it through the injected env instead. A
+        # non-default knowledge target IS a Dockerfile byte (the COPY
+        # destination, ADR-0052) and enters the hash — conditionally, so
+        # every pre-ADR-0052 claude identity stays byte-stable and nothing
+        # retags on upgrade. The rendered materialize instruction is
         # therefore identity-bearing: its format is frozen by golden tests
         # here and in the worker package.
-        canonical = json.dumps(
-            {
-                "base": self.base,
-                "setup": list(self.materialized_setup),
-                "knowledge": self.baked_knowledge,
-                "knowledge_pin": self.baked_knowledge_pin,
-            },
-            sort_keys=True,
-        )
+        identity: dict[str, object] = {
+            "base": self.base,
+            "setup": list(self.materialized_setup),
+            "knowledge": self.baked_knowledge,
+            "knowledge_pin": self.baked_knowledge_pin,
+        }
+        if self.knowledge_target and self.knowledge_target != _DEFAULT_KNOWLEDGE_TARGET:
+            identity["knowledge_target"] = self.knowledge_target
+        canonical = json.dumps(identity, sort_keys=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @property
@@ -426,22 +473,29 @@ class WorkerTypeDef:
 
     def recipe_wire(self) -> dict[str, Any]:
         """The derived-image recipe as it rides in the ``images`` wire list.
-        Still 8 keys: ``knowledge`` (the in-repo reference) and
+        10 keys (8 pre-ADR-0052): ``knowledge`` (the in-repo reference) and
         ``knowledge_pin`` (the per-tree content pin) replace the retired
         ``knowledge_source`` pair (ADR-0048) — the node bakes the referenced
-        tree from its applied config-distribution tree after verifying the pin.
-        The BAKED values ride: a driverless type's recipe carries empty
-        knowledge fields, so the node never bakes under a Flight Deck's
-        volume-shadowed ~/.claude (the deck reads the applied tree through
-        its read-only mount instead). ``setup`` is the MATERIALIZED setup
-        (ADR-0045): the daemon renders one RUN per entry exactly as before
-        and stays adapter-blind."""
+        tree from its applied config-distribution tree after verifying the
+        pin — and ``knowledge_tool``/``knowledge_target`` (ADR-0052) tell
+        the node WHICH per-tool compile of the tree to stage and WHERE the
+        bake COPY lands, both computed control-side from the adapter so the
+        daemon stays adapter-blind (an old daemon ignores them and behaves
+        exactly as before; empty for legacy-layout dists it falls back to
+        the bare tree). The BAKED values ride: a driverless type's recipe
+        carries empty knowledge fields, so the node never bakes under a
+        Flight Deck's volume-shadowed ~/.claude (the deck reads the applied
+        tree through its read-only mount instead). ``setup`` is the
+        MATERIALIZED setup (ADR-0045): the daemon renders one RUN per entry
+        exactly as before."""
         return {
             "name": self.name,
             "base": self.base,
             "setup": list(self.materialized_setup),
             "knowledge": self.baked_knowledge,
             "knowledge_pin": self.baked_knowledge_pin,
+            "knowledge_tool": self.knowledge_tool,
+            "knowledge_target": self.knowledge_target,
             "tag": self.tag,
             "base_digest": self.base_digest,
             "instruction_hash": self.instruction_hash,
@@ -931,6 +985,9 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                 " in the Config Repo: reference it as knowledge ="
                 ' "knowledge/<name>" and let ingest compute the per-tree pin'
             )
+    # The adapter selects which per-tool compile of the tree this type
+    # consumes (ADR-0052), so it parses before the pin join below.
+    adapter_name = _require_str(data, "adapter", context, default="claude")
     knowledge = _require_str(data, "knowledge", context, default="")
     knowledge_pin = ""
     if knowledge:
@@ -943,13 +1000,15 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                 ' "knowledge/<name>" with a plain tree name'
                 " (^[A-Za-z0-9][A-Za-z0-9._-]*$) (ADR-0048)"
             )
-        knowledge_pin = (pins.knowledge if pins else {}).get(tree, "")
+        knowledge_pin = (pins.knowledge if pins else {}).get(f"{tree}/{adapter_name}", "")
         if not knowledge_pin:
             raise ConfigRepoError(
-                f"{context}: no ingest-computed pin for {knowledge!r} — the"
-                " pinned build is written only by `theozolith config ingest`,"
-                " which compiles the tree and records its content hash in"
-                f" {PINS_FILE} (ADR-0048)"
+                f"{context}: no ingest-computed pin for {knowledge!r} compiled"
+                f" for {adapter_name!r} — either the tree has no"
+                f" {adapter_name}-consumable content, or the pinned build"
+                " predates per-tool compiles: re-run `theozolith config"
+                f" ingest`, which records the content hash in {PINS_FILE}"
+                " (ADR-0048/ADR-0052)"
             )
     driver = _require_str(data, "driver", context, default="")
     workspace = _require_str(data, "workspace", context, default="")
@@ -987,12 +1046,36 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
     # reference selects which applied tree the deck's read-only mount serves
     # (nothing bakes — the state volume shadows ~/.claude). The pin join and
     # the compiled-tree presence check below apply identically to both kinds.
+    # The node's knowledge export serves the CLAUDE view of the tree
+    # (ADR-0052), so a non-claude deck cannot be given knowledge it could
+    # read — refused here, recorded as future work in ADR-0052.
+    if knowledge and not driver and adapter_name != "claude":
+        raise ConfigRepoError(
+            f"{context}: a driverless (Flight Deck) type with adapter"
+            f" {adapter_name!r} cannot declare knowledge — the node's"
+            " knowledge export serves the claude view only (ADR-0052)"
+        )
+    if knowledge and driver and adapter_name not in _KNOWLEDGE_TARGETS:
+        raise ConfigRepoError(
+            f"{context}: no knowledge bake target is mapped for adapter"
+            f" {adapter_name!r} — extend _KNOWLEDGE_TARGETS when adding an"
+            " adapter whose worker types bake knowledge (ADR-0052)"
+        )
+    # A driverless type is a Flight Deck, and the deck machinery is
+    # Claude-shaped end to end (ADR-0043; the interactive materialize scope
+    # exists only on the Claude adapter). Refuse here rather than at the
+    # image build the daemon would fail on.
+    if not driver and adapter_name != "claude" and (data.get("model") or data.get("effort")):
+        raise ConfigRepoError(
+            f"{context}: a driverless (Flight Deck) type with adapter"
+            f" {adapter_name!r} cannot bake a model/effort — no"
+            f" {adapter_name} Flight Deck exists (ADR-0052)"
+        )
     if workspace and not _valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"
         )
-    adapter_name = _require_str(data, "adapter", context, default="claude")
     model = _require_str(data, "model", context, default="")
     effort = _require_str(data, "effort", context, default="")
     _validate_model_effort(context, adapter_name, model, effort, is_driver=bool(driver))
@@ -1305,12 +1388,19 @@ def load_config(repo_dir: Path) -> DeployConfig:
     for wt in worker_types.values():
         if wt.is_driver:
             _resolve_driver_command(wt, repo_dir)
-        if wt.knowledge and not (repo_dir / wt.knowledge).is_dir():
-            raise ConfigRepoError(
-                f"worker-types/{wt.name}.toml: knowledge reference"
-                f" {wt.knowledge!r} has no compiled tree in the pinned build —"
-                " run `theozolith config ingest` (ADR-0048)"
-            )
+        if wt.knowledge:
+            compiled = repo_dir / wt.knowledge / wt.adapter
+            # A pre-ADR-0052 pinned build keeps the claude compile directly
+            # under knowledge/<name>/ — tolerated until the next ingest
+            # migrates the layout (only claude compiles could exist there).
+            legacy_ok = wt.adapter == "claude" and (repo_dir / wt.knowledge).is_dir()
+            if not compiled.is_dir() and not legacy_ok:
+                raise ConfigRepoError(
+                    f"worker-types/{wt.name}.toml: knowledge reference"
+                    f" {wt.knowledge!r} has no compiled {wt.adapter} tree in"
+                    " the pinned build — run `theozolith config ingest`"
+                    " (ADR-0048/ADR-0052)"
+                )
     stacks = _resolve_stacks(
         tuple(
             _parse_stack(path.stem, _load_toml(path))

@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from theozolith_knowledge.claude import compile_claude
+from theozolith_knowledge.compilers import get_compiler
 from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
 from theozolith_knowledge.sync import SyncReport, apply_fileset, manifest_location
 
@@ -74,6 +74,7 @@ def bake(
     *,
     scope: str = "global",
     subdir: str | None = None,
+    tool: str = "claude",
 ) -> BakeResult:
     """Install the knowledge repo at `source`, pinned to `pin`, into `target`."""
     if shutil.which("git") is None:
@@ -84,7 +85,7 @@ def bake(
         commit = _checkout_pin(source, pin, workdir)
         knowledge_root = workdir / subdir if subdir else workdir
         root = load_knowledge_root(knowledge_root)
-        files = compile_claude(root, scope)
+        files = get_compiler(tool)(root, scope)
         report = apply_fileset(target, files, manifest_location(target, scope))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -92,7 +93,7 @@ def bake(
     receipt_path = manifest_location(target, scope).parent / RECEIPT_NAME
     receipt = (
         json.dumps(
-            {"source": source, "pin": pin, "commit": commit, "subdir": subdir},
+            {"source": source, "pin": pin, "commit": commit, "subdir": subdir, "tool": tool},
             indent=2,
             sort_keys=True,
         )

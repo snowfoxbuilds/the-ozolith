@@ -161,15 +161,19 @@ driverless worker type — see step 4.
 
 **Knowledge on a laptop** — the knowledge machinery is standalone (no cluster required):
 `pip install ./knowledge`, then `theozolith-knowledge sync` a knowledge repo into your
-`~/.claude`, or `bake` a pinned Knowledge Source into a container image at build time. See
+`~/.claude`, or `bake` a pinned Knowledge Source into a container image at build time.
+`--tool` selects the compiler: `claude` (the default) or `codex` (ADR-0052 — targets
+`~/.codex`, global scope only; `AGENTS.md` and skills copy verbatim, `agents/codex/`
+becomes custom prompts, workflows have no codex home). See
 [knowledge/README.md](knowledge/README.md).
 
 **Knowledge on the fleet (ADR-0048)** — deployment knowledge lives IN the Config Repo: a
 `knowledge/<name>/` directory holds one knowledge root (`skills/`, `agents/`, `workflows/`,
 `AGENTS.md`), referenced from worker types as `knowledge = "knowledge/<name>"`. Ingest compiles
-it and pins its content hash. Driver workers **bake** the compiled tree into their derived
-images (an edit re-tags exactly the types that reference the tree → nodes rebuild → new Runs
-carry it). The **Flight Deck** (a driverless worker type,
+it once per registered tool into `knowledge/<name>/<tool>/` in the pinned build and records one
+content-hash pin per `(tree, tool)`, keyed `"<name>/<tool>"` (ADR-0052). Driver workers **bake**
+their adapter's compiled view into their derived images (an edit re-tags exactly the types whose
+tool's view changed → nodes rebuild → new Runs carry it). The **Flight Deck** (a driverless worker type,
 `deploy/configs-example/worker-types/flightdeck.toml`) never bakes: its `knowledge` field
 selects which node-applied tree its read-only `/var/lib/theozolith/knowledge` mount serves,
 and the deck fails loud until the node has converged that tree. One edit → commit → ingest

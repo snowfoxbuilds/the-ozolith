@@ -77,6 +77,13 @@ _PROTECTED_CLAUDE_TREES = (
     "/home/ozolith/.claude",
     f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.CHECKOUT_DIR}/.claude",
     f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.WORK_DIR}/.claude",
+    # The codex twin (ADR-0052): the CLI's config/auth/session home. The
+    # per-Run CODEX_HOME is a throwaway temp dir, but a persistent volume at
+    # a .codex-shaped path would carry config, plan-auth state, and session
+    # history across Runs exactly the way a .claude volume would.
+    "/home/ozolith/.codex",
+    f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.CHECKOUT_DIR}/.codex",
+    f"{jobdir.CONTAINER_JOB_PATH}/{jobdir.WORK_DIR}/.codex",
 )
 
 
@@ -114,10 +121,12 @@ def _volumes(raw: str) -> tuple[tuple[str, str], ...]:
         if not sep or not name or not path.startswith("/"):
             raise ConfigError(f"THEOZOLITH_CACHE_VOLUMES entry {item!r} is not name:/path")
         dest = _normalize_container_path(path)
-        if ".claude" in dest.split("/"):
+        segments = dest.split("/")
+        if ".claude" in segments or ".codex" in segments:
             raise ConfigError(
-                f"THEOZOLITH_CACHE_VOLUMES entry {item!r} targets a .claude path —"
-                " live knowledge must never mount into a Run (ADR-0043/0048); the"
+                f"THEOZOLITH_CACHE_VOLUMES entry {item!r} targets a .claude or"
+                " .codex path — live knowledge and agent config/auth state must"
+                " never mount into a Run (ADR-0043/0048/0052); the"
                 " knowledge-mount symlink carve-out is Flight-Deck-only"
             )
         covered = [
@@ -186,11 +195,18 @@ DEFAULT_CACHE_VOLUMES = "theozolith-cache:/home/ozolith/.cache"
 #                            credential ADR-0013 describes)
 #   CLAUDE_CODE_OAUTH_TOKEN  a subscription token from `claude setup-token`
 # Supply whichever you have (both may be set — the Claude CLI decides
-# precedence). A future adapter registers its own credential names here;
-# nothing outside this map is forwarded, so a non-Claude worker never
-# receives a Claude token.
+# precedence). For the codex adapter the single credential is the full
+# ChatGPT-plan auth.json document:
+#   CODEX_AUTH_JSON          the auth.json content captured by a one-time
+#                            `codex login --device-auth` (spike #76);
+#                            CodexAdapter.prepare() writes it 0600 into the
+#                            per-Run throwaway CODEX_HOME
+# Each adapter registers only its own credential names here; nothing outside
+# this map is forwarded, so a non-Claude worker never receives a Claude
+# token (and vice versa).
 _ADAPTER_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
     "claude": ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "codex": ("CODEX_AUTH_JSON",),
 }
 
 
