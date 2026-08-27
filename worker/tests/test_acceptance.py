@@ -43,7 +43,7 @@ from theozolith_worker.containers import EngineError
 from theozolith_worker.gitops import GitError
 from theozolith_worker.implementer import Implementer
 from theozolith_worker.jobdir import AgentOutcome
-from theozolith_worker.runner import branch_for
+from theozolith_worker.runner import branch_for, compose_pr_body
 from theozolith_worker.sessions import SessionError
 from theozolith_worker.sweep import pending_dir
 
@@ -1957,6 +1957,47 @@ def test_create_pr_race_fallback_retargets_a_stale_base_with_a_note(harness: Har
     assert "raced body" not in harness.fake.issues[raced_pr]["body"]
 
 
+def test_create_pr_race_fallback_converges_a_title_only_mismatch(harness: Harness):
+    """Convergence covers every composed surface: a raced twin whose base
+    AND body already match this Run's composition but whose title differs
+    is still patched — before pr_ready hands the PR to review."""
+    number = harness.file_issue("Raced twin", CRITERIA_BODY)
+    dep_branch = branch_for(number)
+    # Exactly what the driver will compose from the default scripted
+    # proposal (title diverges; base and body match byte for byte).
+    section = decisions.DecisionsSection(
+        decisions=[decisions.Decision(what="made the change", why="the issue asked")]
+    )
+    composed = compose_pr_body(number, "What the scripted agent did and why.", section)
+    planted: list[int] = []
+
+    def plant(actor: str, method: str, path: str) -> None:
+        if method == "GET" and path.endswith("/pulls") and not planted:
+            pr = harness.fake.create_issue(f"#{number}: a raced twin title", composed, set())
+            harness.fake.pulls[pr] = {"state": "open", "head": dep_branch, "base": "main"}
+            planted.append(pr)
+
+    harness.fake.after_request = plant
+    assert harness.worker_once() == 1
+    harness.fake.after_request = None
+
+    (raced_pr,) = planted
+    assert harness.fake.issues[raced_pr]["title"] == f"#{number}: scripted change"
+    assert PR_READY in harness.fake.labels_of(raced_pr)
+    # The title PATCH lands strictly BEFORE pr_ready is applied.
+    writes = [(w[1], w[2]) for w in harness.fake.write_log]
+    patch_at = writes.index(("PATCH", f"/repos/{harness.fake.repo}/pulls/{raced_pr}"))
+    label_at = writes.index(("POST", f"/repos/{harness.fake.repo}/issues/{raced_pr}/labels"))
+    assert patch_at < label_at
+    patched = next(
+        w[3] for w in harness.fake.write_log if w[1] == "PATCH" and w[2].endswith(f"/{raced_pr}")
+    )
+    assert patched["title"] == f"#{number}: scripted change"
+    assert "base" not in patched  # base already matched: never PATCHed
+    notes = _run_notes(harness, number)
+    assert any("converged title/body" in note and "retargeted" not in note for note in notes)
+
+
 def test_completion_retry_re_ships_against_the_carried_chained_base(harness: Harness):
     """The carryover path never re-resolves the chain — the worktree
     embodies the base (ADR-0053): even after the blocker's go-ahead is
@@ -1988,11 +2029,34 @@ def test_completion_retry_re_ships_against_the_carried_chained_base(harness: Har
     assert harness.remote_file(branch_for(number), "blocker.txt") == "blocker work"
 
 
+def _round_diffstat(harness: Harness, number: int, round_number: int) -> str:
+    """The evidence diffstat of the given round's Run."""
+    run_jsons = [
+        p
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+    ]
+    match = next(
+        p for p in run_jsons if json.loads(harness.evidence_file(p))["round"] == round_number
+    )
+    return harness.evidence_file(match.replace("run.json", "diffstat.txt"))
+
+
+def _run_notes(harness: Harness, number: int) -> list[str]:
+    """Every note from every Run's evidence record on the issue."""
+    return [
+        note
+        for p in harness.evidence_paths()
+        if p.startswith(f"runs/issue-{number}/") and p.endswith("/run.json")
+        for note in json.loads(harness.evidence_file(p))["notes"]
+    ]
+
+
 def test_a_blocker_merged_mid_session_retargets_the_new_pr_at_ship(harness: Harness):
     """Merging the approved blocker is the EXPECTED human act and can land
-    during the dependent's agent session: the ship path re-checks the base
-    and opens against main with no zone, instead of 422-discarding the
-    whole completed session as infra."""
+    during the dependent's agent session: the ship path proves the merge
+    through the blocker's PR and opens against main with no zone, instead
+    of 422-discarding the whole completed session as infra."""
     number = harness.file_issue("Dependent feature", CRITERIA_BODY)
     blocker, blocker_pr = harness.approved_blocker(number)
 
@@ -2008,6 +2072,206 @@ def test_a_blocker_merged_mid_session_retargets_the_new_pr_at_ship(harness: Harn
     assert harness.fake.pulls[dep_pr]["base"] == "main"
     assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
     assert harness.remote_file(branch_for(number), "change.txt") == "done"
+    assert any("merged and deleted" in note for note in _run_notes(harness, number))
+    # The evidence diffstat runs against the FRESH default-branch tip, so
+    # the blocker's own (now-merged) work never shows as this Run's diff.
+    diffstat = _round_diffstat(harness, number, 1)
+    assert "change.txt" in diffstat and "blocker.txt" not in diffstat
+
+
+def test_a_mid_session_merge_into_a_lower_blocker_targets_the_surviving_base(harness: Harness):
+    """Multi-level chain main <- A <- B <- dependent, with B merged into
+    A's branch (and deleted) during the dependent's session: the ship path
+    follows B's merged PR to its ACTUAL base branch — the PR targets A and
+    the zone records A, never a guessed main."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    a, _a_pr = harness.approved_blocker(number, filename="a.txt", content="a work\n")
+    b, b_pr = harness.approved_blocker(
+        number, filename="b.txt", content="b work\n", base=branch_for(a)
+    )
+    harness.fake.add_blocked_by(b, a)
+    b_tip = harness.remote_sha(branch_for(b))
+
+    def merges_b_into_a_mid_session(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("done\n")
+        write_proposal(cwd)
+        harness.merge_blocker(b, b_pr)  # merge target: B's PR base — A's branch
+
+    harness.worker_behaviors.append(merges_b_into_a_mid_session)
+    assert harness.worker_once() == 1
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == branch_for(a)
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) == basedon.BasedOn(issue=a, sha=b_tip)
+    assert f"merge #{a} first" in body  # the warning names the REMAINING blocker
+    # The checkout embodied the whole chain; the diff is the dependent only.
+    assert harness.remote_file(branch_for(number), "a.txt") == "a work"
+    assert harness.remote_file(branch_for(number), "b.txt") == "b work"
+    diffstat = _round_diffstat(harness, number, 1)
+    assert "change.txt" in diffstat
+    assert "a.txt" not in diffstat and "b.txt" not in diffstat
+
+
+def test_multiple_merged_layers_are_followed_to_the_surviving_base(harness: Harness):
+    """Both chain layers merge and delete during the session: the ship path
+    follows the merged PRs layer by layer (B -> A -> main) and lands on the
+    actual surviving base — here the default branch, because that is the
+    true successor, not a guess."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    a, a_pr = harness.approved_blocker(number, filename="a.txt", content="a work\n")
+    b, b_pr = harness.approved_blocker(
+        number, filename="b.txt", content="b work\n", base=branch_for(a)
+    )
+    harness.fake.add_blocked_by(b, a)
+
+    def merges_both_mid_session(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("done\n")
+        write_proposal(cwd)
+        harness.merge_blocker(b, b_pr)  # B into A's branch
+        harness.merge_blocker(a, a_pr)  # then A into main
+
+    harness.worker_behaviors.append(merges_both_mid_session)
+    assert harness.worker_once() == 1
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
+    diffstat = _round_diffstat(harness, number, 1)
+    assert "change.txt" in diffstat
+    assert "a.txt" not in diffstat and "b.txt" not in diffstat
+
+
+def test_a_deleted_unmerged_blocker_base_fails_loudly_as_infra(harness: Harness):
+    """Branch absence is NOT merge proof: a blocker branch deleted with its
+    PR closed unmerged is unverifiable — the Run fails loudly as infra and
+    no dependent PR is ever opened against a guessed main."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+
+    def deletes_unmerged_mid_session(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("done\n")
+        write_proposal(cwd)
+        harness.delete_blocker_unmerged(blocker, blocker_pr)
+
+    harness.worker_behaviors.append(deletes_unmerged_mid_session)
+    assert harness.worker_once() == 2  # the refused ship and the local retry
+
+    failed = [e for e in harness.sink.run_events(number) if e["phase"] == "failed"]
+    assert [e["failure_class"] for e in failed] == ["infra", "infra"]
+    assert {FAILED, NEEDS_HUMAN} <= harness.fake.labels_of(number)
+    # The first Run named the missing merge proof; the retry re-resolved at
+    # checkout and found no go-ahead. Neither guessed a base.
+    (comment,) = harness.fake.comments[number]
+    assert "not merged" in comment["body"]
+    assert not any(
+        p["head"] == branch_for(number) for p in harness.fake.pulls.values()
+    )  # no PR from a guessed base
+
+
+def test_resume_round_retargeted_mid_session_refreshes_base_and_zone(harness: Harness):
+    """GitHub can retarget the dependent PR while a resume round's session
+    runs (the blocker merges mid-round): the ship path reloads the PR and
+    ships against its effective base — zone removed, diffstat against the
+    fresh default-branch tip, and no driver-side base PATCH (GitHub already
+    moved it)."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+    assert harness.worker_once() == 1
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is not None
+
+    harness.reviewer_replies.append(revise_reply("1. improve change.txt"))
+    assert harness.reviewer_once() == 1
+
+    def improves_and_blocker_merges(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("improved\n")
+        write_proposal(cwd)
+        harness.merge_blocker(blocker, blocker_pr)  # GitHub retargets dep_pr
+
+    harness.worker_behaviors.append(improves_and_blocker_merges)
+    assert harness.worker_once() == 1
+
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) is None
+    assert "Based on" not in body
+    assert harness.remote_file(branch_for(number), "change.txt") == "improved"
+    assert any("retargeted" in note for note in _run_notes(harness, number))
+    diffstat = _round_diffstat(harness, number, 2)
+    assert "change.txt" in diffstat and "blocker.txt" not in diffstat
+    # GitHub's own retarget needs no PATCH: no driver write touched the base.
+    patches = [
+        w for w in harness.fake.write_log if w[1] == "PATCH" and w[2].endswith(f"/pulls/{dep_pr}")
+    ]
+    assert patches and all("base" not in w[3] for w in patches)
+
+
+def test_resume_round_retargeted_mid_session_to_a_surviving_blocker_refreshes_the_zone(
+    harness: Harness,
+):
+    """The multi-level resume race: B merges into A's branch during the
+    dependent's resume session and GitHub retargets the PR to A. The ship
+    path reloads, keeps the recorded base commit (contained in A), and the
+    zone warns for the ACTUAL remaining blocker — never removed while the
+    effective base is not the default branch."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    a, _a_pr = harness.approved_blocker(number, filename="a.txt", content="a work\n")
+    b, b_pr = harness.approved_blocker(
+        number, filename="b.txt", content="b work\n", base=branch_for(a)
+    )
+    harness.fake.add_blocked_by(b, a)
+    b_tip = harness.remote_sha(branch_for(b))
+    assert harness.worker_once() == 1
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) == basedon.BasedOn(
+        issue=b, sha=b_tip
+    )
+
+    harness.reviewer_replies.append(revise_reply("1. improve change.txt"))
+    assert harness.reviewer_once() == 1
+
+    def improves_and_b_merges(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("improved\n")
+        write_proposal(cwd)
+        harness.merge_blocker(b, b_pr)  # into A's branch; GitHub retargets dep_pr to A
+
+    harness.worker_behaviors.append(improves_and_b_merges)
+    assert harness.worker_once() == 1
+
+    assert harness.fake.pulls[dep_pr]["base"] == branch_for(a)
+    body = harness.fake.issues[dep_pr]["body"]
+    assert basedon.parse_zone(body) == basedon.BasedOn(issue=a, sha=b_tip)
+    assert f"merge #{a} first" in body
+    diffstat = _round_diffstat(harness, number, 2)
+    assert "change.txt" in diffstat
+    assert "a.txt" not in diffstat and "b.txt" not in diffstat
+
+
+def test_completion_retry_reconciles_a_base_that_disappeared_between_sessions(harness: Harness):
+    """The completion retry keeps its carryover base for the CHECKOUT (the
+    worktree embodies it) but still reconciles at ship: a blocker merged
+    and deleted between the sessions is proven merged and the PR opens
+    against the actual successor base."""
+    number = harness.file_issue("Dependent feature", CRITERIA_BODY)
+    blocker, blocker_pr = harness.approved_blocker(number)
+
+    def forgets_commit_message_and_blocker_merges(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("chained work\n")
+        write_proposal(cwd, skip={"commit-message"})
+        harness.merge_blocker(blocker, blocker_pr)
+
+    def fills_in(prompt: str, cwd: Path) -> None:
+        format_output(cwd.parent, "commit-message", "chained work\n\nwhat and why")
+
+    harness.worker_behaviors.extend([forgets_commit_message_and_blocker_merges, fills_in])
+    assert harness.worker_once() == 2  # the original and the completion retry
+
+    dep_pr = _pr_for_head(harness, branch_for(number))
+    assert harness.fake.pulls[dep_pr]["base"] == "main"
+    assert basedon.parse_zone(harness.fake.issues[dep_pr]["body"]) is None
+    assert harness.remote_file(branch_for(number), "change.txt") == "chained work"
+    assert any("merged and deleted" in note for note in _run_notes(harness, number))
 
 
 def test_resume_round_zone_keeps_the_sha_the_history_contains(harness: Harness):

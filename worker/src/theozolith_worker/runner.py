@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import secrets
 import shutil
 import time
@@ -697,6 +698,82 @@ def _derive_checkout_base(client: GitHubClient, issue_number: int) -> str:
     return decision.base_branch
 
 
+# The only base branches the ship path will fetch or publish against are
+# names the pipeline itself derives (the default branch, ozolith/issue-N);
+# this guard additionally refuses any repository-derived name git could
+# parse as an option (a leading dash) or that carries shell-hostile bytes.
+_SAFE_REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/+-]*")
+
+
+def _resolve_deleted_base(client: GitHubClient, base_branch: str, default: str) -> str:
+    """Follow a deleted chained base to its live successor (ADR-0053): the
+    branch's PR — resolved across ALL states — must PROVE the merge, and
+    the dependent follows the merged PR's actual ``base_ref``, layer by
+    layer through any already-merged-and-deleted chain, until a live branch
+    or the default branch. Branch absence alone is never merge proof: an
+    absent, closed-unmerged, or otherwise unverifiable blocker PR fails the
+    Run loudly as infra — the driver never publishes against a guessed
+    base, and never guesses the repository default."""
+    walked = [base_branch]
+    while True:
+        gone = walked[-1]
+        pr = client.find_pr_by_head(gone)
+        if pr is None:
+            raise _RunFailed(
+                f"chained base {gone} no longer exists and no PR for it can be found"
+                " — cannot prove it merged; refusing to publish against a guessed base",
+                "infra",
+            )
+        if not pr.merged:
+            raise _RunFailed(
+                f"chained base {gone} no longer exists but its PR #{pr.number} is"
+                f" {pr.state} and not merged — a deleted branch without merge proof is"
+                " unverifiable; refusing to publish against a guessed base",
+                "infra",
+            )
+        successor = pr.base_ref
+        if successor == default:
+            return default
+        if issue_for_branch(successor) is None:
+            raise _RunFailed(
+                f"merged blocker PR #{pr.number} targeted {successor!r}, outside the"
+                " pipeline's branch naming — refusing to follow it to a base",
+                "infra",
+            )
+        if successor in walked:
+            raise _RunFailed(
+                "the merged-base chain loops"
+                f" ({' -> '.join([*walked, successor])}); refusing to publish against"
+                " a guessed base",
+                "infra",
+            )
+        walked.append(successor)
+        if client.branch_head(successor) is not None:
+            return successor
+
+
+def _verify_ship_base(workdir: Path, base_branch: str, base_sha: str, auth: dict[str, str]) -> None:
+    """The retargeted-base containment proof (ADR-0053): fetch the resolved
+    base — refusing a repository-derived name git could parse as an option
+    — and require the Run's recorded base commit to be an ancestor of its
+    fresh tip; anything else would fold blocker-owned changes into the PR
+    diff. The fetch also refreshes the checkout's ``origin/<base>`` ref, so
+    the evidence diffstat runs against the tip the PR actually targets."""
+    if not _SAFE_REF_RE.fullmatch(base_branch):
+        raise _RunFailed(f"resolved base branch {base_branch!r} is not a safe ref name", "infra")
+    try:
+        gitops.fetch(workdir, base_branch, env=auth)
+    except gitops.GitError as exc:
+        raise _RunFailed(f"cannot fetch the resolved base {base_branch}: {exc}", "infra") from exc
+    if not gitops.is_ancestor(workdir, base_sha, f"origin/{base_branch}"):
+        raise _RunFailed(
+            f"the recorded base commit {base_sha} is not contained in the resolved"
+            f" base {base_branch} — publishing against it would fold blocker-owned"
+            " changes into this PR's diff; refusing",
+            "infra",
+        )
+
+
 def _run_to_pr(
     config: DriverConfig,
     client: GitHubClient,
@@ -1007,37 +1084,65 @@ def _run_to_pr(
 
     gitops.push(workdir, branch, force=context.force, env=auth)
 
+    # -- ship-time base reconciliation (ADR-0053) ------------------------------
     # The blocker can merge (branch auto-deleted: the delete-branch-on-merge
     # posture chaining requires) DURING the agent session — the EXPECTED
     # human act, since chained dispatch demands an approved-and-awaiting-
-    # merge blocker. Creating the PR against the deleted branch would 422
-    # and discard the whole completed session as infra, so a fresh chained
-    # Run re-checks its base at ship: gone means the healthy retarget shape
-    # — default-branch base, no zone; the checkout's content is unchanged
-    # (the blocker's commits are in the default branch now). Resume rounds
-    # need no check: their PR already exists and GitHub retargeted it.
-    if (
-        chained_tip is not None
-        and existing_pr is None
-        and client.branch_head(context.base_branch) is None
-    ):
+    # merge blocker. Every ship path — fresh Run, resume round, completion
+    # retry — therefore reconciles its base against current GitHub truth
+    # immediately before composing the PR. An existing PR is reloaded
+    # (GitHub retargets it to the merged PR's base branch when its base is
+    # deleted, and may have done so mid-session); a recorded base branch
+    # that no longer exists must be PROVEN merged — its PR resolved across
+    # all states — and is followed to that PR's actual base branch, layer
+    # by layer through any already-merged chain, until a live branch or the
+    # default branch. Branch absence alone is never merge proof, and the
+    # driver never publishes against a guessed base.
+    default = client.default_branch()
+    current_pr = client.get_pull(existing_pr.number) if existing_pr is not None else None
+    effective_base = current_pr.base_ref if current_pr is not None else context.base_branch
+    if current_pr is not None and effective_base != context.base_branch:
         report.notes.append(
-            f"chained base {context.base_branch} was merged and deleted during the"
-            f" session; the PR opens against {client.default_branch()}"
+            f"PR #{current_pr.number} was retargeted from {context.base_branch} to"
+            f" {effective_base} during the session"
         )
-        context.base_branch = client.default_branch()
-        chained_tip = None
+    if effective_base != default and issue_for_branch(effective_base) is None:
+        raise _RunFailed(
+            f"PR base {effective_base!r} is neither the default branch nor an"
+            " ozolith/issue-N blocker branch — a human retarget owns this PR;"
+            " refusing to ship against a base outside the pipeline's naming",
+            "infra",
+        )
+    retargeted_by_walk = False
+    if effective_base != default and client.branch_head(effective_base) is None:
+        resolved = _resolve_deleted_base(client, effective_base, default)
+        report.notes.append(
+            f"chained base {effective_base} was merged and deleted during the"
+            f" session; the PR {'retargets to' if current_pr is not None else 'opens against'}"
+            f" {resolved}"
+        )
+        effective_base = resolved
+        retargeted_by_walk = current_pr is not None
+    if effective_base != context.base_branch:
+        # The diff must stay scoped to the dependent layer: prove the
+        # recorded base commit is contained in the resolved target before
+        # publishing against it, and refresh the checkout's origin/<base>
+        # ref so the evidence diffstat runs against the fresh tip.
+        _verify_ship_base(workdir, effective_base, context.base_sha, auth)
+        context.base_branch = effective_base
+    ship_tip = issue_for_branch(effective_base) if effective_base != default else None
     # The Based-on zone (ADR-0053) is driver-owned — composed from the
     # checkout's own base record, never from the Output Proposal — and
-    # refreshed (or removed, when a retargeted round is main-based again)
-    # on EVERY ship round.
+    # refreshed on EVERY ship round: removed only when the effective base
+    # is truly the default branch, otherwise warning for the actual
+    # remaining blocker. The recorded SHA stays the base commit this Run's
+    # history actually CONTAINS (containment in the effective base was just
+    # verified) — never a refreshed tip, which would mask drift (#82).
     based_on = (
-        basedon.BasedOn(issue=chained_tip, sha=context.base_sha)
-        if chained_tip is not None
-        else None
+        basedon.BasedOn(issue=ship_tip, sha=context.base_sha) if ship_tip is not None else None
     )
     intro = _no_change_intro(section) if empty else ""
-    if existing_pr is None:
+    if current_pr is None:
         # The driver owns the number prefix; the proposal owns the words.
         title = f"#{issue.number}: {validated.pr_title}"
         composed = basedon.upsert_zone(
@@ -1045,11 +1150,12 @@ def _run_to_pr(
             based_on,
         )
         pr = client.create_pr(head=branch, base=context.base_branch, title=title, body=composed)
-        if pr.base_ref != context.base_branch or pr.body != composed:
+        if pr.base_ref != context.base_branch or pr.title != title or pr.body != composed:
             # The 422 fallback reused an existing PR (a lookup-to-create
             # race): converge it on this Run's composed content — base,
-            # title, AND body, so a raced chained PR never enters review
-            # without its Based-on zone and merge-order warning. Safe:
+            # title, AND body (any one differing is enough), so a raced
+            # chained PR never enters review without its Based-on zone and
+            # merge-order warning, and never under the twin's title. Safe:
             # resume rounds never reach create_pr, so the PR predates any
             # review round (ADR-0053).
             retargeted = pr.base_ref != context.base_branch
@@ -1067,10 +1173,12 @@ def _run_to_pr(
                 else f"create-PR fallback found PR #{pr.number}; converged title/body"
             )
     else:
-        pr = existing_pr
+        pr = current_pr
         # Absent field = no-op, never clear (ADR-0046): a resume round that
         # proposes no title/narrative keeps the PR's existing ones and only
-        # the Decisions Section is replaced.
+        # the Decisions Section is replaced. The body baseline is the
+        # RELOADED PR's — the session-stale copy may predate a mid-session
+        # human edit or retarget.
         body = (
             compose_pr_body(issue.number, validated.pr_description, section, no_change_intro=intro)
             if validated.pr_description
@@ -1080,6 +1188,9 @@ def _run_to_pr(
             pr.number,
             title=f"#{issue.number}: {validated.pr_title}" if validated.pr_title else None,
             body=basedon.upsert_zone(body, based_on),
+            # A base the walk resolved past a deleted branch is PATCHed;
+            # GitHub's own retarget already moved the PR and needs none.
+            base=context.base_branch if retargeted_by_walk else None,
         )
     report.pr_number = pr.number
     client.add_labels(pr.number, PR_READY)

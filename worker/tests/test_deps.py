@@ -330,10 +330,11 @@ def test_zone_survives_an_agent_mangled_warning_line():
     assert basedon.parse_zone(replaced) == basedon.BasedOn(5, "e" * 40)
 
 
-def test_walk_closure_prunes_beneath_closed_blockers():
-    """A closed blocker's own edges constrained work that is over: its
-    subtree never judges a live dependent, so historical edges beneath
-    long-completed blockers cannot poison new work."""
+def test_walk_closure_is_complete_beneath_closed_blockers():
+    """The closure is the truthful full transitive graph: a completed
+    blocker keeps its real edges and the nodes beneath it — issue #82's
+    input/deps/ serialization consumes this helper and must never have to
+    rediscover omitted edges."""
     fake, client = make_env()
     ancient = fake.create_issue("ancient", "", set())
     done = fake.create_issue("done", "", set())
@@ -341,17 +342,75 @@ def test_walk_closure_prunes_beneath_closed_blockers():
     fake.add_blocked_by(dependent, done)
     fake.add_blocked_by(done, ancient)
     fake.close_issue(done, "completed")
-    fake.close_issue(ancient, "not_planned")  # would malform if walked
+    fake.close_issue(ancient, "completed")
 
     closure = deps.walk_closure(client, dependent)
 
-    assert closure.order == (done, dependent)
-    assert ancient not in closure.issues
-    assert closure.edges[done] == ()  # pruned, never fetched
+    # Closed/merged dependencies stay topologically ordered with real edges.
+    assert closure.order == (ancient, done, dependent)
+    assert closure.edges == {dependent: (done,), done: (ancient,), ancient: ()}
+    assert {ancient, done} <= set(closure.issues)
     assert deps.resolve(client, closure, "main").kind == deps.READY
 
 
-def test_a_stale_cycle_beneath_a_completed_blocker_never_raises():
+def test_live_work_beneath_a_completed_blocker_chains_on_the_open_ancestor():
+    """The chain-internal merge shape: B's PR merged into A's still-open
+    branch, B closed completed. A carries B's merged work, so the dependent
+    must chain on A — resolving READY over A's head would base the
+    dependent on main and silently drop B's work."""
+    fake, client = make_env()
+    a = fake.create_issue("a", "", set())
+    b = fake.create_issue("b", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, b)
+    fake.add_blocked_by(b, a)
+    fake.close_issue(b, "completed")
+    add_pr(fake, a, APPROVED, base="main")
+
+    closure = deps.walk_closure(client, dependent)
+
+    # A and B are both in the closure, with their real edges.
+    assert closure.order == (a, b, dependent)
+    assert closure.edges == {dependent: (b,), b: (a,), a: ()}
+    decision = deps.resolve(client, closure, "main")
+    assert decision.kind == deps.CHAINED
+    assert decision.tip_issue == a
+    assert decision.base_branch == deps.branch_for(a)
+
+
+def test_an_unapproved_open_ancestor_beneath_a_completed_blocker_means_wait():
+    """Same shape, no go-ahead on A: wait — never READY on main, which
+    would drop the completed layer's work (it lives on A's branch)."""
+    fake, client = make_env()
+    a = fake.create_issue("a", "", set())
+    b = fake.create_issue("b", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, b)
+    fake.add_blocked_by(b, a)
+    fake.close_issue(b, "completed")
+    assert resolve(client, dependent).kind == deps.WAIT
+
+
+def test_a_not_planned_ancestor_beneath_a_completed_blocker_is_malformed():
+    """Only a completed close satisfies an edge, anywhere in the graph
+    (the settled issue #81 truth table): a not_planned ancestor is a graph
+    a human must re-edge, not a subtree eligibility silently skips."""
+    fake, client = make_env()
+    ancient = fake.create_issue("ancient", "", set())
+    done = fake.create_issue("done", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, done)
+    fake.add_blocked_by(done, ancient)
+    fake.close_issue(done, "completed")
+    fake.close_issue(ancient, "not_planned")
+    decision = resolve(client, dependent)
+    assert decision.kind == deps.MALFORMED
+    assert f"#{ancient}" in decision.reason and "not_planned" in decision.reason
+
+
+def test_a_transitive_cycle_beneath_a_completed_blocker_is_still_detected():
+    """Cycle detection covers the full closure: closure pruning must never
+    hide a back edge beneath a closed blocker."""
     fake, client = make_env()
     a = fake.create_issue("a", "", set())
     b = fake.create_issue("b", "", set())
@@ -360,8 +419,21 @@ def test_a_stale_cycle_beneath_a_completed_blocker_never_raises():
     fake.add_blocked_by(a, b)
     fake.add_blocked_by(b, a)
     fake.close_issue(a, "completed")
-    closure = deps.walk_closure(client, dependent)
-    assert deps.resolve(client, closure, "main").kind == deps.READY
+    with pytest.raises(deps.DependencyCycleError) as excinfo:
+        deps.walk_closure(client, dependent)
+    assert excinfo.value.cycle == (a, b, a)
+
+
+def test_a_cross_repo_edge_beneath_a_completed_blocker_is_still_detected():
+    fake, client = make_env()
+    done = fake.create_issue("done", "", set())
+    dependent = fake.create_issue("dependent", "", set())
+    fake.add_blocked_by(dependent, done)
+    fake.add_blocked_by(done, 999, repo="acme/elsewhere")
+    fake.close_issue(done, "completed")
+    with pytest.raises(deps.CrossRepoEdgeError) as excinfo:
+        deps.walk_closure(client, dependent)
+    assert excinfo.value.foreign_repo == "acme/elsewhere"
 
 
 def test_zone_round_trips_a_crlf_body():

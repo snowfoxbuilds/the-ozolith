@@ -400,18 +400,27 @@ class Harness:
         self.fake.add_issue_comment(number, "sean", body, association="OWNER")
 
     def approved_blocker(
-        self, dependent: int, *, filename: str = "blocker.txt", content: str = "blocker work\n"
+        self,
+        dependent: int,
+        *,
+        filename: str = "blocker.txt",
+        content: str = "blocker work\n",
+        base: str = "main",
     ) -> tuple[int, int]:
         """The Chained Base go-ahead fixture (ADR-0053): a claimed blocker
         issue whose work sits on a real remote ``ozolith/issue-N`` branch
         under an approved-and-awaiting-merge PR (pr_ready + needs_human),
-        plus the blocked-by edge onto ``dependent``. Returns (blocker
-        issue number, blocker PR number)."""
+        plus the blocked-by edge onto ``dependent``. ``base`` builds the
+        blocker on another blocker's branch (a multi-level chain). Returns
+        (blocker issue number, blocker PR number)."""
         blocker = self.fake.create_issue("blocker groundwork", "", {IN_PROGRESS})
         self.fake.force_assign(blocker, WORKER_LOGIN)
         branch = f"ozolith/issue-{blocker}"
         work = self.remote.parent / f"blocker-work-{blocker}"
-        _git(["clone", "--quiet", str(self.remote), str(work)], self.remote.parent)
+        _git(
+            ["clone", "--quiet", "--branch", base, str(self.remote), str(work)],
+            self.remote.parent,
+        )
         (work / filename).write_text(content)
         identity = ["-c", "user.name=blocker", "-c", "user.email=blocker@example.com"]
         _git(["add", "--all"], work)
@@ -420,19 +429,24 @@ class Harness:
         pr_number = self.fake.create_issue(
             f"#{blocker}: groundwork", f"Closes #{blocker}.", {"pr_ready", "needs_human"}
         )
-        self.fake.pulls[pr_number] = {"state": "open", "head": branch, "base": "main"}
+        self.fake.pulls[pr_number] = {"state": "open", "head": branch, "base": base}
         self.fake.add_blocked_by(dependent, blocker)
         return blocker, pr_number
 
     def merge_blocker(self, blocker: int, pr_number: int) -> None:
         """Land a blocker the way the human gate does on a chain-enabled
-        workspace (ADR-0053): merge commit into main, branch deleted, PR
-        recorded merged, issue closed as completed — and open PRs based on
-        the deleted branch retargeted to main, GitHub's
-        retarget-on-branch-delete behavior."""
+        workspace (ADR-0053): merge commit into the PR's own base branch,
+        branch deleted, PR recorded merged, issue closed as completed — and
+        open PRs based on the deleted branch retargeted to the merged PR's
+        base branch (the default branch only when that is the actual
+        successor base), GitHub's retarget-on-branch-delete behavior."""
         branch = f"ozolith/issue-{blocker}"
+        target = self.fake.pulls[pr_number]["base"]
         work = self.remote.parent / f"merge-work-{blocker}"
-        _git(["clone", "--quiet", str(self.remote), str(work)], self.remote.parent)
+        _git(
+            ["clone", "--quiet", "--branch", target, str(self.remote), str(work)],
+            self.remote.parent,
+        )
         identity = ["-c", "user.name=human", "-c", "user.email=human@example.com"]
         _git(
             [
@@ -446,13 +460,24 @@ class Harness:
             ],
             work,
         )
-        _git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], work)
+        _git(["push", "--quiet", "origin", f"HEAD:refs/heads/{target}"], work)
         _git(["push", "--quiet", "origin", "--delete", branch], work)
         self.fake.merge_pr(pr_number)
         self.fake.close_issue(blocker, "completed")
         for pull in self.fake.pulls.values():
             if pull["state"] == "open" and pull["base"] == branch:
-                pull["base"] = "main"
+                pull["base"] = target
+
+    def delete_blocker_unmerged(self, blocker: int, pr_number: int) -> None:
+        """The unverifiable shape: the blocker PR is closed WITHOUT merging
+        and its branch deleted — branch absence with no merge proof, which
+        the ship path must refuse to treat as merged (ADR-0053)."""
+        branch = f"ozolith/issue-{blocker}"
+        _git(
+            ["--git-dir", str(self.remote), "update-ref", "-d", f"refs/heads/{branch}"],
+            self.remote,
+        )
+        self.fake.close_pr(pr_number)
 
     def human_requeue(self, issue_number: int, pr_number: int) -> None:
         """The human answers a blocked PR and re-queues the issue."""

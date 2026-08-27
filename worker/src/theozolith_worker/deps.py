@@ -69,14 +69,23 @@ class CrossRepoEdgeError(RuntimeError):
 
 @dataclass(frozen=True)
 class DependencyClosure:
-    """The transitive blocked-by closure of one issue.
+    """The COMPLETE transitive blocked-by closure of one issue.
 
     ``order`` is topological — blockers before dependents, the walked issue
     last — and deterministic (ties resolve by ascending issue number).
     ``edges`` maps each issue to its direct blockers; ``issues`` holds the
     blocker payloads as the walk read them (the walked issue itself is not
     fetched — callers already hold it). ``order == (number,)`` means
-    edge-less."""
+    edge-less.
+
+    Complete means closed and merged blockers keep their real edges: this
+    closure is the truthful graph — issue #82's ``input/deps/`` serialization
+    consumes it and must never rediscover omitted edges — and eligibility
+    (``resolve``) is an interpretation OVER it, never baked into the walk. A
+    completed blocker can sit above a still-open ancestor whose branch
+    carries the merged work (a chain layer merged into its parent branch);
+    pruning beneath the completed blocker would hide that live ancestor and
+    base the dependent on the default branch, silently dropping its work."""
 
     order: tuple[int, ...]
     edges: dict[int, tuple[int, ...]]
@@ -85,16 +94,12 @@ class DependencyClosure:
 
 def walk_closure(client: GitHubClient, number: int) -> DependencyClosure:
     """DFS over ``list_blocked_by``, live per call — the reads are the
-    authority (ADR-0053). Raises :class:`DependencyCycleError` on a back
-    edge (carrying the cycle path) and :class:`CrossRepoEdgeError` on a
-    blocker outside ``client.repo``; a diamond is walked once.
-
-    The walk PRUNES beneath closed blockers: a closed blocker's own edges
-    constrained work that is over — its subtree must not judge (or chain)
-    a live dependent, or historical edges under long-completed blockers
-    would poison new work forever. The closed blocker itself stays in the
-    closure (``resolve`` judges its state_reason); its edges are recorded
-    empty and never fetched."""
+    authority (ADR-0053). The walk is FULL: every reachable same-repo edge
+    is followed, closed/merged blockers included, so cycle detection
+    (:class:`DependencyCycleError`, carrying the cycle path) and cross-repo
+    detection (:class:`CrossRepoEdgeError`) cover the whole graph — a
+    transitive cycle or foreign edge is never hidden beneath a closed
+    blocker. A diamond is walked once."""
     order: list[int] = []
     edges: dict[int, tuple[int, ...]] = {}
     issues: dict[int, Issue] = {}
@@ -115,13 +120,6 @@ def walk_closure(client: GitHubClient, number: int) -> DependencyClosure:
             issues.setdefault(blocker.number, blocker)
         edges[current] = tuple(blocker.number for blocker in blockers)
         for blocker in blockers:
-            if blocker.state == "closed":
-                # Pruned leaf: judged by resolve, never descended into.
-                if blocker.number not in done:
-                    done.add(blocker.number)
-                    edges.setdefault(blocker.number, ())
-                    order.append(blocker.number)
-                continue
             visit(blocker.number)
         on_path.pop()
         done.add(current)
@@ -143,15 +141,21 @@ class ChainDecision:
 
 
 def resolve(client: GitHubClient, closure: DependencyClosure, default_branch: str) -> ChainDecision:
-    """The ADR-0053 go-ahead, over the closure minus the walked issue.
+    """The ADR-0053 go-ahead, over the COMPLETE closure minus the walked
+    issue — nodes beneath closed blockers included.
 
     Every blocker closed as completed -> READY (base = the default branch).
     Any blocker closed for another reason -> MALFORMED (only completed
-    satisfies an edge). Open blockers qualify only when each has an
+    satisfies an edge, anywhere in the graph — a not_planned ancestor is a
+    graph a human must re-edge). Open blockers qualify only when each has an
     approved-and-awaiting-merge PR — ``pr_ready`` + ``needs_human`` without
     ``blocked``, labels only, never comment parsing — and those PRs form a
     single chain by base_ref linkage with exactly one tip; the dependent
-    then bases on the tip (CHAINED). Anything else healthy -> WAIT.
+    then bases on the tip (CHAINED). An open ancestor beneath a completed
+    blocker joins that chain check like any other open blocker: its branch
+    is where the completed layer's work merged to, so resolving READY over
+    its head would base the dependent on the default branch and drop that
+    work. Anything else healthy -> WAIT.
 
     Preconditions (:func:`chain_preconditions`) are deliberately NOT
     checked here: dispatch must check them; the driver at checkout never

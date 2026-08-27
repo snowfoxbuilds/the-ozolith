@@ -320,6 +320,60 @@ def test_dispatch_grants_a_chained_dependent_with_ordinary_claim_writes(control:
     assert control.admin("GET", "/api/v1/flags").json()["dispatch_waits"] == []
 
 
+def test_dispatch_chains_on_a_live_ancestor_beneath_a_completed_blocker(control: ControlRig):
+    """The complete-closure truth table (issue #81): blocker #2 merged into
+    #1's still-open branch and closed completed, #1 open and approved. The
+    dependent is granted — chained on #1, whose branch carries #2's merged
+    work — never resolved ready over #1's head (which would base the
+    dependent on main and drop that work)."""
+    control.github.add_issue(1, labels={"in_progress"}, assignees=["ozolith-worker-z"])
+    control.github.add_pr(11, head_ref="ozolith/issue-1", labels={"pr_ready", "needs_human"})
+    control.github.add_issue(
+        2, labels=set(), assignees=[], state="closed", state_reason="completed"
+    )
+    control.github.add_issue(3, labels={"plan_ready"}, assignees=[])
+    control.github.add_blocked_by(3, 2)
+    control.github.add_blocked_by(2, 1)
+    assert control.dispatch().json()["issue"]["number"] == 3
+
+
+def test_dispatch_waits_on_an_unapproved_ancestor_beneath_a_completed_blocker(
+    control: ControlRig,
+):
+    """Same shape, no go-ahead on the open ancestor: a visible wait — never
+    a grant on main that drops the completed layer's work."""
+    control.github.add_issue(1, labels={"in_progress"}, assignees=["ozolith-worker-z"])
+    control.github.add_issue(
+        2, labels=set(), assignees=[], state="closed", state_reason="completed"
+    )
+    control.github.add_issue(3, labels={"plan_ready"}, assignees=[])
+    control.github.add_blocked_by(3, 2)
+    control.github.add_blocked_by(2, 1)
+    assert control.dispatch().json()["issue"] is None
+    waits = control.admin("GET", "/api/v1/flags").json()["dispatch_waits"]
+    assert [w["issue"] for w in waits] == [3]
+    assert "#1" in waits[0]["reason"]
+
+
+def test_dispatch_flags_a_not_planned_ancestor_beneath_a_completed_blocker(control: ControlRig):
+    """Only a completed close satisfies an edge, anywhere in the complete
+    closure: a not_planned ancestor beneath a completed blocker is a graph
+    a human must re-edge, surfaced as malformed and never granted."""
+    control.github.add_issue(
+        1, labels=set(), assignees=[], state="closed", state_reason="not_planned"
+    )
+    control.github.add_issue(
+        2, labels=set(), assignees=[], state="closed", state_reason="completed"
+    )
+    control.github.add_issue(3, labels={"plan_ready"}, assignees=[])
+    control.github.add_blocked_by(3, 2)
+    control.github.add_blocked_by(2, 1)
+    assert control.dispatch().json()["issue"] is None
+    malformed = control.admin("GET", "/api/v1/flags").json()["malformed_states"]
+    assert [m["issue"] for m in malformed] == [3]
+    assert "#1" in malformed[0]["detail"] and "not_planned" in malformed[0]["detail"]
+
+
 def test_dispatch_waits_on_a_blocked_blocker_pr(control: ControlRig):
     control.github.add_issue(1, labels={"in_progress"}, assignees=["ozolith-worker-z"])
     control.github.add_pr(

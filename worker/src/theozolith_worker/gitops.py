@@ -657,6 +657,21 @@ def commit_exists(cwd: Path, sha: str) -> bool:
     )
 
 
+def is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
+    """Is ``ancestor`` reachable from ``descendant``? False on any failure
+    (unknown commit or ref included) — callers treat containment as a proof
+    obligation, so an unverifiable ancestry is a plain no."""
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=str(cwd),
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 def diff_stat(cwd: Path, base_ref: str) -> str:
     """Numstat of HEAD against the merge base with ``base_ref``."""
     return git(["diff", "--numstat", f"{base_ref}...HEAD"], cwd, check=False)
