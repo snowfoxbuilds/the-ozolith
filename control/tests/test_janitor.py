@@ -363,6 +363,30 @@ def test_a_blocked_blocker_also_lists_its_dependent(control, github):
     assert row["blocker_state"] == "blocked"
 
 
+def test_a_blocked_blocker_with_a_moved_tip_is_visibility_only(control, github):
+    """A blocker carrying blocked is a HUMAN-OWNED condition: even with its
+    tip off the recorded SHA the janitor records the visibility row and
+    writes NOTHING to GitHub — the drift lane escalates only against an
+    open, unblocked blocker. Once the human unblocks the blocker, ordinary
+    drift escalation resumes."""
+    chained_pair(github, tip=MOVED, blocker_labels={"pr_ready", "needs_human", BLOCKED})
+
+    assert drift_sweep(control, github) == []
+    assert github.writes == []
+    assert github.comments.get(9, []) == []
+    assert BLOCKED not in github.pulls[9]["labels"]
+    (row,) = control.store.chained_dependents()
+    assert row["dependent_pr"] == 9 and row["blocker_state"] == "blocked"
+
+    github.pulls[7]["labels"].discard(BLOCKED)  # the human resolves the blocker
+    assert drift_sweep(control, github) == [9]
+    assert github.writes == [
+        ("add_comment", 9),
+        ("add_labels", 9, BLOCKED, NEEDS_HUMAN),
+    ]
+    assert control.store.chained_dependents() == []
+
+
 def test_a_departed_dependent_clears_its_row(control, github):
     chained_pair(github, tip=RECORDED, blocker_state="closed")
     drift_sweep(control, github)
@@ -433,3 +457,44 @@ def test_a_failed_label_write_retries_without_reposting_the_comment(control, git
     assert drift_sweep(control, github) == [9]  # completes, no re-comment
     assert len(github.comments[9]) == 1
     assert BLOCKED in github.pulls[9]["labels"]
+
+
+def test_an_interrupted_recording_heals_without_another_write(control, github):
+    """The completed-act failure window: comment and labels land on GitHub
+    but the final SHA-pair recording is lost (a crash mid-sequence). The
+    next pass proves completion from GitHub state plus the recorded comment
+    sub-key and heals the acted ledger with NO new write; a later human
+    unblock stays final for that exact pair, and only a genuinely new
+    blocker tip escalates again."""
+    chained_pair(github, tip=MOVED)
+    key = f"base-drift-{RECORDED[:12]}-{MOVED[:12]}"
+    escalation = [("add_comment", 9), ("add_labels", 9, BLOCKED, NEEDS_HUMAN)]
+    record = control.store.record_janitor_action
+
+    def lossy(issue: int, run_id: str, worker: str, reason: str) -> None:
+        if run_id == key:
+            raise RuntimeError("store lost mid-sequence")
+        record(issue, run_id, worker, reason)
+
+    control.store.record_janitor_action = lossy
+    assert drift_sweep(control, github) == []  # escalation landed, recording lost
+    assert github.writes == escalation
+    assert BLOCKED in github.pulls[9]["labels"]
+    assert control.store.janitor_acted(9, f"{key}-comment")
+    assert not control.store.janitor_acted(9, key)
+
+    control.store.record_janitor_action = record  # the store recovers
+    assert drift_sweep(control, github) == []  # healed: recognized complete
+    assert control.store.janitor_acted(9, key)
+    assert github.writes == escalation  # no second comment, no second label
+    assert len(github.comments[9]) == 1
+
+    github.pulls[9]["labels"].discard(BLOCKED)  # the human unblocks
+    github.pulls[9]["labels"].discard(NEEDS_HUMAN)
+    assert drift_sweep(control, github) == []  # the healed pair is final
+    assert github.writes == escalation
+
+    github.branch_tips["ozolith/issue-3"] = "c" * 40  # a genuinely NEW drift
+    assert drift_sweep(control, github) == [9]
+    assert len(github.comments[9]) == 2
+    assert github.writes[-1] == ("add_labels", 9, BLOCKED, NEEDS_HUMAN)

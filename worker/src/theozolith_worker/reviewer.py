@@ -268,6 +268,32 @@ _AGENT_CONFIG_NAMES = {"CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"}
 _AGENT_CONFIG_DIRS = {".claude", ".codex"}
 
 
+class JudgeIsolationError(RuntimeError):
+    """The review checkout could not be proven free of agent-instruction
+    artifacts. Raised strictly pre-session: the round never launches and no
+    verdict-related GitHub write happens (the pass-level input lane)."""
+
+
+def _agent_config_artifacts(workdir: Path) -> list[Path]:
+    """Every agent-instruction artifact in the working tree, any depth,
+    any filesystem shape. A reserved name is matched in BOTH walk lists:
+    ``os.walk`` classifies a directory symlink under ``dirs`` and a file
+    or broken symlink under ``files``, and a hostile branch chooses the
+    shape — so ``.claude`` is doomed whether it is a real tree, a symlink
+    to one, or a stray file, and ``CLAUDE.md`` whether file, symlink, or
+    directory. Matched directories are pruned from the walk (their
+    contents go with them)."""
+    reserved = _AGENT_CONFIG_NAMES | _AGENT_CONFIG_DIRS
+    found: list[Path] = []
+    for root, dirs, files in os.walk(workdir):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in [d for d in dirs if d in reserved]:
+            found.append(Path(root) / name)
+            dirs.remove(name)
+        found += [Path(root) / name for name in files if name in reserved]
+    return found
+
+
 def _neutralize_agent_config(workdir: Path) -> None:
     """ADR-0008's no-self-grading boundary applied to the workspace: the
     judged PR must not steer its judge. Agent-instruction files (CLAUDE.md
@@ -279,15 +305,28 @@ def _neutralize_agent_config(workdir: Path) -> None:
     prompt directs the reviewer to judge their changes through git
     diff/show like any other file. (Implementer sessions deliberately load
     checkout config — ADR-0045's stated accepted gap; a worker reading its
-    own repo's config is not a judged party instructing its judge.)"""
-    for root, dirs, files in os.walk(workdir):
-        dirs[:] = [d for d in dirs if d != ".git"]
-        for name in [d for d in dirs if d in _AGENT_CONFIG_DIRS]:
-            shutil.rmtree(Path(root) / name, ignore_errors=True)
-            dirs.remove(name)
-        for name in files:
-            if name in _AGENT_CONFIG_NAMES:
-                (Path(root) / name).unlink(missing_ok=True)
+    own repo's config is not a judged party instructing its judge.)
+
+    Removal FAILS LOUDLY (:class:`JudgeIsolationError`): a partially
+    neutralized checkout must never reach a session, so nothing here
+    ignores an error, and a final verification walk proves the tree clean
+    — a symlink is unlinked (never followed, never rmtree'd: rmtree
+    refuses symlinks, and following one would delete reviewed material
+    the link merely points at)."""
+    for path in _agent_config_artifacts(workdir):
+        try:
+            if path.is_symlink() or not path.is_dir():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+        except OSError as exc:
+            raise JudgeIsolationError(
+                f"cannot remove agent-instruction artifact {path.relative_to(workdir)}: {exc}"
+            ) from exc
+    leftovers = _agent_config_artifacts(workdir)
+    if leftovers:
+        listed = ", ".join(str(path.relative_to(workdir)) for path in leftovers)
+        raise JudgeIsolationError(f"agent-instruction artifacts survived removal: {listed}")
 
 
 def _checkout_pr(config: DriverConfig, pr: PullRequest, workdir: Path) -> str:
@@ -446,16 +485,19 @@ def review_pr(
         except (
             gitops.GitError,
             GitHubError,
+            JudgeIsolationError,
             deps.DependencyCycleError,
             deps.CrossRepoEdgeError,
         ) as exc:
-            # A pre-session input failure — a clone/read failure or a
-            # malformed dependency graph — means this round cannot start:
-            # no GitHub write, the PR stays reviewable. But discovery is
-            # oldest-first and a failed PR keeps pr_ready, so a
-            # persistently broken PR would retry FIRST and abort the pass
-            # every time — one broken PR must never starve every younger
-            # reviewable PR. Logged, surfaced on the error feed, skipped.
+            # A pre-session input failure — a clone/read failure, a
+            # checkout that cannot be proven free of agent-instruction
+            # artifacts, or a malformed dependency graph — means this
+            # round cannot start: no GitHub write, the PR stays
+            # reviewable. But discovery is oldest-first and a failed PR
+            # keeps pr_ready, so a persistently broken PR would retry
+            # FIRST and abort the pass every time — one broken PR must
+            # never starve every younger reviewable PR. Logged, surfaced
+            # on the error feed, skipped.
             log(f"PR #{pr.number} review round {round_number}: inputs unavailable ({exc})")
             emit_error(
                 sink,
@@ -565,12 +607,20 @@ def review_pr(
                 _emit_review(sink, config, pr, issue_number, escalated)
                 return escalated
         finally:
-            session.finish()
-
-        # The container touched the checkout: distrust its git metadata
-        # before anything else happens near the tree (parity with the
-        # Implementer's post-exit rule).
-        gitops.sanitize_checkout(workdir, config.clone_url)
+            # The container touched the checkout: distrust its git metadata
+            # on EVERY exit path — success, timeout, generic session error,
+            # identity failure, schema skew — before anything else happens
+            # near the tree (parity with the Implementer's post-exit rule).
+            # The nested finally keeps the guarantee when finish() itself
+            # raises; a sanitize failure propagates into the pass-level
+            # error lane (surfaced, never swallowed) and it does so AFTER
+            # the escalation lanes above pushed their evidence, so nothing
+            # already required is masked — and the whole job dir, checkout
+            # included, is removed on the way out regardless.
+            try:
+                session.finish()
+            finally:
+                gitops.sanitize_checkout(workdir, config.clone_url)
 
         # The driver is the sole policy boundary (ADR-0046): the proposal is
         # re-validated here no matter what the in-session CLI reported.

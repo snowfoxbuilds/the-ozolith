@@ -28,12 +28,17 @@ Base drift (ADR-0053) is the SECOND enumerated janitorial exception: a
 dependent PR whose Based-on zone records its blocker's tip at checkout
 silently rots when that blocker branch moves — nothing else watches the
 pair. Only under the exact three-way trigger (dependent PR open with a
-zone, the named blocker PR still open, blocker tip != recorded SHA) does
-the janitor apply blocked + needs_human with a forensic comment naming the
-blocker and both SHAs; idempotent per drift (SHA-pair keyed), never an
-auto-repair. A merged-and-deleted blocker is the healthy retarget path,
-not drift; a rejected or abandoned blocker is a human act — its chained
-dependents are surfaced on the dashboard with no automated GitHub write.
+zone, the named blocker PR still open AND not itself blocked, blocker tip
+!= recorded SHA) does the janitor apply blocked + needs_human with a
+forensic comment naming the blocker and both SHAs; idempotent per drift
+(SHA-pair keyed, interruption-recoverable: an act proven complete on
+GitHub whose final recording was lost is healed into the ledger with no
+new write), never an auto-repair. A merged-and-deleted blocker is the
+healthy retarget path, not drift; a rejected or abandoned blocker — its
+PR closed unmerged, or open but carrying blocked — is a HUMAN-OWNED
+condition: a moved tip changes nothing automatically once the blocker is
+blocked; its chained dependents are surfaced on the dashboard with no
+automated GitHub write until the human resolves the blocker itself.
 Everything is re-verified against GitHub at act time; ``LiveClaim`` is
 untouched — this lane watches PRs, not claims.
 """
@@ -261,25 +266,50 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
         store.record_chained_dependent(
             pr.number, based.issue, blocker_pr.number, rejected, based.sha
         )
-    else:
-        store.clear_chained_dependent(pr.number)
+        # A rejected or blocked blocker is a HUMAN-OWNED condition: once a
+        # human (or the one-strike lane) has put the blocker itself on
+        # hold, its tip moving changes nothing automatically — the
+        # dependent's fate rides the human's call on the blocker, and
+        # stacking a drift escalation on top would only bury that call
+        # under machine noise. Visibility only, no GitHub write, until the
+        # blocker is open and unblocked again.
+        return False
+    store.clear_chained_dependent(pr.number)
 
-    # The drift lane's three-way trigger (ADR-0053): dependent open with a
-    # zone (established above), blocker PR still OPEN, and the blocker tip
-    # off the recorded SHA. A closed blocker PR is never drift; a deleted
-    # branch is the healthy retarget in flight.
+    # The drift lane's trigger (ADR-0053): dependent open with a zone
+    # (established above), blocker PR still OPEN and NOT blocked (ruled out
+    # above), and the blocker tip off the recorded SHA. A closed blocker PR
+    # is never drift; a deleted branch is the healthy retarget in flight.
     if blocker_pr is None or blocker_pr.state != "open":
         return False
     tip = client.branch_head(blocker_branch)
     if tip is None or tip == based.sha:
         return False
 
-    # Idempotency first: the dependent already escalated (label present), or
-    # this exact drift already completed its act. The SHA-pair key lets a
-    # NEW drift after a human unblock act again while the same drift never
-    # double-writes.
+    # Idempotency: this exact drift already completed its act — the
+    # SHA-pair key lets a NEW drift after a human unblock act again while
+    # the same drift never double-writes.
     key = f"base-drift-{based.sha[:12]}-{tip[:12]}"
-    if BLOCKED in pr.labels or store.janitor_acted(pr.number, key):
+    if store.janitor_acted(pr.number, key):
+        return False
+    comment_recorded = store.janitor_acted(pr.number, f"{key}-comment")
+    if BLOCKED in pr.labels:
+        if comment_recorded:
+            # Interruption recovery: GitHub state (the label is on) plus
+            # the recorded comment sub-key (the forensics for exactly this
+            # SHA pair landed) prove the escalation completed, but the
+            # final recording was lost — a crash between the label write
+            # and the ledger write. Heal the ledger with NO GitHub write,
+            # so a later human unblock is final for this pair.
+            store.record_janitor_action(
+                pr.number,
+                key,
+                "",
+                f"base-drift escalation on PR #{pr.number} recovered as already"
+                f" complete ({based.sha[:12]} -> {tip[:12]}): label present and"
+                " forensic comment recorded; ledger healed, no write",
+            )
+            log(f"janitor: base-drift act on PR #{pr.number} recovered as complete")
         return False
 
     # The comment lands first: no observable blocked state without the
@@ -288,7 +318,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
     # write that fails mid-sequence retries next pass WITHOUT re-posting
     # the forensics; the full key is recorded only once the labels landed —
     # a later human unblock is then final for this drift.
-    if not store.janitor_acted(pr.number, f"{key}-comment"):
+    if not comment_recorded:
         client.add_comment(pr.number, _drift_comment(based, blocker_pr.number, tip))
         store.record_janitor_action(
             pr.number, f"{key}-comment", "", f"base-drift forensic comment on PR #{pr.number}"
