@@ -873,7 +873,9 @@ class CodexAdapter:
         and control refuses the config upstream — this is the in-image
         backstop. A pre-existing baked config is conflict-scanned: any
         selection key fails the build naming it (operator content is never
-        overwritten); identity keys are then emitted as a header block
+        overwritten), and so does any instruction-discovery key
+        (``project_doc_fallback_filenames`` — the judge-isolation name set
+        is fixed, #82); identity keys are then emitted as a header block
         PREPENDED before the preserved operator bytes, and the merged text
         is re-parsed before landing. Same symlink-safe atomic write
         discipline as the Claude bake."""
@@ -924,6 +926,23 @@ class CodexAdapter:
                         " identity — refusing to overwrite operator content;"
                         f" remove the conflicting keys from {config_target}:"
                         f" {', '.join(conflicts)}"
+                    )
+                instruction = [
+                    key for key in codexidentity.CODEX_CONFIG_INSTRUCTION_KEYS if key in document
+                ]
+                if instruction:
+                    # The judge-isolation boundary (#82) removes a fixed
+                    # instruction-file name set from review checkouts; a
+                    # baked config extending the CLI's project-doc
+                    # discovery would reopen that channel under a name the
+                    # driver does not know, so the key is refused for every
+                    # codex image — the pipeline's canonical instruction
+                    # file is AGENTS.md, never a configured alias.
+                    raise AgentAdapterError(
+                        "existing baked codex config redefines instruction-file"
+                        " discovery — the review judge-isolation boundary"
+                        " depends on a fixed name set (#82); remove from"
+                        f" {config_target}: {', '.join(instruction)}"
                     )
             header = [
                 "# Materialized by theozolith-adapter (ADR-0052) — the baked",

@@ -139,6 +139,23 @@ def test_codex_adapter_materialize_refuses_operator_identity_keys(tmp_path):
     assert tomllib.loads(config.read_text()) == {"model": "o3", "profile": "fast"}
 
 
+def test_codex_adapter_materialize_refuses_operator_instruction_keys(tmp_path):
+    """The judge-isolation name set is fixed (#82): an operator config
+    carrying project_doc_fallback_filenames would extend the CLI's
+    instruction-file discovery past what the Reviewer neutralizes, so the
+    bake fails naming the key — for every codex image, since the image
+    does not declare which role will run it."""
+    config = tmp_path / codexidentity.BAKED_CONFIG_FILE
+    config.parent.mkdir(parents=True)
+    config.write_text('project_doc_fallback_filenames = ["TEAM_GUIDE.md"]\n')
+    with pytest.raises(AgentAdapterError, match="project_doc_fallback_filenames"):
+        CodexAdapter().materialize("gpt-5.2-codex", "", root=tmp_path, scope="managed")
+    # Operator content untouched by the refusal.
+    assert tomllib.loads(config.read_text()) == {
+        "project_doc_fallback_filenames": ["TEAM_GUIDE.md"]
+    }
+
+
 def test_codex_adapter_materialize_refuses_malformed_operator_config(tmp_path):
     config = tmp_path / codexidentity.BAKED_CONFIG_FILE
     config.parent.mkdir(parents=True)

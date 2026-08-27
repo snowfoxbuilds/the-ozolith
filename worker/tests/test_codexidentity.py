@@ -134,6 +134,29 @@ def test_malformed_baked_config_is_unknowable(tmp_path):
         read_baked_identity(tmp_path)
 
 
+def test_instruction_discovery_keys_in_the_baked_config_are_refused(tmp_path):
+    """The judge-isolation name set is closed: a baked config carrying
+    project_doc_fallback_filenames would make the CLI auto-load
+    instruction files the Reviewer's neutralization does not know, so the
+    identity reader refuses it (#82)."""
+    _bake(tmp_path, "gpt-5.2-codex")
+    _write(
+        tmp_path,
+        BAKED_CONFIG_FILE,
+        'model = "gpt-5.2-codex"\nproject_doc_fallback_filenames = ["TEAM_GUIDE.md"]\n',
+    )
+    with pytest.raises(IdentityError, match="instruction-file discovery"):
+        read_baked_identity(tmp_path)
+
+
+def test_instruction_discovery_keys_without_identity_are_refused(tmp_path):
+    """The refusal holds on a model-less image, and regardless of the
+    value — an empty list today is a hostile list after one edit."""
+    _write(tmp_path, BAKED_CONFIG_FILE, "project_doc_fallback_filenames = []\n")
+    with pytest.raises(IdentityError, match="instruction-file discovery"):
+        read_baked_identity(tmp_path)
+
+
 # -- CODEX_HOME assembly -------------------------------------------------------
 
 
@@ -209,6 +232,21 @@ def test_static_checks_fail_on_a_drifted_config(tmp_path):
     _write(tmp_path, BAKED_CONFIG_FILE, 'model = "o3"\n')
     report = static_identity_report(BakedIdentity("gpt-5.2-codex"), root=tmp_path, environ={})
     assert not report.ok and report.category == CATEGORY_INCONSISTENT
+
+
+def test_static_checks_fail_on_instruction_discovery_keys(tmp_path):
+    """The per-Run static checks catch a config that widens project-doc
+    discovery even when the identity selection itself is intact — a
+    tampered image fails loud before any session launches (#82)."""
+    _bake(tmp_path, "gpt-5.2-codex")
+    _write(
+        tmp_path,
+        BAKED_CONFIG_FILE,
+        'model = "gpt-5.2-codex"\nproject_doc_fallback_filenames = ["TEAM_GUIDE.md"]\n',
+    )
+    report = static_identity_report(BakedIdentity("gpt-5.2-codex"), root=tmp_path, environ={})
+    assert not report.ok and report.category == CATEGORY_INCONSISTENT
+    assert "project_doc_fallback_filenames" in report.detail
 
 
 def test_static_checks_fail_on_an_unproven_pair(tmp_path):

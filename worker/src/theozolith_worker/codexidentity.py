@@ -80,6 +80,18 @@ CODEX_CONFIG_IDENTITY_KEYS = (
     "profiles",
 )
 
+# config.toml keys that redefine WHICH working-tree files the CLI auto-loads
+# as instructions (codex's project-doc discovery: AGENTS.override.md, then
+# AGENTS.md, then any configured fallback names). The Reviewer's judge
+# isolation removes a FIXED name set from the review checkout
+# (reviewer._neutralize_agent_config, ADR-0008/#82); a baked config
+# extending that discovery would reopen the involuntary instruction channel
+# under a name the driver does not know. Refused wherever the baked config
+# is read — the materialize conflict scan, the per-Run static checks, and
+# the identity reader (model-less images included) — so the fixed set
+# provably IS the effective set.
+CODEX_CONFIG_INSTRUCTION_KEYS = ("project_doc_fallback_filenames",)
+
 # Process-environment variables that would steer a codex session over the
 # baked identity: an externally-delivered CODEX_HOME points the CLI at a
 # foreign config+auth tree; OPENAI_BASE_URL repoints the provider;
@@ -163,6 +175,25 @@ def _load_baked_config(root: Path) -> dict | None:
         ) from exc
 
 
+def _instruction_key_error(path: Path, document: dict) -> str:
+    """Why the baked config would widen the CLI's instruction-file
+    discovery; "" when it would not. The judge-isolation boundary removes a
+    fixed name set from review checkouts, so these keys are refused no
+    matter what they are set to — an empty list today is a hostile or
+    mistaken list after one edit, and the driver cannot see image bytes to
+    follow along."""
+    present = [key for key in CODEX_CONFIG_INSTRUCTION_KEYS if key in document]
+    if present:
+        return (
+            f"{path}: redefines the CLI's instruction-file discovery"
+            f" ({', '.join(present)}) — the review judge-isolation boundary"
+            " removes a fixed instruction-file name set, and a configured"
+            " fallback name would reopen the involuntary instruction channel"
+            " (#82); remove the key"
+        )
+    return ""
+
+
 def verify_baked_config(root: Path, expected: BakedIdentity) -> str:
     """Why the baked config does not carry ``expected``; "" when it does.
     The well-known files declare the identity; the baked config.toml is what
@@ -193,6 +224,9 @@ def verify_baked_config(root: Path, expected: BakedIdentity) -> str:
             f"{path}: carries steering keys beyond the materialized selection"
             f" ({', '.join(foreign)}) — the effective identity is not the baked one"
         )
+    instruction = _instruction_key_error(path, document)
+    if instruction:
+        return instruction
     if "model_reasoning_effort" in document and not expected.effort:
         return (
             f"{path}: pins an effort the well-known files do not declare — half-declared identity"
@@ -226,6 +260,14 @@ def read_baked_identity(root: Path) -> BakedIdentity | None:
                 f"{root / BAKED_CONFIG_FILE} carries selection keys but the"
                 " image declares no baked identity (missing " + WELL_KNOWN_MODEL_FILE + ")"
             )
+        if document:
+            # The instruction-discovery refusal holds on model-less images
+            # too: this reader is the one check every baked_identity() call
+            # runs, identity or not, so a config widening project-doc
+            # discovery can never ride an unidentified image past it.
+            instruction = _instruction_key_error(root / BAKED_CONFIG_FILE, document)
+            if instruction:
+                raise IdentityError(instruction)
         return None
     if "\n" in model or "\n" in effort:
         raise IdentityError(
