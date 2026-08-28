@@ -617,9 +617,12 @@ def clone_with_mirror(
     ADR-0053); the mirror update precedes the reference clone, so a
     freshly pushed blocker tip is always present. Any failure here — a
     trust validation refusal, a git failure, or a ``timeout`` expiry on the
-    lock wait or any single git operation — is a pre-session infra failure
-    (ADR-0016): the caller's Run fails and burns the normal retry; a
-    half-context checkout is never handed to an agent."""
+    lock wait or any single git operation — raises ``GitError``; a partial
+    checkout is never handed to an agent. The mirror is an optimization,
+    never load-bearing (#56): on that error the caller
+    (``runner._run_to_pr``) falls back once to a full network clone, and
+    only failure of both checkout lanes is a pre-session infra failure
+    (ADR-0016) burning the normal retry."""
     with mirror_lock(mirrors_dir, url, timeout=timeout):
         mirror = _ensure_mirror_locked(mirrors_dir, url, env, timeout)
         _update_mirror_locked(mirror, url, env, timeout)

@@ -6,14 +6,16 @@ self-contained the instant the clone returns. These tests pin the three
 rulings from the issue (lock contention, corruption recovery, checkout
 self-containedness), the boot sweep of partial mirrors and stale locks, and
 the two integration facts: the mirror appears in no container mount spec,
-and mirror failure is a pre-session infra failure burning the normal retry.
+and the mirror is never load-bearing — a failed mirror-backed checkout
+gets one full-clone fallback, and only failure of both lanes is a
+pre-session infra failure burning the normal retry (#56, detailed below).
 
 The PR #54 amendment adds two pinned surfaces: the trust boundary (an
 untrusted or symlinked cache root/entry fails closed before any
 authenticated git subprocess; persistent mirror config is rewritten, never
 believed) and the operation budget (flock waits and every mirror git op are
-deadline-bounded; expiry cleans partial state, releases the lock, and rides
-the same pre-session infra lane).
+deadline-bounded; expiry cleans partial state, releases the lock, and
+surfaces as the ``GitError`` the fallback lane absorbs).
 
 #56 pins four more: maintenance-free driver git (every subprocess through
 ``_run_git`` carries ``-c maintenance.auto=false -c gc.auto=0`` before the
