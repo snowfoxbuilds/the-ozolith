@@ -48,8 +48,10 @@ creation, the update fetch, and the reference clone — runs under an
 operator-configurable budget (``THEOZOLITH_GIT_TIMEOUT_SECONDS``). Expiry
 kills the subprocess, cleans partial state, releases the lock, and raises a
 self-describing :class:`GitTimeout` (a :class:`GitError`), so a stuck
-holder or waiter lands in the ordinary pre-session infra lane (ADR-0016)
-instead of wedging the driver.
+holder or waiter surfaces as an ordinary checkout failure — absorbed by the
+runner's one-shot fallback (#56), reaching the pre-session infra lane
+(ADR-0016) only when that fallback fails too — instead of wedging the
+driver.
 
 Maintenance-free driver git (#56): git 2.54's default auto-maintenance
 writes a split commit-graph into the mirror during the update fetch, and
@@ -391,7 +393,7 @@ def _lock_still_named(fd: int, lock_path: Path) -> bool:
 def _acquire_lock(lock_path: Path, timeout: float | None = None) -> int:
     """Acquire the per-repo flock; with a ``timeout``, poll non-blocking
     against a monotonic deadline and raise :class:`GitTimeout` (descriptor
-    closed) on expiry — a stuck holder becomes a normal pre-session infra
+    closed) on expiry — a stuck holder becomes an ordinary surfaced checkout
     failure, never a wedged driver."""
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
