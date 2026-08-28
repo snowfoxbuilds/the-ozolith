@@ -858,17 +858,42 @@ def _run_to_pr(
         # every tie to the mirror — but the per-Run download is a ref
         # advertisement instead of the whole history. The mirror update
         # precedes the reference clone, so a freshly pushed blocker tip is
-        # present for a chained base. Mirror failures — trust validation
-        # refusals, git failures, and per-operation timeout expiry alike —
-        # raise GitError and land in the pre-session infra lane (ADR-0016).
-        gitops.clone_with_mirror(
-            config.clone_url,
-            config.mirrors_dir,
-            workdir,
-            branch=context.base_branch,
-            env=auth,
-            timeout=config.git_timeout_seconds,
-        )
+        # present for a chained base. The mirror is an optimization, never
+        # load-bearing for Run success (#56): any mirror-path failure —
+        # trust validation refusals, git failures, and per-operation timeout
+        # expiry alike — falls back ONCE to a full network clone, after one
+        # advisory telemetry event. The mirror itself is left in place (the
+        # next Run's _ensure_mirror_locked heals or replaces it). Only when
+        # the fallback also fails does the Run land in the pre-session infra
+        # lane (ADR-0016), exactly as a full-clone failure always has.
+        try:
+            gitops.clone_with_mirror(
+                config.clone_url,
+                config.mirrors_dir,
+                workdir,
+                branch=context.base_branch,
+                env=auth,
+                timeout=config.git_timeout_seconds,
+            )
+        except gitops.GitError as exc:
+            events.emit_error(
+                sink,
+                config,
+                error_class="mirror-fallback",
+                message=(
+                    f"run {report.run_id} (issue #{issue.number}): mirror-backed"
+                    f" checkout failed, falling back to a full clone: {exc}"
+                ),
+            )
+            # Never trust partial clone debris left by the failed attempt.
+            shutil.rmtree(workdir, ignore_errors=True)
+            gitops.clone(
+                config.clone_url,
+                workdir,
+                branch=context.base_branch,
+                env=auth,
+                timeout=config.git_timeout_seconds,
+            )
     else:
         # The enumerated carryover (ADR-0016 as amended by ADR-0046): the
         # preserved worktree — uncommitted completed work included — IS this
@@ -1331,6 +1356,10 @@ def _push_run_evidence(
                 # driver; identity is the run image (its tag covers the baked
                 # model) and "model" is what the session stream reported.
                 "run_image": config.run_image,
+                # The node's git, the variable #56 makes irrelevant to Run
+                # success — recorded so a fleet-wide git behavior change is
+                # attributable from the bundle alone ("" = git cannot report).
+                "git_version": gitops.git_version(),
                 "model": stats.model,
                 "model_note": stats.model_note,
                 # The harness's identity record (ADR-0045): expected vs

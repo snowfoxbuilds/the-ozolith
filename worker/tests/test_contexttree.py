@@ -929,14 +929,12 @@ def test_git_pr_commits_is_uncapped_and_ordered(tmp_path):
 def test_commit_snapshot_taken_at_fetched_head_before_reset(harness: Harness):
     """The commit snapshot comes from the trusted checkout: commits that
     landed on the PR branch after the verdict all appear, chronologically,
-    with complete messages — and the reviewer-designated reset applied
-    AFTER enumeration changes nothing about what was recorded.
-
-    The >250-commit half of the acceptance lives in
-    test_git_pr_commits_is_uncapped_and_ordered: on current git (2.54, CI)
-    the pre-existing #51 mirror machinery corrupts Run checkouts once a
-    few-hundred-commit pack flows through the reference clone (#56), so
-    this end-to-end round keeps a small history until that is fixed."""
+    with complete messages, past the REST endpoint's 250 cap — and the
+    reviewer-designated reset applied AFTER enumeration changes nothing
+    about what was recorded. The 260-commit pack flowing through the
+    mirror-backed reference clone is also the #56 end-to-end proof: the
+    maintenance-free mirror path survives a few-hundred-commit fetch on
+    every git version."""
     number = harness.file_issue("Bulk", CRITERIA_BODY)
     branch = branch_for(number)
     harness.worker_behaviors.append(behavior_write({"feature.txt": "one\n"}))
@@ -947,8 +945,8 @@ def test_commit_snapshot_taken_at_fetched_head_before_reset(harness: Harness):
     harness.reviewer_replies.append(revise_reply("1. try again"))
     harness.reviewer_once()  # authorized verdict designating resume at c1
 
-    # Three more commits land on the PR branch after the verdict.
-    _bulk_commits(harness.remote, c1, branch, 3)
+    # 260 more commits land on the PR branch after the verdict.
+    _bulk_commits(harness.remote, c1, branch, 260)
 
     seen: dict = {}
 
@@ -964,13 +962,13 @@ def test_commit_snapshot_taken_at_fetched_head_before_reset(harness: Harness):
     # retry); surface the driver's own failure log instead of a KeyError.
     assert "commits" in seen, "\n".join(harness.logs)
     commits = seen["commits"]
-    assert "# PR commits (4)" in commits  # c1 + all 3, from the checkout
-    assert commits.count("\n## ") == 4
+    assert "# PR commits (261)" in commits  # c1 + all 260, from the checkout
+    assert commits.count("\n## ") == 261
     assert c1 in commits
-    # Chronological: c1 first, then bulk 1 .. bulk 3, messages complete.
+    # Chronological: c1 first, then bulk 1 .. bulk 260, messages complete.
     assert commits.index(c1) < commits.index("bulk commit 1\n")
-    assert commits.index("bulk commit 1\n") < commits.index("bulk commit 3")
-    assert "second line 3" in commits
+    assert commits.index("bulk commit 1\n") < commits.index("bulk commit 260")
+    assert "second line 260" in commits
     # The snapshot was taken at the fetched PR head even though the Run
     # itself was reset back to the designated resume commit.
     assert seen["head"] == c1
