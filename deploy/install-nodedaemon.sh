@@ -17,7 +17,8 @@
 # configuration: `provision` persists everything under /var/lib/theozolith.
 #
 # Host baseline (ADR-0015): systemd Linux, docker (with the compose plugin),
-# python3 >= 3.11.
+# python3 >= 3.11, git (>= 2.55 recommended, never required — driver git
+# runs maintenance-free, #56).
 
 set -euo pipefail
 

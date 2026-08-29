@@ -48,8 +48,29 @@ creation, the update fetch, and the reference clone — runs under an
 operator-configurable budget (``THEOZOLITH_GIT_TIMEOUT_SECONDS``). Expiry
 kills the subprocess, cleans partial state, releases the lock, and raises a
 self-describing :class:`GitTimeout` (a :class:`GitError`), so a stuck
-holder or waiter lands in the ordinary pre-session infra lane (ADR-0016)
-instead of wedging the driver.
+holder or waiter surfaces as an ordinary checkout failure — absorbed by the
+runner's one-shot fallback (#56), reaching the pre-session infra lane
+(ADR-0016) only when that fallback fails too — instead of wedging the
+driver.
+
+Maintenance-free driver git (#56): git 2.54's default auto-maintenance
+writes a split commit-graph into the mirror during the update fetch, and
+the reference clone then parses the branch tip through the borrowed graph —
+``--dissociate`` closes it mid-clone and checkout dies ``unable to parse
+commit`` (fixed upstream only in 2.55). git >= 2.54 fetch/push also spawn
+DETACHED background maintenance that mutates repos after the command
+returns, outside the per-repo mirror lock. Fleet git is operator-
+controlled, so the remedy is version-independent: every invocation through
+:func:`_run_git` carries ``-c maintenance.auto=false -c gc.auto=0`` (no
+graph ever appears, no background child outlives our lock windows), the
+reference clone additionally ignores any graph via ``-c
+core.commitGraph=false``, and ``sanitize_mirror`` deletes foreign
+``objects/info/commit-graph*`` state outright. With auto-maintenance off,
+mirror pack health is owned explicitly: the update repacks synchronously
+under the lock past :data:`MIRROR_REPACK_PACK_LIMIT` — always ``repack``,
+never ``gc`` (gc would write the graph back). The mirror stays a pure
+optimization: a failed reference clone falls back once to a full network
+clone (the runner's lane) before the pre-session infra lane.
 """
 
 from __future__ import annotations
@@ -66,6 +87,15 @@ import time
 from pathlib import Path
 
 TOKEN_ENV = "THEOZOLITH_GIT_TOKEN"
+
+# Every driver-side git invocation runs with auto-maintenance and auto-gc
+# off (#56): deterministic subprocesses, no detached children mutating
+# repos outside our locks, no commit-graph ever written into the mirror.
+# argv ``-c`` pairs, not GIT_CONFIG_* env: ``auth_env`` owns the
+# GIT_CONFIG_COUNT/KEY_0/VALUE_0 slots for the credential helper, and the
+# two channels are both command-scope config that compose without
+# renumbering.
+_MAINTENANCE_OFF = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
 
 # A credential helper that reads the PAT from the environment. The helper
 # string itself contains no secret, so it is safe in env/config listings.
@@ -103,13 +133,15 @@ def _run_git(
 ) -> subprocess.CompletedProcess[str]:
     """The one subprocess seam every git invocation goes through.
 
-    ``subprocess.run`` kills the child before raising ``TimeoutExpired``, so
-    no git process outlives its budget still holding the mirror lock; the
-    kill is converted into a self-describing :class:`GitTimeout` here and
-    partial-state cleanup stays with the caller."""
+    The maintenance-off pairs are injected here, ahead of any subcommand,
+    so the seam being total IS the #56 guarantee. ``subprocess.run`` kills
+    the child before raising ``TimeoutExpired``, so no git process outlives
+    its budget still holding the mirror lock; the kill is converted into a
+    self-describing :class:`GitTimeout` here and partial-state cleanup
+    stays with the caller."""
     try:
         return subprocess.run(
-            ["git", *args],
+            ["git", *_MAINTENANCE_OFF, *args],
             cwd=None if cwd is None else str(cwd),
             capture_output=True,
             text=True,
@@ -151,6 +183,11 @@ def clone(
         # Objects come from the local reference repo; --dissociate copies
         # them out so the checkout never depends on the mirror again (#51).
         args[2:2] = ["--reference", str(reference), "--dissociate"]
+        # Graph blindness (#56): never parse mirror commits through a
+        # commit-graph --dissociate is about to close — rescues a mirror
+        # already carrying a graph, on any git version. A global option:
+        # it must precede the clone subcommand.
+        args[0:0] = ["-c", "core.commitGraph=false"]
     try:
         proc = _run_git(args, env=env, timeout=timeout)
     except GitTimeout:
@@ -162,10 +199,32 @@ def clone(
         raise GitError(f"git clone failed: {proc.stderr.strip()}")
 
 
+_GIT_VERSION: str | None = None  # cached: the binary cannot change under a driver
+
+
+def git_version() -> str:
+    """The node's ``git --version`` output for Run evidence (#56) —
+    best-effort: ``""`` when git itself cannot report, never raises."""
+    global _GIT_VERSION
+    if _GIT_VERSION is None:
+        try:
+            proc = _run_git(["--version"], timeout=10)
+            _GIT_VERSION = proc.stdout.strip() if proc.returncode == 0 else ""
+        except Exception:
+            _GIT_VERSION = ""
+    return _GIT_VERSION
+
+
 # -- node-local repo mirrors (#51) ---------------------------------------------
 
 MIRROR_TMP_SUFFIX = ".tmp"  # staging dir during creation; atomic-renamed away
 MIRROR_LOCK_SUFFIX = ".lock"  # per-repo advisory lock beside the mirror
+
+# With auto-maintenance off (#56), pack accumulation is owned explicitly:
+# the update repacks the mirror under the per-repo lock once objects/pack
+# holds more than this many *.pack files. One pack per fetch-with-news puts
+# the amortized cost at one repack per ~50 updates per repo.
+MIRROR_REPACK_PACK_LIMIT = 50
 
 _LOCK_RETRY_SECONDS = 0.05  # poll cadence of the deadline-bounded flock loop
 
@@ -334,7 +393,7 @@ def _lock_still_named(fd: int, lock_path: Path) -> bool:
 def _acquire_lock(lock_path: Path, timeout: float | None = None) -> int:
     """Acquire the per-repo flock; with a ``timeout``, poll non-blocking
     against a monotonic deadline and raise :class:`GitTimeout` (descriptor
-    closed) on expiry — a stuck holder becomes a normal pre-session infra
+    closed) on expiry — a stuck holder becomes an ordinary surfaced checkout
     failure, never a wedged driver."""
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
@@ -405,11 +464,17 @@ def sanitize_mirror(mirror: Path, url: str) -> None:
     foreign ``objects/info/alternates`` is dropped. A pre-created or
     tampered repo therefore cannot redirect the authenticated fetch, run
     hook code in the driver, or splice a foreign object store into
-    checkouts. ``sanitize_checkout`` is this function's worktree sibling."""
+    checkouts. Any ``objects/info/commit-graph*`` state goes too (#56):
+    driver git never writes one, so a present graph is foreign — an older
+    build's auto-maintenance or an operator hand-run — and on git 2.54 a
+    reference clone parsing through it corrupts the checkout.
+    ``sanitize_checkout`` is this function's worktree sibling."""
     no_hooks = mirror / "theozolith-no-hooks"
     no_hooks.mkdir(exist_ok=True)
-    alternates = mirror / "objects" / "info" / "alternates"
-    alternates.unlink(missing_ok=True)
+    info = mirror / "objects" / "info"
+    (info / "alternates").unlink(missing_ok=True)
+    (info / "commit-graph").unlink(missing_ok=True)
+    shutil.rmtree(info / "commit-graphs", ignore_errors=True)
     config = "\n".join(
         [
             "[core]",
@@ -495,7 +560,12 @@ def _update_mirror_locked(
     """Refresh the mirror by fetching the CALLER-supplied URL and mirror
     refspec directly on argv — the authenticated operation never consults
     stored remote configuration (which ``sanitize_mirror`` just rewrote
-    anyway; this is the second belt on the same trust boundary)."""
+    anyway; this is the second belt on the same trust boundary).
+
+    The explicit repack (#56) replaces the auto-maintenance we turn off:
+    synchronous, inside the lock window, and deliberately ``repack`` rather
+    than ``gc`` — ``gc.writeCommitGraph`` defaults true, so gc would write
+    back exactly the graph the maintenance ban exists to keep out."""
     try:
         git(
             ["fetch", "--quiet", "--prune", url, "+refs/*:refs/*"],
@@ -503,10 +573,13 @@ def _update_mirror_locked(
             env=env,
             timeout=timeout,
         )
+        packs = list((mirror / "objects" / "pack").glob("*.pack"))
+        if len(packs) > MIRROR_REPACK_PACK_LIMIT:
+            git(["repack", "-a", "-d", "--quiet"], mirror, timeout=timeout)
     except GitTimeout:
-        # A killed fetch can leave repo-internal lock/tmp debris that would
-        # poison later fetches. The cache is non-authoritative: delete the
-        # mirror so the next attempt re-clones clean.
+        # A killed fetch (or repack) can leave repo-internal lock/tmp debris
+        # that would poison later operations. The cache is non-authoritative:
+        # delete the mirror so the next attempt re-clones clean.
         shutil.rmtree(mirror, ignore_errors=True)
         raise
 
@@ -546,9 +619,12 @@ def clone_with_mirror(
     ADR-0053); the mirror update precedes the reference clone, so a
     freshly pushed blocker tip is always present. Any failure here — a
     trust validation refusal, a git failure, or a ``timeout`` expiry on the
-    lock wait or any single git operation — is a pre-session infra failure
-    (ADR-0016): the caller's Run fails and burns the normal retry; a
-    half-context checkout is never handed to an agent."""
+    lock wait or any single git operation — raises ``GitError``; a partial
+    checkout is never handed to an agent. The mirror is an optimization,
+    never load-bearing (#56): on that error the caller
+    (``runner._run_to_pr``) falls back once to a full network clone, and
+    only failure of both checkout lanes is a pre-session infra failure
+    (ADR-0016) burning the normal retry."""
     with mirror_lock(mirrors_dir, url, timeout=timeout):
         mirror = _ensure_mirror_locked(mirrors_dir, url, env, timeout)
         _update_mirror_locked(mirror, url, env, timeout)
@@ -592,15 +668,7 @@ def checkout_branch(cwd: Path, branch: str, *, create: bool = False) -> None:
 
 
 def ref_exists(cwd: Path, ref: str) -> bool:
-    return (
-        subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=str(cwd),
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
+    return _run_git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd).returncode == 0
 
 
 def reset_hard(cwd: Path, ref: str) -> None:
@@ -646,30 +714,14 @@ def head_sha(cwd: Path) -> str:
 
 
 def commit_exists(cwd: Path, sha: str) -> bool:
-    return (
-        subprocess.run(
-            ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
-            cwd=str(cwd),
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
+    return _run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=cwd).returncode == 0
 
 
 def is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
     """Is ``ancestor`` reachable from ``descendant``? False on any failure
     (unknown commit or ref included) — callers treat containment as a proof
     obligation, so an unverifiable ancestry is a plain no."""
-    return (
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
-            cwd=str(cwd),
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
+    return _run_git(["merge-base", "--is-ancestor", ancestor, descendant], cwd=cwd).returncode == 0
 
 
 def diff_stat(cwd: Path, base_ref: str) -> str:

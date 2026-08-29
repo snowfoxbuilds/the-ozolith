@@ -127,7 +127,10 @@ Stacks and worker types on top, never below.
    the plaintext listener) — it creates the `ozolith` user, the venv at
    `/opt/theozolith`, the systemd unit (`KillMode=control-group`), and hands off to
    `theozolith-nodedaemon provision` as its final step. Already-installed box: the
-   printed `sudo theozolith-nodedaemon provision 'ozjoin1:…'` line alone.
+   printed `sudo theozolith-nodedaemon provision 'ozjoin1:…'` line alone. The host
+   baseline (ADR-0015) is systemd Linux, docker with the compose plugin, python3 >=
+   3.11, and git — git >= 2.55 recommended, never required: driver git runs
+   maintenance-free (#56).
 
    `provision` parses and checksums the join string, fetches the CA from the bootstrap
    listener, verifies it against the pinned fingerprint **before transmitting

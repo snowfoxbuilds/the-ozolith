@@ -6,14 +6,27 @@ self-contained the instant the clone returns. These tests pin the three
 rulings from the issue (lock contention, corruption recovery, checkout
 self-containedness), the boot sweep of partial mirrors and stale locks, and
 the two integration facts: the mirror appears in no container mount spec,
-and mirror failure is a pre-session infra failure burning the normal retry.
+and the mirror is never load-bearing — a failed mirror-backed checkout
+gets one full-clone fallback, and only failure of both lanes is a
+pre-session infra failure burning the normal retry (#56, detailed below).
 
 The PR #54 amendment adds two pinned surfaces: the trust boundary (an
 untrusted or symlinked cache root/entry fails closed before any
 authenticated git subprocess; persistent mirror config is rewritten, never
 believed) and the operation budget (flock waits and every mirror git op are
-deadline-bounded; expiry cleans partial state, releases the lock, and rides
-the same pre-session infra lane).
+deadline-bounded; expiry cleans partial state, releases the lock, and
+surfaces as the ``GitError`` the fallback lane absorbs).
+
+#56 pins four more: maintenance-free driver git (every subprocess through
+``_run_git`` carries ``-c maintenance.auto=false -c gc.auto=0`` before the
+subcommand; the reference clone alone adds ``-c core.commitGraph=false``),
+graph-immune checkouts (a commit-graph planted in the mirror — git 2.54's
+auto-maintenance shape — is stripped by ``sanitize_mirror`` and never
+parsed through), explicit pack health (the update repacks under the lock
+past ``MIRROR_REPACK_PACK_LIMIT``, never below it, never via ``gc``), and
+the fallback lane (a failed mirror-backed checkout falls back once to a
+full network clone and the Run ships — the mirror is an optimization,
+never load-bearing; only a failed fallback rides the ADR-0016 infra lane).
 """
 
 from __future__ import annotations
@@ -31,6 +44,7 @@ import pytest
 from conftest import Harness, write_proposal
 from theozolith_worker import gitops, jobdir
 from theozolith_worker.bootstrap.vocabulary import FAILED, NEEDS_HUMAN
+from theozolith_worker.evidence import EVIDENCE_BRANCH
 from theozolith_worker.gitops import GitError
 from theozolith_worker.sweep import sweep_mirrors
 
@@ -38,6 +52,40 @@ from theozolith_worker.sweep import sweep_mirrors
 def _git(args: list[str], cwd: Path) -> str:
     proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
     return proc.stdout.strip()
+
+
+def _subcommand(argv: list[str]) -> list[str]:
+    """``argv`` minus ``git`` and every leading global ``-c key=val`` pair —
+    the injected maintenance-off flags (#56) among them — so argv matching
+    targets the subcommand no matter how many globals precede it."""
+    i = 1
+    while i < len(argv) and argv[i] == "-c":
+        i += 2
+    return argv[i:]
+
+
+def _bulk_commits(git_dir: Path, base: str, branch: str, count: int) -> None:
+    """Grow ``branch`` in a bare repo by ``count`` commits on top of
+    ``base`` (the test_contexttree shape): hash-object/mktree/commit-tree +
+    update-ref, no clone, no transport, each commit a distinct one-file
+    tree."""
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -e; export GIT_DIR="{git_dir}"'
+            " GIT_AUTHOR_NAME=bulk GIT_AUTHOR_EMAIL=b@x"
+            " GIT_COMMITTER_NAME=bulk GIT_COMMITTER_EMAIL=b@x;"
+            f" parent={base};"
+            f" for i in $(seq 1 {count}); do"
+            '   blob=$(printf "content %d\\n" "$i" | git hash-object -w --stdin);'
+            '   tree=$(printf "100644 blob %s\\tfile-%d\\n" "$blob" "$i" | git mktree);'
+            '   parent=$(git commit-tree "$tree" -p "$parent" -m "bulk commit $i");'
+            " done;"
+            f' git update-ref "refs/heads/{branch}" "$parent"',
+        ],
+        check=True,
+    )
 
 
 @pytest.fixture
@@ -375,7 +423,7 @@ def test_timed_out_mirror_clone_cleans_staging_and_recovers(
     real_run = subprocess.run
 
     def killing_run(argv, **kwargs):
-        if argv[:4] == ["git", "clone", "--quiet", "--mirror"] and not tripped:
+        if _subcommand(argv)[:3] == ["clone", "--quiet", "--mirror"] and not tripped:
             tripped.append(argv)
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         return real_run(argv, **kwargs)
@@ -402,7 +450,7 @@ def test_timed_out_update_deletes_the_mirror_and_recovers(
     real_run = subprocess.run
 
     def killing_run(argv, **kwargs):
-        if argv[:4] == ["git", "fetch", "--quiet", "--prune"] and not tripped:
+        if _subcommand(argv)[:3] == ["fetch", "--quiet", "--prune"] and not tripped:
             tripped.append(argv)
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         return real_run(argv, **kwargs)
@@ -427,7 +475,7 @@ def test_timed_out_reference_clone_cleans_the_partial_checkout(
     real_run = subprocess.run
 
     def killing_run(argv, **kwargs):
-        if argv[:2] == ["git", "clone"] and "--reference" in argv and not tripped:
+        if _subcommand(argv)[:1] == ["clone"] and "--reference" in argv and not tripped:
             tripped.append(argv)
             # What a kill leaves behind: git cannot clean its own destination.
             (dest / ".git").mkdir(parents=True)
@@ -445,10 +493,12 @@ def test_timed_out_reference_clone_cleans_the_partial_checkout(
     assert (dest / "README.md").exists()
 
 
-def test_stuck_lock_holder_is_a_pre_session_infra_failure(harness: Harness):
-    """The end-to-end ruling: a stuck holder rides the existing ADR-0016
-    lane — both budgeted Runs fail `infra` before any Run container
-    launches, evidence names the timeout, and the claim escalates."""
+def test_stuck_lock_holder_is_a_pre_session_infra_failure(harness: Harness, monkeypatch):
+    """The end-to-end timeout ruling, #56-adjusted: a stuck holder times
+    out the mirror path and the Run falls back to a full clone — only when
+    that TOO fails (broken here) does it ride the existing ADR-0016 lane:
+    both budgeted Runs fail `infra` before any Run container launches, the
+    fallback events name the timeout, and the claim escalates."""
     number = harness.file_issue("Mirror stuck", CRITERIA_BODY)
     harness.worker_config = dataclasses.replace(harness.worker_config, git_timeout_seconds=0.4)
     root = Path(harness.worker_config.mirrors_dir)
@@ -456,6 +506,16 @@ def test_stuck_lock_holder_is_a_pre_session_infra_failure(harness: Harness):
     lock_path = root / (
         gitops.mirror_name(harness.worker_config.clone_url) + gitops.MIRROR_LOCK_SUFFIX
     )
+    real_clone = gitops.clone
+
+    def broken_clone(url, dest, *, branch=None, **kwargs):
+        # Break the Run-checkout fallback; the evidence channel (its
+        # checkout clones the evidence branch) stays intact.
+        if branch == EVIDENCE_BRANCH:
+            return real_clone(url, dest, branch=branch, **kwargs)
+        raise GitError("git clone failed: network down")
+
+    monkeypatch.setattr(gitops, "clone", broken_clone)
     holder = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(holder, fcntl.LOCK_EX)
     try:
@@ -474,7 +534,130 @@ def test_stuck_lock_holder_is_a_pre_session_infra_failure(harness: Harness):
     ]
     assert len(run_reports) == 2
     assert {report["failure_class"] for report in run_reports} == {"infra"}
-    assert all("timed out" in report["reason"] for report in run_reports)
+    # The lock-wait timeout stays visible: it rides the advisory
+    # mirror-fallback events, while the Run's reason names the fallback
+    # failure that actually sank it.
+    fallbacks = [e for e in harness.sink.events if e.get("error_class") == "mirror-fallback"]
+    assert len(fallbacks) == 2
+    assert all("timed out" in e["message"] for e in fallbacks)
+    assert all("network down" in report["reason"] for report in run_reports)
+
+
+# -- maintenance-free driver git (#56) ----------------------------------------------
+
+
+def test_reference_clone_survives_a_mirror_commit_graph(tmp_path: Path, remote: Path):
+    """The git 2.54 regression: auto-maintenance used to write a commit-graph
+    into the mirror once a fetch brought >= 100 ungraphed commits, and the
+    reference clone then parsed the branch tip through the borrowed graph —
+    --dissociate closed it mid-clone and checkout died 'unable to parse
+    commit' with an fsck-clean object store and an empty worktree. Driver
+    git never writes a graph anymore, so this plants one exactly where 2.54
+    did and proves the checkout path strips and ignores it — deterministic
+    on every git version (on unfixed 2.54 it is the live bug)."""
+    mirrors = tmp_path / "mirrors"
+    url = url_of(remote)
+    base = _git(["--git-dir", str(remote), "rev-parse", "refs/heads/main"], tmp_path)
+    _bulk_commits(remote, base, "graphed", 120)  # past the 100-commit graph boundary
+    mirror = gitops.ensure_mirror(mirrors, url)
+    _git(["--git-dir", str(mirror), "commit-graph", "write", "--reachable"], tmp_path)
+    info = mirror / "objects" / "info"
+    assert (info / "commit-graph").is_file() or (info / "commit-graphs").is_dir()
+
+    dest = tmp_path / "checkout"
+    gitops.clone_with_mirror(url, mirrors, dest)
+
+    fsck = subprocess.run(
+        ["git", "fsck", "--no-progress", "--strict"], cwd=dest, capture_output=True
+    )
+    assert fsck.returncode == 0
+    assert (dest / "README.md").exists()  # the worktree is complete, not empty
+    assert _git(["log", "--oneline", "-1"], dest)
+    # And the mirror is graph-free again: sanitize_mirror stripped it.
+    assert not (info / "commit-graph").exists()
+    assert not (info / "commit-graphs").exists()
+
+
+def test_update_repacks_only_past_the_pack_limit(tmp_path: Path, remote: Path, monkeypatch):
+    """With auto-maintenance off, pack health is owned explicitly: the
+    update repacks under the lock once objects/pack exceeds the threshold —
+    never below it, always ``repack`` (gc would write the commit-graph
+    back) — and checkouts keep working off the collapsed pack."""
+    root = tmp_path / "mirrors"
+    url = url_of(remote)
+    mirror = gitops.ensure_mirror(root, url)
+    base = _git(["--git-dir", str(remote), "rev-parse", "refs/heads/main"], tmp_path)
+    _bulk_commits(remote, base, "main", 150)
+
+    recorded: list[list[str]] = []
+    real_run = subprocess.run
+
+    def recording_run(argv, **kwargs):
+        recorded.append(list(argv))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", recording_run)
+    # The fetch stores its news as a second pack (fetch.unpackLimit=1,
+    # composed through GIT_CONFIG_* exactly like auth_env would be) — still
+    # under the threshold: no repack may run.
+    overlay = {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "fetch.unpackLimit",
+        "GIT_CONFIG_VALUE_0": "1",
+    }
+    gitops.update_mirror(root, url, env=overlay)
+    assert len(list((mirror / "objects" / "pack").glob("*.pack"))) == 2
+    assert not any("repack" in argv for argv in recorded)
+
+    monkeypatch.setattr(gitops, "MIRROR_REPACK_PACK_LIMIT", 1)
+    recorded.clear()
+    gitops.update_mirror(root, url)
+    assert any("repack" in argv for argv in recorded)
+    assert not any("gc" in argv for argv in recorded)  # repack, never gc
+    assert len(list((mirror / "objects" / "pack").glob("*.pack"))) == 1
+    dest = tmp_path / "checkout"
+    gitops.clone_with_mirror(url, root, dest)
+    assert (dest / "file-150").exists()
+
+
+def test_every_git_subprocess_is_maintenance_free(tmp_path: Path, remote: Path, monkeypatch):
+    """The #56 seam is total: every subprocess through gitops — mirror
+    creation clone, update fetch, reference clone, plain git() calls, and
+    the boolean probes that used to bypass _run_git — carries the
+    maintenance-off pairs immediately after ``git``, ahead of any
+    subcommand; the reference clone (and only it) is additionally
+    graph-blind."""
+    recorded: list[list[str]] = []
+    real_run = subprocess.run
+
+    def recording_run(argv, **kwargs):
+        recorded.append(list(argv))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", recording_run)
+    root = tmp_path / "mirrors"
+    url = url_of(remote)
+    dest = tmp_path / "checkout"
+    gitops.clone_with_mirror(url, root, dest)
+    gitops.git(["status", "--porcelain"], dest)
+    assert gitops.ref_exists(dest, "HEAD")
+    assert gitops.commit_exists(dest, gitops.head_sha(dest))
+    assert gitops.is_ancestor(dest, "HEAD", "HEAD")
+
+    assert any(_subcommand(argv)[:3] == ["clone", "--quiet", "--mirror"] for argv in recorded)
+    assert any(_subcommand(argv)[:3] == ["fetch", "--quiet", "--prune"] for argv in recorded)
+    assert any(_subcommand(argv)[:1] == ["rev-parse"] for argv in recorded)
+    assert any(_subcommand(argv)[:1] == ["cat-file"] for argv in recorded)
+    assert any(_subcommand(argv)[:1] == ["merge-base"] for argv in recorded)
+    for argv in recorded:
+        assert argv[0] == "git"
+        assert argv[1:5] == ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+    (ref_clone,) = [argv for argv in recorded if "--reference" in argv]
+    assert "core.commitGraph=false" in ref_clone
+    assert ref_clone.index("core.commitGraph=false") < ref_clone.index("clone")
+    for argv in recorded:
+        if "--reference" not in argv:
+            assert "core.commitGraph=false" not in argv
 
 
 # -- boot sweep -------------------------------------------------------------------
@@ -620,16 +803,62 @@ def test_second_run_reuses_the_mirror_without_a_second_full_download(harness: Ha
     assert creations == [False]  # warm: validated and reused, not re-cloned
 
 
+def test_mirror_failure_falls_back_to_a_full_clone_and_the_run_ships(harness: Harness, monkeypatch):
+    """The #56 fallback lane: the mirror is an optimization, never
+    load-bearing for Run success. A failed mirror-backed checkout falls
+    back exactly once to a full network clone and the Run ships normally —
+    one advisory mirror-fallback error event on the telemetry channel, the
+    mirror left in place for the next Run's _ensure_mirror_locked to
+    heal."""
+    number = harness.file_issue("Mirror flaky", CRITERIA_BODY)
+    root = Path(harness.worker_config.mirrors_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mirror = gitops.ensure_mirror(root, harness.worker_config.clone_url)
+
+    def broken_mirror(url, mirrors_dir, dest, *, branch=None, env=None, timeout=None):
+        raise GitError("git fetch --quiet --prune failed: remote hung up")
+
+    monkeypatch.setattr(gitops, "clone_with_mirror", broken_mirror)
+
+    def agent(prompt: str, cwd: Path) -> None:
+        (cwd / "change.txt").write_text("x\n")
+        write_proposal(cwd)
+
+    harness.worker_behaviors.append(agent)
+    assert harness.worker_once() == 1  # no retry burned: the fallback shipped
+
+    (pr_number,) = harness.fake.open_pr_numbers()
+    assert pr_number
+    fallbacks = [e for e in harness.sink.events if e.get("error_class") == "mirror-fallback"]
+    assert len(fallbacks) == 1  # once, not a loop
+    assert fallbacks[0]["type"] == "theozolith.error"
+    assert f"issue #{number}" in fallbacks[0]["message"]
+    assert "remote hung up" in fallbacks[0]["message"]
+    assert mirror.is_dir()  # left in place, never deleted by the fallback
+
+
 def test_mirror_failure_is_a_pre_session_infra_failure(harness: Harness, monkeypatch):
-    """ADR-0016 lane, no new class: both budgeted Runs fail 'infra' before
-    any container launches, evidence carries the class, and the claim
-    escalates to failed + needs_human."""
+    """ADR-0016 lane, no new class — now behind the #56 fallback, so BOTH
+    lanes break here: the mirror path and the full-clone fallback. Both
+    budgeted Runs fail 'infra' before any container launches, evidence
+    carries the class, and the claim escalates to failed + needs_human."""
     number = harness.file_issue("Mirror down", CRITERIA_BODY)
 
     def broken_update(mirror, url, env, timeout=None):
         raise GitError("git fetch --quiet --prune failed: remote hung up")
 
+    real_clone = gitops.clone
+
+    def broken_clone(url, dest, *, branch=None, **kwargs):
+        # Break the Run-checkout fallback; the evidence channel (its
+        # checkout clones the evidence branch) stays intact — the lane
+        # under test must still push its bundles.
+        if branch == EVIDENCE_BRANCH:
+            return real_clone(url, dest, branch=branch, **kwargs)
+        raise GitError("git clone failed: network down")
+
     monkeypatch.setattr(gitops, "_update_mirror_locked", broken_update)
+    monkeypatch.setattr(gitops, "clone", broken_clone)
     assert harness.worker_once() == 2  # the original Run and the one local retry
 
     # Pre-session: no RUN container ever launched (the boot-time identity
@@ -646,3 +875,9 @@ def test_mirror_failure_is_a_pre_session_infra_failure(harness: Harness, monkeyp
     assert len(run_reports) == 2  # the original and the one local retry
     assert {report["failure_class"] for report in run_reports} == {"infra"}
     assert all(report["phase"] == "failed" for report in run_reports)
+    # The fallback ran (and was advertised) before each Run failed — once
+    # per Run, never a loop.
+    fallbacks = [e for e in harness.sink.events if e.get("error_class") == "mirror-fallback"]
+    assert len(fallbacks) == 2
+    # Every bundle names the node's git: the #56 evidence field.
+    assert all(report["git_version"].startswith("git version") for report in run_reports)
