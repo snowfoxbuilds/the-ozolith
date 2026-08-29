@@ -19,9 +19,14 @@ RUN apt-get update \
 
 COPY knowledge /opt/theozolith/knowledge
 COPY worker /opt/theozolith/worker
+# nodedaemon: `theozolith candidate` shares the daemon's Dockerfile codegen
+# and knowledge staging instead of duplicating it (ADR-0054); the package is
+# stdlib-only, so this adds nothing transitively.
+COPY nodedaemon /opt/theozolith/nodedaemon
 COPY control /opt/theozolith/control
 RUN pip install --no-cache-dir \
-    /opt/theozolith/knowledge /opt/theozolith/worker /opt/theozolith/control
+    /opt/theozolith/knowledge /opt/theozolith/worker /opt/theozolith/nodedaemon \
+    /opt/theozolith/control
 
 RUN useradd --create-home --uid 1000 ozolith \
     && mkdir -p /data && chown ozolith:ozolith /data
