@@ -767,6 +767,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "textual" },
     { name = "theozolith-knowledge" },
+    { name = "theozolith-nodedaemon" },
     { name = "theozolith-worker" },
     { name = "uvicorn" },
 ]
@@ -786,6 +787,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "textual", specifier = ">=1.0" },
     { name = "theozolith-knowledge", editable = "knowledge" },
+    { name = "theozolith-nodedaemon", editable = "nodedaemon" },
     { name = "theozolith-worker", editable = "worker" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]

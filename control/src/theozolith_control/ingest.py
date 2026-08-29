@@ -1094,7 +1094,12 @@ def _resolve_http_hint(ref: str, registry: str, code: int, credential: str) -> s
     )
 
 
-def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) -> str:
+def resolve_image_digest(
+    ref: str,
+    credentials: dict[str, str] | None = None,
+    *,
+    hint: Callable[[str, str, int, str], str] | None = None,
+) -> str:
     """Resolve a tag-only image ref to its manifest digest via the registry
     HTTP API. This is MECHANICAL pin resolution (ADR-0048): the registry is
     the same authority ``docker pull`` trusts, and the resulting digest-pinned
@@ -1105,7 +1110,12 @@ def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) ->
     stored for the challenged host (ADR-0049), the token-realm request carries
     it as HTTP Basic; anonymous otherwise. There is never a third manifest
     attempt — by a 403 the challenge is already gone (GHCR's private-package
-    failure mode), so a refused credential surfaces an actionable message."""
+    failure mode), so a refused credential surfaces an actionable message.
+
+    ``hint`` overrides the terminal 401/403 message builder: candidate export
+    (ADR-0054) discovers its credential from a caller-supplied DOCKER_CONFIG,
+    so its remediation must not name the control-node Fernet store."""
+    describe = hint or _resolve_http_hint
     registry, repo, tag = _split_image_ref(ref)
     credential = (credentials or {}).get(registry, "")
     url = f"https://{registry}/v2/{repo}/manifests/{urllib.parse.quote(tag, safe='')}"
@@ -1140,7 +1150,7 @@ def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) ->
                 except urllib.error.HTTPError as token_exc:
                     if token_exc.code in (401, 403):
                         raise IngestError(
-                            _resolve_http_hint(ref, registry, token_exc.code, credential)
+                            describe(ref, registry, token_exc.code, credential)
                         ) from token_exc
                     raise IngestError(
                         f"cannot resolve base tag {ref!r}: registry token endpoint"
@@ -1157,7 +1167,7 @@ def resolve_image_digest(ref: str, credentials: dict[str, str] | None = None) ->
                         " returned a malformed response"
                     ) from token_exc
                 continue
-            raise IngestError(_resolve_http_hint(ref, registry, exc.code, credential)) from exc
+            raise IngestError(describe(ref, registry, exc.code, credential)) from exc
         except urllib.error.URLError as exc:
             raise IngestError(f"cannot resolve base tag {ref!r}: {exc.reason}") from exc
     raise IngestError(f"cannot resolve base tag {ref!r}")  # pragma: no cover

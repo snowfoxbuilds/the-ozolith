@@ -26,6 +26,12 @@ dependencies = [
     # `theozolith config ingest` runs the ADR-0009 knowledge compiler on the
     # Control Node (ADR-0048): compile at ingest, distribute compiled output.
     "theozolith-knowledge",
+    # `theozolith candidate export/verify/build` (ADR-0054) emits and
+    # byte-verifies bundle Dockerfiles through the Node Daemon's OWN codegen
+    # and knowledge staging — shared, never duplicated (issue #88), so bench
+    # builds cannot drift from fleet builds. nodedaemon stays stdlib-only, so
+    # this adds nothing transitively.
+    "theozolith-nodedaemon",
 ]
 
 [project.scripts]
@@ -45,6 +51,7 @@ packages = ["src/theozolith_control"]
 [tool.uv.sources]
 theozolith-worker = { workspace = true }
 theozolith-knowledge = { workspace = true }
+theozolith-nodedaemon = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27", "pytest-asyncio>=1"]
