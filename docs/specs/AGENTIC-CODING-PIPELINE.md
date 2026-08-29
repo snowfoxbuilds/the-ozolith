@@ -126,6 +126,7 @@ A first-party quality gate (in worker/) fronts every push: disposable worktree, 
 
 - A new model or agent is a new adapter image. Route a fraction of plan_ready issues to the new adapter.
 - Compare gate pass rate, retry count, escalation rate, and cost per merged PR from evidence bundles and GitHub data. Promote on wins.
+- Off-fleet benchmarking: worker types export as Candidate Bundles and execute under the published bench contract — bundle format, identity spec, and the Run Contract for both implementer and review modes — see [BENCH-CONTRACT.md](BENCH-CONTRACT.md) (ADR-0054; grilling 2026-08-28).
 ### Deployment and substrate
 
 The Control Node, Node Daemon, Config Repo, secrets, extension points, and the deployment boundary are specified in [NODE-SUBSTRATE.md](NODE-SUBSTRATE.md). The pipeline is one consumer of that substrate; nothing pipeline-side may depend on private deployment specifics.
