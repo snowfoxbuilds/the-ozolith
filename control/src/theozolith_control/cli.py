@@ -52,6 +52,7 @@ from theozolith_worker.config import ConfigError, env_value
 from theozolith_control import (
     bearerhttp,
     bootstrap,
+    candidate,
     configrepo,
     controltoml,
     ingest,
@@ -1271,6 +1272,63 @@ def _config_migrate(args) -> int:
     return 0
 
 
+def _candidate_summary_lines(summary: candidate.CandidateSummary) -> list[str]:
+    return [
+        f"  worker type:      {summary.worker_type}",
+        f"  identity triple:  base {summary.base_digest}",
+        f"                    instruction hash {summary.instruction_hash}",
+        f"                    adapter {summary.adapter}",
+        f"  deterministic tag: {summary.tag}",
+    ]
+
+
+def _candidate_export(args) -> int:
+    """`theozolith candidate export` (ADR-0054): local config-repo-shaped
+    directory -> self-contained Candidate Bundle. Runs the ingest resolution
+    machinery; touches no Pinned Build and no control-node state."""
+    try:
+        docker_config = candidate.discover_docker_config(args.docker_config or None)
+        summary = candidate.export_candidate(
+            args.source, args.worker_type, args.out, docker_config=docker_config
+        )
+    except candidate.CandidateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _log(f"exported candidate bundle to {args.out}")
+    for line in _candidate_summary_lines(summary):
+        _log(line)
+    return 0
+
+
+def _candidate_verify(args) -> int:
+    """`theozolith candidate verify` (ADR-0054): authenticate the complete
+    executable build context from bundle bytes — no Docker involved."""
+    try:
+        summary = candidate.verify_bundle(args.bundle)
+    except candidate.CandidateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _log(f"bundle {args.bundle} verifies")
+    for line in _candidate_summary_lines(summary):
+        _log(line)
+    return 0
+
+
+def _candidate_build(args) -> int:
+    """`theozolith candidate build` (ADR-0054): the verified standalone
+    build — private snapshot, full verification, docker build of that same
+    snapshot, cleanup on every exit path."""
+    try:
+        docker_config = candidate.discover_docker_config(args.docker_config or None)
+        summary = candidate.build_candidate(
+            args.bundle, docker_config=docker_config, no_cache=args.no_cache
+        )
+    except candidate.CandidateError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    _log(f"built verified candidate image {summary.tag}")
+    for line in _candidate_summary_lines(summary):
+        _log(line)
+    return 0
+
+
 def _secret_set(args) -> int:
     url, token, ca = _admin_env(args)
     value = args.value
@@ -1522,6 +1580,73 @@ def main(argv: list[str] | None = None) -> int:
         " deployment's configs/ dir — the future pinned build).",
     )
     config_migrate.set_defaults(func=_config_migrate)
+
+    candidate_cmd = sub.add_parser(
+        "candidate",
+        help="Candidate Bundles for benchmarking (ADR-0054): export a"
+        " worker-type definition, verify a bundle, run the verified build.",
+    )
+    candidate_sub = candidate_cmd.add_subparsers(dest="candidate_cmd", required=True)
+    candidate_export = candidate_sub.add_parser(
+        "export",
+        help="Export one worker-type definition from a LOCAL config-repo-shaped"
+        " directory (worker-types/ + knowledge/) as a self-contained,"
+        " docker-buildable Candidate Bundle: candidate.json, the compiled"
+        " knowledge tree for the type's adapter tool, and a Dockerfile from"
+        " the Node Daemon's own codegen. No Pinned Build is involved; URLs"
+        " are refused — clone remote repos yourself, preferably at an"
+        " immutable commit.",
+    )
+    candidate_export.add_argument(
+        "--source", required=True, help="The local config-repo-shaped source directory."
+    )
+    candidate_export.add_argument(
+        "--type",
+        required=True,
+        dest="worker_type",
+        help="The worker type to export (worker-types/<type>.toml).",
+    )
+    candidate_export.add_argument(
+        "--out", required=True, help="Bundle output directory (new or empty)."
+    )
+    candidate_export.add_argument(
+        "--docker-config",
+        default="",
+        help="DOCKER_CONFIG directory carrying a pull credential for a private"
+        " base (static auths or a credential helper, ADR-0049; default: the"
+        " DOCKER_CONFIG env var, then ~/.docker). Public bases resolve"
+        " anonymously.",
+    )
+    candidate_export.set_defaults(func=_candidate_export)
+    candidate_verify = candidate_sub.add_parser(
+        "verify",
+        help="Authenticate the complete executable build context from bundle"
+        " bytes: strict manifest parse, knowledge-pin recompute, identity"
+        " recompute, wire-recipe reconstruction, an exact Dockerfile byte"
+        " match against the shared production codegen, and the layout"
+        " allowlist — refusing before Docker is ever invoked.",
+    )
+    candidate_verify.add_argument("bundle", help="The bundle directory to verify.")
+    candidate_verify.set_defaults(func=_candidate_verify)
+    candidate_build = candidate_sub.add_parser(
+        "build",
+        help="The supported standalone build: stage a private snapshot of the"
+        " bundle, fully verify it, docker-build that same snapshot under the"
+        " deterministic tag, and clean up on every exit path. Raw `docker"
+        " build` on the bundle stays possible but is not identity-verified"
+        " and never produces trusted benchmark evidence.",
+    )
+    candidate_build.add_argument("bundle", help="The bundle directory to build.")
+    candidate_build.add_argument(
+        "--docker-config",
+        default="",
+        help="DOCKER_CONFIG directory for a private-base pull at build time"
+        " (default: the DOCKER_CONFIG env var, then ~/.docker).",
+    )
+    candidate_build.add_argument(
+        "--no-cache", action="store_true", help="Build with --no-cache (fresh layers)."
+    )
+    candidate_build.set_defaults(func=_candidate_build)
 
     secret = sub.add_parser("secret", help="Enter and list secrets (values never displayed).")
     secret_sub = secret.add_subparsers(dest="secret_cmd", required=True)

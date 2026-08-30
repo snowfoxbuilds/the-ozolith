@@ -350,7 +350,7 @@ class _RunContext:
     trusted_input: dict[str, bytes] | None = None
 
 
-def _build_prompt(
+def render_run_prompt(
     issue: Issue,
     round_number: int,
     revised: verdict.Verdict | None,
@@ -363,7 +363,11 @@ def _build_prompt(
     Chained-base section when the base is a blocker branch (``chained``,
     pre-rendered from CHAINED_BASE_CONTEXT; ADR-0053) and the input/deps
     bullet when the issue carries Dependency Edges. Discussion content is
-    never injected — every authorized comment lives in the Context Tree."""
+    never injected — every authorized comment lives in the Context Tree.
+
+    ``schema_version`` surface (ADR-0054): the production implementer prompt
+    renderer, exposed through ``theozolith_worker.api`` so a bench driver
+    replays the exact bytes this driver writes to ``input/prompt.md``."""
     round_context = ""
     if revised is not None and revised.verdict == verdict.REVISE and revised.revised_plan:
         round_context = REVISED_PLAN_CONTEXT.format(
@@ -1014,7 +1018,7 @@ def _run_to_pr(
             pr_ref=f" (PR #{blocker_pr.number})" if blocker_pr is not None else "",
         )
 
-    prompt = _build_prompt(
+    prompt = render_run_prompt(
         issue, report.round, revised, chained=chained_section, deps_present=has_deps
     )
     if completion is not None:

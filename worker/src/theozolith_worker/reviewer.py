@@ -231,6 +231,46 @@ FINAL_ROUND_RULE = (
 )
 
 
+def render_review_prompt(
+    issue: Issue,
+    *,
+    head_sha: str,
+    round_number: int,
+    round_budget: int = ROUND_BUDGET,
+    based_on: basedon.BasedOn | None = None,
+    deps_present: bool = False,
+) -> str:
+    """The production review prompt: issue + workspace guide + round rules,
+    plus the Chained-base section when ``based_on`` names a blocker and the
+    input/deps bullet when the issue carries Dependency Edges. The final
+    budgeted round swaps in the revise-forbidden rule.
+
+    ``schema_version`` surface (ADR-0054): the production review prompt
+    renderer, exposed through ``theozolith_worker.api`` so a bench driver
+    replays the exact bytes this driver writes to ``input/prompt.md``
+    (bench review runs pin ``round_number=1, round_budget=3`` — production
+    first-round conditions)."""
+    final_round = round_number >= round_budget
+    chained = (
+        CHAINED_REVIEW_CONTEXT.format(blocker=based_on.issue, sha=based_on.sha)
+        if based_on is not None
+        else ""
+    )
+    deps_bullet = runner.DEPS_BULLET.format(job=jobdir.CONTAINER_JOB_PATH) if deps_present else ""
+    return REVIEW_PROMPT.format(
+        number=issue.number,
+        title=issue.title,
+        body=issue.body or "(no body)",
+        head=head_sha,
+        job=jobdir.CONTAINER_JOB_PATH,
+        deps_bullet=deps_bullet,
+        chained=chained,
+        round=round_number,
+        budget=round_budget,
+        round_rule=FINAL_ROUND_RULE if final_round else MIDDLE_ROUND_RULE,
+    )
+
+
 def _log(message: str) -> None:
     print(message, flush=True)
 
@@ -244,10 +284,14 @@ def _strip_claim_and_requeue(client: GitHubClient, issue_number: int) -> None:
     client.add_labels(issue_number, PLAN_READY)
 
 
-def _base_md(pr: PullRequest, base_commit: str, based_on: basedon.BasedOn | None) -> str:
+def render_base_md(pr: PullRequest, base_commit: str, based_on: basedon.BasedOn | None) -> str:
     """input/pr/base.md: the driver-verified base facts (ADR-0053) — the
     ref, the merge-base commit the diff frames against, and the chained-base
-    record when the PR's Based-on zone names a blocker."""
+    record when the PR's Based-on zone names a blocker.
+
+    ``schema_version`` surface (ADR-0054): exposed through
+    ``theozolith_worker.api`` so a bench driver constructing a synthetic
+    Review Run writes the same base facts the production driver would."""
     lines = [
         "# PR base",
         "",
@@ -407,7 +451,7 @@ def _materialize_inputs(
             closure,
         )
     pr_input = job / "input" / contexttree.PR_DIR
-    jobdir.atomic_write(pr_input / "base.md", _base_md(pr, base_commit, based_on))
+    jobdir.atomic_write(pr_input / "base.md", render_base_md(pr, base_commit, based_on))
     jobdir.atomic_write(
         pr_input / "changed-files.md", (name_status + "\n") if name_status else "(none)\n"
     )
@@ -519,23 +563,13 @@ def review_pr(
             return None
 
         final_round = round_number >= ROUND_BUDGET
-        chained = (
-            CHAINED_REVIEW_CONTEXT.format(blocker=based_on.issue, sha=based_on.sha)
-            if based_on is not None
-            else ""
-        )
-        deps_bullet = runner.DEPS_BULLET.format(job=jobdir.CONTAINER_JOB_PATH) if has_deps else ""
-        prompt = REVIEW_PROMPT.format(
-            number=issue.number,
-            title=issue.title,
-            body=issue.body or "(no body)",
-            head=pr.head_sha,
-            job=jobdir.CONTAINER_JOB_PATH,
-            deps_bullet=deps_bullet,
-            chained=chained,
-            round=round_number,
-            budget=ROUND_BUDGET,
-            round_rule=FINAL_ROUND_RULE if final_round else MIDDLE_ROUND_RULE,
+        prompt = render_review_prompt(
+            issue,
+            head_sha=pr.head_sha,
+            round_number=round_number,
+            round_budget=ROUND_BUDGET,
+            based_on=based_on,
+            deps_present=has_deps,
         )
         jobdir.atomic_write(job / jobdir.PROMPT_FILE, prompt)
         manifest = jobdir.Manifest(
