@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
@@ -277,6 +278,59 @@ def test_export_refuses_a_nonempty_output_directory(tmp_path):
     (out / "leftover").write_text("x", encoding="utf-8")
     with pytest.raises(CandidateError, match="new or empty"):
         candidate.export_candidate(source, "goldtype", out, resolve_digest=resolve_a)
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
+def test_a_failed_export_leaves_no_partial_destination_and_retries(tmp_path, monkeypatch, failure):
+    """Atomic publication: the bundle assembles in hidden staging beside the
+    destination and lands in one rename — a mid-assembly failure or
+    interruption leaves a NEW destination absent, a PRE-EXISTING empty
+    destination empty, no staging litter beside them, and the very same
+    destination retries immediately."""
+    source = make_source(tmp_path)
+    before = {p.name for p in tmp_path.iterdir()}
+
+    def boom(recipe, built_at):
+        raise failure()
+
+    monkeypatch.setattr(candidate.builds, "dockerfile_for", boom)
+    fresh = tmp_path / "fresh-out"
+    with pytest.raises(failure):
+        candidate.export_candidate(source, "goldtype", fresh, resolve_digest=resolve_a)
+    assert not fresh.exists()
+
+    existing = tmp_path / "existing-out"
+    existing.mkdir()
+    with pytest.raises(failure):
+        candidate.export_candidate(source, "goldtype", existing, resolve_digest=resolve_a)
+    assert existing.is_dir() and list(existing.iterdir()) == []
+    assert {p.name for p in tmp_path.iterdir()} == before | {"existing-out"}
+
+    monkeypatch.undo()
+    for out in (fresh, existing):
+        summary = candidate.export_candidate(
+            source, "goldtype", out, resolve_digest=resolve_a, now=lambda: NOW
+        )
+        assert candidate.verify_bundle(out) == summary
+
+
+def test_a_destination_filled_during_export_refuses_at_publication(tmp_path, monkeypatch):
+    """The rename is the only write to the final path: a destination that
+    gains content while the export runs fails the publication and receives
+    nothing — there is no incremental copy to interleave with."""
+    source = make_source(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    real = candidate.builds.dockerfile_for
+
+    def fill_then_render(recipe, built_at):
+        (out / "intruder").write_text("x", encoding="utf-8")
+        return real(recipe, built_at)
+
+    monkeypatch.setattr(candidate.builds, "dockerfile_for", fill_then_render)
+    with pytest.raises(CandidateError, match="cannot publish"):
+        candidate.export_candidate(source, "goldtype", out, resolve_digest=resolve_a)
+    assert [p.name for p in out.iterdir()] == ["intruder"]
 
 
 def test_reexport_after_a_moved_tag_yields_a_new_identity(tmp_path):
@@ -614,6 +668,116 @@ def test_build_cleans_up_on_docker_failure_and_interruption(tmp_path, tracked_tm
     with pytest.raises(KeyboardInterrupt):
         candidate.build_candidate(bundle, docker=FakeDocker(on_build=interrupt))
     assert list(tracked_tmp.iterdir()) == []
+
+
+def test_a_symlink_swapped_in_during_staging_is_refused_and_never_copied(tmp_path, monkeypatch):
+    """Deterministic replay of the copy race the descriptor walk closes: the
+    knowledge file is swapped for a symlink to an outside secret AFTER the
+    directory listing is taken but BEFORE the entry is opened. The
+    O_NOFOLLOW open fails on the swapped-in link, so the secret's bytes
+    never enter staging — and the raced bundle never reaches Docker."""
+    bundle, _ = export_gold(tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside-bundle-secret", encoding="utf-8")
+    victim = bundle / "knowledge" / "CLAUDE.md"
+
+    real_listdir = os.listdir
+    state = {"swapped": False}
+
+    def swapping_listdir(path="."):
+        names = real_listdir(path)
+        if not state["swapped"] and "CLAUDE.md" in names:
+            victim.unlink()
+            victim.symlink_to(secret)
+            state["swapped"] = True
+        return names
+
+    monkeypatch.setattr(os, "listdir", swapping_listdir)
+    dest = tmp_path / "snapshot"
+    with pytest.raises(CandidateError, match="is a symlink — refused before staging"):
+        candidate._snapshot_bundle(bundle, dest)
+    monkeypatch.undo()
+    assert state["swapped"]
+    for path in dest.rglob("*"):
+        if path.is_file():
+            assert b"outside-bundle-secret" not in path.read_bytes()
+    assert not (dest / "knowledge" / "CLAUDE.md").exists()
+
+    fake = FakeDocker()
+    with pytest.raises(CandidateError, match="symlink"):
+        candidate.build_candidate(bundle, docker=fake)
+    assert fake.builds == []
+
+
+def test_a_symlinked_bundle_root_is_refused(tmp_path, tracked_tmp):
+    bundle, _ = export_gold(tmp_path)
+    link = tmp_path / "linked-bundle"
+    link.symlink_to(bundle)
+    fake = FakeDocker()
+    with pytest.raises(CandidateError, match="is a symlink"):
+        candidate.build_candidate(link, docker=fake)
+    assert fake.builds == []
+    assert list(tracked_tmp.iterdir()) == []
+
+
+def test_snapshot_copy_preserves_the_exec_bit_the_pin_covers(tmp_path):
+    """The one mode bit tree_hash classifies survives the descriptor copy,
+    normalized to exactly the 755/644 classes the pin distinguishes."""
+    source = tmp_path / "src"
+    (source / "sub").mkdir(parents=True)
+    script = source / "sub" / "tool.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o750)
+    (source / "plain.txt").write_text("x", encoding="utf-8")
+    dest = tmp_path / "snap"
+    candidate._snapshot_bundle(source, dest)
+    assert (dest / "sub" / "tool.sh").stat().st_mode & 0o777 == 0o755
+    assert (dest / "plain.txt").stat().st_mode & 0o777 == 0o644
+    assert (dest / "sub" / "tool.sh").read_bytes() == b"#!/bin/sh\n"
+
+
+def test_a_docker_timeout_normalizes_to_a_candidate_error(tmp_path, tracked_tmp):
+    """The spec's cleanup-after-timeout obligation: TimeoutExpired from the
+    docker subprocess surfaces as a CandidateError naming the tag and the
+    budget — the CLI's normal `error:` result, never a traceback — and the
+    staging directory is gone."""
+    bundle, summary = export_gold(tmp_path)
+
+    def hang(context):
+        raise subprocess.TimeoutExpired(cmd=["docker", "build"], timeout=3600)
+
+    with pytest.raises(CandidateError, match="timed out after 3600 seconds") as excinfo:
+        candidate.build_candidate(bundle, docker=FakeDocker(on_build=hang))
+    assert summary.tag in str(excinfo.value)
+    assert list(tracked_tmp.iterdir()) == []
+
+
+def test_a_cleanup_failure_after_success_is_surfaced_not_swallowed(
+    tmp_path, tracked_tmp, monkeypatch
+):
+    bundle, summary = export_gold(tmp_path)
+    fake = FakeDocker()
+
+    def refuse(path, *args, **kwargs):
+        raise OSError("busy")
+
+    monkeypatch.setattr(candidate.shutil, "rmtree", refuse)
+    with pytest.raises(CandidateError, match="could not be removed") as excinfo:
+        candidate.build_candidate(bundle, docker=fake)
+    assert summary.tag in str(excinfo.value)  # the message states the build DID succeed
+    assert len(fake.builds) == 1
+
+
+def test_a_cleanup_failure_never_masks_the_primary_failure(tmp_path, tracked_tmp, monkeypatch):
+    bundle, _ = export_gold(tmp_path)
+
+    def refuse(path, *args, **kwargs):
+        raise OSError("busy")
+
+    monkeypatch.setattr(candidate.shutil, "rmtree", refuse)
+    with pytest.raises(CandidateError, match=r"docker build of .* failed") as excinfo:
+        candidate.build_candidate(bundle, docker=FakeDocker(fail=True))
+    assert any("could not be removed" in note for note in excinfo.value.__notes__)
 
 
 def test_repeat_builds_keep_the_deterministic_identity_and_tag(tmp_path, tracked_tmp):

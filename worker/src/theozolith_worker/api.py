@@ -17,7 +17,7 @@ from theozolith_worker.basedon import BasedOn, upsert_zone
 from theozolith_worker.bootstrap import vocabulary
 from theozolith_worker.config import ConfigError, DriverConfig, load_config
 from theozolith_worker.containers import ContainerSpec, DockerEngine
-from theozolith_worker.contexttree import ContextSnapshot, write_tree
+from theozolith_worker.contexttree import ContextSnapshot, PrCommit, git_pr_commits, write_tree
 from theozolith_worker.decisions import Decision, DecisionsSection
 from theozolith_worker.dispatch import DispatchClient, WorkDispatch
 from theozolith_worker.drivercli import run_driver
@@ -130,6 +130,7 @@ __all__ = [
     "JobRequest",
     "JobResult",
     "Manifest",
+    "PrCommit",
     "PullRequest",
     "RepoMergeSettings",
     "Reviewer",
@@ -149,6 +150,7 @@ __all__ = [
     "create_job_dir",
     "emit_error",
     "execute_claim",
+    "git_pr_commits",
     "load_config",
     "load_steps",
     "read_manifest",

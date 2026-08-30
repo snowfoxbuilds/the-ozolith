@@ -45,6 +45,7 @@ visibility, not immutability.
 from __future__ import annotations
 
 import base64
+import errno
 import functools
 import json
 import os
@@ -143,7 +144,13 @@ def export_candidate(
     DOCKER_CONFIG-credentialed registry resolver, pin computation, the full
     worker-type parse with its capability gates) and writes the bundle; no
     Pinned Build is read or written. Secret slot NAMES travel in the
-    manifest; stored secret names and values never do."""
+    manifest; stored secret names and values never do.
+
+    Publication is atomic: the bundle is assembled in a hidden staging
+    directory beside the destination (same filesystem) and lands in one
+    ``rename`` only after every step has succeeded — a failed or
+    interrupted export leaves a new destination absent and a pre-existing
+    empty destination empty, and an immediate retry works."""
     source_dir = _source_dir(source)
     if not _WORKER_TYPE_NAME.fullmatch(worker_type):
         raise CandidateError(
@@ -160,9 +167,14 @@ def export_candidate(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise CandidateError(f"worker-types/{worker_type}.toml does not parse: {exc}") from exc
 
-    out_dir = _prepare_out(out)
-    with tempfile.TemporaryDirectory(prefix="theozolith-candidate-export-") as staging_text:
-        staging = Path(staging_text)
+    out_dir = _check_out(out)
+    # Staging lives BESIDE the destination (hidden name, same filesystem) so
+    # the final publication can be one atomic rename; the destination itself
+    # is never created early or filled incrementally.
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{out_dir.name}.theozolith-export-", dir=out_dir.parent)
+    )
+    try:
         try:
             knowledge_pins = ingest._compile_knowledge(source_dir, staging)
         except ingest.IngestError as exc:
@@ -178,8 +190,6 @@ def export_candidate(
 
         recipe = wt.recipe_wire()
         exported_at = now() if now else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        # Assemble in staging, publish to out only on full success — a failed
-        # export never leaves a partial bundle behind.
         bundle = staging / "bundle"
         bundle.mkdir()
         reason = builds.stage_knowledge(recipe, staging, bundle)
@@ -215,7 +225,11 @@ def export_candidate(
         (bundle / MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        shutil.copytree(bundle, out_dir, dirs_exist_ok=True)
+        _publish_bundle(bundle, out_dir)
+    except BaseException as exc:
+        _cleanup_staging(staging, exc)
+        raise
+    _cleanup_staging(staging, None, completed=f"the bundle was published to {out_dir}")
     return CandidateSummary(
         worker_type=wt.name,
         adapter=wt.adapter,
@@ -244,7 +258,10 @@ def _source_dir(source: str | Path) -> Path:
     return path
 
 
-def _prepare_out(out: str | Path) -> Path:
+def _check_out(out: str | Path) -> Path:
+    """Validate the destination WITHOUT creating it or writing into it —
+    only missing parent directories are made. The final path is claimed by
+    :func:`_publish_bundle`'s atomic rename alone."""
     out_dir = Path(out)
     if out_dir.is_symlink():
         raise CandidateError(f"output {out_dir} is a symlink — refused")
@@ -252,8 +269,40 @@ def _prepare_out(out: str | Path) -> Path:
         if not out_dir.is_dir() or any(out_dir.iterdir()):
             raise CandidateError(f"output {out_dir} must be a new or empty directory")
     else:
-        out_dir.mkdir(parents=True)
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _publish_bundle(bundle: Path, out_dir: Path) -> None:
+    """One atomic ``rename`` from staging onto the destination: POSIX rename
+    creates an absent target and replaces an empty-directory target, so both
+    accepted destination states publish without ever exposing a partial
+    bundle. A destination filled since :func:`_check_out` fails the rename
+    — and still receives nothing."""
+    try:
+        os.rename(bundle, out_dir)
+    except OSError as exc:
+        raise CandidateError(
+            f"cannot publish the bundle to {out_dir}: {exc} — nothing was written"
+            " to the destination; if it gained content while the export ran,"
+            " clear it and retry"
+        ) from exc
+
+
+def _cleanup_staging(staging: Path, failed: BaseException | None, *, completed: str = "") -> None:
+    """Staging removal runs on every exit path, and a removal failure is
+    never silently swallowed: when the operation otherwise succeeded it
+    raises (the caller must learn bytes remain on disk), and when a primary
+    failure is already propagating it rides along as a note on that
+    exception — reported, never masking what actually went wrong."""
+    try:
+        shutil.rmtree(staging)
+    except OSError as exc:
+        problem = f"the staging directory {staging} could not be removed: {exc}"
+        if failed is not None:
+            failed.add_note(problem)
+            return
+        raise CandidateError(f"{completed}, but {problem}") from exc
 
 
 def _resolve_base(
@@ -749,14 +798,15 @@ def build_candidate(
     no_cache: bool = False,
 ) -> CandidateSummary:
     """The supported standalone build (ADR-0054): copy the bundle into a
-    PRIVATE staged snapshot (refusing symlinks and special files at copy
-    time — a followed symlink would smuggle outside-bundle bytes into the
-    verified context), run the full verification on that snapshot, ``docker
-    build`` that same snapshot under the deterministic tag, and clean the
-    snapshot up on success, failure, and interruption alike. Nothing can
-    change between what was verified and what is built. ``docker_config``
-    rides to the build for a private base pull (ADR-0049); the credential
-    never appears in argv."""
+    PRIVATE staged snapshot through file descriptors (a symlink or special
+    file anywhere — even one swapped in mid-copy — refuses before its bytes
+    can move), run the full verification on that snapshot, ``docker build``
+    that same snapshot under the deterministic tag, and clean the snapshot
+    up on success, failure, timeout, and interruption alike (a cleanup
+    failure is surfaced, never swallowed). Nothing can change between what
+    was verified and what is built. ``docker_config`` rides to the build
+    for a private base pull (ADR-0049); the credential never appears in
+    argv."""
     bundle_dir = Path(bundle)
     if not bundle_dir.is_dir():
         raise CandidateError(f"bundle {bundle_dir} is not a directory")
@@ -770,27 +820,78 @@ def build_candidate(
             ctl.build(snapshot, verified.tag, no_cache=no_cache, docker_config=docker_config)
         except DockerError as exc:
             raise CandidateError(f"docker build of {verified.tag} failed: {exc}") from exc
-        return verified
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        except subprocess.TimeoutExpired as exc:
+            # Normalized like any other build failure — the argv the raw
+            # exception would print is not part of the error surface.
+            raise CandidateError(
+                f"docker build of {verified.tag} timed out after {exc.timeout:g} seconds"
+            ) from exc
+    except BaseException as exc:
+        _cleanup_staging(staging, exc)
+        raise
+    _cleanup_staging(staging, None, completed=f"the image was built and tagged {verified.tag}")
+    return verified
 
 
 def _snapshot_bundle(source: Path, dest: Path) -> None:
+    """Stage the private snapshot through file DESCRIPTORS, never repeated
+    path lookups: every entry is opened ``O_NOFOLLOW`` relative to its
+    parent directory's descriptor and classified by ``fstat`` on the
+    descriptor actually held — the same object that is then read (files) or
+    descended into (directories). An entry swapped for a symlink at any
+    point either fails the open (``ELOOP``) or is invisible, because a swap
+    after the open cannot retarget a held descriptor — there is no
+    check-to-use window anywhere in the walk, and the completed snapshot is
+    exactly what ``verify_bundle`` then authenticates and Docker builds.
+    FIFOs and devices are refused by the ``fstat`` check (``O_NONBLOCK``
+    keeps a planted FIFO from stalling the open). File modes normalize to
+    755/644 by the exec bit — the one mode bit the knowledge pin covers
+    (``configdist.tree_hash``), preserved exactly as it classifies."""
+    try:
+        root_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        # Linux reports a symlinked root as ENOTDIR under O_DIRECTORY, not
+        # ELOOP; the islink re-check only picks the message — the refusal
+        # already happened at the descriptor.
+        if exc.errno == errno.ELOOP or os.path.islink(source):
+            raise CandidateError(f"bundle {source} is a symlink — refused before staging") from exc
+        raise CandidateError(f"cannot open bundle {source} for staging: {exc}") from exc
     dest.mkdir()
-    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
-        rel = Path(dirpath).relative_to(source)
-        for name in dirnames:
-            entry = Path(dirpath) / name
-            if entry.is_symlink():
+    try:
+        _snapshot_dir(root_fd, dest, Path("."))
+    finally:
+        os.close(root_fd)
+
+
+def _snapshot_dir(dir_fd: int, dest: Path, rel: Path) -> None:
+    for name in sorted(os.listdir(dir_fd)):
+        entry_rel = rel / name
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
                 raise CandidateError(
-                    f"bundle entry {rel / name} is a symlink — refused before staging"
-                )
-            (dest / rel / name).mkdir()
-        for name in filenames:
-            entry = Path(dirpath) / name
-            if not stat.S_ISREG(os.lstat(entry).st_mode):
+                    f"bundle entry {entry_rel} is a symlink — refused before staging"
+                ) from exc
+            raise CandidateError(f"cannot stage bundle entry {entry_rel}: {exc}") from exc
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                target = dest / name
+                target.mkdir()
+                _snapshot_dir(fd, target, entry_rel)
+            elif stat.S_ISREG(st.st_mode):
+                target = dest / name
+                with open(target, "wb") as out:
+                    while chunk := os.read(fd, 1 << 20):
+                        out.write(chunk)
+                target.chmod(0o755 if st.st_mode & 0o111 else 0o644)
+            else:
                 raise CandidateError(
-                    f"bundle entry {rel / name} is not a regular file — refused before staging"
+                    f"bundle entry {entry_rel} is not a regular file or directory —"
+                    " special files are refused before staging"
                 )
-            # copy2 preserves the exec bit the knowledge pin covers.
-            shutil.copy2(entry, dest / rel / name)
+        finally:
+            os.close(fd)

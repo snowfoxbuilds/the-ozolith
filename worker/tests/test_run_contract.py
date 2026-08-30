@@ -241,11 +241,14 @@ def _git(repo, *args) -> str:
 
 def test_synthetic_round_one_review_job_is_constructible_without_github(tmp_path):
     """BENCH-CONTRACT.md constructibility requirement: a Review Run job dir
-    from a synthetic issue + a git branch + an implementer-contract output —
-    PR body composed exactly as the production driver composes it, base.md /
-    changed-files.md / signals.md computed from git, conversation surfaces
-    empty for a first round, the prompt from the production renderer, and
-    the manifest pinned at round 1 of 3."""
+    from a synthetic issue + a git branch + an implementer-contract output,
+    at full production shape — the snapshot carries the synthetic PR and its
+    commits enumerated by the production enumerator, ``write_tree`` emits
+    the COMPLETE first-round PR surface set (body, empty conversation /
+    review-comment / review indexes, commits, checks), base.md /
+    changed-files.md / signals.md come from the driver's own git reads, the
+    prompt from the production renderer, and the manifest pins round 1 of
+    3. No GitHub client anywhere."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
@@ -275,17 +278,24 @@ def test_synthetic_round_one_review_job_is_constructible_without_github(tmp_path
         state="open",
     )
 
+    # The production serializer writes every PR surface — including the
+    # commits the production enumerator reads from the synthetic branch.
     job = tmp_path / "job"
+    snapshot = api.ContextSnapshot(
+        issue=ISSUE,
+        pr=pr,
+        pr_commits=api.git_pr_commits(repo, base_sha, "HEAD"),
+    )
+    api.write_tree(job / "input", snapshot)
     pr_input = job / "input" / "pr"
-    pr_input.mkdir(parents=True)
-    api.atomic_write(pr_input / "body.md", body)
-    api.atomic_write(pr_input / "base.md", api.render_base_md(pr, base_sha, None))
-    name_status = _git(repo, "diff", "--name-status", base_sha, "HEAD")
-    numstat = _git(repo, "diff", "--numstat", base_sha, "HEAD")
+    name_status = _git(repo, "diff", "--name-status", base_sha, "HEAD").strip()
+    numstat = _git(repo, "diff", "--numstat", base_sha, "HEAD").strip()
     signals = api.signals_from_git(numstat.splitlines(), name_status.splitlines())
-    api.atomic_write(pr_input / "changed-files.md", name_status)
+    api.atomic_write(pr_input / "base.md", api.render_base_md(pr, base_sha, None))
+    api.atomic_write(
+        pr_input / "changed-files.md", (name_status + "\n") if name_status else "(none)\n"
+    )
     api.atomic_write(pr_input / "signals.md", signals.render() + "\n")
-    api.write_tree(job / "input", api.ContextSnapshot(issue=ISSUE))
     prompt = api.render_review_prompt(ISSUE, head_sha=head_sha, round_number=1, round_budget=3)
     api.atomic_write(job / api.PROMPT_FILE, prompt)
     manifest = api.Manifest(
@@ -298,14 +308,37 @@ def test_synthetic_round_one_review_job_is_constructible_without_github(tmp_path
     )
     api.write_manifest(job, manifest)
 
-    # The workspace-parity PR surface set (#85) plus the issue snapshot.
+    # The COMPLETE workspace-parity PR surface set (#85): what a production
+    # first-round Review Run materializes, nothing missing, nothing extra.
     assert sorted(p.name for p in pr_input.iterdir()) == [
         "base.md",
         "body.md",
         "changed-files.md",
+        "checks.md",
+        "commits.md",
+        "conversation",
+        "review-comments",
+        "reviews",
         "signals.md",
     ]
+    assert "Closes #7." in (pr_input / "body.md").read_text(encoding="utf-8")
     assert "fetcher.py" in (pr_input / "changed-files.md").read_text(encoding="utf-8")
+    # First round: every conversation surface exists and is EMPTY — the
+    # exact shape a reviewer sees before any human comment lands.
+    for surface, label in (
+        ("conversation", "PR conversation"),
+        ("review-comments", "PR review comments"),
+        ("reviews", "PR reviews"),
+    ):
+        assert [p.name for p in (pr_input / surface).iterdir()] == ["INDEX.md"]
+        index = (pr_input / surface / "INDEX.md").read_text(encoding="utf-8")
+        assert index == f"# {label} (0)\n\n(none)\n"
+    commits = (pr_input / "commits.md").read_text(encoding="utf-8")
+    assert commits.startswith("# PR commits (1)")
+    assert head_sha in commits and "add retries" in commits
+    checks = (pr_input / "checks.md").read_text(encoding="utf-8")
+    assert f"# Checks on {head_sha}" in checks
+    assert "## Check runs (0)" in checks and "## Commit statuses (0)" in checks
     assert (job / "input" / "issue" / "body.md").is_file()
     assert (job / "input" / "issue" / "comments" / "INDEX.md").is_file()
     loaded = api.read_manifest(job)
