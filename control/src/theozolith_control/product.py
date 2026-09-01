@@ -454,12 +454,14 @@ def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
 def install_distribution(venv: Path, wheels: list[Path], *, runner=None, log=_log) -> None:
     """Install the built wheels into ``venv`` and make it usable: pip-install
     (``venv/bin/python -m pip install --upgrade <wheels>``, the built wheels so
-    the two entry paths stay byte-identical), link the managed entry points
-    when ``venv`` is the managed venv (ADR-0041), then hand the venv to the
-    service user (ADR-0015) — a no-op off a node box. Raises ProductError with
-    pip's tail on a failed install; the entry-point publication raises
-    SystemExit on a malformed install. One implementation for both
-    ``theozolith build`` and the bootstrap shim."""
+    the two entry paths stay byte-identical), and — ONLY when ``venv`` is the
+    managed venv (ADR-0041) — link the managed entry points and hand the venv
+    to the service user (ADR-0015). Both the links and the handover share that
+    one gate: an unmanaged ``--venv`` target is never linked and never chowned
+    to the service user (the documented escape hatch stays hands-off). Raises
+    ProductError with pip's tail on a failed install; the entry-point
+    publication raises SystemExit on a malformed install. One implementation
+    for both ``theozolith build`` and the bootstrap shim."""
     runner = subprocess.run if runner is None else runner
     python = venv / "bin" / "python"
     proc = runner(
@@ -475,7 +477,12 @@ def install_distribution(venv: Path, wheels: list[Path], *, runner=None, log=_lo
         )
     if venv.resolve() == MANAGED_VENV.resolve():
         link_entry_points(venv)
-    hand_venv_to_service_user(venv, runner=runner, log=log)
+        # Hand the venv over only for the managed venv — the same gate as the
+        # links (ADR-0041). `sudo python3 build.py --venv <dev-venv>` on a box
+        # that happens to have an ozolith user must never chown that arbitrary
+        # dev venv to the service user: --venv is the unmanaged escape hatch
+        # (no root assumed, no links, and now no ownership handover).
+        hand_venv_to_service_user(venv, runner=runner, log=log)
 
 
 # -- the `theozolith` CLI ---------------------------------------------------------
@@ -577,7 +584,7 @@ def _local_install_skip_reason(args) -> str | None:
     unmanaged venv, non-root) is unchanged."""
     if args.no_install:
         return "--no-install"
-    if Path(sys.prefix).resolve() != MANAGED_VENV:
+    if Path(sys.prefix).resolve() != MANAGED_VENV.resolve():
         return f"not the managed venv ({sys.prefix})"
     if os.geteuid() != 0:
         return "not root"

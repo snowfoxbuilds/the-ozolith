@@ -913,11 +913,15 @@ class NodeDaemon:
         build. Both paths filter to the distributions this venv actually
         carries (_update_distribution_names).
 
-        Ordering (2026-09-01, issue #92): pull the artifacts, THEN verify the
-        venv is writable, and only THEN stop the tree — a node that cannot
-        update must never kill its Drivers over an install that would fail
-        anyway (the old order stopped everything first, so every failed pass
-        killed a live Run about once a minute)."""
+        Ordering (2026-09-01, issue #92): compute the install targets, refuse an
+        EMPTY set, THEN verify the venv is writable, and only THEN stop the tree
+        — a node that cannot update must never kill its Drivers over an install
+        that would fail anyway (the old order stopped everything first, so every
+        failed pass killed a live Run about once a minute). An empty target set
+        (a served set that filters to none of this venv's distributions) is the
+        same class of pre-teardown failure: `pip install --upgrade` with no
+        targets after a stop_all is the exact kill-a-Driver-per-pass loop this
+        ordering exists to prevent."""
         names = self._update_distribution_names()
         artifacts = self._desired.get("product_artifacts")
         if isinstance(artifacts, list) and artifacts and self._client is not None:
@@ -925,6 +929,19 @@ class NodeDaemon:
             targets = self._pull_artifacts(pin, wanted)
         else:
             targets = [f"{name}=={pin}" for name in sorted(names)]
+        if not targets:
+            # A served set that filters to zero of this venv's distributions
+            # (e.g. only a theozolith_control wheel offered to a plain
+            # Container-Host) must fail HERE — before the writability check and
+            # stop_all. Reaching `pip install --upgrade` with no targets after
+            # the tree is stopped would revive the kill-a-Driver-per-failed-pass
+            # pathology this ordering removes (2026-09-01, issue #92).
+            served = [Path(str(a)).name for a in artifacts] if isinstance(artifacts, list) else []
+            raise RuntimeError(
+                f"product update to {pin}: the served artifact set {served or '[]'} holds"
+                f" none of this venv's distributions {sorted(names)} — nothing to install;"
+                " not stopping the tree"
+            )
         reason = self._venv_writable()
         if reason is not None:
             raise RuntimeError(

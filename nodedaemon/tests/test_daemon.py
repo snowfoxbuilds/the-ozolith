@@ -606,6 +606,47 @@ def test_served_control_wheel_filtered_out_on_a_container_host(rig: Rig, monkeyp
     assert not any("theozolith_control" in a for a in installed)  # filtered before the pull
 
 
+def test_served_set_with_only_a_control_wheel_fails_before_teardown(rig: Rig, monkeypatch):
+    """A served set that filters to ZERO of this venv's distributions (only a
+    control wheel offered to a plain Container-Host) fails the update BEFORE any
+    teardown: reaching `pip install --upgrade` with no targets after a stop_all
+    is the exact kill-a-Driver-per-pass loop the issue #92 ordering removes. The
+    live child survives and the error names the useless served set."""
+    stacks = [process_stack("worker")]
+    rig.control.heartbeat_answers.append(heartbeat_response(stacks))
+    rig.daemon.once()  # the worker child is up
+    live = rig.popen.spawned[0]
+
+    stop_all_calls: list = []
+    monkeypatch.setattr(
+        rig.daemon._supervisor,
+        "stop_all",
+        lambda **kwargs: stop_all_calls.append(kwargs),
+    )
+    monkeypatch.setattr(daemon, "_distribution_installed", lambda name: False)  # no control here
+    version = "0.4.0"
+    served = {"theozolith_control-0.4.0-py3-none-any.whl": b"ctl"}
+    for name, payload in served.items():
+        rig.control.artifacts[(version, name)] = payload
+    rig.control.heartbeat_answers.append(
+        {
+            "commands": [],
+            "config": {
+                **desired(stacks),
+                "product_version": version,
+                "product_artifacts": sorted(served),
+            },
+        }
+    )
+    rig.daemon.once()
+
+    assert stop_all_calls == []  # the tree was never torn down over the empty set
+    assert rig.daemon._supervisor.alive("worker") and live.returncode is None
+    assert rig.update_calls == [] and not rig.execv_calls  # nothing installed, no re-exec
+    (event,) = [e for e in rig.control.events if "nothing to install" in e["message"]]
+    assert "theozolith_control-0.4.0-py3-none-any.whl" in event["message"]
+
+
 def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
     """Drain-aware semantics unchanged: an in-flight Run defers the
     convergence attempt; the Run's end releases it."""

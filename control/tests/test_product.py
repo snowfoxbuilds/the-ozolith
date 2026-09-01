@@ -310,6 +310,39 @@ def test_hand_venv_raises_when_the_chown_fails(tmp_path, monkeypatch):
         product.hand_venv_to_service_user(tmp_path, runner=runner, log=lambda _: None)
 
 
+# -- install_distribution: the managed-venv gate covers BOTH links and chown -----
+
+
+def test_install_distribution_into_unmanaged_venv_never_chowns(tmp_path, monkeypatch):
+    """`sudo python3 build.py --venv <dev-venv>` is the unmanaged escape hatch:
+    it must NOT hand an arbitrary dev venv to the service user, even on a box
+    where the ozolith user exists and we are root. install_distribution chowns
+    ONLY the managed venv — the same gate as the entry-point links (ADR-0041),
+    so the two never drift apart."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: object())  # service user present
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)  # and we are root
+    venv = tmp_path / "dev-venv"  # NOT MANAGED_VENV
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    product.install_distribution(
+        venv,
+        [tmp_path / "theozolith_worker-0.3.0-py3-none-any.whl"],
+        runner=runner,
+        log=lambda _: None,
+    )
+
+    # Exactly the pip install ran; the unmanaged venv was never chowned.
+    assert len(calls) == 1
+    assert calls[0][:4] == [str(venv / "bin" / "python"), "-m", "pip", "install"]
+    assert not any(argv[:1] == ["chown"] for argv in calls)
+
+
 # -- an unreachable Control Node is an error, not a traceback --------------------
 
 
