@@ -41,6 +41,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,23 +68,54 @@ from theozolith_nodedaemon.dockerctl import (
     DockerCtl,
 )
 from theozolith_nodedaemon.stacks import (
+    DRIVER_LAUNCHER,
     ProcessSupervisor,
     WireStack,
     materialize_secrets,
     secret_env_files,
 )
 
+# The base packages one product self-update carries (ADR-0013 §8): the
+# daemon's own distribution set, always present on a Container-Host.
 UPDATE_PACKAGES = ("theozolith-nodedaemon", "theozolith-worker", "theozolith-knowledge")
 
-# The generic driver launcher every worker type resolves to control-side
-# (`theozolith-driver <ref>`, ADR-0020) — one executable covers builtin:* and
-# future drivers/* refs, so the daemon recognizes drivers by argv[0] alone and
-# never duplicates control's ref registry or parses a worker type. A driver
-# only functions with a control-authored THEOZOLITH_RUN_IMAGE; seeing this
-# command WITHOUT that env means old or incomplete desired state, and the
-# daemon fails that Stack closed rather than launch it against the worker
-# package's default run image (ADR-0044 amendment).
-DRIVER_LAUNCHER = "theozolith-driver"
+# The conditional fourth member (ADR-0041): on the Control Node host one venv
+# also carries the control distribution (theozolith_control), and a self-update
+# that omitted it would leave the venv split across two versions. It joins the
+# update set only when actually installed here, so a plain Container-Host never
+# pulls it — computed from what is installed (_update_distribution_names), never
+# assumed. (The pip distribution shares its spelling with the deprecated CLI
+# alias, ADR-0032, but is the component package, not the command.)
+OPTIONAL_UPDATE_PACKAGES = ("theozolith-control",)
+
+# DRIVER_LAUNCHER (imported from stacks) is the generic launcher every worker
+# type resolves to control-side (ADR-0020). A driver only functions with a
+# control-authored THEOZOLITH_RUN_IMAGE; seeing this command WITHOUT that env
+# means old or incomplete desired state, and the daemon fails that Stack closed
+# rather than launch it against the worker package's default run image (ADR-0044
+# amendment). The supervisor resolves the launcher to its venv-absolute path.
+
+
+def _distribution_installed(name: str) -> bool:
+    """True when a distribution by this name is installed in the running
+    interpreter's environment (a module-level seam the tests monkeypatch)."""
+    import importlib.metadata
+
+    try:
+        importlib.metadata.distribution(name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+def _wheel_dist_name(path: str) -> str:
+    """The distribution name a wheel FILE carries: the first ``-`` segment of
+    the filename with ``_`` normalized to ``-`` (wheels encode a distribution's
+    hyphens as underscores). Lets the served-artifact update path filter to the
+    set this venv should carry, so a plain Container-Host never installs a
+    theozolith_control wheel that rode along in the served set (ADR-0041)."""
+    return Path(path).name.split("-", 1)[0].replace("_", "-")
+
 
 # theozolith.error events (2026-07-21 grilling): size-capped summaries
 # pointing at the failing node/component; diagnostic depth stays in the
@@ -383,6 +415,7 @@ class NodeDaemon:
             f"node daemon {self._config.node} "
             + (f"heartbeating to {self._config.control_url}" if self._client else "(cache only)")
         )
+        self._boot_preflight()
         while True:
             try:
                 self.once()
@@ -390,6 +423,34 @@ class NodeDaemon:
                 self._log(f"pass failed: {exc}")
                 self._emit_error(type(exc).__name__, f"pass failed: {exc}")
             sleep(self._next_delay())
+
+    def _boot_preflight(self) -> None:
+        """A one-time self-check at boot: if the product venv is not writable
+        by the running user, the daemon can never self-update into it (ADR-0015)
+        — surface it ONCE (a fail-loud setup problem) and keep running, because
+        reconciling Stacks must never depend on updatability. The repair is
+        re-running the installer (or init --with-local-node --force), which
+        hands the venv to the service user (ADR-0037)."""
+        reason = self._venv_writable()
+        if reason is not None:
+            self._log(f"product self-update cannot write {sys.prefix}: {reason}")
+            self._emit_error(
+                "VenvNotWritable",
+                f"product self-update cannot write {sys.prefix} as uid {os.getuid()}:"
+                f" {reason} — re-run install-nodedaemon.sh (or 'theozolith init"
+                " --with-local-node --force') to hand the venv to the service user",
+            )
+
+    def _venv_writable(self) -> str | None:
+        """A reason the running user cannot pip-install into this venv, or None.
+        The daemon self-updates in place (ADR-0015), so BOTH the console-script
+        bin/ and site-packages must be writable by the service user."""
+        bin_dir = Path(sys.prefix) / "bin"
+        purelib = Path(sysconfig.get_paths()["purelib"])
+        for path in (bin_dir, purelib):
+            if not os.access(path, os.W_OK):
+                return f"{path} is not writable"
+        return None
 
     # -- heartbeat ------------------------------------------------------------------
 
@@ -830,18 +891,48 @@ class NodeDaemon:
             self._log(f"product update to {pin} failed: {exc} (retrying next pass)")
             self._emit_error(type(exc).__name__, f"product update to {pin} failed: {exc}")
 
+    def _update_distribution_names(self) -> set[str]:
+        """The distribution names this venv should carry forward on a
+        self-update: the base set, plus any OPTIONAL member actually installed
+        here (ADR-0041: the Control Node host shares one venv that also holds
+        the theozolith_control distribution). Both update paths filter to this
+        set, so a plain Container-Host never gains the control package off a
+        served set, and a mixed control venv is never left split across two
+        versions."""
+        names = set(UPDATE_PACKAGES)
+        for name in OPTIONAL_UPDATE_PACKAGES:
+            if _distribution_installed(name):
+                names.add(name)
+        return names
+
     def _install_product(self, pin: str) -> None:
-        """Stop the tree, install the pinned version, re-exec in place
-        (ADR-0013 §8). Release pins install by name from the package index;
-        a served artifact set (the developer build path) is pulled from the
-        Control Node and installed from local wheel files — nodes never
-        pull source and never build."""
-        self._supervisor.stop_all(grace_seconds=self._stop_grace_seconds())
+        """Install the pinned version and re-exec in place (ADR-0013 §8).
+        Release pins install by name from the package index; a served artifact
+        set (the developer build path) is pulled from the Control Node and
+        installed from local wheel files — nodes never pull source and never
+        build. Both paths filter to the distributions this venv actually
+        carries (_update_distribution_names).
+
+        Ordering (2026-09-01, issue #92): pull the artifacts, THEN verify the
+        venv is writable, and only THEN stop the tree — a node that cannot
+        update must never kill its Drivers over an install that would fail
+        anyway (the old order stopped everything first, so every failed pass
+        killed a live Run about once a minute)."""
+        names = self._update_distribution_names()
         artifacts = self._desired.get("product_artifacts")
         if isinstance(artifacts, list) and artifacts and self._client is not None:
-            targets = self._pull_artifacts(pin, [str(a) for a in artifacts])
+            wanted = [str(a) for a in artifacts if _wheel_dist_name(str(a)) in names]
+            targets = self._pull_artifacts(pin, wanted)
         else:
-            targets = [f"{name}=={pin}" for name in UPDATE_PACKAGES]
+            targets = [f"{name}=={pin}" for name in sorted(names)]
+        reason = self._venv_writable()
+        if reason is not None:
+            raise RuntimeError(
+                f"product venv {sys.prefix} is not writable as uid {os.getuid()}:"
+                f" {reason} — re-run install-nodedaemon.sh to hand the venv to the"
+                " service user"
+            )
+        self._supervisor.stop_all(grace_seconds=self._stop_grace_seconds())
         proc = self._update_runner(
             [sys.executable, "-m", "pip", "install", "--upgrade", *targets],
             capture_output=True,
@@ -1761,6 +1852,14 @@ class NodeDaemon:
         # once all prerequisites are ready do we kill the tree and relaunch.
         if not self._pull_stack_secrets(stack):
             return
+        # Resolve the Driver launcher BEFORE the kill-the-tree teardown
+        # (ADR-0020/0041): the generic launcher is a console script that lives
+        # only in the daemon's own venv bin/, not on systemd's default PATH. If
+        # it is absent, LauncherMissing surfaces here — before a working child
+        # is stopped for a restart — and the per-Stack reconcile handler emits
+        # one theozolith.error naming the venv, then continues with the other
+        # Stacks. ensure_running re-resolves it identically to launch.
+        self._supervisor.resolve_command(stack.command)
         if alive:
             self._stop_process_child(stack.name)  # kill-the-tree before relaunching
         # container->process: a Stack that flipped from a container form to a

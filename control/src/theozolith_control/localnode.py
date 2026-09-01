@@ -161,10 +161,24 @@ def install_node_daemon(
     log=print,
 ) -> None:
     """The node-side install, mirroring install-nodedaemon.sh minus the
-    venv step: service user in the docker group, state dir, unit,
-    daemon-reload. Idempotent — a --force re-run repairs in place."""
+    venv step: service user in the docker group, the venv handed to the
+    service user, state dir, unit, daemon-reload. Idempotent — a --force
+    re-run repairs in place (the chown is the repair path for a
+    Single-Node Deployment whose venv is still root-owned)."""
     import pwd
 
+    # The venv the daemon executable lives in (ADR-0034/0041): <venv>/bin/<exec>.
+    # The daemon self-updates by pip-installing into it (ADR-0015), so it must
+    # be a real venv the service user can be handed ownership of.
+    venv = Path(exec_path).resolve().parent.parent
+    if not (venv / "pyvenv.cfg").is_file():
+        raise SystemExit(
+            f"error: the node daemon executable {exec_path} is not inside a"
+            f" virtual environment ({venv} has no pyvenv.cfg) — the daemon"
+            " executable must live in the managed venv (ADR-0034/0041) so the"
+            " service user can own and self-update it; install under"
+            " /opt/theozolith and re-run"
+        )
     try:
         pwd.getpwnam(NODE_SERVICE_USER)
     except KeyError:
@@ -184,6 +198,16 @@ def install_node_daemon(
         runner,
         ["usermod", "-aG", "docker", NODE_SERVICE_USER],
         "adding the service user to the docker group",
+    )
+    # Hand the product venv to the service user: the daemon self-updates by
+    # pip-installing into it (ADR-0015), and a root-owned venv makes every
+    # update fail — ADR-0037 forbids a root helper doing the install. Runs on
+    # every --with-local-node (including --force), so it also repairs an
+    # existing Single-Node Deployment installed before this change.
+    _run_step(
+        runner,
+        ["chown", "-R", f"{NODE_SERVICE_USER}:{NODE_SERVICE_USER}", str(venv)],
+        "handing the product venv to the service user",
     )
     # The daemon state dir, owned by the service user before provision
     # writes into it (provision chowns its files to the dir owner).

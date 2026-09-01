@@ -23,6 +23,19 @@ def _ok(*args, **kwargs):
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
+def _fake_venv(tmp_path: Path) -> tuple[Path, str]:
+    """A managed-venv shape (pyvenv.cfg + bin/theozolith-nodedaemon): the
+    daemon executable install_node_daemon derives its venv from, so the
+    chown-to-service-user step (ADR-0015/0041) has a real venv to hand over."""
+    venv = tmp_path / "opt" / "theozolith"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)  # idempotent: some tests build several
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    exec_path = venv / "bin" / "theozolith-nodedaemon"
+    exec_path.write_text("#!/bin/sh\n")
+    exec_path.chmod(0o755)
+    return venv, str(exec_path)
+
+
 # -- pre-flight (before any state is written) ------------------------------------
 
 
@@ -71,9 +84,10 @@ def test_install_node_daemon_lays_down_user_dir_and_unit(tmp_path, monkeypatch):
         calls.append(argv)
         return _ok()
 
+    venv, exec_path = _fake_venv(tmp_path)
     unit_path = tmp_path / "theozolith-nodedaemon.service"
     localnode.install_node_daemon(
-        NODEDAEMON_EXEC,
+        exec_path,
         runner=runner,
         unit_path=unit_path,
         state_dir=tmp_path / "state",
@@ -81,11 +95,34 @@ def test_install_node_daemon_lays_down_user_dir_and_unit(tmp_path, monkeypatch):
     )
     assert calls[0][:2] == ["useradd", "--system"]
     assert ["usermod", "-aG", "docker", "ozolith"] in calls
+    # The venv is handed to the service user (ADR-0015: the daemon self-updates
+    # into it) — derived from the daemon executable, not a hardcoded path.
+    assert ["chown", "-R", "ozolith:ozolith", str(venv)] in calls
     assert any(c[0] == "install" and str(tmp_path / "state") in c for c in calls)
     assert calls[-1] == ["systemctl", "daemon-reload"]
     unit = unit_path.read_text()
-    assert f"ExecStart={NODEDAEMON_EXEC}" in unit
+    assert f"ExecStart={exec_path}" in unit
     assert "KillMode=control-group" in unit
+
+
+def test_install_node_daemon_refuses_a_non_venv_executable(tmp_path, monkeypatch):
+    """The daemon executable must live in a managed venv (ADR-0034/0041) so
+    the service user can own and self-update it — a bare path is refused with
+    remediation before anything is written."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    bare = tmp_path / "usr" / "bin" / "theozolith-nodedaemon"
+    bare.parent.mkdir(parents=True)
+    bare.write_text("#!/bin/sh\n")
+    with pytest.raises(SystemExit, match=r"pyvenv\.cfg"):
+        localnode.install_node_daemon(
+            str(bare),
+            runner=lambda *a, **k: pytest.fail("must not run any step"),
+            unit_path=tmp_path / "unit",
+            state_dir=tmp_path / "state",
+            log=lambda _: None,
+        )
 
 
 # -- the internal join: unmodified flow, machine-consumed ------------------------
@@ -118,6 +155,9 @@ class Harness:
         self.settings = make_settings(tmp_path)
         self.settings.tls_dir.mkdir(parents=True, exist_ok=True)
         (self.settings.tls_dir / "ca.pem").write_bytes(FAKE_CA)
+        # A managed-venv-shaped daemon executable so install_node_daemon can
+        # derive the venv and hand it to the service user (ADR-0015/0041).
+        _, self.nodedaemon_exec = _fake_venv(tmp_path)
         self.state_dir = tmp_path / "state"
         self.calls: list[list[str]] = []
         self.fetches: list[tuple[str, str, dict | None]] = []
@@ -189,7 +229,7 @@ class Harness:
         localnode.bootstrap_local_node(
             self.settings,
             node_name="localbox",
-            nodedaemon_exec=NODEDAEMON_EXEC,
+            nodedaemon_exec=self.nodedaemon_exec,
             runner=self.runner,
             fetch=self.fetch,
             sleep=lambda seconds: None,
@@ -214,7 +254,7 @@ def test_bootstrap_runs_the_standard_provision_grammar(tmp_path, monkeypatch):
     start_index = harness.calls.index(["systemctl", "start", "theozolith-control.service"])
     provision_call = next(c for c in harness.calls if c[1:2] == ["provision"])
     assert provision_call == [
-        NODEDAEMON_EXEC,
+        harness.nodedaemon_exec,
         "provision",
         JOIN_STRING,
         "--node",
@@ -735,7 +775,7 @@ def test_heartbeat_timeout_keeps_the_provisioned_node(tmp_path, monkeypatch):
         localnode.bootstrap_local_node(
             harness.settings,
             node_name="localbox",
-            nodedaemon_exec=NODEDAEMON_EXEC,
+            nodedaemon_exec=harness.nodedaemon_exec,
             runner=harness.runner,
             fetch=harness.fetch,
             sleep=lambda seconds: None,
@@ -762,7 +802,7 @@ def test_bootstrap_times_out_when_serve_never_answers(tmp_path, monkeypatch):
         localnode.bootstrap_local_node(
             harness.settings,
             node_name="localbox",
-            nodedaemon_exec=NODEDAEMON_EXEC,
+            nodedaemon_exec=harness.nodedaemon_exec,
             runner=harness.runner,
             fetch=dead_fetch,
             sleep=lambda seconds: None,
