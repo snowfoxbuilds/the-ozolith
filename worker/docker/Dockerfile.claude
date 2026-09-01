@@ -27,13 +27,18 @@
 FROM python:3.13-slim
 
 # git: the agent inspects the checkout (the driver does all pushes).
-# nodejs/npm: the Claude Code CLI. No terminal multiplexer: sessions are
-# headless one-shot processes (ADR-0019) — interactivity lives only in the
-# Flight Deck.
+# nodejs/npm: the Claude Code CLI, pinned EXACTLY (Dockerfile.codex parity):
+# unpinned, the installed version is whatever was latest at the last
+# cache-invalidating CI build — silent and unauditable under the buildx
+# layer cache. Bumping this pin is the deliberate CLI update path, and the
+# edit itself invalidates the cached layer. Never go below the 2.1.232
+# identity floor (ClaudeAdapter.MIN_ENFORCING_CLI). No terminal
+# multiplexer: sessions are headless one-shot processes (ADR-0019) —
+# interactivity lives only in the Flight Deck.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates nodejs npm \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code
+    && npm install -g @anthropic-ai/claude-code@2.1.257
 
 # The agent must not run as root (the Claude CLI refuses
 # --dangerously-skip-permissions for root, and the Run needs no privileges).
