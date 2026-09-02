@@ -104,3 +104,33 @@ def test_old_nodes_schema_gains_the_presence_bit_and_reads_fail_open(tmp_path):
     # The next heartbeat that explicitly reports '' flips it to a real report.
     store.touch_node("box1", "0.3.0", drivers_hash="")
     assert store.node_drivers_hash("box1") == ""
+
+
+def test_old_db_gains_the_cli_status_table(tmp_path):
+    """ADR-0055: opening a pre-CLI-Pin database creates cli_status (the
+    CREATE IF NOT EXISTS migration lane) and the record/read round-trip
+    works replace-per-beat."""
+    path = tmp_path / "store.db"
+    _seed_old_db(path)
+    store = Store(path, clock=lambda: 2000.0)
+    assert store.fleet_state()["cli_status"] == []
+    store.record_cli_status(
+        "box1",
+        [
+            {
+                "worker_type": "flightdeck",
+                "tool": "claude",
+                "desired": "2.1.257",
+                "applied": "2.1.250",
+                "converged": False,
+                "error_class": "CliDownloadFailed",
+                "error": "claude 2.1.257: download failed after 0 bytes",
+            }
+        ],
+    )
+    rows = store.fleet_state()["cli_status"]
+    assert len(rows) == 1 and rows[0]["node"] == "box1"
+    assert rows[0]["desired"] == "2.1.257" and rows[0]["converged"] == 0
+    assert rows[0]["error_message"].startswith("claude 2.1.257")
+    store.record_cli_status("box1", [])
+    assert store.fleet_state()["cli_status"] == []

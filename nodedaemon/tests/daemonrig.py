@@ -437,6 +437,9 @@ def image_recipe(
     knowledge_target: str = "",
     policy: str = "",
     policy_pin: str = "",
+    cli_tool: str = "",
+    cli_version: str = "",
+    cli_platforms: dict | None = None,
 ) -> dict:
     setup = setup if setup is not None else ["pip install uv"]
     import hashlib
@@ -461,6 +464,9 @@ def image_recipe(
         "knowledge_target": knowledge_target,
         "policy": policy,
         "policy_pin": policy_pin,
+        "cli_tool": cli_tool,
+        "cli_version": cli_version,
+        "cli_platforms": dict(cli_platforms or {}),
         "tag": f"theozolith/{name}:1.0-{digest[:12]}",
         "base_digest": "sha256:" + "0" * 64,
         "instruction_hash": digest,

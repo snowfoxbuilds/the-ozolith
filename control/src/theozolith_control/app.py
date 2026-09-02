@@ -238,6 +238,9 @@ def create_app(
         # Queue-behind visibility: commands the daemon is holding behind an
         # in-flight Run ride the heartbeat as deferrals (NODE-SUBSTRATE).
         store.record_deferrals(node, _list_of_dicts(body, "deferred_commands"))
+        # CLI Pin convergence rows (ADR-0055): telemetry only — decks are
+        # never dispatch targets, so no ladder and no dispatch consequence.
+        store.record_cli_status(node, _list_of_dicts(body, "cli"))
         config_doc = _config().desired_state_for(node)
         # Registry pull credentials (ADR-0049): names-only references so a node
         # building a private-base recipe knows which stored credential feeds

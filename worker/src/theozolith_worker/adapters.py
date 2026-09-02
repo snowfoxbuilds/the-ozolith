@@ -36,7 +36,7 @@ import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from theozolith_worker import codexidentity
 from theozolith_worker import identity as identity_mod
@@ -401,6 +401,24 @@ class ClaudeAdapter:
     # review of what this adapter's validated CLI set actually does with a
     # key.
     POLICY_MODULE = policy_mod
+    # The product-supported CLI platform tuples (ADR-0055): the platforms the
+    # Node Daemon itself supports, keyed "<os>-<arch>-<libc>". Each maps to
+    # the npm platform package publishing that tuple's binary (the wrapper
+    # package's version document enumerates them under optionalDependencies —
+    # names verified against the registry 2026-09-02); ingest resolves EVERY
+    # entry and fails when the registry cannot supply one, so a wrong name
+    # here can never ship silently. Adapter-owned like MIN_ENFORCING_CLI: the
+    # daemon never consults this table — it detects its own tuple and looks
+    # it up in the wire-delivered pinned map (a contract test pins the key
+    # spelling between the two sides).
+    CLI_PLATFORM_PACKAGES: ClassVar[dict[str, str]] = {
+        "linux-x64-glibc": "@anthropic-ai/claude-code-linux-x64",
+        "linux-arm64-glibc": "@anthropic-ai/claude-code-linux-arm64",
+        "linux-x64-musl": "@anthropic-ai/claude-code-linux-x64-musl",
+        "linux-arm64-musl": "@anthropic-ai/claude-code-linux-arm64-musl",
+    }
+    # The npm wrapper package the CLI Pin's version/dist-tag resolves against.
+    CLI_WRAPPER_PACKAGE = "@anthropic-ai/claude-code"
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
     def __init__(self, binary: str = "claude"):

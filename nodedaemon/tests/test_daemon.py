@@ -6129,3 +6129,254 @@ def test_policy_recipe_defers_then_builds_once_converged(rig: Rig):
     )
     rig.daemon.once()
     assert recipe["tag"] in rig.docker.images
+
+
+# -- CLI Pin convergence (ADR-0055) -------------------------------------------------
+
+from theozolith_nodedaemon import cliinstall  # noqa: E402
+
+_CLI_SRI = "sha512-" + "A" * 96
+
+
+def cli_recipe(version: str = "2.1.257", name: str = "flightdeck", **overrides) -> dict:
+    recipe = image_recipe(
+        name=name,
+        cli_tool="claude",
+        cli_version=version,
+        cli_platforms={
+            "linux-x64-glibc": {
+                "package": "@anthropic-ai/claude-code-linux-x64",
+                "integrity": _CLI_SRI,
+            }
+        },
+    )
+    recipe.update(overrides)
+    return recipe
+
+
+def cli_response(images: list[dict], stacks: list[dict] | None = None, commands=None) -> dict:
+    return {"commands": commands or [], "config": desired(stacks or [], images)}
+
+
+class FakeInstaller:
+    """A scripted stand-in for cliinstall.ensure_cli_version: success mimics
+    the real contract (the binary appears at <tool>/<version>/claude), a
+    version in ``fail_versions`` raises the typed download error, and an
+    already published version returns without counting as a download."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.fail_versions: set[str] = set()
+
+    def __call__(self, cli_root, tool, version, platforms, *, fetch=None, log=None):
+        published = Path(cli_root) / tool / version / "claude"
+        if published.is_file():
+            return published
+        self.calls.append((tool, version))
+        if version in self.fail_versions:
+            raise cliinstall.CliDownloadFailed(f"claude {version}: injected download failure")
+        published.parent.mkdir(parents=True, exist_ok=True)
+        published.write_text(f"binary {version}\n", encoding="utf-8")
+        published.chmod(0o755)
+        return published
+
+
+@pytest.fixture
+def installer(monkeypatch) -> FakeInstaller:
+    fake = FakeInstaller()
+    monkeypatch.setattr(daemon.cliinstall, "ensure_cli_version", fake)
+    return fake
+
+
+def _cli_rows(rig: Rig) -> list[dict]:
+    """The `cli` rows of the LAST heartbeat request."""
+    beats = [req for _m, path, req, _r in rig.control.transcript if path == "/heartbeats"]
+    return beats[-1]["cli"]
+
+
+def test_cli_desired_record_lands_before_install_and_entry_only_after(rig: Rig, installer):
+    """The moment applied config changes the desired record is written — with
+    no download prerequisite — while the export entry appears ONLY once
+    exactly that version installed; the failure logs, emits a typed
+    theozolith.error, and rides the heartbeat rows until a later pass
+    succeeds (ADR-0055 point 5)."""
+    installer.fail_versions.add("2.1.257")
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert not (by_type / "flightdeck.current").exists()  # never before the install
+    assert any("injected download failure" in line for line in rig.logs)
+    event = _find_error(rig, "injected download failure")
+    assert event is not None and event["error_class"] == "CliDownloadFailed"
+
+    # The next heartbeat reports the truthful converging/failed row.
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    installer.fail_versions.clear()
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row == {
+        "worker_type": "flightdeck",
+        "tool": "claude",
+        "desired": "2.1.257",
+        "applied": "",
+        "converged": False,
+        "error_class": "CliDownloadFailed",
+        "error": "claude 2.1.257: injected download failure",
+    }
+    # ...and this pass's retry succeeded: entry re-pointed, failure cleared.
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["error_class"] == "" and row["error"] == ""
+
+
+def test_cli_version_bump_rewrites_desired_immediately_repoints_late_and_prunes(
+    rig: Rig, installer
+):
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.257")]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+
+    installer.fail_versions.add("2.1.258")
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.258")]))
+    rig.daemon.once()
+    # Desired moved at once; the entry still identifies the OLD version (the
+    # launch gate refuses via entry != desired — never a silent fallback) and
+    # the old version dir is retained while still entry-referenced.
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.258\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+
+    installer.fail_versions.clear()
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.258")]))
+    rig.daemon.once()
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.258"
+    # Prune: nothing references 2.1.257 any more.
+    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+    assert (rig.config.cli_dir / "claude" / "2.1.258" / "claude").is_file()
+
+
+def test_cli_records_retire_when_the_pin_is_dropped(rig: Rig, installer):
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    assert (by_type / "flightdeck.desired").exists()
+
+    # The type drops its pin (or the deck Stack is deleted): records AND the
+    # now-unreferenced version dir go — the store is a cache, never backup
+    # state (ADR-0024).
+    rig.control.heartbeat_answers.append(cli_response([image_recipe(name="flightdeck")]))
+    rig.daemon.once()
+    assert not (by_type / "flightdeck.desired").exists()
+    assert not (by_type / "flightdeck.current").exists()
+    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+    # The NEXT beat — built from the applied pin-less config — reports no rows.
+    rig.control.heartbeat_answers.append(cli_response([image_recipe(name="flightdeck")]))
+    rig.daemon.once()
+    assert _cli_rows(rig) == []
+
+
+def test_cli_prune_never_touches_referenced_versions_and_failure_degrades(
+    rig: Rig, installer, monkeypatch
+):
+    """Two types on one tool: retiring one prunes only ITS version; an
+    injected prune failure logs + emits and leaves records, entries, and the
+    version dir intact (degrade to retained disk, never a corrupted
+    export)."""
+    recipes = [cli_recipe("2.1.257", name="deck-a"), cli_recipe("2.1.258", name="deck-b")]
+    rig.control.heartbeat_answers.append(cli_response(recipes))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    assert os.readlink(by_type / "deck-a.current") == "../2.1.257"
+    assert os.readlink(by_type / "deck-b.current") == "../2.1.258"
+
+    doomed = rig.config.cli_dir / "claude" / "2.1.258"
+    real_replace = daemon.os.replace
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if Path(src) == doomed:
+            raise OSError(16, "injected EBUSY")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(daemon.os, "replace", failing_replace)
+    rig.control.heartbeat_answers.append(cli_response([recipes[0]]))
+    rig.daemon.once()
+    # deck-b's records retired; the prune of its version FAILED contained:
+    # the dir is retained, deck-a's export is untouched, and the failure is
+    # surfaced.
+    assert not (by_type / "deck-b.desired").exists()
+    assert doomed.is_dir()
+    assert os.readlink(by_type / "deck-a.current") == "../2.1.257"
+    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+    assert _find_error(rig, "cli prune under claude failed") is not None
+    monkeypatch.setattr(daemon.os, "replace", real_replace)
+
+    # The next healthy pass prunes the retained dir.
+    rig.control.heartbeat_answers.append(cli_response([recipes[0]]))
+    rig.daemon.once()
+    assert not doomed.exists()
+
+
+def test_cli_wiped_store_reconstructs_from_the_cached_wire(rig: Rig, installer):
+    """Daemon restart / replacement-host recovery (ADR-0055 point 5): the
+    binary cache is never backup state — convergence over an empty cli/
+    rebuilds records, install, and entry from the cached Pinned Build wire
+    plus the (faked) registry, even with the Control Node unreachable."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    shutil.rmtree(rig.config.cli_dir)
+
+    rig.daemon.once()  # no scripted answer -> unreachable -> cached config
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+
+
+def test_cli_malformed_wire_is_skipped_and_records_stay(rig: Rig, installer):
+    """Fail-closed wire shape checks (ADR-0055): control/daemon skew never
+    destroys a working export — the malformed entry emits CliWireMalformed,
+    the pass continues, and the type's existing records survive."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+
+    for mangled in (
+        cli_recipe(cli_version="not-a-version"),
+        cli_recipe(cli_tool="Not A Slug"),
+        cli_recipe(cli_platforms={"linux-x64-glibc": "not-a-table"}),
+        cli_recipe(cli_platforms={}),
+    ):
+        rig.control.heartbeat_answers.append(cli_response([mangled]))
+        rig.daemon.once()
+        assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+        assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    event = _find_error(rig, "malformed on the wire")
+    assert event is not None and event["error_class"] == "CliWireMalformed"
+    # Malformed rows are skipped from the telemetry (no truthful desired
+    # exists), and the reconcile still ran every pass.
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    assert _cli_rows(rig) == []  # the last mangled pass reported no cli row
+
+
+def test_cli_version_change_never_recreates_the_deck_container(rig: Rig, installer):
+    """The lifecycle contract's daemon half (ADR-0055 point 6): a wire
+    cli_version change alone alters no container-spec input — the running
+    deck is not recreated (adopt/drop recreates control-side through the
+    injected env, which IS part of the stack spec)."""
+    stack = container_stack(name="deck", image=cli_recipe()["tag"])
+    stack["env"] = {"THEOZOLITH_WORKER_TYPE": "flightdeck"}
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.257")], stacks=[stack]))
+    rig.daemon.once()
+    assert "ozolith-stack-deck" in rig.docker.stacks
+    removed_before = list(rig.docker.removed)
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.258")], stacks=[stack]))
+    rig.daemon.once()
+    assert rig.docker.removed == removed_before  # no recreate on a version bump
+    assert (rig.config.cli_dir / "claude" / "2.1.258" / "claude").is_file()

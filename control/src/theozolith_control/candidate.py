@@ -181,6 +181,16 @@ def export_candidate(
         data = tomllib.loads(type_path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise CandidateError(f"worker-types/{worker_type}.toml does not parse: {exc}") from exc
+    if data.get("cli"):
+        # Early, before _parse_worker_type would fail on the missing pin
+        # (candidate export never resolves CLI pins): the CLI Pin is a Flight
+        # Deck live surface, never bundle identity (ADR-0055) — the manifest
+        # key set and bundle_format_version deliberately do not move.
+        raise CandidateError(
+            f"worker-types/{worker_type}.toml declares a CLI Pin ('cli') — the"
+            " pin is a Flight Deck live surface, never Candidate Bundle"
+            " identity (ADR-0055); remove the field to export"
+        )
 
     out_dir = _check_out(out)
     # Staging lives BESIDE the destination (hidden name, same filesystem) so

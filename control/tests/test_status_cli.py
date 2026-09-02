@@ -458,3 +458,83 @@ def test_status_subcommand_is_wired_with_json_flag(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(statuscli, "run", fake_run)
     assert cli_main(["status", "--json"]) == 0
     assert seen["json"] is True
+
+
+# -- CLI Pin convergence rows (ADR-0055) --------------------------------------------
+
+
+def _cli_row(**over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "node": "box1",
+        "worker_type": "flightdeck",
+        "tool": "claude",
+        "desired": "2.1.257",
+        "applied": "2.1.250",
+        "converged": 0,
+        "error_class": "",
+        "error_message": "",
+        "updated_at": NOW - 10,
+    }
+    row.update(over)
+    return row
+
+
+def test_nonconverged_cli_pin_degrades_with_the_specified_wording(tmp_path):
+    state = state_doc(cli_status=[_cli_row(error_class="CliIntegrityMismatch")])
+    code, lines = _run(tmp_path, state)
+    assert code == 1
+    assert lines[0] == (
+        "degraded: worker type flightdeck on box1 cli pin not converged:"
+        " desired 2.1.257, applied 2.1.250 (last failure: CliIntegrityMismatch)"
+    )
+    # No applied version and no recorded failure both render honestly.
+    state = state_doc(cli_status=[_cli_row(applied="")])
+    _code, lines = _run(tmp_path, state)
+    assert "applied none" in lines[0] and "last failure" not in lines[0]
+
+
+def test_converged_cli_pin_is_healthy_and_renders_the_table(tmp_path):
+    state = state_doc(cli_status=[_cli_row(applied="2.1.257", converged=1)])
+    code, lines = _run(tmp_path, state)
+    assert code == 0
+    joined = "\n".join(lines)
+    assert "cli pins:" in joined
+    header = next(line for line in lines if "WORKER-TYPE" in line)
+    assert "NODE" in header and "DESIRED" in header and "LAST FAILURE" in header
+    row = next(line for line in lines if "flightdeck" in line)
+    assert "2.1.257" in row and " ok" in row
+    # No rows -> no table (the section only prints when it has content).
+    _code, lines = _run(tmp_path, state_doc())
+    assert "cli pins:" not in "\n".join(lines)
+
+
+def test_cli_pin_reason_precedence_sits_between_offhash_and_stacks(tmp_path):
+    """After off-hash, before stack-off-desired (ADR-0055 telemetry)."""
+    state = state_doc(
+        config_drivers_hash="c" * 64,
+        cli_status=[_cli_row(error_class="CliDownloadFailed")],
+        desired_stacks=[{"node": "box1", "name": "worker", "kind": "process", "state": "running"}],
+    )
+    state["nodes"][0]["drivers_hash"] = "d" * 64
+    state["nodes"][0]["drivers_hash_reported"] = 1
+    reasons = statuscli.evaluate(state, no_errors())
+    kinds = [
+        "off-hash"
+        if "off-hash" in r
+        else "cli"
+        if "cli pin" in r
+        else "stack"
+        if "off desired state" in r
+        else "other"
+        for r in reasons
+    ]
+    assert kinds == ["off-hash", "cli", "stack"]
+
+
+def test_json_carries_the_cli_status_rows_verbatim(tmp_path):
+    state = state_doc(cli_status=[_cli_row(error_class="CliArchiveInvalid")])
+    code, lines = _run(tmp_path, state, json_output=True)
+    assert code == 1
+    document = json.loads(lines[0])
+    assert document["state"]["cli_status"] == state["cli_status"]
+    assert any("cli pin not converged" in reason for reason in document["reasons"])

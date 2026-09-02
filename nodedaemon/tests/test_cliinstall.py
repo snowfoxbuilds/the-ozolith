@@ -1,0 +1,303 @@
+"""The fail-closed CLI Pin install (ADR-0055 point 4): ordered gates over
+crafted in-memory tarballs and a fake fetch — platform selection before any
+download, whole-tarball SRI before extraction, allowlisted archive semantics
+with every member validated before any is extracted, normalized modes, atomic
+publication, and staging cleaned on every failure with nothing partial ever
+visible at a non-dot path."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import platform
+import tarfile
+from pathlib import Path
+
+import pytest
+from theozolith_nodedaemon import cliinstall
+from theozolith_nodedaemon.cliinstall import (
+    CliArchiveInvalid,
+    CliDownloadFailed,
+    CliDownloadTooLarge,
+    CliInstallError,
+    CliIntegrityMismatch,
+    CliPlatformUnsupported,
+    CliPublishFailed,
+    ensure_cli_version,
+    platform_tuple_key,
+    supported_tuple_keys,
+)
+
+KEY = "linux-x64-glibc"
+SIBLING = "linux-arm64-glibc"
+PACKAGE = "@anthropic-ai/claude-code-linux-x64"
+VERSION = "2.1.257"
+BINARY = b"#!/bin/sh\necho claude\n"
+
+
+@pytest.fixture(autouse=True)
+def pinned_host(monkeypatch):
+    """Deterministic tuple detection for every test (the real-host detection
+    is exercised explicitly in test_tuple_detection_on_this_host)."""
+    monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
+
+
+def make_tarball(members) -> bytes:
+    """members: (name, content, mode) for regular files (content=None makes a
+    directory), or (name, linkname, mode, tartype) for special members."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for member in members:
+            name, content, mode = member[0], member[1], member[2]
+            info = tarfile.TarInfo(name)
+            info.mode = mode
+            if len(member) > 3:
+                info.type = member[3]
+                if member[3] in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                    info.linkname = content or "target"
+                tar.addfile(info)
+            elif content is None:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            else:
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def good_members():
+    return [
+        ("package/package.json", b'{"name": "x"}', 0o644),
+        ("package/claude", BINARY, 0o755),
+        ("package/README.md", b"readme\n", 0o600),
+    ]
+
+
+def sri(data: bytes) -> str:
+    return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+
+
+def platform_map(data: bytes, *, key: str = KEY, integrity: str | None = None) -> dict:
+    resolved = sri(data) if integrity is None else integrity
+    return {key: {"package": PACKAGE, "integrity": resolved}}
+
+
+def fetching(data: bytes, calls: list | None = None):
+    def fetch(url: str):
+        if calls is not None:
+            calls.append(url)
+        return io.BytesIO(data)
+
+    return fetch
+
+
+def non_dot(tool_root: Path) -> list[str]:
+    if not tool_root.is_dir():
+        return []
+    return sorted(p.name for p in tool_root.iterdir() if not p.name.startswith("."))
+
+
+def test_happy_path_publishes_atomically_with_normalized_modes(tmp_path):
+    data = make_tarball(good_members())
+    calls: list[str] = []
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data, calls)
+    )
+    assert published == tmp_path / "claude" / VERSION / "claude"
+    assert published.read_bytes() == BINARY
+    # The deck-facing contract: exactly the binary at the version root —
+    # decoupled from npm packaging (no package.json, no README ride along).
+    assert sorted(p.name for p in published.parent.iterdir()) == ["claude"]
+    assert published.stat().st_mode & 0o777 == 0o755  # normalized, never archive metadata
+    # The URL is npm's convention over pinned data.
+    assert calls == [f"https://registry.npmjs.org/{PACKAGE}/-/claude-code-linux-x64-{VERSION}.tgz"]
+    # Staging is gone; only the published version dir remains.
+    assert non_dot(tmp_path / "claude") == [VERSION]
+    assert not list((tmp_path / "claude").glob(".*"))
+
+
+def test_installed_version_returns_without_touching_the_network(tmp_path):
+    data = make_tarball(good_members())
+    ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+
+    def poisoned(url):
+        raise AssertionError("an installed version must never re-download")
+
+    published = ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=poisoned)
+    assert published.read_bytes() == BINARY
+
+
+def test_absent_tuple_fails_before_any_download(tmp_path):
+    def poisoned(url):
+        raise AssertionError("fetch must not be called for an unsupported tuple")
+
+    with pytest.raises(CliPlatformUnsupported, match=KEY):
+        ensure_cli_version(
+            tmp_path,
+            "claude",
+            VERSION,
+            {SIBLING: {"package": PACKAGE, "integrity": "sha512-" + "A" * 96}},
+            fetch=poisoned,
+        )
+    assert non_dot(tmp_path / "claude") == []
+
+
+def test_each_platform_verifies_against_its_own_entry(tmp_path):
+    """The node's tuple selects ITS map entry; a sibling entry's integrity
+    never passes for bytes it does not describe."""
+    served = make_tarball(good_members())
+    other = make_tarball([("package/package.json", b"{}", 0o644), ("package/claude", b"B", 0o755)])
+    platforms = {
+        KEY: {"package": PACKAGE, "integrity": sri(other)},  # wrong bytes for our tuple
+        SIBLING: {"package": PACKAGE, "integrity": sri(served)},  # right bytes, wrong tuple
+    }
+    with pytest.raises(CliIntegrityMismatch, match=KEY):
+        ensure_cli_version(tmp_path, "claude", VERSION, platforms, fetch=fetching(served))
+    assert non_dot(tmp_path / "claude") == []
+
+
+def test_malformed_pinned_sri_is_an_integrity_failure(tmp_path):
+    data = make_tarball(good_members())
+    for bad in ("sha256-" + "A" * 44, "sha512-@@@", "sha512-short", ""):
+        with pytest.raises(CliIntegrityMismatch):
+            ensure_cli_version(
+                tmp_path,
+                "claude",
+                VERSION,
+                platform_map(data, integrity=bad),
+                fetch=fetching(data),
+            )
+    assert non_dot(tmp_path / "claude") == []
+
+
+def test_download_byte_cap_and_deadline_and_errors(tmp_path, monkeypatch):
+    data = make_tarball(good_members())
+    monkeypatch.setattr(cliinstall, "CLI_DOWNLOAD_MAX_BYTES", 8)
+    with pytest.raises(CliDownloadTooLarge):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    monkeypatch.undo()
+    monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
+    monkeypatch.setattr(cliinstall, "CLI_DOWNLOAD_TIMEOUT_SECONDS", -1)
+    with pytest.raises(CliDownloadFailed, match="deadline"):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    monkeypatch.undo()
+    monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
+
+    def broken(url):
+        raise OSError("connection reset")
+
+    with pytest.raises(CliDownloadFailed, match="download failed"):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=broken)
+    assert non_dot(tmp_path / "claude") == []
+    assert not list((tmp_path / "claude").glob(".*"))  # staging cleaned every time
+
+
+ARCHIVE_CASES = [
+    # (members, expected error needle)
+    ([("package/package.json", b"{}", 0o644)], "no binary"),
+    ([("other/claude", BINARY, 0o755), ("package/package.json", b"{}", 0o644)], "outside the"),
+    ([("package/claude", BINARY, 0o755)], "package.json"),
+    ([*good_members(), ("package/../evil", b"x", 0o644)], "path component"),
+    ([*good_members(), ("/etc/passwd", b"x", 0o644)], "absolute"),
+    ([*good_members(), ("package/link", "claude", 0o644, tarfile.SYMTYPE)], "symlink"),
+    ([*good_members(), ("package/hard", "package/claude", 0o644, tarfile.LNKTYPE)], "hardlink"),
+    ([*good_members(), ("package/dev", "", 0o644, tarfile.CHRTYPE)], "character device"),
+    ([*good_members(), ("package/fifo", "", 0o644, tarfile.FIFOTYPE)], "FIFO"),
+    ([*good_members(), ("package/README.md", b"again", 0o644)], "duplicate"),
+    ([*good_members(), ("package/evil.sh", b"#!/bin/sh\n", 0o755)], "unexpected executable"),
+    ([*good_members(), ("package/claude/nested", b"x", 0o644)], "conflicts with file"),
+]
+
+
+@pytest.mark.parametrize("members, needle", ARCHIVE_CASES)
+def test_archive_validation_refuses_and_publishes_nothing(tmp_path, members, needle):
+    data = make_tarball(members)
+    with pytest.raises(CliArchiveInvalid, match=needle):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    assert non_dot(tmp_path / "claude") == []
+    assert not list((tmp_path / "claude").glob(".*"))
+
+
+def test_archive_caps_are_enforced(tmp_path, monkeypatch):
+    data = make_tarball(good_members())
+    monkeypatch.setattr(cliinstall, "CLI_ARCHIVE_MAX_ENTRIES", 2)
+    with pytest.raises(CliArchiveInvalid, match="entries"):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    monkeypatch.undo()
+    monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
+    monkeypatch.setattr(cliinstall, "CLI_ARCHIVE_MAX_EXPANDED_BYTES", 4)
+    with pytest.raises(CliArchiveInvalid, match="expands past"):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    assert non_dot(tmp_path / "claude") == []
+
+
+def test_garbage_bytes_with_matching_integrity_are_archive_invalid(tmp_path):
+    """The SRI authenticates bytes only — it never substitutes for archive
+    validation (a pin over garbage still refuses at the archive gate)."""
+    data = b"this is not a gzip tarball"
+    with pytest.raises(CliArchiveInvalid):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+
+
+def test_interrupted_extraction_publishes_nothing_and_a_retry_succeeds(tmp_path, monkeypatch):
+    data = make_tarball(good_members())
+    real = cliinstall.shutil.copyfileobj
+
+    def interrupted(*args, **kwargs):
+        raise OSError(28, "injected ENOSPC")
+
+    monkeypatch.setattr(cliinstall.shutil, "copyfileobj", interrupted)
+    with pytest.raises(CliPublishFailed, match="mid-extract"):
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    # NOTHING partial at any non-dot path, staging fully reclaimed.
+    assert non_dot(tmp_path / "claude") == []
+    assert not list((tmp_path / "claude").glob(".*"))
+    monkeypatch.setattr(cliinstall.shutil, "copyfileobj", real)
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data)
+    )
+    assert published.read_bytes() == BINARY
+    assert non_dot(tmp_path / "claude") == [VERSION]
+
+
+def test_broken_version_dir_is_retired_aside_and_reinstalled(tmp_path):
+    data = make_tarball(good_members())
+    broken = tmp_path / "claude" / VERSION
+    broken.mkdir(parents=True)
+    (broken / "debris").write_text("no binary here", encoding="utf-8")
+    calls: list[str] = []
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data, calls)
+    )
+    assert calls  # the broken install triggered a real reinstall
+    assert published.read_bytes() == BINARY
+    assert not (published.parent / "debris").exists()
+
+
+def test_error_messages_never_carry_urls_or_member_contents(tmp_path):
+    data = make_tarball([*good_members(), ("package/evil.sh", b"SECRETBODY", 0o755)])
+    with pytest.raises(CliArchiveInvalid) as excinfo:
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    assert "SECRETBODY" not in str(excinfo.value)
+    assert "https://" not in str(excinfo.value)
+
+
+def test_tuple_detection_on_this_host():
+    """The real detection emits a key spelled from the supported set (the CI
+    host is a supported linux tuple by construction)."""
+    if platform.system() != "Linux":
+        pytest.skip("tuple detection is linux-only by design")
+    assert platform_tuple_key() in supported_tuple_keys()
+
+
+def test_typed_errors_share_the_stable_base_class():
+    for cls in (
+        CliPlatformUnsupported,
+        CliDownloadFailed,
+        CliDownloadTooLarge,
+        CliIntegrityMismatch,
+        CliArchiveInvalid,
+        CliPublishFailed,
+    ):
+        assert issubclass(cls, CliInstallError)

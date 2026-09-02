@@ -1669,3 +1669,45 @@ def test_put_registry_secret_enforces_the_shape_guard(control: ControlRig):
         "PUT", "/api/v1/secrets/github-implementer", body={"value": "opaque-value"}
     )
     assert normal.status_code == 200
+
+
+# -- CLI Pin telemetry (ADR-0055) ----------------------------------------------------
+
+
+def test_heartbeat_cli_rows_are_stored_replaced_per_beat_and_served(control: ControlRig):
+    """The heartbeat's `cli` rows land in cli_status (replace-per-beat, the
+    record_status pattern), ride `/api/v1/state`, and carry names, versions,
+    and error classes only — telemetry with no dispatch consequence."""
+    row = {
+        "worker_type": "flightdeck",
+        "tool": "claude",
+        "desired": "2.1.257",
+        "applied": "",
+        "converged": False,
+        "error_class": "CliIntegrityMismatch",
+        "error": "platform linux-x64-glibc package @anthropic-ai/claude-code-linux-x64: mismatch",
+    }
+    assert control.heartbeat(cli=[row]).status_code == 200
+    state = control.admin("GET", "/api/v1/state").json()
+    stored = state["cli_status"]
+    assert len(stored) == 1 and stored[0]["node"] == "box1"
+    assert stored[0]["worker_type"] == "flightdeck"
+    assert stored[0]["desired"] == "2.1.257" and stored[0]["applied"] == ""
+    assert stored[0]["converged"] == 0
+    assert stored[0]["error_class"] == "CliIntegrityMismatch"
+
+    # Replaced whole on the next beat; a nameless row never lands.
+    converged = {**row, "applied": "2.1.257", "converged": True, "error_class": "", "error": ""}
+    control.heartbeat(cli=[converged, {"tool": "claude"}])
+    stored = control.admin("GET", "/api/v1/state").json()["cli_status"]
+    assert len(stored) == 1
+    assert stored[0]["applied"] == "2.1.257" and stored[0]["converged"] == 1
+    assert stored[0]["error_class"] == ""
+
+    # A beat with no rows clears the node's slice (a dropped pin).
+    control.heartbeat(cli=[])
+    assert control.admin("GET", "/api/v1/state").json()["cli_status"] == []
+
+    # A legacy heartbeat that omits the field entirely also clears nothing
+    # into an error — the endpoint stays tolerant of old daemons.
+    assert control.heartbeat().status_code == 200

@@ -290,6 +290,21 @@ CREATE TABLE IF NOT EXISTS drivers_health (
     restart_queued INTEGER NOT NULL DEFAULT 0,
     escalated INTEGER NOT NULL DEFAULT 0
 );
+-- CLI Pin convergence per worker type per node (ADR-0055): replaced whole
+-- from each heartbeat's `cli` rows — desired/applied versions, convergence,
+-- and the daemon's redacted last install failure. Telemetry only: decks are
+-- never dispatch targets, so there is no ladder and no dispatch consequence.
+CREATE TABLE IF NOT EXISTS cli_status (
+    node TEXT NOT NULL,
+    worker_type TEXT NOT NULL,
+    tool TEXT NOT NULL DEFAULT '',
+    desired TEXT NOT NULL DEFAULT '',
+    applied TEXT NOT NULL DEFAULT '',
+    converged INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL
+);
 """
 
 # Tables of earlier schema generations, dropped on open: the advisory
@@ -742,6 +757,33 @@ class Store:
                     )
                     for c in (stack_containers or [])
                     if c.get("name")
+                ],
+            )
+
+    def record_cli_status(self, node: str, rows: list[dict[str, Any]]) -> None:
+        """Replace the node's CLI Pin convergence rows with this heartbeat's
+        (ADR-0055) — the record_status DELETE+INSERT pattern."""
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM cli_status WHERE node = ?", (node,))
+            self._db.executemany(
+                "INSERT INTO cli_status (node, worker_type, tool, desired, applied,"
+                " converged, error_class, error_message, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        node,
+                        str(r.get("worker_type", "")),
+                        str(r.get("tool", "")),
+                        str(r.get("desired", "")),
+                        str(r.get("applied", "")),
+                        1 if r.get("converged") else 0,
+                        str(r.get("error_class", "")),
+                        str(r.get("error", "")),
+                        now,
+                    )
+                    for r in rows
+                    if r.get("worker_type")
                 ],
             )
 
@@ -1701,6 +1743,9 @@ class Store:
                 "SELECT * FROM stack_containers ORDER BY node, name"
             ).fetchall()
             images = self._db.execute("SELECT * FROM images ORDER BY node, name").fetchall()
+            cli_status = self._db.execute(
+                "SELECT * FROM cli_status ORDER BY node, worker_type"
+            ).fetchall()
             commands = self._db.execute(
                 "SELECT id, node, verb, target, force, created_at, delivered_at, completed_at,"
                 " deferred_reason FROM commands ORDER BY id"
@@ -1712,6 +1757,7 @@ class Store:
             "run_containers": [dict(r) for r in containers],
             "stack_containers": [dict(r) for r in stack_containers],
             "images": [dict(r) for r in images],
+            "cli_status": [dict(r) for r in cli_status],
             "commands": [dict(r) for r in commands],
             "node_health": [dict(r) for r in health],
         }

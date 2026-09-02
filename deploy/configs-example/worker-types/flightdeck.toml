@@ -114,6 +114,21 @@ knowledge = "knowledge/claude-dev"
 # tree; load fails loud on a dangling reference.
 policy = "policy/claude-defaults"
 
+# The CLI Pin (ADR-0055): an exact npm version (or dist-tag — re-resolved on
+# every ingest, like a moving base tag) of the agent CLI this deck launches.
+# Ingest resolves it against the npm registry into an exact version plus the
+# complete per-platform integrity map in pins.toml; the Node Daemon installs
+# it fail-closed under /var/lib/theozolith/cli and the shim baked below
+# enforces entry == desired at EVERY launch — never the previous export,
+# never the image CLI. Declared but NOT identity-bearing: a version bump here
+# redistributes live (next `claude` launch; running sessions keep their
+# binary) and never rebuilds this image or recreates the deck; adopting or
+# dropping the field recreates once (the injected THEOZOLITH_WORKER_TYPE env
+# is container spec). Matches the run image's own pinned CLI. KNOWN
+# LIMITATION: nothing checks model<->CLI-version compatibility — pin a CLI
+# that knows the `model` below, or a launch fails where a build used to.
+cli = "2.1.257"
+
 # The deck's DEFAULT model (ADR-0045 §4). Control appends an interactive-scope
 # materialize step for this field: the build validates the ID and writes it to
 # /etc/theozolith/model — atomically, as a root-owned non-user-writable regular
@@ -279,6 +294,11 @@ fi''',
 '# see the same claude environment as the flightdeck-start session.' \
 'export CLAUDE_CONFIG_DIR=/home/ozolith/.claude' \
 ': "${LANG:=en_US.UTF-8}"; export LANG' \
+'# CLI Pin launch path (ADR-0055), conditional on the pin: only a deck whose' \
+'# worker type declares cli gets the shim first on PATH (it enforces' \
+'# entry == desired at every launch) and the autoupdater disabled - a' \
+'# pinless deck keeps the image CLI and todays behavior exactly.' \
+'if [ -n "${THEOZOLITH_WORKER_TYPE:-}" ]; then PATH="/opt/theozolith-deck/bin:$PATH"; export PATH; export DISABLE_AUTOUPDATER=1; fi' \
 "alias claude-long='claude --dangerously-skip-permissions'" \
 '# Runtime values from flightdeck-start (the workspace checkout path).' \
 '[ -r /home/ozolith/.flightdeck-env ] && . /home/ozolith/.flightdeck-env' \
@@ -390,6 +410,33 @@ fi''',
 '  sudo ln -s "$POLICY_TREE_DIR" /etc/claude-code/managed-settings.d' \
 'else' \
 '  echo "flightdeck-start: no Agent Policy selected for this deck - the managed drop-in dir stays untouched (ADR-0055)"' \
+'fi' \
+'# ADR-0055: the CLI Pin launch path. A deck whose worker type pins a CLI' \
+'# gets THEOZOLITH_WORKER_TYPE injected control-side; the container start' \
+'# refuses loudly (docker restart policy retries) until the export entry' \
+'# identifies exactly the desired version - the identical check the shim' \
+'# repeats at every later launch - then the shim goes first on PATH for the' \
+'# tmux session and the autoupdater is disabled. Neither the previous' \
+'# export nor the image CLI is ever a fallback. A pinless deck keeps the' \
+'# image CLI and todays behavior exactly.' \
+'if [ -n "${THEOZOLITH_WORKER_TYPE:-}" ]; then' \
+'  CLI_ROOT="/var/lib/theozolith/cli/claude"' \
+'  CLI_DESIRED=""' \
+'  [ -r "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.desired" ] && CLI_DESIRED=$(cat "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.desired")' \
+'  if [ -z "$CLI_DESIRED" ]; then' \
+'    echo "flightdeck-start: no desired CLI record for worker type ${THEOZOLITH_WORKER_TYPE} on this node (pin not applied yet) - failing loud (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  CLI_ENTRY=$(readlink "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.current" 2>/dev/null || true)' \
+'  if [ "$(basename "${CLI_ENTRY:-x}")" != "$CLI_DESIRED" ]; then' \
+'    echo "flightdeck-start: CLI pin not converged (desired $CLI_DESIRED, export ${CLI_ENTRY:-none}); never the previous export, never the image CLI - failing loud (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  PATH="/opt/theozolith-deck/bin:$PATH"' \
+'  export PATH' \
+'  export DISABLE_AUTOUPDATER=1' \
+'else' \
+'  echo "flightdeck-start: no CLI pin for this deck - the image CLI stays in use (ADR-0055)"' \
 'fi' \
 '# Claude session env (snow-maker parity, mirrored in /etc/profile.d): the' \
 '# CLI config dir lives INSIDE ~/.claude so .claude.json - login credential,' \
@@ -528,6 +575,35 @@ fi''',
 'exit 0' \
 > /usr/local/bin/flightdeck-start \
 && chmod 0755 /usr/local/bin/flightdeck-start''',
+
+    # (8) The claude launch shim (ADR-0055) at /opt/theozolith-deck/bin/claude
+    #     (0755, root-owned at build — operator-authored CONFIG content like
+    #     flightdeck-start itself: the product ships no deck helper binary and
+    #     the Node Daemon learns no workload internals). The profile.d block
+    #     in step (6) puts it FIRST on PATH only when the deck has a pin, so
+    #     `claude` in the tmux command and in every shell resolves here. The
+    #     shim is PIN-STRICT at EVERY launch — a container start or a new
+    #     tmux window on a deck up for weeks — and execs the VERSION-ADDRESSED
+    #     path (never the .current symlink), so a concurrent re-point can
+    #     never swap the binary mid-decision and a running session holds its
+    #     binary inode through any later bump while the next launch gets the
+    #     new version.
+    '''mkdir -p /opt/theozolith-deck/bin && printf '%s\n' \
+'#!/bin/sh' \
+'set -eu' \
+'# TheOzolith claude launch shim (ADR-0055): PIN-STRICT - every launch fails' \
+'# loudly unless the node-maintained export entry identifies exactly the' \
+'# desired version. Never the previous export, never the image CLI.' \
+'root="/var/lib/theozolith/cli/claude"' \
+'wt="${THEOZOLITH_WORKER_TYPE:?theozolith claude shim: THEOZOLITH_WORKER_TYPE is not set (ADR-0055)}"' \
+'desired=""' \
+'[ -r "$root/by-type/$wt.desired" ] && desired=$(cat "$root/by-type/$wt.desired")' \
+'[ -n "$desired" ] || { echo "claude: launch refused - no desired CLI record for worker type $wt on this node (pin not applied yet; ADR-0055)" >&2; exit 1; }' \
+'entry=$(readlink "$root/by-type/$wt.current" 2>/dev/null || true)' \
+'[ "$(basename "${entry:-x}")" = "$desired" ] || { echo "claude: launch refused - CLI pin not converged (desired $desired, export ${entry:-none}); never the previous export, never the image CLI (ADR-0055)" >&2; exit 1; }' \
+'exec "$root/$desired/claude" "$@"' \
+> /opt/theozolith-deck/bin/claude \
+&& chmod 0755 /opt/theozolith-deck/bin/claude''',
 ]
 
 command = "/usr/local/bin/flightdeck-start"
@@ -535,19 +611,21 @@ command = "/usr/local/bin/flightdeck-start"
 # Node-local volumes (ADR-0043/0048/0055). `{stack}` is substituted
 # control-side with this Flight Deck Stack's name, so two same-type Flight
 # Decks on one node get distinct runtime-state and tailnet-identity volumes.
-# The knowledge and policy entries are READ-ONLY BINDS of the stable exports
-# the Node Daemon maintains from the applied pinned tree — deliberately
-# shared (no `{stack}`), never writable, and mounted at the PARENT so a tree
-# swap on the host never recreates the container: a running session keeps
-# what it loaded, an agent-CLI restart (or, for policy, the next `claude`
-# launch) picks up the new trees. The host paths are `<state-dir>/knowledge`
-# and `<state-dir>/policy`; adjust them if your nodes override
+# The knowledge, policy, and cli entries are READ-ONLY BINDS of the stable
+# exports the Node Daemon maintains from the applied pinned tree —
+# deliberately shared (no `{stack}`), never writable, and mounted at the
+# PARENT so a tree swap or CLI re-point on the host never recreates the
+# container: a running session keeps what it loaded, an agent-CLI restart
+# (or, for policy and the CLI pin, the next `claude` launch) picks up the
+# new content. The host paths are `<state-dir>/knowledge`, `<state-dir>/
+# policy`, and `<state-dir>/cli`; adjust them if your nodes override
 # THEOZOLITH_STATE_DIR.
 volumes = [
     "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
     "{stack}-claude-state:/home/ozolith/.claude",    # per-instance runtime state (never shared)
     "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",  # applied knowledge (ADR-0048)
     "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",        # applied Agent Policy (ADR-0055)
+    "/var/lib/theozolith/cli:/var/lib/theozolith/cli:ro",              # installed CLI Pins (ADR-0055)
     "{stack}-tailscale-state:/var/lib/tailscale",    # per-instance tailnet machine identity
     "{stack}-workspace:/workspace",                  # per-instance working tree (snow-maker repo-mount parity)
 ]

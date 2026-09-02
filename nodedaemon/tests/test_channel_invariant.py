@@ -67,6 +67,10 @@ HEARTBEAT_REQUEST_KEYS = {
     # references only, so the control-side ladders pause on a drain.
     "update_deferred",
     "drivers_deferred",
+    # CLI Pin convergence per worker type (ADR-0055): worker-type names,
+    # versions, and typed error classes only — never credentials, request
+    # URLs, or archive contents (asserted below).
+    "cli",
 }
 
 

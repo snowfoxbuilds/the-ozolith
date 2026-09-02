@@ -52,10 +52,11 @@ def write_pins(
     knowledge: dict[str, str] | None = None,
     base: dict[str, str] | None = None,
     policy: dict[str, str] | None = None,
+    cli: dict[str, dict] | None = None,
 ) -> None:
     """A machine-shaped pins.toml (ADR-0048/0055): what `theozolith config
     ingest` would have written for the given knowledge trees / base
-    resolutions / policy trees."""
+    resolutions / policy trees / CLI pins."""
     lines = ['[source]\ncommit = "cafe1234"']
     if base:
         lines.append("[base]")
@@ -66,7 +67,33 @@ def write_pins(
     if policy:
         lines.append("[policy]")
         lines.extend(f'"{name}" = "{tree_hash}"' for name, tree_hash in policy.items())
+    for key, pin in (cli or {}).items():
+        lines.append(f'[cli."{key}"]\nversion = "{pin["version"]}"')
+        lines.append(f'[cli."{key}".platforms]')
+        lines.extend(
+            f'"{tuple_key}" = {{ ' + ", ".join(f'{k} = "{v}"' for k, v in entry.items()) + " }"
+            for tuple_key, entry in pin["platforms"].items()
+        )
     write(tmp_path, "pins.toml", "\n".join(lines) + "\n")
+
+
+def cli_pin(version: str = "2.1.257", tuples: tuple[str, ...] | None = None) -> dict:
+    """An ingest-shaped CLI pin record (ADR-0055)."""
+    tuples = tuples or ("linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl")
+    return {
+        "version": version,
+        "platforms": {
+            key: {"package": f"@anthropic-ai/claude-code-{key}", "integrity": "sha512-" + "A" * 96}
+            for key in tuples
+        },
+    }
+
+
+def deck_type(tmp_path, name: str = "flightdeck", **fields) -> None:
+    """A minimal driverless (Flight Deck) worker type."""
+    body = {"base": f'"{BASE}"', "command": '"flightdeck-start"', **fields}
+    lines = [f"{k} = {v}" for k, v in body.items() if v is not None]
+    write(tmp_path, f"worker-types/{name}.toml", "\n".join(lines) + "\n")
 
 
 def write_knowledge_tree(tmp_path, name: str, files: dict[str, str] | None = None) -> None:
@@ -883,6 +910,162 @@ def test_refuse_ui_write_covers_policy(tmp_path):
         refuse_ui_write("policy/gold/attribution.json")
 
 
+# -- the CLI Pin (ADR-0055) ---------------------------------------------------------
+
+
+def test_cli_pin_field_parses_and_joins_the_ingest_pin(tmp_path):
+    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.257"')
+    wt = load_config(tmp_path).worker_types["flightdeck"]
+    assert wt.cli == "2.1.257"
+    assert wt.cli_version == "2.1.257"
+    assert set(wt.cli_platforms) == {"linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl"}
+    assert wt.cli_platforms["linux-x64-glibc"]["integrity"].startswith("sha512-")
+    recipe = wt.recipe_wire()
+    assert recipe["cli_tool"] == "claude"
+    assert recipe["cli_version"] == "2.1.257"
+    assert recipe["cli_platforms"] == wt.cli_platforms
+
+
+def test_cli_with_a_driver_is_refused(tmp_path):
+    """Driverless-only in v1 (ADR-0055 §7): a driver type keeps the base
+    image's CLI as identity bytes — and the refusal fires with its precise
+    message even though ingest resolved no pin for the definition."""
+    driver_type(tmp_path, cli='"2.1.257"')
+    with pytest.raises(ConfigRepoError, match="driverless-only in v1"):
+        load_config(tmp_path)
+
+
+def test_cli_on_a_codex_adapter_is_refused(tmp_path):
+    deck_type(tmp_path, adapter='"codex"', cli='"0.150.0"')
+    with pytest.raises(ConfigRepoError, match="cannot declare a CLI Pin"):
+        load_config(tmp_path)
+
+
+def test_cli_without_an_ingest_pin_is_refused(tmp_path):
+    deck_type(tmp_path, cli='"2.1.257"')
+    with pytest.raises(ConfigRepoError, match="re-run `theozolith config ingest`"):
+        load_config(tmp_path)
+
+
+def test_cli_declared_shape_is_validated(tmp_path):
+    for bad in ("2.1.257 beta", "a/b", ".hidden", ""):
+        deck_type(tmp_path, cli=f'"{bad}"' if bad else None)
+        if not bad:
+            load_config(tmp_path)  # absent field: a pinless deck is legal
+            continue
+        with pytest.raises(ConfigRepoError, match="cli"):
+            load_config(tmp_path)
+
+
+def test_cli_resolved_fields_cannot_be_authored(tmp_path):
+    deck_type(tmp_path, cli_version='"2.1.257"')
+    with pytest.raises(ConfigRepoError, match="ingest-resolved, never authored"):
+        load_config(tmp_path)
+
+
+def test_cli_below_the_adapter_floor_is_refused_at_load(tmp_path):
+    """The pinned build may predate a floor bump: the load re-checks the
+    joined version against MIN_ENFORCING_CLI (the lint site is
+    configrepo/ingest, never the image build or the deck launch)."""
+    write_pins(tmp_path, cli={"claude/2.0.0": cli_pin("2.0.0")})
+    deck_type(tmp_path, cli='"2.0.0"')
+    with pytest.raises(ConfigRepoError, match="below the claude adapter's enforcement floor"):
+        load_config(tmp_path)
+
+
+def test_cli_is_never_identity_bearing(tmp_path):
+    """GOLDEN (ADR-0055): a cli-bearing driverless type's instruction_hash
+    and tag are byte-identical to the same type without cli — declared,
+    fleet-visible, never identity — and the wire recipes differ ONLY in the
+    three cli keys."""
+    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.257"')
+    deck_type(tmp_path, name="twin")
+    config = load_config(tmp_path)
+    pinned, twin = config.worker_types["flightdeck"], config.worker_types["twin"]
+    assert pinned.instruction_hash == twin.instruction_hash
+    assert pinned.tag.split(":", 1)[1] == twin.tag.split(":", 1)[1]
+    cli_keys = ("cli_tool", "cli_version", "cli_platforms")
+    pinned_wire, twin_wire = pinned.recipe_wire(), twin.recipe_wire()
+    assert {k: v for k, v in pinned_wire.items() if k not in ("name", "tag", *cli_keys)} == {
+        k: v for k, v in twin_wire.items() if k not in ("name", "tag", *cli_keys)
+    }
+    assert (twin_wire["cli_tool"], twin_wire["cli_version"], twin_wire["cli_platforms"]) == (
+        "",
+        "",
+        {},
+    )
+
+
+def test_cli_lifecycle_rides_the_injected_env(tmp_path):
+    """ADR-0055 lifecycle at the config layer: ADOPTING or DROPPING cli
+    changes the resolved Stack env (THEOZOLITH_WORKER_TYPE appears or goes —
+    a container-fingerprint delta, one recreate); a VERSION bump changes no
+    container-spec input at all (env, image, command, volumes identical) —
+    it redistributes live through the wire recipe only."""
+    deck_type(tmp_path)
+    thin_stack(tmp_path, "deck", "flightdeck")
+    bare = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
+    assert "THEOZOLITH_WORKER_TYPE" not in bare.env
+
+    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.257")})
+    deck_type(tmp_path, cli='"pinned"')
+    adopted = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
+    assert adopted.env["THEOZOLITH_WORKER_TYPE"] == "flightdeck"
+    assert adopted.image == bare.image  # never identity-bearing
+
+    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.258")})
+    bumped = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
+    for field in ("env", "image", "command", "volumes", "ports", "secrets"):
+        assert getattr(bumped, field) == getattr(adopted, field)
+    wt = load_config(tmp_path).worker_types["flightdeck"]
+    assert wt.cli_version == "2.1.258"  # the wire recipe moved; the spec did not
+
+
+def test_stack_env_worker_type_override_is_rejected(tmp_path):
+    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.257"')
+    write(
+        tmp_path,
+        "stacks/deck.toml",
+        'worker_type = "flightdeck"\nnode = "box1"\n[env]\nTHEOZOLITH_WORKER_TYPE = "other"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="THEOZOLITH_WORKER_TYPE"):
+        load_config(tmp_path)
+
+
+def test_pins_cli_table_shape_is_validated(tmp_path):
+    """The [cli] table is machine-written: any deviation is corruption."""
+    good = cli_pin()
+    for mutate, needle in (
+        (lambda p: {"claude": p}, r"\[cli\] key 'claude' must be"),
+        (lambda p: {"claude/x": {**p, "version": "latest"}}, "exact"),
+        (lambda p: {"claude/x": {"version": p["version"], "platforms": {}}}, "non-empty"),
+        (
+            lambda p: {
+                "claude/x": {
+                    "version": p["version"],
+                    "platforms": {"linux-x64-glibc": {"package": "p", "integrity": "sha256-x"}},
+                }
+            },
+            "sha512",
+        ),
+        (
+            lambda p: {
+                "claude/x": {
+                    "version": p["version"],
+                    "platforms": {"linux-x64-glibc": {"integrity": "sha512-" + "A" * 96}},
+                }
+            },
+            "package",
+        ),
+    ):
+        write_pins(tmp_path, cli=mutate(dict(good)))
+        with pytest.raises(ConfigRepoError, match=needle):
+            load_config(tmp_path)
+
+
 def test_knowledge_reference_shape_is_validated(tmp_path):
     for bad in ("dev", "knowledge/", "knowledge/../x", "knowledge/.dot", "knowledge/a/b"):
         driver_type(tmp_path, knowledge=f'"{bad}"')
@@ -1260,10 +1443,10 @@ def test_full_model_ids_produce_no_warnings(tmp_path):
 
 
 def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
-    """The synthesized instruction rides the recipe's ``setup`` — the 12
+    """The synthesized instruction rides the recipe's ``setup`` — the 15
     wire keys (ADR-0052 added knowledge_tool/knowledge_target, ADR-0055
-    policy/policy_pin), daemon adapter-blind — with managed scope for driver
-    run images."""
+    policy/policy_pin and cli_tool/cli_version/cli_platforms), daemon
+    adapter-blind — with managed scope for driver run images."""
     driver_type(tmp_path, effort='"high"')
     thin_stack(tmp_path, "implementer", "claude-dev")
     recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
@@ -1281,6 +1464,9 @@ def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
         "knowledge_target",
         "policy",
         "policy_pin",
+        "cli_tool",
+        "cli_version",
+        "cli_platforms",
         "tag",
         "base_digest",
         "instruction_hash",
