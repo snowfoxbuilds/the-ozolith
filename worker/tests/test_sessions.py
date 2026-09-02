@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 
 from theozolith_worker import jobdir, proposal
-from theozolith_worker.containers import ContainerSpec
+from theozolith_worker.containers import ContainerSpec, EngineError
 from theozolith_worker.harness.main import run_harness
 from theozolith_worker.sessions import ContainerSession, SessionError
 from theozolith_worker.shell import run_shell
@@ -134,3 +134,66 @@ def test_wait_for_agent_raises_when_container_dies_silently(tmp_path):
         raise AssertionError("expected SessionError")
     except SessionError as exc:
         assert "exited before" in str(exc)
+
+
+# -- fail-closed observation at the session seam (#109, grilling 2026-09-02) ------
+
+
+def test_finish_contains_an_observation_failure_and_still_removes(tmp_path):
+    """An unobservable container at session END must never escape finish(): a
+    blip there would, via `finally: session.finish()` on the Run's SUCCESS path,
+    reclassify an already-completed Run as an infra failure. The force-remove
+    still runs, so container lifetime = Run lifetime is preserved regardless."""
+    job, manifest, spec = make_run_job(tmp_path)  # a serve_jobs (MODE_RUN) manifest
+
+    class BlipAtFinishEngine:
+        def __init__(self):
+            self.removed: list[str] = []
+
+        def launch(self, spec):
+            pass
+
+        def alive(self, name):
+            raise EngineError("aliveness unobservable at session end")
+
+        def wait(self, name, timeout):
+            return None
+
+        def remove(self, name):
+            self.removed.append(name)
+
+    engine = BlipAtFinishEngine()
+    session = ContainerSession(engine, spec, job, manifest, poll_seconds=0.01)
+    session.finish()  # must NOT raise, even though alive() raises EngineError
+    assert engine.removed == [spec.name]  # the force-remove still ran
+
+
+def test_wait_for_agent_propagates_an_engine_error_into_the_infra_lane(tmp_path):
+    """An unobservable container mid-wait raises EngineError OUT of
+    wait_for_agent — it is NOT reclassified as a SessionError (a fabricated
+    'container exited'). The runner's generic driver-side catch then maps the
+    escaping EngineError to the ADR-0016 infra lane."""
+    job, manifest, spec = make_run_job(tmp_path)
+
+    class UnobservableEngine:
+        def launch(self, spec):
+            pass
+
+        def alive(self, name):
+            raise EngineError("container aliveness unobservable (observation doctrine)")
+
+        def wait(self, name, timeout):
+            return 0
+
+        def remove(self, name):
+            pass
+
+    session = ContainerSession(UnobservableEngine(), spec, job, manifest, poll_seconds=0.01)
+    session.launch()
+    try:
+        session.wait_for_agent()
+        raise AssertionError("expected EngineError")
+    except SessionError as exc:  # must NOT be swallowed/reclassified as a Run outcome
+        raise AssertionError(f"EngineError was reclassified as SessionError: {exc}") from exc
+    except EngineError:
+        pass  # escapes as-is -> the runner maps it to the infra lane

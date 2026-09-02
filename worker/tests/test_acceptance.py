@@ -1316,6 +1316,41 @@ def test_container_start_failure_emits_an_error_event(harness: Harness):
     assert escalated["failure_class"] == "infra"
 
 
+def test_unobservable_container_mid_run_fails_into_the_infra_lane(harness: Harness):
+    """The driver-side observation doctrine (#109): when a Run container's
+    aliveness becomes unobservable mid-wait — the aliveness path exhausts its
+    bounded retries and raises EngineError — the escaping EngineError is the
+    ADR-0016 infra lane (evidence failure_class 'infra', one local retry, then
+    failed + needs_human), NEVER a fabricated completion or a 'container exited'
+    Run outcome."""
+    number = harness.file_issue("Unobservable", CRITERIA_BODY)
+    real_factory = harness.session_factory
+
+    def blip_factory(spec, job, manifest):
+        session = real_factory(spec, job, manifest)
+        if manifest.mode == jobdir_module.MODE_DRYRUN:
+            return session  # the setup dry-run works; only RUN aliveness blips
+
+        def unobservable_wait():
+            raise EngineError(
+                "docker inspect for the run container failed on every attempt —"
+                " aliveness unobservable (observation doctrine)"
+            )
+
+        session.wait_for_agent = unobservable_wait  # type: ignore[method-assign]
+        return session
+
+    harness.session_factory = blip_factory  # type: ignore[method-assign]
+    harness.worker_once()
+
+    assert FAILED in harness.fake.labels_of(number)
+    run_events = harness.sink.run_events(number)
+    # Both the Run and its one local retry fail infra — never a fabricated exit.
+    assert [e["failure_class"] for e in run_events if e["phase"] == "failed"] == ["infra", "infra"]
+    (escalated,) = (e for e in run_events if e["phase"] == "escalated")
+    assert escalated["failure_class"] == "infra"
+
+
 # -- the setup dry-run latch (ADR-0045) ----------------------------------------
 # A dry-run VERDICT (the container ran and failed) latches the driver until a
 # manual restart: the probe is never re-spent, no work is fetched, and the

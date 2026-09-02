@@ -2442,7 +2442,8 @@ class NodeDaemon:
             detail = "running container carries no applied-spec label; reconciling once"
         elif running:
             reason = "spec-mismatch"
-            detail = f"applied spec {running[0].get(LABEL_STACK_SPEC, '') or '(none)'} -> wanted {want}"
+            applied = running[0].get(LABEL_STACK_SPEC, "") or "(none)"
+            detail = f"applied spec {applied} -> wanted {want}"
         else:
             reason = "no-running-container"
             detail = "no running container (first create, stopped rows only, or process->container)"
