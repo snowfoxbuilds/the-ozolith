@@ -61,6 +61,17 @@ setup = [
 # Editing the tree re-tags exactly the worker types that reference it.
 knowledge = "knowledge/claude-dev"
 
+# The policy/<name>/ Agent Policy tree in THIS Config Repo (ADR-0055):
+# verbatim Claude managed-settings drop-ins, validated at ingest AND config
+# load against the safe-key allowlist (only positively classified
+# declarative keys — v1 admits exactly `attribution` closed to
+# `sessionUrl: boolean`; identity/steering keys, executable references,
+# `env`, and everything unclassified refuse). On a DRIVER type like this
+# one the tree BAKES into the derived image's managed drop-in dir before
+# any setup RUN, and reference + pin enter the image identity: editing a
+# drop-in re-tags and rebuilds exactly the driver types that reference it.
+policy = "policy/claude-defaults"
+
 # Secret NAMES only — values live encrypted on the Control Node, entered
 # once via `theozolith secret set <name>`, pulled node-scoped at deploy
 # time, and delivered as <ENV>_FILE from tmpfs (never node disk).

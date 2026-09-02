@@ -375,8 +375,9 @@ class NodeDaemon:
         # the new tree (ADR-0042).
         self._converge_drivers()
         # Before reconcile so a Flight Deck (re)started this pass mounts the
-        # freshly exported knowledge trees (ADR-0048).
+        # freshly exported knowledge and policy trees (ADR-0048/0055).
         self._export_knowledge()
+        self._export_policy()
         self._reconcile()
 
     def _wire_setting(self, key: str, config_value: float, shipped_default: float) -> float:
@@ -1064,8 +1065,9 @@ class NodeDaemon:
 
     def _applied_tree_shape_error(self, tree: Path) -> str | None:
         """The applied root ``config-dist/<hash>/`` may hold ONLY the unpacked
-        artifact shape: the ``drivers`` and ``knowledge`` directories (real,
-        not symlinks; ADR-0042/0048) and the ``config-dist.json`` metadata
+        artifact shape: the ``DIST_DIRS`` directories — ``drivers``,
+        ``knowledge``, and ``policy`` (real, not symlinks;
+        ADR-0042/0048/0055) — and the ``config-dist.json`` metadata
         file (regular, not a symlink) — any may be absent, but NOTHING else
         may be present. The source-tree exclusion predicate does not apply
         here: it selects files from a working repo, while this root is the
@@ -1316,6 +1318,17 @@ class NodeDaemon:
             else:
                 path.unlink()
 
+    @staticmethod
+    def _reclaim_strict(path: Path) -> None:
+        """Remove a file or tree, raising OSError on failure — the raising
+        variant of _reclaim for callers that own the diagnostic (log + emit)
+        instead of deferring silently to the leftover sweep. A missing path
+        is not a failure."""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
     def _export_knowledge(self) -> None:
         """Maintain the STABLE deck-facing knowledge export at
         ``<state>/knowledge`` from the verified applied distribution: one
@@ -1403,6 +1416,95 @@ class NodeDaemon:
                 continue
             self._reclaim(retired)
             self._log(f"knowledge export {stale!r} retired")
+        with contextlib.suppress(OSError):
+            for leftover in export.glob(".*"):
+                self._reclaim(leftover)
+
+    def _export_policy(self) -> None:
+        """Maintain the STABLE deck-facing Agent Policy export at
+        ``<state>/policy`` from the verified applied distribution (ADR-0055):
+        one child directory per policy tree, exported VERBATIM (no per-tool
+        view — a policy tree is already the claude drop-in set), each swapped
+        whole through the same crash-recoverable exchange the knowledge
+        export uses. Flight Decks read-only bind-mount the stable parent —
+        the parent inode never moves, so a swap never changes the container
+        spec; running sessions keep the drop-ins they loaded, and the next
+        ``claude`` launch reads the new content through the deck's
+        managed-settings link.
+
+        Non-converged (empty applied hash while a distribution IS desired)
+        leaves the existing export alone — advisory skew. A RETIRED
+        distribution retires the export with it. Every filesystem failure
+        logs AND emits a theozolith.error (paths and error class only, never
+        drop-in contents) but never fails the pass; the export is re-derived
+        state, repaired next pass."""
+        applied = self._current_drivers_hash()
+        if not applied:
+            if str(self._desired.get("drivers_hash", "") or ""):
+                return  # not converged yet: keep the last export (advisory skew)
+            source_root = None
+        else:
+            source_root = self._config.config_dist_dir / applied / configdist.POLICY_DIR
+        export = self._config.policy_export_dir
+        try:
+            desired: dict[str, Path] = {}
+            if source_root is not None and source_root.is_dir() and not source_root.is_symlink():
+                with os.scandir(source_root) as it:
+                    for entry in sorted(it, key=lambda e: e.name):
+                        if entry.is_dir(follow_symlinks=False):
+                            desired[entry.name] = Path(entry.path)
+            if not desired and not export.is_dir():
+                return  # nothing to export and nothing stale to retire
+            export.mkdir(parents=True, exist_ok=True)
+            with os.scandir(export) as it:
+                current = {e.name for e in it if not e.name.startswith(".")}
+        except OSError as exc:
+            self._log(f"policy export enumeration failed: {exc}")
+            self._emit_error(type(exc).__name__, f"policy export enumeration failed: {exc}")
+            return
+        for name, source in desired.items():
+            target = export / name
+            try:
+                source_hash = configdist.tree_hash(source)
+                try:
+                    up_to_date = configdist.tree_hash(target) == source_hash
+                except configdist.ConfigDistError:
+                    up_to_date = False  # malformed export tree: re-export it
+                if up_to_date:
+                    continue
+                staging = export / f".{name}.tmp"
+                self._reclaim(staging)
+                shutil.copytree(source, staging, symlinks=False)
+                self._exchange_config_dist_tree(staging, target)
+                self._log(f"policy export {name!r} updated ({source_hash[:12]})")
+            except (OSError, configdist.ConfigDistError) as exc:
+                self._log(f"policy export {name!r} failed: {exc}")
+                self._emit_error(type(exc).__name__, f"policy export {name!r} failed: {exc}")
+        for stale in sorted(current - set(desired)):
+            # Retire through a dot-prefixed rename so the tree disappears from
+            # the mounted parent atomically, then reclaim the bytes. Every
+            # stage fails CONTAINED — log + emit, never the pass: a failed
+            # pre-rename clear or rename leaves the stale tree honestly
+            # enumerable (retried next pass); a failed tombstone reclaim
+            # leaves the dot-prefixed remnant — invisible to the mount and to
+            # enumeration — for the leftover sweep on a later healthy pass.
+            retired = export / f".{stale}.retired"
+            try:
+                self._reclaim_strict(retired)
+                os.replace(export / stale, retired)
+            except OSError as exc:
+                message = f"policy export {stale!r} retire failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                continue
+            try:
+                self._reclaim_strict(retired)
+            except OSError as exc:
+                message = f"policy export {stale!r} tombstone reclaim failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                continue
+            self._log(f"policy export {stale!r} retired")
         with contextlib.suppress(OSError):
             for leftover in export.glob(".*"):
                 self._reclaim(leftover)

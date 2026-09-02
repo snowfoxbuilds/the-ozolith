@@ -32,9 +32,16 @@ Layout::
                               drivers/ (a pre-ADR-0052 build keeps the claude
                               compile bare under knowledge/<name>/ until the
                               next ingest migrates it)
+    policy/<name>/            one Agent Policy tree per name (ADR-0055):
+                              verbatim Claude managed-settings drop-ins,
+                              allowlist-validated at ingest AND at load,
+                              copied by ingest, distributed to nodes
+                              alongside drivers/ and knowledge/ (baked into
+                              driver-type images, live-mounted into decks)
     pins.toml                 machine-written by ingest: source-commit stamp,
                               base tag->digest resolutions, per-knowledge-tree
-                              content-hash pins keyed "<name>/<tool>"
+                              content-hash pins keyed "<name>/<tool>", and
+                              per-policy-tree pins under [policy]
     product.toml              optional [product] version pin for the update command
 
 An empty or missing repo is a legal deployment (the deletion test): every
@@ -67,6 +74,12 @@ from typing import Any
 # unmappable value fails here at config load — earlier than the in-image
 # ``theozolith-adapter`` backstop — and the synthesized setup instruction is
 # rendered by the one shared renderer.
+# The Agent Policy validator (ADR-0055): the ONE safe-key allowlist, owned by
+# the claude adapter, applied here at config load and by ingest at staging
+# time. Imported as a MODULE and invoked through the attribute at every call
+# site, so a single monkeypatch of theozolith_worker.policy.validate_policy_tree
+# observes both sites — the provable-sharing contract the tests pin.
+from theozolith_worker import policy as agentpolicy
 from theozolith_worker.adapters import (
     MODEL_ALIAS,
     MODEL_UNMAPPABLE,
@@ -82,11 +95,13 @@ from theozolith_control import configdist
 STACK_KINDS = ("process", "container")
 DESIRED_STATES = ("running", "stopped")
 
-# Repo-relative prefixes that are git-native only (ADR-0042/0048): a config
-# write here equals code execution (drivers/) or agent-instruction injection
-# (knowledge/) on nodes, so neither is ever touched by the web UI or any future
-# config editor — drivers/ is edited in git, knowledge/ is compiled by ingest.
-GIT_NATIVE_ONLY = ("drivers/", "knowledge/")
+# Repo-relative prefixes that are git-native only (ADR-0042/0048/0055): a
+# config write here equals code execution (drivers/), agent-instruction
+# injection (knowledge/), or managed-settings injection into decks and images
+# (policy/) on nodes, so none is ever touched by the web UI or any future
+# config editor — drivers/ is edited in git, knowledge/ is compiled and
+# policy/ validated-and-copied by ingest.
+GIT_NATIVE_ONLY = ("drivers/", "knowledge/", "policy/")
 
 # Files only `theozolith config ingest` writes (ADR-0048); refused for any
 # UI/editor write alongside the git-native prefixes.
@@ -113,6 +128,10 @@ _DEFAULT_KNOWLEDGE_TARGET = _KNOWLEDGE_TARGETS["claude"]
 # names (dot-prefixed components never ride the config distribution).
 KNOWLEDGE_REF_PREFIX = "knowledge/"
 KNOWLEDGE_TREE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+# An in-repo Agent Policy reference is ``policy/<name>`` (ADR-0055); the name
+# rule is the knowledge tree-name rule.
+POLICY_REF_PREFIX = "policy/"
 
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
 # supervised command each resolves to control-side. Every builtin runs through
@@ -249,9 +268,9 @@ def refuse_ui_write(relpath: str) -> None:
         if parts[0] == prefix.rstrip("/"):
             raise ConfigRepoError(
                 f"{relpath!r} is under a git-native-only path ({prefix}) — driver"
-                " code and compiled knowledge are never editable through the web"
-                " UI or a config editor; edit the Config Repo and ingest"
-                " (ADR-0042/0048)"
+                " code, compiled knowledge, and Agent Policy trees are never"
+                " editable through the web UI or a config editor; edit the"
+                " Config Repo and ingest (ADR-0042/0048/0055)"
             )
     if normalized in MACHINE_OWNED_FILES:
         raise ConfigRepoError(
@@ -270,12 +289,14 @@ class Pins:
     ``<name>/<tool>`` to its content hash (ADR-0052 — a legacy bare
     ``<name>`` key from a pre-per-tool pinned build normalizes to
     ``<name>/claude`` at load, the only compiler that could have written it);
+    ``policy`` maps an Agent Policy tree name to its content hash (ADR-0055);
     ``source_commit`` stamps the Config Repo commit the pinned build was
     ingested from."""
 
     source_commit: str = ""
     base: dict[str, str] = field(default_factory=dict)
     knowledge: dict[str, str] = field(default_factory=dict)
+    policy: dict[str, str] = field(default_factory=dict)
 
 
 def load_pins(repo_dir: Path) -> Pins:
@@ -294,8 +315,9 @@ def load_pins(repo_dir: Path) -> Pins:
         raise ConfigRepoError(f"{PINS_FILE}: [source].commit must be a string")
     base = data.get("base", {})
     knowledge = data.get("knowledge", {})
-    if not isinstance(base, dict) or not isinstance(knowledge, dict):
-        raise ConfigRepoError(f"{PINS_FILE}: [base] and [knowledge] must be tables")
+    policy = data.get("policy", {})
+    if not all(isinstance(table, dict) for table in (base, knowledge, policy)):
+        raise ConfigRepoError(f"{PINS_FILE}: [base], [knowledge], and [policy] must be tables")
     for ref, digest in base.items():
         if not isinstance(digest, str) or not (
             digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
@@ -320,7 +342,20 @@ def load_pins(repo_dir: Path) -> Pins:
         # could have written it. Unknown tool suffixes are tolerated: a
         # newer ingest may pin tools this control version has no use for.
         normalized[name if len(parts) == 2 else f"{name}/claude"] = tree_hash
-    return Pins(source_commit=commit, base=dict(base), knowledge=normalized)
+    policy_pins: dict[str, str] = {}
+    for name, tree_hash in policy.items():
+        if not isinstance(tree_hash, str) or not _HEX64.fullmatch(tree_hash):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [policy] {name!r} must map to a 64-hex content"
+                f" hash, got {tree_hash!r}"
+            )
+        if not KNOWLEDGE_TREE_NAME.fullmatch(name):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [policy] key {name!r} must be a plain tree name"
+                " (^[A-Za-z0-9][A-Za-z0-9._-]*$) (ADR-0055)"
+            )
+        policy_pins[name] = tree_hash
+    return Pins(source_commit=commit, base=dict(base), knowledge=normalized, policy=policy_pins)
 
 
 @dataclass(frozen=True)
@@ -355,6 +390,18 @@ class WorkerTypeDef:
     # recreating nothing.
     knowledge: str = ""
     knowledge_pin: str = ""
+    # In-repo Agent Policy reference (ADR-0055): "" or "policy/<name>". The
+    # pin is ingest-computed and joined from pins.toml at load, never
+    # authored. DRIVER types BAKE the tree into the managed drop-in dir, so
+    # both fields enter the image identity — conditionally, exactly like the
+    # ADR-0052 knowledge_target key, so a policy-less identity hashes
+    # byte-identically to before. DRIVERLESS (Flight Deck) types never bake:
+    # the reference selects which exported tree the deck's read-only mount
+    # serves, delivered as the control-injected THEOZOLITH_POLICY_TREE env —
+    # changing the SELECTION changes the container spec (recreate once) while
+    # a content edit moves only the pin and redistributes live.
+    policy: str = ""
+    policy_pin: str = ""
     # -- per-type variables --
     driver: str = ""  # "" (Flight Deck) | "builtin:<name>" | "drivers/<name>"
     adapter: str = "claude"  # Agent adapter the harness invokes
@@ -396,6 +443,24 @@ class WorkerTypeDef:
         return self.knowledge_pin if self.is_driver else ""
 
     @property
+    def policy_tree(self) -> str:
+        """The bare tree name of the Agent Policy reference ("" when none)."""
+        return self.policy[len(POLICY_REF_PREFIX) :] if self.policy else ""
+
+    @property
+    def baked_policy(self) -> str:
+        """The policy reference AS BAKED: only a driver type bakes the tree
+        into its derived image (ADR-0055) — a Flight Deck's reference selects
+        the live read-only mount instead and must stay out of the image
+        recipe and the image identity (a deck policy edit or reselection must
+        never rebuild an image)."""
+        return self.policy if self.is_driver else ""
+
+    @property
+    def baked_policy_pin(self) -> str:
+        return self.policy_pin if self.is_driver else ""
+
+    @property
     def knowledge_tool(self) -> str:
         """Which per-tool compile of the tree the node stages for the bake
         (ADR-0052): the adapter name, for a baking (driver) type only."""
@@ -435,26 +500,29 @@ class WorkerTypeDef:
 
     @property
     def instruction_hash(self) -> str:
-        # CRITICAL (ADR-0044 as amended by ADR-0045/0052): exactly these
-        # four keys — plus ``knowledge_target`` ONLY when it differs from
-        # the historical claude default — canonical JSON with sort_keys,
-        # over the MATERIALIZED setup: the hash covers the exact bytes that
-        # build the image, including the baked model/effort config, so
-        # candidate identity equals image identity. driver/workspace/secrets
-        # never enter (they change no image bytes; adding them would rebuild
-        # the fleet for nothing) — which is what makes their per-Stack
-        # rebinding free (ADR-0047) — and a type with no model/effort hashes
-        # byte-identically to pre-ADR-0045. The knowledge keys are the BAKED
-        # values: a Flight Deck's reference selects a mount, changes no
-        # image bytes, and so hashes as empty — a knowledge-content edit
-        # must never rebuild or recreate a deck (ADR-0048 amendment); the
-        # selection change recreates it through the injected env instead. A
-        # non-default knowledge target IS a Dockerfile byte (the COPY
-        # destination, ADR-0052) and enters the hash — conditionally, so
-        # every pre-ADR-0052 claude identity stays byte-stable and nothing
-        # retags on upgrade. The rendered materialize instruction is
-        # therefore identity-bearing: its format is frozen by golden tests
-        # here and in the worker package.
+        # CRITICAL (ADR-0044 as amended by ADR-0045/0052/0055): exactly
+        # these four keys — plus ``knowledge_target`` ONLY when it differs
+        # from the historical claude default, plus ``policy``/``policy_pin``
+        # ONLY when a driver type bakes a policy tree — canonical JSON with
+        # sort_keys, over the MATERIALIZED setup: the hash covers the exact
+        # bytes that build the image, including the baked model/effort
+        # config, so candidate identity equals image identity.
+        # driver/workspace/secrets never enter (they change no image bytes;
+        # adding them would rebuild the fleet for nothing) — which is what
+        # makes their per-Stack rebinding free (ADR-0047) — and a type with
+        # no model/effort hashes byte-identically to pre-ADR-0045. The
+        # knowledge and policy keys are the BAKED values: a Flight Deck's
+        # reference selects a mount, changes no image bytes, and so hashes
+        # as empty — a knowledge- or policy-content edit must never rebuild
+        # or recreate a deck (ADR-0048/0055); the selection change recreates
+        # it through the injected env instead. A non-default knowledge
+        # target IS a Dockerfile byte (the COPY destination, ADR-0052) and
+        # enters the hash, and so does a baked policy tree (a COPY plus its
+        # content pin, ADR-0055) — both conditionally, so every pre-existing
+        # identity stays byte-stable and nothing retags on upgrade. The
+        # rendered materialize instruction is therefore identity-bearing:
+        # its format is frozen by golden tests here and in the worker
+        # package.
         identity: dict[str, object] = {
             "base": self.base,
             "setup": list(self.materialized_setup),
@@ -463,6 +531,9 @@ class WorkerTypeDef:
         }
         if self.knowledge_target and self.knowledge_target != _DEFAULT_KNOWLEDGE_TARGET:
             identity["knowledge_target"] = self.knowledge_target
+        if self.baked_policy:
+            identity["policy"] = self.baked_policy
+            identity["policy_pin"] = self.baked_policy_pin
         canonical = json.dumps(identity, sort_keys=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -473,21 +544,25 @@ class WorkerTypeDef:
 
     def recipe_wire(self) -> dict[str, Any]:
         """The derived-image recipe as it rides in the ``images`` wire list.
-        10 keys (8 pre-ADR-0052): ``knowledge`` (the in-repo reference) and
-        ``knowledge_pin`` (the per-tree content pin) replace the retired
-        ``knowledge_source`` pair (ADR-0048) — the node bakes the referenced
-        tree from its applied config-distribution tree after verifying the
-        pin — and ``knowledge_tool``/``knowledge_target`` (ADR-0052) tell
-        the node WHICH per-tool compile of the tree to stage and WHERE the
-        bake COPY lands, both computed control-side from the adapter so the
-        daemon stays adapter-blind (an old daemon ignores them and behaves
-        exactly as before; empty for legacy-layout dists it falls back to
-        the bare tree). The BAKED values ride: a driverless type's recipe
-        carries empty knowledge fields, so the node never bakes under a
-        Flight Deck's volume-shadowed ~/.claude (the deck reads the applied
-        tree through its read-only mount instead). ``setup`` is the
-        MATERIALIZED setup (ADR-0045): the daemon renders one RUN per entry
-        exactly as before."""
+        12 keys (10 pre-ADR-0055, 8 pre-ADR-0052): ``knowledge`` (the
+        in-repo reference) and ``knowledge_pin`` (the per-tree content pin)
+        replace the retired ``knowledge_source`` pair (ADR-0048) — the node
+        bakes the referenced tree from its applied config-distribution tree
+        after verifying the pin — and ``knowledge_tool``/``knowledge_target``
+        (ADR-0052) tell the node WHICH per-tool compile of the tree to stage
+        and WHERE the bake COPY lands, both computed control-side from the
+        adapter so the daemon stays adapter-blind (an old daemon ignores
+        them and behaves exactly as before; empty for legacy-layout dists it
+        falls back to the bare tree). ``policy``/``policy_pin`` (ADR-0055)
+        name the Agent Policy tree the node stages and pin-verifies into the
+        managed drop-in COPY — an old daemon ignores them (its distribution
+        refuses policy/ members anyway: advisory skew). The BAKED values
+        ride: a driverless type's recipe carries empty knowledge AND policy
+        fields, so the node never bakes under a Flight Deck's
+        volume-shadowed state (the deck reads the applied trees through its
+        read-only mounts instead). ``setup`` is the MATERIALIZED setup
+        (ADR-0045): the daemon renders one RUN per entry exactly as
+        before."""
         return {
             "name": self.name,
             "base": self.base,
@@ -496,6 +571,8 @@ class WorkerTypeDef:
             "knowledge_pin": self.baked_knowledge_pin,
             "knowledge_tool": self.knowledge_tool,
             "knowledge_target": self.knowledge_target,
+            "policy": self.baked_policy,
+            "policy_pin": self.baked_policy_pin,
             "tag": self.tag,
             "base_digest": self.base_digest,
             "instruction_hash": self.instruction_hash,
@@ -861,6 +938,17 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
             " type's `knowledge` field (per-Stack knowledge is rejected,"
             f" ADR-0048); edit worker-types/{worker_type}.toml"
         )
+    if "THEOZOLITH_POLICY_TREE" in env:
+        # Per-Stack policy does not exist (ADR-0055): the selection is
+        # worker-type declared and injected control-side — an [env] override
+        # here would silently run one deck under different managed settings
+        # than its type declares.
+        raise ConfigRepoError(
+            f"{context}: [env] THEOZOLITH_POLICY_TREE cannot be set on a"
+            " worker-type Stack — the Agent Policy selection is the worker"
+            " type's `policy` field (per-Stack policy is rejected,"
+            f" ADR-0055); edit worker-types/{worker_type}.toml"
+        )
     for key in ("THEOZOLITH_RUN_IMAGE", "THEOZOLITH_RUN_IMAGE_FILE"):
         # Not inert — the opposite: after ADR-0045 the run-image tag IS the
         # model, so a per-placement override here would silently run a
@@ -1010,6 +1098,44 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                 f" ingest`, which records the content hash in {PINS_FILE}"
                 " (ADR-0048/ADR-0052)"
             )
+    if "policy_pin" in data:
+        raise ConfigRepoError(
+            f"{context}: 'policy_pin' is ingest-computed, never authored"
+            ' (ADR-0055) — declare policy = "policy/<name>" and let'
+            " `theozolith config ingest` record the content hash"
+        )
+    policy = _require_str(data, "policy", context, default="")
+    policy_pin = ""
+    if policy:
+        # The Agent Policy field is claude-only in v1, driver AND driverless
+        # alike (unlike knowledge, whose refusal is deck-shaped): codex has
+        # no managed-settings tier, so a codex type could never consume the
+        # tree — refused here, recorded as out of scope in ADR-0055 §7.
+        if adapter_name != "claude":
+            raise ConfigRepoError(
+                f"{context}: a worker type with adapter {adapter_name!r}"
+                " cannot declare an Agent Policy — policy trees are Claude"
+                " managed-settings drop-ins, and no other adapter has a"
+                " managed-settings tier (ADR-0055)"
+            )
+        policy_tree = policy[len(POLICY_REF_PREFIX) :]
+        if not policy.startswith(POLICY_REF_PREFIX) or not KNOWLEDGE_TREE_NAME.fullmatch(
+            policy_tree
+        ):
+            raise ConfigRepoError(
+                f"{context}: policy reference {policy!r} must be"
+                ' "policy/<name>" with a plain tree name'
+                " (^[A-Za-z0-9][A-Za-z0-9._-]*$) (ADR-0055)"
+            )
+        policy_pin = (pins.policy if pins else {}).get(policy_tree, "")
+        if not policy_pin:
+            raise ConfigRepoError(
+                f"{context}: no ingest-computed pin for {policy!r} — either"
+                " the tree is empty or absent from the Config Repo, or the"
+                " pinned build predates it: re-run `theozolith config"
+                f" ingest`, which records the content hash in {PINS_FILE}"
+                " (ADR-0055)"
+            )
     driver = _require_str(data, "driver", context, default="")
     workspace = _require_str(data, "workspace", context, default="")
     command = _require_str(data, "command", context, default="")
@@ -1090,6 +1216,8 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
         setup=_str_list(data, "setup", context),
         knowledge=knowledge,
         knowledge_pin=knowledge_pin,
+        policy=policy,
+        policy_pin=policy_pin,
         driver=driver,
         adapter=adapter_name,
         model=model,
@@ -1290,6 +1418,14 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
         # the container spec, so changing the selected tree recreates the
         # deck while content edits redistribute live.
         env["THEOZOLITH_KNOWLEDGE_TREE"] = wt.knowledge_tree
+    if wt.policy:
+        # The deck's Agent Policy SELECTION (ADR-0055): the start script
+        # links the managed drop-in dir to exactly this tree under the
+        # read-only policy mount and fails loud when it is absent. Same
+        # contract as knowledge: un-overridable per Stack, part of the
+        # container spec — reselection recreates the deck once, a content
+        # edit redistributes live and recreates nothing.
+        env["THEOZOLITH_POLICY_TREE"] = wt.policy_tree
     env.update(stack.env)
     return StackDef(
         name=stack.name,
@@ -1385,9 +1521,35 @@ def load_config(repo_dir: Path) -> DeployConfig:
     # never later when a Stack first activates them. A dangling knowledge
     # reference fails the same way (ADR-0048): the pin joined above proves a
     # tree was ingested, this proves it is still present to distribute.
+    # Every Agent Policy tree in the pinned build is validated against the
+    # one safe-key allowlist at LOAD as well as at ingest (ADR-0055): the two
+    # sites run the same theozolith_worker.policy validator, so a tree that
+    # reached the pinned build outside ingest (a hand edit, a restore) can
+    # never deliver an unadmitted key to a deck or an image.
+    policy_root = repo_dir / configdist.POLICY_DIR
+    if policy_root.is_dir() and not policy_root.is_symlink():
+        for entry in sorted(policy_root.iterdir(), key=lambda p: p.name):
+            if configdist.excluded_part(entry.name):
+                continue
+            try:
+                agentpolicy.validate_policy_tree(
+                    entry, label=f"{configdist.POLICY_DIR}/{entry.name}"
+                )
+            except agentpolicy.PolicyError as exc:
+                raise ConfigRepoError(str(exc)) from exc
     for wt in worker_types.values():
         if wt.is_driver:
             _resolve_driver_command(wt, repo_dir)
+        if wt.policy and not (repo_dir / wt.policy).is_dir():
+            # A dangling policy reference fails load exactly as a dangling
+            # knowledge reference does (ADR-0055): the pin joined at parse
+            # proves a tree was ingested, this proves it is still present to
+            # distribute.
+            raise ConfigRepoError(
+                f"worker-types/{wt.name}.toml: policy reference {wt.policy!r}"
+                " has no tree in the pinned build — run `theozolith config"
+                " ingest` (ADR-0055)"
+            )
         if wt.knowledge:
             compiled = repo_dir / wt.knowledge / wt.adapter
             # A pre-ADR-0052 pinned build keeps the claude compile directly
