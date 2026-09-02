@@ -552,6 +552,22 @@ volumes = [
     "{stack}-workspace:/workspace",                  # per-instance working tree (snow-maker repo-mount parity)
 ]
 
+# tmpfs /tmp (grilling 2026-09-02, the #109 mitigation): a deck's own workload
+# churns temp files under the container rootfs /tmp (this repo's
+# theozolith-evidence-*, theozolith-ingest-*, pytest-of-* dirs), which lands on
+# the overlay WRITABLE LAYER — the very layer docker's `size` scan walks, and
+# what raced temp-file deletion into a transient dockerd 500 on `docker ps`.
+# A RAM-backed, size-capped tmpfs /tmp moves that churn OFF the overlay layer:
+# invisible to any size scan over the container filesystem, hard-capped (a
+# runaway test gets a clean ENOSPC inside the deck instead of filling the host
+# root), fast, and wiped on recreate — the right semantics for /tmp. The size
+# is a starting point: raise or lower it per node RAM (the host has GBs to
+# spare with decks idling under 1 GB). Applying or changing this entry changes
+# the container spec fingerprint, so it recreates the deck ONCE (the running
+# session is lost) — apply at a quiet moment. The config-side rollout is
+# tracked separately (ozolith-configs#8).
+tmpfs = ["/tmp:size=8g"]
+
 # Secret NAMES only — values live encrypted on the Control Node
 # (`theozolith secret set <name>`), pulled node-scoped, delivered read-only as
 # <ENV>_FILE from tmpfs (never node disk). GITHUB_TOKEN is the dedicated

@@ -63,13 +63,32 @@ class DockerCtl:
     # -- observation ---------------------------------------------------------
 
     def _ps(self, label_filter: str) -> list[dict[str, str]]:
+        # A failed observation is never evidence of absence (NODE-SUBSTRATE
+        # observation doctrine, grilling 2026-09-02): a non-zero exit RAISES
+        # DockerError (check defaults True) rather than coercing to an empty
+        # listing — every consumer that would act destructively on "no
+        # containers" now surfaces the failure instead. NO in-call retry: the
+        # ~60s reconcile pass cadence is the retry.
+        #
+        # The explicit per-field format is deliberate, NOT `{{json .}}`: the
+        # whole-struct form makes the docker CLI request container sizes
+        # (size=1), an overlay-snapshot walk that races this repo's own temp
+        # churn and returns a transient dockerd 500 (the #109 root cause). This
+        # format references no `.Size`, so no size walk happens; the row shape
+        # (name/state/status + flattened labels) is byte-for-byte what every
+        # consumer already reads.
         proc = self._run(
-            ["ps", "--all", "--filter", f"label={label_filter}", "--format", "{{json .}}"],
-            check=False,
+            [
+                "ps",
+                "--all",
+                "--filter",
+                f"label={label_filter}",
+                "--format",
+                '{"Names":{{json .Names}},"State":{{json .State}},'
+                '"Status":{{json .Status}},"Labels":{{json .Labels}}}',
+            ],
             timeout=60,
         )
-        if proc.returncode != 0:
-            return []
         rows = []
         for line in (proc.stdout or "").splitlines():
             try:
@@ -153,6 +172,7 @@ class DockerCtl:
         env: dict[str, str],
         ports: list[str],
         volumes: list[str],
+        tmpfs: list[str] | None = None,
         command: list[str] | None = None,
         spec: str = "",
     ) -> None:
@@ -193,6 +213,12 @@ class DockerCtl:
             args += ["--publish", port]
         for volume in volumes:
             args += ["--volume", volume]
+        # tmpfs mounts (grilling 2026-09-02): each entry is docker's own
+        # `--tmpfs` value syntax (`/path` or `/path:opts`), emitted in declared
+        # order. RAM-backed scratch off the overlay writable layer — invisible
+        # to the size walk that made `docker ps` racy at the source.
+        for entry in tmpfs or []:
+            args += ["--tmpfs", entry]
         args.append(image)
         if command:
             args.extend(command[1:])
@@ -212,14 +238,18 @@ class DockerCtl:
         self._run(args, timeout=600)
 
     def compose_ps(self, project: str) -> list[dict[str, str]]:
-        """Containers of one compose project (status reporting)."""
+        """Containers of one compose project (status reporting).
+
+        Fail-closed like ``_ps`` (observation doctrine): a non-zero exit RAISES
+        rather than coercing to an empty listing. Unlike ``docker ps``, this
+        needs no explicit no-size format — ``docker compose ps`` computes
+        container size only behind its opt-in ``--size``/``-s`` flag (the
+        list-API WithSize option is set only then), so ``--format json`` without
+        it triggers no overlay-snapshot walk (#109 Decisions Section)."""
         proc = self._run(
             ["compose", "--project-name", project, "ps", "--all", "--format", "json"],
-            check=False,
             timeout=60,
         )
-        if proc.returncode != 0:
-            return []
         rows = []
         for line in (proc.stdout or "").splitlines():
             try:
