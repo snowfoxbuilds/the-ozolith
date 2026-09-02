@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended by ADR-0052 (2026-08-26): a second adapter (codex) exists at a deliberately weaker enforcement ceiling — PROBE + STATIC only (baked theozolith-owned config, one driver-boot probe reading the CLI's session rollout journal, per-Run static checks, a benign post-exit observer; no live kill, no effort pairs until proven) — and the identity-hash formula gains a `knowledge_target` key ONLY when it differs from the historical claude default (the "exactly these four keys" clause is amended; every pre-ADR-0052 identity hashes byte-identically).
+Status: ACCEPTED — amended by ADR-0052 (2026-08-26): a second adapter (codex) exists at a deliberately weaker enforcement ceiling — PROBE + STATIC only (baked theozolith-owned config, one driver-boot probe reading the CLI's session rollout journal, per-Run static checks, a benign post-exit observer; no live kill, no effort pairs until proven) — and the identity-hash formula gains a `knowledge_target` key ONLY when it differs from the historical claude default (the "exactly these four keys" clause is amended; every pre-ADR-0052 identity hashes byte-identically). Amended by ADR-0055 (2026-09-02, #95): operator managed-settings policy becomes a reviewed Config Repo tree (Agent Policy, `policy/<name>`), validated at ingest and config load by a safe-key ALLOWLIST strictly stronger than this ADR's conflict scan — only positively classified declarative keys are admitted, each under a recursively closed schema (unknown nested members, wrong types, and extra depth refuse like unclassified top-level keys); identity, steering-env, executable-reference (hooks, helpers, statusLine, plugin/MCP registration), and unclassified keys all refuse, naming file and key — so a live-delivered drop-in can never carry an identity, steering, or executable key; the conflict scan itself keeps its driver-image build-gate site as defense in depth, and the deck needs no runtime content re-scan.
 Date: 2026-08-10 (consolidated 2026-08-14)
 
 # ADR-0045: Model and reasoning effort are typed fields baked into the derived image, held by best effort
@@ -209,3 +209,38 @@ Stated plainly, per the operator ruling:
   subscription credentials and out of scope for the current
   single-operator deployment; revisit if benchmark-grade identity
   integrity becomes load-bearing.
+
+## Amendment (2026-09-02, ADR-0055 / #95 — policy trees are allowlist-validated at ingest)
+
+- **Operator policy has a home.** Managed-settings drop-ins are no longer
+  baked by setup-step heredocs; they live in a Config Repo `policy/<name>`
+  tree referenced by the worker-type definition (Agent Policy). Driver
+  types bake it (the build-time scan here still sees it — codegen copies
+  the tree before the materialize step); Flight Decks mount it live.
+- **Policy trees get a validator strictly stronger than the conflict
+  scan.** This ADR's `scan_managed_conflicts` is a denylist over identity
+  keys — sufficient as a build gate over a directory the operator already
+  owns, insufficient alone for a document delivered live into decks, which
+  could otherwise carry executable or dynamically resolved behavior
+  (`hooks`, `apiKeyHelper`/`awsAuthRefresh`/`awsCredentialExport`/
+  `otelHeadersHelper`, `statusLine`, plugin or MCP-server registration).
+  Ingest and config load therefore run one shared safe-key allowlist
+  validator (ADR-0055 §2) over every policy tree: only positively
+  classified declarative keys are admitted, each validated by a
+  recursively closed schema — every permitted nested member enumerated
+  with its exact type, unknown nested members and wrong types refusing
+  like unclassified top-level keys; identity keys, steering `env`
+  entries, executable-reference keys, and every unclassified key refuse,
+  naming file and key with values redacted.
+  A strict tree shape (top-level `*.json` regular files only) is enforced
+  at the same site. The allowlist is adapter-owned product code and
+  advances only with the deliberate classification review that moves the
+  adapter's validated-CLI set. The build never overwrites operator policy
+  — and operator policy is now reviewed, pinned, and allowlist-validated
+  before any image or deck sees it; the conflict scan keeps its
+  driver-image build-gate site as defense in depth.
+- **No runtime content re-scan on decks.** The deck's model still rides
+  the well-known file and the `--model` flag; a mounted policy tree is
+  trusted on the same basis as `drivers/` code — pinned build plus
+  hash-verified distribution. `DISABLE_AUTOUPDATER` is not a steering key
+  and rides the deck session env when a CLI Pin is declared.
