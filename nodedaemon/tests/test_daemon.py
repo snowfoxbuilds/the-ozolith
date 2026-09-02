@@ -5960,6 +5960,94 @@ def test_policy_export_repairs_local_drift(rig: Rig):
     assert not (export / "stale-extra").exists()  # not in the applied tree
 
 
+def test_policy_export_enumeration_failure_logs_emits_and_survives(rig: Rig):
+    """An export-root failure (the stable path occupied by a plain file, so
+    mkdir raises) logs AND emits a theozolith.error, aborts nothing — the
+    pass completes — and the next pass repairs once the obstruction clears
+    (ADR-0055: export failures are advisory, the export is re-derived
+    state)."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    export = rig.config.policy_export_dir
+    export.parent.mkdir(parents=True, exist_ok=True)
+    export.write_text("not a dir", encoding="utf-8")
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()  # completes — the OSError never escapes the export
+    assert any("policy export enumeration failed" in line for line in rig.logs)
+    assert _find_error(rig, "policy export enumeration failed") is not None
+
+    export.unlink()
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    assert (
+        export / "claude-defaults" / "attribution.json"
+    ).read_text() == '{"attribution": {"sessionUrl": false}}\n'
+
+
+def test_policy_export_copy_failure_is_logged_emitted_and_repaired(rig: Rig, monkeypatch):
+    """A per-tree copy/hash/exchange failure stays logged AND emitted, the
+    pass survives, and the next healthy pass exports the tree — without ever
+    moving the stable export parent (the deck's bind-mount anchor)."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    export = rig.config.policy_export_dir
+    real_copytree = daemon.shutil.copytree
+
+    def failing_copytree(src, dst, **kwargs):
+        if export in Path(dst).parents:
+            raise OSError("injected: no space left on device")
+        return real_copytree(src, dst, **kwargs)
+
+    monkeypatch.setattr(daemon.shutil, "copytree", failing_copytree)
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()  # completes — the OSError never escapes the export
+    assert not (export / "claude-defaults").exists()
+    assert any("policy export 'claude-defaults' failed" in line for line in rig.logs)
+    assert _find_error(rig, "policy export 'claude-defaults' failed") is not None
+    parent_inode = export.stat().st_ino
+
+    monkeypatch.setattr(daemon.shutil, "copytree", real_copytree)
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    assert (export / "claude-defaults" / "attribution.json").is_file()
+    assert export.stat().st_ino == parent_inode  # the mount anchor never moved
+
+
+def test_policy_export_retire_failure_is_logged_emitted_and_retryable(rig: Rig, monkeypatch):
+    """A stale-tree retirement failure logs AND emits, never aborts the pass,
+    and leaves the stale tree in place — honestly enumerable, so the next
+    healthy pass retires it; the stable parent never moves or recreates."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.policy_export_dir
+    parent_inode = export.stat().st_ino
+    stale = export / "claude-defaults"
+    real_replace = daemon.os.replace
+
+    def failing_replace(src, dst, *args, **kwargs):
+        if Path(src) == stale:
+            raise PermissionError(13, "injected EACCES")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(daemon.os, "replace", failing_replace)
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()  # completes — the retire OSError never escapes
+    assert stale.is_dir()  # honest retryable state: still exported
+    assert any("policy export 'claude-defaults' retire failed" in line for line in rig.logs)
+    assert _find_error(rig, "policy export 'claude-defaults' retire failed") is not None
+    assert export.stat().st_ino == parent_inode
+
+    monkeypatch.setattr(daemon.os, "replace", real_replace)
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert not stale.exists()
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+
 def test_policy_recipe_defers_then_builds_once_converged(rig: Rig):
     """End to end (ADR-0055): a policy-referencing recipe defers while the
     node has no verified distribution, then builds in the SAME pass that

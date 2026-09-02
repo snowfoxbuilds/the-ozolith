@@ -65,6 +65,11 @@ from theozolith_nodedaemon import builds
 from theozolith_nodedaemon import configdist as node_configdist
 from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
 
+# Imported as a module and invoked through the attribute — the same shape as
+# ingest and config load — so a single monkeypatch of
+# theozolith_worker.policy.validate_policy_tree observes every site (ADR-0055).
+from theozolith_worker import policy as agentpolicy
+
 from theozolith_control import __version__, configdist, configrepo, ingest
 
 # v2 (ADR-0055): the manifest gained the policy/policy_pin keys, the layout
@@ -550,7 +555,9 @@ def verify_bundle(bundle: str | Path) -> CandidateSummary:
     hash, base-digest consistency, adapter identity, and the identity triple
     — through the production worker-type parse, so every capability gate a
     deployment applies fires here too (the Agent Policy tree recomputes its
-    pin the same way, ADR-0055); (4) reconstruct the production wire
+    pin the same way AND passes the shared safe-key allowlist, ADR-0055 — a
+    matching pin proves byte consistency, never admissibility); (4)
+    reconstruct the production wire
     recipe; (5) regenerate the Dockerfile through the shared production
     codegen and require an exact byte match; (6) validate the layout against
     the allowlist — unexpected entries, symlinks, path traversal, and
@@ -737,10 +744,10 @@ def _verify_knowledge_tree(bundle: Path, manifest: dict) -> None:
 
 def _verify_policy_tree(bundle: Path, manifest: dict) -> None:
     """The Agent Policy half of step 2 (ADR-0055): recompute the baked tree's
-    pin with the daemon's own fail-closed tree hash. An empty policy ref means
-    no policy tree may be present and no pin may be recorded; a driverless
-    manifest can never carry a baked policy (the manifest is the BAKED
-    view)."""
+    pin with the daemon's own fail-closed tree hash, then enforce the shared
+    safe-key allowlist on the tree itself. An empty policy ref means no policy
+    tree may be present and no pin may be recorded; a driverless manifest can
+    never carry a baked policy (the manifest is the BAKED view)."""
     ref = manifest["policy"]
     tree = bundle / POLICY_SUBDIR
     if not ref:
@@ -773,6 +780,16 @@ def _verify_policy_tree(bundle: Path, manifest: dict) -> None:
             f" manifest pins {manifest['policy_pin'][:12]} — tree bytes and"
             " recorded pin disagree"
         )
+    # A matching pin proves BYTE consistency with the recorded manifest, not
+    # policy admissibility — a malicious producer records the pin of whatever
+    # bytes it carries. The verifier distrusts the bundle, so it enforces the
+    # shared safe-key allowlist itself (the same theozolith_worker.policy
+    # validator ingest, config load, and export run); refusals name the file
+    # and dotted key path with values redacted, and precede any Docker use.
+    try:
+        agentpolicy.validate_policy_tree(tree, label=POLICY_SUBDIR)
+    except agentpolicy.PolicyError as exc:
+        raise CandidateError(f"bundle policy tree fails the safe-key allowlist: {exc}") from exc
 
 
 def _reconstruct_worker_type(manifest: dict) -> configrepo.WorkerTypeDef:

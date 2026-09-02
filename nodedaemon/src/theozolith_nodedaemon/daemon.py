@@ -1423,9 +1423,10 @@ class NodeDaemon:
 
         Non-converged (empty applied hash while a distribution IS desired)
         leaves the existing export alone — advisory skew. A RETIRED
-        distribution retires the export with it. Failures log and emit but
-        never fail the pass; the export is re-derived state, repaired next
-        pass."""
+        distribution retires the export with it. Every filesystem failure
+        logs AND emits a theozolith.error (paths and error class only, never
+        drop-in contents) but never fails the pass; the export is re-derived
+        state, repaired next pass."""
         applied = self._current_drivers_hash()
         if not applied:
             if str(self._desired.get("drivers_hash", "") or ""):
@@ -1448,6 +1449,7 @@ class NodeDaemon:
                 current = {e.name for e in it if not e.name.startswith(".")}
         except OSError as exc:
             self._log(f"policy export enumeration failed: {exc}")
+            self._emit_error(type(exc).__name__, f"policy export enumeration failed: {exc}")
             return
         for name, source in desired.items():
             target = export / name
@@ -1475,7 +1477,9 @@ class NodeDaemon:
                 self._reclaim(retired)
                 os.replace(export / stale, retired)
             except OSError as exc:
-                self._log(f"policy export {stale!r} retire failed: {exc}")
+                message = f"policy export {stale!r} retire failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
                 continue
             self._reclaim(retired)
             self._log(f"policy export {stale!r} retired")

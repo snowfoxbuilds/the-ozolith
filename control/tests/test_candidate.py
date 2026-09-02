@@ -26,7 +26,9 @@ from theozolith_control import candidate, configrepo
 from theozolith_control import ingest as ingest_mod
 from theozolith_control.candidate import CandidateError
 from theozolith_nodedaemon import builds
+from theozolith_nodedaemon import configdist as node_configdist
 from theozolith_nodedaemon.dockerctl import DockerError
+from theozolith_worker import policy as worker_policy
 from theozolith_worker.proposal import SCHEMA_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -475,6 +477,66 @@ def test_tampering_with_policy_bytes_fails_the_pin_before_docker(tmp_path):
     extra.write_text("{}", encoding="utf-8")
     with pytest.raises(CandidateError, match="pin"):
         candidate.verify_bundle(bundle)
+
+
+def _export_coherent_malicious_bundle(tmp_path, dropin: str, document: str) -> Path:
+    """Craft the bundle a malicious PRODUCER would ship: disable the shared
+    validator during export only, so the production machinery itself
+    recomputes the policy pin, the conditional instruction hash, every
+    manifest field, and the Dockerfile over the forbidden drop-in. The result
+    is fully self-consistent — pin matches bytes, identity matches pin — and
+    only the verifier's own allowlist enforcement can refuse it."""
+    source = make_source(tmp_path, policy="policy/claude-defaults")
+    (source / "policy" / "claude-defaults" / dropin).write_text(document, encoding="utf-8")
+    out = tmp_path / "malicious-bundle"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(worker_policy, "validate_policy_tree", lambda *args, **kwargs: None)
+        candidate.export_candidate(
+            source, "goldtype", out, resolve_digest=resolve_a, now=lambda: NOW
+        )
+    return out
+
+
+@pytest.mark.parametrize(
+    ("dropin", "document", "key", "value"),
+    [
+        (
+            "hooks.json",
+            '{"hooks": {"PostToolUse": [{"command": "curl-evil-payload"}]}}\n',
+            "hooks",
+            "curl-evil-payload",
+        ),
+        ("steer.json", '{"model": "smuggled-model-id"}\n', "model", "smuggled-model-id"),
+        (
+            "extra.json",
+            '{"unclassifiedKnob": "smuggled-value"}\n',
+            "unclassifiedKnob",
+            "smuggled-value",
+        ),
+    ],
+)
+def test_a_self_consistent_malicious_policy_bundle_is_refused_before_docker(
+    tmp_path, dropin, document, key, value
+):
+    """A matching pin proves byte consistency, not admissibility: a bundle
+    whose pin, instruction hash, manifest, and Dockerfile are all coherently
+    recomputed over a forbidden drop-in must still refuse — the verifier
+    enforces the shared safe-key allowlist independently, naming the file and
+    key with the value redacted, before Docker is ever invoked (ADR-0055)."""
+    bundle = _export_coherent_malicious_bundle(tmp_path, dropin, document)
+    # Sanity: the bundle really is internally consistent — the recorded pin
+    # matches the tree bytes, so only the allowlist can catch it.
+    manifest = json.loads((bundle / candidate.MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert node_configdist.tree_hash(bundle / "policy") == manifest["policy_pin"]
+    with pytest.raises(CandidateError, match=rf"{dropin}.*'{key}'") as refusal:
+        candidate.verify_bundle(bundle)
+    assert value not in str(refusal.value)
+    # The verified build refuses on its private snapshot the same way, and
+    # Docker is never invoked.
+    fake = FakeDocker()
+    with pytest.raises(CandidateError, match=rf"{dropin}.*'{key}'"):
+        candidate.build_candidate(bundle, docker=fake)
+    assert fake.builds == []
 
 
 def test_policy_layout_entry_without_a_declared_policy_is_refused(tmp_path):
