@@ -102,7 +102,11 @@ CREATE TABLE IF NOT EXISTS events (
     pr INTEGER,
     round INTEGER,
     verdict TEXT,
-    component TEXT
+    component TEXT,
+    -- The repository a run/review event acts in (ADR-0055). NULL on rows
+    -- recorded before the column existed: kept as metrics history behind
+    -- the claim-logic fence in live_claims(), never claim input.
+    repo TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue ON events (issue, id);
 CREATE INDEX IF NOT EXISTS events_type ON events (type, id);
@@ -193,8 +197,11 @@ CREATE TABLE IF NOT EXISTS unregistered_nodes (
     beats INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (name, source)
 );
+-- The janitor's append ledger; every coordination row keys on the repo it
+-- acted in (ADR-0055; repo '' = a node-scoped act, e.g. quarantine release).
 CREATE TABLE IF NOT EXISTS janitor_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
     issue INTEGER NOT NULL,
     run_id TEXT NOT NULL,
     worker TEXT NOT NULL,
@@ -203,21 +210,28 @@ CREATE TABLE IF NOT EXISTS janitor_actions (
 );
 -- Write-through claim grants awaiting activation (ADR-0017): a row lives
 -- from the GitHub claim write until the driver's claimed event lands; the
--- janitor releases rows that outlive the activation window.
+-- janitor releases rows that outlive the activation window. Keyed by the
+-- repository the grant was written in (ADR-0055): identical issue numbers
+-- in two Bound Workspaces can never collide.
 CREATE TABLE IF NOT EXISTS grants (
-    issue INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
     worker TEXT NOT NULL,
     node TEXT NOT NULL DEFAULT '',
     login TEXT NOT NULL,
-    granted_at REAL NOT NULL
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (repo, issue)
 );
 -- Driver registration (ADR-0017 prerequisite): each dispatch request
 -- carries the driver's GitHub login; the registry feeds the dashboard.
+-- repo/stack record what the driver's last request named (ADR-0055).
 CREATE TABLE IF NOT EXISTS drivers (
     worker TEXT PRIMARY KEY,
     node TEXT NOT NULL DEFAULT '',
     login TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    stack TEXT NOT NULL DEFAULT '',
     registered_at REAL NOT NULL,
     last_dispatch_at REAL NOT NULL
 );
@@ -234,30 +248,35 @@ CREATE TABLE IF NOT EXISTS node_health (
 -- dashboard without touching GitHub; the row clears when the Worker
 -- resurfaces or the janitor escalates with evidence.
 CREATE TABLE IF NOT EXISTS zombie_flags (
+    repo TEXT NOT NULL,
     issue INTEGER NOT NULL,
     run_id TEXT NOT NULL,
     worker TEXT NOT NULL DEFAULT '',
     node TEXT NOT NULL DEFAULT '',
     flagged_at REAL NOT NULL,
-    PRIMARY KEY (issue, run_id)
+    PRIMARY KEY (repo, issue, run_id)
 );
 -- Malformed coordination states dispatch refuses to launder (ADR-0016):
 -- failed + plan_ready stays refused and visible until a human fixes it.
 CREATE TABLE IF NOT EXISTS malformed_states (
-    issue INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
     detail TEXT NOT NULL,
     first_seen REAL NOT NULL,
-    last_seen REAL NOT NULL
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (repo, issue)
 );
 -- Why a plan_ready dependent is not being granted (ADR-0053): an open
 -- blocker chain still waiting for its go-ahead, or chaining switched off
 -- by the repo's merge settings. Advisory display cache, rebuilt from
 -- GitHub every dispatch pass — never authority.
 CREATE TABLE IF NOT EXISTS dispatch_waits (
-    issue INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
     reason TEXT NOT NULL,
     first_seen REAL NOT NULL,
-    last_seen REAL NOT NULL
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (repo, issue)
 );
 -- Chained dependents of a rejected or abandoned blocker (ADR-0053): the
 -- blocker PR a dependent's Based-on zone names is closed-unmerged or
@@ -265,11 +284,23 @@ CREATE TABLE IF NOT EXISTS dispatch_waits (
 -- GitHub over. Cache-only display rows, re-verified and self-clearing
 -- every base-drift pass.
 CREATE TABLE IF NOT EXISTS chained_dependents (
-    dependent_pr INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    dependent_pr INTEGER NOT NULL,
     blocker_issue INTEGER NOT NULL,
     blocker_pr INTEGER NOT NULL,
     blocker_state TEXT NOT NULL,
     recorded_sha TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (repo, dependent_pr)
+);
+-- Per-repo dispatch pause (ADR-0055): one repo's GitHub trouble degrades
+-- to a recorded reason answer instead of a 500, and never pauses a
+-- sibling repo. Self-clearing: the repo's next successful pass deletes
+-- the row. Advisory display cache in the malformed_states mold.
+CREATE TABLE IF NOT EXISTS dispatch_pauses (
+    repo TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL
 );
@@ -344,8 +375,10 @@ EVICTION_WILDCARD = "*"
 
 @dataclass(frozen=True)
 class LiveClaim:
-    """The latest non-terminal Run event for one issue."""
+    """The latest non-terminal Run event for one (repo, issue) — the claim
+    key since ADR-0055."""
 
+    repo: str
     issue: int
     driver: str  # the worker_id that emitted the Run event (ADR-0020 field)
     node: str
@@ -389,9 +422,37 @@ class Store:
         ):
             if column not in present:
                 self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
+        # The ADR-0055 re-key: every coordination cache table gains repo in
+        # its primary key. These are caches (ADR-0016) rebuilt from GitHub by
+        # the next dispatch/janitor pass, so a pre-ADR-0055 database drops
+        # and recreates them EMPTY — never a backfill (a guessed repo would
+        # be exactly the wrong-repo collision the re-key exists to prevent).
+        grant_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(grants)")}
+        if grant_columns and "repo" not in grant_columns:
+            for table in (
+                "grants",
+                "malformed_states",
+                "dispatch_waits",
+                "zombie_flags",
+                "janitor_actions",
+                "chained_dependents",
+            ):
+                self._db.execute(f"DROP TABLE IF EXISTS {table}")
+            self._db.executescript(_SCHEMA)
+        # drivers is a registry, not a coordination cache: ALTER-add.
+        driver_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(drivers)")}
+        for column in ("repo", "stack"):
+            if driver_columns and column not in driver_columns:
+                self._db.execute(
+                    f"ALTER TABLE drivers ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         event_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(events)")}
         if "component" not in event_columns:  # theozolith.error filter column
             self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
+        if "repo" not in event_columns:
+            # ADR-0055 extracted column. Pre-column rows stay NULL: metrics
+            # history only, fenced out of claim logic in live_claims().
+            self._db.execute("ALTER TABLE events ADD COLUMN repo TEXT")
         if "driver" not in event_columns:
             # ADR-0020 sweep: the run/progress-event actor field became `driver`
             # and the column follows. RENAME carries the old `worker` values
@@ -766,11 +827,12 @@ class Store:
 
         event_type = str(event.get("type", ""))
         issue, phase, node = _int("issue"), _str("phase"), _str("node")
+        repo = _str("repo")
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO events (type, received_at, payload, node, driver, issue,"
-                " run_id, attempt, phase, pr, round, verdict, component)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " run_id, attempt, phase, pr, round, verdict, component, repo)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_type,
                     self._clock(),
@@ -788,14 +850,17 @@ class Store:
                     _int("round"),
                     _str("verdict"),
                     _str("component"),
+                    repo,
                 ),
             )
             if event_type != EVENT_RUN:
                 return
-            if phase == "claimed" and issue is not None:
+            if phase == "claimed" and issue is not None and repo is not None:
                 # Activation: the grant did its job; the events record owns
-                # claim tracking from here (ADR-0017).
-                self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+                # claim tracking from here (ADR-0017). Keyed (repo, issue) —
+                # a repo-less event can never match a keyed grant row, so it
+                # activates nothing (ADR-0055).
+                self._db.execute("DELETE FROM grants WHERE repo = ? AND issue = ?", (repo, issue))
             if node and phase == "failed":
                 self._bump_failures(node, issue, _str("run_id"))
             if node and phase == "pr-open":
@@ -910,18 +975,22 @@ class Store:
         return nodes, components
 
     def live_claims(self) -> list[LiveClaim]:
-        """Issues whose LATEST Run event is non-terminal (claimed/gate)."""
+        """(repo, issue) pairs whose LATEST Run event is non-terminal
+        (claimed/gate/failed). The legacy fence (ADR-0055): rows whose repo
+        is NULL or empty are pre-ADR-0055 events kept as metrics history
+        only — they never enter claim logic."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.issue, e.driver, e.node, e.run_id, e.received_at, e.phase"
+                "SELECT e.repo, e.issue, e.driver, e.node, e.run_id, e.received_at, e.phase"
                 " FROM events e JOIN ("
-                "   SELECT issue, MAX(id) AS latest FROM events"
-                "   WHERE type = ? AND issue IS NOT NULL GROUP BY issue"
+                "   SELECT repo, issue, MAX(id) AS latest FROM events"
+                "   WHERE type = ? AND issue IS NOT NULL GROUP BY repo, issue"
                 " ) last ON e.id = last.latest",
                 (EVENT_RUN,),
             ).fetchall()
         return [
             LiveClaim(
+                repo=r["repo"],
                 issue=r["issue"],
                 driver=r["driver"] or "",
                 node=r["node"] or "",
@@ -929,18 +998,20 @@ class Store:
                 last_event_at=r["received_at"],
             )
             for r in rows
-            if r["phase"] in LIVE_RUN_PHASES
+            if r["phase"] in LIVE_RUN_PHASES and r["repo"]
         ]
 
     def run_states(self) -> list[dict[str, Any]]:
-        """Per issue: the latest Run event, joined with the latest progress
-        telemetry for that run_id (the dashboard's Runs view)."""
+        """Per (repo, issue): the latest Run event, joined with the latest
+        progress telemetry for that run_id (the dashboard's Runs view).
+        ``repo`` may be None on legacy pre-ADR-0055 rows — display keeps
+        them; claim logic (live_claims) does not."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.issue, e.driver, e.node, e.run_id, e.attempt, e.phase, e.pr,"
+                "SELECT e.repo, e.issue, e.driver, e.node, e.run_id, e.attempt, e.phase, e.pr,"
                 " e.received_at FROM events e JOIN ("
-                "   SELECT issue, MAX(id) AS latest FROM events"
-                "   WHERE type = ? AND issue IS NOT NULL GROUP BY issue"
+                "   SELECT repo, issue, MAX(id) AS latest FROM events"
+                "   WHERE type = ? AND issue IS NOT NULL GROUP BY repo, issue"
                 " ) last ON e.id = last.latest ORDER BY e.issue",
                 (EVENT_RUN,),
             ).fetchall()
@@ -955,6 +1026,7 @@ class Store:
                 progress[row["run_id"]] = json.loads(row["payload"])
         return [
             {
+                "repo": r["repo"],
                 "issue": r["issue"],
                 "driver": r["driver"] or "",
                 "node": r["node"] or "",
@@ -1262,15 +1334,33 @@ class Store:
 
     # -- dispatch grants and driver registry (ADR-0017) ------------------------
 
-    def upsert_driver(self, worker: str, node: str, login: str, role: str) -> None:
+    def upsert_driver(
+        self, worker: str, node: str, login: str, role: str, repo: str, stack: str
+    ) -> None:
         now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO drivers (worker, node, login, role, registered_at, last_dispatch_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)"
+                "INSERT INTO drivers"
+                " (worker, node, login, role, repo, stack, registered_at, last_dispatch_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (worker) DO UPDATE SET node = ?, login = ?, role = ?,"
-                " last_dispatch_at = ?",
-                (worker, node, login, role, now, now, node, login, role, now),
+                " repo = ?, stack = ?, last_dispatch_at = ?",
+                (
+                    worker,
+                    node,
+                    login,
+                    role,
+                    repo,
+                    stack,
+                    now,
+                    now,
+                    node,
+                    login,
+                    role,
+                    repo,
+                    stack,
+                    now,
+                ),
             )
 
     def drivers(self) -> list[dict[str, Any]]:
@@ -1278,36 +1368,51 @@ class Store:
             rows = self._db.execute("SELECT * FROM drivers ORDER BY worker").fetchall()
         return [dict(r) for r in rows]
 
-    def record_grant(self, issue: int, worker: str, node: str, login: str) -> None:
+    def record_grant(self, repo: str, issue: int, worker: str, node: str, login: str) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO grants (issue, worker, node, login, granted_at) VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT (issue) DO UPDATE SET worker = ?, node = ?, login = ?,"
+                "INSERT INTO grants (repo, issue, worker, node, login, granted_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (repo, issue) DO UPDATE SET worker = ?, node = ?, login = ?,"
                 " granted_at = ?",
-                (issue, worker, node, login, self._clock(), worker, node, login, self._clock()),
+                (
+                    repo,
+                    issue,
+                    worker,
+                    node,
+                    login,
+                    self._clock(),
+                    worker,
+                    node,
+                    login,
+                    self._clock(),
+                ),
             )
 
-    def granted_issues(self) -> set[int]:
+    def granted_issues(self, repo: str) -> set[int]:
         with self._lock:
-            rows = self._db.execute("SELECT issue FROM grants").fetchall()
+            rows = self._db.execute("SELECT issue FROM grants WHERE repo = ?", (repo,)).fetchall()
         return {r["issue"] for r in rows}
 
     def expired_grants(self, window_seconds: float) -> list[dict[str, Any]]:
-        """Grants past the activation window with no claimed event seen."""
+        """Grants past the activation window with no claimed event seen;
+        each row carries the repo it was granted in."""
         cutoff = self._clock() - window_seconds
         with self._lock:
             rows = self._db.execute(
-                "SELECT issue, worker, node, login, granted_at FROM grants"
-                " WHERE granted_at <= ? ORDER BY issue",
+                "SELECT repo, issue, worker, node, login, granted_at FROM grants"
+                " WHERE granted_at <= ? ORDER BY repo, issue",
                 (cutoff,),
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def release_grant(self, issue: int) -> bool:
+    def release_grant(self, repo: str, issue: int) -> bool:
         """True when the grant row was still there — i.e. the caller won
         the race against a late activation and owns the GitHub unwind."""
         with self._lock, self._db:
-            cursor = self._db.execute("DELETE FROM grants WHERE issue = ?", (issue,))
+            cursor = self._db.execute(
+                "DELETE FROM grants WHERE repo = ? AND issue = ?", (repo, issue)
+            )
         return cursor.rowcount > 0
 
     # -- node health: the quarantine gate (ADR-0016) ---------------------------
@@ -1342,71 +1447,88 @@ class Store:
 
     # -- dashboard flags -------------------------------------------------------
 
-    def flag_zombie(self, issue: int, run_id: str, worker: str, node: str) -> None:
+    def flag_zombie(self, repo: str, issue: int, run_id: str, worker: str, node: str) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT OR IGNORE INTO zombie_flags (issue, run_id, worker, node, flagged_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (issue, run_id, worker, node, self._clock()),
+                "INSERT OR IGNORE INTO zombie_flags (repo, issue, run_id, worker, node, flagged_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, issue, run_id, worker, node, self._clock()),
             )
 
-    def clear_zombie_flag(self, issue: int, run_id: str) -> None:
+    def clear_zombie_flag(self, repo: str, issue: int, run_id: str) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "DELETE FROM zombie_flags WHERE issue = ? AND run_id = ?", (issue, run_id)
+                "DELETE FROM zombie_flags WHERE repo = ? AND issue = ? AND run_id = ?",
+                (repo, issue, run_id),
             )
 
-    def zombie_flags(self) -> list[dict[str, Any]]:
+    def zombie_flags(self, repo: str | None = None) -> list[dict[str, Any]]:
+        """All flags (rows carry repo) or one repo's — the no-argument call
+        stays the /api/v1/flags and dashboard read (ADR-0055)."""
+        query = "SELECT repo, issue, run_id, worker, node, flagged_at FROM zombie_flags"
+        params: tuple = ()
+        if repo is not None:
+            query += " WHERE repo = ?"
+            params = (repo,)
         with self._lock:
-            rows = self._db.execute(
-                "SELECT issue, run_id, worker, node, flagged_at FROM zombie_flags ORDER BY issue"
-            ).fetchall()
+            rows = self._db.execute(query + " ORDER BY repo, issue", params).fetchall()
         return [dict(r) for r in rows]
 
-    def record_malformed(self, issue: int, detail: str) -> None:
+    def record_malformed(self, repo: str, issue: int, detail: str) -> None:
         now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO malformed_states (issue, detail, first_seen, last_seen)"
-                " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT (issue) DO UPDATE SET detail = ?, last_seen = ?",
-                (issue, detail, now, now, detail, now),
+                "INSERT INTO malformed_states (repo, issue, detail, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (repo, issue) DO UPDATE SET detail = ?, last_seen = ?",
+                (repo, issue, detail, now, now, detail, now),
             )
 
-    def clear_malformed(self, issue: int) -> None:
+    def clear_malformed(self, repo: str, issue: int) -> None:
         with self._lock, self._db:
-            self._db.execute("DELETE FROM malformed_states WHERE issue = ?", (issue,))
+            self._db.execute(
+                "DELETE FROM malformed_states WHERE repo = ? AND issue = ?", (repo, issue)
+            )
 
-    def malformed_states(self) -> list[dict[str, Any]]:
+    def malformed_states(self, repo: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT repo, issue, detail, first_seen, last_seen FROM malformed_states"
+        params: tuple = ()
+        if repo is not None:
+            query += " WHERE repo = ?"
+            params = (repo,)
         with self._lock:
-            rows = self._db.execute(
-                "SELECT issue, detail, first_seen, last_seen FROM malformed_states ORDER BY issue"
-            ).fetchall()
+            rows = self._db.execute(query + " ORDER BY repo, issue", params).fetchall()
         return [dict(r) for r in rows]
 
-    def record_wait(self, issue: int, reason: str) -> None:
+    def record_wait(self, repo: str, issue: int, reason: str) -> None:
         now = self._clock()
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO dispatch_waits (issue, reason, first_seen, last_seen)"
-                " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT (issue) DO UPDATE SET reason = ?, last_seen = ?",
-                (issue, reason, now, now, reason, now),
+                "INSERT INTO dispatch_waits (repo, issue, reason, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (repo, issue) DO UPDATE SET reason = ?, last_seen = ?",
+                (repo, issue, reason, now, now, reason, now),
             )
 
-    def clear_wait(self, issue: int) -> None:
+    def clear_wait(self, repo: str, issue: int) -> None:
         with self._lock, self._db:
-            self._db.execute("DELETE FROM dispatch_waits WHERE issue = ?", (issue,))
+            self._db.execute(
+                "DELETE FROM dispatch_waits WHERE repo = ? AND issue = ?", (repo, issue)
+            )
 
-    def dispatch_waits(self) -> list[dict[str, Any]]:
+    def dispatch_waits(self, repo: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT repo, issue, reason, first_seen, last_seen FROM dispatch_waits"
+        params: tuple = ()
+        if repo is not None:
+            query += " WHERE repo = ?"
+            params = (repo,)
         with self._lock:
-            rows = self._db.execute(
-                "SELECT issue, reason, first_seen, last_seen FROM dispatch_waits ORDER BY issue"
-            ).fetchall()
+            rows = self._db.execute(query + " ORDER BY repo, issue", params).fetchall()
         return [dict(r) for r in rows]
 
     def record_chained_dependent(
         self,
+        repo: str,
         dependent_pr: int,
         blocker_issue: int,
         blocker_pr: int,
@@ -1417,12 +1539,13 @@ class Store:
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO chained_dependents"
-                " (dependent_pr, blocker_issue, blocker_pr, blocker_state,"
+                " (repo, dependent_pr, blocker_issue, blocker_pr, blocker_state,"
                 "  recorded_sha, first_seen, last_seen)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT (dependent_pr) DO UPDATE SET blocker_issue = ?,"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (repo, dependent_pr) DO UPDATE SET blocker_issue = ?,"
                 "  blocker_pr = ?, blocker_state = ?, recorded_sha = ?, last_seen = ?",
                 (
+                    repo,
                     dependent_pr,
                     blocker_issue,
                     blocker_pr,
@@ -1438,18 +1561,46 @@ class Store:
                 ),
             )
 
-    def clear_chained_dependent(self, dependent_pr: int) -> None:
+    def clear_chained_dependent(self, repo: str, dependent_pr: int) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "DELETE FROM chained_dependents WHERE dependent_pr = ?", (dependent_pr,)
+                "DELETE FROM chained_dependents WHERE repo = ? AND dependent_pr = ?",
+                (repo, dependent_pr),
             )
 
-    def chained_dependents(self) -> list[dict[str, Any]]:
+    def chained_dependents(self, repo: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT repo, dependent_pr, blocker_issue, blocker_pr, blocker_state,"
+            " recorded_sha, first_seen, last_seen FROM chained_dependents"
+        )
+        params: tuple = ()
+        if repo is not None:
+            query += " WHERE repo = ?"
+            params = (repo,)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY repo, dependent_pr", params).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- per-repo dispatch pause (ADR-0055) -------------------------------------
+
+    def record_dispatch_pause(self, repo: str, reason: str) -> None:
+        now = self._clock()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO dispatch_pauses (repo, reason, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (repo) DO UPDATE SET reason = ?, last_seen = ?",
+                (repo, reason, now, now, reason, now),
+            )
+
+    def clear_dispatch_pause(self, repo: str) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM dispatch_pauses WHERE repo = ?", (repo,))
+
+    def dispatch_pauses(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT dependent_pr, blocker_issue, blocker_pr, blocker_state,"
-                " recorded_sha, first_seen, last_seen"
-                " FROM chained_dependents ORDER BY dependent_pr"
+                "SELECT repo, reason, first_seen, last_seen FROM dispatch_pauses ORDER BY repo"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1668,25 +1819,31 @@ class Store:
 
     # -- janitor records --------------------------------------------------------
 
-    def record_janitor_action(self, issue: int, run_id: str, worker: str, reason: str) -> None:
+    def record_janitor_action(
+        self, repo: str, issue: int, run_id: str, worker: str, reason: str
+    ) -> None:
+        """One ledger entry; ``repo=""`` marks a node-scoped act (quarantine
+        release), never an issue act (ADR-0055)."""
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO janitor_actions (issue, run_id, worker, reason, acted_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (issue, run_id, worker, reason, self._clock()),
+                "INSERT INTO janitor_actions (repo, issue, run_id, worker, reason, acted_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, issue, run_id, worker, reason, self._clock()),
             )
 
-    def janitor_acted(self, issue: int, run_id: str) -> bool:
+    def janitor_acted(self, repo: str, issue: int, run_id: str) -> bool:
         with self._lock:
             row = self._db.execute(
-                "SELECT 1 FROM janitor_actions WHERE issue = ? AND run_id = ?", (issue, run_id)
+                "SELECT 1 FROM janitor_actions WHERE repo = ? AND issue = ? AND run_id = ?",
+                (repo, issue, run_id),
             ).fetchone()
         return row is not None
 
     def janitor_actions(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT issue, run_id, worker, reason, acted_at FROM janitor_actions ORDER BY id"
+                "SELECT repo, issue, run_id, worker, reason, acted_at FROM janitor_actions"
+                " ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
 

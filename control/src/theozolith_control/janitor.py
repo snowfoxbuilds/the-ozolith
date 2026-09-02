@@ -118,9 +118,14 @@ def sweep(
     clock: Callable[[], float] = time.time,
     log=_log,
 ) -> list[int]:
-    """One zombie pass; returns the issues escalated with evidence."""
+    """One zombie pass over ``client``'s repo; returns the issues escalated
+    with evidence. Claims from another repo are skipped (ADR-0055): this
+    pass can only re-verify — and write — against the repo its client
+    speaks for."""
     escalated: list[int] = []
     for claim in store.live_claims():
+        if claim.repo != client.repo:
+            continue
         try:
             if _sweep_one(store, client, claim, grace_seconds, clock, log):
                 escalated.append(claim.issue)
@@ -139,33 +144,34 @@ def _sweep_one(
     clock: Callable[[], float],
     log,
 ) -> bool:
-    if store.janitor_acted(claim.issue, claim.run_id):
+    repo = client.repo
+    if store.janitor_acted(repo, claim.issue, claim.run_id):
         return False  # this Run's zombie claim was already handled
     silence = clock() - _last_seen(store, claim)
     if silence <= grace_seconds:
         # The Worker resurfaced (or never left): drop any stale flag.
-        store.clear_zombie_flag(claim.issue, claim.run_id)
+        store.clear_zombie_flag(repo, claim.issue, claim.run_id)
         return False
 
     # Phase 1: dashboard flag only — GitHub is untouched.
-    store.flag_zombie(claim.issue, claim.run_id, claim.driver, claim.node)
+    store.flag_zombie(repo, claim.issue, claim.run_id, claim.driver, claim.node)
 
     # Events are advisory: GitHub decides what actually needs releasing.
     issue = client.get_issue(claim.issue)
     if IN_PROGRESS not in issue.labels and not issue.assignees:
         store.record_janitor_action(
-            claim.issue, claim.run_id, claim.driver, "claim already released on GitHub"
+            repo, claim.issue, claim.run_id, claim.driver, "claim already released on GitHub"
         )
-        store.clear_zombie_flag(claim.issue, claim.run_id)
+        store.clear_zombie_flag(repo, claim.issue, claim.run_id)
         return False
     pr = client.find_open_pr_by_head(branch_for(claim.issue))
     if pr is not None and PR_READY in pr.labels:
         # A shipped PR awaits the Reviewer; the Run did not die mid-flight
         # (or its death no longer matters). Never touch the claim under it.
         store.record_janitor_action(
-            claim.issue, claim.run_id, claim.driver, f"skipped: PR #{pr.number} is pr_ready"
+            repo, claim.issue, claim.run_id, claim.driver, f"skipped: PR #{pr.number} is pr_ready"
         )
-        store.clear_zombie_flag(claim.issue, claim.run_id)
+        store.clear_zombie_flag(repo, claim.issue, claim.run_id)
         return False
 
     # Phase 2: evidence first. No bundle yet = the driver has not
@@ -185,8 +191,8 @@ def _sweep_one(
         f" (grace {grace_seconds:.0f}s); run {claim.run_id or 'unknown'} escalated"
         f" {FAILED} + {NEEDS_HUMAN} with swept evidence"
     )
-    store.record_janitor_action(claim.issue, claim.run_id, claim.driver, reason)
-    store.clear_zombie_flag(claim.issue, claim.run_id)
+    store.record_janitor_action(repo, claim.issue, claim.run_id, claim.driver, reason)
+    store.clear_zombie_flag(repo, claim.issue, claim.run_id)
     log(f"janitor: issue #{claim.issue} escalated ({reason})")
     return True
 
@@ -236,19 +242,21 @@ def sweep_base_drift(
             log(f"janitor: base-drift check for PR #{pr.number} failed: {exc}")
     # Display rows for PRs that left the open pool (merged, closed) clear
     # here — the condition can no longer be re-verified, so it no longer
-    # holds.
-    for row in store.chained_dependents():
+    # holds. Scoped to this client's repo (ADR-0055): a sibling repo's rows
+    # are another pass's to reconcile.
+    for row in store.chained_dependents(client.repo):
         if row["dependent_pr"] not in seen:
-            store.clear_chained_dependent(row["dependent_pr"])
+            store.clear_chained_dependent(client.repo, row["dependent_pr"])
     return acted
 
 
 def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool:
+    repo = client.repo
     based = basedon.parse_zone(pr.body)
     if based is None:
         # No zone (main-based, or a retargeted round removed it): nothing
         # to watch; drop any stale display row.
-        store.clear_chained_dependent(pr.number)
+        store.clear_chained_dependent(repo, pr.number)
         return False
     blocker_branch = branch_for(based.issue)
     blocker_pr = client.find_pr_by_head(blocker_branch, state="all")
@@ -264,7 +272,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
             rejected = "blocked"
     if rejected:
         store.record_chained_dependent(
-            pr.number, based.issue, blocker_pr.number, rejected, based.sha
+            repo, pr.number, based.issue, blocker_pr.number, rejected, based.sha
         )
         # A rejected or blocked blocker is a HUMAN-OWNED condition: once a
         # human (or the one-strike lane) has put the blocker itself on
@@ -274,7 +282,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
         # under machine noise. Visibility only, no GitHub write, until the
         # blocker is open and unblocked again.
         return False
-    store.clear_chained_dependent(pr.number)
+    store.clear_chained_dependent(repo, pr.number)
 
     # The drift lane's trigger (ADR-0053): dependent open with a zone
     # (established above), blocker PR still OPEN and NOT blocked (ruled out
@@ -290,9 +298,9 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
     # SHA-pair key lets a NEW drift after a human unblock act again while
     # the same drift never double-writes.
     key = f"base-drift-{based.sha[:12]}-{tip[:12]}"
-    if store.janitor_acted(pr.number, key):
+    if store.janitor_acted(repo, pr.number, key):
         return False
-    comment_recorded = store.janitor_acted(pr.number, f"{key}-comment")
+    comment_recorded = store.janitor_acted(repo, pr.number, f"{key}-comment")
     if BLOCKED in pr.labels:
         if comment_recorded:
             # Interruption recovery: GitHub state (the label is on) plus
@@ -302,6 +310,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
             # and the ledger write. Heal the ledger with NO GitHub write,
             # so a later human unblock is final for this pair.
             store.record_janitor_action(
+                repo,
                 pr.number,
                 key,
                 "",
@@ -321,7 +330,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
     if not comment_recorded:
         client.add_comment(pr.number, _drift_comment(based, blocker_pr.number, tip))
         store.record_janitor_action(
-            pr.number, f"{key}-comment", "", f"base-drift forensic comment on PR #{pr.number}"
+            repo, pr.number, f"{key}-comment", "", f"base-drift forensic comment on PR #{pr.number}"
         )
     client.add_labels(pr.number, BLOCKED, NEEDS_HUMAN)
     reason = (
@@ -329,7 +338,7 @@ def _drift_one(store: Store, client: GitHubClient, pr: PullRequest, log) -> bool
         f" #{blocker_pr.number}) moved {based.sha[:12]} -> {tip[:12]};"
         f" escalated {BLOCKED} + {NEEDS_HUMAN} (ADR-0053, no auto-repair)"
     )
-    store.record_janitor_action(pr.number, key, "", reason)
+    store.record_janitor_action(repo, pr.number, key, "", reason)
     log(f"janitor: {reason}")
     return True
 
@@ -342,22 +351,28 @@ def release_never_activated(
     log=_log,
 ) -> list[int]:
     """Unwind grants with no claimed event inside the activation window
-    (ADR-0017): the Control Node wrote these claims, so it reverts them."""
+    (ADR-0017): the Control Node wrote these claims, so it reverts them.
+    Grant rows are (repo, issue)-keyed (ADR-0055): every store call uses
+    the row's own repo, and rows from another repo are skipped — this
+    pass's GitHub unwind can only address the repo its client speaks for
+    (an issue number means nothing outside its repo)."""
     released: list[int] = []
-    live = {claim.issue for claim in store.live_claims()}
+    live = {(claim.repo, claim.issue) for claim in store.live_claims()}
     for grant in store.expired_grants(window_seconds):
-        number = grant["issue"]
-        if number in live:
+        repo, number = grant["repo"], grant["issue"]
+        if repo != client.repo:
+            continue
+        if (repo, number) in live:
             # A claimed event exists after all (activation raced or a
             # retried release re-recorded the grant): the claim is real,
             # only the bookkeeping row goes.
-            store.release_grant(number)
+            store.release_grant(repo, number)
             continue
         try:
             # Deleting the grant row FIRST decides the race against a
             # late-landing activation: whoever removes the row owns the
             # issue's fate, so an activated claim is never unwound.
-            if not store.release_grant(number):
+            if not store.release_grant(repo, number):
                 continue
             issue = client.get_issue(number)
             for login in issue.assignees:
@@ -367,10 +382,11 @@ def release_never_activated(
         except Exception as exc:
             # Put the row back so the next pass retries: a half-unwound
             # claim with no grant row would be invisible to every reaper.
-            store.record_grant(number, grant["worker"], grant["node"], grant["login"])
+            store.record_grant(repo, number, grant["worker"], grant["node"], grant["login"])
             log(f"janitor: releasing grant for #{number} failed (will retry): {exc}")
             continue
         store.record_janitor_action(
+            repo,
             number,
             "(never-activated)",
             grant["worker"],

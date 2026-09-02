@@ -708,12 +708,13 @@ def _check_jobs_dirs(stacks: tuple[StackDef, ...]) -> None:
             claims[(stack.node, path)] = stack.name
 
 
-def _valid_workspace(value: str) -> bool:
+def valid_workspace(value: str) -> bool:
     """The documented workspace shape: exactly two non-empty path components
     (``owner/name``). Deliberately NOT GitHub's full naming policy — only the
     two-component promise the schema makes. Rejects ``/repo``, ``owner/``,
     ``owner/repo/extra``, ``///``, and any empty or whitespace-only
-    component (ADR-0044 amendment)."""
+    component (ADR-0044 amendment). Public since ADR-0055: the dispatch
+    endpoint validates the request's ``repo`` with the same predicate."""
     parts = value.split("/")
     return len(parts) == 2 and all(part.strip() for part in parts)
 
@@ -826,7 +827,7 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
     # Per-placement target-repo binding (ADR-0047): overrides the type's
     # workspace default at resolution.
     workspace = _require_str(data, "workspace", context, default="")
-    if workspace and not _valid_workspace(workspace):
+    if workspace and not valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"
@@ -1071,7 +1072,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
             f" {adapter_name!r} cannot bake a model/effort — no"
             f" {adapter_name} Flight Deck exists (ADR-0052)"
         )
-    if workspace and not _valid_workspace(workspace):
+    if workspace and not valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"

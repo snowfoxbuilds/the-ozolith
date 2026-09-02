@@ -62,11 +62,27 @@ class LiveControl:
         else:
             self.node_token = secret_store.mint_node_token(NODE_NAME)
             token_copy.write_text(self.node_token)
-        github = GitHubClient(
-            harness.fake.repo, "tok-control", transport=harness.fake, sleep=lambda s: None
-        )
+        self.repo = harness.fake.repo
+        # The daemon-less harness config defaults its stack to the role;
+        # LiveControl has no Config Repo, so dispatch is the fail-open dev
+        # door and any Stack name verifies trivially (ADR-0055).
+        self.stack = harness.worker_config.stack
+        clients: dict[str, GitHubClient] = {}
+
+        def github_clients(repo: str) -> GitHubClient:
+            # Per-repo factory (ADR-0055) over the harness's one fake GitHub.
+            if repo not in clients:
+                clients[repo] = GitHubClient(
+                    repo, "tok-control", transport=harness.fake, sleep=lambda s: None
+                )
+            return clients[repo]
+
         app = create_app(
-            settings, self.store, secret_store, SecretBox(generate_key()), github_client=github
+            settings,
+            self.store,
+            secret_store,
+            SecretBox(generate_key()),
+            github_clients=github_clients,
         )
         self._server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
@@ -95,7 +111,9 @@ class LiveControl:
         return ControlNodeSink(self.url, token=self.node_token, timeout=2.0)
 
     def dispatch(self, timeout: float = 5.0) -> DispatchClient:
-        return DispatchClient(self.url, self.node_token, timeout=timeout)
+        return DispatchClient(
+            self.url, self.node_token, repo=self.repo, stack=self.stack, timeout=timeout
+        )
 
     def run_phases(self, issue: int) -> list[str]:
         return [e["phase"] for e in self.store.events(type="theozolith.run", issue=issue)]
@@ -148,8 +166,16 @@ def test_live_dispatch_claims_on_github_before_the_driver_acts(harness: Harness,
         assert claim_writers == {CONTROL_LOGIN}
         assert harness.fake.assignees_of(issue) == ["ozolith-worker-a"]
         # Activation: the claimed event landed, so the grant is retired.
-        assert live.store.granted_issues() == set()
+        assert live.store.granted_issues(harness.fake.repo) == set()
         assert live.run_phases(issue) == ["claimed", "gate", "pr-open"]
+        # The request named its repo and Stack (ADR-0055): the registry
+        # recorded them, and the fail-closed event ingest accepted the
+        # repo-carrying run events end to end.
+        (driver_row,) = live.store.drivers()
+        assert driver_row["repo"] == harness.fake.repo
+        assert driver_row["stack"] == harness.worker_config.stack
+        run_events = live.store.events(type="theozolith.run", issue=issue)
+        assert run_events and all(e["repo"] == harness.fake.repo for e in run_events)
 
     pr = harness.worker_client.find_open_pr_by_head(f"ozolith/issue-{issue}")
     assert pr is not None
@@ -190,7 +216,9 @@ def test_dead_control_node_pauses_new_claims(harness: Harness):
     """ADR-0017: no second claim path — a dead Control Node means no new
     claims, and the issue is left exactly as it was."""
     issue = harness.file_issue("waiting", "nobody claims me")
-    dispatch = DispatchClient(DEAD_URL, "any-token", timeout=0.3)
+    dispatch = DispatchClient(
+        DEAD_URL, "any-token", repo=harness.fake.repo, stack="implementer", timeout=0.3
+    )
     sink = ControlNodeSink(DEAD_URL, token="any-token", timeout=0.3)
 
     assert worker_once(harness, sink=sink, dispatch=dispatch) == 0

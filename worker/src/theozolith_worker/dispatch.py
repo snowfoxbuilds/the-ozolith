@@ -55,6 +55,12 @@ class WorkDispatch(Protocol):
 class DispatchClient:
     """POSTs /api/v1/dispatch; every failure mode is a clean pause.
 
+    Every request names ``repo`` (the repository this Driver will check out)
+    and ``stack`` (the Stack it runs as) — the Claim Protocol is keyed by
+    repository and the Control Node verifies the pair against the Pinned
+    Build (ADR-0055). Adding the required keyword-only constructor arguments
+    is a release-note-class ``theozolith_worker.api`` change (ADR-0042).
+
     ``on_error(error_class, message)`` is the theozolith.error hook (2026-07-21
     grilling): the drivers wire it to their event sink so dispatch failures
     surface on the dashboard. Best-effort — when the Control Node itself is
@@ -67,6 +73,8 @@ class DispatchClient:
         url: str,
         token: str,
         *,
+        repo: str,
+        stack: str,
         ca: str | None = None,
         timeout: float = 15.0,
         log=None,
@@ -74,6 +82,8 @@ class DispatchClient:
     ):
         self._url = url.rstrip("/") + "/api/v1/dispatch"
         self._token = token
+        self._repo = repo
+        self._stack = stack
         self._ca = ca
         self._timeout = timeout
         self._log = log
@@ -113,7 +123,16 @@ class DispatchClient:
         return answer if isinstance(answer, dict) else None
 
     def request_work(self, worker: str, node: str, login: str) -> dict[str, Any] | None:
-        answer = self._post({"role": "implementer", "driver": worker, "node": node, "login": login})
+        answer = self._post(
+            {
+                "role": "implementer",
+                "driver": worker,
+                "node": node,
+                "login": login,
+                "repo": self._repo,
+                "stack": self._stack,
+            }
+        )
         if answer is None:
             return None
         issue = answer.get("issue")
@@ -131,7 +150,16 @@ class DispatchClient:
         return issue
 
     def review_targets(self, worker: str, node: str, login: str) -> list[int] | None:
-        answer = self._post({"role": "reviewer", "driver": worker, "node": node, "login": login})
+        answer = self._post(
+            {
+                "role": "reviewer",
+                "driver": worker,
+                "node": node,
+                "login": login,
+                "repo": self._repo,
+                "stack": self._stack,
+            }
+        )
         if answer is None:
             return None
         prs = answer.get("prs")

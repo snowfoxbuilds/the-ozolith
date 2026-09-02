@@ -40,6 +40,7 @@ reconciles to what GitHub answers at grant time, never the reverse.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from theozolith_worker import deps
@@ -91,11 +92,17 @@ class _PassReads:
 
 
 class Dispatcher:
-    """One serialized grant path for the whole fleet (ADR-0017)."""
+    """One serialized grant path for the whole fleet (ADR-0017).
 
-    def __init__(self, store: Store, client: GitHubClient, *, log=_log):
+    Every request names the repository the Driver will check out (ADR-0055):
+    the GitHub client is resolved per call through ``client_factory`` — a
+    memoized per-repo factory over the one control PAT and api_url (v1
+    doctrine: one GitHub host, one control PAT per Control Node). The single
+    global lock stays: grants across every Bound Workspace serialize on it."""
+
+    def __init__(self, store: Store, client_factory: Callable[[str], GitHubClient], *, log=_log):
         self._store = store
-        self._client = client
+        self._client_factory = client_factory
         self._log = log
         self._lock = threading.Lock()
 
@@ -137,7 +144,11 @@ class Dispatcher:
         )
 
     def _dependency_block(
-        self, issue_number: int, reads: _PassReads, settings_cache: list[RepoMergeSettings]
+        self,
+        client: GitHubClient,
+        issue_number: int,
+        reads: _PassReads,
+        settings_cache: list[RepoMergeSettings],
     ) -> tuple[str, str] | None:
         """The ADR-0053 eligibility lanes: None when every Dependency Edge
         is satisfied (or none exist); otherwise ``("malformed" | "wait",
@@ -163,29 +174,42 @@ class Dispatcher:
             ) from exc
         if closure.order == (issue_number,):
             return None  # edge-less: the exact pre-ADR-0053 path
-        decision = deps.resolve(reads, closure, self._client.default_branch())
+        decision = deps.resolve(reads, closure, client.default_branch())
         if decision.kind == deps.MALFORMED:
             return ("malformed", decision.reason)
         if decision.kind == deps.WAIT:
             return ("wait", decision.reason)
         if decision.kind == deps.CHAINED:
             if not settings_cache:
-                settings_cache.append(self._client.repo_merge_settings())
+                settings_cache.append(client.repo_merge_settings())
             off = deps.chain_preconditions(settings_cache[0])
             if off is not None:
                 return ("wait", f"{off}; dependents wait for full merge (ADR-0053)")
         return None
 
     def grant_work(
-        self, worker: str, node: str, login: str, *, pin: str = "", drivers_hash: str = ""
+        self,
+        repo: str,
+        worker: str,
+        node: str,
+        login: str,
+        *,
+        stack: str = "",
+        pin: str = "",
+        drivers_hash: str = "",
     ) -> dict[str, Any]:
-        """Grant one issue to ``worker`` (write-through), or explain why not.
+        """Grant one issue in ``repo`` to ``worker`` (write-through), or
+        explain why not.
 
         Returns ``{"issue": {...}}`` on a grant and ``{"issue": None}``
-        (with an optional ``reason``) otherwise.
+        (with an optional ``reason``) otherwise. GitHub trouble anywhere in
+        the pass — the listing, a dependency read, a mid-grant write — is a
+        recorded per-repo dispatch pause answered as a reason, never a 500
+        (ADR-0055); the repo's next pass that completes its GitHub reads
+        clears the pause. A sibling repo's pass is untouched either way.
         """
         with self._lock:
-            self._store.upsert_driver(worker, node, login, "implementer")
+            self._store.upsert_driver(worker, node, login, "implementer", repo, stack)
             quarantine = self._store.node_quarantine(node)
             if quarantine is not None:
                 return {"issue": None, "reason": f"node {node!r} quarantined: {quarantine}"}
@@ -202,107 +226,144 @@ class Dispatcher:
                     "reason": f"node {node!r} has pending {'/'.join(pending)}; no new work",
                 }
 
-            granted = self._store.granted_issues()
-            live = {claim.issue for claim in self._store.live_claims()}
-            candidates = self._client.list_open_issues(PLAN_READY)
-            # Advisory rows describe the plan_ready pool: an issue that
-            # left it (closed, label removed, claimed) takes its wait and
-            # malformed rows with it — otherwise the dashboard shows a
-            # departed issue "waiting" forever. Rows for issues still in
-            # the pool are reconciled lane by lane below.
-            listed = {candidate.number for candidate in candidates}
-            for row in self._store.malformed_states():
-                if row["issue"] not in listed:
-                    self._store.clear_malformed(row["issue"])
-            for row in self._store.dispatch_waits():
-                if row["issue"] not in listed:
-                    self._store.clear_wait(row["issue"])
-            flagged = {row["issue"] for row in self._store.malformed_states()}
-            waiting = {row["issue"] for row in self._store.dispatch_waits()}
-            # Pass-scoped read caches: the merge settings are fetched
-            # lazily at most once per pass (only a pass that reaches a
-            # chained candidate reads them), and dependency reads are
-            # memoized across candidates sharing a blocker chain.
-            settings_cache: list[RepoMergeSettings] = []
-            reads = _PassReads(self._client)
-            for issue in candidates:
-                if FAILED in issue.labels:
-                    detail = "carries failed + plan_ready; dispatch refuses to grant (ADR-0016)"
-                    self._store.record_malformed(issue.number, detail)
-                    if issue.number in waiting:
-                        self._store.clear_wait(issue.number)  # superseded by the flag
-                    self._log(f"dispatch: issue #{issue.number} {detail}")
-                    continue
-                if issue.assignees or IN_PROGRESS in issue.labels:
-                    continue  # spoken for on GitHub (hand-edited labels stay meaningful)
-                if issue.number in granted or issue.number in live:
-                    continue
-                block = self._dependency_block(issue.number, reads, settings_cache)
-                if block is not None:
-                    lane, detail = block
-                    # The lanes reconcile each other: an issue is malformed
-                    # OR waiting, never both — a waiting dependent whose
-                    # blocker was closed not_planned moves lanes cleanly.
-                    if lane == "malformed":
-                        self._store.record_malformed(issue.number, detail)
-                        if issue.number in waiting:
-                            self._store.clear_wait(issue.number)
-                    else:
-                        self._store.record_wait(issue.number, detail)
-                        if issue.number in flagged:
-                            self._store.clear_malformed(issue.number)
-                    self._log(f"dispatch: issue #{issue.number} {lane}: {detail}")
-                    continue
-                # The candidate passed every malformed and wait lane: stale
-                # flags clear here (a human fixed the labels or the graph,
-                # or the chain's go-ahead arrived) — and only here.
-                if issue.number in flagged:
-                    self._store.clear_malformed(issue.number)
-                if issue.number in waiting:
-                    self._store.clear_wait(issue.number)
+            client = self._client_factory(repo)
+            try:
+                answer = self._granting_pass(client, repo, worker, node, login)
+            except GitHubError as exc:
+                # The ADR-0053 dependency-read re-raise lands here too: its
+                # distinct fail-loud reason text rides str(exc) unchanged.
+                reason = f"dispatch paused for {repo}: {exc}"
+                self._store.record_dispatch_pause(repo, str(exc))
+                self._log(f"dispatch: {reason}")
+                return {"issue": None, "reason": reason}
+            self._store.clear_dispatch_pause(repo)
+            return answer
 
-                # The grant row lands BEFORE the GitHub writes: if any write
-                # fails midway (or this process dies), the janitor's
-                # never-activated release finds the row and unwinds whatever
-                # landed — a half-written claim is never orphaned.
-                self._store.record_grant(issue.number, worker, node, login)
-                self._client.add_assignees(issue.number, login)
-                self._client.add_labels(issue.number, IN_PROGRESS)
-                self._client.remove_label(issue.number, PLAN_READY)
-                self._log(f"dispatch: issue #{issue.number} granted to {worker} ({login})")
-                return {
-                    "issue": {
-                        "number": issue.number,
-                        "title": issue.title,
-                        "body": issue.body,
-                        "labels": sorted((issue.labels | {IN_PROGRESS}) - {PLAN_READY}),
-                    }
+    def _granting_pass(
+        self, client: GitHubClient, repo: str, worker: str, node: str, login: str
+    ) -> dict[str, Any]:
+        """The GitHub-touching body of one implementer pass, scoped to
+        ``repo``: advisory-row reconciliation touches only this repo's rows
+        (a sibling repo's flags and waits are never cleared here)."""
+        granted = self._store.granted_issues(repo)
+        live = {claim.issue for claim in self._store.live_claims() if claim.repo == repo}
+        candidates = client.list_open_issues(PLAN_READY)
+        # Advisory rows describe the plan_ready pool: an issue that
+        # left it (closed, label removed, claimed) takes its wait and
+        # malformed rows with it — otherwise the dashboard shows a
+        # departed issue "waiting" forever. Rows for issues still in
+        # the pool are reconciled lane by lane below.
+        listed = {candidate.number for candidate in candidates}
+        for row in self._store.malformed_states(repo):
+            if row["issue"] not in listed:
+                self._store.clear_malformed(repo, row["issue"])
+        for row in self._store.dispatch_waits(repo):
+            if row["issue"] not in listed:
+                self._store.clear_wait(repo, row["issue"])
+        flagged = {row["issue"] for row in self._store.malformed_states(repo)}
+        waiting = {row["issue"] for row in self._store.dispatch_waits(repo)}
+        # Pass-scoped read caches: the merge settings are fetched
+        # lazily at most once per pass (only a pass that reaches a
+        # chained candidate reads them), and dependency reads are
+        # memoized across candidates sharing a blocker chain.
+        settings_cache: list[RepoMergeSettings] = []
+        reads = _PassReads(client)
+        for issue in candidates:
+            if FAILED in issue.labels:
+                detail = "carries failed + plan_ready; dispatch refuses to grant (ADR-0016)"
+                self._store.record_malformed(repo, issue.number, detail)
+                if issue.number in waiting:
+                    self._store.clear_wait(repo, issue.number)  # superseded by the flag
+                self._log(f"dispatch: issue #{issue.number} {detail}")
+                continue
+            if issue.assignees or IN_PROGRESS in issue.labels:
+                continue  # spoken for on GitHub (hand-edited labels stay meaningful)
+            if issue.number in granted or issue.number in live:
+                continue
+            block = self._dependency_block(client, issue.number, reads, settings_cache)
+            if block is not None:
+                lane, detail = block
+                # The lanes reconcile each other: an issue is malformed
+                # OR waiting, never both — a waiting dependent whose
+                # blocker was closed not_planned moves lanes cleanly.
+                if lane == "malformed":
+                    self._store.record_malformed(repo, issue.number, detail)
+                    if issue.number in waiting:
+                        self._store.clear_wait(repo, issue.number)
+                else:
+                    self._store.record_wait(repo, issue.number, detail)
+                    if issue.number in flagged:
+                        self._store.clear_malformed(repo, issue.number)
+                self._log(f"dispatch: issue #{issue.number} {lane}: {detail}")
+                continue
+            # The candidate passed every malformed and wait lane: stale
+            # flags clear here (a human fixed the labels or the graph,
+            # or the chain's go-ahead arrived) — and only here.
+            if issue.number in flagged:
+                self._store.clear_malformed(repo, issue.number)
+            if issue.number in waiting:
+                self._store.clear_wait(repo, issue.number)
+
+            # The grant row lands BEFORE the GitHub writes: if any write
+            # fails midway (or this process dies), the janitor's
+            # never-activated release finds the row and unwinds whatever
+            # landed — a half-written claim is never orphaned. A GitHubError
+            # here rides the pause path, and the row stays for that release.
+            self._store.record_grant(repo, issue.number, worker, node, login)
+            client.add_assignees(issue.number, login)
+            client.add_labels(issue.number, IN_PROGRESS)
+            client.remove_label(issue.number, PLAN_READY)
+            self._log(f"dispatch: issue #{issue.number} granted to {worker} ({login})")
+            return {
+                "issue": {
+                    "number": issue.number,
+                    "title": issue.title,
+                    "body": issue.body,
+                    "labels": sorted((issue.labels | {IN_PROGRESS}) - {PLAN_READY}),
                 }
-            return {"issue": None}
+            }
+        return {"issue": None}
 
     def review_targets(
-        self, worker: str, node: str, login: str, *, pin: str = "", drivers_hash: str = ""
+        self,
+        repo: str,
+        worker: str,
+        node: str,
+        login: str,
+        *,
+        stack: str = "",
+        pin: str = "",
+        drivers_hash: str = "",
     ) -> dict[str, Any]:
-        """Discovery for the Reviewer: reviewable pr_ready PRs, no writes.
-        The pin-eligibility gate applies here too — an off-pin node burns
-        review rounds on the wrong product version — as does the identical
-        config-distribution gate (ADR-0042).
+        """Discovery for the Reviewer: reviewable pr_ready PRs in ``repo``,
+        no writes. The pin-eligibility gate applies here too — an off-pin
+        node burns review rounds on the wrong product version — as does the
+        identical config-distribution gate (ADR-0042). A failing listing is
+        the same per-repo dispatch pause as the implementer side (ADR-0055).
 
         The listing arrives oldest-first (the client passes
         sort=created&direction=asc) and the order is passed through
         untouched: oldest-first Reviewer discovery is load-bearing for
         chains — a blocker must be reviewed before its dependents'
         Chained Base go-ahead can hold (ADR-0053)."""
-        self._store.upsert_driver(worker, node, login, "reviewer")
+        self._store.upsert_driver(worker, node, login, "reviewer", repo, stack)
         version_block = self._version_block(node, pin)
         if version_block is not None:
             return {"prs": [], "reason": version_block}
         drivers_block = self._drivers_block(node, drivers_hash)
         if drivers_block is not None:
             return {"prs": [], "reason": drivers_block}
-        numbers = [
-            candidate.number
-            for candidate in self._client.list_open_prs_by_label(PR_READY)
-            if reviewable(candidate.labels)
-        ]
+        client = self._client_factory(repo)
+        try:
+            numbers = [
+                candidate.number
+                for candidate in client.list_open_prs_by_label(PR_READY)
+                if reviewable(candidate.labels)
+            ]
+        except GitHubError as exc:
+            reason = f"dispatch paused for {repo}: {exc}"
+            self._store.record_dispatch_pause(repo, str(exc))
+            self._log(f"dispatch: {reason}")
+            return {"prs": [], "reason": reason}
+        self._store.clear_dispatch_pause(repo)
         return {"prs": numbers}

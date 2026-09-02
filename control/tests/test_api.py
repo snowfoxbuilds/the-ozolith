@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import threading
 
-from controlrig import ADMIN_TOKEN, ControlRig, make_rig, run_event
+from controlrig import (
+    ADMIN_TOKEN,
+    ControlRig,
+    FakeGitHubLite,
+    make_rig,
+    review_event,
+    run_event,
+)
+from theozolith_worker.githubapi import GitHubError
 
 # A driver worker type + the thin Stack that names it (ADR-0044). The
 # resolved Stack is an ordinary process Stack: command/env/secrets come from
@@ -175,6 +183,37 @@ def test_unknown_event_types_are_accepted_and_stored(control: ControlRig):
 
 def test_events_require_a_type(control: ControlRig):
     assert control.node_post("/api/v1/events", {"phase": "claimed"}).status_code == 400
+
+
+def test_run_and_review_events_require_a_repo(control: ControlRig):
+    """ADR-0055 fail-closed ingest, no compatibility fallback: a repo-less
+    run or review event can never key a coordination cache row, so it is
+    refused outright; progress and error telemetry are unchanged."""
+    for event in (run_event(5, "claimed"), review_event(11, 5, 1, "approve")):
+        missing = dict(event)
+        del missing["repo"]
+        assert control.node_post("/api/v1/events", missing).status_code == 400
+        empty = {**event, "repo": ""}
+        assert control.node_post("/api/v1/events", empty).status_code == 400
+    assert control.store.events(type="theozolith.run") == []  # nothing slipped in
+
+    progress = {
+        "type": "theozolith.run.progress",
+        "driver": "worker-a",
+        "node": "box1",
+        "issue": 5,
+        "run_id": "r1",
+        "phase": "agent",
+    }
+    assert control.node_post("/api/v1/events", progress).status_code == 200
+    error = {
+        "type": "theozolith.error",
+        "node": "box1",
+        "component": "driver",
+        "error_class": "RuntimeError",
+        "message": "boom",
+    }
+    assert control.node_post("/api/v1/events", error).status_code == 200
 
 
 # -- claim dispatch (ADR-0017: write-through, single serialized writer) ------------
@@ -500,7 +539,7 @@ def test_quarantined_node_gets_no_work(control: ControlRig):
     # Human release reopens the gate (recycle is one of the two releases).
     control.github.issues[7]["labels"] = {"plan_ready"}
     control.github.issues[7]["assignees"] = []
-    control.store.release_grant(7)
+    control.store.release_grant("acme/sandbox", 7)
     control.admin("POST", "/api/v1/nodes/box1/quarantine/release")
     assert control.dispatch(node="box1").json()["issue"]["number"] == 7
 
@@ -537,6 +576,8 @@ def test_pin_bump_pauses_dispatch_fleet_wide_until_nodes_converge(control: Contr
     REPORTED version equals the pin — issuing an update pauses new dispatch
     fleet-wide; capacity returns node by node as versions converge."""
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.scaffold_stack("box1")
+    control.scaffold_stack("box2")
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
     for node in ("box1", "box2"):
         control.heartbeat(node=node, version="0.3.0")
@@ -547,7 +588,14 @@ def test_pin_bump_pauses_dispatch_fleet_wide_until_nodes_converge(control: Contr
     # Reviewer discovery pauses on the same gate.
     review = control.node_post(
         "/api/v1/dispatch",
-        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
+        {
+            "role": "reviewer",
+            "driver": "rev-1",
+            "node": "box1",
+            "login": "ozolith-rev",
+            "repo": "acme/sandbox",
+            "stack": "worker-box1",
+        },
     ).json()
     assert review["prs"] == [] and "pin is 0.4.0" in review["reason"]
 
@@ -560,6 +608,7 @@ def test_pin_bump_pauses_dispatch_fleet_wide_until_nodes_converge(control: Contr
 def test_unreported_node_versions_stay_dispatch_eligible(control: ControlRig):
     """The daemon-less dev shape heartbeats no version at all: the gate is
     keyed on the reported version, and no report means no block."""
+    control.scaffold_stack("ghost")
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
     control.github.add_issue(9, labels={"plan_ready"}, assignees=[])
     assert control.dispatch(worker="worker-a", node="ghost").json()["issue"]["number"] == 9
@@ -574,6 +623,7 @@ def test_persistently_offpin_node_gets_restart_then_error_and_stays_ineligible(
     update_deferred, so this is also the legacy-daemon coverage (issue #8):
     field absence keeps exactly the pre-deferral ladder behavior."""
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.scaffold_stack("box1")
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
 
     for _ in range(2):
@@ -605,6 +655,7 @@ def test_deferred_update_behind_a_run_never_restarts_or_escalates(control: Contr
     an in-flight Run trips nothing — no restart command, no error event —
     for arbitrarily many beats; it converges right after the Run ends."""
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    control.scaffold_stack("box1")
     control.write_config("product.toml", '[product]\nversion = "0.4.0"\n')
     # Far past 2x the threshold in deferral beats: the ladder never moves.
     for _ in range(8):
@@ -675,6 +726,190 @@ def test_dispatch_registers_the_driver(control: ControlRig):
     assert drivers[0]["worker"] == "worker-a"
     assert drivers[0]["login"] == "ozolith-worker-a"
     assert drivers[0]["role"] == "implementer"
+    # The registry records what the request named (ADR-0055).
+    assert drivers[0]["repo"] == "acme/sandbox"
+    assert drivers[0]["stack"] == "worker-box1"
+
+
+# -- repo-keyed dispatch (ADR-0055): verification, isolation, per-repo pauses ------
+
+
+def test_dispatch_requires_repo_stack_and_a_wellformed_repo(control: ControlRig):
+    """The fail-closed wire: a request missing repo or stack is 400 — no
+    compatibility fallback — as is a repo that is not owner/name."""
+    body = {"role": "implementer", "driver": "w", "node": "box1", "login": "l"}
+    assert control.node_post("/api/v1/dispatch", {**body, "stack": "s"}).status_code == 400
+    repo_only = {**body, "repo": "acme/sandbox"}
+    assert control.node_post("/api/v1/dispatch", repo_only).status_code == 400
+    malformed = control.node_post(
+        "/api/v1/dispatch", {**body, "repo": "not-owner-name", "stack": "s"}
+    )
+    assert malformed.status_code == 400
+    assert "owner/name" in malformed.json()["detail"]
+    assert control.github.writes == []  # nothing was ever considered
+
+
+def test_dispatch_verifies_the_stack_against_the_pinned_build(control: ControlRig):
+    """The named Stack must exist in the Pinned Build, be placed on the
+    authenticated node, and resolve exactly the request's repo — else 403
+    with a detail naming the Stack and both repos, never a fallback to the
+    request's repo. A verified request still gets its ordinary answer."""
+    control.scaffold_stack("box1")  # worker-box1 -> acme/sandbox
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+
+    missing = control.dispatch(stack="ghost")
+    assert missing.status_code == 403
+    assert "'ghost'" in missing.json()["detail"]
+    assert "acme/sandbox" in missing.json()["detail"]
+
+    elsewhere = control.dispatch(node="box2", stack="worker-box1")
+    assert elsewhere.status_code == 403
+    assert "'box1'" in elsewhere.json()["detail"] and "'box2'" in elsewhere.json()["detail"]
+
+    foreign = control.dispatch(repo="acme/other")
+    assert foreign.status_code == 403
+    detail = foreign.json()["detail"]
+    assert "'worker-box1'" in detail
+    assert "acme/sandbox" in detail and "acme/other" in detail  # both repos named
+
+    # The Reviewer side verifies identically, before the role branch.
+    assert control.dispatch(role="reviewer", stack="ghost").status_code == 403
+
+    # No refusal fell back to granting from the request's repo.
+    assert control.github.writes == []
+
+    # The verified request is granted; once nothing is eligible the answer
+    # is {"issue": None} — a verified empty pool is never a 403.
+    assert control.dispatch().json()["issue"]["number"] == 7
+    empty = control.dispatch(worker="worker-b")
+    assert empty.status_code == 200 and empty.json()["issue"] is None
+
+
+def test_zero_stack_pinned_build_refuses_never_falls_open(control: ControlRig):
+    """An ingested Pinned Build with zero Stacks is NOT the absent-config
+    dev door: no Stack can be vouched for, so every request is 403."""
+    control.write_config("product.toml", 'version = "0.3.0"\n')
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    assert control.dispatch().status_code == 403
+    assert control.github.writes == []
+
+
+def test_two_stacks_bound_to_two_repos_never_collide(tmp_path):
+    """The ADR-0055 acceptance: two Stacks bound to two Bound Workspaces on
+    one Control Node, dict-backed client factory. Each request is granted
+    only from its own repo, and IDENTICAL issue numbers in the two repos
+    hold distinct (repo, issue) rows in every coordination cache."""
+    sandbox, other = FakeGitHubLite(), FakeGitHubLite()
+    other.repo = "acme/other"
+    fakes = {"acme/sandbox": sandbox, "acme/other": other}
+    control = make_rig(tmp_path, github_clients=lambda repo: fakes[repo])
+    control.scaffold_stack("box1")  # worker-box1 -> acme/sandbox
+    control.scaffold_stack("box1", workspace="acme/other", name="worker-other")
+
+    # The same numbers on both sides: 7 grantable, 8 waiting behind 7,
+    # 9 malformed (failed + plan_ready).
+    for fake in (sandbox, other):
+        fake.add_issue(7, labels={"plan_ready"}, assignees=[])
+        fake.add_issue(8, labels={"plan_ready"}, assignees=[])
+        fake.add_issue(9, labels={"plan_ready", "failed"}, assignees=[])
+        fake.add_blocked_by(8, 7)
+
+    def dispatch_other(worker="worker-b"):
+        return control.dispatch(worker=worker, repo="acme/other", stack="worker-other")
+
+    # Each request granted only from its own repo — issue 7 twice over,
+    # one grant row per (repo, issue), no collision.
+    assert control.dispatch(worker="worker-a").json()["issue"]["number"] == 7
+    assert dispatch_other().json()["issue"]["number"] == 7
+    assert control.store.granted_issues("acme/sandbox") == {7}
+    assert control.store.granted_issues("acme/other") == {7}
+    # Each grant's claim writes rode that repo's client alone.
+    claim = ["add_assignees", "add_labels", "remove_label"]
+    assert [w[0] for w in sandbox.writes] == claim
+    assert [w[0] for w in other.writes] == claim
+
+    # A second pass per repo records the advisory lanes, repo-keyed.
+    assert control.dispatch(worker="worker-a").json()["issue"] is None
+    assert dispatch_other().json()["issue"] is None
+    waits = {(row["repo"], row["issue"]) for row in control.store.dispatch_waits()}
+    assert waits == {("acme/sandbox", 8), ("acme/other", 8)}
+    malformed = {(row["repo"], row["issue"]) for row in control.store.malformed_states()}
+    assert malformed == {("acme/sandbox", 9), ("acme/other", 9)}
+
+    # One repo's GitHub trouble pauses that repo alone: the sibling's pass
+    # still completes, and its clear never touches the foreign pause row.
+    def fail(label):
+        raise GitHubError("GitHub answered HTTP 502", status=502)
+
+    sandbox.list_open_issues = fail
+    paused = control.dispatch(worker="worker-a").json()
+    assert paused["issue"] is None and "dispatch paused for acme/sandbox" in paused["reason"]
+    assert dispatch_other().json()["issue"] is None  # untouched
+    (pause,) = control.store.dispatch_pauses()
+    assert pause["repo"] == "acme/sandbox" and "502" in pause["reason"]
+
+
+def test_github_trouble_records_a_pause_cleared_by_the_next_good_pass(control: ControlRig):
+    """One repo's GitHub trouble is a recorded per-repo dispatch pause
+    answered as a reason — 200, never a 500 escaping the endpoint — and the
+    repo's next pass that completes its GitHub reads clears the row."""
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    listing = control.github.list_open_issues
+
+    def fail(label):
+        raise GitHubError("GitHub answered HTTP 502", status=502)
+
+    control.github.list_open_issues = fail
+    answer = control.dispatch()
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["issue"] is None
+    assert "dispatch paused for acme/sandbox" in body["reason"] and "502" in body["reason"]
+    (pause,) = control.store.dispatch_pauses()
+    assert pause["repo"] == "acme/sandbox" and "502" in pause["reason"]
+
+    control.github.list_open_issues = listing
+    assert control.dispatch().json()["issue"]["number"] == 7  # pass completes
+    assert control.store.dispatch_pauses() == []
+
+
+def test_reviewer_listing_trouble_rides_the_same_pause(control: ControlRig):
+    control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
+
+    def fail(label):
+        raise GitHubError("GitHub answered HTTP 500", status=500)
+
+    control.github.list_open_prs_by_label = fail
+    answer = control.dispatch(role="reviewer")
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["prs"] == [] and "dispatch paused for acme/sandbox" in body["reason"]
+    (pause,) = control.store.dispatch_pauses()
+    assert pause["repo"] == "acme/sandbox"
+
+    del control.github.list_open_prs_by_label  # restore the class method
+    assert control.dispatch(role="reviewer").json() == {"prs": [11]}
+    assert control.store.dispatch_pauses() == []
+
+
+def test_failed_dependency_read_pauses_with_its_distinct_reason(control: ControlRig):
+    """The ADR-0053 fail-loud dependency read rides the ADR-0055 pause path
+    — a reason answer plus a recorded pause, never a 500 — keeping its
+    distinct granting-with-unknown-ordering text."""
+    control.github.add_issue(2, labels={"plan_ready"}, assignees=[])
+
+    def fail(number):
+        raise GitHubError("dependencies API answered HTTP 502", status=502)
+
+    control.github.list_blocked_by = fail
+    answer = control.dispatch()
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["issue"] is None
+    assert "dependency read for issue #2" in body["reason"]
+    assert "unknown ordering (ADR-0053)" in body["reason"]
+    (pause,) = control.store.dispatch_pauses()
+    assert pause["repo"] == "acme/sandbox" and "ADR-0053" in pause["reason"]
 
 
 # -- grant activation (ADR-0017: never-activated grants are released) --------------
@@ -683,9 +918,9 @@ def test_dispatch_registers_the_driver(control: ControlRig):
 def test_claimed_event_activates_and_retires_the_grant(control: ControlRig):
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     control.dispatch()
-    assert control.store.granted_issues() == {7}
+    assert control.store.granted_issues("acme/sandbox") == {7}
     control.node_post("/api/v1/events", run_event(7, "claimed", run_id="r1"))
-    assert control.store.granted_issues() == set()
+    assert control.store.granted_issues("acme/sandbox") == set()
 
 
 # -- telemetry ingestion caps (ADR-0016) --------------------------------------------
@@ -1010,6 +1245,7 @@ def test_config_artifact_rejects_bad_hashes_and_requires_node_token(control: Con
 
 
 def test_offhash_node_is_dispatch_ineligible_with_a_reason(control: ControlRig):
+    control.scaffold_stack("box1")
     digest = _write_driver(control)
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
@@ -1019,7 +1255,14 @@ def test_offhash_node_is_dispatch_ineligible_with_a_reason(control: ControlRig):
     assert refused["issue"] is None and "config distribution" in refused["reason"]
     review = control.node_post(
         "/api/v1/dispatch",
-        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
+        {
+            "role": "reviewer",
+            "driver": "rev-1",
+            "node": "box1",
+            "login": "ozolith-rev",
+            "repo": "acme/sandbox",
+            "stack": "worker-box1",
+        },
     ).json()
     assert review["prs"] == [] and "config distribution" in review["reason"]
     # Converge → eligible again, no human action.
@@ -1031,6 +1274,7 @@ def test_unreported_and_converged_and_no_recorded_hash_stay_eligible(control: Co
     control.github.add_issue(9, labels={"plan_ready"}, assignees=[])
     # No recorded distribution: always eligible.
     assert control.dispatch(worker="w", node="box1").json()["issue"]["number"] == 9
+    control.scaffold_stack("ghost")
     _write_driver(control)
     control.github.add_issue(10, labels={"plan_ready"}, assignees=[])
     # Unreported hash (daemon-less shape heartbeats nothing) stays eligible.
@@ -1488,6 +1732,7 @@ def test_flags_lists_stamp_skew_and_state_carries_the_hash(control: ControlRig):
 def test_desired_nonempty_field_absent_stays_eligible(control: ControlRig):
     """A heartbeat that OMITS drivers_hash is the legacy/daemon-less shape:
     fail-open eligible even when a non-empty distribution is desired."""
+    control.scaffold_stack("box1")
     digest = _write_driver(control)
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     # The rig's default heartbeat carries NO drivers_hash key at all.
@@ -1501,6 +1746,7 @@ def test_desired_nonempty_field_explicit_empty_is_blocked(control: ControlRig):
     """A current daemon that reports drivers_hash='' because it has no verified
     applied tree is off-hash and dispatch-blocked — never conflated with the
     legacy omission — on BOTH the implementer and reviewer paths."""
+    control.scaffold_stack("box1")
     digest = _write_driver(control)
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     control.github.add_pr(11, head_ref="ozolith/issue-5", labels={"pr_ready"})
@@ -1511,7 +1757,14 @@ def test_desired_nonempty_field_explicit_empty_is_blocked(control: ControlRig):
     assert "none applied" in refused["reason"]
     review = control.node_post(
         "/api/v1/dispatch",
-        {"role": "reviewer", "driver": "rev-1", "node": "box1", "login": "ozolith-rev"},
+        {
+            "role": "reviewer",
+            "driver": "rev-1",
+            "node": "box1",
+            "login": "ozolith-rev",
+            "repo": "acme/sandbox",
+            "stack": "worker-box1",
+        },
     ).json()
     assert review["prs"] == [] and "config distribution" in review["reason"]
     # A successful repair restores eligibility with no human action.
@@ -1523,6 +1776,7 @@ def test_missing_applied_tree_with_repeated_failed_fetch_stays_blocked(control: 
     """A node whose applied tree is missing/mutated reports '' every beat (its
     own recompute fails) and repeated failed artifact fetches never flip the
     gate: it stays blocked until a real converged hash arrives (ADR-0042)."""
+    control.scaffold_stack("box1")
     digest = _write_driver(control)
     control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
     headers = {"Authorization": f"Bearer {control.node_token()}"}

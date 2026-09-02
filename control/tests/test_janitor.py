@@ -173,7 +173,7 @@ def test_a_grant_with_no_claimed_event_is_released_after_the_window(control, git
     issue = github.get_issue(7)
     assert issue.assignees == []
     assert "in_progress" not in issue.labels and "plan_ready" in issue.labels
-    assert control.store.granted_issues() == set()
+    assert control.store.granted_issues("acme/sandbox") == set()
     # Releasing makes the issue grantable again.
     assert control.dispatch(worker="worker-b").json()["issue"]["number"] == 7
 
@@ -191,7 +191,7 @@ def test_a_fresh_grant_is_left_alone(control, github):
     control.dispatch()
     control.clock.advance(30)
     assert release(control, github) == []
-    assert control.store.granted_issues() == {7}
+    assert control.store.granted_issues("acme/sandbox") == {7}
 
 
 def test_one_broken_claim_never_starves_the_sweep(control, github):
@@ -471,21 +471,21 @@ def test_an_interrupted_recording_heals_without_another_write(control, github):
     escalation = [("add_comment", 9), ("add_labels", 9, BLOCKED, NEEDS_HUMAN)]
     record = control.store.record_janitor_action
 
-    def lossy(issue: int, run_id: str, worker: str, reason: str) -> None:
+    def lossy(repo: str, issue: int, run_id: str, worker: str, reason: str) -> None:
         if run_id == key:
             raise RuntimeError("store lost mid-sequence")
-        record(issue, run_id, worker, reason)
+        record(repo, issue, run_id, worker, reason)
 
     control.store.record_janitor_action = lossy
     assert drift_sweep(control, github) == []  # escalation landed, recording lost
     assert github.writes == escalation
     assert BLOCKED in github.pulls[9]["labels"]
-    assert control.store.janitor_acted(9, f"{key}-comment")
-    assert not control.store.janitor_acted(9, key)
+    assert control.store.janitor_acted(github.repo, 9, f"{key}-comment")
+    assert not control.store.janitor_acted(github.repo, 9, key)
 
     control.store.record_janitor_action = record  # the store recovers
     assert drift_sweep(control, github) == []  # healed: recognized complete
-    assert control.store.janitor_acted(9, key)
+    assert control.store.janitor_acted(github.repo, 9, key)
     assert github.writes == escalation  # no second comment, no second label
     assert len(github.comments[9]) == 1
 

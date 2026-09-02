@@ -311,9 +311,9 @@ def test_run_phases_and_links_appear_as_they_happen(control: ControlRig):
 
 def test_zombie_malformed_and_quarantine_flags_are_visible(control: ControlRig):
     login(control)
-    control.store.flag_zombie(5, "r1", "worker-a", "box1")
-    control.store.record_malformed(9, "carries failed + plan_ready")
-    control.store.record_chained_dependent(12, 3, 7, "closed unmerged", "a" * 40)
+    control.store.flag_zombie("acme/sandbox", 5, "r1", "worker-a", "box1")
+    control.store.record_malformed("acme/sandbox", 9, "carries failed + plan_ready")
+    control.store.record_chained_dependent("acme/sandbox", 12, 3, 7, "closed unmerged", "a" * 40)
     for run_id in ("r2", "r3"):
         control.node_post("/api/v1/events", run_event(6, "failed", run_id=run_id))
     page = control.client.get("/fragments/runs").text
