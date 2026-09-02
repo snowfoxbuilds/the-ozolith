@@ -239,10 +239,14 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(text, encoding="utf-8")
+    if mode is not None:
+        # The explicit final mode lands BEFORE publication — a reader never
+        # observes the file with umask residue.
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -1533,14 +1537,17 @@ class NodeDaemon:
 
     def _classify_cli_recipe(self, recipe: dict[str, Any]) -> tuple[str, Any]:
         """One wire recipe's CLI Pin fields, FAIL-CLOSED: ``("none", None)``
-        when the type pins no CLI (today's behavior), ``("ok", (tool,
-        version, platforms))`` when well-formed, ``("malformed", reason)``
-        otherwise — control/daemon skew must never destroy a working export,
-        so a malformed entry is skipped with its records left untouched."""
+        ONLY when every field is absent or exactly empty (``cli_tool == ""``,
+        ``cli_version == ""``, ``cli_platforms == {}`` — today's pinless
+        shape, a genuine pin drop included), ``("ok", (tool, version,
+        platforms))`` when well-formed, ``("malformed", reason)`` otherwise —
+        a PARTIALLY populated combination is control/daemon skew, never a pin
+        drop, and skew must never destroy a working export: a malformed entry
+        is skipped with its records left untouched."""
         version = recipe.get("cli_version", "")
         tool = recipe.get("cli_tool", "")
         platforms = recipe.get("cli_platforms", {})
-        if not version and not tool:
+        if version == "" and tool == "" and platforms == {}:
             return "none", None
         if not isinstance(version, str) or not _CLI_VERSION_RE.fullmatch(version or ""):
             return "malformed", f"cli_version {version!r} is not an exact version"
@@ -1575,6 +1582,11 @@ class NodeDaemon:
         try:
             cli_root = self._config.cli_dir
             cli_root.mkdir(parents=True, exist_ok=True)
+            # Deck-visible modes are code-owned, never umask residue: the
+            # tree mounts read-only into Flight Deck containers running an
+            # arbitrary non-root UID, and the chmod re-asserts every pass so
+            # a pre-amendment or umask-restricted store repairs in place.
+            os.chmod(cli_root, 0o755)
         except OSError as exc:
             message = f"cli store {self._config.cli_dir} unavailable: {exc}"
             self._log(message)
@@ -1600,6 +1612,8 @@ class NodeDaemon:
             by_type = cli_root / tool / CLI_BY_TYPE_DIR
             try:
                 by_type.mkdir(parents=True, exist_ok=True)
+                os.chmod(by_type.parent, 0o755)  # code-owned cross-UID modes, per pass
+                os.chmod(by_type, 0o755)
                 desired_path = by_type / f"{name}.desired"
                 text = version + "\n"
                 try:
@@ -1607,8 +1621,12 @@ class NodeDaemon:
                 except OSError:
                     stale = True
                 if stale:
-                    _atomic_write_text(desired_path, text)
+                    _atomic_write_text(desired_path, text, mode=0o644)
                     self._log(f"cli pin for worker type {name!r}: desired {version} recorded")
+                else:
+                    # Repair a record written by an older amendment or under a
+                    # restrictive umask — the deck must always read it.
+                    os.chmod(desired_path, 0o644)
             except OSError as exc:
                 message = f"cli pin for worker type {name!r}: desired record failed: {exc}"
                 self._log(message)
@@ -1735,16 +1753,36 @@ class NodeDaemon:
         """The version this worker type's export entry ACTUALLY serves —
         evidence, not memory (the _verify_applied_drivers posture): the entry
         symlink's target basename, and only when that version dir holds a
-        regular-file binary. '' when absent or broken."""
-        entry = cli_root / tool / CLI_BY_TYPE_DIR / f"{name}.current"
+        regular-file binary the MOUNTED deck UID can reach. The tree mounts
+        read-only into containers running an arbitrary non-root UID, so the
+        launch path must be world-traversable and the binary world-r+x — or
+        status would report a convergence launches cannot see. '' when
+        absent, broken, or unreadable."""
+
+        def grants(path: Path, bits: int) -> bool:
+            try:
+                return os.stat(path).st_mode & bits == bits
+            except OSError:
+                return False
+
+        by_type = cli_root / tool / CLI_BY_TYPE_DIR
+        entry = by_type / f"{name}.current"
         try:
             version = os.path.basename(os.readlink(entry).rstrip("/"))
         except OSError:
             return ""
-        binary = cli_root / tool / version / cliinstall.CLI_BINARY_NAME
-        if version and binary.is_file() and not binary.is_symlink():
-            return version
-        return ""
+        if not version:
+            return ""
+        version_dir = cli_root / tool / version
+        binary = version_dir / cliinstall.CLI_BINARY_NAME
+        if not binary.is_file() or binary.is_symlink():
+            return ""
+        for directory in (cli_root, cli_root / tool, by_type, version_dir):
+            if not grants(directory, 0o001):
+                return ""
+        if not grants(binary, 0o005):
+            return ""
+        return version
 
     def _cli_status_rows(self) -> list[dict[str, Any]]:
         """Heartbeat telemetry (ADR-0055 point 7): one row per wanted worker

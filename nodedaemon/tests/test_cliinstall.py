@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
 import platform
 import tarfile
 from pathlib import Path
@@ -41,6 +42,18 @@ def pinned_host(monkeypatch):
     """Deterministic tuple detection for every test (the real-host detection
     is exercised explicitly in test_tuple_detection_on_this_host)."""
     monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
+
+
+@pytest.fixture(autouse=True)
+def restrictive_umask():
+    """EVERY test in this module runs under umask 077: published modes must
+    be code-owned, never umask residue — the tree mounts read-only into deck
+    containers running an arbitrary non-root UID (ADR-0055)."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def make_tarball(members) -> bytes:
@@ -115,6 +128,43 @@ def test_happy_path_publishes_atomically_with_normalized_modes(tmp_path):
     # Staging is gone; only the published version dir remains.
     assert non_dot(tmp_path / "claude") == [VERSION]
     assert not list((tmp_path / "claude").glob(".*"))
+
+
+def test_modes_are_explicit_and_deck_readable_under_a_restrictive_umask(tmp_path):
+    """Cross-UID mount contract: with umask 077 active (the autouse fixture),
+    every directory on the launch path is world-traversable and the binary
+    world-readable+executable, so a non-root deck UID can walk
+    cli/<tool>/<version>/claude. (The test process shares the UID; mode bits
+    ARE the cross-UID evidence.)"""
+    data = make_tarball(good_members())
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data)
+    )
+    for directory in (tmp_path, tmp_path / "claude", published.parent):
+        assert directory.stat().st_mode & 0o777 == 0o755, directory
+    assert published.stat().st_mode & 0o777 == 0o755
+
+
+def test_fast_path_repairs_restrictive_modes_without_a_download(tmp_path):
+    """An install whose modes went restrictive (an older daemon amendment, a
+    past umask) is REPAIRED on the already-installed fast path — chmod only,
+    never a re-download."""
+    data = make_tarball(good_members())
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data)
+    )
+    os.chmod(published, 0o700)
+    for directory in (tmp_path, tmp_path / "claude", published.parent):
+        os.chmod(directory, 0o700)
+
+    def poisoned(url):
+        raise AssertionError("mode repair must never re-download")
+
+    again = ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=poisoned)
+    assert again == published
+    for directory in (tmp_path, tmp_path / "claude", published.parent):
+        assert directory.stat().st_mode & 0o777 == 0o755, directory
+    assert published.stat().st_mode & 0o777 == 0o755
 
 
 def test_installed_version_returns_without_touching_the_network(tmp_path):
@@ -254,6 +304,95 @@ def test_interrupted_extraction_publishes_nothing_and_a_retry_succeeds(tmp_path,
     assert non_dot(tmp_path / "claude") == []
     assert not list((tmp_path / "claude").glob(".*"))
     monkeypatch.setattr(cliinstall.shutil, "copyfileobj", real)
+    published = ensure_cli_version(
+        tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data)
+    )
+    assert published.read_bytes() == BINARY
+    assert non_dot(tmp_path / "claude") == [VERSION]
+
+
+def _fail_staging_mkdir(monkeypatch):
+    real = Path.mkdir
+
+    def failing(self, *args, **kwargs):
+        if self.name.startswith(".staging-"):
+            raise OSError(13, "injected EACCES")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", failing)
+
+
+def _fail_integrity_read(monkeypatch):
+    real = Path.open
+
+    def failing(self, mode="r", *args, **kwargs):
+        if self.name == "package.tgz" and "r" in mode:
+            raise OSError(5, "injected EIO")
+        return real(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing)
+
+
+def _fail_publish_mkdir(monkeypatch):
+    real = Path.mkdir
+
+    def failing(self, *args, **kwargs):
+        if self.name == "publish":
+            raise OSError(13, "injected EACCES")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", failing)
+
+
+def _fail_assembly_replace(monkeypatch):
+    real = cliinstall.os.replace
+
+    def failing(src, dst, *args, **kwargs):
+        if str(src).endswith(f"extract/{cliinstall.CLI_BINARY_MEMBER}"):
+            raise OSError(18, "injected EXDEV")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cliinstall.os, "replace", failing)
+
+
+def _fail_final_replace(monkeypatch):
+    real = cliinstall.os.replace
+
+    def failing(src, dst, *args, **kwargs):
+        if Path(dst).name == VERSION:
+            raise OSError(16, "injected EBUSY")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cliinstall.os, "replace", failing)
+
+
+FILESYSTEM_FAILURE_SITES = [
+    # (injector, message needle) — one OSError per staging/publish-side site.
+    (_fail_staging_mkdir, "staging setup"),
+    (_fail_integrity_read, "integrity check"),
+    (_fail_publish_mkdir, "publish-directory setup"),
+    (_fail_assembly_replace, "binary assembly rename"),
+    (_fail_final_replace, "publish rename"),
+]
+
+
+@pytest.mark.parametrize("inject, needle", FILESYSTEM_FAILURE_SITES)
+def test_every_filesystem_failure_is_typed_cleaned_and_retryable(
+    tmp_path, monkeypatch, inject, needle
+):
+    """The stable CliInstallError boundary: an OSError at ANY staging- or
+    publish-side site surfaces as CliPublishFailed with the original cause
+    chained, publishes nothing partial, reclaims staging, and a plain retry
+    succeeds once the fault clears."""
+    data = make_tarball(good_members())
+    inject(monkeypatch)
+    with pytest.raises(CliPublishFailed, match=needle) as excinfo:
+        ensure_cli_version(tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data))
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert non_dot(tmp_path / "claude") == []
+    assert not list((tmp_path / "claude").glob(".staging-*"))
+    monkeypatch.undo()
+    monkeypatch.setattr(cliinstall, "platform_tuple_key", lambda: KEY)
     published = ensure_cli_version(
         tmp_path, "claude", VERSION, platform_map(data), fetch=fetching(data)
     )

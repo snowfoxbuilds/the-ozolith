@@ -99,7 +99,10 @@ class CliBinaryInvalid(CliInstallError):
 
 
 class CliPublishFailed(CliInstallError):
-    """Staging-side extraction or the atomic publication rename failed."""
+    """A staging- or publish-side filesystem operation failed: store/staging
+    setup, the staged-tarball read at the integrity check, extraction writes,
+    binary assembly, export mode normalization, or the atomic publication
+    rename."""
 
 
 _ARCH_NORMALIZE = {"x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}
@@ -133,6 +136,25 @@ def _default_fetch(url: str):
     return urllib.request.urlopen(url, timeout=60)  # https by construction
 
 
+def _normalize_export_modes(
+    cli_root: Path, tool_root: Path, version_dir: Path, binary: Path, tool: str, version: str
+) -> None:
+    """Deck-visible modes are code-owned, never umask residue: the tree is
+    mounted read-only into Flight Deck containers running an arbitrary
+    non-root UID, so the launch path must be world-traversable and the binary
+    world-readable+executable. Doubles as the REPAIR path for an install
+    published by an older daemon amendment or under a restrictive service
+    umask."""
+    try:
+        for directory in (cli_root, tool_root, version_dir):
+            os.chmod(directory, 0o755)
+        os.chmod(binary, 0o755)
+    except OSError as exc:
+        raise CliPublishFailed(
+            f"{tool} {version}: export mode normalization failed: {type(exc).__name__}"
+        ) from exc
+
+
 def ensure_cli_version(
     cli_root: Path,
     tool: str,
@@ -144,12 +166,15 @@ def ensure_cli_version(
 ) -> Path:
     """Ensure ``<cli_root>/<tool>/<version>/claude`` is installed and return
     its path — the ADR-0055 point 4 gates (a)-(g), in order. An already
-    published version returns without touching the network; a broken version
+    published version returns without touching the network, re-normalizing
+    its modes (the repair path for entries created by an older daemon
+    amendment or under a restrictive service umask); a broken version
     directory (present, but the binary missing or irregular) is renamed aside
     dot-prefixed and reinstalled. Every failure raises a typed
     ``CliInstallError`` with staging cleaned and nothing partial published."""
     fetch = fetch or _default_fetch
-    tool_root = Path(cli_root) / tool
+    cli_root = Path(cli_root)
+    tool_root = cli_root / tool
     version_dir = tool_root / version
     published = version_dir / CLI_BINARY_NAME
 
@@ -164,6 +189,7 @@ def ensure_cli_version(
     package = str(entry.get("package", ""))
     integrity = str(entry.get("integrity", ""))
     if published.is_file() and not published.is_symlink():
+        _normalize_export_modes(cli_root, tool_root, version_dir, published, tool, version)
         return published
     if version_dir.exists() or version_dir.is_symlink():
         # Present but not a healthy install: retire it aside (dot-prefixed —
@@ -177,11 +203,27 @@ def ensure_cli_version(
             ) from exc
         log(f"cli {tool} {version}: broken version directory retired for reinstall")
 
+    try:
+        # Deck-visible directory modes are code-owned, never umask residue:
+        # the tree mounts read-only into containers running an arbitrary
+        # non-root UID.
+        os.makedirs(tool_root, exist_ok=True)
+        os.chmod(cli_root, 0o755)
+        os.chmod(tool_root, 0o755)
+    except OSError as exc:
+        raise CliPublishFailed(
+            f"{tool} {version}: cli store setup failed: {type(exc).__name__}"
+        ) from exc
     staging = tool_root / f".staging-{version}-{os.getpid()}"
     if staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
     try:
-        staging.mkdir(parents=True)
+        try:
+            staging.mkdir()
+        except OSError as exc:
+            raise CliPublishFailed(
+                f"{tool} {version}: staging setup failed: {type(exc).__name__}"
+            ) from exc
         tarball = staging / "package.tgz"
         _download(package, version, tarball, fetch)  # (b)
         _verify_integrity(tarball, integrity, key, package, version)  # (c)
@@ -190,8 +232,20 @@ def ensure_cli_version(
         # root — the deck-facing contract is <tool>/<version>/claude, decoupled
         # from npm packaging — then publish with ONE same-filesystem rename.
         publish = staging / "publish"
-        publish.mkdir()
-        os.replace(staging / "extract" / CLI_BINARY_MEMBER, publish / CLI_BINARY_NAME)
+        try:
+            publish.mkdir()
+            # The published dir's explicit mode, set BEFORE it becomes visible.
+            os.chmod(publish, 0o755)
+        except OSError as exc:
+            raise CliPublishFailed(
+                f"{tool} {version}: publish-directory setup failed: {type(exc).__name__}"
+            ) from exc
+        try:
+            os.replace(staging / "extract" / CLI_BINARY_MEMBER, publish / CLI_BINARY_NAME)
+        except OSError as exc:
+            raise CliPublishFailed(
+                f"{tool} {version}: binary assembly rename failed: {type(exc).__name__}"
+            ) from exc
         try:
             os.replace(publish, version_dir)
         except OSError as exc:
@@ -255,9 +309,15 @@ def _verify_integrity(tarball: Path, integrity: str, key: str, package: str, ver
             " not a well-formed sha512 SRI string"
         )
     digest = hashlib.sha512()
-    with tarball.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(CLI_DOWNLOAD_CHUNK_BYTES), b""):
-            digest.update(chunk)
+    try:
+        with tarball.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(CLI_DOWNLOAD_CHUNK_BYTES), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise CliPublishFailed(
+            f"platform {key} package {package} {version}: staged tarball"
+            f" unreadable at the integrity check: {type(exc).__name__}"
+        ) from exc
     if digest.digest() != expected:
         raise CliIntegrityMismatch(f"platform {key} package {package} {version}: sha512 mismatch")
 

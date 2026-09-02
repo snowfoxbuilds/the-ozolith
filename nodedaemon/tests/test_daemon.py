@@ -6160,22 +6160,33 @@ def cli_response(images: list[dict], stacks: list[dict] | None = None, commands=
 
 class FakeInstaller:
     """A scripted stand-in for cliinstall.ensure_cli_version: success mimics
-    the real contract (the binary appears at <tool>/<version>/claude), a
-    version in ``fail_versions`` raises the typed download error, and an
-    already published version returns without counting as a download."""
+    the real contract (the binary appears at <tool>/<version>/claude with
+    code-owned 0o755 modes; the fast path re-normalizes them like the real
+    repair path, unless ``repair`` is disabled to freeze an on-disk state), a
+    version in ``fail_versions`` raises ``failure`` (the typed download error
+    by default), and an already published version returns without counting as
+    a download."""
 
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.fail_versions: set[str] = set()
+        self.failure: Exception | None = None
+        self.repair = True
 
     def __call__(self, cli_root, tool, version, platforms, *, fetch=None, log=None):
         published = Path(cli_root) / tool / version / "claude"
         if published.is_file():
+            if self.repair:
+                published.parent.chmod(0o755)
+                published.chmod(0o755)
             return published
         self.calls.append((tool, version))
         if version in self.fail_versions:
-            raise cliinstall.CliDownloadFailed(f"claude {version}: injected download failure")
+            raise self.failure or cliinstall.CliDownloadFailed(
+                f"claude {version}: injected download failure"
+            )
         published.parent.mkdir(parents=True, exist_ok=True)
+        published.parent.chmod(0o755)
         published.write_text(f"binary {version}\n", encoding="utf-8")
         published.chmod(0o755)
         return published
@@ -6350,11 +6361,21 @@ def test_cli_malformed_wire_is_skipped_and_records_stay(rig: Rig, installer):
         cli_recipe(cli_tool="Not A Slug"),
         cli_recipe(cli_platforms={"linux-x64-glibc": "not-a-table"}),
         cli_recipe(cli_platforms={}),
+        # PARTIALLY populated combinations are skew, never a pin drop — the
+        # pinless shape is exactly all-empty (tool "", version "",
+        # platforms {}), so none of these may retire a record.
+        cli_recipe(cli_tool="", cli_version=""),  # platforms only
+        cli_recipe(cli_version=""),  # version missing
+        cli_recipe(cli_tool="", cli_platforms={}),  # version only
+        cli_recipe(cli_version="", cli_platforms={}),  # tool only
+        cli_recipe(cli_tool="", cli_version="", cli_platforms=["wrong-type"]),
     ):
         rig.control.heartbeat_answers.append(cli_response([mangled]))
         rig.daemon.once()
         assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
         assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+        # ...and the referenced version dir survives the pass's prune.
+        assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
     event = _find_error(rig, "malformed on the wire")
     assert event is not None and event["error_class"] == "CliWireMalformed"
     # Malformed rows are skipped from the telemetry (no truthful desired
@@ -6380,3 +6401,109 @@ def test_cli_version_change_never_recreates_the_deck_container(rig: Rig, install
     rig.daemon.once()
     assert rig.docker.removed == removed_before  # no recreate on a version bump
     assert (rig.config.cli_dir / "claude" / "2.1.258" / "claude").is_file()
+
+
+def _mode(path: Path) -> int:
+    return os.stat(path).st_mode & 0o777
+
+
+@pytest.fixture
+def restrictive_umask():
+    """A restrictive service umask: every deck-visible mode must be
+    code-owned, never umask residue (ADR-0055 — the tree mounts read-only
+    into deck containers running an arbitrary non-root UID)."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def test_cli_export_modes_are_explicit_under_a_restrictive_umask(
+    rig: Rig, installer, restrictive_umask
+):
+    """The whole deck-visible tree — cli root, tool dir, by-type, version
+    dir, desired record, binary — carries explicit cross-UID modes even with
+    umask 077 active, and the beat reports the export converged. (The test
+    process shares the UID; mode bits ARE the cross-UID evidence.)"""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    cli_root = rig.config.cli_dir
+    by_type = cli_root / "claude" / "by-type"
+    version_dir = cli_root / "claude" / "2.1.257"
+    for directory in (cli_root, cli_root / "claude", by_type, version_dir):
+        assert _mode(directory) == 0o755, directory
+    assert _mode(by_type / "flightdeck.desired") == 0o644
+    assert _mode(version_dir / "claude") == 0o755
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+
+
+def test_cli_preexisting_restrictive_modes_are_repaired_in_place(
+    rig: Rig, installer, restrictive_umask
+):
+    """Migration: an export written by an older daemon amendment (or under a
+    restrictive umask) is repaired on the next ordinary pass — dirs and the
+    desired record re-normalized daemon-side, the version dir and binary
+    through the installer's fast path — with no re-download."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    cli_root = rig.config.cli_dir
+    by_type = cli_root / "claude" / "by-type"
+    version_dir = cli_root / "claude" / "2.1.257"
+    os.chmod(by_type / "flightdeck.desired", 0o600)
+    os.chmod(version_dir / "claude", 0o700)
+    for directory in (version_dir, by_type, cli_root / "claude", cli_root):
+        os.chmod(directory, 0o700)
+    downloads = list(installer.calls)
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    assert installer.calls == downloads  # repair is chmod, never a download
+    for directory in (cli_root, cli_root / "claude", by_type, version_dir):
+        assert _mode(directory) == 0o755, directory
+    assert _mode(by_type / "flightdeck.desired") == 0o644
+    assert _mode(version_dir / "claude") == 0o755
+
+
+def test_cli_unreadable_export_never_reports_applied_or_converged(rig: Rig, installer):
+    """``applied`` is evidence INCLUDING deck readability: an export the
+    mounted non-root deck UID cannot traverse never reports applied or
+    converged — status must agree with launch reality — and the production
+    repair path heals it."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    version_dir = rig.config.cli_dir / "claude" / "2.1.257"
+    installer.repair = False  # freeze the broken modes: no fast-path repair
+    os.chmod(version_dir, 0o700)
+    for _ in range(2):  # converge, then beat from the frozen state
+        rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+        rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "" and row["converged"] is False
+
+    installer.repair = True
+    for _ in range(2):
+        rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+        rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+
+
+def test_cli_installer_failure_class_rides_the_event_and_heartbeat(rig: Rig, installer):
+    """Every typed installer failure — a publish-side one included — surfaces
+    its STABLE class in the theozolith.error event and the heartbeat row."""
+    installer.fail_versions.add("2.1.257")
+    installer.failure = cliinstall.CliPublishFailed(
+        "claude 2.1.257: publish rename failed: injected"
+    )
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    event = _find_error(rig, "publish rename failed")
+    assert event is not None and event["error_class"] == "CliPublishFailed"
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["error_class"] == "CliPublishFailed" and row["converged"] is False
