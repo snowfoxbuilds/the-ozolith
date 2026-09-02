@@ -63,5 +63,7 @@ Flight Deck worker type has the identical shape minus the driver.
   identities unchanged); the CLI Pin is refused with a driver in v1. On a
   driverless type neither field is identity-bearing: the node exports, the
   deck mounts a stable parent, and a stable env selector resolves the entry
-  — adopting, dropping, or reselecting recreates once; content or version
-  changes are live. See ADR-0055.
+  — adopting or dropping a field, or reselecting the policy tree,
+  recreates once; a policy content edit or CLI version change is live at
+  the next agent-CLI launch (the CLI pin-strict: new launches refuse until
+  the exact pinned version has converged on the node). See ADR-0055.
