@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment) — amended 2026-08-26 by ADR-0051 (a source Config Repo without `product.toml` no longer deletes the pinned build's product pin: ingest carries the current pin forward — the update flow owns it unless the Config Repo declares one) (see Amendment) — amended 2026-08-26 by ADR-0052 (ingest compiles every knowledge tree once per registered compiler into `knowledge/<name>/<tool>/` with pins keyed `"<name>/<tool>"`; claude pin values are byte-stable across the layout change, legacy builds load through compat shims until the next ingest migrates them, and the node's deck export serves the claude view)
+Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment) — amended 2026-08-26 by ADR-0051 (a source Config Repo without `product.toml` no longer deletes the pinned build's product pin: ingest carries the current pin forward — the update flow owns it unless the Config Repo declares one) (see Amendment) — amended 2026-08-26 by ADR-0052 (ingest compiles every knowledge tree once per registered compiler into `knowledge/<name>/<tool>/` with pins keyed `"<name>/<tool>"`; claude pin values are byte-stable across the layout change, legacy builds load through compat shims until the next ingest migrates them, and the node's deck export serves the claude view) — amended 2026-09-02 by ADR-0055 (#95): the Config Repo gains a `policy/` tree (Agent Policy drop-ins, distributed beside drivers/ and knowledge/ under the same hash), the pinned build gains `[cli]` pins (an npm version or dist-tag resolved at ingest to exact version + platform-package integrity — the tag→digest doctrine applied to the agent CLI), and Flight Decks gain two more live-mounted surfaces on the knowledge model (see Amendment)
 
 Date: 2026-08-18
 
@@ -208,3 +208,28 @@ types, and worker types are cheap.
   state — the preserved pin included — from a read-only snapshot of the
   committed HEAD, never from a worktree the interrupted ingest left
   behind. See ADR-0051.
+
+## Amendment (2026-09-02, ADR-0055 — policy trees and CLI pins)
+
+- **A third Config Repo tree.** `policy/<name>/` holds verbatim managed-
+  settings drop-ins (Agent Policy), referenced from worker-type definitions
+  as `policy = "policy/<name>"`. Ingest lints it (strict shape + the
+  ADR-0045 conflict scan), computes a per-tree content pin, and the config
+  distribution carries it beside `drivers/` and `knowledge/` under the one
+  hash (the tree is text-sized; the #51 ruling holds). The delivery split
+  is the knowledge split: driver types bake it (identity-bearing), Flight
+  Decks read-only bind-mount the node's export of the applied tree.
+- **A third pin class.** `cli = "<exact version | npm dist-tag>"` resolves
+  at ingest against the npm registry to `[cli] "<tool>/<declared>" =
+  {version, integrity}` — mechanical, like base tag→digest, and a dist-tag
+  re-resolves on every ingest like a moving base tag. The binary itself
+  never enters the pinned build or the distribution: nodes fetch the
+  platform package by pin and verify against the recorded integrity. The
+  human-entered-only rule for the tailscale checksum is unaffected: the
+  CLI integrity is vendor-published registry metadata, the same class as
+  an image manifest digest, not an ingest-computed hash of a download.
+- **Decks gain two live surfaces.** The node exports `<state-dir>/policy/
+  <name>` (atomic child exchange, as knowledge) and `<state-dir>/cli/<tool>/
+  <version>` with one export entry per worker type; the deck mounts both
+  parents read-only, selected by un-overridable env; restart = pick up is
+  the stated semantic for both. See ADR-0055.

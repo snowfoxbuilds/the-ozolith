@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended by ADR-0052 (2026-08-26): a second adapter (codex) exists at a deliberately weaker enforcement ceiling — PROBE + STATIC only (baked theozolith-owned config, one driver-boot probe reading the CLI's session rollout journal, per-Run static checks, a benign post-exit observer; no live kill, no effort pairs until proven) — and the identity-hash formula gains a `knowledge_target` key ONLY when it differs from the historical claude default (the "exactly these four keys" clause is amended; every pre-ADR-0052 identity hashes byte-identically).
+Status: ACCEPTED — amended by ADR-0052 (2026-08-26): a second adapter (codex) exists at a deliberately weaker enforcement ceiling — PROBE + STATIC only (baked theozolith-owned config, one driver-boot probe reading the CLI's session rollout journal, per-Run static checks, a benign post-exit observer; no live kill, no effort pairs until proven) — and the identity-hash formula gains a `knowledge_target` key ONLY when it differs from the historical claude default (the "exactly these four keys" clause is amended; every pre-ADR-0052 identity hashes byte-identically). Amended by ADR-0055 (2026-09-02, #95): operator managed-settings policy becomes a reviewed Config Repo tree (Agent Policy, `policy/<name>`); the managed-scope conflict scan gains an ingest/config-load site in build-gate mode over every policy tree, so a live-delivered drop-in can never carry an identity or steering key — the deck needs no runtime re-check.
 Date: 2026-08-10 (consolidated 2026-08-14)
 
 # ADR-0045: Model and reasoning effort are typed fields baked into the derived image, held by best effort
@@ -209,3 +209,24 @@ Stated plainly, per the operator ruling:
   subscription credentials and out of scope for the current
   single-operator deployment; revisit if benchmark-grade identity
   integrity becomes load-bearing.
+
+## Amendment (2026-09-02, ADR-0055 / #95 — policy trees are linted at ingest)
+
+- **Operator policy has a home.** Managed-settings drop-ins are no longer
+  baked by setup-step heredocs; they live in a Config Repo `policy/<name>`
+  tree referenced by the worker-type definition (Agent Policy). Driver
+  types bake it (the build-time scan here still sees it — codegen copies
+  the tree before the materialize step); Flight Decks mount it live.
+- **The conflict scan gains a lint site.** Ingest and config load run
+  `scan_managed_conflicts` in its build-gate mode (`expected=None`) over
+  every policy tree: any identity key, policy helper, or model/effort/
+  endpoint-steering `env` entry refuses the ingest, naming file and key. A
+  strict tree shape (top-level `*.json` regular files only) is enforced at
+  the same site. The build never overwrites operator policy — and operator
+  policy is now reviewed, pinned, and linted before any image or deck sees
+  it.
+- **No runtime re-check on decks.** The deck's model still rides the
+  well-known file and the `--model` flag; a mounted policy tree is trusted
+  on the same basis as `drivers/` code — pinned build plus hash-verified
+  distribution. `DISABLE_AUTOUPDATER` is not a steering key and rides the
+  deck session env when a CLI Pin is declared.

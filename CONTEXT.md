@@ -22,6 +22,12 @@ The credential-free half of any worker (Implementer, Reviewer, Initializer): PID
 
 *Avoid*: "driver" (the credentialed node-resident half); giving the harness any credential or decision authority; interactive tmux sessions (retired 2026-07-21 — interactivity lives only in the Flight Deck; ADR-0019).
 
+**Agent Policy**
+
+Operator policy for one agent CLI's managed tier: a Config Repo tree of verbatim managed-settings drop-ins (`policy/<name>`), referenced from a worker-type definition as `policy = "policy/<name>"` (grilling 2026-09-02, issue #95). Identity-free by rule — ingest and config load refuse any model, effort, allowlist, policy-helper, or steering-env key in it (the ADR-0045 conflict scan) — so it never selects the model. Delivery splits on the HITL/HOTL line like knowledge: baked into driver-type images at build (identity-bearing there), read-only bind-mounted into Flight Decks from the node's applied tree and picked up on the next agent-CLI launch (never identity-bearing there).
+
+*Avoid*: "settings" (the `control.toml` settings surface is a different thing); baking it by setup-step heredoc; anything under `~/.claude`; using it to carry model or effort.
+
 **Candidate Bundle**
 
 The self-contained export of one worker-type definition for benchmarking (grilling 2026-08-28; ADR-0054): a docker-buildable directory carrying the definition's resolved manifest (fields, pins, adapter, instruction hash, non-identity metadata), the compiled knowledge tree for the candidate's adapter tool, and a generated Dockerfile — producing the same derived image a deployment would run. Exported by `theozolith candidate export` from a local config-repo-shaped source directory (callers clone remote repos themselves), never from the Pinned Build; equivalence with a deployed image is identity-hash equality, and verification recomputes the complete build context from bundle bytes — identity, knowledge pin, Dockerfile, and allowlisted layout. Secret slot names travel; secret values never do. A candidate is kind-agnostic — implementer vs reviewer is a benchmark-mode property, never part of the bundle or its identity.
@@ -46,6 +52,12 @@ A single `.md` subagent file used by Claude. One component inside the Claude age
 
 *Avoid*: "agent" (which means an entire tool config), "skill".
 
+**CLI Pin**
+
+A worker-type definition's declared agent-CLI version — `cli = "<exact version | npm dist-tag>"` — that ingest resolves mechanically to an exact version plus the platform package's registry-published integrity, the base-tag doctrine applied to the CLI (ADR-0055, grilling 2026-09-02). Driverless-only in v1: the Node Daemon fetches and verifies the binary against the pin and exports it per worker type; Flight Decks mount it live and pick up a bump on the next agent-CLI launch, so the pin is fleet-visible without being image identity. Absent means the image's CLI.
+
+*Avoid*: treating the base image's CLI as the deck's version once a pin is declared; in-container self-update (the pin is the only version path); a deployment-wide pin (the definition owns it).
+
 **Completion Retry**
 
 The cheap retry class for contract failures (grilling 2026-08-16): a session that completed cleanly but whose Output Proposal fails validation — missing or invalid required fields, e.g. commit-message — relaunches once with the working tree and partially-filled proposal preserved, a new container, run_id, and evidence bundle, and the main prompt plus a machine-generated error appendix naming the missing fields (fill-only; code churn there is a reviewable finding). Capped at one — a second miss escalates failed + needs_human. Implementer-only: it exists to protect work products that survive the session (worktree, pending proposal); the Reviewer's work product is the proposal itself, so a missing verdict escalates immediately (ADR-0014 stands). Distinct from the full local retry (crash, timeout, zero commits), which discards everything.
@@ -54,7 +66,7 @@ The cheap retry class for contract failures (grilling 2026-08-16): a session tha
 
 **Config Distribution**
 
-The hash-pinned artifact the Control Node packages from the Pinned Build's `drivers/` and compiled `knowledge/` trees on every config change (ADR-0042/0048 — one hash covers both, kept under the original drivers-hash name for protocol stability), served to nodes over the same artifact-pull path as `theozolith build` output. The heartbeat channel carries only the hash reference; the Node Daemon reconciles it exactly like the product pin, and an off-hash node is dispatch-ineligible (ADR-0042). Stamped with the product version it was built against; skew is advisory.
+The hash-pinned artifact the Control Node packages from the Pinned Build's `drivers/`, compiled `knowledge/`, and `policy/` trees on every config change (ADR-0042/0048/0055 — one hash covers all three, kept under the original drivers-hash name for protocol stability), served to nodes over the same artifact-pull path as `theozolith build` output. The heartbeat channel carries only the hash reference; the Node Daemon reconciles it exactly like the product pin, and an off-hash node is dispatch-ineligible (ADR-0042). Stamped with the product version it was built against; skew is advisory.
 
 *Avoid*: confusing with the product distribution (daemon, built-in drivers, harness); code riding the command channel as config payload.
 
@@ -102,7 +114,7 @@ The trusted, credentialed half of any worker: a node-resident process, spawned a
 
 **Flight Deck**
 
-The interactive, human-driven agent container (named 2026-07-21 — the station, not the person): a container-kind Stack running an agent CLI in an attachable tmux session — the web terminal's primary target and the only place the interactive-session convention survives (ADR-0019). Used for issue drafting and non-decomposable work (cross-cutting refactors, design-in-flux). Knowledge reaches it as a read-only bind-mount of the node's applied pinned knowledge tree — authoring happens in the Config Repo, and an agent restart picks up a newly applied tree (ADR-0048; the shared writable clone and promote workflow of grilling 2026-08-08 are retired). Holds GitHub credentials under human supervision — its own machine identity (fine-grained PAT: issues, PRs, contents; no merge permission), never the operator's PAT; not a pipeline actor — it never claims issues, and its sole delegated transition is executing the human's initial plan_ready stamp on an explicit in-conversation instruction naming each work issue and its confirmed risk label (ADR-0019 as amended 2026-08-27); every other transition authority is withheld.
+The interactive, human-driven agent container (named 2026-07-21 — the station, not the person): a container-kind Stack running an agent CLI in an attachable tmux session — the web terminal's primary target and the only place the interactive-session convention survives (ADR-0019). Used for issue drafting and non-decomposable work (cross-cutting refactors, design-in-flux). Knowledge, Agent Policy, and the pinned agent CLI reach it as live surfaces — read-only bind-mounts of the node's applied trees and exports, authored in the Config Repo, picked up on the next agent-CLI launch, never recreating the container (ADR-0048/0055; the shared writable clone and promote workflow of grilling 2026-08-08 are retired). Holds GitHub credentials under human supervision — its own machine identity (fine-grained PAT: issues, PRs, contents; no merge permission), never the operator's PAT; not a pipeline actor — it never claims issues, and its sole delegated transition is executing the human's initial plan_ready stamp on an explicit in-conversation instruction naming each work issue and its confirmed risk label (ADR-0019 as amended 2026-08-27); every other transition authority is withheld.
 
 *Avoid*: "Pilot", "Helm" (rejected names); "ad-hoc container" (retired name); "Planner" (reserved for a future autonomous planning actor); confusing with workers (autonomous, headless, credential-free sessions).
 
@@ -162,7 +174,7 @@ The structured set of GitHub mutations a worker's agent proposes during a Run, w
 
 **Pinned Build**
 
-The machine-owned git tree at the control data dir's `configs/` that only `theozolith config ingest` commits to (ADR-0048): the lint-checked, pin-resolved, knowledge-compiled materialization of one Config Repo commit, stamped with the source commit SHA. It is what config load reads and what the Config Distribution serves; hand edits are refused structurally and operationally. Rollback is `git revert` on the pinned build — the resolved pins (base digests, knowledge content hashes) are decisions that exist nowhere else, so re-ingesting an old source commit is not a rollback. Durable git-class state (ADR-0024): recovery restores it, never rebuilds it.
+The machine-owned git tree at the control data dir's `configs/` that only `theozolith config ingest` commits to (ADR-0048): the lint-checked, pin-resolved, knowledge-compiled materialization of one Config Repo commit, stamped with the source commit SHA. It is what config load reads and what the Config Distribution serves; hand edits are refused structurally and operationally. Rollback is `git revert` on the pinned build — the resolved pins (base digests, knowledge content hashes, CLI versions + integrity) are decisions that exist nowhere else, so re-ingesting an old source commit is not a rollback. Durable git-class state (ADR-0024): recovery restores it, never rebuilds it.
 
 *Avoid*: calling it the Config Repo (that term means the human repo); a second write path into it (settings included — everything goes through ingest); treating it as derivable cache (its pins are underivable).
 
@@ -216,7 +228,7 @@ The base abstraction for every automated pipeline actor (redefined 2026-07-21; A
 
 **Worker-Type Definition**
 
-The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source (`knowledge = "knowledge/<name>"`; ADR-0048), driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, model + reasoning effort (typed fields; grilling 2026-08-10), workspace (target repo), and secret names. Compiled into a derived image at config change — the compiler materializes model and reasoning effort into the tool's native config at build (never hand-written in setup instructions, never selected at invocation), and the build fails on a model the adapter cannot map. Instantiated by a thin worker Stack (worker type + placement + desired state, plus optional per-placement bindings).
+The complete customization unit for one worker, declared in the Config Repo (grilling 2026-08-09): base image + setup instructions, optional Knowledge Source (`knowledge = "knowledge/<name>"`; ADR-0048), driver reference (`builtin:<name>` or `drivers/<name>`; ADR-0042), Agent adapter, model + reasoning effort (typed fields; grilling 2026-08-10), optional Agent Policy reference and, on a driverless type, CLI Pin (declared but not identity-bearing there; ADR-0055), workspace (target repo), and secret names. Compiled into a derived image at config change — the compiler materializes model and reasoning effort into the tool's native config at build (never hand-written in setup instructions, never selected at invocation), and the build fails on a model the adapter cannot map. Instantiated by a thin worker Stack (worker type + placement + desired state, plus optional per-placement bindings).
 
 *Avoid*: loading these fields onto the Stack format (Stacks stay generic; the Node Daemon never special-cases workers) — per-Stack workspace/secret bindings are the enumerated exception (ADR-0047), identity fields never move; "harness" as a field (the adapter is the variable; the harness is product plumbing); setting the model via setup instructions, env vars, or invocation flags (it is a typed field, baked at build).
 
@@ -245,6 +257,8 @@ A configuration that involves multiple agents working together.
 - A Node Daemon runs on exactly one box, supervises its Stacks (container workloads and driver processes in its cgroup), and heartbeats to the Control Node.
 - The Flight Deck is a human-driven, credentialed, interactive agent container Stack; it never claims issues and holds no transition authority beyond executing the human's explicitly instructed initial plan_ready stamp (ADR-0019 as amended 2026-08-27).
 - The Config Repo declares Stacks; Node Daemons reconcile them from desired state received over the heartbeat/command channel.
+- A Flight Deck's live surfaces (Knowledge Source, Agent Policy, CLI Pin) are declared on its worker-type definition, exported by the Node Daemon, mounted read-only at a stable parent, and selected by un-overridable env; only adopting, dropping, or reselecting one recreates the deck — content and version changes are live (ADR-0055).
+- An Agent Policy tree is identity-free by construction: ingest and config load refuse any model, effort, allowlist, policy-helper, or steering-env key in it (ADR-0045/0055).
 - `theozolith config ingest` is the only path from the Config Repo (human) to the Pinned Build (machine-owned); control loads and the Config Distribution serves only the Pinned Build (ADR-0048).
 - A worker-type definition names exactly one driver: `builtin:<name>` from the product distribution or `drivers/<name>` from the Config Distribution (ADR-0042).
 - A Candidate Bundle is a pure function of one config-repo-shaped source tree, exported without touching the Pinned Build; candidate identity is the triple (base digest, instruction hash, adapter name), and benchmark-to-deployment equivalence is identity-hash equality, recomputed from bundle bytes (ADR-0054).
