@@ -719,6 +719,7 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
         "flightdeck-logs:/var/log/flightdeck",
         "flightdeck-claude-state:/home/ozolith/.claude",
         "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
+        "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",
         "flightdeck-tailscale-state:/var/lib/tailscale",
         "flightdeck-workspace:/workspace",
     }
@@ -761,19 +762,55 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
     assert '"/home/ozolith/.claude/$entry"' in script
 
     # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts
-    # the knowledge export, any .claude path, or a tailnet identity.
+    # the knowledge or policy exports, any .claude path, or a tailnet identity.
     for stack in config.stacks:
         if stack.name == "flightdeck":
             continue
         for volume in stack.volumes:
             assert "knowledge" not in volume and ".claude" not in volume, (stack.name, volume)
+            assert "policy" not in volume, (stack.name, volume)
             assert "tailscale" not in volume, (stack.name, volume)
     for name, other in config.worker_types.items():
         if name == "flightdeck":
             continue
         for volume in other.volumes:
             assert "knowledge" not in volume and ".claude" not in volume, (name, volume)
+            assert "policy" not in volume, (name, volume)
             assert "tailscale" not in volume, (name, volume)
+
+
+def test_configs_example_flightdeck_policy_wiring(example_config):
+    """ADR-0055: the example Flight Deck declares an Agent Policy tree,
+    control injects the bare tree name (never a literal in the script), the
+    read-only policy bind rides at the stable PARENT, and the deck recipe's
+    policy fields stay EMPTY — a policy content edit never rebuilds the deck
+    image or recreates the container; only reselecting the tree does
+    (through the injected env)."""
+    config = example_config
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+    wt = config.worker_types["flightdeck"]
+    assert wt.policy == "policy/claude-defaults"
+    assert wt.policy_pin == config.worker_types["claude-dev"].policy_pin != ""
+    recipe = wt.recipe_wire()
+    assert recipe["policy"] == "" and recipe["policy_pin"] == ""
+    assert flightdeck.env["THEOZOLITH_POLICY_TREE"] == "claude-defaults"
+    assert "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro" in flightdeck.volumes
+
+    script = "\n".join(wt.setup)
+    assert "policy/claude-defaults" not in script  # the selection is env, not a literal
+    assert 'POLICY_TREE_DIR="/var/lib/theozolith/policy/${THEOZOLITH_POLICY_TREE}"' in script
+    assert 'if [ ! -d "$POLICY_TREE_DIR" ]; then' in script
+    assert "sudo mkdir -p /etc/claude-code" in script
+    assert "sudo rm -f /etc/claude-code/managed-settings.d" in script
+    assert 'sudo ln -s "$POLICY_TREE_DIR" /etc/claude-code/managed-settings.d' in script
+
+    # The BAKE path is exercised by the driver types: claude-dev declares the
+    # same tree, its recipe carries the reference and pin, and the identity
+    # gained exactly the conditional keys (nothing pins example tags, so the
+    # tag moving with the drop-in content is fine).
+    claude_dev = config.worker_types["claude-dev"].recipe_wire()
+    assert claude_dev["policy"] == "policy/claude-defaults"
+    assert claude_dev["policy_pin"] == config.worker_types["claude-dev"].policy_pin
 
 
 def test_configs_example_flightdeck_github_workspace_wiring(example_config):
@@ -1035,14 +1072,22 @@ def _generate_flightdeck_start(tmp_path: Path, config) -> Path:
     return dest
 
 
+POLICY_DOC = '{"attribution": {"sessionUrl": false}}\n'
+
+
 def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     """Rewrite the generated script's absolute paths into a sandbox so it can
-    run as the test user; the command sequence is untouched."""
+    run as the test user; the command sequence is untouched. A passthrough
+    `sudo` stub lands in the sandbox bin dir (the policy wiring escalates for
+    the root-owned managed drop-in link, ADR-0055; in the sandbox the command
+    just runs as the test user)."""
     content = script.read_text()
     content = content.replace("/home/ozolith", str(sandbox / "home"))
     content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
     content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
     content = content.replace("/var/lib/theozolith/knowledge", str(sandbox / "knowledge"))
+    content = content.replace("/var/lib/theozolith/policy", str(sandbox / "policy"))
+    content = content.replace("/etc/claude-code", str(sandbox / "claude-code"))
     content = content.replace("/etc/theozolith", str(sandbox / "etc"))
     content = content.replace("/workspace", str(sandbox / "workspace"))
     rewritten = sandbox / "start"
@@ -1055,6 +1100,14 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     # present by default so the fail-loud gate passes; the unavailable-tree
     # test removes it.
     (sandbox / "knowledge" / "claude-dev").mkdir(parents=True)
+    # The applied Agent Policy tree (ADR-0055), same posture.
+    (sandbox / "policy" / "claude-defaults").mkdir(parents=True)
+    (sandbox / "policy" / "claude-defaults" / "attribution.json").write_text(POLICY_DOC)
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sudo = bin_dir / "sudo"
+    sudo.write_text('#!/bin/sh\nexec "$@"\n')
+    sudo.chmod(0o755)
     return rewritten
 
 
@@ -1203,14 +1256,16 @@ def _instant_sleep(bin_dir: Path) -> None:
 def _run_start(
     script: Path, bin_dir: Path, *, timeout: float | None = None, **extra_env: str | None
 ) -> subprocess.CompletedProcess:
-    """The container-start env: the knowledge selection rides as the
-    control-injected THEOZOLITH_KNOWLEDGE_TREE (ADR-0048) — defaulted here so
-    every lifecycle test starts like a resolved deck Stack; pass ``None`` to
-    UNSET a variable (the missing-selection test)."""
+    """The container-start env: the knowledge and policy selections ride as
+    the control-injected THEOZOLITH_KNOWLEDGE_TREE / THEOZOLITH_POLICY_TREE
+    (ADR-0048/0055) — defaulted here so every lifecycle test starts like a
+    resolved deck Stack; pass ``None`` to UNSET a variable (the
+    missing-selection and policy-less-deck tests)."""
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "THEOZOLITH_KNOWLEDGE_TREE": "claude-dev",
+        "THEOZOLITH_POLICY_TREE": "claude-defaults",
     }
     env.pop("TS_AUTHKEY_FILE", None)
     env.pop("GITHUB_TOKEN_FILE", None)
@@ -1269,6 +1324,8 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         "FLIGHTDECK_TS_HOSTNAME",
         "THEOZOLITH_KNOWLEDGE_TREE",
         "KNOWLEDGE_TREE_DIR",
+        "THEOZOLITH_POLICY_TREE",
+        "POLICY_TREE_DIR",
         "entry",
         "CLAUDE_CONFIG",
         "tmp",
@@ -1293,6 +1350,7 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
     assert (
         script.index("KNOWLEDGE_TREE_DIR=")
         < script.index("link_knowledge")
+        < script.index("POLICY_TREE_DIR=")  # policy wiring before the tailnet path (ADR-0055)
         < script.index("CLAUDE_CONFIG=")  # the seed decides before the tailnet path
         < script.index("gh auth login")  # identity + workspace before the tailnet path
         < script.index("gh repo clone")
@@ -1311,12 +1369,18 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
     # Nothing on the TAILNET-IDENTITY volume is ever deleted; the only rms in
     # the script are the portable symlink replace under ~/.claude (never a
     # real directory — the guard above it refuses those), which GNU ln -sfnT
-    # performed implicitly before, and the seed subshell's cleanup trap on its
-    # own mktemp file (the published .claude.json itself is never removed).
+    # performed implicitly before, the same replace idiom for the managed
+    # drop-in link (ADR-0055; a real directory refuses first), and the seed
+    # subshell's cleanup trap on its own mktemp file (the published
+    # .claude.json itself is never removed).
     for line in lines:
         if "rm " in line:
             assert "tailscale" not in line, line
-            assert 'rm -f "$2"' in line or 'rm -f \\"$tmp\\"' in line, line
+            assert (
+                'rm -f "$2"' in line
+                or 'rm -f \\"$tmp\\"' in line
+                or "sudo rm -f /etc/claude-code/managed-settings.d" in line
+            ), line
     assert (
         script.index(" up --ssh")
         < script.index("> /var/lib/tailscale/.theozolith-enrolled-v1.tmp")
@@ -1441,6 +1505,130 @@ def test_flightdeck_start_replaces_stale_links_but_refuses_a_real_directory(
     assert proc.returncode == 1
     assert "refusing to symlink over it" in proc.stderr
     assert (claude / "agents").is_dir() and not (claude / "agents").is_symlink()
+
+
+def _policy_run(tmp_path, example_config):
+    """A sandboxed script plus the minimal env for a run that reaches (and
+    passes) the policy wiring before the deliberately dying daemon stub fails
+    the container — the policy sections run strictly before tailscaled."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    return sandbox, bin_dir, script, daemon_calls, key_file
+
+
+def test_flightdeck_start_links_managed_settings_into_the_policy_tree(tmp_path, example_config):
+    """ADR-0055 §8: the managed drop-in dir becomes a symlink into the
+    selected exported tree (via the passwordless-sudo stub), and the drop-in
+    reads through it — the path the CLI resolves at launch."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert daemon_calls.exists()  # the wiring completed and the daemon launched
+    link = sandbox / "claude-code" / "managed-settings.d"
+    assert os.readlink(link) == str(sandbox / "policy" / "claude-defaults")
+    assert (link / "attribution.json").read_text() == POLICY_DOC
+
+
+def test_flightdeck_start_unconverged_policy_tree_fails_before_the_daemon(tmp_path, example_config):
+    """ADR-0055 §6: a SELECTED policy tree the node has not converged fails
+    the start loudly BEFORE tailscaled launches — docker restart policy owns
+    the retry; a deck never runs under silently missing policy."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    shutil.rmtree(sandbox / "policy" / "claude-defaults")  # not converged yet
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "policy tree" in proc.stderr and "not available on this node" in proc.stderr
+    assert not daemon_calls.exists()
+    assert not (sandbox / "claude-code" / "managed-settings.d").exists()
+
+
+def test_flightdeck_start_without_policy_selection_skips_wiring_and_starts(
+    tmp_path, example_config
+):
+    """A policy-less deck is today's deck: no selection injected, the section
+    skips with a logged note, and the start proceeds (here to the
+    deliberately dying daemon stub — past the policy section)."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_POLICY_TREE=None,
+    )
+    assert daemon_calls.exists()  # the skip is not a failure
+    assert "no Agent Policy selected" in proc.stdout + proc.stderr
+    assert not (sandbox / "claude-code").exists()  # the wiring never ran
+
+
+def test_flightdeck_start_refuses_a_real_directory_at_the_managed_settings_path(
+    tmp_path, example_config
+):
+    """A REAL directory at the link destination (image debris, a hand edit)
+    is never deleted — same posture as link_knowledge (ADR-0055)."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    real = sandbox / "claude-code" / "managed-settings.d"
+    real.mkdir(parents=True)
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert proc.returncode == 1
+    assert "refusing to symlink over it" in proc.stderr
+    assert real.is_dir() and not real.is_symlink()
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_policy_content_edit_lands_on_the_next_launch(tmp_path, example_config):
+    """The ADR-0055 lifecycle obligation: after a successful start, a policy
+    CONTENT edit exchanged under the mounted parent — exactly the daemon's
+    child swap, with the script NOT re-run — is readable through the managed
+    drop-in path the CLI resolves at its next launch, with no container-spec
+    input (env, volumes, image) having changed."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert daemon_calls.exists()
+    link = sandbox / "claude-code" / "managed-settings.d"
+    target_before = os.readlink(link)
+    assert (link / "attribution.json").read_text() == POLICY_DOC
+
+    # The daemon's exchange: stage a v2 tree, rename the old child aside,
+    # rename the staged tree in (parent inode stable, script not re-run).
+    parent = sandbox / "policy"
+    v2 = '{"attribution": {"sessionUrl": true}}\n'
+    staging = parent / ".claude-defaults.tmp"
+    staging.mkdir()
+    (staging / "attribution.json").write_text(v2)
+    os.replace(parent / "claude-defaults", parent / ".claude-defaults.retired")
+    os.replace(staging, parent / "claude-defaults")
+
+    # The next `claude` launch resolves the SAME link to the new content —
+    # nothing about the container spec changed (the link target path is
+    # byte-identical; env/volumes/image are config-level facts pinned by
+    # test_configs_example_flightdeck_policy_wiring).
+    assert os.readlink(link) == target_before
+    assert (link / "attribution.json").read_text() == v2
 
 
 def test_flightdeck_start_missing_hostname_fails_before_the_daemon(tmp_path, example_config):

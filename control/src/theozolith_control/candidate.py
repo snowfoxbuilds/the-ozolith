@@ -3,11 +3,12 @@
 
 A Candidate Bundle is the self-contained export of one worker-type definition
 for benchmarking: ``candidate.json`` (the resolved manifest), the compiled
-knowledge tree for the candidate's adapter tool, and a Dockerfile emitted by
-the Node Daemon's own codegen — building the same derived image a deployment
-would run. Export consumes an already-materialized LOCAL config-repo-shaped
-directory and reuses the ingest resolution machinery (per-tool knowledge
-compile, base tag->digest, pins, instruction hash) with no Pinned Build
+knowledge tree for the candidate's adapter tool, the baked Agent Policy tree
+(ADR-0055), and a Dockerfile emitted by the Node Daemon's own codegen —
+building the same derived image a deployment would run. Export consumes an
+already-materialized LOCAL config-repo-shaped directory and reuses the ingest
+resolution machinery (per-tool knowledge compile, policy allowlist validation
+and pinning, base tag->digest, pins, instruction hash) with no Pinned Build
 involvement; benchmark<->deployment equivalence is identity-hash equality,
 never shared provenance.
 
@@ -64,17 +65,23 @@ from theozolith_nodedaemon import builds
 from theozolith_nodedaemon import configdist as node_configdist
 from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
 
-from theozolith_control import __version__, configrepo, ingest
+from theozolith_control import __version__, configdist, configrepo, ingest
 
-BUNDLE_FORMAT_VERSION = 1
-IDENTITY_SPEC_VERSION = 1
+# v2 (ADR-0055): the manifest gained the policy/policy_pin keys, the layout
+# allowlist gained policy/, and the canonical identity serialization gained
+# the conditional policy keys — each bump owned by its key, with a dated
+# Changelog entry in BENCH-CONTRACT.md (no silent breaks, no windows).
+BUNDLE_FORMAT_VERSION = 2
+IDENTITY_SPEC_VERSION = 2
 
 MANIFEST_NAME = "candidate.json"
 DOCKERFILE_NAME = "Dockerfile"
-# The bundle IS a docker build context, so the knowledge tree lives under the
-# exact directory name the daemon stages (builds._CONTEXT_KNOWLEDGE); the
-# layout contract test pins the two names together.
+# The bundle IS a docker build context, so the knowledge and policy trees
+# live under the exact directory names the daemon stages
+# (builds._CONTEXT_KNOWLEDGE / builds._CONTEXT_POLICY); the layout contract
+# test pins the names together.
 KNOWLEDGE_SUBDIR = "knowledge"
+POLICY_SUBDIR = "policy"
 
 # Worker-type names ride into the deterministic tag and the bundle manifest;
 # v1 pins them to the same conservative class as knowledge tree names.
@@ -99,6 +106,8 @@ _MANIFEST_KEYS = (
     "knowledge_pin",
     "knowledge_target",
     "model",
+    "policy",
+    "policy_pin",
     "product_version",
     "secret_slots",
     "setup",
@@ -135,7 +144,8 @@ def export_candidate(
     now: Callable[[], str] | None = None,
 ) -> CandidateSummary:
     """Export one worker-type definition from a local config-repo-shaped
-    directory (``worker-types/`` + ``knowledge/``) as a Candidate Bundle.
+    directory (``worker-types/`` + ``knowledge/`` + ``policy/``) as a
+    Candidate Bundle.
 
     v1 accepts nothing but a local directory: URLs and non-directory sources
     are rejected — callers clone remote repositories themselves, preferably
@@ -179,9 +189,11 @@ def export_candidate(
             knowledge_pins = ingest._compile_knowledge(source_dir, staging)
         except ingest.IngestError as exc:
             raise CandidateError(str(exc)) from exc
+        policy_pins = _stage_policy_trees(source_dir, staging)
         pins = configrepo.Pins(
             base=_resolve_base(data, docker_config, resolve_digest),
             knowledge=knowledge_pins,
+            policy=policy_pins,
         )
         try:
             wt = configrepo._parse_worker_type(worker_type, data, pins)
@@ -195,6 +207,9 @@ def export_candidate(
         reason = builds.stage_knowledge(recipe, staging, bundle)
         if reason:
             raise CandidateError(f"cannot stage the compiled knowledge tree: {reason}")
+        reason = builds.stage_policy(recipe, staging, bundle)
+        if reason:
+            raise CandidateError(f"cannot stage the Agent Policy tree: {reason}")
         (bundle / DOCKERFILE_NAME).write_text(
             builds.dockerfile_for(recipe, exported_at), encoding="utf-8"
         )
@@ -214,6 +229,10 @@ def export_candidate(
             "knowledge": wt.baked_knowledge,
             "knowledge_pin": wt.baked_knowledge_pin,
             "knowledge_target": wt.knowledge_target,
+            # The BAKED policy view (ADR-0055): empty for a driverless
+            # candidate, exactly as it rides the wire recipe.
+            "policy": wt.baked_policy,
+            "policy_pin": wt.baked_policy_pin,
             "instruction_hash": wt.instruction_hash,
             "driver": wt.driver,
             # Slot names only — a consumer learns what to bind; the
@@ -237,6 +256,30 @@ def export_candidate(
         instruction_hash=wt.instruction_hash,
         tag=wt.tag,
     )
+
+
+def _stage_policy_trees(source_dir: Path, staging: Path) -> dict[str, str]:
+    """Copy the source's Agent Policy trees into the dist-shaped staging and
+    return the per-tree pins (ADR-0055). Validation and pin computation are
+    ingest's own (``ingest._pin_policy`` — the shared safe-key allowlist),
+    run over the same staged shape a deployment distributes, so
+    ``builds.stage_policy`` can stage the bundle from staging exactly as a
+    node stages a bake. An unstageable tree (a special file the copy cannot
+    carry) fails here; everything else — symlinks, unadmitted keys, bad
+    names — fails in the shared validator with its own message."""
+    source_root = source_dir / configdist.POLICY_DIR
+    if source_root.is_dir():
+        for entry in sorted(source_root.iterdir(), key=lambda p: p.name):
+            if configdist.excluded_part(entry.name) or entry.is_symlink() or not entry.is_dir():
+                continue  # ingest._pin_policy refuses irregular entries below
+            try:
+                shutil.copytree(entry, staging / configdist.POLICY_DIR / entry.name, symlinks=False)
+            except (OSError, shutil.Error) as exc:
+                raise CandidateError(f"cannot stage policy/{entry.name}: {exc}") from exc
+    try:
+        return ingest._pin_policy(source_dir, staging)
+    except ingest.IngestError as exc:
+        raise CandidateError(str(exc)) from exc
 
 
 def _source_dir(source: str | Path) -> Path:
@@ -506,20 +549,26 @@ def verify_bundle(bundle: str | Path) -> CandidateSummary:
     tree may be present); (3) recompute the materialized setup, instruction
     hash, base-digest consistency, adapter identity, and the identity triple
     — through the production worker-type parse, so every capability gate a
-    deployment applies fires here too; (4) reconstruct the production wire
+    deployment applies fires here too (the Agent Policy tree recomputes its
+    pin the same way, ADR-0055); (4) reconstruct the production wire
     recipe; (5) regenerate the Dockerfile through the shared production
     codegen and require an exact byte match; (6) validate the layout against
-    the v1 allowlist — unexpected entries, symlinks, path traversal, and
+    the allowlist — unexpected entries, symlinks, path traversal, and
     special files refused. Every failure precedes any Docker invocation."""
     bundle_dir = Path(bundle)
     if not bundle_dir.is_dir():
         raise CandidateError(f"bundle {bundle_dir} is not a directory")
     manifest = _load_manifest(bundle_dir)
     _verify_knowledge_tree(bundle_dir, manifest)
+    _verify_policy_tree(bundle_dir, manifest)
     wt = _reconstruct_worker_type(manifest)
     recipe = wt.recipe_wire()
     _verify_dockerfile(bundle_dir, recipe, manifest)
-    _verify_layout(bundle_dir, has_knowledge=bool(manifest["knowledge"]))
+    _verify_layout(
+        bundle_dir,
+        has_knowledge=bool(manifest["knowledge"]),
+        has_policy=bool(manifest["policy"]),
+    )
     return CandidateSummary(
         worker_type=wt.name,
         adapter=wt.adapter,
@@ -597,6 +646,8 @@ def _check_manifest_shapes(raw: dict) -> None:
         "knowledge_pin",
         "knowledge_target",
         "model",
+        "policy",
+        "policy_pin",
         "product_version",
         "worker_type",
     ):
@@ -622,6 +673,8 @@ def _check_manifest_shapes(raw: dict) -> None:
         raise CandidateError(f"{MANIFEST_NAME}: instruction_hash must be 64 hex chars")
     if raw["knowledge_pin"] and not _HEX64.fullmatch(raw["knowledge_pin"]):
         raise CandidateError(f"{MANIFEST_NAME}: knowledge_pin must be '' or 64 hex chars")
+    if raw["policy_pin"] and not _HEX64.fullmatch(raw["policy_pin"]):
+        raise CandidateError(f"{MANIFEST_NAME}: policy_pin must be '' or 64 hex chars")
     if not _EXPORTED_AT.fullmatch(raw["exported_at"]):
         raise CandidateError(
             f"{MANIFEST_NAME}: exported_at must be 'YYYY-MM-DDTHH:MM:SSZ'"
@@ -682,6 +735,46 @@ def _verify_knowledge_tree(bundle: Path, manifest: dict) -> None:
         )
 
 
+def _verify_policy_tree(bundle: Path, manifest: dict) -> None:
+    """The Agent Policy half of step 2 (ADR-0055): recompute the baked tree's
+    pin with the daemon's own fail-closed tree hash. An empty policy ref means
+    no policy tree may be present and no pin may be recorded; a driverless
+    manifest can never carry a baked policy (the manifest is the BAKED
+    view)."""
+    ref = manifest["policy"]
+    tree = bundle / POLICY_SUBDIR
+    if not ref:
+        if manifest["policy_pin"]:
+            raise CandidateError(f"{MANIFEST_NAME}: policy_pin is set but the policy ref is empty")
+        if tree.is_symlink() or tree.exists():
+            raise CandidateError(
+                "bundle carries a policy/ entry but the manifest declares no"
+                " policy — an empty policy ref means no policy tree may be"
+                " present"
+            )
+        return
+    if not manifest["driver"]:
+        raise CandidateError(
+            f"{MANIFEST_NAME}: a driverless candidate bakes no policy — the"
+            " manifest carries the BAKED policy view, which is empty for a"
+            " Flight Deck type (ADR-0055)"
+        )
+    if not manifest["policy_pin"]:
+        raise CandidateError(f"{MANIFEST_NAME}: a policy ref requires its tree pin")
+    if tree.is_symlink() or not tree.is_dir():
+        raise CandidateError("bundle policy/ must be a directory (symlinks refused)")
+    try:
+        recomputed = node_configdist.tree_hash(tree)
+    except node_configdist.ConfigDistError as exc:
+        raise CandidateError(f"bundle policy tree failed verification: {exc}") from exc
+    if not recomputed or recomputed != manifest["policy_pin"]:
+        raise CandidateError(
+            f"bundle policy tree hashes {recomputed[:12] or '(empty)'} but the"
+            f" manifest pins {manifest['policy_pin'][:12]} — tree bytes and"
+            " recorded pin disagree"
+        )
+
+
 def _reconstruct_worker_type(manifest: dict) -> configrepo.WorkerTypeDef:
     """Step 3: rebuild the worker-type definition through the PRODUCTION
     parse (capability gates, reserved-slot guards, adapter identity and all)
@@ -689,6 +782,7 @@ def _reconstruct_worker_type(manifest: dict) -> configrepo.WorkerTypeDef:
     a recorded identity is a convenience the verifier checks, never trusted
     (ADR-0054)."""
     knowledge = manifest["knowledge"]
+    policy = manifest["policy"]
     pins = configrepo.Pins(
         knowledge=(
             {
@@ -699,11 +793,15 @@ def _reconstruct_worker_type(manifest: dict) -> configrepo.WorkerTypeDef:
             if knowledge
             else {}
         ),
+        policy=(
+            {policy[len(configrepo.POLICY_REF_PREFIX) :]: manifest["policy_pin"]} if policy else {}
+        ),
     )
     data = {
         "base": manifest["base"],
         "setup": list(manifest["setup"]),
         "knowledge": knowledge,
+        "policy": policy,
         "driver": manifest["driver"],
         "adapter": manifest["adapter"],
         "model": manifest["model"],
@@ -719,6 +817,8 @@ def _reconstruct_worker_type(manifest: dict) -> configrepo.WorkerTypeDef:
     for name, recomputed in (
         ("base_digest", wt.base_digest),
         ("knowledge_target", wt.knowledge_target),
+        ("policy", wt.baked_policy),
+        ("policy_pin", wt.baked_policy_pin),
         ("instruction_hash", wt.instruction_hash),
     ):
         if manifest[name] != recomputed:
@@ -751,29 +851,36 @@ def _verify_dockerfile(bundle: Path, recipe: dict, manifest: dict) -> None:
         )
 
 
-def _verify_layout(bundle: Path, *, has_knowledge: bool) -> None:
-    """Step 6: the v1 allowlist — exactly ``candidate.json``, ``Dockerfile``,
-    and (with knowledge) ``knowledge/``; every entry a regular file or
-    directory. Anything that could alter or escape the build context —
-    unexpected entries, symlinks, special files — refuses."""
-    allowed = {MANIFEST_NAME, DOCKERFILE_NAME} | ({KNOWLEDGE_SUBDIR} if has_knowledge else set())
+def _verify_layout(bundle: Path, *, has_knowledge: bool, has_policy: bool) -> None:
+    """Step 6: the allowlist — exactly ``candidate.json``, ``Dockerfile``,
+    (with knowledge) ``knowledge/``, and (with a baked policy) ``policy/``;
+    every entry a regular file or directory. Anything that could alter or
+    escape the build context — unexpected entries, symlinks, special files —
+    refuses."""
+    allowed = {MANIFEST_NAME, DOCKERFILE_NAME}
+    if has_knowledge:
+        allowed.add(KNOWLEDGE_SUBDIR)
+    if has_policy:
+        allowed.add(POLICY_SUBDIR)
     unexpected = sorted(set(os.listdir(bundle)) - allowed)
     if unexpected:
         raise CandidateError(
             f"bundle carries unexpected entries: {', '.join(unexpected)} —"
             f" bundle_format_version {BUNDLE_FORMAT_VERSION} allows exactly"
-            f" {MANIFEST_NAME}, {DOCKERFILE_NAME}, and (with knowledge)"
-            f" {KNOWLEDGE_SUBDIR}/"
+            f" {MANIFEST_NAME}, {DOCKERFILE_NAME}, (with knowledge)"
+            f" {KNOWLEDGE_SUBDIR}/, and (with a baked policy) {POLICY_SUBDIR}/"
         )
     for name in (MANIFEST_NAME, DOCKERFILE_NAME):
         if not stat.S_ISREG(os.lstat(bundle / name).st_mode):
             raise CandidateError(
                 f"bundle {name} must be a regular file — symlinks and special files are refused"
             )
-    if has_knowledge:
-        root = bundle / KNOWLEDGE_SUBDIR
+    for subdir, present in ((KNOWLEDGE_SUBDIR, has_knowledge), (POLICY_SUBDIR, has_policy)):
+        if not present:
+            continue
+        root = bundle / subdir
         if not stat.S_ISDIR(os.lstat(root).st_mode):
-            raise CandidateError(f"bundle {KNOWLEDGE_SUBDIR}/ must be a directory")
+            raise CandidateError(f"bundle {subdir}/ must be a directory")
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             for name in (*dirnames, *filenames):
                 entry = Path(dirpath) / name

@@ -522,6 +522,75 @@ def test_cross_package_knowledge_tree_pin_agreement(tmp_path):
     assert node_configdist.knowledge_tree_hash(tmp_path, "missing") == ""
 
 
+def test_cross_package_dist_dirs_agreement():
+    """The two DIST_DIRS enumerations MUST agree (ADR-0042/0048/0055): a
+    subtree only one side distributes would either never ride the artifact or
+    always fail node-side verification."""
+    assert configdist.DIST_DIRS == node_configdist.DIST_DIRS
+    assert configdist.POLICY_DIR == node_configdist.POLICY_DIR == "policy"
+
+
+def test_cross_package_policy_tree_pin_agreement(tmp_path):
+    """The per-tree Agent Policy pin (ADR-0055) MUST agree across packages:
+    control computes it at ingest and bakes it into the instruction hash of
+    driver types; the node recomputes it over the staged copy before every
+    bake."""
+    _write(tmp_path, "policy/claude-defaults/attribution.json", '{"attribution":{}}\n')
+    _write(tmp_path, "policy/other/attribution.json", '{"attribution":{"sessionUrl":false}}\n')
+    control_pin = configdist.policy_tree_hash(tmp_path, "claude-defaults")
+    node_pin = node_configdist.tree_hash(tmp_path / "policy" / "claude-defaults")
+    assert control_pin == node_pin != ""
+    assert configdist.policy_tree_hash(tmp_path, "other") != control_pin
+    assert configdist.policy_tree_hash(tmp_path, "missing") == ""
+
+
+def test_policy_content_edit_moves_the_distribution_hash(tmp_path):
+    """policy/ rides the config distribution (ADR-0055): editing a drop-in
+    moves the single distribution hash exactly as a drivers/ or knowledge/
+    edit does, so nodes converge on it."""
+    _populate(tmp_path)
+    _write(tmp_path, "policy/claude-defaults/attribution.json", '{"attribution":{}}\n')
+    before = configdist.dist_hash(tmp_path)
+    _write(
+        tmp_path,
+        "policy/claude-defaults/attribution.json",
+        '{"attribution":{"sessionUrl":false}}\n',
+    )
+    after = configdist.dist_hash(tmp_path)
+    assert before != after != ""
+    assert node_configdist.manifest_hash_of_tree(tmp_path) == after
+
+
+def test_policy_members_ride_the_artifact_and_verify_on_both_sides(tmp_path):
+    """An artifact carrying policy/ members (ADR-0055) builds, verifies on
+    the control side, extracts on the node side, and recomputes to the same
+    hash."""
+    _populate(tmp_path)
+    _write(tmp_path, "policy/claude-defaults/attribution.json", '{"attribution":{}}\n')
+    out = tmp_path / "out"
+    digest, path = configdist.build_artifact(tmp_path, out, built_against="0.3.0")
+    assert digest and path is not None
+    recomputed, _ = configdist.verify_artifact(path)
+    assert recomputed == digest
+    dest = tmp_path / "node-tree"
+    dest.mkdir()
+    node_configdist.extract_zip(path.read_bytes(), dest)
+    assert node_configdist.manifest_hash_of_tree(dest) == digest
+    assert (dest / "policy/claude-defaults/attribution.json").is_file()
+
+
+def test_policy_bake_target_is_the_managed_dropin_dir():
+    """The daemon's policy COPY destination is contract-pinned to the worker
+    package's managed drop-in directory (ADR-0055): the drop-ins must land
+    exactly where the ADR-0045 build-gate conflict scan and the CLI read
+    them. nodedaemon cannot import theozolith_worker (ADR-0010), so the two
+    constants are pinned here."""
+    from theozolith_nodedaemon import builds
+    from theozolith_worker import identity
+
+    assert f"/{identity.MANAGED_DROPIN_DIR}/" == builds._POLICY_TARGET
+
+
 def test_knowledge_members_ride_the_artifact_and_verify_on_both_sides(tmp_path):
     """An artifact carrying knowledge/ members (ADR-0048) builds, verifies on
     the control side, extracts on the node side, and recomputes to the same

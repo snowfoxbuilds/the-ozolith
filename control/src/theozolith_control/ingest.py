@@ -11,12 +11,15 @@ distributes. This module is the ONLY path between them:
    build's ``product.toml`` carried forward when the source declares none —
    the update flow owns the pin, ADR-0051), ``knowledge/<name>`` trees
    compiled by the ADR-0009 compiler (compile errors surface HERE, not at
-   image build or container start), ``control.toml`` merged (the machine-
-   written [control] address block is preserved from the pinned build; the
-   [settings] surface is harvested from the source), and ``pins.toml``
-   written with the resolved pins.
-3. RESOLVE pins where resolution is mechanical: per-knowledge-tree content
-   hashes and base tag->digest. NEVER where the value must come out-of-band —
+   image build or container start), ``policy/<name>`` Agent Policy trees
+   validated against the safe-key allowlist (ADR-0055 — an unadmitted key
+   surfaces HERE, and again at every config load), ``control.toml`` merged
+   (the machine-written [control] address block is preserved from the pinned
+   build; the [settings] surface is harvested from the source), and
+   ``pins.toml`` written with the resolved pins.
+3. RESOLVE pins where resolution is mechanical: per-knowledge-tree and
+   per-policy-tree content hashes and base tag->digest. NEVER where the
+   value must come out-of-band —
    a vendor-published artifact checksum in a setup line stays human-entered
    in the Config Repo, and ingest only refuses the fail-closed placeholder
    for worker types a running Stack references (computing it would sign
@@ -100,6 +103,11 @@ from pathlib import Path
 
 from theozolith_knowledge import COMPILERS, KnowledgeError, load_knowledge_root
 
+# The ONE Agent Policy validator (ADR-0055), shared with config load: imported
+# as a module and invoked through the attribute, so a single monkeypatch of
+# theozolith_worker.policy.validate_policy_tree observes both sites.
+from theozolith_worker import policy as agentpolicy
+
 from theozolith_control import configdist, configrepo, controltoml, repolock
 
 # A sha256 whose value is the fail-closed placeholder convention (all zeros):
@@ -148,6 +156,7 @@ class IngestReport:
     changed: bool = False  # in a dry run: whether a real ingest WOULD commit
     resolved_bases: dict[str, str] = field(default_factory=dict)  # ref -> digest
     knowledge_pins: dict[str, str] = field(default_factory=dict)  # "tree/tool" -> hash
+    policy_pins: dict[str, str] = field(default_factory=dict)  # tree -> hash (ADR-0055)
     retagged: dict[str, tuple[str, str]] = field(default_factory=dict)  # type -> (old, new)
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False  # lint + preview only — nothing was committed
@@ -170,6 +179,8 @@ class IngestReport:
             lines.append(f"resolved base {ref} -> {digest[:19]}…")
         for name, tree_hash in sorted(self.knowledge_pins.items()):
             lines.append(f"knowledge/{name} pinned {tree_hash[:12]}")
+        for name, tree_hash in sorted(self.policy_pins.items()):
+            lines.append(f"policy/{name} pinned {tree_hash[:12]}")
         retag_verb = "would re-tag" if self.dry_run else "re-tagged"
         for name, (old, new) in sorted(self.retagged.items()):
             lines.append(f"worker type {name} {retag_verb}: {old or '(new)'} -> {new}")
@@ -496,6 +507,49 @@ def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
     return pins
 
 
+def _pin_policy(source_dir: Path, staging: Path) -> dict[str, str]:
+    """Validate every ``policy/<name>`` Agent Policy tree and return the
+    per-tree content pins (ADR-0055). Validation runs over the SOURCE tree —
+    so a dot-prefixed drop-in is refused rather than silently dropped by
+    ``_copy_config_files``' exclusion filter — with the same
+    ``theozolith_worker.policy`` validator config load applies (the two
+    sites provably share one allowlist); the pin is then computed over the
+    already-copied STAGED tree, which validation guarantees is byte-for-byte
+    the source (``policy/`` copies verbatim — it is not in
+    ``_SKIP_TOP_LEVEL``). An empty tree records no pin — a worker type
+    joining an absent pin fails config load with an actionable error
+    instead. The pinned build stays a pure function of the source: ingest
+    never inspects which worker types reference a tree."""
+    source_root = source_dir / configdist.POLICY_DIR
+    pins: dict[str, str] = {}
+    if not source_root.is_dir():
+        return pins
+    for entry in sorted(source_root.iterdir(), key=lambda p: p.name):
+        if configdist.excluded_part(entry.name):
+            continue
+        if not entry.is_dir() or entry.is_symlink():
+            raise IngestError(
+                f"policy/{entry.name} must be a directory (one Agent Policy"
+                " tree per name, ADR-0055)"
+            )
+        if not configrepo.KNOWLEDGE_TREE_NAME.fullmatch(entry.name):
+            raise IngestError(
+                f"policy/{entry.name}: tree names must match"
+                " ^[A-Za-z0-9][A-Za-z0-9._-]*$ (ADR-0055)"
+            )
+        try:
+            agentpolicy.validate_policy_tree(entry, label=f"policy/{entry.name}")
+        except agentpolicy.PolicyError as exc:
+            raise IngestError(str(exc)) from exc
+        try:
+            pin = configdist.policy_tree_hash(staging, entry.name)
+        except configdist.ConfigDistError as exc:
+            raise IngestError(f"policy/{entry.name}: {exc}") from exc
+        if pin:
+            pins[entry.name] = pin
+    return pins
+
+
 def _live_worker_types(staging: Path) -> set[str]:
     """Worker types referenced by a Stack whose desired state is running —
     the scope of the placeholder refusal: a template (dormant or stopped) may
@@ -566,7 +620,11 @@ def _resolve_bases(staging: Path, resolve_digest: Callable[[str], str]) -> dict[
 
 
 def _write_pins(
-    staging: Path, source_commit: str, bases: dict[str, str], knowledge: dict[str, str]
+    staging: Path,
+    source_commit: str,
+    bases: dict[str, str],
+    knowledge: dict[str, str],
+    policy: dict[str, str],
 ) -> None:
     lines = [
         "# Machine-written by `theozolith config ingest` (ADR-0048) — never hand-edit.",
@@ -582,6 +640,9 @@ def _write_pins(
     if knowledge:
         lines += ["", "[knowledge]"]
         lines += [f'"{name}" = "{tree_hash}"' for name, tree_hash in sorted(knowledge.items())]
+    if policy:
+        lines += ["", "[policy]"]
+        lines += [f'"{name}" = "{tree_hash}"' for name, tree_hash in sorted(policy.items())]
     (staging / configrepo.PINS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -885,9 +946,16 @@ def _ingest_locked(
         _copy_config_files(source_dir, staging)
         _preserve_product_pin(source_dir, pinned_state, staging, report)
         report.knowledge_pins = _compile_knowledge(source_dir, staging)
+        report.policy_pins = _pin_policy(source_dir, staging)
         _refuse_live_placeholders(staging)
         report.resolved_bases = _resolve_bases(staging, resolve)
-        _write_pins(staging, report.source_commit, report.resolved_bases, report.knowledge_pins)
+        _write_pins(
+            staging,
+            report.source_commit,
+            report.resolved_bases,
+            report.knowledge_pins,
+            report.policy_pins,
+        )
         _merge_control_toml(source_dir, pinned_state, staging)
 
         # LINT: the staged tree must load under the exact fail-loud checks the

@@ -4,7 +4,8 @@ ADR-0042: the Node Daemon fetches a config-distribution artifact by its
 drivers-hash and VERIFIES it by recomputing the manifest over the unpacked
 tree — never by trusting the archive bytes or the served filename. ADR-0048
 extends the distributed tree to the pinned build's compiled ``knowledge/``
-trees alongside ``drivers/``; the hash keeps its historical wire name. This module
+trees alongside ``drivers/``, and ADR-0055 adds the ``policy/`` Agent Policy
+trees; the hash keeps its historical wire name. This module
 mirrors the SUBSET of ``theozolith_control.configdist`` the node needs: the
 canonical hash algorithm. It cannot import the control package (nodedaemon is
 stdlib-only, ADR-0010), so the algorithm is duplicated here and pinned to the
@@ -51,8 +52,12 @@ DRIVERS_DIR = "drivers"
 # drivers/ under the same single hash.
 KNOWLEDGE_DIR = "knowledge"
 
+# The Agent Policy trees (ADR-0055), distributed under the same single hash.
+# Mirror of the control side (pinned by the cross-package contract tests).
+POLICY_DIR = "policy"
+
 # The subtrees the distribution covers, in manifest order.
-DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR)
+DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR, POLICY_DIR)
 
 # The metadata member at the archive/unpacked root (control side writes it):
 # metadata ABOUT the manifest, excluded from the hash by construction.
@@ -182,9 +187,9 @@ def _regular_files(root: Path) -> list[Path]:
 
 def manifest_hash_of_tree(dist_root: Path) -> str:
     """Recompute the distribution hash over an unpacked config-distribution
-    root (which holds ``drivers/`` + ``knowledge/`` plus the
-    ``config-dist.json`` metadata member). The manifest covers the ``drivers/``
-    and ``knowledge/`` file sets, with relpaths INCLUDING the subtree prefix —
+    root (which holds the ``DIST_DIRS`` subtrees plus the
+    ``config-dist.json`` metadata member). The manifest covers the distributed
+    subtree file sets, with relpaths INCLUDING the subtree prefix —
     the metadata member at the root is excluded by construction. An empty tree
     hashes to ``""``. Byte-for-byte the control side's
     ``manifest_hash(dist_manifest(...))``.
@@ -277,7 +282,8 @@ def artifact_structure_error(names: list[str]) -> str | None:
     cross-package contract test).
 
     A valid archive holds EXACTLY the single ``config-dist.json`` metadata member
-    at the root plus zero or more ``drivers/...`` / ``knowledge/...`` files the
+    at the root plus zero or more ``drivers/...`` / ``knowledge/...`` /
+    ``policy/...`` files the
     canonical manifest counts. Anything the manifest would ignore (a dot
     component, ``__pycache__``, a ``*.pyc``, a bare directory entry, a second
     top-level file, an unsafe name, or a duplicate) is rejected, so no
@@ -297,7 +303,7 @@ def artifact_structure_error(names: list[str]) -> str | None:
         if parts[0] not in DIST_DIRS or len(parts) < 2:
             return (
                 f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
-                f" {DRIVERS_DIR}/ or {KNOWLEDGE_DIR}/ file"
+                f" {DRIVERS_DIR}/, {KNOWLEDGE_DIR}/, or {POLICY_DIR}/ file"
             )
         if any(excluded_part(part) for part in parts):
             return (

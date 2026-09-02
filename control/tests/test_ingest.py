@@ -355,6 +355,112 @@ def test_source_symlink_is_refused(tmp_path):
         ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
 
 
+# -- Agent Policy trees (ADR-0055) -----------------------------------------------
+
+POLICY_DOC = '{"attribution": {"sessionUrl": false}}\n'
+
+
+def test_policy_trees_are_validated_pinned_and_round_trip(tmp_path):
+    """A valid policy tree copies verbatim into the pinned build, its content
+    pin lands under [policy] in pins.toml, and the pinned build loads with
+    the pin joined onto the referencing worker type (ADR-0055)."""
+    src = source_repo(tmp_path, git=False)
+    write(src, "policy/claude-defaults/attribution.json", POLICY_DOC)
+    write(
+        src,
+        "worker-types/claude-dev.toml",
+        f'driver = "builtin:implementer"\nadapter = "claude"\n'
+        f'model = "claude-sonnet-5"\nworkspace = "acme/sandbox"\n'
+        f'base = "{BASE}"\npolicy = "policy/claude-defaults"\n',
+    )
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, log=lambda *_: None)
+    assert (pinned / "policy/claude-defaults/attribution.json").read_text() == POLICY_DOC
+    expected = configdist.policy_tree_hash(pinned, "claude-defaults")
+    assert report.policy_pins == {"claude-defaults": expected}
+    assert f'"claude-defaults" = "{expected}"' in (pinned / "pins.toml").read_text()
+    assert "policy/claude-defaults pinned" in report.summary()
+    config = configrepo.load_config(pinned)
+    assert config.worker_types["claude-dev"].policy_pin == expected
+
+
+def test_invalid_policy_tree_fails_ingest_with_nothing_committed(tmp_path):
+    """An unadmitted key refuses at ingest (the allowlist's first site), and
+    the refusal commits nothing; a dry run reports the same refusal."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    write(src, "policy/rogue/hooks.json", '{"hooks": {"Stop": []}}\n')
+    _commit_all(src, "rogue policy")
+    with pytest.raises(IngestError, match=r"policy/rogue/hooks\.json.*'hooks'"):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert not (pinned / "policy").exists()
+    with pytest.raises(IngestError, match=r"policy/rogue/hooks\.json.*'hooks'"):
+        ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+
+
+def test_dot_prefixed_policy_drop_in_is_refused_not_silently_dropped(tmp_path):
+    """Validation runs over the SOURCE tree: a dot-prefixed drop-in would be
+    silently excluded by the staging copy filter, so it refuses instead —
+    a file the operator wrote must never become dead policy (ADR-0055)."""
+    src = source_repo(tmp_path, git=False)
+    write(src, "policy/t/attribution.json", POLICY_DOC)
+    write(src, "policy/t/.draft.json", POLICY_DOC)
+    with pytest.raises(IngestError, match=r"policy/t/\.draft\.json"):
+        ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
+
+
+def test_policy_root_entries_must_be_directories_with_plain_names(tmp_path):
+    src = source_repo(tmp_path, git=False)
+    write(src, "policy/stray.json", POLICY_DOC)
+    with pytest.raises(IngestError, match="must be a directory"):
+        ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
+
+
+def test_empty_policy_tree_records_no_pin(tmp_path):
+    src = source_repo(tmp_path, git=False)
+    (src / "policy" / "empty").mkdir(parents=True)
+    report = ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
+    assert report.policy_pins == {}
+    assert "[policy]" not in (pinned_dir(tmp_path) / "pins.toml").read_text()
+
+
+def test_ingest_and_config_load_provably_share_the_policy_validator(tmp_path, monkeypatch):
+    """ADR-0055 §2: one validator at both sites. A single monkeypatch of
+    theozolith_worker.policy.validate_policy_tree is observed from ingest
+    (--dry-run included) AND from configrepo.load_config — both invoke the
+    module attribute, so they cannot drift apart."""
+    from theozolith_worker import policy as worker_policy
+
+    src = source_repo(tmp_path, git=False)
+    write(src, "policy/claude-defaults/attribution.json", POLICY_DOC)
+    pinned = pinned_dir(tmp_path)
+
+    calls: list[tuple[str, str]] = []
+    real = worker_policy.validate_policy_tree
+
+    def spy(root, *, label):
+        calls.append((str(root), label))
+        return real(root, label=label)
+
+    monkeypatch.setattr(worker_policy, "validate_policy_tree", spy)
+
+    ingest(str(src), pinned, dry_run=True, log=lambda *_: None)
+    assert any(label == "policy/claude-defaults" for _, label in calls)
+
+    calls.clear()
+    ingest(str(src), pinned, log=lambda *_: None)
+    # A real ingest hits the validator from _pin_policy AND from the lint's
+    # load_config over staging; both observations come through the one spy.
+    assert len(calls) >= 2
+
+    calls.clear()
+    configrepo.load_config(pinned)
+    assert any(label == "policy/claude-defaults" for _, label in calls)
+
+
 def test_source_control_table_is_refused_and_address_is_preserved(tmp_path):
     src = source_repo(tmp_path, knowledge=False)
     pinned = pinned_dir(tmp_path)

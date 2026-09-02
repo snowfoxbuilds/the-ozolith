@@ -5876,3 +5876,117 @@ def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
     assert (export / "dev" / "CLAUDE.md").read_text() == "# migrated\n"
     assert not (export / "dev" / "codex").exists()
     assert export.stat().st_ino == parent_inode
+
+
+# -- deck Agent Policy export + policy-aware builds (ADR-0055) --------------------
+
+
+def _policy_dist(session_url: str = "false"):
+    return make_config_dist(
+        {
+            "drivers/custom/impl.py": "x = 1\n",
+            "policy/claude-defaults/attribution.json": (
+                f'{{"attribution": {{"sessionUrl": {session_url}}}}}\n'
+            ),
+        }
+    )
+
+
+def test_policy_export_is_maintained_updated_and_retired(rig: Rig):
+    """The stable deck-facing export at <state>/policy: one child per tree,
+    exported VERBATIM, swapped whole on a content edit, retired when the
+    applied tree drops it — while the PARENT directory inode never moves
+    (the deck's bind mount), so nothing recreates (ADR-0055)."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.policy_export_dir
+    assert (
+        export / "claude-defaults" / "attribution.json"
+    ).read_text() == '{"attribution": {"sessionUrl": false}}\n'
+    parent_inode = export.stat().st_ino
+
+    b_hash, b_data = _policy_dist("true")
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert (
+        export / "claude-defaults" / "attribution.json"
+    ).read_text() == '{"attribution": {"sessionUrl": true}}\n'
+    assert export.stat().st_ino == parent_inode  # the mount anchor never moved
+
+    c_hash, c_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[c_hash] = c_data
+    rig.control.heartbeat_answers.append(dist_response([], c_hash))
+    rig.daemon.once()
+    assert not (export / "claude-defaults").exists()  # retired with the tree
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+
+def test_policy_export_survives_a_failed_convergence(rig: Rig):
+    """Not converged -> the export is left alone (advisory skew): a deck
+    keeps the last exported policy exactly as it keeps its knowledge."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.policy_export_dir
+
+    b_hash, _ = _policy_dist("true")  # desired but never served (409)
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert (
+        export / "claude-defaults" / "attribution.json"
+    ).read_text() == '{"attribution": {"sessionUrl": false}}\n'
+
+
+def test_policy_export_repairs_local_drift(rig: Rig):
+    """A hand-mutated or corrupted export re-exports from the applied tree on
+    the next pass — the export is re-derived state, never authoritative."""
+    digest, data = _policy_dist("false")
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    export = rig.config.policy_export_dir
+    (export / "claude-defaults" / "attribution.json").write_text("{}\n")
+    (export / "stale-extra").mkdir()
+
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (
+        export / "claude-defaults" / "attribution.json"
+    ).read_text() == '{"attribution": {"sessionUrl": false}}\n'
+    assert not (export / "stale-extra").exists()  # not in the applied tree
+
+
+def test_policy_recipe_defers_then_builds_once_converged(rig: Rig):
+    """End to end (ADR-0055): a policy-referencing recipe defers while the
+    node has no verified distribution, then builds in the SAME pass that
+    converges it (converge and export run before reconcile)."""
+    import tempfile
+
+    from theozolith_nodedaemon import configdist as node_configdist
+
+    digest, data = _policy_dist("false")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        node_configdist.extract_zip(data, root)
+        pin = node_configdist.tree_hash(root / "policy" / "claude-defaults")
+    recipe = image_recipe(policy="policy/claude-defaults", policy_pin=pin)
+
+    # Pass 1: distribution not yet served (409) -> the build defers.
+    rig.control.heartbeat_answers.append(
+        {"commands": [], "config": desired([], [recipe], drivers_hash=digest)}
+    )
+    rig.daemon.once()
+    assert recipe["tag"] not in rig.docker.images
+    assert any("deferring derived image" in line for line in rig.logs)
+
+    # Pass 2: the artifact is available -> converge, then build, one pass.
+    rig.control.config_artifacts[digest] = data
+    rig.control.heartbeat_answers.append(
+        {"commands": [], "config": desired([], [recipe], drivers_hash=digest)}
+    )
+    rig.daemon.once()
+    assert recipe["tag"] in rig.docker.images
