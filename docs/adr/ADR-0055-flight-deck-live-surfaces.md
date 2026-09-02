@@ -33,7 +33,12 @@ denylist, not a safety boundary for a live-delivered document that could
 carry `hooks` or helper commands; "a fetch failure keeps the last export"
 contradicted the pin being a requirement; and an npm integrity value
 authenticates bytes without making archive extraction safe for a
-privileged daemon.
+privileged daemon. A second review pass added two more, also folded in:
+an allowlist that admits a key without closing its interior recreates
+the forward-compatibility hole one level down, and the CLI ships one
+platform package per (OS, architecture, libc) tuple — each with its own
+tarball and integrity — so a single recorded integrity cannot
+authenticate every package a heterogeneous fleet selects.
 
 ## Decision
 
@@ -84,14 +89,22 @@ resolves the entry, and the next `claude` launch picks up the new content.
    admitted variable classes yet; nothing needs one), every
    executable-reference key named above, and — the default posture — any
    key the allowlist has not classified, so a future vendor setting can
-   never silently become an execution or identity surface. An admitted key
-   also validates its value shape (the declared scalar/object form only),
-   so a vector cannot ride an allowlisted key. Errors fail loud and name
-   the policy file and offending key, never echoing other document
+   never silently become an execution or identity surface. An admitted
+   key is validated by a **recursively closed schema**, not a shape
+   check: every permitted nested member is enumerated with its exact
+   type, an unknown nested member refuses exactly as an unclassified
+   top-level key does, and a wrong type or extra nesting depth refuses —
+   confirming that an admitted key holds an object proves nothing about
+   what the object carries, and an open interior would recreate the same
+   forward-compatibility hole one level down. Errors fail loud and name
+   the policy file and offending key path, never echoing other document
    contents. The v1 allowlist is exactly the declarative class the
-   motivating drop-in needs — `attribution` (ozolith-configs#6's
-   `attribution.sessionUrl: false`) — and it is adapter-owned product
-   code, advanced only by deliberate classification review when the
+   motivating drop-in needs — `attribution`, an object closed to the
+   single member `sessionUrl: boolean` (ozolith-configs#6's
+   `attribution.sessionUrl: false`); nothing else under it is admitted.
+   The allowlist and its schemas are adapter-owned product code,
+   advanced only by deliberate classification review — a review that
+   classifies the full nested schema, never just the key name — when the
    adapter's validated-CLI set advances (the same review that moves
    `MIN_ENFORCING_CLI`), never by default. The build-gate conflict scan
    still runs where it always ran — over the whole baked managed-settings
@@ -103,10 +116,22 @@ resolves the entry, and the next `claude` launch picks up the new content.
    matters because a hook, helper, allowlist, or endpoint key would bite.)
 3. **The CLI Pin is a worker-type field resolved at ingest, the base-tag
    doctrine applied to the agent CLI.** `cli = "<exact version | npm dist-
-   tag>"` on the definition; ingest resolves it against the npm registry to
-   an exact version plus the platform package's registry-published
-   integrity, recorded in `pins.toml` under `[cli]` keyed `<tool>/<declared>`
-   with an inline `{version, integrity}` value. A dist-tag re-resolves on
+   tag>"` on the definition; ingest resolves it against the npm registry
+   to an exact version plus the **complete supported-platform integrity
+   map**. The CLI ships one platform npm package per (OS, architecture,
+   libc) tuple — Linux x64, Linux ARM64, and musl variants among them —
+   each with its own tarball and registry-published integrity, so a
+   single recorded integrity cannot authenticate every package a
+   heterogeneous fleet selects. The supported-tuple set is product-owned
+   (the platforms the Node Daemon itself supports); ingest resolves
+   every tuple in that set and records, in `pins.toml` under `[cli]`
+   keyed `<tool>/<declared>`, the exact version plus one
+   `{package, integrity}` entry per tuple — a supported tuple whose
+   package or integrity the registry cannot supply fails the ingest.
+   Nodes select only from the pinned map (point 4a): every
+   network-derived trust decision lives in the durable pinned build,
+   never in registry metadata fetched node-side at download time. A
+   dist-tag re-resolves on
    every ingest, exactly as a moving base tag does. Ingest and load refuse a
    resolved version below the adapter's `MIN_ENFORCING_CLI` floor — the
    product-wide statement of which CLIs it has validated. Absent field means
@@ -115,12 +140,13 @@ resolves the entry, and the next `claude` launch picks up the new content.
    The registry-published integrity authenticates bytes; it says nothing
    about whether an archive is safe to unpack, so verification and
    extraction are separate, ordered gates. At reconcile the node: (a)
-   resolves its platform package deterministically — OS, architecture, and
-   libc map to exactly one platform package, and an unsupported combination
-   fails before any download; (b) downloads the tarball with a bounded size
+   resolves its platform tuple deterministically — OS, architecture, and
+   libc — and selects that tuple's `{package, integrity}` entry from the
+   ingest-pinned map; a tuple absent from the map fails before any
+   download; (b) downloads the tarball with a bounded size
    and timeout into a private staging directory on the state filesystem;
-   (c) verifies the complete tarball against the ingest-pinned integrity
-   before extracting anything; (d) parses and validates the archive before
+   (c) verifies the complete tarball against the selected entry's
+   ingest-pinned integrity before extracting anything; (d) parses and validates the archive before
    extraction — absolute paths, `..` traversal, symlinks, hardlinks,
    devices, sockets, FIFOs, and unexpected entry types refuse; duplicate or
    conflicting paths refuse; entry-count and expanded-size caps apply; the
@@ -206,13 +232,17 @@ behavior. The implementing PRs must demonstrate at minimum:
   identity/steering key, every executable-reference key (`hooks`, helpers,
   `statusLine`, plugin/MCP registration), an `env` block, and an
   unclassified key each fail naming file and key with values redacted;
-  nested or malformed variants (wrong value shape under an admitted key, a
-  non-object document) cannot bypass; ingest and config load provably
-  share the one validator.
+  the recursively closed schemas hold — an unknown nested member beside
+  an admitted one (e.g. a second key under `attribution`), a wrong
+  nested type, extra nesting depth, and a non-object document each
+  refuse; ingest and config load provably share the one validator.
 - **CLI resolution and installation**: an exact version and a dist-tag
-  both resolve to exact version + integrity; a version below
-  `MIN_ENFORCING_CLI` fails; an unsupported platform fails before
-  download; integrity mismatch, truncated download, timeout, missing
+  both resolve to exact version + the full supported-platform integrity
+  map, and ingest fails when the registry cannot supply a supported
+  tuple's package or integrity; a version below
+  `MIN_ENFORCING_CLI` fails; a node tuple absent from the pinned map
+  fails before download, and each platform package verifies against its
+  own map entry; integrity mismatch, truncated download, timeout, missing
   binary, wrong layout, traversal, absolute paths, symlinks, hardlinks,
   devices, duplicate paths, oversized archives, and interrupted extraction
   all fail without publishing anything; success publishes atomically with
@@ -307,5 +337,6 @@ behavior. The implementing PRs must demonstrate at minimum:
   operator policy" clause now also reads "operator policy is a reviewed,
   allowlist-validated Config Repo tree".
 - **ADR-0048**: the Config Repo gains `policy/`, the pinned build gains
-  `[cli]` pins, and the config distribution carries the policy tree; the
-  mechanical-pin doctrine extends to the agent CLI.
+  `[cli]` pins carrying the per-platform integrity map, and the config
+  distribution carries the policy tree; the mechanical-pin doctrine
+  extends to the agent CLI.
