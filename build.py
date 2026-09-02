@@ -22,15 +22,19 @@ an initialized box that fails to publish fails THIS command, and
 ``--no-publish`` opts out. ``--venv PATH`` is the unmanaged escape hatch
 (dev checkouts, tests): same build, install, and publish attempt, no root,
 no links.
+
+This is the FIRST-DAY command; every day after, ``sudo theozolith build``
+does everything this does — build, install locally, serve, and pin (ADR-0051
+amendment) — so the chained publish passes ``--no-install`` (this shim
+already installed) and the operator never runs both.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib.util
 import os
-import secrets
+import secrets  # noqa: F401 — re-exported so tests can monkeypatch shim.secrets.token_hex
 import shutil
 import subprocess
 import sys
@@ -44,28 +48,23 @@ if sys.version_info < (3, 11):  # noqa: UP036 — the guard exists FOR older int
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-# The shared implementation, imported straight from the checkout: the
-# product module is deliberately stdlib-only at import time (component
-# separability), so a bare interpreter can run the build.
+# The shared implementation, imported straight from the checkout: the product
+# module is deliberately stdlib-only at import time (component separability),
+# so a bare interpreter can run the build. Since ADR-0051's amendment the
+# install machinery (managed venv, entry-point links, the install helper) lives
+# there too — one implementation, so `theozolith build` and this shim cannot
+# drift — and is re-imported here by name.
 sys.path.insert(0, str(REPO_ROOT / "control" / "src"))
 
-from theozolith_control.product import ProductError, build_distribution  # noqa: E402
-
-# The managed environment (ADR-0041): a system path the service user can
-# reach (a home venv is refused by init's exec policy — ADR-0034), the same
-# venv layout `install-nodedaemon.sh` builds on node-shaped boxes.
-MANAGED_VENV = Path("/opt/theozolith")
-
-# The entry points reachable without the venv on PATH: the human CLI and
-# its deprecated alias (ADR-0032), plus the daemon CLI that `theozolith
-# init --with-local-node` resolves from PATH (ADR-0037). The remaining
-# console scripts are machine-run by absolute path.
-LINKED_ENTRY_POINTS = (
-    "theozolith",
-    "theozolith-control",  # the deprecated alias, linked for its one release
-    "theozolith-nodedaemon",
+from theozolith_control.product import (  # noqa: E402
+    LINK_DIR,
+    LINKED_ENTRY_POINTS,  # noqa: F401 — re-exported for test_build_shim
+    MANAGED_VENV,
+    ProductError,
+    build_distribution,
+    install_distribution,
+    link_entry_points,  # noqa: F401 — re-exported for test_build_shim
 )
-LINK_DIR = Path("/usr/local/bin")
 
 # Belt over braces for the re-exec: a venv interpreter that runs but does
 # not identify as the venv would exec-loop; the marker turns pass two into
@@ -194,79 +193,6 @@ def check_pip(python: Path, *, runner=None) -> None:
         )
 
 
-def _own_temp_symlink(target: Path, link_dir: Path, name: str) -> Path:
-    """Create a temporary symlink to ``target`` under a name this invocation
-    provably owns: collision-resistant randomness plus exclusive creation
-    (symlink(2) fails EEXIST on any existing path, dangling links included).
-    An occupied candidate name — whatever occupies it — is left alone and
-    another name chosen; no path is ever "ours by name"."""
-    for _ in range(32):
-        tmp = link_dir / f".{name}.{secrets.token_hex(8)}.tmp"
-        try:
-            os.symlink(target, tmp)
-        except FileExistsError:
-            continue
-        return tmp
-    raise SystemExit(
-        f"error: could not create a temporary link in {link_dir} — 32 randomly"
-        f" named .{name}.*.tmp candidates were already taken; clean the"
-        " directory up and re-run"
-    )
-
-
-def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
-    """Publish the human-reachable entry points into ``link_dir``. Every
-    source (a non-symlink regular executable file) and every destination
-    (absent, or already this installation's symlink) is validated before
-    the directory is created or anything else is touched; any other
-    occupant is refused by name, never unlinked. Each destination then
-    lands atomically — an exclusively created temp symlink renamed over it
-    in the same directory — but the set of three is sequential, not
-    transactional: an interruption can leave a valid subset published, and
-    a re-run converges on the full set. Only temp links this invocation
-    itself created are ever removed."""
-    link_dir = LINK_DIR if link_dir is None else link_dir
-    publishable: list[tuple[Path, Path]] = []
-    for name in LINKED_ENTRY_POINTS:
-        target = venv / "bin" / name
-        if target.is_symlink() or not target.is_file() or not os.access(target, os.X_OK):
-            raise SystemExit(
-                f"error: the install produced no executable regular file at"
-                f" {target} (missing, non-executable, or a symlink) — the wheel"
-                " set looks incomplete; nothing was linked"
-            )
-        link = link_dir / name
-        if link.is_symlink():
-            existing = os.readlink(link)
-            if existing != str(target):
-                raise SystemExit(
-                    f"error: {link} is a symlink to {existing}, not to this"
-                    f" installation's {target} — refusing to replace it; remove"
-                    " it yourself and re-run; nothing was linked"
-                )
-        elif link.exists():
-            kind = "directory" if link.is_dir() else "regular file"
-            raise SystemExit(
-                f"error: {link} exists and is a {kind} — refusing to overwrite"
-                " it; move it aside and re-run; nothing was linked"
-            )
-        publishable.append((target, link))
-    link_dir.mkdir(parents=True, exist_ok=True)
-    for target, link in publishable:
-        tmp = None
-        try:
-            tmp = _own_temp_symlink(target, link_dir, link.name)
-            os.replace(tmp, link)
-        except OSError as exc:
-            if tmp is not None:
-                with contextlib.suppress(OSError):
-                    tmp.unlink()
-            raise SystemExit(
-                f"error: could not publish {link}: {exc} — links published"
-                " before this one are valid; re-run to converge on the full set"
-            ) from None
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
@@ -296,27 +222,15 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = REPO_ROOT / "dist"
     try:
         version, wheels = build_distribution(REPO_ROOT, out_dir)
+        # Installing the built wheels (not the source trees) keeps the two
+        # entry paths byte-identical: what this box runs is what nodes pull.
+        # The shared helper pip-installs, links the managed entry points (when
+        # this IS the managed venv), and hands the venv to the service user —
+        # ONE implementation, so `theozolith build` and this shim can't drift.
+        install_distribution(venv, [out_dir / name for name in wheels])
     except ProductError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    # Installing the built wheels (not the source trees) keeps the two entry
-    # paths byte-identical: what this box runs is what nodes will pull.
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            *(str(out_dir / name) for name in wheels),
-        ],
-        check=False,
-    )
-    if proc.returncode != 0:
-        print("error: pip install of the built wheels failed", file=sys.stderr)
-        return proc.returncode
-    if managed:
-        link_entry_points(venv)
     print(f"built and installed {len(wheels)} wheel(s) at version {version} into {venv}")
     if args.no_publish:
         print("publish skipped (--no-publish); run 'theozolith build' to serve")
@@ -328,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
     # wheels this run built (--dist skips the second multi-minute build).
     # --if-initialized keeps the ADR-0030 bootstrap case: a box with no
     # Control Node target yet skips with a notice inside the subprocess; an
-    # initialized box that fails to publish fails THIS command.
+    # initialized box that fails to publish fails THIS command. --no-install:
+    # this shim already installed locally, so the subprocess publishes only
+    # (its own local-install eligibility would double the work — ADR-0051).
     cli = venv / "bin" / "theozolith"
     publish_argv = [
         str(cli),
@@ -338,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dist",
         str(out_dir),
         "--if-initialized",
+        "--no-install",
     ]
     try:
         proc = subprocess.run(publish_argv, check=False)

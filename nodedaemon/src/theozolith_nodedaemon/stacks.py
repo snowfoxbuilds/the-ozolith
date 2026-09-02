@@ -31,10 +31,21 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# The generic driver launcher every worker type resolves to control-side
+# (`theozolith-driver <ref>`, ADR-0020) — one executable covers builtin:* and
+# future drivers/* refs, so the daemon recognizes drivers by argv[0] alone and
+# never duplicates control's ref registry or parses a worker type. It is a
+# console script that lives only in the daemon's own venv bin/ (ADR-0041:
+# "console scripts are machine-run by absolute path"); the daemon resolves it
+# there rather than trusting its PATH (see resolve_launcher). daemon.py imports
+# this name for its argv[0] driver checks.
+DRIVER_LAUNCHER = "theozolith-driver"
 
 
 @dataclass(frozen=True)
@@ -116,6 +127,34 @@ def secret_env_files(stack: WireStack, secrets_dir: Path) -> dict[str, str]:
 
 # -- process Stacks: supervised children in their own process groups ------------
 
+
+class LauncherMissing(RuntimeError):
+    """The generic Driver launcher is not installed beside the daemon's interpreter."""
+
+
+def resolve_launcher(argv: list[str], launcher_dir: Path) -> list[str]:
+    """argv[0] == DRIVER_LAUNCHER -> the absolute path under launcher_dir
+    (the daemon's own venv bin/), validated executable. Any other argv[0] is
+    returned untouched: generic process Stacks keep PATH semantics.
+
+    Under systemd the daemon's PATH is the default one, and the launcher is a
+    console script linked only into the venv bin/ (ADR-0041) — a bare
+    `theozolith-driver` would never resolve. Only the launcher argv[0] is
+    rewritten; its ref and flags (argv[1:]) are preserved verbatim, and the
+    logical command a caller fingerprints stays PATH-relative so a venv move
+    never churns a running Driver."""
+    if not argv or argv[0] != DRIVER_LAUNCHER:
+        return argv
+    target = launcher_dir / DRIVER_LAUNCHER
+    if not target.is_file() or not os.access(target, os.X_OK):
+        raise LauncherMissing(
+            f"{DRIVER_LAUNCHER} is not installed at {target} — theozolith-worker"
+            f" is missing from the daemon's environment {launcher_dir.parent};"
+            " re-run install-nodedaemon.sh or let the product update converge"
+        )
+    return [str(target), *argv[1:]]
+
+
 # Env keys redacted before an effective-spec fingerprint is computed: the
 # node's control-channel token is a credential injected into every driver's
 # env, not a spec input — it must never enter a fingerprint (ADR-0044
@@ -152,9 +191,15 @@ class Child:
 class ProcessSupervisor:
     """The daemon's children: one per running process Stack."""
 
-    def __init__(self, *, popen=subprocess.Popen, log=print):
+    def __init__(self, *, popen=subprocess.Popen, log=print, launcher_dir: Path | None = None):
         self._popen = popen
         self._log = log
+        # Where the generic Driver launcher is resolved from (ADR-0020/0041):
+        # the daemon's own venv bin/, i.e. the directory holding this
+        # interpreter. Never a spec input — see spec_fingerprint.
+        self._launcher_dir = (
+            Path(sys.executable).resolve().parent if launcher_dir is None else launcher_dir
+        )
         self._children: dict[str, Child] = {}
         self._last_exit: dict[str, int] = {}
 
@@ -180,6 +225,14 @@ class ProcessSupervisor:
             return True
         return child.fingerprint != spec_fingerprint(command, env)
 
+    def resolve_command(self, command: str) -> list[str]:
+        """The argv the supervisor WOULD launch for this command: the generic
+        Driver launcher resolved to its venv-absolute path (ADR-0020/0041),
+        raising LauncherMissing when it is absent. Lets the daemon fail a
+        driver Stack closed BEFORE tearing a working child down for a restart
+        (the resolution never has to reach into the private launcher dir)."""
+        return resolve_launcher(shlex.split(command), self._launcher_dir)
+
     def ensure_running(self, name: str, command: str, env: dict[str, str]) -> None:
         """Start (or restart) the Stack's child unless its effective spec is
         already live. The effective spec is the argv command AND its
@@ -188,10 +241,15 @@ class ProcessSupervisor:
         and secret-mapping changes (ADR-0044 amendment)."""
         fingerprint = spec_fingerprint(command, env)
         child = self._children.get(name)
+        if child is not None and child.process.poll() is None and child.fingerprint == fingerprint:
+            return  # already live at this exact effective spec
+        # Resolve the launcher BEFORE any teardown of a changed-spec live
+        # child: a missing launcher (LauncherMissing) must surface without
+        # ever stopping the running instance (the fingerprint uses the logical
+        # PATH-relative command, so the resolved absolute path never enters it).
+        argv = resolve_launcher(shlex.split(command), self._launcher_dir)
         if child is not None:
             code = child.process.poll()
-            if code is None and child.fingerprint == fingerprint:
-                return
             if code is None:
                 # The effective spec changed: recycle to the new one.
                 self.stop(name, grace_seconds=30.0)
@@ -200,12 +258,12 @@ class ProcessSupervisor:
                 self._log(f"stack {name}: child exited with {code}; restarting")
                 self._children.pop(name, None)
         process = self._popen(
-            shlex.split(command),
+            argv,
             env={**os.environ, **env},
             start_new_session=True,  # its own process group: the kill-tree unit
         )
         self._children[name] = Child(process=process, command=command, fingerprint=fingerprint)
-        self._log(f"stack {name}: started pid {process.pid} ({command})")
+        self._log(f"stack {name}: started pid {process.pid} ({shlex.join(argv)})")
 
     def stop(self, name: str, *, grace_seconds: float, sleep=time.sleep) -> None:
         """SIGTERM the process group, wait, SIGKILL what remains."""

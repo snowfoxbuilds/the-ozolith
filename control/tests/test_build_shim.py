@@ -61,10 +61,15 @@ def test_build_py_wraps_the_exact_same_implementation():
     copy-paste fork fails here, not in a deployment."""
     shim = _load_shim()
     assert shim.build_distribution is product.build_distribution
+    # The install machinery is shared too (ADR-0051 amendment): the shim and
+    # `theozolith build` run the SAME install_distribution / link_entry_points,
+    # so a copy-paste fork fails here, not in a deployment.
+    assert shim.install_distribution is product.install_distribution
+    assert shim.link_entry_points is product.link_entry_points
     # The shim finishes by installing the built wheels (the entry points),
     # and adds no second build pipeline.
     source = (REPO_ROOT / "build.py").read_text()
-    assert "pip" in source and "install" in source
+    assert "install" in source
     assert "pip wheel" not in source  # building is product.py's job alone
 
 
@@ -543,6 +548,11 @@ def sandbox(monkeypatch, tmp_path):
     bin_dir = tmp_path / "usr-local-bin"
     monkeypatch.setattr(shim, "MANAGED_VENV", opt)
     monkeypatch.setattr(shim, "LINK_DIR", bin_dir)
+    # The install machinery lives in product now (ADR-0051 amendment); the shim
+    # re-imports its constants, so BOTH modules' copies must point at the
+    # sandbox for install_distribution's link decision and link dir to match.
+    monkeypatch.setattr(product, "MANAGED_VENV", opt)
+    monkeypatch.setattr(product, "LINK_DIR", bin_dir)
     state = {
         "environ": {},
         "execs": [],
@@ -687,8 +697,9 @@ def test_main_publishes_via_the_venv_cli_after_install(sandbox):
     """ADR-0051: pass two chains into the fleet publish — the JUST-INSTALLED
     venv CLI as a subprocess (never an in-process import: checkout modules
     and installed modules must not mix), reusing this run's dist/ wheels,
-    with the uninitialized-box skip living inside the CLI
-    (--if-initialized), never in the shim."""
+    with the uninitialized-box skip living inside the CLI (--if-initialized),
+    never in the shim. --no-install: the shim already installed locally, so
+    the subprocess publishes only (ADR-0051 amendment)."""
     shim, opt, _bin_dir, state = sandbox
     _fake_venv(opt)
     _entry_points(shim, opt)
@@ -704,6 +715,7 @@ def test_main_publishes_via_the_venv_cli_after_install(sandbox):
             "--dist",
             str(shim.REPO_ROOT / "dist"),
             "--if-initialized",
+            "--no-install",
         ]
     ]
     assert state["pip"]  # the publish chains AFTER the install, never replaces it

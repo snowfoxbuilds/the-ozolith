@@ -26,6 +26,8 @@ _ALLOWED_LINE = re.compile(
     r"|^# theozolith-control$"  # the component README heading
     r"|theozolith-control\.service"  # the systemd unit (ADR-0034)
     r"|/var/lib/theozolith-control"  # the root-mediated data dir (ADR-0034)
+    # the conditional self-update package (ADR-0041/#92): the component, not the command
+    r"|OPTIONAL_UPDATE_PACKAGES = \(\"theozolith-control\",\)"
     r"|alias"  # deprecation notes
 )
 _SKIP_PARTS = {

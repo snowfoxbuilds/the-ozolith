@@ -28,6 +28,18 @@ from theozolith_nodedaemon.stacks import ProcessSupervisor
 SECRET_VALUE = "ghp_THEACTUALSECRETVALUE999"
 REGISTRY_VALUE = "ozolith-bot:ghp_REGISTRYCREDENTIAL777"
 
+
+def _launcher_dir(tmp_path: Path) -> Path:
+    """A stub generic Driver launcher (ADR-0020/0041) so driver Stacks launch;
+    the supervisor resolves argv[0] to this venv-absolute path."""
+    bin_dir = tmp_path / "venv-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = bin_dir / "theozolith-driver"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    return bin_dir
+
+
 KNOWN_CHANNEL_PATHS = {
     "/api/v1/heartbeats",
     "/api/v1/secrets/pull",
@@ -128,7 +140,9 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
         client=ControlClient(
             "http://control.test", node_token, insecure_dev=True, transport=tapped_transport
         ),
-        supervisor=ProcessSupervisor(popen=popen, log=lambda *_: None),
+        supervisor=ProcessSupervisor(
+            popen=popen, log=lambda *_: None, launcher_dir=_launcher_dir(tmp_path)
+        ),
         log=lambda *_: None,
     )
     daemon.once()  # heartbeat + recycle command + pull + start
@@ -235,7 +249,9 @@ def test_registry_credential_value_only_crosses_on_the_pull(tmp_path: Path, monk
         client=ControlClient(
             "http://control.test", node_token, insecure_dev=True, transport=tapped_transport
         ),
-        supervisor=ProcessSupervisor(popen=popen, log=lambda *_: None),
+        supervisor=ProcessSupervisor(
+            popen=popen, log=lambda *_: None, launcher_dir=_launcher_dir(tmp_path)
+        ),
         log=lambda *_: None,
     )
     daemon.once()

@@ -7,12 +7,43 @@ import os
 import time
 from pathlib import Path
 
+import pytest
 from theozolith_nodedaemon.stacks import (
+    DRIVER_LAUNCHER,
+    LauncherMissing,
     ProcessSupervisor,
     WireStack,
     materialize_secrets,
+    resolve_launcher,
     secret_env_files,
+    spec_fingerprint,
 )
+
+
+class _RecordingPopen:
+    """Records the argv/env the supervisor launches; never runs anything."""
+
+    def __init__(self):
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv, env=None, start_new_session=False, **_):
+        self.calls.append((list(argv), dict(env or {})))
+
+        class _Proc:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        return _Proc()
+
+
+def _installed_launcher(dir_path: Path) -> Path:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    launcher = dir_path / DRIVER_LAUNCHER
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    return launcher
 
 
 def _pgid_alive(pgid: int) -> bool:
@@ -154,10 +185,99 @@ def test_node_token_value_is_redacted_from_the_fingerprint():
     """A secret value must not enter a fingerprint: the node control-channel
     token is redacted, so a token rotation neither churns the process nor
     leaks the value into the digest inputs (ADR-0044 amendment)."""
-    from theozolith_nodedaemon.stacks import spec_fingerprint
-
     a = spec_fingerprint("cmd", {"THEOZOLITH_NODE_TOKEN": "tok-1", "X": "1"})
     b = spec_fingerprint("cmd", {"THEOZOLITH_NODE_TOKEN": "tok-2", "X": "1"})
     assert a == b
     # And a real spec change is still detected.
     assert spec_fingerprint("cmd", {"X": "1"}) != spec_fingerprint("cmd", {"X": "2"})
+
+
+# -- the Driver launcher resolves to an absolute path (ADR-0020/0041) ------------
+
+
+def test_driver_launcher_resolves_to_the_venv_absolute_path(tmp_path: Path):
+    """A `theozolith-driver <ref>` command launches from the launcher_dir's
+    absolute path (systemd's default PATH never finds the console script);
+    the ref and any flags ride through untouched."""
+    launcher_dir = tmp_path / "bin"
+    _installed_launcher(launcher_dir)
+    popen = _RecordingPopen()
+    supervisor = ProcessSupervisor(popen=popen, log=lambda *_: None, launcher_dir=launcher_dir)
+    supervisor.ensure_running(
+        "impl", "theozolith-driver builtin:implementer --loop", {"THEOZOLITH_RUN_IMAGE": "x:1"}
+    )
+    (argv, env) = popen.calls[0]
+    assert argv == [str(launcher_dir / "theozolith-driver"), "builtin:implementer", "--loop"]
+    assert env["THEOZOLITH_RUN_IMAGE"] == "x:1"  # env still flows through
+
+
+def test_non_launcher_command_keeps_path_semantics(tmp_path: Path):
+    """A generic process Stack is launched by bare name — resolve_launcher
+    only ever rewrites the DRIVER_LAUNCHER argv[0]."""
+    popen = _RecordingPopen()
+    supervisor = ProcessSupervisor(popen=popen, log=lambda *_: None, launcher_dir=tmp_path / "bin")
+    supervisor.ensure_running("batch", "my-batch --run", {})
+    assert popen.calls[0][0] == ["my-batch", "--run"]
+
+
+def test_fingerprint_uses_the_logical_command_not_the_resolved_path(tmp_path: Path):
+    """The stored fingerprint is the LOGICAL PATH-relative command, so the
+    resolved absolute launcher path never enters it — a driver child started
+    under one launcher_dir does not need a restart just because the launcher
+    lives elsewhere (a venv move must not churn a running Driver)."""
+    launcher_dir = tmp_path / "bin"
+    _installed_launcher(launcher_dir)
+    popen = _RecordingPopen()
+    command = "theozolith-driver builtin:implementer"
+    env = {"THEOZOLITH_RUN_IMAGE": "x:1"}
+    supervisor = ProcessSupervisor(popen=popen, log=lambda *_: None, launcher_dir=launcher_dir)
+    supervisor.ensure_running("impl", command, env)
+    assert supervisor._children["impl"].fingerprint == spec_fingerprint(command, env)
+    assert not supervisor.needs_restart("impl", command, env)
+
+
+def test_missing_launcher_raises_and_never_spawns(tmp_path: Path):
+    """An absent launcher fails closed: LauncherMissing names the launcher
+    path and the venv dir, and nothing is spawned."""
+    launcher_dir = tmp_path / "bin"
+    launcher_dir.mkdir()  # empty: no theozolith-driver inside
+    popen = _RecordingPopen()
+    supervisor = ProcessSupervisor(popen=popen, log=lambda *_: None, launcher_dir=launcher_dir)
+    with pytest.raises(LauncherMissing) as excinfo:
+        supervisor.ensure_running("impl", "theozolith-driver builtin:implementer", {})
+    assert str(launcher_dir / "theozolith-driver") in str(excinfo.value)
+    assert str(launcher_dir.parent) in str(excinfo.value)  # the venv dir is named
+    assert popen.calls == []
+
+
+def test_a_non_executable_launcher_is_launcher_missing(tmp_path: Path):
+    launcher_dir = tmp_path / "bin"
+    launcher = _installed_launcher(launcher_dir)
+    launcher.chmod(0o644)  # present but not executable
+    supervisor = ProcessSupervisor(log=lambda *_: None, launcher_dir=launcher_dir)
+    with pytest.raises(LauncherMissing):
+        supervisor.ensure_running("impl", "theozolith-driver builtin:implementer", {})
+
+
+def test_a_missing_launcher_never_stops_a_live_child(tmp_path: Path):
+    """The resolution runs BEFORE any teardown, so a launcher that vanishes
+    while a child is live at the old spec leaves the running instance alone —
+    a spec change that cannot launch never tears down what works."""
+    launcher_dir = tmp_path / "bin"
+    _installed_launcher(launcher_dir)
+    popen = _RecordingPopen()
+    supervisor = ProcessSupervisor(popen=popen, log=lambda *_: None, launcher_dir=launcher_dir)
+    supervisor.ensure_running("impl", "theozolith-driver builtin:implementer", {"V": "1"})
+    live = supervisor._children["impl"].process
+    assert supervisor.alive("impl")
+    (launcher_dir / DRIVER_LAUNCHER).unlink()  # launcher disappears
+    with pytest.raises(LauncherMissing):
+        # A changed effective spec would normally recycle the child.
+        supervisor.ensure_running("impl", "theozolith-driver builtin:implementer", {"V": "2"})
+    assert supervisor.alive("impl")  # the live child was never stopped
+    assert supervisor._children["impl"].process is live
+    assert len(popen.calls) == 1  # only the original launch ever happened
+
+
+def test_resolve_launcher_returns_empty_argv_untouched(tmp_path: Path):
+    assert resolve_launcher([], tmp_path) == []

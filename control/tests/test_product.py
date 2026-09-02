@@ -251,6 +251,98 @@ def test_prune_artifacts_keeps_only_the_named_versions(tmp_path):
     assert product.prune_artifacts(tmp_path / "absent", {"x"}) == []  # no dir, no crash
 
 
+# -- handing the managed venv to the service user (ADR-0015/0041) -----------------
+
+
+def test_hand_venv_noop_without_a_service_user(tmp_path, monkeypatch):
+    """A control-only box has no node service user: nothing to hand over, so
+    the helper is a no-op returning False and never chowns."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)
+    assert (
+        product.hand_venv_to_service_user(
+            tmp_path, runner=lambda *a, **k: pytest.fail("must not chown"), log=lambda _: None
+        )
+        is False
+    )
+
+
+def test_hand_venv_noop_when_not_root(tmp_path, monkeypatch):
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: object())  # user exists
+    monkeypatch.setattr(product.os, "geteuid", lambda: 1000)
+    assert (
+        product.hand_venv_to_service_user(
+            tmp_path, runner=lambda *a, **k: pytest.fail("must not chown"), log=lambda _: None
+        )
+        is False
+    )
+
+
+def test_hand_venv_chowns_when_user_exists_and_root(tmp_path, monkeypatch):
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: object())
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert product.hand_venv_to_service_user(tmp_path, runner=runner, log=lambda _: None) is True
+    assert calls == [["chown", "-R", "ozolith:ozolith", str(tmp_path)]]
+
+
+def test_hand_venv_raises_when_the_chown_fails(tmp_path, monkeypatch):
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: object())
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "chown: operation not permitted")
+
+    with pytest.raises(product.ProductError, match="operation not permitted"):
+        product.hand_venv_to_service_user(tmp_path, runner=runner, log=lambda _: None)
+
+
+# -- install_distribution: the managed-venv gate covers BOTH links and chown -----
+
+
+def test_install_distribution_into_unmanaged_venv_never_chowns(tmp_path, monkeypatch):
+    """`sudo python3 build.py --venv <dev-venv>` is the unmanaged escape hatch:
+    it must NOT hand an arbitrary dev venv to the service user, even on a box
+    where the ozolith user exists and we are root. install_distribution chowns
+    ONLY the managed venv — the same gate as the entry-point links (ADR-0041),
+    so the two never drift apart."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: object())  # service user present
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)  # and we are root
+    venv = tmp_path / "dev-venv"  # NOT MANAGED_VENV
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    product.install_distribution(
+        venv,
+        [tmp_path / "theozolith_worker-0.3.0-py3-none-any.whl"],
+        runner=runner,
+        log=lambda _: None,
+    )
+
+    # Exactly the pip install ran; the unmanaged venv was never chowned.
+    assert len(calls) == 1
+    assert calls[0][:4] == [str(venv / "bin" / "python"), "-m", "pip", "install"]
+    assert not any(argv[:1] == ["chown"] for argv in calls)
+
+
 # -- an unreachable Control Node is an error, not a traceback --------------------
 
 
@@ -269,7 +361,14 @@ def test_upload_reports_an_unreachable_control_node_cleanly(tmp_path, monkeypatc
 
 def _build_args(**overrides) -> argparse.Namespace:
     """`theozolith build`'s full parsed-argument surface, defaulted."""
-    defaults: dict = {"source": ".", "url": None, "ca": None, "dist": None, "if_initialized": False}
+    defaults: dict = {
+        "source": ".",
+        "url": None,
+        "ca": None,
+        "dist": None,
+        "if_initialized": False,
+        "no_install": False,
+    }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
@@ -386,3 +485,131 @@ def test_build_still_fails_loud_without_the_flag(monkeypatch):
     monkeypatch.setattr(statuscli, "resolve_target", unresolved)
     with pytest.raises(SystemExit, match="no Control Node URL"):
         product._cmd_build(_build_args())
+
+
+# -- the everyday command installs locally then publishes (ADR-0051 amendment) ---
+
+
+def _wire_eligible_build(monkeypatch, *, dist_dir: Path):
+    """Wire `theozolith build` to look eligible for a local install (running
+    as root from the managed venv) with a resolvable target and pre-built
+    --dist wheels, recording install and upload order."""
+    from theozolith_control import cli, statuscli
+
+    version = "0.3.0+gabc123def456"
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(product.sys, "prefix", str(product.MANAGED_VENV))
+    monkeypatch.setattr(
+        statuscli, "resolve_target", lambda url, ca: ("https://10.0.0.2:8443", "t", None)
+    )
+    monkeypatch.setattr(cli, "_call", lambda *a, **kw: {})
+    monkeypatch.setattr(product, "source_version", lambda source: version)
+    monkeypatch.setattr(product, "_update_via_api", lambda args, ver: 0)
+    for component in product.COMPONENTS:
+        (dist_dir / f"theozolith_{component}-{version}-py3-none-any.whl").write_bytes(b"w")
+    return version
+
+
+def test_build_installs_locally_then_uploads_in_order(tmp_path, monkeypatch):
+    """`sudo theozolith build` from the managed venv installs the built wheels
+    into this box BEFORE any upload, then publishes and pins — the everyday
+    command brings this box and the fleet to the new SHA in one step."""
+    version = _wire_eligible_build(monkeypatch, dist_dir=tmp_path)
+    order: list[str] = []
+    monkeypatch.setattr(
+        product, "install_distribution", lambda venv, wheels: order.append("install")
+    )
+    monkeypatch.setattr(product, "_upload_artifact", lambda *a, **kw: order.append("upload"))
+    assert product._cmd_build(_build_args(dist=str(tmp_path))) == 0
+    # Install first, then one upload per component.
+    assert order == ["install"] + ["upload"] * len(product.COMPONENTS)
+    _ = version
+
+
+def test_build_local_install_failure_prevents_any_upload(tmp_path, monkeypatch):
+    """A failed local install stops BEFORE any upload — the fleet is never
+    carried ahead of the Control Node host (ADR-0051 amendment)."""
+    _wire_eligible_build(monkeypatch, dist_dir=tmp_path)
+
+    def boom(venv, wheels):
+        raise product.ProductError("pip install of the built wheels failed")
+
+    monkeypatch.setattr(product, "install_distribution", boom)
+    monkeypatch.setattr(
+        product, "_upload_artifact", lambda *a, **kw: pytest.fail("uploaded after a failed install")
+    )
+    with pytest.raises(product.ProductError, match="pip install"):
+        product._cmd_build(_build_args(dist=str(tmp_path)))
+
+
+def test_build_no_install_skips_the_local_install(tmp_path, monkeypatch):
+    """--no-install (the shim's chained publish) publishes without installing,
+    even from the managed venv as root."""
+    _wire_eligible_build(monkeypatch, dist_dir=tmp_path)
+    monkeypatch.setattr(
+        product,
+        "install_distribution",
+        lambda *a, **kw: pytest.fail("installed despite --no-install"),
+    )
+    uploads: list[str] = []
+    monkeypatch.setattr(product, "_upload_artifact", lambda *a, **kw: uploads.append("u"))
+    assert product._cmd_build(_build_args(dist=str(tmp_path), no_install=True)) == 0
+    assert len(uploads) == len(product.COMPONENTS)
+
+
+def test_build_non_root_skips_the_local_install_and_publishes(tmp_path, monkeypatch, capsys):
+    """A non-root invocation (the dev-box publish path) logs the skip reason
+    and publishes as before — the local install is Control-Node-host only."""
+    _wire_eligible_build(monkeypatch, dist_dir=tmp_path)
+    monkeypatch.setattr(product.os, "geteuid", lambda: 1000)  # not root
+    monkeypatch.setattr(
+        product,
+        "install_distribution",
+        lambda *a, **kw: pytest.fail("installed while non-root"),
+    )
+    uploads: list[str] = []
+    monkeypatch.setattr(product, "_upload_artifact", lambda *a, **kw: uploads.append("u"))
+    assert product._cmd_build(_build_args(dist=str(tmp_path))) == 0
+    assert len(uploads) == len(product.COMPONENTS)
+    assert "local install skipped (not root)" in capsys.readouterr().out
+
+
+def test_build_unmanaged_venv_skips_the_local_install(tmp_path, monkeypatch, capsys):
+    """From an unmanaged venv the skip reason names it; publish proceeds."""
+    _wire_eligible_build(monkeypatch, dist_dir=tmp_path)
+    monkeypatch.setattr(product.sys, "prefix", str(tmp_path / "some-dev-venv"))
+    monkeypatch.setattr(
+        product,
+        "install_distribution",
+        lambda *a, **kw: pytest.fail("installed from an unmanaged venv"),
+    )
+    monkeypatch.setattr(product, "_upload_artifact", lambda *a, **kw: None)
+    assert product._cmd_build(_build_args(dist=str(tmp_path))) == 0
+    assert "local install skipped (not the managed venv" in capsys.readouterr().out
+
+
+def test_build_if_initialized_installs_locally_then_skips_publish(tmp_path, monkeypatch, capsys):
+    """The bootstrap first boot: an eligible box with no Control Node target
+    yet still installs the built wheels locally, then skips the publish."""
+    from theozolith_control import cli, statuscli
+
+    version = "0.3.0+gabc123def456"
+    monkeypatch.setattr(product.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(product.sys, "prefix", str(product.MANAGED_VENV))
+    monkeypatch.setattr(
+        statuscli,
+        "resolve_target",
+        lambda url, ca: (_ for _ in ()).throw(statuscli.TargetError("no admin token")),
+    )
+    monkeypatch.setattr(cli, "_call", lambda *a, **kw: pytest.fail("dialed while skipping publish"))
+    monkeypatch.setattr(product, "source_version", lambda source: version)
+    for component in product.COMPONENTS:
+        (tmp_path / f"theozolith_{component}-{version}-py3-none-any.whl").write_bytes(b"w")
+    installed: list[str] = []
+    monkeypatch.setattr(product, "install_distribution", lambda venv, wheels: installed.append("i"))
+    monkeypatch.setattr(
+        product, "_upload_artifact", lambda *a, **kw: pytest.fail("uploaded while skipping")
+    )
+    assert product._cmd_build(_build_args(dist=str(tmp_path), if_initialized=True)) == 0
+    assert installed == ["i"]  # installed locally (the first-boot install)
+    assert "publish skipped" in capsys.readouterr().out

@@ -23,9 +23,11 @@ recorded version.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -318,6 +320,171 @@ def prune_artifacts(artifacts_dir: Path, keep: set[str]) -> list[str]:
     return sorted(pruned)
 
 
+# -- the managed venv install (shared by `theozolith build` and build.py) --------
+
+# The managed environment (ADR-0041): a system venv the service user can reach
+# (a home venv is refused by init's exec policy — ADR-0034), the same layout
+# `install-nodedaemon.sh` builds on node-shaped boxes. `_cmd_build` compares
+# this against sys.prefix to decide whether a build also installs locally.
+MANAGED_VENV = Path("/opt/theozolith")
+
+# The service user the Node Daemon runs as (ADR-0037): it owns the managed
+# venv so it can self-update into it (ADR-0015).
+SERVICE_USER = "ozolith"
+
+# The entry points reachable without the venv on PATH: the human CLI and its
+# deprecated alias (ADR-0032), plus the daemon CLI that `theozolith init
+# --with-local-node` resolves from PATH (ADR-0037). The remaining console
+# scripts are machine-run by absolute path — the Node Daemon resolves
+# theozolith-driver itself (ADR-0020, stacks.resolve_launcher).
+LINKED_ENTRY_POINTS = (
+    "theozolith",
+    "theozolith-control",  # the deprecated alias, linked for its one release
+    "theozolith-nodedaemon",
+)
+LINK_DIR = Path("/usr/local/bin")
+
+
+def hand_venv_to_service_user(
+    venv: Path, *, user: str = SERVICE_USER, runner=None, log=_log
+) -> bool:
+    """Give the managed venv to the node service user so the Node Daemon can
+    self-update into it (ADR-0015). A no-op returning False on a box with no
+    such user (a control-only host) or when not running as root — the two
+    shapes where there is nothing to hand over — so every local install can
+    call it unconditionally and a rebuild on the Control Node host never hands
+    the venv back to root. Raises ProductError if the chown itself fails."""
+    import pwd
+
+    runner = subprocess.run if runner is None else runner
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        return False  # no node service user on this box: nothing to hand over
+    if os.geteuid() != 0:
+        return False  # an unprivileged install cannot chown; skip quietly
+    proc = runner(
+        ["chown", "-R", f"{user}:{user}", str(venv)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ProductError(
+            f"could not hand {venv} to the {user} service user:"
+            f" {(proc.stderr or proc.stdout or '').strip()[:300]}"
+        )
+    log(f"handed {venv} to the {user} service user")
+    return True
+
+
+def _own_temp_symlink(target: Path, link_dir: Path, name: str) -> Path:
+    """Create a temporary symlink to ``target`` under a name this invocation
+    provably owns: collision-resistant randomness plus exclusive creation
+    (symlink(2) fails EEXIST on any existing path, dangling links included).
+    An occupied candidate name — whatever occupies it — is left alone and
+    another name chosen; no path is ever "ours by name"."""
+    for _ in range(32):
+        tmp = link_dir / f".{name}.{secrets.token_hex(8)}.tmp"
+        try:
+            os.symlink(target, tmp)
+        except FileExistsError:
+            continue
+        return tmp
+    raise SystemExit(
+        f"error: could not create a temporary link in {link_dir} — 32 randomly"
+        f" named .{name}.*.tmp candidates were already taken; clean the"
+        " directory up and re-run"
+    )
+
+
+def link_entry_points(venv: Path, *, link_dir: Path | None = None) -> None:
+    """Publish the human-reachable entry points into ``link_dir``. Every
+    source (a non-symlink regular executable file) and every destination
+    (absent, or already this installation's symlink) is validated before
+    the directory is created or anything else is touched; any other
+    occupant is refused by name, never unlinked. Each destination then
+    lands atomically — an exclusively created temp symlink renamed over it
+    in the same directory — but the set of three is sequential, not
+    transactional: an interruption can leave a valid subset published, and
+    a re-run converges on the full set. Only temp links this invocation
+    itself created are ever removed."""
+    link_dir = LINK_DIR if link_dir is None else link_dir
+    publishable: list[tuple[Path, Path]] = []
+    for name in LINKED_ENTRY_POINTS:
+        target = venv / "bin" / name
+        if target.is_symlink() or not target.is_file() or not os.access(target, os.X_OK):
+            raise SystemExit(
+                f"error: the install produced no executable regular file at"
+                f" {target} (missing, non-executable, or a symlink) — the wheel"
+                " set looks incomplete; nothing was linked"
+            )
+        link = link_dir / name
+        if link.is_symlink():
+            existing = os.readlink(link)
+            if existing != str(target):
+                raise SystemExit(
+                    f"error: {link} is a symlink to {existing}, not to this"
+                    f" installation's {target} — refusing to replace it; remove"
+                    " it yourself and re-run; nothing was linked"
+                )
+        elif link.exists():
+            kind = "directory" if link.is_dir() else "regular file"
+            raise SystemExit(
+                f"error: {link} exists and is a {kind} — refusing to overwrite"
+                " it; move it aside and re-run; nothing was linked"
+            )
+        publishable.append((target, link))
+    link_dir.mkdir(parents=True, exist_ok=True)
+    for target, link in publishable:
+        tmp = None
+        try:
+            tmp = _own_temp_symlink(target, link_dir, link.name)
+            os.replace(tmp, link)
+        except OSError as exc:
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+            raise SystemExit(
+                f"error: could not publish {link}: {exc} — links published"
+                " before this one are valid; re-run to converge on the full set"
+            ) from None
+
+
+def install_distribution(venv: Path, wheels: list[Path], *, runner=None, log=_log) -> None:
+    """Install the built wheels into ``venv`` and make it usable: pip-install
+    (``venv/bin/python -m pip install --upgrade <wheels>``, the built wheels so
+    the two entry paths stay byte-identical), and — ONLY when ``venv`` is the
+    managed venv (ADR-0041) — link the managed entry points and hand the venv
+    to the service user (ADR-0015). Both the links and the handover share that
+    one gate: an unmanaged ``--venv`` target is never linked and never chowned
+    to the service user (the documented escape hatch stays hands-off). Raises
+    ProductError with pip's tail on a failed install; the entry-point
+    publication raises SystemExit on a malformed install. One implementation
+    for both ``theozolith build`` and the bootstrap shim."""
+    runner = subprocess.run if runner is None else runner
+    python = venv / "bin" / "python"
+    proc = runner(
+        [str(python), "-m", "pip", "install", "--upgrade", *(str(w) for w in wheels)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ProductError(
+            f"pip install of the built wheels into {venv} failed:"
+            f" {(proc.stderr or proc.stdout or '').strip()[-400:]}"
+        )
+    if venv.resolve() == MANAGED_VENV.resolve():
+        link_entry_points(venv)
+        # Hand the venv over only for the managed venv — the same gate as the
+        # links (ADR-0041). `sudo python3 build.py --venv <dev-venv>` on a box
+        # that happens to have an ozolith user must never chown that arbitrary
+        # dev venv to the service user: --venv is the unmanaged escape hatch
+        # (no root assumed, no links, and now no ownership handover).
+        hand_venv_to_service_user(venv, runner=runner, log=log)
+
+
 # -- the `theozolith` CLI ---------------------------------------------------------
 
 
@@ -409,52 +576,107 @@ def _wheels_from_dist(dist_dir: Path, version: str) -> list[Path]:
     return wheels
 
 
+def _local_install_skip_reason(args) -> str | None:
+    """Why ``theozolith build`` will NOT also install into this box's venv, or
+    None when it will. Eligible only from the managed venv, as root, without
+    --no-install: the everyday command completes the edit-to-fleet step on the
+    Control Node host (ADR-0051 amendment), while a dev-box publish (the
+    unmanaged venv, non-root) is unchanged."""
+    if args.no_install:
+        return "--no-install"
+    if Path(sys.prefix).resolve() != MANAGED_VENV.resolve():
+        return f"not the managed venv ({sys.prefix})"
+    if os.geteuid() != 0:
+        return "not root"
+    return None
+
+
+@contextlib.contextmanager
+def _staged_wheels(args, source: Path):
+    """(version, [wheel Path]) for one build: the pre-built ``--dist`` set
+    (the shim's wheels, no second build) or a fresh build into a temp dir. A
+    fresh build's temp dir lives for the whole ``with`` body so install and
+    upload both see the files; ``--dist`` reuses a persistent dir untouched."""
+    if args.dist:
+        # source_version still runs first — the clean-tree refusal and the
+        # version the wheels must carry come from the same place.
+        version = source_version(source)
+        yield version, _wheels_from_dist(Path(args.dist).resolve(), version)
+    else:
+        with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
+            out_dir = Path(staging)
+            version, names = build_distribution(source, out_dir)
+            yield version, [out_dir / name for name in names]
+
+
 def _cmd_build(args) -> int:
     # Lazy imports: this module stays stdlib-only at import time (ADR-0030).
     from theozolith_control import statuscli
     from theozolith_control.cli import _call
 
     source = Path(args.source).resolve()
+    # Decide the local install up front (ADR-0051 amendment): `sudo theozolith
+    # build` from the managed venv installs the built wheels into THIS box too,
+    # so the everyday command brings this box and the fleet to the new SHA in
+    # one step. A non-root or unmanaged invocation, or --no-install (the shim's
+    # chained publish), skips it and just publishes.
+    skip_reason = _local_install_skip_reason(args)
+    local_install = skip_reason is None
+
     # Target resolution has ONE implementation (statuscli.resolve_target,
     # ADR-0039); --if-initialized converts exactly its refusal — the two
-    # uninitialized-box shapes, no URL / no admin token — into a skip, so
-    # the bootstrap shim's chained publish (ADR-0051) never needs to probe
-    # init state itself. Every failure AFTER resolution stays loud.
+    # uninitialized-box shapes, no URL / no admin token — into a skip, so the
+    # bootstrap shim's chained publish (ADR-0051) never needs to probe init
+    # state itself. Every failure AFTER resolution stays loud.
+    publish = True
+    skip_exc: statuscli.TargetError | None = None
     try:
         url, token, ca = statuscli.resolve_target(args.url, args.ca)
     except statuscli.TargetError as exc:
-        if args.if_initialized:
-            _log(f"publish skipped: {exc}")
+        if not args.if_initialized:
+            raise SystemExit(f"error: {exc}") from exc
+        publish = False
+        skip_exc = exc
+
+    if publish:
+        # Pre-flight: building four wheels takes minutes, and every one is
+        # wasted if the Control Node is not up. Fail here, before the work.
+        _call(url, "/api/v1/healthz", token=token, ca=ca)
+    elif not local_install:
+        # No Control Node target and nothing to install locally: nothing to do
+        # but the bootstrap-first-boot notice (the build would be wasted).
+        _skip_publish_notice(skip_exc)
+        return 0
+
+    with _staged_wheels(args, source) as (version, wheels):
+        if local_install:
+            # A failed local install stops BEFORE any upload — the fleet is
+            # never carried ahead of the Control Node host (ADR-0051 amendment).
+            install_distribution(MANAGED_VENV, wheels)
             _log(
-                "(no Control Node on this box yet — after 'sudo theozolith"
-                " init', 'sudo theozolith build' serves the wheels and pins"
-                " the version)"
+                f"installed {version} into {MANAGED_VENV} on this box — restart"
+                " theozolith-control.service to run it; the local Node Daemon"
+                " converges on its next heartbeat"
             )
+        else:
+            _log(
+                f"local install skipped ({skip_reason}); this box converges through its Node Daemon"
+            )
+        if not publish:
+            _skip_publish_notice(skip_exc)
             return 0
-        raise SystemExit(f"error: {exc}") from exc
-    # Pre-flight: building four wheels takes minutes, and every one of them
-    # is wasted if the Control Node is not up. Fail here, before the work.
-    _call(url, "/api/v1/healthz", token=token, ca=ca)
-    if args.dist:
-        # The bootstrap shim's one-step path (ADR-0051): upload the wheels
-        # the shim just built instead of building them a second time.
-        # source_version still runs first — the clean-tree refusal and the
-        # version the wheels must carry come from the same place.
-        version = source_version(source)
-        for path in _wheels_from_dist(Path(args.dist).resolve(), version):
+        for path in wheels:
             _upload_artifact(url, token, ca, version, path)
-        _log(
-            f"uploaded {len(COMPONENTS)} pre-built wheel(s); the Control Node"
-            " serves them for node pulls"
-        )
-    else:
-        with tempfile.TemporaryDirectory(prefix="theozolith-wheels-") as staging:
-            out_dir = Path(staging)
-            version, wheels = build_distribution(source, out_dir)
-            for name in wheels:
-                _upload_artifact(url, token, ca, version, out_dir / name)
-            _log(f"uploaded {len(wheels)} wheel(s); the Control Node serves them for node pulls")
+        _log(f"uploaded {len(wheels)} wheel(s); the Control Node serves them for node pulls")
     return _update_via_api(args, version)
+
+
+def _skip_publish_notice(exc) -> None:
+    _log(f"publish skipped: {exc}")
+    _log(
+        "(no Control Node on this box yet — after 'sudo theozolith init',"
+        " 'sudo theozolith build' serves the wheels and pins the version)"
+    )
 
 
 def _cmd_join_token(args) -> int:
@@ -527,6 +749,12 @@ def register(commands) -> None:
         action="store_true",
         help="skip with a notice (exit 0) when this box has no Control Node"
         " target yet (bootstrap first boot) instead of failing",
+    )
+    build.add_argument(
+        "--no-install",
+        action="store_true",
+        help="publish only: skip installing the built wheels into this box's"
+        " managed venv (the bootstrap shim passes this after its own install)",
     )
     build.set_defaults(func=_cmd_build)
 

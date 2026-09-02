@@ -269,6 +269,7 @@ class Rig:
     logs: list[str]
     update_calls: list[list[str]]
     execv_calls: list[tuple[str, list[str]]]
+    launcher_dir: Path
 
 
 @pytest.fixture
@@ -282,6 +283,16 @@ def rig(tmp_path: Path, monkeypatch) -> Rig:
         process.returncode = -sig
 
     monkeypatch.setattr("theozolith_nodedaemon.stacks.os.killpg", fake_killpg)
+
+    # The generic Driver launcher (ADR-0020/0041) resolves to an absolute path
+    # under the daemon's venv bin/; the rig supplies a stub there so driver
+    # Stacks reach the fake popen (the resolved argv is what the supervisor
+    # launches). A test can delete or chmod it to exercise LauncherMissing.
+    launcher_dir = tmp_path / "venv-bin"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "theozolith-driver"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
 
     config = DaemonConfig(
         node="box1",
@@ -314,12 +325,14 @@ def rig(tmp_path: Path, monkeypatch) -> Rig:
             insecure_dev=True,
             transport=control,
         ),
-        supervisor=ProcessSupervisor(popen=popen, log=logs.append),
+        supervisor=ProcessSupervisor(popen=popen, log=logs.append, launcher_dir=launcher_dir),
         log=logs.append,
         execv=lambda path, argv: execv_calls.append((path, list(argv))),
         update_runner=update_runner,
     )
-    return Rig(config, docker, popen, control, daemon, logs, update_calls, execv_calls)
+    return Rig(
+        config, docker, popen, control, daemon, logs, update_calls, execv_calls, launcher_dir
+    )
 
 
 def desired(stacks: list[dict], images: list[dict] | None = None, **extra) -> dict:

@@ -62,6 +62,13 @@ else
         theozolith-knowledge theozolith-worker theozolith-nodedaemon
 fi
 
+# The service user owns the venv: the daemon runs as ozolith and self-updates
+# by pip-installing the pinned version INTO this venv (ADR-0015 — the pin is
+# desired state, nodes converge on their heartbeats). Root-owned files make
+# every self-update fail with EACCES; ADR-0037 forbids a root helper that
+# pip-installs on its own, so the venv must be writable by the service user.
+chown -R ozolith:ozolith /opt/theozolith
+
 # The daemon state dir, owned by the service user before provision writes
 # into it (provision chowns its files to the dir owner).
 install -d -m 0750 -o ozolith -g ozolith /var/lib/theozolith

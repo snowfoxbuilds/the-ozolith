@@ -132,6 +132,16 @@ Stacks and worker types on top, never below.
    3.11, and git — git >= 2.55 recommended, never required: driver git runs
    maintenance-free (#56).
 
+   The installer leaves `/opt/theozolith` **owned by the `ozolith` service
+   user** (ADR-0015/0037): the Node Daemon runs as `ozolith` and self-updates by
+   pip-installing the pinned version into that venv, so a root-owned venv makes
+   every update fail with a permission error (the daemon logs a single
+   `VenvNotWritable` error at boot and keeps reconciling Stacks — it just never
+   converges to a new pin). A node installed before this change is repaired with
+   `sudo chown -R ozolith:ozolith /opt/theozolith` (or by re-running the
+   installer / `sudo theozolith init --with-local-node --force`, which does the
+   same chown idempotently).
+
    `provision` parses and checksums the join string, fetches the CA from the bootstrap
    listener, verifies it against the pinned fingerprint **before transmitting
    anything** (mismatch = possible MITM or a stale join string after CA rotation —
@@ -252,23 +262,33 @@ Stacks and worker types on top, never below.
    ```sh
    theozolith update                  # user path: pin the latest published release
    theozolith update --version 0.4.0  # …or an explicit one; rollback = re-pin
-   theozolith build                   # developer path, from a CLEAN source checkout:
-       # builds the distribution, pins the checkout's git SHA, and uploads the
-       # wheels — the Control Node serves them, so nodes never pull source and
-       # never build. A dirty tree is refused: every pin names a committed SHA.
+   sudo theozolith build              # developer path, from a CLEAN source checkout:
+       # builds the distribution, INSTALLS it into this box's /opt/theozolith
+       # venv (links the CLI, hands the venv to the service user), pins the
+       # checkout's git SHA, and uploads the wheels — the Control Node serves
+       # them, so nodes never pull source and never build. A dirty tree is
+       # refused: every pin names a committed SHA. Run as root from the managed
+       # venv so the local install happens; from a dev box (non-root, or an
+       # unmanaged venv) it publishes only, logging the skip reason. Restart
+       # theozolith-control.service afterwards to run the new code on this box.
    theozolith test                    # the local-development signal: run the
        # checkout's test and lint suite (iterate here, never by deploying
        # uncommitted state)
-   sudo python3 build.py              # bootstrap AND publish (ADR-0041/0051): the shim
-       # owns the environment — it creates (or reuses) the /opt/theozolith venv,
-       # re-executes itself inside it, installs the wheels there, links
+   sudo python3 build.py              # FIRST-DAY bootstrap only (ADR-0041/0051): the
+       # shim owns the environment — it creates (or reuses) the /opt/theozolith
+       # venv, re-executes itself inside it, installs the wheels there, links
        # `theozolith`, `theozolith-nodedaemon`, and the one-release deprecated
-       # `theozolith-control` alias into /usr/local/bin (ADR-0023/0032) — and then
-       # chains into `theozolith build` with the wheels it just built (no second
-       # build). On a box with no Control Node yet it skips the publish with a
-       # notice; `--no-publish` defers it deliberately. The full bare-metal
-       # sequence: "Build / rebuild from the repo" below.
+       # `theozolith-control` alias into /usr/local/bin (ADR-0023/0032) — and
+       # then chains into `theozolith build --no-install` (it already installed).
+       # After the first day, `sudo theozolith build` alone does everything this
+       # does. The full bare-metal sequence: "Build / rebuild from the repo".
    ```
+
+   **First day `sudo python3 build.py`; every day after `sudo theozolith build`;
+   never both** (ADR-0051 amendment). The first-day command exists to create the
+   managed venv and publish the CLI; once that CLI exists, `sudo theozolith
+   build` builds, installs on this box, serves, and pins in one step — this box
+   and the fleet reach the new SHA together.
 
    Both paths commit the pin bump to `product.toml` in the pinned build — and
    ingest respects it (ADR-0051): a Config Repo that declares no
@@ -358,33 +378,36 @@ and separate: `sudo theozolith origin-init`; ADR-0036) — then pin the product
 so the fleet has a recorded version:
 
 ```sh
-cd the-ozolith && sudo theozolith build      # uploads the wheels, commits the pin
-# (or re-run `sudo python3 build.py` — its chained publish goes through now
-# that init has run; ADR-0051)
+cd the-ozolith && sudo theozolith build      # installs on this box, uploads the wheels, commits the pin
 ```
 
 If a shell had a previous checkout venv active, `deactivate` and confirm
 `which theozolith` answers `/usr/local/bin/theozolith` — the old entry point
 shadows the system one until it does.
 
-**Rebuild after source changes.** From here the loop is:
+**Rebuild after source changes.** From here the loop is a single everyday
+command (ADR-0051 amendment) — **first day `sudo python3 build.py`; every day
+after `sudo theozolith build`; never both**:
 
 ```sh
 cd the-ozolith
 git pull                        # a dirty tree is refused — every pin names a committed SHA
 theozolith test                 # iterate here (checkout venv), never by deploying
-sudo python3 build.py           # ONE step (ADR-0051): update this box's CLI, then
-                                # publish — build, upload, pin; nodes converge on
-                                # their heartbeats
+sudo theozolith build           # ONE step: build, INSTALL on this box (CLI links +
+                                # venv handed to the service user), upload, pin —
+                                # this box and the fleet reach the new SHA together
+sudo systemctl restart theozolith-control.service   # run the new code on this box
 ```
 
 The publish serves the wheels from the Control Node and bumps the pin, so
 every node — the Control Node's own host queued last — self-updates; no node
-ever pulls source or builds. `sudo theozolith build` remains the
-publish-without-reinstall fast path when this box's CLI does not need
-updating; `sudo python3 build.py --no-publish` is the reverse (install only).
-The shim reuses the existing `/opt/theozolith` venv (ADR-0041; the old
-`sudo /opt/theozolith/bin/python build.py` spelling still works).
+ever pulls source or builds. Run `theozolith build` as root from the managed
+`/opt/theozolith` venv so the local install happens; a non-root or unmanaged
+invocation publishes only and logs the skip reason (a dev-box publish is
+unchanged). The one manual step the build cannot take for you is the
+`theozolith-control.service` restart above — the new CLI is installed, but the
+running control process is still the old code until you restart it.
+`sudo python3 build.py --no-publish` stays the install-only escape hatch.
 
 ## Upgrading a pre-ingest deployment (ADR-0048)
 
@@ -1090,7 +1113,9 @@ sudo rm -rf /var/tmp/theozolith
 
 After this the box is clean: secrets lived only in tmpfs and the encrypted Control Node
 store, both now gone (including the root-mediated partition, its unit, its service
-user, the managed venv, and every `/usr/local/bin` link the bootstrap owned — a link at
-those names that pointed elsewhere is left alone, exactly as the bootstrap found it).
+user, the managed venv — service-user-owned since the daemon self-updates into it
+(ADR-0015), and removed here by root regardless of owner — and every `/usr/local/bin`
+link the bootstrap owned — a link at those names that pointed elsewhere is left alone,
+exactly as the bootstrap found it).
 Orphaned run containers from a mid-Run kill are reaped by the daemon on its next
 start; the zombie-claim janitor restores the GitHub claim state.

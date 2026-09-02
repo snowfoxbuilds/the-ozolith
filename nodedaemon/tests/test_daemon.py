@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 from daemonrig import Rig, container_stack, desired, image_recipe, process_stack
+from theozolith_nodedaemon import daemon
 from theozolith_nodedaemon.dockerctl import DockerCtl, DockerError
 from theozolith_nodedaemon.stacks import WireStack
 
@@ -508,6 +509,142 @@ def test_failed_update_retries_on_a_later_pass_without_a_command(rig: Rig, monke
     rig.control.heartbeat_answers.append(pinned_response([]))
     rig.daemon.once()  # the next pass simply tries again
     assert len(calls) == 2
+
+
+# -- self-update writability + the shared control venv (issue #92) ----------------
+
+
+def test_venv_not_writable_boot_preflight_emits_one_event(rig: Rig, monkeypatch):
+    """At boot, an unwritable product venv surfaces exactly one
+    VenvNotWritable event (a fail-loud setup problem) and the daemon keeps
+    running — reconcile never depends on updatability (ADR-0015)."""
+    monkeypatch.setattr(rig.daemon, "_venv_writable", lambda: "/opt/theozolith/bin is not writable")
+    rig.daemon._boot_preflight()
+    events = [e for e in rig.control.events if e["error_class"] == "VenvNotWritable"]
+    assert len(events) == 1
+    assert "re-run install-nodedaemon.sh" in events[0]["message"]
+
+
+def test_unwritable_venv_fails_update_without_tearing_down_stacks(rig: Rig, monkeypatch):
+    """A node that cannot write its venv fails the update BEFORE any teardown:
+    stop_all is never called, the live child survives, and the error names the
+    installer repair (issue #92 — the old order killed a live Run per pass)."""
+    stacks = [process_stack("worker")]
+    rig.control.heartbeat_answers.append(heartbeat_response(stacks))
+    rig.daemon.once()  # the worker child is up
+    live = rig.popen.spawned[0]
+
+    stop_all_calls: list = []
+    monkeypatch.setattr(
+        rig.daemon._supervisor,
+        "stop_all",
+        lambda **kwargs: stop_all_calls.append(kwargs),
+    )
+    monkeypatch.setattr(rig.daemon, "_venv_writable", lambda: "site-packages is not writable")
+    rig.control.heartbeat_answers.append(pinned_response(stacks))
+    rig.daemon.once()
+
+    assert stop_all_calls == []  # the tree was never torn down over the failure
+    assert rig.daemon._supervisor.alive("worker") and live.returncode is None
+    assert not rig.execv_calls  # no re-exec
+    (event,) = [e for e in rig.control.events if "not writable" in e["message"]]
+    assert "re-run install-nodedaemon.sh" in event["message"]
+
+
+def test_control_package_updates_only_when_installed_here(rig: Rig, monkeypatch):
+    """The Control Node host shares one venv (ADR-0041): the self-update's pip
+    targets include the control distribution exactly when it is installed — a
+    plain Container-Host never pulls it. The package name is read from the
+    constant (its spelling collides with the deprecated CLI alias, ADR-0032)."""
+    control_pkg = daemon.OPTIONAL_UPDATE_PACKAGES[0]
+    monkeypatch.setattr(
+        daemon, "_distribution_installed", lambda name: name in daemon.OPTIONAL_UPDATE_PACKAGES
+    )
+    rig.control.heartbeat_answers.append(pinned_response([]))
+    rig.daemon.once()
+    (call,) = rig.update_calls
+    assert any(f"{control_pkg}==0.4.0" in a for a in call)
+    assert any("theozolith-nodedaemon==0.4.0" in a for a in call)
+
+    # And when it is NOT installed, it never enters the target set.
+    rig.update_calls.clear()
+    rig.daemon._update_done = False
+    rig.daemon._product_attempted = False
+    monkeypatch.setattr(daemon, "_distribution_installed", lambda name: False)
+    rig.control.heartbeat_answers.append(pinned_response([]))
+    rig.daemon.once()
+    (call,) = rig.update_calls
+    assert not any(control_pkg in a for a in call)
+
+
+def test_served_control_wheel_filtered_out_on_a_container_host(rig: Rig, monkeypatch):
+    """The served-artifact path filters the same way: a served set that
+    includes a control wheel installs it only when the control distribution is
+    present here, so it never rides onto a plain Container-Host (ADR-0041)."""
+    version = "0.4.0"
+    wheels = {
+        "theozolith_nodedaemon-0.4.0-py3-none-any.whl": b"nd",
+        "theozolith_control-0.4.0-py3-none-any.whl": b"ctl",
+    }
+    for name, payload in wheels.items():
+        rig.control.artifacts[(version, name)] = payload
+    monkeypatch.setattr(daemon, "_distribution_installed", lambda name: False)  # no control here
+    rig.control.heartbeat_answers.append(
+        {
+            "commands": [],
+            "config": {
+                **desired([]),
+                "product_version": version,
+                "product_artifacts": sorted(wheels),
+            },
+        }
+    )
+    rig.daemon.once()
+    (call,) = rig.update_calls
+    installed = [a for a in call if a.endswith(".whl")]
+    assert any("theozolith_nodedaemon" in a for a in installed)
+    assert not any("theozolith_control" in a for a in installed)  # filtered before the pull
+
+
+def test_served_set_with_only_a_control_wheel_fails_before_teardown(rig: Rig, monkeypatch):
+    """A served set that filters to ZERO of this venv's distributions (only a
+    control wheel offered to a plain Container-Host) fails the update BEFORE any
+    teardown: reaching `pip install --upgrade` with no targets after a stop_all
+    is the exact kill-a-Driver-per-pass loop the issue #92 ordering removes. The
+    live child survives and the error names the useless served set."""
+    stacks = [process_stack("worker")]
+    rig.control.heartbeat_answers.append(heartbeat_response(stacks))
+    rig.daemon.once()  # the worker child is up
+    live = rig.popen.spawned[0]
+
+    stop_all_calls: list = []
+    monkeypatch.setattr(
+        rig.daemon._supervisor,
+        "stop_all",
+        lambda **kwargs: stop_all_calls.append(kwargs),
+    )
+    monkeypatch.setattr(daemon, "_distribution_installed", lambda name: False)  # no control here
+    version = "0.4.0"
+    served = {"theozolith_control-0.4.0-py3-none-any.whl": b"ctl"}
+    for name, payload in served.items():
+        rig.control.artifacts[(version, name)] = payload
+    rig.control.heartbeat_answers.append(
+        {
+            "commands": [],
+            "config": {
+                **desired(stacks),
+                "product_version": version,
+                "product_artifacts": sorted(served),
+            },
+        }
+    )
+    rig.daemon.once()
+
+    assert stop_all_calls == []  # the tree was never torn down over the empty set
+    assert rig.daemon._supervisor.alive("worker") and live.returncode is None
+    assert rig.update_calls == [] and not rig.execv_calls  # nothing installed, no re-exec
+    (event,) = [e for e in rig.control.events if "nothing to install" in e["message"]]
+    assert "theozolith_control-0.4.0-py3-none-any.whl" in event["message"]
 
 
 def test_convergence_respects_queue_behind(rig: Rig, tmp_path):
@@ -1594,6 +1731,56 @@ def test_other_stacks_reconcile_when_one_fails_closed(rig: Rig):
     rig.daemon.once()
     assert not rig.daemon._supervisor.alive("implementer")
     assert rig.daemon._supervisor.alive("batch")  # reconcile continued past the failure
+
+
+def test_missing_launcher_emits_the_venv_path_and_keeps_reconciling(rig: Rig):
+    """The launcher absent from the daemon's venv fails the driver Stack
+    closed (ADR-0020/0041): one theozolith.error names the launcher path and
+    the venv dir, nothing is spawned for it, and the reconcile continues with
+    the other Stacks."""
+    recipe = image_recipe()
+    driver = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
+    )
+    good = process_stack("batch", command="my-batch --run", env={})
+    (rig.launcher_dir / "theozolith-driver").unlink()  # launcher gone from the venv
+    rig.control.heartbeat_answers.append(heartbeat_response([driver, good], [recipe]))
+    rig.daemon.once()
+    assert not rig.daemon._supervisor.alive("implementer")  # nothing spawned for it
+    assert rig.daemon._supervisor.alive("batch")  # reconcile continued
+    (event,) = rig.control.events
+    assert str(rig.launcher_dir / "theozolith-driver") in event["message"]
+    assert str(rig.launcher_dir.parent) in event["message"]  # the venv dir is named
+
+
+def test_missing_launcher_never_stops_a_live_driver(rig: Rig):
+    """A launcher that vanishes while a driver child is live at a CHANGED
+    spec never tears the running instance down (resolution precedes teardown):
+    the child keeps running and the error names the venv."""
+    recipe = image_recipe()
+    up = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/x", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([up], [recipe]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("implementer")
+    live = rig.popen.spawned[-1]
+
+    (rig.launcher_dir / "theozolith-driver").unlink()  # launcher disappears
+    changed = process_stack(
+        "implementer",
+        command="theozolith-driver builtin:implementer",
+        env={"THEOZOLITH_REPO": "acme/other", "THEOZOLITH_RUN_IMAGE": recipe["tag"]},
+    )
+    rig.control.heartbeat_answers.append(heartbeat_response([changed], [recipe]))
+    rig.daemon.once()
+    assert rig.daemon._supervisor.alive("implementer")  # the live child survived
+    assert rig.daemon._supervisor._children["implementer"].process is live
+    assert any("theozolith-driver" in e["message"] for e in rig.control.events)
 
 
 # -- effective-spec convergence: container Stacks (ADR-0044 amendment) ------------
@@ -4411,12 +4598,16 @@ def test_config_dist_swap_restarts_only_drivers_stacks(rig: Rig):
     assert (rig.config.state_dir / "config-dist" / "current").read_text().strip() == b_hash
     # The custom driver child was restarted exactly once (a new spawn).
     custom_spawns = [
-        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
     ]
     assert len(custom_spawns) == 2
     # The builtin and generic children were never restarted.
     builtin_spawns = [
-        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "builtin:implementer"]
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "builtin:implementer"]
     ]
     generic_spawns = [p for p in rig.popen.spawned if p.args[0] == "plain-driver"]
     assert len(builtin_spawns) == 1 and len(generic_spawns) == 1
@@ -4471,7 +4662,10 @@ def test_config_dist_empty_hashes_never_start_custom_driver(rig: Rig):
     assert not rig.daemon._supervisor.alive("custom-impl")
     assert rig.daemon._supervisor.alive("impl")
     assert rig.daemon._supervisor.alive("plain")
-    assert not any(p.args[:2] == ["theozolith-driver", "drivers/custom"] for p in rig.popen.spawned)
+    assert not any(
+        p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+        for p in rig.popen.spawned
+    )
 
     # A valid distribution converges: the custom driver now starts, once.
     digest, data = make_config_dist({"drivers/custom/impl.py": "v = 1\n"})
@@ -4480,7 +4674,9 @@ def test_config_dist_empty_hashes_never_start_custom_driver(rig: Rig):
     rig.daemon.once()
     assert rig.daemon._supervisor.alive("custom-impl")
     custom_spawns = [
-        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
     ]
     assert len(custom_spawns) == 1
     # The builtin and generic children were never restarted along the way.
@@ -4833,7 +5029,11 @@ def test_config_dist_same_hash_repair_stops_live_driver_before_exchange(rig: Rig
     assert alive_at_exchange == [False]
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
     assert rig.daemon._supervisor.alive("custom-impl")
-    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    spawns = [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
     assert len(spawns) == 2  # restarted exactly once
     # Only the COMPLETE transition is reported on the next heartbeat.
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
@@ -4920,7 +5120,11 @@ def test_config_dist_exchange_failure_is_honest_and_retried(rig: Rig):
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
     # The retry pass repaired, published, and restarted the driver exactly once.
     assert rig.daemon._supervisor.alive("custom-impl")
-    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    spawns = [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
     assert len(spawns) == 2  # the initial start + exactly one post-repair restart
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
     rig.daemon.once()
@@ -4989,7 +5193,11 @@ def test_config_dist_crash_between_renames_keeps_driver_stopped_then_repairs(rig
     rig.daemon.once()
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"  # repaired
     assert rig.daemon._supervisor.alive("custom-impl")
-    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    spawns = [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
     assert len(spawns) == 2  # the initial start + exactly one post-repair restart
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
     rig.daemon.once()
@@ -5024,7 +5232,11 @@ def test_config_dist_pointer_failure_after_repair_allows_freshly_verified_restar
     # the desired hash — so the driver restarted, exactly once.
     assert (tree / "drivers" / "custom" / "impl.py").read_text() == "x = 1\n"
     assert rig.daemon._supervisor.alive("custom-impl")
-    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    spawns = [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
     assert len(spawns) == 2
     del rig.daemon._write_current_pointer  # restore the real method
     rig.control.heartbeat_answers.append(dist_response([custom], digest))
@@ -5064,7 +5276,11 @@ def test_config_dist_pointer_failure_on_new_hash_keeps_driver_stopped(rig: Rig):
     assert _last_heartbeat(rig)["drivers_hash"] == a_hash
     assert (root / "current").read_text().strip() == b_hash
     assert rig.daemon._supervisor.alive("custom-impl")
-    spawns = [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    spawns = [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
     assert len(spawns) == 2  # the initial start + exactly one post-publication restart
     rig.control.heartbeat_answers.append(dist_response([custom], b_hash))
     rig.daemon.once()
@@ -5361,7 +5577,11 @@ def _drivers_dir(rig: Rig, digest: str) -> str:
 
 
 def _custom_spawns(rig: Rig):
-    return [p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "drivers/custom"]]
+    return [
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "drivers/custom"]
+    ]
 
 
 def test_config_dist_stack_gets_drivers_dir_env(rig: Rig):
@@ -5436,7 +5656,9 @@ def test_builtin_driver_stack_gets_no_drivers_dir_and_is_untouched_by_swaps(rig:
     rig.control.heartbeat_answers.append(dist_response(stacks, b_hash))
     rig.daemon.once()
     builtin_spawns = [
-        p for p in rig.popen.spawned if p.args[:2] == ["theozolith-driver", "builtin:implementer"]
+        p
+        for p in rig.popen.spawned
+        if p.args[:2] == [str(rig.launcher_dir / "theozolith-driver"), "builtin:implementer"]
     ]
     assert len(builtin_spawns) == 1  # never restarted by the swap
     assert "THEOZOLITH_DRIVERS_DIR" not in builtin_spawns[0].env
