@@ -2218,9 +2218,7 @@ class NodeDaemon:
         }
         if stack.tmpfs:
             identity["tmpfs"] = list(stack.tmpfs)
-        return hashlib.sha256(
-            json.dumps(identity, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _converge_container(self, stack: WireStack, want_running: bool) -> None:
         # A process child still tracked under this name means the Stack flipped
