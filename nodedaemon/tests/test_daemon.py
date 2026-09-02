@@ -6048,6 +6048,57 @@ def test_policy_export_retire_failure_is_logged_emitted_and_retryable(rig: Rig, 
     assert export.is_dir() and export.stat().st_ino == parent_inode
 
 
+def test_policy_export_tombstone_reclaim_failure_is_contained_and_swept(rig: Rig, monkeypatch):
+    """The rename out of the mounted parent succeeds but reclaiming the
+    resulting dot-prefixed tombstone fails: the failure logs AND emits (no
+    drop-in contents), the pass still reaches reconciliation, the stable
+    parent never moves, and the tombstone — already invisible to the mount
+    and to enumeration — remains as honest retryable state until the
+    leftover sweep removes it on the next healthy pass."""
+    a_hash, a_data = _policy_dist("false")
+    rig.control.config_artifacts[a_hash] = a_data
+    rig.control.heartbeat_answers.append(dist_response([], a_hash))
+    rig.daemon.once()
+    export = rig.config.policy_export_dir
+    parent_inode = export.stat().st_ino
+    tombstone = export / ".claude-defaults.retired"
+    real_rmtree = daemon.shutil.rmtree
+
+    def failing_rmtree(path, *args, **kwargs):
+        if Path(path) == tombstone:
+            raise OSError(16, "injected EBUSY")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon.shutil, "rmtree", failing_rmtree)
+    reconciled = []
+    real_reconcile = rig.daemon._reconcile
+
+    def spying_reconcile():
+        reconciled.append(True)
+        return real_reconcile()
+
+    monkeypatch.setattr(rig.daemon, "_reconcile", spying_reconcile)
+    b_hash, b_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
+    rig.control.config_artifacts[b_hash] = b_data
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()  # completes — the reclaim OSError never escapes
+    assert reconciled  # ...and the pass still reached reconciliation
+    assert not (export / "claude-defaults").exists()  # gone from the mounted view
+    assert tombstone.is_dir()  # honest retryable remnant, hidden from the mount
+    needle = "policy export 'claude-defaults' tombstone reclaim failed"
+    assert any(needle in line for line in rig.logs)
+    event = _find_error(rig, needle)
+    assert event is not None
+    assert "sessionUrl" not in event["message"]  # paths and class only, never contents
+    assert export.stat().st_ino == parent_inode
+
+    monkeypatch.setattr(daemon.shutil, "rmtree", real_rmtree)
+    rig.control.heartbeat_answers.append(dist_response([], b_hash))
+    rig.daemon.once()
+    assert not tombstone.exists()  # swept by the next healthy pass
+    assert export.is_dir() and export.stat().st_ino == parent_inode
+
+
 def test_policy_recipe_defers_then_builds_once_converged(rig: Rig):
     """End to end (ADR-0055): a policy-referencing recipe defers while the
     node has no verified distribution, then builds in the SAME pass that

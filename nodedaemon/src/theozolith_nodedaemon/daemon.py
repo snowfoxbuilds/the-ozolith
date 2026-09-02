@@ -1318,6 +1318,17 @@ class NodeDaemon:
             else:
                 path.unlink()
 
+    @staticmethod
+    def _reclaim_strict(path: Path) -> None:
+        """Remove a file or tree, raising OSError on failure — the raising
+        variant of _reclaim for callers that own the diagnostic (log + emit)
+        instead of deferring silently to the leftover sweep. A missing path
+        is not a failure."""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
     def _export_knowledge(self) -> None:
         """Maintain the STABLE deck-facing knowledge export at
         ``<state>/knowledge`` from the verified applied distribution: one
@@ -1471,17 +1482,28 @@ class NodeDaemon:
                 self._emit_error(type(exc).__name__, f"policy export {name!r} failed: {exc}")
         for stale in sorted(current - set(desired)):
             # Retire through a dot-prefixed rename so the tree disappears from
-            # the mounted parent atomically, then reclaim the bytes.
+            # the mounted parent atomically, then reclaim the bytes. Every
+            # stage fails CONTAINED — log + emit, never the pass: a failed
+            # pre-rename clear or rename leaves the stale tree honestly
+            # enumerable (retried next pass); a failed tombstone reclaim
+            # leaves the dot-prefixed remnant — invisible to the mount and to
+            # enumeration — for the leftover sweep on a later healthy pass.
             retired = export / f".{stale}.retired"
             try:
-                self._reclaim(retired)
+                self._reclaim_strict(retired)
                 os.replace(export / stale, retired)
             except OSError as exc:
                 message = f"policy export {stale!r} retire failed: {exc}"
                 self._log(message)
                 self._emit_error(type(exc).__name__, message)
                 continue
-            self._reclaim(retired)
+            try:
+                self._reclaim_strict(retired)
+            except OSError as exc:
+                message = f"policy export {stale!r} tombstone reclaim failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                continue
             self._log(f"policy export {stale!r} retired")
         with contextlib.suppress(OSError):
             for leftover in export.glob(".*"):
