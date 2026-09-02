@@ -103,6 +103,16 @@ class DaemonConfig:
         return self.state_dir / "knowledge"
 
     @property
+    def policy_export_dir(self) -> Path:
+        # The STABLE deck-facing Agent Policy export (ADR-0055): one child
+        # dir per policy tree, exported verbatim from the applied
+        # distribution with the same whole-tree swap as knowledge. Flight
+        # Decks read-only bind-mount this parent; the deck start script
+        # links the managed drop-in dir into the selected child, so a
+        # content swap lands on the next `claude` launch with no recreate.
+        return self.state_dir / "policy"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 

@@ -102,6 +102,18 @@ base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 # reference — same validation as the driver types.
 knowledge = "knowledge/claude-dev"
 
+# The Agent Policy SELECTION (ADR-0055): the validated managed-settings
+# drop-in tree this deck's /etc/claude-code/managed-settings.d links into,
+# delivered to flightdeck-start as THEOZOLITH_POLICY_TREE (per-Stack [env]
+# override rejected — per-Stack policy does not exist). On a driverless type
+# the tree NEVER bakes and never enters the image identity: reselecting the
+# tree recreates the deck ONCE (the injected env is container spec), while a
+# CONTENT edit redistributes live and lands on the next `claude` launch
+# inside the running deck — running sessions keep the drop-ins they loaded.
+# Ingest validates every drop-in against the safe-key allowlist and pins the
+# tree; load fails loud on a dangling reference.
+policy = "policy/claude-defaults"
+
 # The deck's DEFAULT model (ADR-0045 §4). Control appends an interactive-scope
 # materialize step for this field: the build validates the ID and writes it to
 # /etc/theozolith/model — atomically, as a root-owned non-user-writable regular
@@ -355,6 +367,30 @@ fi''',
 'for entry in skills agents workflows CLAUDE.md; do' \
 '  link_knowledge "$KNOWLEDGE_TREE_DIR/$entry" "/home/ozolith/.claude/$entry"' \
 'done' \
+'# ADR-0055: the Agent Policy tree is the node-applied pinned tree, mounted' \
+'# read-only at /var/lib/theozolith/policy. The worker-type policy field' \
+'# selects the tree, control-injected as THEOZOLITH_POLICY_TREE; a deck with' \
+'# no policy skips this section (todays deck). The managed drop-in dir is' \
+'# linked to the selected tree via passwordless sudo (the managed tier is' \
+'# root-owned; the link survives only the container layer and is rewired on' \
+'# every start). A content edit swaps the exported tree under the mount and' \
+'# lands on the next claude launch - running sessions keep what they loaded.' \
+'if [ -n "${THEOZOLITH_POLICY_TREE:-}" ]; then' \
+'  POLICY_TREE_DIR="/var/lib/theozolith/policy/${THEOZOLITH_POLICY_TREE}"' \
+'  if [ ! -d "$POLICY_TREE_DIR" ]; then' \
+'    echo "flightdeck-start: policy tree $POLICY_TREE_DIR is not available on this node (config distribution not converged, or the tree was retired) - failing loud (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  if [ -d /etc/claude-code/managed-settings.d ] && [ ! -L /etc/claude-code/managed-settings.d ]; then' \
+'    echo "flightdeck-start: /etc/claude-code/managed-settings.d is a real directory; refusing to symlink over it (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  sudo mkdir -p /etc/claude-code' \
+'  sudo rm -f /etc/claude-code/managed-settings.d' \
+'  sudo ln -s "$POLICY_TREE_DIR" /etc/claude-code/managed-settings.d' \
+'else' \
+'  echo "flightdeck-start: no Agent Policy selected for this deck - the managed drop-in dir stays untouched (ADR-0055)"' \
+'fi' \
 '# Claude session env (snow-maker parity, mirrored in /etc/profile.d): the' \
 '# CLI config dir lives INSIDE ~/.claude so .claude.json - login credential,' \
 '# onboarding flag - rides the per-deck state volume with settings.json;' \
@@ -496,19 +532,22 @@ fi''',
 
 command = "/usr/local/bin/flightdeck-start"
 
-# Node-local volumes (ADR-0043/0048). `{stack}` is substituted control-side
-# with this Flight Deck Stack's name, so two same-type Flight Decks on one node
-# get distinct runtime-state and tailnet-identity volumes. The knowledge entry
-# is a READ-ONLY BIND of the stable export the Node Daemon maintains from the
-# applied pinned tree — deliberately shared (no `{stack}`), never writable,
-# and mounted at the PARENT so a tree swap on the host never recreates the
-# container: a running session keeps what it loaded, an agent-CLI restart
-# picks up the new trees. The host path is `<state-dir>/knowledge`; adjust it
-# if your nodes override THEOZOLITH_STATE_DIR.
+# Node-local volumes (ADR-0043/0048/0055). `{stack}` is substituted
+# control-side with this Flight Deck Stack's name, so two same-type Flight
+# Decks on one node get distinct runtime-state and tailnet-identity volumes.
+# The knowledge and policy entries are READ-ONLY BINDS of the stable exports
+# the Node Daemon maintains from the applied pinned tree — deliberately
+# shared (no `{stack}`), never writable, and mounted at the PARENT so a tree
+# swap on the host never recreates the container: a running session keeps
+# what it loaded, an agent-CLI restart (or, for policy, the next `claude`
+# launch) picks up the new trees. The host paths are `<state-dir>/knowledge`
+# and `<state-dir>/policy`; adjust them if your nodes override
+# THEOZOLITH_STATE_DIR.
 volumes = [
     "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
     "{stack}-claude-state:/home/ozolith/.claude",    # per-instance runtime state (never shared)
     "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",  # applied knowledge (ADR-0048)
+    "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",        # applied Agent Policy (ADR-0055)
     "{stack}-tailscale-state:/var/lib/tailscale",    # per-instance tailnet machine identity
     "{stack}-workspace:/workspace",                  # per-instance working tree (snow-maker repo-mount parity)
 ]

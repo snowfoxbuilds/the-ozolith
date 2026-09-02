@@ -47,10 +47,15 @@ def thin_stack(tmp_path, name: str, worker_type: str, **fields) -> None:
 
 
 def write_pins(
-    tmp_path, *, knowledge: dict[str, str] | None = None, base: dict[str, str] | None = None
+    tmp_path,
+    *,
+    knowledge: dict[str, str] | None = None,
+    base: dict[str, str] | None = None,
+    policy: dict[str, str] | None = None,
 ) -> None:
-    """A machine-shaped pins.toml (ADR-0048): what `theozolith config ingest`
-    would have written for the given knowledge trees / base resolutions."""
+    """A machine-shaped pins.toml (ADR-0048/0055): what `theozolith config
+    ingest` would have written for the given knowledge trees / base
+    resolutions / policy trees."""
     lines = ['[source]\ncommit = "cafe1234"']
     if base:
         lines.append("[base]")
@@ -58,6 +63,9 @@ def write_pins(
     if knowledge:
         lines.append("[knowledge]")
         lines.extend(f'"{name}" = "{tree_hash}"' for name, tree_hash in knowledge.items())
+    if policy:
+        lines.append("[policy]")
+        lines.extend(f'"{name}" = "{tree_hash}"' for name, tree_hash in policy.items())
     write(tmp_path, "pins.toml", "\n".join(lines) + "\n")
 
 
@@ -65,6 +73,15 @@ def write_knowledge_tree(tmp_path, name: str, files: dict[str, str] | None = Non
     """A compiled knowledge tree in the pinned build (ADR-0048)."""
     for relpath, text in (files or {"CLAUDE.md": "# k\n"}).items():
         write(tmp_path, f"knowledge/{name}/{relpath}", text)
+
+
+POLICY_DOC = '{"attribution": {"sessionUrl": false}}\n'
+
+
+def write_policy_tree(tmp_path, name: str, files: dict[str, str] | None = None) -> None:
+    """An Agent Policy tree in the pinned build (ADR-0055)."""
+    for relpath, text in (files or {"attribution.json": POLICY_DOC}).items():
+        write(tmp_path, f"policy/{name}/{relpath}", text)
 
 
 # -- empty / migration ----------------------------------------------------------
@@ -542,6 +559,43 @@ def test_tag_with_model_is_golden_over_the_materialized_setup(tmp_path):
     )
 
 
+# The content pin of the standard example drop-in tree ({"attribution":
+# {"sessionUrl": false}} in attribution.json) as configdist.policy_tree_hash
+# computes it — a fixed literal so the golden below is a full-config golden.
+GOLDEN_POLICY_PIN = "96a9ffe39ded28373fbd24fda24379d2d4309844ca7abbba16050f473058e7a6"
+
+
+def test_tag_with_policy_is_golden_over_the_conditional_keys(tmp_path):
+    """A DRIVER type with an Agent Policy gains exactly the conditional
+    policy/policy_pin identity keys (ADR-0055): same image fields as the
+    model golden above plus the policy reference — a different, stable hash.
+    GOLDEN: it moves only when the identity formula changes again, a
+    deliberate act. The two policy-less goldens above passing UNCHANGED is
+    the byte-identical proof for every pre-ADR-0055 identity."""
+    _golden_repo(tmp_path)
+    write_policy_tree(tmp_path, "gold")
+    write_pins(
+        tmp_path,
+        knowledge={"gold": GOLDEN_KNOWLEDGE_PIN},
+        policy={"gold": GOLDEN_POLICY_PIN},
+    )
+    write(
+        tmp_path,
+        "worker-types/goldtype.toml",
+        'driver = "builtin:implementer"\nworkspace = "acme/sandbox"\n'
+        + GOLDEN_IMAGE_FIELDS
+        + 'adapter = "claude"\nmodel = "claude-sonnet-5"\npolicy = "policy/gold"\n',
+    )
+    wt = load_config(tmp_path).worker_types["goldtype"]
+    assert wt.baked_policy == "policy/gold" and wt.baked_policy_pin == GOLDEN_POLICY_PIN
+    recipe = wt.recipe_wire()
+    assert recipe["policy"] == "policy/gold" and recipe["policy_pin"] == GOLDEN_POLICY_PIN
+    assert wt.tag == "theozolith/goldtype:0.3.0-0a3a3fc6d5c8"
+    assert wt.instruction_hash == (
+        "0a3a3fc6d5c8e14573cb93061a92406cb3340016fd3869dcf0e2c4c60c6367ea"
+    )
+
+
 def test_driverless_knowledge_selects_the_mount_and_stays_out_of_the_image(tmp_path):
     """ADR-0048 amendment: a Flight Deck may declare knowledge =
     "knowledge/<name>". The reference is validated exactly like a driver's
@@ -653,6 +707,180 @@ def test_knowledge_reference_requires_the_compiled_tree(tmp_path):
     driver_type(tmp_path, knowledge='"knowledge/dev"')
     with pytest.raises(ConfigRepoError, match="no compiled claude tree in the pinned build"):
         load_config(tmp_path)
+
+
+# -- Agent Policy (ADR-0055) -----------------------------------------------------
+
+
+def _policy_repo(tmp_path, name: str = "gold", pin: str = "d" * 64) -> None:
+    write_policy_tree(tmp_path, name)
+    write_pins(tmp_path, policy={name: pin})
+
+
+def test_policy_field_parses_and_joins_the_ingested_pin(tmp_path):
+    _policy_repo(tmp_path)
+    driver_type(tmp_path, policy='"policy/gold"')
+    wt = load_config(tmp_path).worker_types["claude-dev"]
+    assert wt.policy == "policy/gold" and wt.policy_pin == "d" * 64
+    assert wt.policy_tree == "gold"
+    assert wt.baked_policy == "policy/gold" and wt.baked_policy_pin == "d" * 64
+
+
+def test_policy_reference_shape_is_validated(tmp_path):
+    _policy_repo(tmp_path)
+    for bad in ('"gold"', '"policy/"', '"policy/has/slash"', '"policy/.dot"'):
+        driver_type(tmp_path, policy=bad)
+        with pytest.raises(ConfigRepoError, match=r'must be\s+"policy/<name>"'):
+            load_config(tmp_path)
+
+
+def test_hand_authored_policy_pin_is_refused(tmp_path):
+    _policy_repo(tmp_path)
+    driver_type(tmp_path, policy='"policy/gold"', policy_pin=f'"{"d" * 64}"')
+    with pytest.raises(ConfigRepoError, match="ingest-computed, never authored"):
+        load_config(tmp_path)
+
+
+def test_policy_reference_requires_an_ingested_pin(tmp_path):
+    write_policy_tree(tmp_path, "gold")
+    driver_type(tmp_path, policy='"policy/gold"')
+    with pytest.raises(ConfigRepoError, match="no ingest-computed pin for 'policy/gold'"):
+        load_config(tmp_path)
+
+
+def test_dangling_policy_reference_fails_load(tmp_path):
+    """The pin proves a tree was ingested; the tree must still be present to
+    distribute — a dormant type with a dangling reference breaks at configure
+    time (ADR-0055), never later."""
+    write_pins(tmp_path, policy={"gone": "d" * 64})
+    driver_type(tmp_path, policy='"policy/gone"')
+    with pytest.raises(ConfigRepoError, match="has no tree in the pinned build"):
+        load_config(tmp_path)
+
+
+def test_policy_is_refused_on_codex_types_in_both_shapes(tmp_path):
+    """claude-only in v1, driver AND driverless alike (ADR-0055 §7): codex
+    has no managed-settings tier."""
+    _policy_repo(tmp_path)
+    driver_type(
+        tmp_path,
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        policy='"policy/gold"',
+        base='"ghcr.io/acme/run-codex:1.0@sha256:' + "0" * 64 + '"',
+    )
+    with pytest.raises(ConfigRepoError, match="cannot declare an Agent Policy"):
+        load_config(tmp_path)
+    write(
+        tmp_path,
+        "worker-types/claude-dev.toml",
+        f'base = "{BASE}"\nadapter = "codex"\npolicy = "policy/gold"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="cannot declare an Agent Policy"):
+        load_config(tmp_path)
+
+
+def test_load_validates_every_policy_tree_against_the_allowlist(tmp_path):
+    """Config load re-runs the safe-key allowlist over every tree in the
+    pinned build (ADR-0055) — referenced or not — so a hand edit or restore
+    can never deliver an unadmitted key."""
+    write_policy_tree(tmp_path, "rogue", {"steer.json": '{"model": "claude-opus-5"}\n'})
+    with pytest.raises(ConfigRepoError, match=r"policy/rogue/steer\.json.*'model'"):
+        load_config(tmp_path)
+
+
+def test_stack_env_policy_tree_override_is_rejected(tmp_path):
+    """Per-Stack policy does not exist (ADR-0055): the selection is
+    worker-type declared, so an [env] override on a worker-type Stack fails
+    the load."""
+    _policy_repo(tmp_path)
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\npolicy = "policy/gold"\n',
+    )
+    write(
+        tmp_path,
+        "stacks/deck.toml",
+        'worker_type = "flightdeck"\nnode = "box1"\n[env]\nTHEOZOLITH_POLICY_TREE = "other"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="THEOZOLITH_POLICY_TREE"):
+        load_config(tmp_path)
+
+
+def test_driverless_policy_selects_the_mount_and_stays_out_of_the_image(tmp_path):
+    """ADR-0055: a Flight Deck's policy reference never bakes — the wire
+    recipe carries empty policy fields, hash/tag/recipe are byte-identical to
+    the policy-less twin, and the resolved Stack carries the selection as
+    THEOZOLITH_POLICY_TREE (spec input: reselection recreates once)."""
+    write_policy_tree(tmp_path, "gold")
+    write_policy_tree(tmp_path, "other")
+    write_pins(tmp_path, policy={"gold": "d" * 64, "other": "e" * 64})
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "flightdeck-start"\npolicy = "policy/gold"\n',
+    )
+    thin_stack(tmp_path, "deck", "flightdeck")
+    config = load_config(tmp_path)
+    wt = config.worker_types["flightdeck"]
+    assert wt.policy == "policy/gold" and wt.policy_pin == "d" * 64
+    assert wt.baked_policy == "" and wt.baked_policy_pin == ""
+    recipe = wt.recipe_wire()
+    assert recipe["policy"] == "" and recipe["policy_pin"] == ""
+    stack = next(s for s in config.stacks if s.name == "deck")
+    assert stack.env["THEOZOLITH_POLICY_TREE"] == "gold"
+
+    # The policy-less twin: identical hash, tag, and recipe wire — only the
+    # resolved Stack env differs (policy trees are never identity-bearing on
+    # decks).
+    write(
+        tmp_path,
+        "worker-types/twin.toml",
+        f'base = "{BASE}"\ncommand = "flightdeck-start"\n',
+    )
+    twin = load_config(tmp_path).worker_types["twin"]
+    assert twin.instruction_hash == wt.instruction_hash
+    assert twin.tag.split(":", 1)[1] == wt.tag.split(":", 1)[1]
+    # The full wire recipe is byte-identical up to the name-derived fields.
+    assert {k: v for k, v in twin.recipe_wire().items() if k not in ("name", "tag")} == {
+        k: v for k, v in recipe.items() if k not in ("name", "tag")
+    }
+
+    # Content edit: the pin moves, nothing else does — live redistribution.
+    write_pins(tmp_path, policy={"gold": "f" * 64, "other": "e" * 64})
+    after_content = load_config(tmp_path)
+    assert after_content.worker_types["flightdeck"].tag == wt.tag
+    deck = next(s for s in after_content.stacks if s.name == "deck")
+    assert deck.env["THEOZOLITH_POLICY_TREE"] == "gold"  # spec unchanged: no recreate
+
+    # Selection edit: the tag still does not move, the injected env does —
+    # the container spec changes and the deck is recreated on the new tree.
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "flightdeck-start"\npolicy = "policy/other"\n',
+    )
+    after_selection = load_config(tmp_path)
+    assert after_selection.worker_types["flightdeck"].tag == wt.tag
+    deck = next(s for s in after_selection.stacks if s.name == "deck")
+    assert deck.env["THEOZOLITH_POLICY_TREE"] == "other"
+
+
+def test_pins_policy_table_shape_is_validated(tmp_path):
+    write(tmp_path, "pins.toml", '[source]\ncommit = "c"\n[policy]\ngold = "nothex"\n')
+    with pytest.raises(ConfigRepoError, match=r"\[policy\] 'gold' must map to a 64-hex"):
+        load_config(tmp_path)
+    write(tmp_path, "pins.toml", f'[source]\ncommit = "c"\n[policy]\n".bad" = "{"d" * 64}"\n')
+    with pytest.raises(ConfigRepoError, match=r"\[policy\] key '\.bad' must be a plain"):
+        load_config(tmp_path)
+
+
+def test_refuse_ui_write_covers_policy(tmp_path):
+    from theozolith_control.configrepo import refuse_ui_write
+
+    with pytest.raises(ConfigRepoError, match="git-native-only"):
+        refuse_ui_write("policy/gold/attribution.json")
 
 
 def test_knowledge_reference_shape_is_validated(tmp_path):
@@ -1032,9 +1260,10 @@ def test_full_model_ids_produce_no_warnings(tmp_path):
 
 
 def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
-    """The synthesized instruction rides the recipe's ``setup`` — the 10
-    wire keys (ADR-0052 added knowledge_tool/knowledge_target), daemon
-    adapter-blind — with managed scope for driver run images."""
+    """The synthesized instruction rides the recipe's ``setup`` — the 12
+    wire keys (ADR-0052 added knowledge_tool/knowledge_target, ADR-0055
+    policy/policy_pin), daemon adapter-blind — with managed scope for driver
+    run images."""
     driver_type(tmp_path, effort='"high"')
     thin_stack(tmp_path, "implementer", "claude-dev")
     recipe = load_config(tmp_path).desired_state_for("box1")["images"][0]
@@ -1050,6 +1279,8 @@ def test_driver_model_effort_materialize_managed_scope_on_the_wire(tmp_path):
         "knowledge_pin",
         "knowledge_tool",
         "knowledge_target",
+        "policy",
+        "policy_pin",
         "tag",
         "base_digest",
         "instruction_hash",

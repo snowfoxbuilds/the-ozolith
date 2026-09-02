@@ -26,7 +26,9 @@ from theozolith_control import candidate, configrepo
 from theozolith_control import ingest as ingest_mod
 from theozolith_control.candidate import CandidateError
 from theozolith_nodedaemon import builds
+from theozolith_nodedaemon import configdist as node_configdist
 from theozolith_nodedaemon.dockerctl import DockerError
+from theozolith_worker import policy as worker_policy
 from theozolith_worker.proposal import SCHEMA_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +43,9 @@ def resolve_a(ref: str) -> str:
     return DIGEST_A
 
 
+POLICY_DOC = '{"attribution": {"sessionUrl": false}}\n'
+
+
 def make_source(
     tmp_path,
     *,
@@ -50,6 +55,7 @@ def make_source(
     model: str = "claude-sonnet-5",
     effort: str = "",
     knowledge: str = "knowledge/gold",
+    policy: str = "",
     name: str = "goldtype",
 ) -> Path:
     source = tmp_path / "config-src"
@@ -58,6 +64,10 @@ def make_source(
     (source / "knowledge" / "gold" / "AGENTS.md").write_text(
         "# golden knowledge\n", encoding="utf-8"
     )
+    if policy:
+        tree = source / "policy" / policy.removeprefix("policy/")
+        tree.mkdir(parents=True, exist_ok=True)
+        (tree / "attribution.json").write_text(POLICY_DOC, encoding="utf-8")
     lines = [f'base = "{base}"', 'setup = ["apt-get update && apt-get install -y ripgrep"]']
     for key, value in (
         ("driver", driver),
@@ -65,6 +75,7 @@ def make_source(
         ("model", model),
         ("effort", effort),
         ("knowledge", knowledge),
+        ("policy", policy),
     ):
         if value:
             lines.append(f'{key} = "{value}"')
@@ -101,8 +112,8 @@ def test_contract_version_keys_are_stamped_and_drift_locked():
     """The three exactly-owned compatibility keys (BENCH-CONTRACT.md): the
     code constants, the spec's stated versions, and the published vectors
     file must all agree — a bump anywhere without the others is a failure."""
-    assert candidate.BUNDLE_FORMAT_VERSION == 1
-    assert candidate.IDENTITY_SPEC_VERSION == 1
+    assert candidate.BUNDLE_FORMAT_VERSION == 2  # ADR-0055: policy joins the bundle
+    assert candidate.IDENTITY_SPEC_VERSION == 2  # ADR-0055: conditional policy keys
     assert SCHEMA_VERSION == 1
     spec = (REPO_ROOT / "docs" / "specs" / "BENCH-CONTRACT.md").read_text(encoding="utf-8")
     assert f"**`schema_version`** (currently {SCHEMA_VERSION}" in spec
@@ -115,10 +126,11 @@ def test_contract_version_keys_are_stamped_and_drift_locked():
 
 
 def test_bundle_knowledge_dir_matches_the_daemon_staging_name():
-    """The bundle is a plain docker build context: its knowledge dir must be
-    the exact name the daemon's shared staging writes and the shared codegen
-    COPYs from."""
+    """The bundle is a plain docker build context: its knowledge and policy
+    dirs must be the exact names the daemon's shared staging writes and the
+    shared codegen COPYs from."""
     assert candidate.KNOWLEDGE_SUBDIR == builds._CONTEXT_KNOWLEDGE
+    assert candidate.POLICY_SUBDIR == builds._CONTEXT_POLICY
 
 
 # -- golden identity vectors -----------------------------------------------------
@@ -135,9 +147,9 @@ def test_identity_vectors_recompute_through_the_production_formula():
         (REPO_ROOT / "docs" / "specs" / "bench-identity-vectors.json").read_text(encoding="utf-8")
     )
     vectors = data["vectors"]
-    assert len(vectors) >= 4
+    assert len(vectors) >= 5
     assert len({vector["fields"]["adapter"] for vector in vectors}) >= 2
-    seen_conditional_target = seen_default_target_omitted = False
+    seen_conditional_target = seen_default_target_omitted = seen_policy = False
     for vector in vectors:
         fields = vector["fields"]
         configrepo._validate_model_effort(
@@ -153,6 +165,10 @@ def test_identity_vectors_recompute_through_the_production_formula():
             setup=tuple(fields["setup"]),
             knowledge=fields["knowledge"],
             knowledge_pin=fields["knowledge_pin"],
+            # The conditional policy keys (identity_spec_version 2, ADR-0055):
+            # a vector that omits the fields is a policy-less identity.
+            policy=fields.get("policy", ""),
+            policy_pin=fields.get("policy_pin", ""),
             driver=fields["driver"],
             adapter=fields["adapter"],
             model=fields["model"],
@@ -175,13 +191,19 @@ def test_identity_vectors_recompute_through_the_production_formula():
         elif wt.baked_knowledge:
             assert wt.knowledge_target == configrepo._DEFAULT_KNOWLEDGE_TARGET
             seen_default_target_omitted = True
+        if "policy" in parsed:
+            assert parsed["policy"] == wt.baked_policy != ""
+            assert parsed["policy_pin"] == wt.baked_policy_pin != ""
+            seen_policy = True
+        else:
+            assert wt.baked_policy == ""
         assert expected["identity_triple"] == {
             "base_digest": wt.base_digest,
             "instruction_hash": wt.instruction_hash,
             "adapter": wt.adapter,
         }
         assert wt.tag == expected["tag"]
-    assert seen_conditional_target and seen_default_target_omitted
+    assert seen_conditional_target and seen_default_target_omitted and seen_policy
 
 
 def test_identity_vectors_carry_the_promoted_goldens():
@@ -398,6 +420,158 @@ def test_unsafe_knowledge_trees_are_rejected(tmp_path):
         candidate.export_candidate(source, "goldtype", tmp_path / "out", resolve_digest=resolve_a)
 
 
+# -- Agent Policy in the bundle (ADR-0055) ---------------------------------------
+
+
+def test_export_bundles_and_verifies_a_baked_policy_tree(tmp_path):
+    """A policy-declaring driver type exports the tree under policy/, the
+    Dockerfile carries the managed-drop-in COPY, the manifest records the
+    baked view, and verification recomputes pin and identity."""
+    bundle, summary = export_gold(tmp_path, policy="policy/claude-defaults")
+    assert sorted(entry.name for entry in bundle.iterdir()) == [
+        "Dockerfile",
+        "candidate.json",
+        "knowledge",
+        "policy",
+    ]
+    assert (bundle / "policy" / "attribution.json").read_text() == POLICY_DOC
+    manifest = json.loads((bundle / "candidate.json").read_text(encoding="utf-8"))
+    assert manifest["policy"] == "policy/claude-defaults"
+    assert manifest["policy_pin"]
+    dockerfile = (bundle / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY policy/ /etc/claude-code/managed-settings.d/" in dockerfile
+    assert dockerfile.index("COPY policy/") < dockerfile.index("RUN apt-get")
+    assert candidate.verify_bundle(bundle) == summary
+    # The identity gained the conditional keys: a policy-less twin differs.
+    _, plain = export_gold(tmp_path, out_name="bundle-plain")
+    assert summary.instruction_hash != plain.instruction_hash
+
+
+def test_export_refuses_an_unadmitted_policy_key(tmp_path):
+    """The shared safe-key allowlist gates export exactly as it gates ingest
+    and config load (ADR-0055)."""
+    source = make_source(tmp_path, policy="policy/claude-defaults")
+    (source / "policy" / "claude-defaults" / "steer.json").write_text(
+        '{"model": "claude-opus-5"}\n', encoding="utf-8"
+    )
+    with pytest.raises(CandidateError, match=r"steer\.json.*'model'"):
+        candidate.export_candidate(source, "goldtype", tmp_path / "out", resolve_digest=resolve_a)
+
+
+def test_tampering_with_policy_bytes_fails_the_pin_before_docker(tmp_path):
+    """One flipped drop-in byte refuses at verification — before any Docker
+    invocation (the verified build runs verify on its private snapshot
+    first, so the refusal precedes the build there too)."""
+    bundle, _ = export_gold(tmp_path, policy="policy/claude-defaults")
+    target = bundle / "policy" / "attribution.json"
+    original = target.read_bytes()
+    mutated = bytearray(original)
+    mutated[-2] ^= 0x01
+    target.write_bytes(bytes(mutated))
+    with pytest.raises(CandidateError, match="pin"):
+        candidate.verify_bundle(bundle)
+    target.write_bytes(original)
+    candidate.verify_bundle(bundle)
+
+    extra = bundle / "policy" / "smuggled.json"
+    extra.write_text("{}", encoding="utf-8")
+    with pytest.raises(CandidateError, match="pin"):
+        candidate.verify_bundle(bundle)
+
+
+def _export_coherent_malicious_bundle(tmp_path, dropin: str, document: str) -> Path:
+    """Craft the bundle a malicious PRODUCER would ship: disable the shared
+    validator during export only, so the production machinery itself
+    recomputes the policy pin, the conditional instruction hash, every
+    manifest field, and the Dockerfile over the forbidden drop-in. The result
+    is fully self-consistent — pin matches bytes, identity matches pin — and
+    only the verifier's own allowlist enforcement can refuse it."""
+    source = make_source(tmp_path, policy="policy/claude-defaults")
+    (source / "policy" / "claude-defaults" / dropin).write_text(document, encoding="utf-8")
+    out = tmp_path / "malicious-bundle"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(worker_policy, "validate_policy_tree", lambda *args, **kwargs: None)
+        candidate.export_candidate(
+            source, "goldtype", out, resolve_digest=resolve_a, now=lambda: NOW
+        )
+    return out
+
+
+@pytest.mark.parametrize(
+    ("dropin", "document", "key", "value"),
+    [
+        (
+            "hooks.json",
+            '{"hooks": {"PostToolUse": [{"command": "curl-evil-payload"}]}}\n',
+            "hooks",
+            "curl-evil-payload",
+        ),
+        ("steer.json", '{"model": "smuggled-model-id"}\n', "model", "smuggled-model-id"),
+        (
+            "extra.json",
+            '{"unclassifiedKnob": "smuggled-value"}\n',
+            "unclassifiedKnob",
+            "smuggled-value",
+        ),
+    ],
+)
+def test_a_self_consistent_malicious_policy_bundle_is_refused_before_docker(
+    tmp_path, dropin, document, key, value
+):
+    """A matching pin proves byte consistency, not admissibility: a bundle
+    whose pin, instruction hash, manifest, and Dockerfile are all coherently
+    recomputed over a forbidden drop-in must still refuse — the verifier
+    enforces the shared safe-key allowlist independently, naming the file and
+    key with the value redacted, before Docker is ever invoked (ADR-0055)."""
+    bundle = _export_coherent_malicious_bundle(tmp_path, dropin, document)
+    # Sanity: the bundle really is internally consistent — the recorded pin
+    # matches the tree bytes, so only the allowlist can catch it.
+    manifest = json.loads((bundle / candidate.MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert node_configdist.tree_hash(bundle / "policy") == manifest["policy_pin"]
+    with pytest.raises(CandidateError, match=rf"{dropin}.*'{key}'") as refusal:
+        candidate.verify_bundle(bundle)
+    assert value not in str(refusal.value)
+    # The verified build refuses on its private snapshot the same way, and
+    # Docker is never invoked.
+    fake = FakeDocker()
+    with pytest.raises(CandidateError, match=rf"{dropin}.*'{key}'"):
+        candidate.build_candidate(bundle, docker=fake)
+    assert fake.builds == []
+
+
+def test_policy_layout_entry_without_a_declared_policy_is_refused(tmp_path):
+    bundle, _ = export_gold(tmp_path)
+    (bundle / "policy").mkdir()
+    (bundle / "policy" / "attribution.json").write_text(POLICY_DOC, encoding="utf-8")
+    with pytest.raises(CandidateError, match="carries a policy/ entry"):
+        candidate.verify_bundle(bundle)
+
+
+def test_driverless_manifest_with_a_baked_policy_is_refused(tmp_path):
+    """The manifest carries the BAKED view: a driverless candidate can never
+    declare a baked policy (ADR-0055)."""
+    bundle, _ = export_gold(tmp_path, knowledge="", policy="policy/claude-defaults")
+    rewrite_manifest(bundle, driver="")
+    with pytest.raises(CandidateError, match="driverless candidate bakes no policy"):
+        candidate.verify_bundle(bundle)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("policy", "policy/evil"),
+        ("policy", ""),
+        ("policy_pin", "f" * 64),
+        ("policy_pin", ""),
+    ],
+)
+def test_tampering_with_policy_manifest_fields_fails_verification(tmp_path, field, value):
+    bundle, _ = export_gold(tmp_path, policy="policy/claude-defaults")
+    rewrite_manifest(bundle, **{field: value})
+    with pytest.raises(CandidateError):
+        candidate.verify_bundle(bundle)
+
+
 # -- negative verification: the tampering matrix ---------------------------------
 
 
@@ -531,9 +705,13 @@ def test_unknown_duplicate_and_malformed_manifest_fields_are_refused(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["bundle_format_version", "identity_spec_version"])
-def test_unsupported_versions_are_refused_outright(tmp_path, key):
+@pytest.mark.parametrize("version", [1, 3])
+def test_unsupported_versions_are_refused_outright(tmp_path, key, version):
+    """Older AND newer stamps refuse with the re-export message — a
+    v1-stamped bundle predates the ADR-0055 policy keys and is never
+    reinterpreted (no compatibility windows, BENCH-CONTRACT.md)."""
     bundle, _ = export_gold(tmp_path)
-    rewrite_manifest(bundle, **{key: 2})
+    rewrite_manifest(bundle, **{key: version})
     with pytest.raises(CandidateError, match="unsupported"):
         candidate.verify_bundle(bundle)
 
