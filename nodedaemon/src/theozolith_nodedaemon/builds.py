@@ -16,7 +16,11 @@ the build recomputes it over the applied tree before copying — a tag is a
 complete statement of what a Run executed with, so an image is never built
 from content that disagrees with the identity it would be tagged under. A
 missing or off-pin tree defers the build (the node converges the distribution
-first; the next pass retries).
+first; the next pass retries). A recipe's Agent Policy tree (ADR-0055) rides
+the same gate: staged from the applied distribution, verified against the
+recipe's ``policy_pin``, and COPY'd into Claude Code's managed drop-in
+directory before any setup RUN so the in-image build-gate conflict scan sees
+the drop-ins.
 """
 
 from __future__ import annotations
@@ -43,6 +47,14 @@ LABEL_BUILT_AT = "theozolith.built-at"
 _CONTEXT_KNOWLEDGE = "knowledge"
 _KNOWLEDGE_TARGET = "/home/ozolith/.claude/"
 
+# The build-context directory a recipe's Agent Policy tree is staged into and
+# the fixed in-image destination it lands at (ADR-0055): Claude Code's managed
+# drop-in directory. A CONSTANT, not wire-carried — policy is claude-only in
+# v1 and the daemon stays adapter-blind; the value is contract-pinned to
+# theozolith_worker.identity.MANAGED_DROPIN_DIR by the cross-package tests.
+_CONTEXT_POLICY = "policy"
+_POLICY_TARGET = "/etc/claude-code/managed-settings.d/"
+
 
 def _knowledge_target(image: dict[str, Any]) -> str:
     return str(image.get("knowledge_target", "") or _KNOWLEDGE_TARGET)
@@ -57,6 +69,13 @@ def dockerfile_for(image: dict[str, Any], built_at: str) -> str:
         # (package installs) need root, so the build escalates and drops back.
         "USER root",
     ]
+    if image.get("policy", ""):
+        # The Agent Policy drop-ins (ADR-0055), staged by stage_policy after
+        # pin verification. BEFORE every RUN: the materialize instruction is
+        # the last setup RUN and its in-image scan_managed_conflicts build
+        # gate must see the drop-ins it will run beside. Root-owned COPY is
+        # correct for the managed tier (no --chown).
+        lines.append(f"COPY {_CONTEXT_POLICY}/ {_POLICY_TARGET}")
     lines.extend(f"RUN {instruction}" for instruction in image.get("setup", []))
     if image.get("knowledge", ""):
         # The compiled tree was staged into the build context by ensure_image
@@ -141,6 +160,47 @@ def stage_knowledge(image: dict[str, Any], dist_root: Path | None, context: Path
     return None
 
 
+def stage_policy(image: dict[str, Any], dist_root: Path | None, context: Path) -> str | None:
+    """Copy the recipe's Agent Policy tree from the applied config-distribution
+    root into the build context and verify THE COPY against the recipe's
+    ``policy_pin`` (ADR-0055) — the stage_knowledge discipline: hash exactly
+    the bytes the build will consume. Policy trees stage VERBATIM (no per-tool
+    view — the tree is already the claude drop-in set). Returns a defer
+    reason, or ``None`` when the context is staged (or the recipe references
+    no policy). A reason means DEFER: the distribution has not converged to
+    the tree this recipe was pinned against (ADR-0042 advisory skew), or the
+    applied tree is malformed (repaired by the convergence loop)."""
+    ref = str(image.get("policy", "") or "")
+    if not ref:
+        return None
+    prefix = configdist.POLICY_DIR + "/"
+    name = ref[len(prefix) :]
+    if not ref.startswith(prefix) or not name or "/" in name:
+        return f"recipe policy reference {ref!r} is not policy/<name>"
+    if dist_root is None:
+        return "no verified config-distribution tree is applied yet"
+    source = dist_root / configdist.POLICY_DIR / name
+    staged = context / _CONTEXT_POLICY
+    try:
+        shutil.copytree(source, staged, symlinks=False)
+    except FileNotFoundError:
+        return f"applied config-distribution tree has no policy/{name}"
+    except OSError as exc:
+        return f"cannot stage policy/{name}: {exc}"
+    pin = image.get("policy_pin", "")
+    try:
+        copied = configdist.tree_hash(staged)
+    except configdist.ConfigDistError as exc:
+        return f"staged policy/{name} failed verification: {exc}"
+    if not copied or copied != pin:
+        return (
+            f"applied policy/{name} hashes {copied[:12] or '(empty)'}, recipe"
+            f" pins {pin[:12] or '(none)'} — distribution and desired state"
+            " disagree; converging first"
+        )
+    return None
+
+
 def ensure_image(
     docker: DockerCtl,
     image: dict[str, Any],
@@ -165,7 +225,9 @@ def ensure_image(
         return False
     built_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with tempfile.TemporaryDirectory(prefix="theozolith-build-") as context:
-        reason = stage_knowledge(image, dist_root, Path(context))
+        reason = stage_knowledge(image, dist_root, Path(context)) or stage_policy(
+            image, dist_root, Path(context)
+        )
         if reason:
             log(f"deferring derived image {tag}: {reason}")
             return False

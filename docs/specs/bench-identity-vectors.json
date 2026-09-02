@@ -1,9 +1,9 @@
 {
-  "_comment": "Golden vectors for the candidate identity spec (identity_spec_version 1, ADR-0054). Promoted from control/tests/test_configrepo.py; drift-locked by control/tests/test_candidate.py, which recomputes every expected value through the production formula. A consumer implementing independent verification must reproduce every expected value from 'fields' alone.",
-  "identity_spec_version": 1,
+  "_comment": "Golden vectors for the candidate identity spec (identity_spec_version 2, ADR-0054/0055). Promoted from control/tests/test_configrepo.py; drift-locked by control/tests/test_candidate.py, which recomputes every expected value through the production formula. A consumer implementing independent verification must reproduce every expected value from 'fields' alone (fields omitted from a vector are empty strings).",
+  "identity_spec_version": 2,
   "algorithm": {
-    "summary": "Candidate identity is the triple (base image digest, instruction hash, adapter name); the instruction hash is sha256 over the canonical JSON of the identity mapping (ADR-0045/0052, BENCH-CONTRACT.md).",
-    "identity_keys": "Exactly: base (the digest-pinned image ref), setup (the MATERIALIZED setup: the operator's instructions plus, when model or effort is set, one synthesized 'theozolith-adapter materialize --adapter <a> [--model <m>] [--effort <e>] --scope <scope>' instruction \u2014 managed scope for driver types, interactive for driverless; values shell-quoted, single-space joined), knowledge (the BAKED knowledge ref: '' for driverless types), knowledge_pin (the compiled tree's content hash, '' when nothing bakes) \u2014 plus knowledge_target ONLY when it is non-empty and differs from the default /home/ozolith/.claude/ (the ADR-0052 conditional key: pre-existing claude identities stay byte-stable).",
+    "summary": "Candidate identity is the triple (base image digest, instruction hash, adapter name); the instruction hash is sha256 over the canonical JSON of the identity mapping (ADR-0045/0052/0055, BENCH-CONTRACT.md).",
+    "identity_keys": "Exactly: base (the digest-pinned image ref), setup (the MATERIALIZED setup: the operator's instructions plus, when model or effort is set, one synthesized 'theozolith-adapter materialize --adapter <a> [--model <m>] [--effort <e>] --scope <scope>' instruction \u2014 managed scope for driver types, interactive for driverless; values shell-quoted, single-space joined), knowledge (the BAKED knowledge ref: '' for driverless types), knowledge_pin (the compiled tree's content hash, '' when nothing bakes) \u2014 plus knowledge_target ONLY when it is non-empty and differs from the default /home/ozolith/.claude/ (the ADR-0052 conditional key: pre-existing claude identities stay byte-stable) \u2014 plus policy (the BAKED Agent Policy ref) and policy_pin (the tree's content hash, same hash function as the knowledge pin) ONLY when a driver type bakes a policy tree (the ADR-0055 conditional keys: every policy-less identity, and every driverless identity, stays byte-stable).",
     "canonicalization": "json.dumps(identity, sort_keys=True) with Python's DEFAULT separators (', ' and ': ') \u2014 NOT the compact form; UTF-8 encoded, sha256 hex digest.",
     "excluded": "driver reference, workspace, secret slots, worker-type name (the name enters the tag, never the hash), adapter (enters the triple directly and, indirectly, the rendered materialize instruction and the conditional knowledge_target).",
     "tag": "theozolith/<worker-type-name>:<base-tag>-<instruction_hash[:12]> where <base-tag> is the tag component of the base ref before '@' ('latest' when bare).",
@@ -128,6 +128,39 @@
           "adapter": "codex"
         },
         "tag": "theozolith/codexreview:0.3.0-bd88f5453a9a"
+      }
+    },
+    {
+      "name": "claude-policy-baked",
+      "description": "Driver type baking an Agent Policy tree (ADR-0055): the conditional policy/policy_pin keys enter the canonical identity. Same fields as claude-model-knowledge-default-target plus the policy reference (promoted from test_configrepo.py::test_tag_with_policy_is_golden_over_the_conditional_keys); that vector's hash differing from this one is the conditional-key proof.",
+      "fields": {
+        "name": "goldtype",
+        "base": "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "setup": [
+          "apt-get update && apt-get install -y ripgrep"
+        ],
+        "knowledge": "knowledge/gold",
+        "knowledge_pin": "1a7090eb2377900ecf12c6d8ccd2d44ad9e843bd2e4fc660b80f332d1fc77a05",
+        "policy": "policy/gold",
+        "policy_pin": "96a9ffe39ded28373fbd24fda24379d2d4309844ca7abbba16050f473058e7a6",
+        "driver": "builtin:implementer",
+        "adapter": "claude",
+        "model": "claude-sonnet-5",
+        "effort": ""
+      },
+      "expected": {
+        "materialized_setup": [
+          "apt-get update && apt-get install -y ripgrep",
+          "theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed"
+        ],
+        "canonical_identity": "{\"base\": \"ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"knowledge\": \"knowledge/gold\", \"knowledge_pin\": \"1a7090eb2377900ecf12c6d8ccd2d44ad9e843bd2e4fc660b80f332d1fc77a05\", \"policy\": \"policy/gold\", \"policy_pin\": \"96a9ffe39ded28373fbd24fda24379d2d4309844ca7abbba16050f473058e7a6\", \"setup\": [\"apt-get update && apt-get install -y ripgrep\", \"theozolith-adapter materialize --adapter claude --model claude-sonnet-5 --scope managed\"]}",
+        "instruction_hash": "0a3a3fc6d5c8e14573cb93061a92406cb3340016fd3869dcf0e2c4c60c6367ea",
+        "identity_triple": {
+          "base_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "instruction_hash": "0a3a3fc6d5c8e14573cb93061a92406cb3340016fd3869dcf0e2c4c60c6367ea",
+          "adapter": "claude"
+        },
+        "tag": "theozolith/goldtype:0.3.0-0a3a3fc6d5c8"
       }
     }
   ]

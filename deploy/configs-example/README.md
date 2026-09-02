@@ -72,6 +72,24 @@ After updating the product across the ADR-0052 layout change, re-run
 `theozolith config ingest` once (a no-op source re-ingest migrates the
 pinned build to the per-tool layout; claude pins and tags stay put).
 
+## Agent Policy (`policy/`, ADR-0055)
+
+`policy/claude-defaults/` is an Agent Policy tree: top-level `*.json` Claude
+managed-settings drop-ins, copied verbatim — safe only because ingest AND
+every config load validate each document against the safe-key allowlist
+(v1 admits exactly `attribution` closed to `sessionUrl: boolean`; identity/
+steering keys, executable references like `hooks` or helper commands, `env`,
+and every unclassified key refuse naming the file and key). Worker types
+reference it as `policy = "policy/claude-defaults"` (claude adapter only).
+Driver types BAKE the tree into their derived image's managed drop-in dir —
+reference and pin are image identity, so a drop-in edit re-tags exactly the
+referencing driver types. The Flight Deck's `policy` field instead selects
+which node-applied tree the deck links `/etc/claude-code/managed-settings.d`
+into at start: a CONTENT edit redistributes live and lands on the next
+`claude` launch inside the running deck (sessions keep what they loaded),
+while reselecting the tree recreates the deck once. A deck whose selected
+tree has not converged onto its node fails the start loudly.
+
 ## Two reviewers (`codex-review`, ADR-0052)
 
 `worker-types/codex-review.toml` is the same Reviewer driver on the codex

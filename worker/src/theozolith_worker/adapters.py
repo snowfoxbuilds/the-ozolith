@@ -40,6 +40,7 @@ from typing import Protocol
 
 from theozolith_worker import codexidentity
 from theozolith_worker import identity as identity_mod
+from theozolith_worker import policy as policy_mod
 from theozolith_worker.identity import (
     BakedIdentity,
     ClaudeSessionMonitor,
@@ -393,6 +394,13 @@ class ClaudeAdapter:
     # every Run with a confusing error (unknown flag) or silently void an
     # observation channel, and the floor turns both into cli-too-old.
     MIN_ENFORCING_CLI = (2, 1, 232)
+    # The Agent Policy validator this adapter owns (ADR-0055): the safe-key
+    # allowlist in ``theozolith_worker.policy`` admits verbatim managed-
+    # settings drop-ins, and it advances ONLY through the same deliberate
+    # classification review that moves MIN_ENFORCING_CLI — the two are one
+    # review of what this adapter's validated CLI set actually does with a
+    # key.
+    POLICY_MODULE = policy_mod
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
     def __init__(self, binary: str = "claude"):

@@ -1,16 +1,18 @@
-"""The config distribution: packaging ``drivers/`` + ``knowledge/`` into a
-hash-pinned artifact.
+"""The config distribution: packaging ``drivers/`` + ``knowledge/`` +
+``policy/`` into a hash-pinned artifact.
 
 ADR-0042: custom driver code lives in the private Config Repo under
 ``drivers/``. ADR-0048 extends the same distribution to the pinned build's
 compiled ``knowledge/`` trees (baked into derived images, bind-mounted into
-Flight Decks). On a config change the Control Node packages both subtrees into
-a content-addressed zip served over the artifact-pull path, and the heartbeat
-channel carries only the hash reference. Nodes fetch by hash, verify by
-RECOMPUTING the manifest over the unpacked tree (never by hashing archive
-bytes), and converge like the product pin. The wire/metadata field keeps its
-original ``drivers_hash`` name for protocol stability; it covers the whole
-distributed tree.
+Flight Decks), and ADR-0055 adds the ``policy/`` Agent Policy trees
+(allowlist-validated managed-settings drop-ins, baked into driver images and
+live-mounted into decks). On a config change the Control Node packages the
+subtrees into a content-addressed zip served over the artifact-pull path, and
+the heartbeat channel carries only the hash reference. Nodes fetch by hash,
+verify by RECOMPUTING the manifest over the unpacked tree (never by hashing
+archive bytes), and converge like the product pin. The wire/metadata field
+keeps its original ``drivers_hash`` name for protocol stability; it covers
+the whole distributed tree.
 
 The canonical hash covers file relpaths, sha256 of file bytes, and the
 NORMALIZED EXECUTABLE STATE of each file (any executable bit -> "755", else
@@ -23,8 +25,8 @@ bakes). The algorithm is implemented twice (nodedaemon is stdlib-only and
 cannot import this package); the two are pinned together by a mandatory
 cross-package contract test.
 
-File set: every regular file under ``<repo>/drivers/`` and
-``<repo>/knowledge/``, recursive, excluding dot-prefixed path components,
+File set: every regular file under ``<repo>/drivers/``, ``<repo>/knowledge/``,
+and ``<repo>/policy/``, recursive, excluding dot-prefixed path components,
 ``__pycache__`` components, and ``*.pyc``. Symlinks and other non-regular
 files are a packaging error (fail closed — a symlink could escape the repo).
 Missing or effectively-empty subtrees hash to ``""`` (no artifact, no gate,
@@ -55,8 +57,16 @@ DRIVERS_DIR = "drivers"
 # drivers/ under the same single hash.
 KNOWLEDGE_DIR = "knowledge"
 
+# The Agent Policy trees (ADR-0055): one subtree per policy name, each a set
+# of allowlist-validated managed-settings drop-ins copied verbatim by ingest,
+# distributed under the same single hash. Known accepted skew: an old Node
+# Daemon's structural rule refuses an artifact carrying policy/ members, so
+# it reads as non-converged until the product updates — the ADR-0042
+# advisory-skew posture, never silent.
+POLICY_DIR = "policy"
+
 # The subtrees the distribution covers, in manifest order.
-DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR)
+DIST_DIRS = (DRIVERS_DIR, KNOWLEDGE_DIR, POLICY_DIR)
 
 # The metadata member at the archive root — metadata ABOUT the manifest, never
 # part of it (the contract hash is the manifest hash, not archive bytes).
@@ -194,7 +204,7 @@ def entry_mode(st_mode: int) -> str:
 
 def dist_manifest(repo_dir: Path) -> list[list[str]]:
     """The manifest: sorted ``[relpath, sha256hex, mode]`` entries over the
-    ``drivers/`` + ``knowledge/`` file sets (ADR-0042/0048). ``relpath`` is
+    distributed subtree file sets (``DIST_DIRS``, ADR-0042/0048/0055). ``relpath`` is
     POSIX and INCLUDES the subtree prefix; the digest is sha256 over the file
     bytes; ``mode`` is the normalized executable state (``entry_mode``)."""
     repo_dir = Path(repo_dir)
@@ -257,10 +267,33 @@ def knowledge_tree_hash(repo_dir: Path, name: str) -> str:
     return manifest_hash(sorted(entries))
 
 
+def policy_tree_hash(repo_dir: Path, name: str) -> str:
+    """The per-tree content pin for one ``policy/<name>/`` Agent Policy tree
+    (ADR-0055): the manifest hash over the tree's file set with relpaths
+    RELATIVE TO THE TREE ROOT — the same convention as the knowledge pin.
+    ``""`` for a missing or empty tree. Computed at ingest, joined into worker
+    types via ``pins.toml``, and independently recomputed by the node before a
+    bake (``theozolith_nodedaemon.configdist.tree_hash`` over the staged copy —
+    pinned by the cross-package contract tests)."""
+    root = Path(repo_dir) / POLICY_DIR / name
+    entries: list[list[str]] = []
+    for path in regular_files(root, refuse_irregular=True):
+        relpath = path.relative_to(root).as_posix()
+        try:
+            data = path.read_bytes()
+            mode = entry_mode(path.stat().st_mode)
+        except OSError as exc:
+            raise ConfigDistError(
+                f"cannot read policy/{name}/{relpath} for the per-tree pin: {exc}"
+            ) from exc
+        entries.append([relpath, hashlib.sha256(data).hexdigest(), mode])
+    return manifest_hash(sorted(entries))
+
+
 def build_artifact(
     repo_dir: Path, out_dir: Path, *, built_against: str, built_at: str | None = None
 ) -> tuple[str, Path | None]:
-    """Package ``drivers/`` + ``knowledge/`` into ``<out_dir>/<hash>.zip``
+    """Package the distributed subtrees (``DIST_DIRS``) into ``<out_dir>/<hash>.zip``
     (atomic tempfile + ``os.replace``). Members ride under their subtree
     arcnames plus a ``config-dist.json`` metadata member at the archive root.
     Returns ``(hash, path)``; ``("", None)`` when there is no distribution to
@@ -368,7 +401,8 @@ def artifact_structure_error(names: list[str]) -> str | None:
 
     A valid archive holds EXACTLY the single ``config-dist.json`` metadata
     member at the root plus zero or more ``drivers/...`` / ``knowledge/...``
-    files that the canonical manifest counts. Every member must therefore be
+    / ``policy/...`` files that the canonical manifest counts. Every member
+    must therefore be
     either that one metadata file or a hash-covered distributed file — anything
     the manifest would ignore (a dot-prefixed component, a ``__pycache__``
     directory, a ``*.pyc``, a bare directory entry, a second top-level file, an
@@ -391,7 +425,7 @@ def artifact_structure_error(names: list[str]) -> str | None:
         if parts[0] not in DIST_DIRS or len(parts) < 2:
             return (
                 f"member {name!r} is neither the {ARTIFACT_METADATA} metadata nor a"
-                f" {DRIVERS_DIR}/ or {KNOWLEDGE_DIR}/ file"
+                f" {DRIVERS_DIR}/, {KNOWLEDGE_DIR}/, or {POLICY_DIR}/ file"
             )
         if any(excluded_part(part) for part in parts):
             return (

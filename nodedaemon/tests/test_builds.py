@@ -271,3 +271,114 @@ def test_bogus_knowledge_tool_defers_fail_closed(tmp_path):
         )
         assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False, tool
         assert any("knowledge tool" in line for line in logs), tool
+
+
+# -- the Agent Policy bake (ADR-0055) -----------------------------------------
+
+
+def _applied_policy_tree(tmp_path, name: str = "claude-defaults"):
+    """An applied config-distribution root carrying one Agent Policy tree;
+    returns (dist_root, per-tree pin)."""
+    root = tmp_path / "config-dist" / ("f" * 64)
+    target = root / configdist.POLICY_DIR / name / "attribution.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('{"attribution": {"sessionUrl": false}}\n', encoding="utf-8")
+    return root, configdist.tree_hash(root / configdist.POLICY_DIR / name)
+
+
+def test_dockerfile_renders_the_policy_copy_before_every_run():
+    """The drop-ins land before any setup RUN (ADR-0055): the materialize
+    instruction's in-image conflict scan is the build gate, and it must see
+    the drop-ins it will run beside. Root-owned COPY — the managed tier is
+    never user-writable."""
+    recipe = image_recipe(
+        setup=["apt-get install -y jq", "theozolith-adapter materialize --scope managed"],
+        policy="policy/claude-defaults",
+        policy_pin="a" * 64,
+    )
+    text = dockerfile_for(recipe, built_at="t")
+    copy = "COPY policy/ /etc/claude-code/managed-settings.d/"
+    assert copy in text
+    assert "--chown" not in text.split("\n")[text.split("\n").index(copy)]
+    assert text.index("USER root") < text.index(copy)
+    assert text.index(copy) < text.index("RUN apt-get install -y jq")
+
+
+def test_no_policy_reference_renders_a_byte_identical_dockerfile():
+    """A policy-less recipe — the empty-string wire form a new control sends
+    AND the keyless form a pre-ADR-0055 control sends — renders byte-for-byte
+    today's Dockerfile: nothing rebuilds on upgrade."""
+    empty = dockerfile_for(image_recipe(setup=["pip install uv"]), built_at="t")
+    keyless_recipe = image_recipe(setup=["pip install uv"])
+    del keyless_recipe["policy"], keyless_recipe["policy_pin"]
+    keyless = dockerfile_for(keyless_recipe, built_at="t")
+    assert empty == keyless
+    assert "managed-settings.d" not in empty
+
+
+def test_policy_recipe_builds_when_the_applied_tree_matches_the_pin(tmp_path):
+    docker = FakeDocker()
+    root, pin = _applied_policy_tree(tmp_path)
+    recipe = image_recipe(policy="policy/claude-defaults", policy_pin=pin)
+    assert ensure_image(docker, recipe, log=lambda *_: None, dist_root=root) is True
+    assert docker.builds
+
+
+def test_policy_recipe_defers_without_an_applied_tree(tmp_path):
+    logs: list[str] = []
+    recipe = image_recipe(policy="policy/claude-defaults", policy_pin="a" * 64)
+    assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=None) is False
+    assert any("deferring" in line and "no verified" in line for line in logs)
+
+
+def test_policy_recipe_defers_on_a_pin_mismatch(tmp_path):
+    """A tag is a complete statement of what a deck or Run executed with
+    (ADR-0048/0055): an off-pin applied policy tree defers, never bakes."""
+    logs: list[str] = []
+    root, _ = _applied_policy_tree(tmp_path)
+    recipe = image_recipe(policy="policy/claude-defaults", policy_pin="b" * 64)
+    assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False
+    assert any("disagree" in line for line in logs)
+
+
+def test_policy_recipe_defers_when_the_tree_is_absent(tmp_path):
+    logs: list[str] = []
+    root, pin = _applied_policy_tree(tmp_path, name="other")
+    recipe = image_recipe(policy="policy/claude-defaults", policy_pin=pin)
+    assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False
+    assert any("no policy/claude-defaults" in line for line in logs)
+
+
+def test_bogus_policy_reference_defers_fail_closed(tmp_path):
+    root, pin = _applied_policy_tree(tmp_path)
+    for ref in ("claude-defaults", "policy/", "policy/a/b"):
+        logs: list[str] = []
+        recipe = image_recipe(policy=ref, policy_pin=pin)
+        assert ensure_image(FakeDocker(), recipe, log=logs.append, dist_root=root) is False, ref
+        assert any("policy reference" in line for line in logs), ref
+
+
+def test_knowledge_and_policy_stage_together(tmp_path):
+    """A recipe carrying both trees builds only when BOTH pins verify."""
+    root, knowledge_pin = _applied_tree(tmp_path)
+    policy_target = root / configdist.POLICY_DIR / "claude-defaults" / "attribution.json"
+    policy_target.parent.mkdir(parents=True, exist_ok=True)
+    policy_target.write_text('{"attribution": {"sessionUrl": false}}\n', encoding="utf-8")
+    policy_pin = configdist.tree_hash(policy_target.parent)
+    both = image_recipe(
+        knowledge="knowledge/dev",
+        knowledge_pin=knowledge_pin,
+        policy="policy/claude-defaults",
+        policy_pin=policy_pin,
+    )
+    assert ensure_image(FakeDocker(), both, log=lambda *_: None, dist_root=root) is True
+    logs: list[str] = []
+    off_policy = image_recipe(
+        name="off-policy",
+        knowledge="knowledge/dev",
+        knowledge_pin=knowledge_pin,
+        policy="policy/claude-defaults",
+        policy_pin="b" * 64,
+    )
+    assert ensure_image(FakeDocker(), off_policy, log=logs.append, dist_root=root) is False
+    assert any("disagree" in line for line in logs)
