@@ -163,14 +163,26 @@ class DockerEngine:
 
     def _observe_running(self, name: str) -> str:
         """One docker inspect, classified per the observation doctrine.
-        ``{{.State.Running}}`` answers true/false when the container exists;
+
+        ``{{.State.Running}}`` prints exactly ``true`` or ``false`` when the
+        container exists, and ONLY those two values are trusted: ``true`` is
+        alive, ``false`` is a definitive exited answer (absence). A zero exit
+        carrying anything else — blank output, a partial line, an error string
+        the CLI wrote to stdout, any unexpected token — is a failed read that
+        proves nothing, classified UNOBSERVED so the bounded-retry policy
+        governs it (never silently read as absence). Among non-zero exits,
         docker's definitive no-such-object error is evidence of absence (an
-        exited --rm container); any OTHER non-zero inspect proves nothing."""
+        exited --rm container); any other proves nothing."""
         proc = self._run(
             ["inspect", "--format", "{{.State.Running}}", name], check=False, timeout=30
         )
         if proc.returncode == 0:
-            return _ALIVE if proc.stdout.strip() == "true" else _ABSENT
+            value = proc.stdout.strip()
+            if value == "true":
+                return _ALIVE
+            if value == "false":
+                return _ABSENT
+            return _UNOBSERVED
         if _is_no_such_object(proc.stderr or ""):
             return _ABSENT
         return _UNOBSERVED

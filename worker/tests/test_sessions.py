@@ -7,11 +7,13 @@ job-dir files — exactly the production seam, minus docker.
 
 from __future__ import annotations
 
+import json
+import stat
 import threading
 from pathlib import Path
 
 from theozolith_worker import jobdir, proposal
-from theozolith_worker.containers import ContainerSpec, EngineError
+from theozolith_worker.containers import ContainerSpec, DockerEngine, EngineError
 from theozolith_worker.harness.main import run_harness
 from theozolith_worker.sessions import ContainerSession, SessionError
 from theozolith_worker.shell import run_shell
@@ -197,3 +199,63 @@ def test_wait_for_agent_propagates_an_engine_error_into_the_infra_lane(tmp_path)
         raise AssertionError(f"EngineError was reclassified as SessionError: {exc}") from exc
     except EngineError:
         pass  # escapes as-is -> the runner maps it to the infra lane
+
+
+def _scripted_docker(tmp_path: Path, plan: dict) -> Path:
+    """A docker stand-in returning scripted ``[rc, stdout, stderr]`` per
+    subcommand (unlisted subcommands succeed silently), so a REAL DockerEngine
+    runs inside a ContainerSession with no live docker."""
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    count_path = tmp_path / "counts.json"
+    count_path.write_text("{}", encoding="utf-8")
+    binary = tmp_path / "docker"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"plan = json.load(open({str(plan_path)!r}))\n"
+        f"counts = json.load(open({str(count_path)!r}))\n"
+        "sub = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "responses = plan.get(sub, [[0, '', '']])\n"
+        "i = counts.get(sub, 0)\n"
+        "rc, out, err = responses[min(i, len(responses) - 1)]\n"
+        "counts[sub] = i + 1\n"
+        f"json.dump(counts, open({str(count_path)!r}, 'w'))\n"
+        "sys.stdout.write(out)\n"
+        "sys.stderr.write(err)\n"
+        "sys.exit(rc)\n"
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+    return binary
+
+
+def test_wait_for_agent_absorbs_a_transient_inspect_blip_and_completes(tmp_path):
+    """The recovery half at the ContainerSession↔engine seam, with a REAL
+    DockerEngine: a transient unobservable inspect during wait_for_agent() is
+    absorbed by the engine's bounded retry (it clears to a real ``true``), so the
+    session NEVER mistakes the blip for a container-exit SessionError and goes on
+    to read a genuinely completed agent status."""
+    job, manifest, spec = make_run_job(tmp_path)
+    binary = _scripted_docker(
+        tmp_path,
+        # inspect: a 500 blip, then recovered to `true` (still running). run/rm
+        # default to success, so launch() works with no live docker.
+        {"inspect": [[1, "", "Error response from daemon: 500"], [0, "true\n", ""]]},
+    )
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=lambda _s: None)
+
+    def land_done(_seconds):
+        # Between the first poll (whose alive() weathered the blip) and the next,
+        # the harness finishes: status.json lands DONE with a completed agent.
+        jobdir.write_status(
+            job,
+            jobdir.Status(
+                phase=jobdir.PHASE_DONE,
+                agent=jobdir.AgentOutcome(completed=True, exit_code=0),
+            ),
+        )
+
+    session = ContainerSession(engine, spec, job, manifest, sleep=land_done, poll_seconds=0.01)
+    session.launch()
+    outcome = session.wait_for_agent()  # must NOT raise on the transient blip
+    assert outcome.completed  # a real completed agent status, read after recovery

@@ -39,6 +39,15 @@ def _replace_events(rig: Rig) -> list[dict]:
     return [e for e in rig.control.events if e.get("type") == "theozolith.stack-replace"]
 
 
+def _ctl_returning(stdout: str, *, rc: int = 0) -> DockerCtl:
+    """A real DockerCtl over a runner that returns one fixed process result."""
+
+    def runner(args, timeout=None, env=None):
+        return subprocess.CompletedProcess(args, rc, stdout, "")
+
+    return DockerCtl(runner=runner)
+
+
 # -- real DockerCtl: fail-closed listings + the no-size ps format ----------------
 
 
@@ -110,6 +119,86 @@ def test_dockerctl_compose_ps_raises_on_a_nonzero_exit():
     ctl = DockerCtl(runner=runner)
     with pytest.raises(DockerError):
         ctl.compose_ps("ozolith-flightdeck")
+
+
+# -- real DockerCtl: the PARSE is fail-closed too (a zero exit is not enough) -----
+# An unparseable listing is as blind as a non-zero one: a malformed, wrong-shape,
+# or wrong-typed row RAISES rather than silently drop, so a garbled or truncated
+# read can never under-count containers into a destructive "they're gone".
+
+
+def test_dockerctl_ps_raises_on_a_malformed_json_row():
+    """A non-empty ``ps`` listing whose row is not valid JSON is a FAILED read,
+    not an empty one — it raises rather than skip the row (skipping would
+    under-count exactly like coercing a 500 to empty, the #109 defect class)."""
+    with pytest.raises(DockerError, match="malformed JSON"):
+        _ctl_returning("this is not json\n").stack_containers("flightdeck")
+
+
+@pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just-a-string"', "42", "null"])
+def test_dockerctl_ps_raises_on_a_non_object_json_value(payload):
+    """A valid JSON value that is not an object (array, string, number, null) is
+    the wrong shape for a container row — it proves nothing and raises."""
+    with pytest.raises(DockerError, match="unexpected JSON shape"):
+        _ctl_returning(payload + "\n").stack_containers("flightdeck")
+
+
+def test_dockerctl_ps_raises_on_a_field_of_the_wrong_type():
+    """A well-formed object whose required field is the wrong type (the CLI's
+    per-field format always emits JSON strings) is a malformed observation."""
+    with pytest.raises(DockerError, match="unexpected type"):
+        _ctl_returning(json.dumps({"Names": 5, "State": "running"}) + "\n").stack_containers("fd")
+
+
+def test_dockerctl_ps_rejects_a_partial_listing_wholesale():
+    """A VALID row followed by a malformed row fails the whole observation — a
+    partial listing is never returned, because a truncated/garbled read cannot be
+    told apart from a listing that is genuinely short some containers."""
+    good = json.dumps(
+        {"Names": "ozolith-stack-a", "State": "running", "Status": "Up", "Labels": ""}
+    )
+    with pytest.raises(DockerError):
+        _ctl_returning(good + "\n{ broken\n").stack_containers("flightdeck")
+
+
+def test_dockerctl_ps_empty_stdout_is_the_zero_container_result():
+    """Empty stdout stays the ONE empty result the doctrine trusts — the process
+    exited 0 and said nothing, which is a real 'no containers' (a trailing
+    newline alone is the same)."""
+    assert _ctl_returning("").stack_containers("flightdeck") == []
+    assert _ctl_returning("\n").stack_containers("flightdeck") == []
+
+
+def test_dockerctl_compose_ps_parse_is_fail_closed_like_ps():
+    """``compose_ps`` carries the equivalent parse-side coverage: malformed JSON,
+    a non-object value, a wrong field type, and a valid-then-malformed partial
+    all RAISE; empty stdout is still the zero-container result."""
+    with pytest.raises(DockerError, match="malformed JSON"):
+        _ctl_returning("not json\n").compose_ps("ozolith-flightdeck")
+    with pytest.raises(DockerError, match="unexpected JSON shape"):
+        _ctl_returning("[1, 2]\n").compose_ps("ozolith-flightdeck")
+    with pytest.raises(DockerError, match="unexpected type"):
+        _ctl_returning(json.dumps({"Name": "svc", "State": ["running"]}) + "\n").compose_ps("p")
+    good = json.dumps({"Name": "svc-1", "State": "running", "Status": "Up"})
+    with pytest.raises(DockerError):
+        _ctl_returning(good + "\n{ broken\n").compose_ps("ozolith-flightdeck")
+    assert _ctl_returning("").compose_ps("ozolith-flightdeck") == []
+
+
+def test_dockerctl_compose_ps_parses_valid_rows():
+    """A well-formed compose listing still parses to the status rows the
+    heartbeat reads (name, lower-cased state, status) — the fail-closed parse
+    never rejects a legitimate listing."""
+    rows_in = "\n".join(
+        json.dumps(r)
+        for r in (
+            {"Name": "ozolith-svc-1", "State": "Running", "Status": "Up 2 hours"},
+            {"Name": "ozolith-svc-2", "State": "Exited", "Status": "Exited (0)"},
+        )
+    )
+    rows = _ctl_returning(rows_in + "\n").compose_ps("ozolith-svc")
+    assert [r["name"] for r in rows] == ["ozolith-svc-1", "ozolith-svc-2"]
+    assert [r["state"] for r in rows] == ["running", "exited"]  # lower-cased
 
 
 def test_dockerctl_run_stack_container_emits_tmpfs_per_entry():
