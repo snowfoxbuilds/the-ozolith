@@ -169,9 +169,12 @@ def ensure_cli_version(
     published version returns without touching the network, re-normalizing
     its modes (the repair path for entries created by an older daemon
     amendment or under a restrictive service umask); a broken version
-    directory (present, but the binary missing or irregular) is renamed aside
-    dot-prefixed and reinstalled. Every failure raises a typed
-    ``CliInstallError`` with staging cleaned and nothing partial published."""
+    directory (present, but the binary missing or irregular — or the version
+    directory itself a SYMLINK, which can point outside the mounted cli tree
+    and resolve differently or dangle inside the deck container, so it is
+    never served) is renamed aside dot-prefixed and reinstalled. Every
+    failure raises a typed ``CliInstallError`` with staging cleaned and
+    nothing partial published."""
     fetch = fetch or _default_fetch
     cli_root = Path(cli_root)
     tool_root = cli_root / tool
@@ -188,7 +191,7 @@ def ensure_cli_version(
         )
     package = str(entry.get("package", ""))
     integrity = str(entry.get("integrity", ""))
-    if published.is_file() and not published.is_symlink():
+    if published.is_file() and not published.is_symlink() and not version_dir.is_symlink():
         _normalize_export_modes(cli_root, tool_root, version_dir, published, tool, version)
         return published
     if version_dir.exists() or version_dir.is_symlink():

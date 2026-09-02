@@ -6491,6 +6491,89 @@ def test_cli_unreadable_export_never_reports_applied_or_converged(rig: Rig, inst
     row = _cli_rows(rig)[0]
     assert row["applied"] == "2.1.257" and row["converged"] is True
 
+    # The desired record itself is the same class of evidence: owner-only
+    # 0600 (directories and binary left fully valid) fails the deck gate's
+    # read, so the next beat — computed from the on-disk state BEFORE that
+    # pass's repair — reports not applied; the ordinary pass then repairs
+    # the record to 0644 and the following beat reports convergence again.
+    desired_record = rig.config.cli_dir / "claude" / "by-type" / "flightdeck.desired"
+    os.chmod(desired_record, 0o600)
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "" and row["converged"] is False
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    assert _mode(desired_record) == 0o644  # the ordinary pass repaired it
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+
+
+def test_cli_desired_record_is_launch_evidence(rig: Rig, installer, tmp_path):
+    """``_cli_applied_version`` verifies the COMPLETE path the deck launch
+    gate walks. The gate reads the desired record and refuses unless the
+    export entry matches it, so a record the deck UID cannot read, a missing
+    or symlinked one, a value the entry does not serve, or a symlinked
+    version directory each mean NOTHING is launchable — no applied version,
+    never the entry's."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    cli_root = rig.config.cli_dir
+    by_type = cli_root / "claude" / "by-type"
+    desired_record = by_type / "flightdeck.desired"
+
+    def applied() -> str:
+        return rig.daemon._cli_applied_version(cli_root, "claude", "flightdeck")
+
+    assert applied() == "2.1.257"  # the healthy baseline
+
+    # Owner-readable only: the arbitrary non-root deck UID fails the gate's
+    # [ -r ] even though every directory and the binary stay fully valid.
+    os.chmod(desired_record, 0o600)
+    assert applied() == ""
+    os.chmod(desired_record, 0o644)
+    assert applied() == "2.1.257"
+
+    # Missing: the gate fails loud with no desired record.
+    payload = desired_record.read_bytes()
+    desired_record.unlink()
+    assert applied() == ""
+    desired_record.write_bytes(payload)
+    os.chmod(desired_record, 0o644)
+
+    # Symlinked — even with byte-identical content behind the link: the
+    # record is daemon-written state, never a redirection.
+    desired_record.unlink()
+    behind = by_type / ".matching-target"
+    behind.write_bytes(payload)
+    desired_record.symlink_to(behind.name)
+    assert applied() == ""
+    desired_record.unlink()
+    behind.unlink()
+    desired_record.write_bytes(payload)
+    os.chmod(desired_record, 0o644)
+
+    # Mismatched: the record names a version the entry does not serve
+    # (mid-upgrade skew) — the gate refuses, so the OLD version is not
+    # applied either.
+    desired_record.write_bytes(b"2.1.999\n")
+    os.chmod(desired_record, 0o644)
+    assert applied() == ""
+    desired_record.write_bytes(payload)
+    os.chmod(desired_record, 0o644)
+
+    # A symlinked version DIRECTORY — even pointing at the real, valid
+    # content — is no evidence: inside the read-only mount it can resolve
+    # elsewhere or dangle.
+    version_dir = cli_root / "claude" / "2.1.257"
+    moved = tmp_path / "moved-version-dir"
+    os.replace(version_dir, moved)
+    version_dir.symlink_to(moved)
+    assert applied() == ""
+    version_dir.unlink()
+    os.replace(moved, version_dir)
+    assert applied() == "2.1.257"  # every restoration re-closes the chain
+
 
 def test_cli_installer_failure_class_rides_the_event_and_heartbeat(rig: Rig, installer):
     """Every typed installer failure — a publish-side one included — surfaces

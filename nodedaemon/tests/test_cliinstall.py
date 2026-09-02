@@ -414,6 +414,35 @@ def test_broken_version_dir_is_retired_aside_and_reinstalled(tmp_path):
     assert not (published.parent / "debris").exists()
 
 
+def test_symlinked_version_dir_is_never_served_and_is_reinstalled(tmp_path):
+    """A version DIRECTORY that is a symlink is never accepted as the
+    installed fast path, even when it currently resolves to a valid-looking
+    executable: host-side verification would be vouching for a target that
+    can live outside the mounted cli tree and resolve differently (or
+    dangle) inside the deck container. The symlink is retired aside like any
+    broken install and the version reinstalled as a REAL directory; the
+    external target is never served and never touched."""
+    data = make_tarball(good_members())
+    external = tmp_path / "outside-the-tree"
+    external.mkdir()
+    decoy = external / "claude"
+    decoy.write_bytes(b"#!/bin/sh\necho decoy\n")
+    decoy.chmod(0o755)
+    cli_root = tmp_path / "cli"
+    tool_root = cli_root / "claude"
+    tool_root.mkdir(parents=True)
+    (tool_root / VERSION).symlink_to(external)
+    calls: list[str] = []
+    published = ensure_cli_version(
+        cli_root, "claude", VERSION, platform_map(data), fetch=fetching(data, calls)
+    )
+    assert calls  # the symlinked dir was rejected: a real install ran
+    assert not (tool_root / VERSION).is_symlink()  # published as a real directory
+    assert published.read_bytes() == BINARY  # the pinned binary, never the external target
+    assert non_dot(tool_root) == [VERSION]
+    assert decoy.read_bytes() == b"#!/bin/sh\necho decoy\n"  # external target untouched
+
+
 def test_error_messages_never_carry_urls_or_member_contents(tmp_path):
     data = make_tarball([*good_members(), ("package/evil.sh", b"SECRETBODY", 0o755)])
     with pytest.raises(CliArchiveInvalid) as excinfo:

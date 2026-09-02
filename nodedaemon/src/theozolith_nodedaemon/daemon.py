@@ -1617,8 +1617,15 @@ class NodeDaemon:
                 desired_path = by_type / f"{name}.desired"
                 text = version + "\n"
                 try:
-                    stale = desired_path.read_text(encoding="utf-8") != text
-                except OSError:
+                    # A symlinked or undecodable record counts stale: both
+                    # shapes are refused by the launch gate and the applied
+                    # evidence, so leaving one in place would be a permanent
+                    # non-convergence — the rewrite replaces it with a
+                    # regular file.
+                    stale = desired_path.is_symlink() or (
+                        desired_path.read_text(encoding="utf-8") != text
+                    )
+                except (OSError, UnicodeDecodeError):
                     stale = True
                 if stale:
                     _atomic_write_text(desired_path, text, mode=0o644)
@@ -1708,7 +1715,9 @@ class NodeDaemon:
                         continue
                     if name in protected or wanted.get(name, ("",))[0] == tool_dir.name:
                         if kind == "desired":
-                            with contextlib.suppress(OSError):
+                            # An undecodable record names no version — skip
+                            # it, never let the decode error wedge the pass.
+                            with contextlib.suppress(OSError, UnicodeDecodeError):
                                 keep.add(record.read_text(encoding="utf-8").strip())
                         else:
                             with contextlib.suppress(OSError):
@@ -1750,14 +1759,21 @@ class NodeDaemon:
                         self._reclaim(leftover)
 
     def _cli_applied_version(self, cli_root: Path, tool: str, name: str) -> str:
-        """The version this worker type's export entry ACTUALLY serves —
-        evidence, not memory (the _verify_applied_drivers posture): the entry
-        symlink's target basename, and only when that version dir holds a
-        regular-file binary the MOUNTED deck UID can reach. The tree mounts
-        read-only into containers running an arbitrary non-root UID, so the
-        launch path must be world-traversable and the binary world-r+x — or
+        """The version this worker type's export ACTUALLY serves — evidence,
+        not memory (the _verify_applied_drivers posture), over the COMPLETE
+        path the deck launch gate walks: the DESIRED record must be a
+        world-readable regular file (never a symlink) whose recorded value —
+        trailing newlines stripped, the shim's exact ``$(cat)`` parse — names
+        the entry symlink's target version (the gate refuses on any mismatch,
+        so mid-upgrade skew is no applied version, not the old one); every
+        directory must be world-traversable, the version dir a REAL directory
+        (a symlink can resolve elsewhere or dangle inside the read-only
+        mount), and the binary a regular world-r+x file. The tree mounts into
+        containers running an arbitrary non-root UID — anything less and
         status would report a convergence launches cannot see. '' when
-        absent, broken, or unreadable."""
+        absent, broken, unreadable, malformed, or mismatched; every
+        filesystem error is evidence of absence, never an escape into the
+        heartbeat."""
 
         def grants(path: Path, bits: int) -> bool:
             try:
@@ -1773,7 +1789,20 @@ class NodeDaemon:
             return ""
         if not version:
             return ""
+        desired_record = by_type / f"{name}.desired"
+        if desired_record.is_symlink() or not desired_record.is_file():
+            return ""
+        if not grants(desired_record, 0o004):  # the gate's [ -r ] under the deck UID
+            return ""
+        try:
+            recorded = desired_record.read_bytes()
+        except OSError:
+            return ""
+        if recorded.rstrip(b"\n") != version.encode("utf-8"):
+            return ""
         version_dir = cli_root / tool / version
+        if version_dir.is_symlink():
+            return ""
         binary = version_dir / cliinstall.CLI_BINARY_NAME
         if not binary.is_file() or binary.is_symlink():
             return ""
