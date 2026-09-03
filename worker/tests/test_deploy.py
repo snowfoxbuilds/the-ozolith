@@ -20,13 +20,33 @@ CONTROL_DOCKERFILE = REPO_ROOT / "control" / "docker" / "Dockerfile"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
+CLI_PIN_VERSION = "2.1.257"  # what the example's `cli` declares (flightdeck.toml)
+
+
+def fake_resolve_cli(declared: str) -> dict:
+    """The injected CLI Pin resolver seam (ADR-0055) — the npm twin of the
+    faked registry digest resolver: the declared value resolves to itself
+    (the example pins an exact version) with the full supported-platform
+    map, keeping the suite hermetic."""
+    from theozolith_worker.adapters import ClaudeAdapter
+
+    return {
+        "version": declared,
+        "platforms": {
+            key: {"package": package, "integrity": "sha512-" + "A" * 96}
+            for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
+        },
+    }
+
+
 @pytest.fixture(scope="module")
 def example_config(tmp_path_factory):
     """configs-example is a HUMAN Config Repo (ADR-0048): it becomes loadable
     by going through the real `theozolith config ingest` pipeline — which is
     itself the assertion that the shipped example ingests cleanly (knowledge
-    compiles, lints pass, pins resolve). The example bases are tag-only, so
-    the registry round-trip is the one faked seam (the suite stays hermetic);
+    compiles, lints pass, pins resolve). The example bases are tag-only and
+    the deck pins a CLI, so the two registry round-trips (image digest, npm
+    version/integrity) are the faked seams (the suite stays hermetic);
     everything else runs for real."""
     from theozolith_control.configrepo import load_config
     from theozolith_control.ingest import ingest
@@ -36,6 +56,7 @@ def example_config(tmp_path_factory):
         str(DEPLOY / "configs-example"),
         pinned,
         resolve_digest=lambda ref: "sha256:" + "f" * 64,
+        resolve_cli=fake_resolve_cli,
         log=lambda *_: None,
     )
     return load_config(pinned)
@@ -712,14 +733,16 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
     flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
 
     # Per-instance state + logs + tailnet identity (resolved from {stack});
-    # exactly one SHARED read-only knowledge bind that is deliberately NOT
-    # per-instance — and nothing else. Mounted at the stable PARENT the Node
-    # Daemon maintains, so a tree swap never recreates the container.
+    # the SHARED read-only knowledge/policy/cli binds that are deliberately
+    # NOT per-instance — and nothing else. Mounted at the stable PARENT the
+    # Node Daemon maintains, so a tree swap or CLI re-point never recreates
+    # the container.
     assert set(flightdeck.volumes) == {
         "flightdeck-logs:/var/log/flightdeck",
         "flightdeck-claude-state:/home/ozolith/.claude",
         "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
         "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",
+        "/var/lib/theozolith/cli:/var/lib/theozolith/cli:ro",
         "flightdeck-tailscale-state:/var/lib/tailscale",
         "flightdeck-workspace:/workspace",
     }
@@ -1103,6 +1126,8 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
     content = content.replace("/var/lib/theozolith/knowledge", str(sandbox / "knowledge"))
     content = content.replace("/var/lib/theozolith/policy", str(sandbox / "policy"))
+    content = content.replace("/var/lib/theozolith/cli", str(sandbox / "cli"))
+    content = content.replace("/opt/theozolith-deck/bin", str(sandbox / "deck-bin"))
     content = content.replace("/etc/claude-code", str(sandbox / "claude-code"))
     content = content.replace("/etc/theozolith", str(sandbox / "etc"))
     content = content.replace("/workspace", str(sandbox / "workspace"))
@@ -1286,6 +1311,9 @@ def _run_start(
     env.pop("TS_AUTHKEY_FILE", None)
     env.pop("GITHUB_TOKEN_FILE", None)
     env.pop("THEOZOLITH_REPO", None)
+    # The CLI Pin selection (ADR-0055) stays UNSET by default: a pinless deck
+    # keeps today's behavior exactly; the CLI lifecycle tests opt in.
+    env.pop("THEOZOLITH_WORKER_TYPE", None)
     for key, value in extra_env.items():
         if value is None:
             env.pop(key, None)
@@ -1342,6 +1370,11 @@ def test_flightdeck_start_generation_is_literal_until_runtime(tmp_path, example_
         "KNOWLEDGE_TREE_DIR",
         "THEOZOLITH_POLICY_TREE",
         "POLICY_TREE_DIR",
+        "THEOZOLITH_WORKER_TYPE",
+        "CLI_ROOT",
+        "CLI_DESIRED",
+        "CLI_ENTRY",
+        "PATH",
         "entry",
         "CLAUDE_CONFIG",
         "tmp",
@@ -2489,3 +2522,326 @@ def test_mirror_cache_docs_state_the_retention_and_trust_facts():
     assert "may include private refs" in readme
     assert "THEOZOLITH_GIT_TIMEOUT_SECONDS" in readme
     assert "no group/world write" in readme
+
+
+# -- the CLI Pin launch path (ADR-0055): shim + flightdeck-start, EXECUTED --------
+
+
+def test_configs_example_flightdeck_cli_wiring(example_config):
+    """Config level: the example deck pins the CLI, the pin resolves through
+    the injected seam to the full platform map, the resolved Stack carries
+    the control-injected selection, and none of it is image identity."""
+    from theozolith_worker.adapters import ClaudeAdapter
+
+    wt = example_config.worker_types["flightdeck"]
+    assert wt.cli == CLI_PIN_VERSION
+    assert wt.cli_version == CLI_PIN_VERSION
+    assert set(wt.cli_platforms) == set(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
+    recipe = wt.recipe_wire()
+    assert recipe["cli_tool"] == "claude" and recipe["cli_version"] == CLI_PIN_VERSION
+    flightdeck = next(s for s in example_config.stacks if s.name == "flightdeck")
+    assert flightdeck.env["THEOZOLITH_WORKER_TYPE"] == "flightdeck"
+    # The example's pin matches the run image's own pinned CLI (one version
+    # to reason about) and sits above the adapter's floor.
+    dockerfile = DOCKERFILE.read_text()
+    assert f"@anthropic-ai/claude-code@{CLI_PIN_VERSION}" in dockerfile
+    script = "\n".join(wt.setup)
+    assert "DISABLE_AUTOUPDATER=1" in script
+    assert "/opt/theozolith-deck/bin/claude" in script
+
+
+def test_profile_prepends_the_shim_path_only_when_pinned(tmp_path, example_config):
+    """The /etc/profile.d block is conditional on the injected selection: a
+    pinless shell keeps today's PATH and no DISABLE_AUTOUPDATER; a pinned
+    one gets the shim FIRST on PATH and the autoupdater disabled."""
+    setup = example_config.worker_types["flightdeck"].setup
+    generator = next(s for s in setup if "/etc/profile.d/flightdeck.sh" in s)
+    profile = tmp_path / "flightdeck.sh"
+    command = generator.replace("/etc/profile.d/flightdeck.sh", str(profile))
+    command = command.replace("/etc/bash.bashrc", str(tmp_path / "bash.bashrc"))
+    command = command.replace("/home/ozolith/.flightdeck-env", str(tmp_path / "env"))
+    subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
+    pinless = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            f'set -eu; unset THEOZOLITH_WORKER_TYPE; . "{profile}";'
+            ' printf %s "$PATH:${DISABLE_AUTOUPDATER:-unset}"',
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "/opt/theozolith-deck/bin" not in pinless.stdout
+    assert pinless.stdout.endswith(":unset")
+    pinned = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            f'set -eu; THEOZOLITH_WORKER_TYPE=flightdeck; . "{profile}";'
+            ' printf %s "$PATH:${DISABLE_AUTOUPDATER:-unset}"',
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert pinned.stdout.startswith("/opt/theozolith-deck/bin:")
+    assert pinned.stdout.endswith(":1")
+
+
+def _generate_deck_shim(tmp_path: Path, config, sandbox: Path) -> Path:
+    """Run the shim-baking setup entry in a real /bin/sh with the baked
+    destination and the cli store redirected into the sandbox."""
+    wt = config.worker_types["flightdeck"]
+    generators = [s for s in wt.setup if "/opt/theozolith-deck/bin/claude" in s]
+    assert len(generators) == 1
+    deck_bin = sandbox / "deck-bin"
+    command = generators[0].replace("/opt/theozolith-deck/bin", str(deck_bin))
+    command = command.replace("/var/lib/theozolith/cli", str(sandbox / "cli"))
+    subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
+    shim = deck_bin / "claude"
+    assert shim.stat().st_mode & 0o111, "the claude shim must be executable"
+    return shim
+
+
+def _cli_version_binary(store: Path, version: str, *, body: str | None = None) -> Path:
+    """A fake installed CLI at <store>/claude/<version>/claude, recording its
+    argv boundary-preserving into <store>/<version>.argv."""
+    record = store / f"{version}.argv"
+    target = store / "claude" / version / "claude"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        body
+        or (
+            "#!/bin/sh\n"
+            f'echo "argc $#" >> "{record}"\n'
+            f'for a in "$@"; do echo "arg $a" >> "{record}"; done\n'
+            "exit 0\n"
+        )
+    )
+    target.chmod(0o755)
+    return record
+
+
+def _cli_records(
+    store: Path, *, wt: str = "flightdeck", desired: str | None = None, entry: str | None = None
+) -> None:
+    """The daemon-maintained pin records: a .desired text record and/or a
+    .current relative symlink (ADR-0055 export contract)."""
+    by_type = store / "claude" / "by-type"
+    by_type.mkdir(parents=True, exist_ok=True)
+    if desired is not None:
+        (by_type / f"{wt}.desired").write_text(desired + "\n")
+    if entry is not None:
+        link = by_type / f"{wt}.current"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(f"../{entry}")
+
+
+def _run_shim(shim: Path, *args: str, **env_over):
+    env = {**os.environ, "THEOZOLITH_WORKER_TYPE": "flightdeck"}
+    for key, value in env_over.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return subprocess.run([str(shim), *args], env=env, capture_output=True, text=True)
+
+
+def test_deck_shim_refuses_every_preconvergence_state_with_no_fallback(tmp_path, example_config):
+    """PIN-STRICT at every launch (ADR-0055): a missing selection, a missing
+    desired record, a missing entry, and a stale entry each refuse loudly —
+    and neither the previous export's binary nor a later-on-PATH decoy
+    `claude` is EVER invoked as a fallback."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    store = sandbox / "cli"
+    shim = _generate_deck_shim(tmp_path, example_config, sandbox)
+    previous = _cli_version_binary(store, "2.1.250")  # the previous export
+    decoy_dir = sandbox / "decoy-bin"
+    decoy_dir.mkdir()
+    decoy_calls = decoy_dir / "claude.calls"
+    decoy = decoy_dir / "claude"
+    decoy.write_text(f'#!/bin/sh\necho "$@" >> "{decoy_calls}"\nexit 0\n')
+    decoy.chmod(0o755)
+    path_with_decoy = f"{shim.parent}:{decoy_dir}:{os.environ['PATH']}"
+
+    proc = _run_shim(shim, THEOZOLITH_WORKER_TYPE=None, PATH=path_with_decoy)
+    assert proc.returncode != 0 and "THEOZOLITH_WORKER_TYPE" in proc.stderr
+
+    proc = _run_shim(shim, PATH=path_with_decoy)  # no records at all
+    assert proc.returncode == 1
+    assert "no desired CLI record" in proc.stderr
+
+    _cli_records(store, desired="2.1.257")  # desired, not yet installed
+    proc = _run_shim(shim, PATH=path_with_decoy)
+    assert proc.returncode == 1
+    assert "not converged" in proc.stderr and "desired 2.1.257" in proc.stderr
+
+    _cli_records(store, desired="2.1.257", entry="2.1.250")  # stale entry
+    proc = _run_shim(shim, PATH=path_with_decoy)
+    assert proc.returncode == 1
+    assert "never the previous export, never the image CLI" in proc.stderr
+    assert not previous.exists()  # the entry-target binary was never invoked
+    assert not decoy_calls.exists()  # ...and neither was the decoy
+
+
+def test_deck_shim_execs_exactly_the_desired_version_with_argv(tmp_path, example_config):
+    """Post-convergence the shim execs the VERSION-ADDRESSED binary with argv
+    passed through boundary-preserving, and `claude` on PATH resolves to the
+    shim ahead of any later entry."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    store = sandbox / "cli"
+    shim = _generate_deck_shim(tmp_path, example_config, sandbox)
+    record = _cli_version_binary(store, "2.1.257")
+    _cli_records(store, desired="2.1.257", entry="2.1.257")
+
+    proc = _run_shim(shim, "--model", "claude-fable-5", "two words")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == [
+        "argc 3",
+        "arg --model",
+        "arg claude-fable-5",
+        "arg two words",
+    ]
+    record.unlink()
+    # PATH resolution: `claude` finds the shim first (the profile prepend).
+    env = {
+        **os.environ,
+        "THEOZOLITH_WORKER_TYPE": "flightdeck",
+        "PATH": f"{shim.parent}:{os.environ['PATH']}",
+    }
+    proc = subprocess.run(
+        ["/bin/sh", "-c", "claude --version-probe"], env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "arg --version-probe" in record.read_text()
+
+
+def test_deck_shim_running_session_survives_a_bump(tmp_path, example_config):
+    """ADR-0055 point 6: the shim execs the version-addressed path, so a
+    running session holds its binary through a later re-point while the NEXT
+    launch gets the new version."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    store = sandbox / "cli"
+    shim = _generate_deck_shim(tmp_path, example_config, sandbox)
+    pid_file = store / "running.pid"
+    _cli_version_binary(
+        store,
+        "2.1.257",
+        body=f'#!/bin/sh\necho $$ > "{pid_file}"\nexec /bin/sleep 60\n',
+    )
+    _cli_records(store, desired="2.1.257", entry="2.1.257")
+    env = {**os.environ, "THEOZOLITH_WORKER_TYPE": "flightdeck"}
+    session = subprocess.Popen([str(shim)], env=env)
+    try:
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            time.sleep(0.05)
+        pid = int(pid_file.read_text())
+
+        # The bump: the daemon installs the new version, rewrites desired,
+        # and atomically re-points the entry — the running session lives on.
+        new_record = _cli_version_binary(store, "2.1.258")
+        _cli_records(store, desired="2.1.258", entry="2.1.258")
+        os.kill(pid, 0)  # raises if the session died with the re-point
+        proc = _run_shim(shim)
+        assert proc.returncode == 0, proc.stderr
+        assert new_record.exists()  # the next launch ran the NEW version
+        os.kill(pid, 0)  # still alive after the new launch too
+    finally:
+        session.terminate()
+        session.wait(timeout=10)
+
+
+def test_flightdeck_start_unconverged_cli_pin_fails_before_the_daemon(tmp_path, example_config):
+    """ADR-0055 §6: a pinned deck whose node has not converged the CLI export
+    refuses the container start loudly — before tailscaled, before tmux —
+    and docker restart policy owns the retry; neither the previous export
+    nor the image CLI ever runs."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_WORKER_TYPE="flightdeck",
+    )
+    assert proc.returncode == 1
+    assert "no desired CLI record" in proc.stderr
+    assert not daemon_calls.exists()
+
+    _cli_records(sandbox / "cli", desired="2.1.257", entry="2.1.250")
+    _cli_version_binary(sandbox / "cli", "2.1.250")
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_WORKER_TYPE="flightdeck",
+    )
+    assert proc.returncode == 1
+    assert "CLI pin not converged" in proc.stderr
+    assert "never the previous export, never the image CLI" in proc.stderr
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_start_pinned_deck_exports_the_launch_path_to_the_session(
+    tmp_path, example_config
+):
+    """With a CONVERGED pin the start proceeds, and the tmux session — and so
+    every window — inherits the shim-first PATH and DISABLE_AUTOUPDATER=1;
+    the session command still says `claude`, resolved through PATH to the
+    shim."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    _cli_version_binary(sandbox / "cli", "2.1.257")
+    _cli_records(sandbox / "cli", desired="2.1.257", entry="2.1.257")
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    env_record = bin_dir / "tmux.envprobe"
+    tmux = bin_dir / "tmux"
+    tmux.write_text(
+        "#!/bin/sh\n"
+        f'echo "PATH=$PATH" >> "{env_record}"\n'
+        f'echo "DISABLE_AUTOUPDATER=${{DISABLE_AUTOUPDATER:-unset}}" >> "{env_record}"\n'
+        'case "$1" in has-session) exit 1 ;; esac\n'
+        "exit 0\n"
+    )
+    tmux.chmod(0o755)
+
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_WORKER_TYPE="flightdeck",
+    )
+    assert proc.returncode == 0, proc.stderr
+    probe = env_record.read_text()
+    assert f"PATH={sandbox / 'deck-bin'}:" in probe
+    assert "DISABLE_AUTOUPDATER=1" in probe
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_start_pinless_deck_keeps_todays_behavior(tmp_path, example_config):
+    """Without the injected selection the CLI section skips with a note: no
+    PATH prepend, no DISABLE_AUTOUPDATER, the image CLI stays in use, and
+    the start proceeds (here to the deliberately dying daemon stub)."""
+    _sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+    )
+    assert daemon_calls.exists()  # the skip is not a failure
+    assert "no CLI pin for this deck" in proc.stdout + proc.stderr

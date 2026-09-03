@@ -488,6 +488,21 @@ def test_export_refuses_an_unadmitted_policy_key(tmp_path):
         candidate.export_candidate(source, "goldtype", tmp_path / "out", resolve_digest=resolve_a)
 
 
+def test_export_refuses_a_cli_declaring_type_and_the_manifest_never_gained_cli(tmp_path):
+    """The CLI Pin is a Flight Deck live surface, never bundle identity
+    (ADR-0055): export refuses the field early with an actionable message —
+    never the confusing missing-pin parse error — and the manifest key set
+    and bundle_format_version deliberately do not move."""
+    source = make_source(tmp_path, driver="", model="", knowledge="", name="deck")
+    path = source / "worker-types" / "deck.toml"
+    # Prepended: an append would land inside the trailing [secrets] table.
+    path.write_text('cli = "2.1.257"\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(CandidateError, match="live surface, never Candidate Bundle identity"):
+        candidate.export_candidate(source, "deck", tmp_path / "out", resolve_digest=resolve_a)
+    assert not any(key.startswith("cli") for key in candidate._MANIFEST_KEYS)
+    assert candidate.BUNDLE_FORMAT_VERSION == 2  # unchanged by the CLI Pin
+
+
 def test_tampering_with_policy_bytes_fails_the_pin_before_docker(tmp_path):
     """One flipped drop-in byte refuses at verification — before any Docker
     invocation (the verified build runs verify on its private snapshot

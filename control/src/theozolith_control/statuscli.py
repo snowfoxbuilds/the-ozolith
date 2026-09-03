@@ -169,6 +169,23 @@ def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
                     f" {running}, recorded {drivers_hash[:12]}"
                 )
 
+    # A non-converged CLI Pin (ADR-0055): the deck's launch path refuses new
+    # sessions until the export identifies the desired version, so this is a
+    # live degradation. Below off-hash, above stack-off-desired.
+    for row in sorted(
+        state.get("cli_status") or [],
+        key=lambda r: (r.get("node") or "", r.get("worker_type") or ""),
+    ):
+        if row.get("converged"):
+            continue
+        failure = row.get("error_class") or ""
+        reasons.append(
+            f"worker type {row.get('worker_type')} on {row.get('node')} cli pin"
+            f" not converged: desired {row.get('desired') or '?'},"
+            f" applied {row.get('applied') or 'none'}"
+            + (f" (last failure: {failure})" if failure else "")
+        )
+
     actual = {
         (row.get("node"), row.get("name")): row.get("state") or ""
         for row in state.get("stacks") or []
@@ -290,6 +307,30 @@ def render(state: dict[str, Any], reasons: list[str], out) -> None:
                 ]
             )
         out("stacks:")
+        _table(rows, out)
+    cli_rows = state.get("cli_status") or []
+    if cli_rows:
+        rows = [["NODE", "WORKER-TYPE", "DESIRED", "APPLIED", "STATE", "LAST FAILURE"]]
+        for row in sorted(
+            cli_rows, key=lambda r: (r.get("node") or "", r.get("worker_type") or "")
+        ):
+            if row.get("converged"):
+                cli_state = "ok"
+            elif row.get("error_class"):
+                cli_state = "failed"
+            else:
+                cli_state = "converging"
+            rows.append(
+                [
+                    str(row.get("node") or ""),
+                    str(row.get("worker_type") or ""),
+                    str(row.get("desired") or "?"),
+                    str(row.get("applied") or "none"),
+                    cli_state,
+                    str(row.get("error_class") or ""),
+                ]
+            )
+        out("cli pins:")
         _table(rows, out)
 
 

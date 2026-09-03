@@ -40,6 +40,9 @@ attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux",
 # username — a BUILD-time /etc/passwd alias at the ozolith uid, deliberately
 # not a Stack [env] (env arrives only at container start; see the worker
 # type). mosh also needs a udp:60000-61000 grant in the tailnet policy.
+# THEOZOLITH_WORKER_TYPE (the CLI Pin selection, ADR-0055) is injected
+# control-side from the worker type and — like THEOZOLITH_KNOWLEDGE_TREE and
+# THEOZOLITH_POLICY_TREE — refused here in [env].
 [env]
 FLIGHTDECK_TS_HOSTNAME = "flightdeck-box1"
 

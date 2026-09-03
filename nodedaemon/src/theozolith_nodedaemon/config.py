@@ -113,6 +113,18 @@ class DaemonConfig:
         return self.state_dir / "policy"
 
     @property
+    def cli_dir(self) -> Path:
+        # The CLI Pin store (ADR-0055): per tool, fail-closed-installed
+        # version dirs (<tool>/<version>/claude) plus the per-worker-type
+        # by-type/ records (.desired the moment config applies, .current only
+        # post-install). Flight Decks read-only bind-mount this parent
+        # (default /var/lib/theozolith/cli); the daemon creates it every pass
+        # so Docker never auto-creates it root-owned with wrong perms. A
+        # deletable binary CACHE, never backup state (ADR-0024): convergence
+        # reconstructs it from the Pinned Build wire plus the registry.
+        return self.state_dir / "cli"
+
+    @property
     def secrets_dir(self) -> Path:
         return self.runtime_dir / "secrets"
 

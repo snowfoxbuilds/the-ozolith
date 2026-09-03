@@ -133,6 +133,12 @@ KNOWLEDGE_TREE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # rule is the knowledge tree-name rule.
 POLICY_REF_PREFIX = "policy/"
 
+# A CLI Pin declaration (ADR-0055) is a plausible npm exact version or
+# dist-tag: no whitespace, no '/'. The exact version an ingest resolves it to
+# is semver with an optional prerelease suffix (mirrors ingest._CLI_VERSION).
+CLI_DECLARED_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*")
+CLI_VERSION = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?")
+
 # The built-in drivers a worker type may name (ADR-0044/ADR-0020) and the
 # supervised command each resolves to control-side. Every builtin runs through
 # the one generic launcher (`theozolith-driver <ref>`, ADR-0020), so control is
@@ -290,13 +296,16 @@ class Pins:
     ``<name>`` key from a pre-per-tool pinned build normalizes to
     ``<name>/claude`` at load, the only compiler that could have written it);
     ``policy`` maps an Agent Policy tree name to its content hash (ADR-0055);
-    ``source_commit`` stamps the Config Repo commit the pinned build was
-    ingested from."""
+    ``cli`` maps a ``<tool>/<declared>`` CLI Pin key to its ingest-resolved
+    ``{"version": ..., "platforms": {"<os>-<arch>-<libc>": {"package": ...,
+    "integrity": ...}}}`` record (ADR-0055); ``source_commit`` stamps the
+    Config Repo commit the pinned build was ingested from."""
 
     source_commit: str = ""
     base: dict[str, str] = field(default_factory=dict)
     knowledge: dict[str, str] = field(default_factory=dict)
     policy: dict[str, str] = field(default_factory=dict)
+    cli: dict[str, dict] = field(default_factory=dict)
 
 
 def load_pins(repo_dir: Path) -> Pins:
@@ -316,8 +325,11 @@ def load_pins(repo_dir: Path) -> Pins:
     base = data.get("base", {})
     knowledge = data.get("knowledge", {})
     policy = data.get("policy", {})
-    if not all(isinstance(table, dict) for table in (base, knowledge, policy)):
-        raise ConfigRepoError(f"{PINS_FILE}: [base], [knowledge], and [policy] must be tables")
+    cli = data.get("cli", {})
+    if not all(isinstance(table, dict) for table in (base, knowledge, policy, cli)):
+        raise ConfigRepoError(
+            f"{PINS_FILE}: [base], [knowledge], [policy], and [cli] must be tables"
+        )
     for ref, digest in base.items():
         if not isinstance(digest, str) or not (
             digest.startswith("sha256:") and _HEX64.fullmatch(digest[len("sha256:") :])
@@ -355,7 +367,47 @@ def load_pins(repo_dir: Path) -> Pins:
                 " (^[A-Za-z0-9][A-Za-z0-9._-]*$) (ADR-0055)"
             )
         policy_pins[name] = tree_hash
-    return Pins(source_commit=commit, base=dict(base), knowledge=normalized, policy=policy_pins)
+    cli_pins: dict[str, dict] = {}
+    for key, pin in cli.items():
+        # The [cli] table is machine-written (ADR-0055): any shape deviation
+        # is corruption or a hand edit, surfaced with the exact key.
+        parts = key.split("/")
+        if len(parts) != 2 or not all(KNOWLEDGE_TREE_NAME.fullmatch(part) for part in parts):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [cli] key {key!r} must be '<tool>/<declared>' (ADR-0055)"
+            )
+        version = pin.get("version", "") if isinstance(pin, dict) else ""
+        if not isinstance(version, str) or not CLI_VERSION.fullmatch(version):
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [cli] {key!r} must carry an exact"
+                f" <major>.<minor>.<patch> version, got {version!r}"
+            )
+        platforms = pin.get("platforms")
+        if not isinstance(platforms, dict) or not platforms:
+            raise ConfigRepoError(
+                f"{PINS_FILE}: [cli] {key!r} must carry a non-empty platforms table"
+            )
+        for tuple_key, entry in platforms.items():
+            package = entry.get("package", "") if isinstance(entry, dict) else ""
+            integrity = entry.get("integrity", "") if isinstance(entry, dict) else ""
+            if (
+                not isinstance(package, str)
+                or not package
+                or not isinstance(integrity, str)
+                or not integrity.startswith("sha512-")
+            ):
+                raise ConfigRepoError(
+                    f"{PINS_FILE}: [cli] {key!r} platform {tuple_key!r} must map"
+                    " to { package = <non-empty>, integrity = 'sha512-...' }"
+                )
+        cli_pins[key] = {"version": version, "platforms": dict(platforms)}
+    return Pins(
+        source_commit=commit,
+        base=dict(base),
+        knowledge=normalized,
+        policy=policy_pins,
+        cli=cli_pins,
+    )
 
 
 @dataclass(frozen=True)
@@ -402,6 +454,19 @@ class WorkerTypeDef:
     # a content edit moves only the pin and redistributes live.
     policy: str = ""
     policy_pin: str = ""
+    # The CLI Pin (ADR-0055): the declared value ("" or an exact npm version /
+    # dist-tag), plus the ingest-resolved exact version and per-platform
+    # {package, integrity} map joined from pins.toml at load — never authored.
+    # Declared, fleet-visible, and deliberately NOT identity-bearing on a
+    # driverless type: the pinned CLI is delivered LIVE through the node's
+    # fail-closed install and the deck's launch-path shim, so a version bump
+    # changes no image byte and recreates nothing — adopting or dropping the
+    # field recreates once through the injected THEOZOLITH_WORKER_TYPE env.
+    # Driverless-only and claude-only in v1 (driver types keep the base
+    # image's CLI as identity bytes; codex has no consumer).
+    cli: str = ""
+    cli_version: str = ""
+    cli_platforms: dict[str, dict[str, str]] = field(default_factory=dict)
     # -- per-type variables --
     driver: str = ""  # "" (Flight Deck) | "builtin:<name>" | "drivers/<name>"
     adapter: str = "claude"  # Agent adapter the harness invokes
@@ -550,7 +615,12 @@ class WorkerTypeDef:
 
     def recipe_wire(self) -> dict[str, Any]:
         """The derived-image recipe as it rides in the ``images`` wire list.
-        12 keys (10 pre-ADR-0055, 8 pre-ADR-0052): ``knowledge`` (the
+        15 keys (12 before the CLI Pin, 10 pre-ADR-0055, 8 pre-ADR-0052):
+        ``cli_tool``/``cli_version``/``cli_platforms`` (ADR-0055) carry the
+        CLI Pin the Node Daemon converges under ``<state-dir>/cli/`` — the
+        tool computed control-side from the adapter so the daemon stays
+        adapter-blind, all three empty on an unpinned type, ignored by old
+        daemons, and never part of the image identity. ``knowledge`` (the
         in-repo reference) and ``knowledge_pin`` (the per-tree content pin)
         replace the retired ``knowledge_source`` pair (ADR-0048) — the node
         bakes the referenced tree from its applied config-distribution tree
@@ -579,6 +649,9 @@ class WorkerTypeDef:
             "knowledge_target": self.knowledge_target,
             "policy": self.baked_policy,
             "policy_pin": self.baked_policy_pin,
+            "cli_tool": self.adapter if self.cli else "",
+            "cli_version": self.cli_version,
+            "cli_platforms": {k: dict(v) for k, v in self.cli_platforms.items()},
             "tag": self.tag,
             "base_digest": self.base_digest,
             "instruction_hash": self.instruction_hash,
@@ -988,6 +1061,16 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
             " type's `policy` field (per-Stack policy is rejected,"
             f" ADR-0055); edit worker-types/{worker_type}.toml"
         )
+    if "THEOZOLITH_WORKER_TYPE" in env:
+        # The CLI Pin selection key (ADR-0055): worker-type identity, injected
+        # control-side when the type pins a CLI — an [env] override here
+        # would point one deck's launch gate at another type's pin records.
+        raise ConfigRepoError(
+            f"{context}: [env] THEOZOLITH_WORKER_TYPE cannot be set on a"
+            " worker-type Stack — it is injected control-side from the worker"
+            " type itself (the deck's CLI Pin resolves by it, ADR-0055); edit"
+            f" worker-types/{worker_type}.toml"
+        )
     for key in ("THEOZOLITH_RUN_IMAGE", "THEOZOLITH_RUN_IMAGE_FILE"):
         # Not inert — the opposite: after ADR-0045 the run-image tag IS the
         # model, so a per-placement override here would silently run a
@@ -1209,6 +1292,57 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                     f"{context}: {field_name!r} is a driverless (Flight Deck) field"
                     " and is rejected when a driver is set (ADR-0044)"
                 )
+    if "cli_version" in data or "cli_platforms" in data:
+        raise ConfigRepoError(
+            f"{context}: 'cli_version'/'cli_platforms' are ingest-resolved,"
+            ' never authored (ADR-0055) — declare cli = "<version|dist-tag>"'
+            " and let `theozolith config ingest` record the pinned map"
+        )
+    cli = _require_str(data, "cli", context, default="")
+    cli_version = ""
+    cli_platforms: dict[str, dict[str, str]] = {}
+    if cli:
+        # Field refusals fire BEFORE the pin join, so a definition ingest
+        # deliberately skipped (cli with a driver, or on a non-claude
+        # adapter) gets its precise error — never the missing-pin message.
+        if not CLI_DECLARED_NAME.fullmatch(cli):
+            raise ConfigRepoError(
+                f"{context}: cli {cli!r} must be a plausible npm exact version"
+                " or dist-tag (^[0-9A-Za-z][0-9A-Za-z._-]*$) (ADR-0055)"
+            )
+        if driver:
+            raise ConfigRepoError(
+                f"{context}: 'cli' is driverless-only in v1 (ADR-0055) — a"
+                " driver type keeps the base image's CLI as identity bytes;"
+                " remove the field or drop the driver"
+            )
+        if adapter_name != "claude":
+            raise ConfigRepoError(
+                f"{context}: a worker type with adapter {adapter_name!r}"
+                " cannot declare a CLI Pin — refused until a consumer exists"
+                " (ADR-0055)"
+            )
+        pin = (pins.cli if pins else {}).get(f"{adapter_name}/{cli}")
+        if not pin:
+            raise ConfigRepoError(
+                f"{context}: no ingest-resolved CLI pin for {cli!r} — re-run"
+                " `theozolith config ingest`, which resolves the exact version"
+                f" and per-platform integrity map into {PINS_FILE} (ADR-0055)"
+            )
+        cli_version = pin["version"]
+        cli_platforms = {k: dict(v) for k, v in pin["platforms"].items()}
+        # Floor re-check at load (grilling Q14): the pinned build may predate
+        # a floor bump — the lint site is configrepo/ingest, never the image
+        # build or the deck launch.
+        floor = make_agent_adapter(adapter_name).MIN_ENFORCING_CLI
+        if _cli_version_tuple(cli_version) < tuple(floor):
+            floor_text = ".".join(str(part) for part in floor)
+            raise ConfigRepoError(
+                f"{context}: pinned CLI version {cli_version} is below the"
+                f" {adapter_name} adapter's enforcement floor {floor_text}"
+                " (ADR-0055) — pin a newer version and re-run `theozolith"
+                " config ingest`"
+            )
     # Driverless types may declare knowledge too (ADR-0048 amendment): the
     # reference selects which applied tree the deck's read-only mount serves
     # (nothing bakes — the state volume shadows ~/.claude). The pin join and
@@ -1259,6 +1393,9 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
         knowledge_pin=knowledge_pin,
         policy=policy,
         policy_pin=policy_pin,
+        cli=cli,
+        cli_version=cli_version,
+        cli_platforms=cli_platforms,
         driver=driver,
         adapter=adapter_name,
         model=model,
@@ -1269,6 +1406,15 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
         volumes=volumes,
         tmpfs=tmpfs,
     )
+
+
+def _cli_version_tuple(version: str) -> tuple[int, int, int]:
+    """The comparable (major, minor, patch) of a CLI_VERSION-validated string
+    (mirrors ingest._cli_version_tuple; both sides parse the machine-written
+    pin, so the shapes cannot drift)."""
+    core = version.split("-", 1)[0]
+    major, minor, patch = core.split(".")
+    return int(major), int(minor), int(patch)
 
 
 def _validate_model_effort(
@@ -1468,6 +1614,14 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
         # container spec — reselection recreates the deck once, a content
         # edit redistributes live and recreates nothing.
         env["THEOZOLITH_POLICY_TREE"] = wt.policy_tree
+    if wt.cli:
+        # The deck's CLI Pin selection (ADR-0055): the in-container shim and
+        # flightdeck-start resolve the daemon-maintained pin records by this
+        # name. CONDITIONAL injection is the lifecycle mechanism: adopting or
+        # dropping the field is an env delta -> container-fingerprint change
+        # -> one deck recreate, while a version bump changes no container
+        # spec and never recreates (the new export lands on the next launch).
+        env["THEOZOLITH_WORKER_TYPE"] = wt.name
     env.update(stack.env)
     return StackDef(
         name=stack.name,

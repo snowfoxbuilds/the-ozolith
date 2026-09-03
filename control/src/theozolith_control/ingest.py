@@ -108,6 +108,12 @@ from theozolith_knowledge import COMPILERS, KnowledgeError, load_knowledge_root
 # theozolith_worker.policy.validate_policy_tree observes both sites.
 from theozolith_worker import policy as agentpolicy
 
+# The CLI Pin's adapter-owned contract (ADR-0055): the enforcement floor and
+# the supported platform-package table both live on the adapter, so control
+# resolves against the SAME registry of capability the identity machinery
+# enforces (control already carries theozolith-worker, ADR-0015 amendment).
+from theozolith_worker.adapters import make_agent_adapter
+
 from theozolith_control import configdist, configrepo, controltoml, repolock
 
 # A sha256 whose value is the fail-closed placeholder convention (all zeros):
@@ -119,6 +125,10 @@ PLACEHOLDER_SHA256 = "0" * 64
 _SKIP_TOP_LEVEL = (".git", configdist.KNOWLEDGE_DIR, controltoml.CONTROL_TOML)
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+
+# The exact-version shape a CLI Pin resolves to (ADR-0055): semver with an
+# optional prerelease suffix. Shared with configrepo's pins.toml re-parse.
+_CLI_VERSION = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?")
 
 # git's well-known empty tree object — always resolvable without existing on
 # disk; the preview's diff base when the pinned build is unborn or missing.
@@ -157,6 +167,8 @@ class IngestReport:
     resolved_bases: dict[str, str] = field(default_factory=dict)  # ref -> digest
     knowledge_pins: dict[str, str] = field(default_factory=dict)  # "tree/tool" -> hash
     policy_pins: dict[str, str] = field(default_factory=dict)  # tree -> hash (ADR-0055)
+    # "<tool>/<declared>" -> {"version": ..., "platforms": {...}} (ADR-0055).
+    cli_pins: dict[str, dict] = field(default_factory=dict)
     retagged: dict[str, tuple[str, str]] = field(default_factory=dict)  # type -> (old, new)
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False  # lint + preview only — nothing was committed
@@ -181,6 +193,11 @@ class IngestReport:
             lines.append(f"knowledge/{name} pinned {tree_hash[:12]}")
         for name, tree_hash in sorted(self.policy_pins.items()):
             lines.append(f"policy/{name} pinned {tree_hash[:12]}")
+        for key, pin in sorted(self.cli_pins.items()):
+            lines.append(
+                f"cli {key} resolved {pin.get('version', '?')}"
+                f" ({len(pin.get('platforms', {}))} platform(s))"
+            )
         retag_verb = "would re-tag" if self.dry_run else "re-tagged"
         for name, (old, new) in sorted(self.retagged.items()):
             lines.append(f"worker type {name} {retag_verb}: {old or '(new)'} -> {new}")
@@ -619,12 +636,57 @@ def _resolve_bases(staging: Path, resolve_digest: Callable[[str], str]) -> dict[
     return resolved
 
 
+def _resolve_cli_pins(staging: Path, resolve_cli: Callable[[str], dict]) -> dict[str, dict]:
+    """CLI Pin resolutions for every driverless claude worker type declaring
+    ``cli`` (ADR-0055), keyed ``claude/<declared>`` — the ``_resolve_bases``
+    twin. Each distinct declared value resolves once. Definitions carrying
+    ``cli`` with a driver or a non-claude adapter are deliberately skipped
+    here: the staged config load refuses them with the precise error, which
+    the ingest LINT step surfaces before anything commits."""
+    resolved: dict[str, dict] = {}
+    for path in sorted((staging / "worker-types").glob("*.toml")):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue  # the staged lint will fail loudly on this file
+        declared = data.get("cli", "")
+        if not isinstance(declared, str) or not declared:
+            continue
+        adapter = data.get("adapter", "claude")
+        if data.get("driver") or adapter != "claude":
+            continue  # refused by the load lint with the precise message
+        key = f"claude/{declared}"
+        if key in resolved:
+            continue
+        try:
+            pin = resolve_cli(declared)
+        except IngestError:
+            raise
+        except Exception as exc:
+            raise IngestError(f"cannot resolve CLI pin {declared!r}: {exc}") from exc
+        version = pin.get("version", "") if isinstance(pin, dict) else ""
+        platforms = pin.get("platforms") if isinstance(pin, dict) else None
+        if (
+            not isinstance(version, str)
+            or not _CLI_VERSION.fullmatch(version)
+            or not isinstance(platforms, dict)
+            or not platforms
+        ):
+            raise IngestError(
+                f"CLI resolver returned a malformed pin for {declared!r} —"
+                " expected {'version': <semver>, 'platforms': {...}}"
+            )
+        resolved[key] = pin
+    return resolved
+
+
 def _write_pins(
     staging: Path,
     source_commit: str,
     bases: dict[str, str],
     knowledge: dict[str, str],
     policy: dict[str, str],
+    cli: dict[str, dict] | None = None,
 ) -> None:
     lines = [
         "# Machine-written by `theozolith config ingest` (ADR-0048) — never hand-edit.",
@@ -643,6 +705,14 @@ def _write_pins(
     if policy:
         lines += ["", "[policy]"]
         lines += [f'"{name}" = "{tree_hash}"' for name, tree_hash in sorted(policy.items())]
+    for key, pin in sorted((cli or {}).items()):
+        lines += ["", f'[cli."{key}"]', f'version = "{pin["version"]}"']
+        lines += ["", f'[cli."{key}".platforms]']
+        lines += [
+            f'"{tuple_key}" = {{ package = "{entry["package"]}",'
+            f' integrity = "{entry["integrity"]}" }}'
+            for tuple_key, entry in sorted(pin["platforms"].items())
+        ]
     (staging / configrepo.PINS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -783,6 +853,7 @@ def ingest(
     pinned_dir: Path,
     *,
     resolve_digest: Callable[[str], str] | None = None,
+    resolve_cli: Callable[[str], dict] | None = None,
     registry_credentials: dict[str, str] | None = None,
     dry_run: bool = False,
     runner=None,
@@ -803,7 +874,8 @@ def ingest(
     the default resolver's private-base resolution; it is IGNORED when
     ``resolve_digest`` is injected (a test's fake resolver stands in for the
     whole registry). A dry run resolves live too, so it also validates the
-    credential."""
+    credential. ``resolve_cli`` is the same seam for CLI Pin resolution
+    (ADR-0055): the default is the live npm resolver ``resolve_cli_pin``."""
     # Resolved at call time (not as a def-time default) so test rigs that
     # monkeypatch subprocess.run fake the git layer here too.
     runner = runner or subprocess.run
@@ -820,6 +892,7 @@ def ingest(
             log,
             dry_run=True,
             registry_credentials=registry_credentials,
+            resolve_cli=resolve_cli,
         )
     pinned_dir.mkdir(parents=True, exist_ok=True)
     writer = "theozolith config ingest" + (" --dry-run" if dry_run else "")
@@ -833,6 +906,7 @@ def ingest(
                 log,
                 dry_run=dry_run,
                 registry_credentials=registry_credentials,
+                resolve_cli=resolve_cli,
             )
     except repolock.RepoLockError as exc:
         raise IngestError(str(exc)) from exc
@@ -846,6 +920,7 @@ def _ingest_locked(
     log,
     dry_run: bool = False,
     registry_credentials: dict[str, str] | None = None,
+    resolve_cli: Callable[[str], dict] | None = None,
 ) -> IngestReport:
     report = IngestReport(dry_run=dry_run)
     # The injected resolver seam is untouched (every existing fake keeps
@@ -854,6 +929,7 @@ def _ingest_locked(
     resolve = resolve_digest or functools.partial(
         resolve_image_digest, credentials=registry_credentials
     )
+    resolve_cli = resolve_cli or resolve_cli_pin
 
     # The pinned build must exist as a clean git repo before anything is
     # staged. A marker left by an interrupted ingest is repaired FIRST — that
@@ -949,12 +1025,14 @@ def _ingest_locked(
         report.policy_pins = _pin_policy(source_dir, staging)
         _refuse_live_placeholders(staging)
         report.resolved_bases = _resolve_bases(staging, resolve)
+        report.cli_pins = _resolve_cli_pins(staging, resolve_cli)
         _write_pins(
             staging,
             report.source_commit,
             report.resolved_bases,
             report.knowledge_pins,
             report.policy_pins,
+            report.cli_pins,
         )
         _merge_control_toml(source_dir, pinned_state, staging)
 
@@ -1239,3 +1317,102 @@ def resolve_image_digest(
         except urllib.error.URLError as exc:
             raise IngestError(f"cannot resolve base tag {ref!r}: {exc.reason}") from exc
     raise IngestError(f"cannot resolve base tag {ref!r}")  # pragma: no cover
+
+
+# -- CLI Pin resolution (ADR-0055) -------------------------------------------------
+
+_NPM_REGISTRY = "https://registry.npmjs.org"
+
+
+def _npm_document(url: str, declared: str, what: str) -> dict:
+    """One npm registry GET through the shared ``_urlopen`` seam; every
+    failure is an ``IngestError`` naming the declared value and the failing
+    step (the registry is public — no credential is ever involved)."""
+    try:
+        with _urlopen(urllib.request.Request(url), timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise IngestError(f"cannot resolve CLI pin {declared!r}: {what}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: {what}: npm registry unreachable: {exc.reason}"
+        ) from exc
+    except ValueError as exc:  # json.JSONDecodeError / UnicodeDecodeError
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: {what}: npm registry returned"
+            " a malformed response"
+        ) from exc
+    if not isinstance(data, dict):
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: {what}: npm registry returned"
+            " a malformed response"
+        )
+    return data
+
+
+def resolve_cli_pin(declared: str, *, tool: str = "claude") -> dict:
+    """Resolve a CLI Pin declaration (an exact version or an npm dist-tag,
+    ADR-0055) to the exact version plus the COMPLETE per-platform
+    ``{package, integrity}`` map — the base-tag doctrine applied to the CLI.
+    MECHANICAL pin resolution (ADR-0048): the registry npm itself trusts
+    answers, and every network-derived trust decision lands here at ingest —
+    nodes later select from the pinned map and verify against the pinned
+    integrity, never against fetched metadata. A dist-tag re-resolves on
+    every ingest, exactly like a moving base tag."""
+    adapter = make_agent_adapter(tool)
+    packages = getattr(adapter, "CLI_PLATFORM_PACKAGES", None)
+    wrapper = getattr(adapter, "CLI_WRAPPER_PACKAGE", "")
+    if not packages or not wrapper:
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: adapter {tool!r} declares no"
+            " supported CLI platform table (ADR-0055)"
+        )
+    # npm serves both an exact version and a dist-tag at this endpoint.
+    document = _npm_document(
+        f"{_NPM_REGISTRY}/{urllib.parse.quote(wrapper, safe='')}"
+        f"/{urllib.parse.quote(declared, safe='')}",
+        declared,
+        f"version document for {wrapper}",
+    )
+    version = document.get("version", "")
+    if not isinstance(version, str) or not _CLI_VERSION.fullmatch(version):
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: {wrapper} resolved to"
+            f" {version!r}, not an exact <major>.<minor>.<patch> version"
+        )
+    floor = adapter.MIN_ENFORCING_CLI
+    if _cli_version_tuple(version) < tuple(floor):
+        floor_text = ".".join(str(part) for part in floor)
+        raise IngestError(
+            f"cannot resolve CLI pin {declared!r}: resolved version {version} is"
+            f" below the {tool} adapter's enforcement floor {floor_text}"
+            " (ADR-0055) — pin a newer version"
+        )
+    platforms: dict[str, dict[str, str]] = {}
+    for tuple_key, package in sorted(packages.items()):
+        # A supported tuple the registry cannot supply fails the ingest
+        # (ADR-0055): the pinned map must be COMPLETE, or a node of that
+        # platform would discover the gap only at install time.
+        entry = _npm_document(
+            f"{_NPM_REGISTRY}/{urllib.parse.quote(package, safe='')}/{version}",
+            declared,
+            f"platform package {package} ({tuple_key}) at {version}",
+        )
+        dist = entry.get("dist")
+        integrity = dist.get("integrity", "") if isinstance(dist, dict) else ""
+        if not isinstance(integrity, str) or not integrity.startswith("sha512-"):
+            raise IngestError(
+                f"cannot resolve CLI pin {declared!r}: platform package"
+                f" {package} ({tuple_key}) at {version} carries no sha512 SRI"
+                " integrity — a supported tuple the registry cannot supply"
+                " fails the ingest (ADR-0055)"
+            )
+        platforms[tuple_key] = {"package": package, "integrity": integrity}
+    return {"version": version, "platforms": platforms}
+
+
+def _cli_version_tuple(version: str) -> tuple[int, int, int]:
+    """The comparable (major, minor, patch) of a validated version string."""
+    core = version.split("-", 1)[0]
+    major, minor, patch = core.split(".")
+    return int(major), int(minor), int(patch)

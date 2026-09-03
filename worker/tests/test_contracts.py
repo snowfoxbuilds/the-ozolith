@@ -1071,3 +1071,20 @@ def test_run_event_carries_failure_class_only_when_one_exists():
         config, issue=7, run_id="r-3", phase=events.PHASE_FAILED, failure_class=""
     )
     assert "failure_class" not in empty
+
+
+# -- CLI Pin platform-tuple contract (ADR-0055) -----------------------------------
+
+
+def test_cli_platform_tuple_keys_match_the_daemon_detection():
+    """DEV-ONLY cross-package drift lock: the adapter-owned pinned-map keys
+    (what ingest resolves and the wire carries) must be spelled exactly from
+    the components the Node Daemon's tuple detection can emit — the daemon is
+    adapter-blind and only ever looks its own detected key up in the
+    delivered map, so a spelling drift would strand every node off-pin."""
+    from theozolith_nodedaemon import cliinstall
+
+    assert set(ClaudeAdapter.CLI_PLATFORM_PACKAGES) == set(cliinstall.supported_tuple_keys())
+    # Every package name is the scoped claude-code platform package.
+    for package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.values():
+        assert package.startswith("@anthropic-ai/claude-code-")

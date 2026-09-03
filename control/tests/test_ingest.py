@@ -1374,3 +1374,191 @@ def test_an_injected_resolver_ignores_registry_credentials(tmp_path, monkeypatch
     )
     assert seen == [TAG_ONLY_BASE]
     assert report.resolved_bases == {TAG_ONLY_BASE: "sha256:" + "e" * 64}
+
+
+# -- CLI Pin resolution (ADR-0055) ----------------------------------------------
+
+import json  # noqa: E402
+import urllib.parse  # noqa: E402
+
+from theozolith_control.ingest import resolve_cli_pin  # noqa: E402
+from theozolith_worker.adapters import ClaudeAdapter  # noqa: E402
+
+_SRI = "sha512-" + base64.b64encode(b"x" * 64).decode()
+
+
+class FakeNpm:
+    """A scripted npm registry over the shared ingest._urlopen seam: the
+    wrapper package's version document (exact versions echo, dist-tags map
+    through ``tags``) and one document per platform package. ``missing``
+    packages 404; ``bad_integrity`` overrides per package; ``raw`` replaces
+    every body verbatim (the malformed-response shapes)."""
+
+    def __init__(self, *, tags=None, missing=(), bad_integrity=None, raw=None):
+        self.tags = dict(tags or {})
+        self.missing = set(missing)
+        self.bad_integrity = dict(bad_integrity or {})
+        self.raw = raw
+        self.calls: list[str] = []
+
+    def __call__(self, request, timeout=None):
+        url = request.full_url
+        self.calls.append(url)
+        path = url.removeprefix("https://registry.npmjs.org/")
+        package_enc, _, selector = path.rpartition("/")
+        package = urllib.parse.unquote(package_enc)
+        if self.raw is not None:
+            return _FakeResp(body=self.raw)
+        if package == ClaudeAdapter.CLI_WRAPPER_PACKAGE:
+            declared = urllib.parse.unquote(selector)
+            version = self.tags.get(declared, declared)
+            return _FakeResp(body=json.dumps({"version": version}).encode())
+        if package in self.missing:
+            raise urllib.error.HTTPError(url, 404, "Not Found", email.message.Message(), None)
+        integrity = self.bad_integrity.get(package, _SRI)
+        dist = {} if integrity is None else {"integrity": integrity}
+        return _FakeResp(body=json.dumps({"version": selector, "dist": dist}).encode())
+
+
+def test_cli_pin_exact_version_resolves_every_supported_tuple(monkeypatch):
+    npm = FakeNpm()
+    monkeypatch.setattr(ingest_mod, "_urlopen", npm)
+    pin = resolve_cli_pin("2.1.257")
+    assert pin["version"] == "2.1.257"
+    assert pin["platforms"] == {
+        key: {"package": package, "integrity": _SRI}
+        for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
+    }
+    # The wrapper document plus one document per supported tuple, scoped
+    # names URL-encoded whole (quote with safe='').
+    assert npm.calls[0].startswith("https://registry.npmjs.org/%40anthropic-ai%2Fclaude-code/")
+    assert len(npm.calls) == 1 + len(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
+
+
+def test_cli_pin_dist_tag_resolves_and_reresolves(monkeypatch):
+    """A dist-tag re-resolves on every resolution, like a moving base tag."""
+    npm = FakeNpm(tags={"latest": "2.1.258"})
+    monkeypatch.setattr(ingest_mod, "_urlopen", npm)
+    assert resolve_cli_pin("latest")["version"] == "2.1.258"
+    npm.tags["latest"] = "2.1.259"
+    assert resolve_cli_pin("latest")["version"] == "2.1.259"
+
+
+def test_cli_pin_unsuppliable_tuple_fails_naming_it(monkeypatch):
+    """A supported tuple the registry cannot supply fails the whole ingest
+    (ADR-0055) — a 404, a missing integrity, and a non-sha512 algorithm all
+    name the tuple key and package."""
+    package = ClaudeAdapter.CLI_PLATFORM_PACKAGES["linux-arm64-musl"]
+    for npm in (
+        FakeNpm(missing={package}),
+        FakeNpm(bad_integrity={package: None}),
+        FakeNpm(bad_integrity={package: "sha256-" + "a" * 32}),
+    ):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ingest_mod, "_urlopen", npm)
+            with pytest.raises(IngestError, match=r"linux-arm64-musl"):
+                resolve_cli_pin("2.1.257")
+
+
+def test_cli_pin_below_the_floor_fails(monkeypatch):
+    monkeypatch.setattr(ingest_mod, "_urlopen", FakeNpm(tags={"old": "2.0.0"}))
+    with pytest.raises(IngestError, match="below the claude adapter's enforcement floor"):
+        resolve_cli_pin("old")
+
+
+def test_cli_pin_malformed_registry_answers_fail_actionably(monkeypatch):
+    monkeypatch.setattr(ingest_mod, "_urlopen", FakeNpm(raw=b"not json"))
+    with pytest.raises(IngestError, match="malformed response"):
+        resolve_cli_pin("2.1.257")
+    monkeypatch.setattr(ingest_mod, "_urlopen", FakeNpm(tags={"latest": "not-semver"}))
+    with pytest.raises(IngestError, match="not an exact"):
+        resolve_cli_pin("latest")
+
+
+def _deck_source(tmp_path, declared: str = "latest") -> Path:
+    """source_repo plus a driverless claude deck declaring a CLI Pin."""
+    src = source_repo(tmp_path)
+    write(
+        src,
+        "worker-types/deck.toml",
+        f'base = "{BASE}"\ncommand = "flightdeck-start"\ncli = "{declared}"\n',
+    )
+    _commit_all(src, "deck with cli pin")
+    return src
+
+
+def _fake_cli_resolver(version_cell: list[str]):
+    def resolve_cli(declared: str) -> dict:
+        return {
+            "version": version_cell[0],
+            "platforms": {
+                key: {"package": package, "integrity": _SRI}
+                for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
+            },
+        }
+
+    return resolve_cli
+
+
+def test_ingest_writes_the_cli_pins_and_the_result_loads(tmp_path):
+    """The injected resolve_cli seam round-trips: pins.toml carries the
+    documented [cli] shape byte-for-byte, the report and summary name the
+    pin, and the loaded config joins version + platform map onto the type."""
+    src = _deck_source(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(
+        str(src), pinned, resolve_cli=_fake_cli_resolver(["2.1.257"]), log=lambda *_: None
+    )
+    assert report.cli_pins["claude/latest"]["version"] == "2.1.257"
+    assert "cli claude/latest resolved 2.1.257 (4 platform(s))" in report.summary()
+    pins_text = (pinned / "pins.toml").read_text()
+    entries = "".join(
+        f'"{key}" = {{ package = "{ClaudeAdapter.CLI_PLATFORM_PACKAGES[key]}",'
+        f' integrity = "{_SRI}" }}\n'
+        for key in sorted(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
+    )
+    golden = (
+        '[cli."claude/latest"]\nversion = "2.1.257"\n\n[cli."claude/latest".platforms]\n' + entries
+    )
+    assert golden in pins_text
+    wt = configrepo.load_config(pinned).worker_types["deck"]
+    assert wt.cli == "latest" and wt.cli_version == "2.1.257"
+    assert set(wt.cli_platforms) == set(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
+    recipe = wt.recipe_wire()
+    assert recipe["cli_tool"] == "claude" and recipe["cli_version"] == "2.1.257"
+
+
+def test_reingest_with_a_moved_dist_tag_reresolves(tmp_path):
+    src = _deck_source(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    cell = ["2.1.257"]
+    ingest(str(src), pinned, resolve_cli=_fake_cli_resolver(cell), log=lambda *_: None)
+    cell[0] = "2.1.258"
+    report = ingest(str(src), pinned, resolve_cli=_fake_cli_resolver(cell), log=lambda *_: None)
+    assert report.changed  # the moved pin alone recommits the pinned build
+    assert 'version = "2.1.258"' in (pinned / "pins.toml").read_text()
+    assert configrepo.load_config(pinned).worker_types["deck"].cli_version == "2.1.258"
+
+
+def test_cli_on_a_driver_type_is_skipped_at_resolution_and_refused_by_the_lint(tmp_path):
+    """Ingest deliberately resolves nothing for a driver type's cli — the
+    staged config load refuses it with the precise driverless-only message,
+    and nothing commits."""
+    src = source_repo(tmp_path)
+    write(
+        src,
+        "worker-types/claude-dev.toml",
+        f'driver = "builtin:implementer"\nadapter = "claude"\nmodel = "claude-sonnet-5"\n'
+        f'workspace = "acme/sandbox"\nbase = "{BASE}"\ncli = "2.1.257"\n'
+        'knowledge = "knowledge/dev"\n',
+    )
+    _commit_all(src, "driver with cli")
+    calls: list[str] = []
+
+    def resolve_cli(declared: str) -> dict:
+        calls.append(declared)
+        return {"version": declared, "platforms": {}}
+
+    with pytest.raises(IngestError, match="driverless-only in v1"):
+        ingest(str(src), pinned_dir(tmp_path), resolve_cli=resolve_cli, log=lambda *_: None)
+    assert calls == []  # skipped at resolution: the lint owns the refusal

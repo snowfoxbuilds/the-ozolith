@@ -39,6 +39,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -48,7 +49,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from theozolith_nodedaemon import configdist
+from theozolith_nodedaemon import cliinstall, configdist
 from theozolith_nodedaemon.builds import ensure_image, image_status
 from theozolith_nodedaemon.config import (
     DEFAULT_HEARTBEAT_SECONDS,
@@ -144,6 +145,14 @@ OBSERVATION_DETAIL_CHARS = 200
 
 # Unreachable-Control-Node backoff cap (revision ruling amending ADR-0015).
 BACKOFF_CAP_SECONDS = 300.0
+
+# CLI Pin store layout (ADR-0055): versions live directly under
+# <cli-dir>/<tool>/; the per-worker-type records live under by-type/, which
+# can never collide with a version — versions match ^\d. The wire shapes are
+# checked FAIL-CLOSED (control/daemon skew never destroys a working export).
+CLI_BY_TYPE_DIR = "by-type"
+_CLI_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?")
+_CLI_TOOL_RE = re.compile(r"[a-z][a-z0-9]*")
 
 # Every process Stack gets its own jobs directory — <base>/<stack-name>,
 # injected as THEOZOLITH_JOBS_DIR unless the Stack's env overrides it — so
@@ -248,10 +257,14 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(text, encoding="utf-8")
+    if mode is not None:
+        # The explicit final mode lands BEFORE publication — a reader never
+        # observes the file with umask residue.
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -355,6 +368,13 @@ class NodeDaemon:
         # only while the hash memo is non-None (read behind _current_drivers_hash).
         self._verified_drivers_hash: str | None = None
         self._verified_built_against = ""
+        # CLI Pin convergence (ADR-0055): the per-worker-type LAST install
+        # failure — (error class, redacted message) — reported in heartbeats
+        # until a later pass succeeds or the pin is retired. In-memory by
+        # design: on restart the next pass re-derives everything from the
+        # cached wire plus on-disk evidence and re-records a still-failing
+        # install.
+        self._cli_failures: dict[str, tuple[str, str]] = {}
         # Capped exponential backoff while the Control Node is unreachable.
         self._unreachable_streak = 0
 
@@ -392,9 +412,11 @@ class NodeDaemon:
         # the new tree (ADR-0042).
         self._converge_drivers()
         # Before reconcile so a Flight Deck (re)started this pass mounts the
-        # freshly exported knowledge and policy trees (ADR-0048/0055).
+        # freshly exported knowledge and policy trees (ADR-0048/0055) and
+        # sees fresh CLI Pin records (ADR-0055).
         self._export_knowledge()
         self._export_policy()
+        self._converge_cli()
         self._reconcile()
 
     def _wire_setting(self, key: str, config_value: float, shipped_default: float) -> float:
@@ -567,6 +589,9 @@ class NodeDaemon:
             # stamped against. Both "" when none is applied.
             "drivers_hash": self._current_drivers_hash(),
             "drivers_built_against": self._current_built_against(),
+            # CLI Pin convergence per worker type (ADR-0055): desired/applied
+            # versions, convergence, and the redacted last failure.
+            "cli": self._cli_status_rows(),
             "completed_commands": list(self._completed),
             # Queue-behind visibility: what is waiting behind an in-flight Run.
             "deferred_commands": [
@@ -1575,6 +1600,365 @@ class NodeDaemon:
         with contextlib.suppress(OSError):
             for leftover in export.glob(".*"):
                 self._reclaim(leftover)
+
+    # -- CLI Pin convergence (ADR-0055) ------------------------------------------------
+
+    def _classify_cli_recipe(self, recipe: dict[str, Any]) -> tuple[str, Any]:
+        """One wire recipe's CLI Pin fields, FAIL-CLOSED: ``("none", None)``
+        ONLY when every field is absent or exactly empty (``cli_tool == ""``,
+        ``cli_version == ""``, ``cli_platforms == {}`` — today's pinless
+        shape, a genuine pin drop included), ``("ok", (tool, version,
+        platforms))`` when well-formed, ``("malformed", reason)`` otherwise —
+        a PARTIALLY populated combination is control/daemon skew, never a pin
+        drop, and skew must never destroy a working export: a malformed entry
+        is skipped with its records left untouched."""
+        version = recipe.get("cli_version", "")
+        tool = recipe.get("cli_tool", "")
+        platforms = recipe.get("cli_platforms", {})
+        if version == "" and tool == "" and platforms == {}:
+            return "none", None
+        if not isinstance(version, str) or not _CLI_VERSION_RE.fullmatch(version or ""):
+            return "malformed", f"cli_version {version!r} is not an exact version"
+        if not isinstance(tool, str) or not _CLI_TOOL_RE.fullmatch(tool or ""):
+            return "malformed", f"cli_tool {tool!r} is not a tool slug"
+        if not isinstance(platforms, dict) or not platforms:
+            return "malformed", "cli_platforms is not a non-empty table"
+        for key, entry in platforms.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(entry, dict)
+                or not isinstance(entry.get("package"), str)
+                or not entry.get("package")
+                or not isinstance(entry.get("integrity"), str)
+            ):
+                return "malformed", f"cli_platforms entry {key!r} is not {{package, integrity}}"
+        return "ok", (tool, version, platforms)
+
+    def _materialize_cli_dir(self, path: Path, label: str) -> None:
+        """Ensure ``path`` is a REAL directory carrying the code-owned
+        cross-UID 0o755 mode. The intermediate cli directories are a trust
+        boundary: record writes, chmods, and installs all resolve through
+        them, and a symlinked one can point outside the mounted tree — every
+        "repair" through it would mutate its TARGET. So a symlink (or any
+        other non-directory shape) is repaired by removing the entry ITSELF
+        (an unlink — never a traversal into, chmod of, or delete under the
+        target) and creating a real directory in its place; the pass then
+        reconstructs records and install state from the durable wire. A
+        legitimate real directory is never touched beyond the per-pass mode
+        re-assert."""
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink()
+            self._log(f"cli {label} was not a real directory — replaced (its target untouched)")
+        path.mkdir(exist_ok=True)
+        os.chmod(path, 0o755)
+
+    def _converge_cli(self) -> None:
+        """Converge every pinned agent CLI (ADR-0055 point 5), isolated per
+        worker type — one type's failure never blocks another's converge or
+        the rest of the pass. Per pass: write each wanted type's DESIRED
+        record the moment the applied config changes (before and independent
+        of any download), run the fail-closed install (at most one download
+        attempt per (tool, version) per pass; failures log, emit, and land in
+        the heartbeat's last-failure map), re-point the EXPORT entry only
+        after exactly that version installed, retire records for types no
+        longer wanting a pin, and prune version dirs nothing references —
+        never one that is desired or entry-referenced. The store is a cache
+        (ADR-0024): a wiped cli/ reconstructs from the cached wire plus the
+        registry, which is also the whole replacement-host recovery story."""
+        try:
+            cli_root = self._config.cli_dir
+            cli_root.mkdir(parents=True, exist_ok=True)
+            # Deck-visible modes are code-owned, never umask residue: the
+            # tree mounts read-only into Flight Deck containers running an
+            # arbitrary non-root UID, and the chmod re-asserts every pass so
+            # a pre-amendment or umask-restricted store repairs in place.
+            os.chmod(cli_root, 0o755)
+        except OSError as exc:
+            message = f"cli store {self._config.cli_dir} unavailable: {exc}"
+            self._log(message)
+            self._emit_error(type(exc).__name__, message)
+            return
+        wanted: dict[str, tuple[str, str, dict]] = {}
+        protected: set[str] = set()
+        for name, recipe in sorted(self._images().items()):
+            state, payload = self._classify_cli_recipe(recipe)
+            if state == "ok":
+                wanted[name] = payload
+            elif state == "malformed":
+                message = (
+                    f"cli pin for worker type {name!r} malformed on the wire"
+                    f" ({payload}) — skipped, existing records untouched"
+                )
+                self._log(message)
+                self._emit_error("CliWireMalformed", message)
+                self._cli_failures[name] = ("CliWireMalformed", message)
+                protected.add(name)
+        attempted: dict[tuple[str, str], Exception | None] = {}
+        for name, (tool, version, platforms) in wanted.items():
+            tool_root = cli_root / tool
+            by_type = tool_root / CLI_BY_TYPE_DIR
+            try:
+                # Both intermediate directories are trust boundaries: the
+                # record writes below, the install, and the entry re-point
+                # all resolve through them, so a symlinked shape is repaired
+                # FIRST — the link itself replaced with a real directory,
+                # its target never touched — and the code-owned cross-UID
+                # modes re-assert per pass.
+                self._materialize_cli_dir(tool_root, f"tool directory {tool!r}")
+                self._materialize_cli_dir(by_type, f"by-type directory under {tool!r}")
+                desired_path = by_type / f"{name}.desired"
+                text = version + "\n"
+                try:
+                    # A symlinked or undecodable record counts stale: both
+                    # shapes are refused by the launch gate and the applied
+                    # evidence, so leaving one in place would be a permanent
+                    # non-convergence — the rewrite replaces it with a
+                    # regular file.
+                    stale = desired_path.is_symlink() or (
+                        desired_path.read_text(encoding="utf-8") != text
+                    )
+                except (OSError, UnicodeDecodeError):
+                    stale = True
+                if stale:
+                    _atomic_write_text(desired_path, text, mode=0o644)
+                    self._log(f"cli pin for worker type {name!r}: desired {version} recorded")
+                else:
+                    # Repair a record written by an older amendment or under a
+                    # restrictive umask — the deck must always read it.
+                    os.chmod(desired_path, 0o644)
+            except OSError as exc:
+                message = (
+                    f"cli pin for worker type {name!r}: export tree or desired record failed: {exc}"
+                )
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                self._cli_failures[name] = (type(exc).__name__, message)
+                continue
+            if (tool, version) not in attempted:
+                try:
+                    cliinstall.ensure_cli_version(cli_root, tool, version, platforms, log=self._log)
+                    attempted[(tool, version)] = None
+                except Exception as exc:  # typed CliInstallError, or defensive
+                    attempted[(tool, version)] = exc
+            failure = attempted[(tool, version)]
+            if failure is not None:
+                message = f"cli pin {tool} {version} for worker type {name!r}: {failure}"
+                self._log(message)
+                self._emit_error(type(failure).__name__, message)
+                self._cli_failures[name] = (type(failure).__name__, str(failure))
+                continue
+            self._cli_failures.pop(name, None)
+            try:
+                self._point_cli_entry(by_type, name, version)
+            except OSError as exc:
+                message = f"cli pin for worker type {name!r}: export entry failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                self._cli_failures[name] = (type(exc).__name__, message)
+        self._retire_and_prune_cli(cli_root, wanted, protected)
+
+    def _point_cli_entry(self, by_type: Path, name: str, version: str) -> None:
+        """Atomically re-point ``by-type/<name>.current`` at ``../<version>``
+        — ONLY called after exactly that version completed the install. A
+        no-op when the entry already identifies the version (a running
+        session's binary inode is untouched by no-op passes)."""
+        entry = by_type / f"{name}.current"
+        target = f"../{version}"
+        try:
+            if os.readlink(entry) == target:
+                return
+        except OSError:
+            pass  # absent or not a symlink: (re)create it
+        tmp = by_type / f".{name}.current.tmp"
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        os.symlink(target, tmp)
+        os.replace(tmp, entry)
+        self._log(f"cli export for worker type {name!r} -> {version}")
+
+    def _retire_and_prune_cli(
+        self, cli_root: Path, wanted: dict[str, tuple[str, str, dict]], protected: set[str]
+    ) -> None:
+        """Retire by-type records for worker types no longer wanting a pin
+        (a dropped field, a deleted type — the cache is never backup state),
+        then PRUNE version dirs neither desired nor entry-referenced, via
+        rename-aside so a prune failure degrades to retained disk and never
+        corrupts a record or entry. ``by-type`` can never collide with a
+        version: versions start with a digit."""
+        try:
+            tool_dirs = [
+                child
+                for child in sorted(cli_root.iterdir())
+                if child.is_dir() and not child.is_symlink() and not child.name.startswith(".")
+            ]
+        except OSError as exc:
+            message = f"cli store enumeration failed: {exc}"
+            self._log(message)
+            self._emit_error(type(exc).__name__, message)
+            return
+        for tool_dir in tool_dirs:
+            by_type = tool_dir / CLI_BY_TYPE_DIR
+            keep: set[str] = set()
+            try:
+                if by_type.is_symlink():
+                    # Retiring enumerated records through a symlinked by-type
+                    # would unlink them at the TARGET — external content.
+                    # Remove the link itself (target and records untouched)
+                    # and treat this tool's records as absent; a wanted
+                    # type's converge already rebuilt a real directory
+                    # before this runs.
+                    by_type.unlink()
+                    self._log(
+                        f"cli by-type directory under {tool_dir.name!r} was a symlink"
+                        " — removed (its target untouched)"
+                    )
+                records = sorted(by_type.iterdir()) if by_type.is_dir() else []
+                for record in records:
+                    if record.name.startswith("."):
+                        continue
+                    name, _, kind = record.name.rpartition(".")
+                    if kind not in ("desired", "current") or not name:
+                        continue
+                    if name in protected or wanted.get(name, ("",))[0] == tool_dir.name:
+                        if kind == "desired":
+                            # An undecodable record names no version — skip
+                            # it, never let the decode error wedge the pass.
+                            with contextlib.suppress(OSError, UnicodeDecodeError):
+                                keep.add(record.read_text(encoding="utf-8").strip())
+                        else:
+                            with contextlib.suppress(OSError):
+                                keep.add(os.path.basename(os.readlink(record).rstrip("/")))
+                        continue
+                    record.unlink(missing_ok=True)
+                    self._cli_failures.pop(name, None)
+                    self._log(f"cli record {tool_dir.name}/{record.name} retired")
+            except OSError as exc:
+                message = f"cli record retirement under {tool_dir.name} failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+                # Conservatively skip this tool's prune: with the record scan
+                # incomplete, the keep set cannot be trusted not to miss a
+                # referenced version.
+                continue
+            try:
+                for child in sorted(tool_dir.iterdir()):
+                    if child.name.startswith(".") or child.name == CLI_BY_TYPE_DIR:
+                        continue
+                    if child.name in keep:
+                        continue
+                    retired = tool_dir / f".{child.name}.pruned"
+                    self._reclaim(retired)
+                    os.replace(child, retired)
+                    self._reclaim(retired)
+                    self._log(f"cli version {tool_dir.name}/{child.name} pruned")
+            except OSError as exc:
+                message = f"cli prune under {tool_dir.name} failed: {exc}"
+                self._log(message)
+                self._emit_error(type(exc).__name__, message)
+            # Sweep dot-prefixed leftovers — crashed staging, broken-version
+            # and prune tombs — best-effort, like every other export sweep.
+            with contextlib.suppress(OSError):
+                for leftover in tool_dir.glob(".*"):
+                    self._reclaim(leftover)
+                if by_type.is_dir():
+                    for leftover in by_type.glob(".*"):
+                        self._reclaim(leftover)
+
+    def _cli_applied_version(self, cli_root: Path, tool: str, name: str) -> str:
+        """The version this worker type's export ACTUALLY serves — evidence,
+        not memory (the _verify_applied_drivers posture), over the COMPLETE
+        path the deck launch gate walks. Every intermediate directory — the
+        tool directory, ``by-type``, and the version directory — must be a
+        REAL world-traversable directory: a symlinked one resolves elsewhere
+        (or dangles) inside the read-only deck mount, so records and binaries
+        read through it — however valid at the host-resolved target — vouch
+        for a path the gate cannot walk. The DESIRED record must be a
+        world-readable regular file (never a symlink) whose recorded value —
+        trailing newlines stripped, the shim's exact ``$(cat)`` parse — names
+        the entry symlink's target version (the gate refuses on any mismatch,
+        so mid-upgrade skew is no applied version, not the old one), and the
+        binary a regular world-r+x file. The tree mounts into containers
+        running an arbitrary non-root UID — anything less and status would
+        report a convergence launches cannot see. '' when absent, broken,
+        unreadable, malformed, or mismatched; every filesystem error is
+        evidence of absence, never an escape into the heartbeat."""
+
+        def lmode(path: Path) -> int:
+            # The entry's OWN mode — lstat never follows a symlink (a link is
+            # S_ISLNK, never a dir or regular file), and any error is
+            # evidence of absence, never an exception.
+            try:
+                return os.lstat(path).st_mode
+            except OSError:
+                return 0
+
+        def grants(path: Path, bits: int) -> bool:
+            try:
+                return os.stat(path).st_mode & bits == bits
+            except OSError:
+                return False
+
+        tool_root = cli_root / tool
+        by_type = tool_root / CLI_BY_TYPE_DIR
+        if not stat.S_ISDIR(lmode(tool_root)) or not stat.S_ISDIR(lmode(by_type)):
+            return ""
+        entry = by_type / f"{name}.current"
+        try:
+            version = os.path.basename(os.readlink(entry).rstrip("/"))
+        except OSError:
+            return ""
+        if not version:
+            return ""
+        desired_record = by_type / f"{name}.desired"
+        if not stat.S_ISREG(lmode(desired_record)):
+            return ""
+        if not grants(desired_record, 0o004):  # the gate's [ -r ] under the deck UID
+            return ""
+        try:
+            recorded = desired_record.read_bytes()
+        except OSError:
+            return ""
+        if recorded.rstrip(b"\n") != version.encode("utf-8"):
+            return ""
+        version_dir = tool_root / version
+        if not stat.S_ISDIR(lmode(version_dir)):
+            return ""
+        binary = version_dir / cliinstall.CLI_BINARY_NAME
+        if not stat.S_ISREG(lmode(binary)):
+            return ""
+        for directory in (cli_root, tool_root, by_type, version_dir):
+            if not grants(directory, 0o001):
+                return ""
+        if not grants(binary, 0o005):
+            return ""
+        return version
+
+    def _cli_status_rows(self) -> list[dict[str, Any]]:
+        """Heartbeat telemetry (ADR-0055 point 7): one row per wanted worker
+        type — desired from the wire, applied from on-disk evidence, the last
+        failure's class and redacted message. Names, versions, and error
+        classes only (the channel invariant holds)."""
+        rows: list[dict[str, Any]] = []
+        cli_root = self._config.cli_dir
+        for name, recipe in sorted(self._images().items()):
+            state, payload = self._classify_cli_recipe(recipe)
+            if state != "ok":
+                continue
+            tool, version, _platforms = payload
+            applied = self._cli_applied_version(cli_root, tool, name)
+            error_class, error = self._cli_failures.get(name, ("", ""))
+            rows.append(
+                {
+                    "worker_type": name,
+                    "tool": tool,
+                    "desired": version,
+                    "applied": applied,
+                    "converged": applied == version,
+                    "error_class": error_class,
+                    "error": error,
+                }
+            )
+        return rows
 
     # -- reconciliation ---------------------------------------------------------------
 
