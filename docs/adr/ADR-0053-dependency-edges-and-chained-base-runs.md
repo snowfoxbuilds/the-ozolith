@@ -35,3 +35,7 @@ The pipeline spec claimed "parallel PRs are serialized via issue dependencies" w
 - **Honoring cross-repo edges**: rejected — drags the driver's PAT and the Context Tree across a repo boundary the authority model never contemplated; silent-ignore was also rejected (a dropped ordering constraint should be loud).
 - **Deps-only Reviewer inputs (keep curated flat inputs, add `input/deps/`)**: rejected — dependencies would be serialized richer than the primary PR itself, and the curated, truncated inputs already violated the never-truncate doctrine; full workspace parity chosen.
 - **Cycle detection only driver-side (fail-loud pre-Run)**: rejected as primary — a deterministic config-shaped failure would burn container launches and the local retry; dispatch walks the edges anyway and the malformed-state lane is free.
+
+## Relevant PRs
+
+- #82 — implementation PR; clarified the janitor base-drift lane's human-owned resolution and the Review Run judge-isolation instruction-file removal.

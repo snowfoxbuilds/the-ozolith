@@ -104,3 +104,8 @@ These bind the implementation issues split from #96 — each lands with the chan
 - **Dropping the `events` table on the schema bump**: rejected — loses the metrics substrate while buying nothing; the legacy fence has the same (accepted) zombie-coverage gap.
 - **Keeping HTTP 500 as the per-repo pause**: rejected — a noisy per-poll failure that makes a healthy Control Node look broken and gives operators no persistent "still paused" surface.
 - **Silently ignoring a lingering `THEOZOLITH_REPO`**: rejected — an upgrade must never change coordination behavior without a signal; the fix is one `unset`.
+
+## Relevant PRs
+
+- #96 — grilling session (2026-09-02) that settled the multi-repo coordination amendment; the implementation issues bound by the Implementation obligations above were split from it.
+- #99 — post-review hardening of the first draft: the mixed-version update window, the gap between the request's repo and the checkout's, event ingestion trusting its sender, and the unbinding story, plus exact store identity.

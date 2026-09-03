@@ -2,8 +2,6 @@ Status: ACCEPTED
 
 Date: 2026-08-17
 
-Provenance: grilling 2026-08-16 (#41 Problem 3 rulings), implemented via #53.
-
 # ADR-0046: Output Proposal — a schema-validated output channel written through a format-output CLI, applied post-exit by the driver
 
 ## Context
@@ -130,7 +128,7 @@ output half.
 - **See ADR-0016 (as amended)** for the completion-retry class this channel
   introduces for the Implementer.
 
-## Alternatives considered
+## Alternatives Considered
 
 - **Keep free-form files, validate harder**: rejected — validation cannot make
   forbidden mutations unrepresentable, and every prompt change re-negotiates the
@@ -145,3 +143,7 @@ output half.
 - **Coupling dispatch eligibility to schema version**: deferred — version skew fails
   loud pre-work and is visible in evidence; the coupling buys nothing until skew
   actually shows up at fleet scale.
+
+## Relevant PRs
+
+- #53 — implemented this ADR (the Output Proposal channel and `format-output` CLI).

@@ -2,13 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-23
 
-Provenance: operator ruling (2026-08-23). Supersedes the docs half of ADR-0001 and completes the migration ADR-0033 started; retires ADR-0033's "Specs remain Notion-owned" clause and its Notion-side spec-amendment debt.
-
 # ADR-0050: All project docs are repo-authored; the Notion sync is retired
 
 ## Context
 
-ADR-0001 made Notion the source of truth for project docs, synced one-way into the repo by `scripts/sync_notion.py`. ADR-0033 carved ADRs out of that arrangement because rulings emerge from PR reviews and want to change in lockstep with the code that implements them. The same pressure has since consumed the rest of the docs: specs owe amendments whenever an ADR changes their content (ADR-0032's NODE-SUBSTRATE entry, ADR-0048's knowledge sections, ADR-0049's secrets-scoping sentence), and each such amendment queued behind a manual Notion round-trip — "Notion follow-up owed" became a standing debt category on every doc-touching PR. Meanwhile the index files that ship in the repo (AGENTS.md, CLAUDE.md) drifted: the working index was kept current per-branch while the Notion-owned copy went stale, inverting the declared ownership in practice.
+ADR-0001 made Notion the source of truth for project docs, synced one-way into the repo by `scripts/sync_notion.py`. ADR-0033 carved ADRs out of that arrangement because rulings emerge from PR reviews and want to change in lockstep with the code that implements them. The same pressure has since consumed the rest of the docs: specs owe amendments whenever an ADR changes their content (ADR-0032's NODE-SUBSTRATE entry, ADR-0048's knowledge sections, ADR-0049's secrets-scoping sentence), and each such amendment queued behind a manual Notion round-trip — "Notion follow-up owed" became a standing debt category on every doc-touching PR. Meanwhile the index files that ship in the repo (AGENTS.md, CLAUDE.md) drifted: the working index was kept current per-branch while the Notion-owned copy went stale, inverting the declared ownership in practice. This decision (an operator ruling) supersedes the docs half of ADR-0001 and completes the migration ADR-0033 started, retiring ADR-0033's "Specs remain Notion-owned" clause and its Notion-side spec-amendment debt.
 
 ## Decision
 
@@ -23,7 +21,7 @@ ADR-0001 made Notion the source of truth for project docs, synced one-way into t
 - **Negative**: Notion loses its role as the doc authoring surface; contributions drafted there take the PR round-trip.
 - **Neutral**: The frozen Notion ADR mirror (ADR-0033) stays frozen; the rest of the workspace joins it as a mirror, now maintained by an agent reading the repo instead of a sync script writing it.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Status quo (Notion owns specs/glossary/index)**: the follow-up debt was structural — every doc-affecting ADR owed a second, unsynchronized edit on a surface no PR review covers — and the ownership had already inverted in practice.
 - **Two-way sync**: the conflict machinery ADR-0001 was written to avoid; unchanged verdict.

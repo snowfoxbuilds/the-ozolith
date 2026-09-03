@@ -2,8 +2,6 @@ Status: ACCEPTED
 
 Date: 2026-08-26
 
-Provenance: operator rulings (planning session 2026-08-26) — identity doctrine PROBE + STATIC (no live kill), full per-tool knowledge path now (not deferred), ChatGPT-plan auth (design (a) adopted; pre-merge spike execution waived, production rollout is the validation environment — §5), both reviewers in the example with the discovery race documented rather than routed. Amends ADR-0009 (the compiler set and per-tool output), ADR-0044/0045 (a second adapter exists; the identity-hash formula gains one conditional key; codex's weaker observation channels), ADR-0048 (per-tool compile at ingest, pinned-build layout, pins-file shape, the deck export's claude view). ADR-0013's credential doctrine (rotatable spend credential in the run container, PATs never) and ADR-0043's no-sync-daemon doctrine stand; ADR-0051's publish machinery generalizes to a matrix without changing its guarantees. Unauthenticated CLI behavior (the `--json` event schema, the rollout turn_context journal, the version shape, the materialize/probe plumbing up to the authentication boundary) verified live against codex-cli 0.150.0 on the dev box; authenticated lifecycle behavior (login, headless exec under plan auth, token rotation) is deliberately NOT validated by this change — spike #76 records the post-deployment observation procedure.
-
 # ADR-0052: The Codex Agent adapter — per-tool compiled knowledge, adapter-derived bake targets, and PROBE + STATIC identity
 
 ## Context
@@ -74,3 +72,7 @@ This is **design (a)**, adopted as primary. **Pre-merge spike execution is inten
 - Codex identity is honestly weaker than Claude's: probe + static + post-exit evidence, no live kill, effort locked until proven. The evidence record states what ran; the doctrine states what is not checked.
 - Compat shims (legacy pin keys, bare-layout presence check, daemon staging/export fallbacks) carry the migration window and should be deleted once pre-ADR-0052 pinned builds are out of support.
 - Spike #76's S1–S8 procedure (login, headless exec, rotation, stale-copy recovery, stream fixtures, sandbox matrix, per-model config binding) is deliberately **not a pre-merge gate**: production rollout validates the credential design, and the checks remain the post-deployment observation procedure — its recorded answers add capability-table rows (S7) or trigger the design-(b) amendment (S4's question answered no).
+
+## Relevant PRs
+
+- #82 — implementation PR; added the judge-isolation boundary refusing instruction-discovery keys (`project_doc_fallback_filenames`) in the baked codex config, at the bake-time conflict scan, the per-Run identity static checks, and the identity reader on model-less images.

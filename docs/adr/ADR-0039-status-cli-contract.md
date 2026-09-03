@@ -2,11 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-04
 
-Provenance: delegated decision from the M8 brief — the `--json` schema and the degraded-reason precedence order for `theozolith status`. Implements the "Grilling 2026-08-04 (TUI scope, contracts, sequencing)" ruling in NODE-SUBSTRATE.md; consumes ADR-0038 (the events read endpoint) and ADR-0022's 150-second staleness threshold.
-
 # ADR-0039: `theozolith status` — read model, `--json` schema, degraded precedence, exit codes
 
 ## Context
+
+This is a delegated decision from the M8 brief — the `--json` schema and the degraded-reason precedence order for `theozolith status` — implementing the "Grilling 2026-08-04 (TUI scope, contracts, sequencing)" ruling in NODE-SUBSTRATE.md.
 
 The ruling fixed the behavior: human table on stdout, `--json` as the only parsing contract, exit 0 healthy / 1 degraded / 2 Control Node unreachable, pure API consumer (no systemd/docker/subprocess probing), stdlib-only. It delegated the `--json` schema and the precedence order of degraded reasons. Two gaps blocked a pure API consumer: `/api/v1/state` carried neither the product pin nor desired Stack state (both lived only in the dashboard's server-rendered view), and clock skew would poison client-side staleness math. The subcommand replaces the previous `status` (a raw `/api/v1/state` JSON dump) — sanctioned by the ruling, which makes `--json` the sole parsing contract.
 
@@ -50,7 +50,7 @@ Unreachable emits `{"status": "unreachable", "dial_target": "<url>", "error_clas
 
 The implementation lives in a module that is stdlib-only for its entire import closure — module-level *and* function-scope (the nodedaemon AST check's discipline, extended to this module) — and the URL/token/CA resolution it defines is the one implementation the rest of the CLI delegates to. A test imports the module in a clean interpreter and asserts none of the control dependency exceptions (`cryptography`, `fastapi`, `uvicorn`, `jinja2`) were loaded; another runs the command with subprocess machinery poisoned to prove the no-probing rule.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **A server-side `/api/v1/status` verdict endpoint**: moves the health policy into the server where the TUI would re-implement it anyway for per-row display; the read model belongs on the server, the verdict in the client, and `--json` shipping both raw documents keeps every downstream consumer un-lied-to.
 - **Staleness before quarantine in precedence**: a quarantined node is often also stale; leading with "stale" would bury the one reason that names the human action (release) behind the symptom.

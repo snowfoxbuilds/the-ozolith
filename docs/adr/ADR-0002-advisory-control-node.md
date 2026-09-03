@@ -17,6 +17,7 @@ All coordination state (claims, attempt counts, escalations) lives in GitHub iss
 - **Positive**: no second source of truth; a Control Node outage degrades the system (no dashboard, slower zombie cleanup) instead of halting it; the coordination substrate stays agent-agnostic and durable.
 - **Negative**: GitHub label/assign operations are not atomic, so rare duplicate claims remain possible in degraded mode (cost: one wasted duplicate PR); coordination logic is split between the Worker-side Claim Protocol and Control Node janitorial jobs rather than centralized.
 - **Neutral**: monitoring and janitorial functions live in the product's own Control Node (ADR-0005; original wording archived in Historical Context).
+
 ## Alternatives Considered
 
 - **Authoritative central dispatcher**: rejected — single point of failure, second source of truth, and a service that must stay alive for correctness.

@@ -2,8 +2,6 @@ Status: ACCEPTED
 
 Date: 2026-07-30
 
-Provenance: operator ruling (2026-07-30). Amends ADR-0023's CLI-surface decision in place (repo-authored ADRs per ADR-0033); the matching NODE-SUBSTRATE.md CLI-surface entry (grilling 2026-07-27) is a spec and stays Notion-owned — its amendment lands through the normal spec sync. Folding `theozolith-knowledge sync` was considered in the same session and explicitly deferred — knowledge separability (ADR-0007) is untouched.
-
 # ADR-0032: One human CLI — `theozolith-control` folds into `theozolith`
 
 ## Context
@@ -18,7 +16,7 @@ ADR-0023 settled two human entry points on the Control Node: `theozolith` (fleet
 - **Component names keep `theozolith-control`.** The pip distribution and the docker image names (`theozolith-control:local`, `ghcr.io/...`) identify the component, not the command, and do not change.
 - **The naming rule going forward**: `theozolith` is what a human types on the Control Node; `theozolith-<component>` names a machine surface (`worker`, `reviewer`, `harness`, `validate-verdict`, `nodedaemon` — plus `nodedaemon provision`, the one node-side paste, which is machine-composed by `join-token create`) or a separable standalone component (`knowledge`, whose laptop-only install must not drag in the cluster manager, ADR-0007).
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Keep the two-CLI split (status quo)**: the protection it buys is illusory (guards live on the subcommands), and the cost is real — a human surface named like a machine actor, and two top-level commands to remember for one box.
 - **Namespaced `theozolith control <cmd>`**: an extra token on every daily command to resolve a collision that does not exist; the flat namespace is smaller than git's.

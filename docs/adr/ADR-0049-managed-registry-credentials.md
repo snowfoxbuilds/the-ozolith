@@ -2,8 +2,6 @@ Status: ACCEPTED
 
 Date: 2026-08-20
 
-Provenance: issue #67.
-
 # ADR-0049: Managed registry credentials — authenticated base resolution and private-base pulls
 
 ## Context
@@ -171,3 +169,7 @@ node-side build-time injection.
 - **A new settings surface / a dedicated registry-credential store**:
   rejected — the reserved-name prefix in the existing Fernet store reuses
   the encrypted-at-rest, node-scoped-pull machinery with no new surface.
+
+## Relevant PRs
+
+- #67 — the issue this ADR resolves.

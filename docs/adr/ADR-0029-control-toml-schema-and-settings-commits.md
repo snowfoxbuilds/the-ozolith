@@ -2,13 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-07-28
 
-Provenance: delegated decision from the M7 brief; implements ADR-0023's configuration-surface contract (control.toml, tier 2) and ADR-0024's public-origin relocation.
-
 # ADR-0029: control.toml schema layout and the settings-form commit convention
 
 ## Context
 
-`control.toml` in the Config Repo is the durable home for tier-2 tunables; every setting ships a default so the file is optional; the dashboard edits it via a fixed-schema commit (the `product.toml` pin-bump precedent); the public origin lives in it as a read-only field. Schema layout and commit convention were delegated.
+`control.toml` in the Config Repo is the durable home for tier-2 tunables; every setting ships a default so the file is optional; the dashboard edits it via a fixed-schema commit (the `product.toml` pin-bump precedent); the public origin lives in it as a read-only field. Schema layout and commit convention were delegated (M7 brief, implementing ADR-0023's configuration-surface contract and ADR-0024's public-origin relocation).
 
 ## Decision
 
@@ -44,7 +42,7 @@ installer_url = "https://github.com/…/install-nodedaemon.sh"
 - The commit touches only `control.toml`; a no-op write (value unchanged) produces no commit. In folder mode (no `.git`) the file write itself is the record, matching `product.write_pin`.
 - The settings form refuses `public_origin` outright: re-pointing a deployment is `origin-init --force`, a deliberate CLI act with DNS/TLS consequences, never a form field.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Ignore-unknown-keys loading**: the classic misconfiguration trap — a misspelled tunable "works" at the default forever.
 - **Preserving hand-authored comments/layout on write**: a TOML round-tripper dependency (or a fragile homegrown one) to protect prose inside a machine-managed file; commentary belongs in the Config Repo's own docs.

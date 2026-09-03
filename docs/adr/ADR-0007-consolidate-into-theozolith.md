@@ -20,7 +20,8 @@ Naming note: ADR-0001 through ADR-0006 were authored against the names "snow-mak
 
 - **Positive**: one brand, one repo, one release process; the open-source collision (personal skills in a public repo) is resolved; laptop-only knowledge users and cluster adopters share one project; homeserver's sunset is a defined end state instead of an open question.
 - **Negative**: the monorepo spans three concerns and needs discipline (separable installables, substrate admission rule) to avoid becoming a grab-bag; a rename this late touches every doc.
-- **Neutral**: ADR-0004's private-to-public dependency rule is unchanged; the specs split ([AGENTIC-CODING-PIPELINE.md](http://agentic-coding-pipeline.md/), [NODE-SUBSTRATE.md](http://node-substrate.md/)) to keep each focused and under the size limit.
+- **Neutral**: ADR-0004's private-to-public dependency rule is unchanged; the specs split ([AGENTIC-CODING-PIPELINE.md](../specs/AGENTIC-CODING-PIPELINE.md), [NODE-SUBSTRATE.md](../specs/NODE-SUBSTRATE.md)) to keep each focused and under the size limit.
+
 ## Alternatives Considered
 
 - **Two public repos (snow-maker + TheOzolith as separate products)**: rejected — the seam between knowledge machinery and worker images is one build-time invocation; two brands and release processes for that is pure overhead.

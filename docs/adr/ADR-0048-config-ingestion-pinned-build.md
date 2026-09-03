@@ -1,8 +1,6 @@
-Status: ACCEPTED — amended 2026-08-20 by ADR-0049 (a private base digest resolves at ingest via a managed `registry:<host>` pull credential; the tag-only-base / mechanical-pin doctrine is preserved — the credential is what makes it hold for a private base) (see Amendment) — amended 2026-08-26 by ADR-0051 (a source Config Repo without `product.toml` no longer deletes the pinned build's product pin: ingest carries the current pin forward — the update flow owns it unless the Config Repo declares one) (see Amendment) — amended 2026-08-26 by ADR-0052 (ingest compiles every knowledge tree once per registered compiler into `knowledge/<name>/<tool>/` with pins keyed `"<name>/<tool>"`; claude pin values are byte-stable across the layout change, legacy builds load through compat shims until the next ingest migrates them, and the node's deck export serves the claude view) — amended 2026-09-02 by ADR-0055 (#95): the Config Repo gains a `policy/` tree (Agent Policy drop-ins, distributed beside drivers/ and knowledge/ under the same hash), the pinned build gains `[cli]` pins (an npm version or dist-tag resolved at ingest to exact version + a per-platform `{package, integrity}` map covering every product-supported OS/arch/libc tuple — the tag→digest doctrine applied to the agent CLI), and Flight Decks gain two more live-mounted surfaces on the knowledge model — the CLI surface pin-strict at launch, its binary installed by nodes through a fail-closed staged lifecycle (see Amendment)
+Status: ACCEPTED
 
 Date: 2026-08-18
-
-Provenance: issue #62 (design discussion 2026-08-17/18).
 
 # ADR-0048: Config ingestion — human Config Repo, machine-owned pinned build, knowledge in the Config Repo
 
@@ -171,78 +169,114 @@ types, and worker types are cheap.
   availability dependency to every deck and reintroduces the sync
   daemon ADR-0043 refused.
 
-## Amendment (2026-08-20, ADR-0049 — authenticated base resolution)
+## Amendments
 
-- **The resolve step gains an authenticated path.** As written, base
-  tag→digest resolution spoke only anonymous pull scope, so a **private**
-  base failed ingest with a bare `403` (GHCR mints the anonymous token,
-  then 403s the manifest HEAD). ADR-0049 threads a managed
-  `registry:<host>` pull credential (a reserved-name secret in the
-  existing Fernet store, value `<user>:<token>`) into `resolve_image_digest`:
-  attempt 1 stays anonymous (public bases resolve with no credential), and
-  the stored credential rides the token-realm request as HTTP Basic on the
-  401 challenge. The mechanical-pin doctrine here is **preserved** — the
-  human Config Repo still carries tag-only bases and no computed pins; the
-  credential is simply what lets ingest resolve the digest of a private
-  one. The digest pin (and the fleet-skew visibility and git-revert
-  reproducibility that ride on it) is unchanged. See ADR-0049 for the flow,
-  the scoping extension, and the node-side base pull.
+- **2026-08-20**: a private base digest resolves at ingest via a
+  managed `registry:<host>` pull credential; the tag-only-base /
+  mechanical-pin doctrine is preserved — the credential is what makes
+  it hold for a private base. See ADR-0049.
+  - **The resolve step gains an authenticated path.** As written, base
+    tag→digest resolution spoke only anonymous pull scope, so a
+    **private** base failed ingest with a bare `403` (GHCR mints the
+    anonymous token, then 403s the manifest HEAD). ADR-0049 threads a
+    managed `registry:<host>` pull credential (a reserved-name secret
+    in the existing Fernet store, value `<user>:<token>`) into
+    `resolve_image_digest`: attempt 1 stays anonymous (public bases
+    resolve with no credential), and the stored credential rides the
+    token-realm request as HTTP Basic on the 401 challenge. The
+    mechanical-pin doctrine here is **preserved** — the human Config
+    Repo still carries tag-only bases and no computed pins; the
+    credential is simply what lets ingest resolve the digest of a
+    private one. The digest pin (and the fleet-skew visibility and
+    git-revert reproducibility that ride on it) is unchanged. See
+    ADR-0049 for the flow, the scoping extension, and the node-side
+    base pull.
+- **2026-08-26**: a source Config Repo without `product.toml` no
+  longer deletes the pinned build's product pin: ingest carries the
+  current pin forward — the update flow owns it unless the Config
+  Repo declares one. See ADR-0051.
+  - **The commit step no longer round-trips the product pin
+    destructively.** As written, ingest copied the source's config
+    files verbatim and committed the whole staging tree, so a Config
+    Repo without `product.toml` *deleted* the pin the update flow
+    (`theozolith build`/`theozolith update`) had written into the
+    pinned build — including for the Config Repo `theozolith init`
+    scaffolds, which ships none. ADR-0051: when the source carries no
+    `product.toml`, ingest carries the pinned build's current one
+    forward into staging (preserve, never delete), with an explicit
+    report note in both the real and dry-run paths. A source that
+    **does** carry `product.toml` still wins, with the existing
+    divergence note — declarative release pinning is unchanged. Absent
+    in both trees stays absent. A present `product.toml` must be a
+    REGULAR FILE: a directory, symlink, or other shape at that path is
+    refused loudly (preservation must never commit into a
+    `product.toml/` directory). Under a pending marker, the dry run
+    reads the old pinned state — the preserved pin included — from a
+    read-only snapshot of the committed HEAD, never from a worktree
+    the interrupted ingest left behind. See ADR-0051.
+- **2026-08-26**: ingest compiles every knowledge tree once per
+  registered compiler into `knowledge/<name>/<tool>/` with pins keyed
+  `"<name>/<tool>"`; claude pin values are byte-stable across the
+  layout change, legacy builds load through compat shims until the
+  next ingest migrates them, and the node's deck export serves the
+  claude view. See ADR-0052.
+- **2026-09-02 (#95)**: the Config Repo gains a `policy/` tree (Agent
+  Policy drop-ins, distributed beside drivers/ and knowledge/ under the
+  same hash), the pinned build gains `[cli]` pins (an npm version or
+  dist-tag resolved at ingest to exact version + a per-platform
+  `{package, integrity}` map covering every product-supported
+  OS/arch/libc tuple — the tag→digest doctrine applied to the agent
+  CLI), and Flight Decks gain two more live-mounted surfaces on the
+  knowledge model — the CLI surface pin-strict at launch, its binary
+  installed by nodes through a fail-closed staged lifecycle. See
+  ADR-0055.
+  - **A third Config Repo tree.** `policy/<name>/` holds verbatim
+    managed-settings drop-ins (Agent Policy), referenced from
+    worker-type definitions as `policy = "policy/<name>"`. Ingest
+    validates it (strict shape + the ADR-0055 safe-key allowlist, run
+    identically at config load — declarative keys only,
+    executable-reference and unclassified keys refused), computes a
+    per-tree content pin, and the config distribution carries it
+    beside `drivers/` and `knowledge/` under the one hash (the tree is
+    text-sized; the #51 ruling holds). The delivery split is the
+    knowledge split: driver types bake it (identity-bearing), Flight
+    Decks read-only bind-mount the node's export of the applied tree.
+  - **A third pin class.** `cli = "<exact version | npm dist-tag>"`
+    resolves at ingest against the npm registry to `[cli]
+    "<tool>/<declared>"` — the exact version plus one
+    `{package, integrity}` entry per product-supported (OS,
+    architecture, libc) tuple, since the CLI ships a distinct platform
+    package with its own integrity for each; a supported tuple the
+    registry cannot supply fails the ingest — mechanical, like base
+    tag→digest, and a dist-tag re-resolves on every ingest like a
+    moving base tag. The binary itself never enters the pinned build
+    or the distribution: a node selects its tuple's entry from the
+    pinned map and verifies against that recorded integrity, never
+    against registry metadata fetched at download time. The
+    human-entered-only rule for the tailscale checksum is unaffected:
+    the CLI integrity is vendor-published registry metadata, the same
+    class as an image manifest digest, not an ingest-computed hash of
+    a download.
+  - **Decks gain two live surfaces.** The node exports
+    `<state-dir>/policy/<name>` (atomic child exchange, as knowledge)
+    and, per tool, a CLI export parent carrying verified version
+    installs plus, per worker type, a desired record (rewritten the
+    moment config applies) and an export entry (re-pointed only after
+    the exact pinned version has passed the ADR-0055 fail-closed
+    install lifecycle: staged bounded download, integrity before
+    extraction, archive validation, normalized ownership, atomic
+    publication). The deck mounts both parents read-only, selected by
+    un-overridable env. A policy content edit or CLI version bump
+    lands on the next agent-CLI launch; the CLI surface is pin-strict —
+    a launch while the desired pin is unconverged fails loudly, never
+    the previous export, never the image's CLI. See ADR-0055.
 
-## Amendment (2026-08-26, ADR-0051 — an undeclared product pin is preserved)
+## Relevant PRs
 
-- **The commit step no longer round-trips the product pin destructively.**
-  As written, ingest copied the source's config files verbatim and
-  committed the whole staging tree, so a Config Repo without
-  `product.toml` *deleted* the pin the update flow (`theozolith build`/
-  `theozolith update`) had written into the pinned build — including for
-  the Config Repo `theozolith init` scaffolds, which ships none. ADR-0051:
-  when the source carries no `product.toml`, ingest carries the pinned
-  build's current one forward into staging (preserve, never delete), with
-  an explicit report note in both the real and dry-run paths. A source
-  that **does** carry `product.toml` still wins, with the existing
-  divergence note — declarative release pinning is unchanged. Absent in
-  both trees stays absent. A present `product.toml` must be a REGULAR
-  FILE: a directory, symlink, or other shape at that path is refused
-  loudly (preservation must never commit into a `product.toml/`
-  directory). Under a pending marker, the dry run reads the old pinned
-  state — the preserved pin included — from a read-only snapshot of the
-  committed HEAD, never from a worktree the interrupted ingest left
-  behind. See ADR-0051.
-
-## Amendment (2026-09-02, ADR-0055 — policy trees and CLI pins)
-
-- **A third Config Repo tree.** `policy/<name>/` holds verbatim managed-
-  settings drop-ins (Agent Policy), referenced from worker-type definitions
-  as `policy = "policy/<name>"`. Ingest validates it (strict shape + the
-  ADR-0055 safe-key allowlist, run identically at config load — declarative
-  keys only, executable-reference and unclassified keys refused), computes
-  a per-tree content pin, and the config
-  distribution carries it beside `drivers/` and `knowledge/` under the one
-  hash (the tree is text-sized; the #51 ruling holds). The delivery split
-  is the knowledge split: driver types bake it (identity-bearing), Flight
-  Decks read-only bind-mount the node's export of the applied tree.
-- **A third pin class.** `cli = "<exact version | npm dist-tag>"` resolves
-  at ingest against the npm registry to `[cli] "<tool>/<declared>"` — the
-  exact version plus one `{package, integrity}` entry per product-supported
-  (OS, architecture, libc) tuple, since the CLI ships a distinct platform
-  package with its own integrity for each; a supported tuple the registry
-  cannot supply fails the ingest — mechanical, like base tag→digest, and a
-  dist-tag re-resolves on every ingest like a moving base tag. The binary
-  itself never enters the pinned build or the distribution: a node selects
-  its tuple's entry from the pinned map and verifies against that recorded
-  integrity, never against registry metadata fetched at download time. The
-  human-entered-only rule for the tailscale checksum is unaffected: the
-  CLI integrity is vendor-published registry metadata, the same class as
-  an image manifest digest, not an ingest-computed hash of a download.
-- **Decks gain two live surfaces.** The node exports `<state-dir>/policy/
-  <name>` (atomic child exchange, as knowledge) and, per tool, a CLI export
-  parent carrying verified version installs plus, per worker type, a
-  desired record (rewritten the moment config applies) and an export entry
-  (re-pointed only after the exact pinned version has passed the ADR-0055
-  fail-closed install lifecycle: staged bounded download, integrity before
-  extraction, archive validation, normalized ownership, atomic
-  publication). The deck mounts both parents read-only, selected by
-  un-overridable env. A policy content edit or CLI version bump lands on
-  the next agent-CLI launch; the CLI surface is pin-strict — a launch
-  while the desired pin is unconverged fails loudly, never the previous
-  export, never the image's CLI. See ADR-0055.
+- #23 — cited for the staged-repair atomic-rename machinery reused for
+  knowledge tree swaps.
+- #51 — cited for the repo-size ruling underlying the whole-tree
+  distribution-hash decision.
+- #62 — the issue this ADR resolves.
+- #95 — the ADR-0055 amendment adding the `policy/` tree and `[cli]`
+  pins.

@@ -2,13 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-07-28
 
-Provenance: delegated decision from the M7 brief (first-run setup, node provisioning, storage partition); implements ADR-0023's join-string contract.
-
 # ADR-0025: Join-string serialization, checksum, and error-text catalogue
 
 ## Context
 
-ADR-0023 fixed the join string's semantics — version prefix, `{addr, ca_sha256, token, exp}` payload, integrity checksum, ~120 characters — and delegated the exact encoding. Both ends are independent implementations (control composes with its dependencies available; the node parses stdlib-only, no shared import across the component boundary), so the format must be trivial to mirror and a cross-component round-trip test must pin the two together.
+ADR-0023 fixed the join string's semantics — version prefix, `{addr, ca_sha256, token, exp}` payload, integrity checksum, ~120 characters — and delegated the exact encoding. Both ends are independent implementations (control composes with its dependencies available; the node parses stdlib-only, no shared import across the component boundary), so the format must be trivial to mirror and a cross-component round-trip test must pin the two together. This is a delegated decision from the M7 brief (first-run setup, node provisioning, storage partition).
 
 ## Decision
 
@@ -38,7 +36,7 @@ checksum = first 4 bytes of SHA-256(b"ozjoin1" || payload)
 
 Expiry is **not** checked node-side before the exchange: the server's clock is the authority (ADR-0023: expired/consumed/revoked reject cleanly *after* TLS), and the three cases are deliberately indistinguishable off-box. `--inspect` displays the expiry for debugging.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **JSON payload**: doubles the length (the brief's ~120-char budget exists so the string survives terminals and chat clients intact) and invites schema drift between the two stdlib-only ends.
 - **CRC32 checksum**: SHA-256 is already imported on both ends for the fingerprint; a second algorithm buys nothing.

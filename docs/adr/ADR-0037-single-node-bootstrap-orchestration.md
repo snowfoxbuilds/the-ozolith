@@ -1,12 +1,12 @@
-Status: ACCEPTED — amended 2026-08-10 by ADR-0044/ADR-0020: the scaffold's concrete file shapes changed with the worker-type cutover (see the amendment note in "The scaffold" section); the orchestration decisions stand unchanged.
+Status: ACCEPTED
 
 Date: 2026-08-04
-
-Provenance: delegated decision from the M8 brief — listener/serve orchestration inside `init --with-local-node`, plus the scaffold's contents, README wording, and example worker-type choice. Implements the "Grilling 2026-08-04 (single-node)" and "(late)" rulings in NODE-SUBSTRATE.md and ADR-0035's scaffold consequence. Builds on ADR-0023/0025 (join flow, unchanged), ADR-0026 (bootstrap listener), ADR-0034 (root-mediated setup), ADR-0036 (init composes no browser surface).
 
 # ADR-0037: Single-node bootstrap — orchestration inside `init --with-local-node` and the stage-don't-deploy scaffold
 
 ## Context
+
+This is a delegated decision from the M8 brief — listener/serve orchestration inside `init --with-local-node`, plus the scaffold's contents, README wording, and example worker-type choice — implementing the "Grilling 2026-08-04 (single-node)" and "(late)" rulings in NODE-SUBSTRATE.md and ADR-0035's scaffold consequence, and building on ADR-0023/0025 (join flow, unchanged), ADR-0026 (bootstrap listener), ADR-0034 (root-mediated setup), and ADR-0036 (init composes no browser surface).
 
 `theozolith init --with-local-node` must install the Node Daemon on the same box and execute the **unmodified** join flow end-to-end internally: join-token create → machine-composed provision line → loopback bootstrap listener → per-node token minted, join token consumed. The human never sees the join string; no second provisioning code path may exist; the local daemon persists a loopback dial address. The ruling delegated the orchestration (temporary bootstrap listener vs. early serve start) and the scaffold's concrete shape to this PR.
 
@@ -57,10 +57,14 @@ Desired state stops carrying image recipes for stopped Stacks: `desired_state_fo
 - **Negative**: `--with-local-node` hard-requires the all-distributions bare-metal install (refusal with remediation otherwise); the node-side install steps exist twice (shell installer for remote boxes, Python for the local one) — held together by a unit-body drift test rather than a shared file, accepted because the shell installer must stay a curl-able standalone.
 - **Neutral**: multi-node join-string provisioning is byte-for-byte unchanged (the temporary listener is invisible off-box — it binds loopback); quarantine, drain, and Stack mechanics are the multi-node ones unchanged.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Temporary in-process serve instead of starting the unit**: a second serve lifecycle that exists only during init — different supervisor, different port story, and a teardown/handoff seam where the real service replaces the temporary one; starting the real unit early is strictly more honest and is what the operator was about to do anyway.
 - **Making the production bootstrap listener answer loopback callers with a loopback control URL**: puts a peer-dependent conditional inside the deliberately inert three-inert-values listener (ADR-0023/0026) to serve exactly one caller that init itself controls; a second instance with the right value is simpler and leaves the production surface untouched.
 - **Calling `provisioning.provision()` in-process from control**: crosses the control→nodedaemon component boundary with an undeclared import and would *not* be the code path a human paste runs (which enters through the installed CLI); the child process is the same grammar, same entry point, same implementation.
 - **Scaffolding with a real fetched base digest**: init would need network access and a registry round-trip on the critical setup path, and a digest fetched at init silently ages; the README's explicit pin step keeps the pin an operator act (ADR-0006's spirit).
 - **Leaving image builds unconditional for stopped Stacks**: ships a guaranteed first-boot build failure with the placeholder digest, or forces the scaffold to omit `run_image` and grow a fourth finish-line step; gating on desired state matches the ruling's own words.
+
+## Amendments
+
+- **2026-08-10 (ADR-0044/ADR-0020)**: the scaffold's concrete file shapes changed with the worker-type cutover — see "The scaffold" section for the current shape; the orchestration decisions stand unchanged.

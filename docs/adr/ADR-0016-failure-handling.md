@@ -1,4 +1,4 @@
-Status: ACCEPTED — amended 2026-07-27 by ADR-0024 (cache/store split; see Amendments); amended 2026-08-17 with ADR-0046 (#53): the completion-retry class joins the full local retry (see Amendments)
+Status: ACCEPTED
 
 Date: 2026-07-17
 
@@ -17,11 +17,13 @@ ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the re
 - **Cache, never archive**: the Control Node database is a cache; the evidence bundle is the sole durable audit trail, so nothing in the control database may ever be the only copy of anything and everything in it is deletable by policy. Transcript tails live under a ~10GB disk budget with oldest-first eviction; terminal events (claimed / pr-open / failed / escalated) are kept — they are tiny and are the metrics substrate.
 - **Boot-time evidence sweep**: at startup the driver (the PAT holder — the daemon never receives a credential) sweeps orphaned job directories and pushes them to the evidence branch. Normally, a job dir is deleted only after the push is confirmed on the remote; on push failure it is parked outside the active jobs directory, logged, and retried at the next startup or poll cycle. ADR-0022 adds one bounded exception: if the normal park and a collision-safe fallback both fail, the completed directory may be discarded rather than left where queue-behind would mistake it for an active Run. Undeletable remnants are renamed to a dot-prefixed tombstone ignored by queue-behind and the sweep; an unwritable jobs directory remains a logged, human-cleared residual. Collision-parked bundles still publish under the original `run_id` path—the sweep strips the parking suffix—and carry `swept: true` plus the sweep timestamp, preserving janitor lookups and distinguishing recovered evidence from live-pushed evidence.
 - **Two-phase zombie escalation, evidence first**: the janitor detects a claim whose Worker has been silent past the grace period and surfaces it on the dashboard, but does not touch GitHub yet. Only when the swept evidence bundle lands (driver returned and swept) does it release the claim and apply failed + needs_human with the real evidence link. There is no automatic re-queue and no escalate-before-evidence: a node that never returns is a human call made from the dashboard, where the stuck zombie is visible.
+
 ## Consequences
 
 - **Positive**: no distributed state in comments — marker parsing, sanitizer, and claim-time budget checks are deleted; every escalation carries complete forensics; the queue is protected from sick nodes at the grant gate; retry cost is bounded and local.
 - **Negative**: a down node stalls its zombie issues until it returns or a human intervenes (accepted — uptime ranks below stability and token efficiency); a local retry can re-hit node-local causes (accepted — quarantine catches the pattern); the control database stores agent-authored text, an untrusted display surface.
 - **Amends**: ADR-0014 (failed-Run marker/re-queue path replaced by local retry); ADR-0015 (janitor escalates instead of re-queueing; the heartbeat/event channel carries telemetry under the restated invariant); ADR-0002 phrasing (janitorial liveness corrections are the enumerated exception to never-originates-coordination — see also ADR-0017).
+
 ## Alternatives Considered
 
 - **Marker-comment retry ledger (ADR-0014 status quo)**: rejected — distributed state in prose comments, with parsing and ordering races the fast-follow audit surfaced.
@@ -29,9 +31,12 @@ ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the re
 - **Escalate zombies before evidence, link the expected path**: rejected by the operator — faster issue turnaround is not worth escalations without complete forensics.
 - **Driver-side circuit breaker for sick nodes**: rejected — the Control Node holds the grant gate (ADR-0017) and the fleet view, so it can distinguish a failing node from a failing issue; a driver cannot.
 - **Auto-strip failed at dispatch when plan_ready is present**: rejected — launders a forgotten label into silence; a visibly stalled grant is preferable to an unnoticed failure loop.
-## Amendments (2026-08-17, ADR-0046 / #53)
 
-- **Completion retry — a second, narrower retry class beside the full local retry.**
+## Amendments
+
+- **2026-07-27 (grilling session)**: cache, never archive — made true by construction by ADR-0024. The single control database silently mixed durability classes: the encrypted secret store (ADR-0015) and per-node tokens (ADR-0023) lived in the same "deletable" file as heartbeat state and the event cache, so deleting the cache destroyed secrets and fleet enrollment. ADR-0024 splits it into `cache.db` (node/stack state, events, janitor findings, sessions, join tokens — always safe to delete) and `store.db` (encrypted secrets, per-node tokens — the backup set). This ADR's rule stands; its storage now obeys it.
+
+- **2026-08-17 (ADR-0046 / #53) — Completion retry**, a second, narrower retry class beside the full local retry.
   A COMPLETED session whose Output Proposal fails validation (missing or invalid
   required fields — most commonly `commit-message`) gets exactly one **completion
   retry**: a new container, a new run_id, and its own evidence bundle, but with the
@@ -59,6 +64,6 @@ ADR-0014's failed-Run path (release the claim, re-queue plan_ready, track the re
   single full local retry regardless of class, and a schema-version mismatch
   detected pre-work (ADR-0046) lands in the existing pre-session infra class.
 
-## Amendments (2026-07-27, grilling session)
+## Relevant PRs
 
-- **Cache, never archive — made true by construction by ADR-0024.** The single control database silently mixed durability classes: the encrypted secret store (ADR-0015) and per-node tokens (ADR-0023) lived in the same "deletable" file as heartbeat state and the event cache, so deleting the cache destroyed secrets and fleet enrollment. ADR-0024 splits it into `cache.db` (node/stack state, events, janitor findings, sessions, join tokens — always safe to delete) and `store.db` (encrypted secrets, per-node tokens — the backup set). This ADR's rule stands; its storage now obeys it.
+- #53 — implemented the ADR-0046 completion-retry class.

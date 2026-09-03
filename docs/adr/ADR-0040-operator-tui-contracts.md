@@ -2,11 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-05 (M9 correction pass folded in the same day: the failure-class ruling accepted, degraded attach fails closed, the run reduction made complete across event pages, Stacks render the desired/actual union, client-side follow gaps disclosed)
 
-Provenance: delegated decisions from the M9 brief (Operator TUI) — the ADR-0015 amendment text, attach-command delivery, degraded-mode rendering, and the panel/keybinding/cadence surface (documented in `--help`, per the brief; recorded here only where something surprising emerged). Implements the "Grilling 2026-08-04" Operator-TUI rulings in NODE-SUBSTRATE.md and the M9 correction-pass ruling on terminal failure classes; consumes ADR-0022 (attach hardening, 150 s threshold), ADR-0038 (events read view), ADR-0039 (state read model, server-clock rule); amends ADR-0015 (dependency exception, state-document keys, terminal run-event schema).
-
 # ADR-0040: Operator TUI contracts — read-model keys, pure-consumer enforcement, and the terminal failure-class channel
 
 ## Context
+
+This is a set of delegated decisions from the M9 brief (Operator TUI) — the ADR-0015 amendment text, attach-command delivery, degraded-mode rendering, and the panel/keybinding/cadence surface (documented in `--help`, per the brief; recorded here only where something surprising emerged) — implementing the "Grilling 2026-08-04" Operator-TUI rulings in NODE-SUBSTRATE.md and the M9 correction-pass ruling on terminal failure classes; it amends ADR-0015 (dependency exception, state-document keys, terminal run-event schema) and consumes ADR-0022 (attach hardening, 150 s threshold), ADR-0038 (events read view), and ADR-0039 (state read model, server-clock rule).
 
 `theozolith top` (M9) is a Textual application in the operator CLI: a pure API consumer over loopback with the admin bearer token, same endpoints as any remote client, reaching capability parity with the frozen web surface for routine operations. The brief fixed the surface (read panels; exactly three writes; print-only attach assistance; read-only settings) and forbade inventing endpoints beyond M8's. Implementing it surfaced four data needs the M8 read models did not carry, and one datum the channel itself does not carry.
 
@@ -75,7 +75,7 @@ Transcript tails, event payloads, error messages, and every other agent-adjacent
 - **Negative**: five constants exist twice (pinned by test, but still twice); the run index costs a one-time bootstrap walk over the retained run history (bounded, disclosed if truncated) and holds one event per retained issue client-side; the worker event schema gained one field, so event consumers now see two generations of terminal events (handled by the explicit legacy rendering).
 - **Neutral**: Textual adds a dependency to the one component that already has five; the web surface is untouched (no template, static, or cookie-route diffs).
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **A server-side `/api/v1/runs` (or `/api/v1/settings`) endpoint**: new read endpoints beyond M8's, which the brief reserves for a grilling; the state document and events view already carry the facts.
 - **Importing `web.views`/`web.terminal`/`worker.evidence` from the TUI for shared constants**: drags the web surface (and its FastAPI import graph) or worker internals into the pure-consumer tree; mirror-pinned redeclaration keeps the boundary machine-checked from both sides.

@@ -21,6 +21,7 @@ Infrastructure command authority sits with the Control Node; issue coordination 
 - **Positive**: one control service and one dashboard instead of two; the legacy Home Server node agent is retired in favor of the product's Node Agent; the substrate gets dogfooding from a second real consumer; the open-source story improves because the fleet layer is part of the product.
 - **Negative**: the product's surface grows beyond the pipeline (fleet agent, command protocol) with more to maintain and document; constant pressure for private needs to leak into public interfaces, held back only by the admission rule; the private deployment must migrate its existing setup scripts and agent onto the Node Agent.
 - **Neutral**: ADR-0004's private-to-public dependency rule is unchanged and strengthened; ADR-0004's two-separate-control-services consequence is superseded.
+
 ## Alternatives Considered
 
 - **Two separate control services (ADR-0004 original)**: rejected — duplicated heartbeat/dashboard code once both systems exist.

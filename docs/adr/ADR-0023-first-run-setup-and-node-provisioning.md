@@ -1,14 +1,12 @@
-Status: ACCEPTED — amended 2026-08-01 by ADR-0034 (IP browser origin, root-mediated setup); amended 2026-08-04 by ADR-0036 (lazy browser enablement — see Amendments); amended 2026-08-05 by ADR-0041 (the shim owns the bootstrap environment — the managed invocation is `sudo python3 build.py`)
+Status: ACCEPTED
 
 Date: 2026-07-27
-
-Provenance: designed in a chat working session 2026-07-26/27; authored directly in Notion (ADR-0001). Amends ADR-0015 (config surface, node-token model, installer flow); supersedes ADR-0018's admin-credential-and-session section (separate browser password, stateful revocable sessions — password rejection reversed); builds on ADR-0022 (public origin, session cookie, per-deployment TLS); leaves ADR-0006 unchanged (Stack/image config editing stays git-native). Storage locations named here are refined by ADR-0024 (Control Node storage partition and recovery).
 
 # ADR-0023: First-run setup — unified init, settings surface, and join-string node provisioning
 
 ## Context
 
-V1 setup is `.env`-driven: the operator hand-edits environment files in the repo/deploy directory before anything runs. The goals are (1) initialization on the Control Node generates everything needed for the web dashboard to be reachable, (2) all remaining settings and access tokens are entered through the dashboard, (3) dashboard access is password-protected with a session cookie, and (4) configuration lives in the config folder, never the repo directory. The governing constraints: the dashboard cannot configure what it depends on (bootstrap chicken-and-egg); config editing is git-native per ADR-0006 and the M3/M4 briefs (web config editor is post-V1); `nodedaemon/` stays stdlib-only (ADR-0010/0015); the trusted-network, single-operator model is unchanged (ADR-0022).
+V1 setup is `.env`-driven: the operator hand-edits environment files in the repo/deploy directory before anything runs. The goals are (1) initialization on the Control Node generates everything needed for the web dashboard to be reachable, (2) all remaining settings and access tokens are entered through the dashboard, (3) dashboard access is password-protected with a session cookie, and (4) configuration lives in the config folder, never the repo directory. The governing constraints: the dashboard cannot configure what it depends on (bootstrap chicken-and-egg); config editing is git-native per ADR-0006 and the M3/M4 briefs (web config editor is post-V1); `nodedaemon/` stays stdlib-only (ADR-0010/0015); the trusted-network, single-operator model is unchanged (ADR-0022). This decision amends ADR-0015's config surface, node-token model, and installer flow, and supersedes ADR-0018's admin-credential-and-session section (separate browser password, stateful revocable sessions — reversing ADR-0018's password rejection); storage locations named here are later refined by ADR-0024.
 
 ## Decision
 
@@ -21,6 +19,7 @@ V1 setup is `.env`-driven: the operator hand-edits environment files in the repo
 3. `tls-init` — per-deployment CA and server certificate (ADR-0022). The server cert additionally carries the Control Node's IP address in its SAN, so nodes and browsers reaching it by IP present a valid certificate once the CA is trusted.
 4. Prompt for the admin password (new); store only its hash.
 5. Print the operator handoff: the dashboard URL, the DNS record to create (exact `/etc/hosts` line or router entry), the CA download URL, and per-OS trust instructions (macOS `security add-trusted-cert` one-liner, Firefox store note, iOS profile steps).
+
 Init automates generation completely; the two irreducibly manual actions (DNS record, CA trust per device) get exact copy-pasteable instructions rather than prose. Re-running init requires `--force`, matching `origin-init` semantics.
 
 ### Configuration surface: four tiers
@@ -40,6 +39,7 @@ Init automates generation completely; the two irreducibly manual actions (DNS re
 - **Hashing**: stdlib `hashlib.scrypt` — memory-hard, no new dependency. Fernet is encryption, not password hashing, and is not used here.
 - **Sessions**: server-side session table in `cache.db` (ADR-0024 — deleting it costs a re-login, nothing more). The cookie (shape fixed by ADR-0022: `__Host-ozolith_session`, Secure, HttpOnly, SameSite=Strict) carries only a random 128-bit session ID — nothing decodable client-side. Absolute expiry, default 30 days (`session_days` in `control.toml`). Logout deletes the row; a password change truncates the table. Signed stateless cookies were rejected: they save nothing at this scale and cost revocation.
 - **Login hardening**: constant-time comparison and rate limiting on the login form. The 128-bit origin slug is defense in depth (ADR-0022); the password check must stand alone.
+
 ### CA role and distribution
 
 The CA exists for **server authentication and channel integrity**: nodes and browsers verify they are talking to the real Control Node, which is what makes the TLS channel MITM-proof — critical because secrets ride it (ADR-0015). Client authentication is the bearer tokens and the password/cookie; the CA plays no part in it. The CA is minted once at init; its private key never leaves the Control Node — only the public certificate is distributed.
@@ -47,6 +47,7 @@ The CA exists for **server authentication and channel integrity**: nodes and bro
 - **Bootstrap endpoint**: the Control Node serves `{CA certificate, public origin, canonical control URL}` unauthenticated over a **dedicated plaintext bootstrap listener** on its own port (default documented; nonstandard ports ride in the join-string payload) — GET-only, no auth, no state, no cookies, never mounted on the HTTPS app, so ADR-0022's fail-closed origin posture is untouched. Its route table is closed by decision, not convention: these three inert values and nothing else, ever. The channel is safe not because it is trusted but because every byte on it is public and the one value that matters — the CA certificate — is integrity-checked against the join string's pinned fingerprint. **Code never rides it**: the installer and node distribution are fetched over channels with pre-existing trust (the GitHub release over WebPKI HTTPS, or `scp` from the Control Node for air-gapped setups); a plaintext-fetched installer would be remote code execution for a LAN MITM before any verification runs. Browsers downloading the CA cert for device trust have no fingerprint to check; trust there flows from the operator having received the URL from init output over the trusted network — recorded, not fixed, matching ADR-0022's defense-in-depth posture. `provision` fetches the CA cert from this listener for fingerprint verification.
 - **Escape hatch**: operators who own a public domain may substitute a publicly valid certificate (e.g. Let's Encrypt DNS-01) for the minted CA, deleting the per-device trust step. Opt-in, never default; requires no product changes beyond accepting the operator-supplied cert paths.
 - IP-literal browser origins remain rejected (ADR-0022 reaffirmed): an IP origin removes only the DNS step, still requires CA trust to avoid warnings, breaks on DHCP, and forfeits the slug's entropy for no friction saved.
+
 ### Node provisioning: the join string
 
 Provisioning a physical node is one paste:
@@ -62,11 +63,13 @@ The operator never composes this line: `theozolith join-token create` prints the
 - **No manual fingerprint step, no fingerprint-less fallback.** Verification is the machine's job; trust flows from where the join string came from (an authenticated dashboard session or SSH on the Control Node). A human visual check after joining is theater and too late. `provision` requires a join string, full stop: nothing transmits until a machine-checked fingerprint passes.
 - **Failure modes fail closed and loud**: bad checksum → malformed paste; fingerprint mismatch → "possible MITM **or stale join string after CA rotation**" with nothing transmitted; expired/consumed/revoked token → clean rejection after TLS with nothing persisted. Re-minting the CA invalidates every outstanding join string by construction — a feature, distinguished in the error text so legitimate re-inits don't read as attacks.
 - The provision CLI ships in the stdlib-only node distribution: `ssl`, `hashlib`, `urllib`, `base64` cover the whole flow.
+
 ### Join token semantics
 
 - Minted on the Control Node: `theozolith join-token create` (CLI or dashboard), default **1 hour TTL, single-use**, consumed on successful exchange. `--ttl` and `--uses` widen it for batch provisioning sessions. `join-token revoke` is the backstop for the oops case.
 - The join token is **never the node token**. It is exchanged over verified TLS for a freshly minted per-node token; the join string is disposable, the per-node token is what persists.
 - Long-lived revocable join tokens were rejected as the default: a standing "add a node anytime" credential is a second admin password with worse hygiene (shell history, scrollback).
+
 ### Per-node tokens
 
 Provisioning mints a unique bearer token per node, recorded as `{node, token}` in `store.db` (ADR-0024). This deletes the shared-node-token weakness ADR-0015 accepted ("any node can heartbeat as any other") at zero extra cost, and makes revocation per-node. Per-node tokens never expire — nodes are long-lived by design; removing a node from the fleet is explicit revocation, not credential lapse. The admin password never touches a provisioned node.
@@ -82,12 +85,14 @@ Provisioning mints a unique bearer token per node, recorded as `{node, token}` i
 - **Human commands live on the Control Node only.** `theozolith` is the operator CLI — an installed console-script entry point from the package, never a script run out of the repo directory: `update`, `build`, `test`, `join-token create|revoke`. `theozolith-control` is the service-admin entry point for the machine it runs on: `init`, `origin-init`, `tls-init`, `serve`, `recover` (ADR-0024). *(Amended by ADR-0032, 2026-07-30: the two entry points fold into one `theozolith` CLI carrying both halves; `theozolith-control` survives one release as a deprecated alias.)*
 - **Nodes have no human CLI grammar.** The node distribution ships only `theozolith-nodedaemon` (the daemon plus the `provision` subcommand); the sole node-side interaction is pasting the line `join-token create` printed. The earlier `theozolith provision` spelling is renamed accordingly — the operator-CLI name is not installed on nodes.
 - **Bootstrap from source**: `theozolith build` cannot be the first command — it presupposes an installed CLI. A fresh checkout bootstraps with `build.py` in the repo root: a thin shim over the same build implementation `theozolith build` wraps (one implementation, two entry paths — they cannot drift), producing the same artifacts and finishing by installing the `theozolith` and `theozolith-control` entry points. From then on, source-based updates are `theozolith build` (ADR-0015 as amended 2026-07-22: builds from the checkout, pins the committed SHA, serves the artifact for node pulls). `build.py` is the sole exception to "never a script run out of the repo directory" — it exists to end that state. *(Amended by ADR-0041, 2026-08-05: the shim also owns the bootstrap environment — the managed invocation is `sudo python3 build.py`, which creates-or-reuses the `/opt/theozolith` venv, re-executes inside it, and atomically publishes the `theozolith`, `theozolith-control`, and `theozolith-nodedaemon` links into `/usr/local/bin`; only `python3 build.py --venv PATH`, the unmanaged escape hatch, runs unprivileged and links nothing.)*
+
 ## Consequences
 
 - **Positive**: setup collapses to init → paste join string per node → enter tokens in the dashboard; every generated secret and setting lives under the `~/.theozolith/` partition (ADR-0024), none in the repo; the provisioning handshake is MITM-proof without manual hash comparison; per-node tokens arrive for free; `.env` archaeology is gone; the CA-trust and DNS steps — the only manual residue — ship with exact instructions.
 - **Negative**: two manual per-device actions (DNS record, CA trust) survive unless the operator brings a public domain; a new bootstrap endpoint and session table widen `control/` slightly; existing deployments must migrate env-var settings into `control.toml` and re-provision nodes to get per-node tokens.
 - **Neutral**: ADR-0006 is untouched — Stack/image topology stays git-native and a web config editor remains post-V1; the admin bearer token and secret-store mechanics of ADR-0015 are unchanged; ADR-0022's origin/cookie/TLS decisions are consumed as-is.
-## Alternatives rejected
+
+## Alternatives Considered
 
 - **IP-literal origin instead of hostname + CA**: removes only the DNS step; CA trust is still required for warning-free HTTPS, DHCP breaks a pinned-IP origin, and the slug's entropy is forfeited (ADR-0022's fail-closed origin parsing stands).
 - **Plain HTTP over IP**: violates the TLS-mandatory secret channel (ADR-0015) and the Secure-cookie requirement (ADR-0022).
@@ -98,6 +103,9 @@ Provisioning mints a unique bearer token per node, recorded as `{node, token}` i
 - **Signed stateless session cookies**: no benefit at single-operator scale and revocation becomes impossible; a SQLite session table is boring and sufficient.
 - **Web config editor for Stack/image topology**: reverses ADR-0006 and the M3/M4 scope decisions; dashboard-writes-git needs its own brief (git identity, conflict handling, validation UX) — deferred, not rejected on the merits.
 
-## Amendments (2026-08-04, ADR-0036)
+## Amendments
 
-- **The unified-init scope shrinks to the machine surface**: the admin password prompt (step 4 above) and every browser-facing handoff step leave `init`, which now composes master key → admin bearer token → control address → CA + server certificate with IP SANs only → systemd unit → handoff. The reinstated `origin-init` is the opt-in browser step, prompting for the browser origin **and** the admin password together — both browser-only credentials of this ADR's two-credentials split. The fail-closed posture moves from serve startup into the request path: while no origin is persisted, the web surface refuses per-request. See ADR-0036.
+- **2026-07-30 (ADR-0032)**: the two CLI entry points fold into one `theozolith` CLI carrying both halves; `theozolith-control` survives one release as a deprecated alias.
+- **2026-08-01 (ADR-0034)**: IP browser origin, root-mediated setup.
+- **2026-08-04 (ADR-0036)**: the unified-init scope shrinks to the machine surface — the admin password prompt (step 4 above) and every browser-facing handoff step leave `init`, which now composes master key → admin bearer token → control address → CA + server certificate with IP SANs only → systemd unit → handoff. The reinstated `origin-init` is the opt-in browser step, prompting for the browser origin **and** the admin password together — both browser-only credentials of this ADR's two-credentials split. The fail-closed posture moves from serve startup into the request path: while no origin is persisted, the web surface refuses per-request.
+- **2026-08-05 (ADR-0041)**: the shim also owns the bootstrap environment — the managed invocation is `sudo python3 build.py`, which creates-or-reuses the `/opt/theozolith` venv, re-executes inside it, and atomically publishes the `theozolith`, `theozolith-control`, and `theozolith-nodedaemon` links into `/usr/local/bin`; only `python3 build.py --venv PATH`, the unmanaged escape hatch, runs unprivileged and links nothing.

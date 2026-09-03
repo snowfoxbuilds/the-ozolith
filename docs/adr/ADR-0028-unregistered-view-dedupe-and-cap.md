@@ -2,13 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-07-28
 
-Provenance: delegated decision from the M7 brief; implements ADR-0023's unregistered-nodes view.
-
 # ADR-0028: Unregistered-view dedupe key, size cap, and eviction
 
 ## Context
 
-Heartbeats bearing unknown or revoked tokens are rejected 401 and surfaced as an advisory "unregistered nodes" view — display built from unauthenticated input, so it must be deduplicated and size-capped by construction (ADR-0023). Key, cap, and eviction were delegated.
+Heartbeats bearing unknown or revoked tokens are rejected 401 and surfaced as an advisory "unregistered nodes" view — display built from unauthenticated input, so it must be deduplicated and size-capped by construction (ADR-0023). Key, cap, and eviction were delegated (M7 brief).
 
 ## Decision
 
@@ -17,7 +15,7 @@ Heartbeats bearing unknown or revoked tokens are rejected 401 and surfaced as an
 - **Eviction: oldest `last_seen` first**, applied at insertion time past the cap. The view's value is "what is heartbeating at me *now*"; anything evicted while still live re-inserts itself within one heartbeat interval, so eviction can never lose a live signal for longer than that.
 - A successful provisioning (join exchange) and every authorized heartbeat delete sightings under that node's name — the worklist shrinks by itself.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Unbounded table with a janitor sweep**: unauthenticated input must be bounded at the write, not cleaned up on a cadence.
 - **LRU by first_seen**: evicts the longest-suffering node — exactly the one the operator most needs to see.
