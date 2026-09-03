@@ -1668,15 +1668,16 @@ recorded as an accepted residual risk rather than claimed away.
   review's shape): rejected (2026-09-03, #117, fourth review) — a followed
   hop attaches the credential to a target the intent record never named, so
   a summary written after the fact is not write-ahead for that hop, and a
-  crash between hops would leave the sink unable to say where the credential
-  last went; the accounting objection that produced the completion-only
+  crash between hops would leave the sink unable to name the last target
+  whose credential use was authorized; the accounting objection that
+  produced the completion-only
   shape is met by correlating each redirect-intent record by sequence and
   hop number, which interleaves safely under concurrency, and by reserving
   three hops' capacity per request.
 - **Truncating an oversize record to a fixed marker** (the fourth review's
   shape): rejected (2026-09-03, #117, fifth review) — a marker written in
-  place of an intent or redirect-intent records that a credentialed
-  request or hop happened without saying where, so the write-ahead
+  place of an intent or redirect-intent records that a request or hop was
+  authorized without saying against what, so the write-ahead
   invariant would be satisfied by a record that names no target;
   serializing and measuring before the write, refusing what does not fit,
   and giving every kind a schema whose mandatory fields cannot be dropped
