@@ -1,0 +1,38 @@
+Status: ACCEPTED
+
+Date: 2026-09-03
+
+# ADR-0057: Declarative worker types — kind, intake, outputs, prompt
+
+## Context
+
+Issue #120 asked the pipeline to act on Baseline Risk: route `risk:high` work out of automation into the Flight Deck and vary review depth for `low`. Each such rule was another hardcoded label check in `dispatch.py` and `reviewer.py`, on top of ADR-0020's inheritance taxonomy (Implementer, Reviewer, Initializer as classes), ADR-0046's per-class Output Proposal schemas, and prompts compiled into the driver. A tester that works completed PRs, or a second Reviewer with a lighter pass, meant a subclass and a product release. Grilling 2026-09-03 chose to make the wiring data.
+
+## Decision
+
+- **A worker type is a declaration.** Its Worker-Type Definition carries `on` (`issue` | `pr` — Issue Worker or PR Worker), `[intake]` (`requires`, `excludes`, `one_of` groups, `consumes`), `[output]` (a fields allowlist, the Outcome Table, named label groups, an issue→PR mirror map), `prompt` (a Config Repo template), `rounds` (PR Workers), and `[chain_on]`. Implementer, Reviewer, and Initializer become shipped default definitions; the code has no per-type subclasses. Unknown definition keys are refused at ingest. [WORKER-MODEL.md](../specs/WORKER-MODEL.md) is the authoritative page; ADR-0020 is superseded.
+- **Labels are the wiring.** An Intake reads its trigger object's labels only; outputs write labels only through declared groups and outcomes. The Core Labels — `in_progress`, `failed`, `attempt-N` — are written by fixed product mechanics and can appear in no Intake, group, or outcome; `failed` blocks dispatch for every worker on either object of the pair until a human removes it. Product-fixed lanes still write shipped vocabulary (`failed` + `needs_human` on failure, `blocked` + `needs_human` on round exhaustion and janitor drift).
+- **Both kinds claim the issue:PR set.** One issue has exactly one PR (`ozolith/issue-N`, the only PR → issue resolution). The Control Node writes every claim — worker login and `in_progress` on the pair's issue, the definition's `consumes` labels removed atomically — for PR Workers exactly as for Issue Workers; spoken for means `in_progress`, human assignees never block, and release removes the worker's own login. ADR-0017's "the Reviewer side is discovery-only" and ADR-0056's review-specific machinery (per-actor discovery leases, the `theozolith.review` `phase="started"` activation handshake, per-PR activation exclusivity, re-rounding) are retired unbuilt: a PR Worker's claim is the exclusivity and the lease anchor.
+- **Outcome Table.** The agent picks exactly one declared outcome; the definition maps it to label writes on both objects, to companion fields it requires, and to whether it loops back to an Issue Worker. `attempt-N` counts loops — shared per PR, compared against each PR Worker's `rounds`; a looping outcome is refused at write time on the final round; ingest refuses a definition whose non-looping outcomes cannot leave the object outside its own Intake.
+- **Output Proposal per definition.** The schema is derived from the declared fields and stamped into the job manifest; text fields are pre-populated with the current agent-owned zone (edit = overwrite, absent = unchanged); driver-owned zones — Closes, Based-on, Resume-at, Decisions Section framing — stay outside every field; `pr_contents` makes the rich commit message and the Decisions Section mandatory; the resume point is a typed output stored in the Resume-at zone, never a comment machine block.
+- **Prompt in the definition.** The instruction prompt is a Config Repo file, content-hashed and pinned at ingest, carried in the Config Distribution, rendered per Run by the driver with a fixed placeholder set; the product appends a Contract Appendix no definition can remove; a prompt hard-coding read-surface paths is refused. The prompt's content hash joins the definition's instruction hash — identity-bearing though delivered driver-side, so a prompt edit re-tags the derived image (a cached rebuild) and identity-hash equality keeps meaning "same behavior"; the routing fields (`on`, intake, outputs, `rounds`, `chain_on`) are behavior, not identity, like driver and workspace.
+- **Failure lanes by kind.** Issue Workers keep the local and completion retries; PR Workers get none; every no-outcome ending is `failed` + `needs_human` on the trigger object. Round exhaustion alone stays `blocked` + `needs_human`.
+- **Chained Base go-ahead is declared.** `[chain_on]` names the blocker-PR label state that grants early start; absent means wait for merge.
+- **Label bootstrap derives from the Pinned Build**: Core Labels plus every label any bound definition names, with an optional `[labels]` table for color and description.
+- **The shipped default realizes #120's routing.** The Implementer's Intake is `requires = ["plan_ready"]`, `one_of = [["risk:low", "risk:medium", "risk:high"]]`, `excludes = ["risk:high"]`, `consumes = ["plan_ready"]`, with the issue's `risk:*` mirrored to the PR as `baseline:*`; `risk:high` work is unrouted — surfaced for the Flight Deck, its PR reviewed via `pr_ready`. Two Reviewer definitions ride the mirror: thorough (`excludes baseline:low`, `rounds = 3`) and reduced (`requires baseline:low`, `rounds = 2`, a lighter prompt). Routing is configuration; the product ships no risk rule.
+
+## Consequences
+
+- **Positive**: a new worker is a new definition, not a release; routing, depth, and vocabulary are operator data checked for self-consistency at ingest; one claim path for both kinds replaces the unbuilt review lease and handshake design; every pipeline transition is either a Core Label mechanic or a declared outcome — nothing is parsed out of model prose; the hardcoded label checks that #120 would have multiplied are gone.
+- **Negative**: the Config Repo becomes load-bearing for pipeline semantics — ingest catches structural loops, not bad judgment in an outcome table; a large migration across dispatch, runner, reviewer, proposal, bootstrap, configrepo, and the bench contract, sequenced so the shipped defaults reproduce today's behavior before any new type exists; ADR-0056's review lane is discarded unbuilt.
+- **Neutral**: ADR-0008, 0014, 0016, 0017, 0021, 0044, 0046, 0053, 0054, and 0056 are amended; ADR-0020 is superseded; [AGENTIC-CODING-PIPELINE.md](../specs/AGENTIC-CODING-PIPELINE.md) becomes the shipped configuration of the Worker Model.
+
+## Alternatives Considered
+
+- **Hardcode the `risk:high` exclusion and a depth variant in the Reviewer**: rejected — one more rule in the machine, and every future routing need is a product release.
+- **Per-Stack routing overrides**: rejected — Stacks stay generic (ADR-0047's enumerated exceptions only); two Stacks needing different intake are two worker types.
+- **Cross-object intake (a PR selector reading the issue's labels)**: rejected — a GitHub read per candidate per pass, and it breaks the symmetry of the two kinds; the mirror map covers the need without agent choice.
+- **Flat independent output fields coordinated by the prompt alone**: rejected — an agent could emit `revise` without the re-queue, reintroducing trust in model prose through the side door.
+- **Keep review discovery-only with ADR-0056's activation handshake**: rejected — the handshake existed only because review had no claim.
+- **A mandatory namespace prefix for operator labels**: rejected — refusing Core Labels is the safety property; the operator owns the repo's label space.
+- **Globs in selectors (`risk:*`)**: rejected — `one_of` groups and exact-name maps express the same with checkable semantics.

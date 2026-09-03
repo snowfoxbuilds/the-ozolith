@@ -1,10 +1,10 @@
 Status: DRAFT
 
-Last updated: 2026-08-28
+Last updated: 2026-09-03
 
 # Bench Contract
 
-TheOzolith's published export surface for benchmarking worker types off-fleet: the Candidate Bundle format, the candidate identity spec, the standalone build path, and the Run Contract an external bench harness replays for implementer and review modes.
+TheOzolith's published export surface for benchmarking worker types off-fleet: the Candidate Bundle format, the candidate identity spec, the standalone build path, and the Run Contract an external bench harness replays for Issue Worker and PR Worker modes.
 
 ## Context
 
@@ -20,9 +20,9 @@ Versioning promise (grilling 2026-08-28): visibility, not immutability. No part 
 
 Three compatibility keys own the entire contract; every public surface maps to exactly one of them (review 2026-08-28):
 
-- **`schema_version`** (currently 1, stamped in the job manifest) owns the Run Contract: job-dir layout, the Output Proposal schemas for both modes, the production prompt-renderer entry points, the PR-body-composition entry point, the gate entry points, proposal validation, and every other exposed Run behavior. The format-output CLI already asserts it on every invocation; bench records it per run.
+- **`schema_version`** (currently 1, stamped in the job manifest) owns the Run Contract: job-dir layout, the derivation of the Output Proposal schema from a candidate's declared output fields (grilling 2026-09-03), the production prompt-renderer entry point (operator template + product Contract Appendix), the PR-body-composition entry point, the gate entry points, proposal validation, and every other exposed Run behavior. The format-output CLI already asserts it on every invocation; bench records it per run.
 - **`bundle_format_version`** (currently 2, stamped in `candidate.json`) owns the Candidate Bundle: the `candidate.json` schema, the required-and-allowed set of build-context entries, export output, bundle-structure verification, and verified standalone-build behavior.
-- **`identity_spec_version`** (currently 2, stamped in `candidate.json`) owns candidate identity: the canonical serialization, the materialized-setup inputs, the conditional `knowledge_target` and `policy`/`policy_pin` keys, the tree-hash function (knowledge and policy pins share it), and the identity-triple computation.
+- **`identity_spec_version`** (currently 2, stamped in `candidate.json`) owns candidate identity: the canonical serialization, the materialized-setup inputs, the conditional `knowledge_target` and `policy`/`policy_pin` keys, the prompt template's ref and pin (grilling 2026-09-03 — lands as a `bundle_format_version` and `identity_spec_version` bump recorded in the Changelog when implemented), the tree-hash function (knowledge and policy pins share it), and the identity-triple computation.
 
 CLI invocation syntax (`theozolith candidate …` commands, flags, arguments) is governed by the product's public CLI and version policy and its changelog, not by these keys: a CLI-only syntax change bumps no contract version, while any change to the emitted bundle or to identity semantics bumps `bundle_format_version` or `identity_spec_version` respectively.
 
@@ -33,7 +33,8 @@ The Candidate Bundle is the self-contained export of one worker-type definition 
 - Producer: `theozolith candidate export --source <dir> --type <worker-type> --out <dir>`. The source is an already-materialized **local** config-repo-shaped directory (`worker-types/` + `knowledge/` + `policy/`) — v1 accepts nothing else (review 2026-08-28): URLs and non-directory sources are rejected with a clear error, and remote Git fetching, Git authentication, ref resolution, submodules, and LFS are explicit non-goals. Callers resolve and clone repositories themselves — preferably at an immutable commit — and pass the resulting tree. Export runs the same resolution machinery as `theozolith config ingest` — per-tool knowledge compilation, base tag→digest resolution, pin computation, instruction hash — but writes a bundle and touches no Pinned Build (grilling 2026-08-28). Benchmark variants never enter deployment config history; equivalence with a deployed image is proven by identity-hash equality, not shared provenance.
 - Private-base credentials ride the Docker-compatible pull-credential model, never argv (review 2026-08-28): export discovers the pull credential from a caller-supplied `DOCKER_CONFIG` directory — static auths or a credential helper — since the Fernet store is absent off the Control Node; the public first-party base resolves through the anonymous fast path with no credential at all. The credential serves exactly two operations — base digest resolution at export and the private-base pull at build — and is never copied into `candidate.json`, the bundle, a temporary build context, image layers, logs, diagnostics, or evidence. A credential failure names the registry host and the remediation, never usernames, tokens, authorization headers, Docker config contents, or credential-helper output. Temporary credential material a caller stages is the caller's to create with owner-only permissions and to remove afterwards — there is no second credential store.
 - Contents:
-  - `candidate.json` — the machine manifest: worker-type name, adapter, base ref + resolved digest, setup instructions, model, effort, knowledge ref + pin + target, the baked Agent Policy ref + pin (empty for a driverless candidate), the computed instruction hash, and non-identity metadata (driver reference, secret slot names, product version, bundle-format and identity-spec versions, export timestamp).
+  - `candidate.json` — the machine manifest: worker-type name, adapter, base ref + resolved digest, setup instructions, model, effort, knowledge ref + pin + target, the baked Agent Policy ref + pin (empty for a driverless candidate), the prompt template ref + pin and the candidate's kind and declared output fields (grilling 2026-09-03), the computed instruction hash, and non-identity metadata (driver reference, secret slot names, product version, bundle-format and identity-spec versions, export timestamp).
+  - The operator prompt template under `prompts/`, byte-identical to what the deployment's Config Distribution delivers, verifiable against its recorded pin (grilling 2026-09-03).
   - The compiled knowledge tree for the candidate's adapter tool only — byte-identical to what the derived image `COPY`s into the agent home, verifiable against the knowledge pin with the published tree-hash function. The raw knowledge source is never vendored (grilling 2026-08-28).
   - The baked Agent Policy tree under `policy/`, when the candidate declares one — validated by the same safe-key allowlist a deployment applies, at export and again at verification, byte-identical to what the derived image `COPY`s into the managed drop-in directory, verifiable against the policy pin with the same published tree-hash function.
   - A generated `Dockerfile`, emitted by the same codegen the Node Daemon uses — never a reimplementation.
@@ -41,9 +42,9 @@ The Candidate Bundle is the self-contained export of one worker-type definition 
 
 ### Candidate identity
 
-Candidate identity is the triple (base image digest, instruction hash, adapter name) (SilverquiLLM-bench#39; adapter name ruled sufficient — adapter/CLI version is run metadata, grilling 2026-08-28). The instruction hash is the production formula: sha256 over the canonical JSON of base, materialized setup (operator setup plus the synthesized model/effort materialize instruction), knowledge ref, knowledge pin, — only when non-default — knowledge target, and — only when a driver type bakes an Agent Policy tree — the policy ref and policy pin (policy-less and driverless identities stay byte-stable). Excluded from identity: driver reference, workspace, secret slots, worker-type name.
+Candidate identity is the triple (base image digest, instruction hash, adapter name) (SilverquiLLM-bench#39; adapter name ruled sufficient — adapter/CLI version is run metadata, grilling 2026-08-28). The instruction hash is the production formula: sha256 over the canonical JSON of base, materialized setup (operator setup plus the synthesized model/effort materialize instruction), knowledge ref, knowledge pin, — only when non-default — knowledge target, — only when a driver type bakes an Agent Policy tree — the policy ref and policy pin (policy-less and driverless identities stay byte-stable), and the prompt template's ref and pin (grilling 2026-09-03: a definition with a different prompt is a different candidate). Excluded from identity: driver reference, workspace, secret slots, worker-type name.
 
-- A candidate is kind-agnostic: nothing in the bundle or its identity says implementer or reviewer. The run kind is a benchmark-mode property, mechanically real because the job manifest's `mode` field alone selects the Output Proposal schema — the same derived image executes either kind (grilling 2026-08-28).
+- The benchmark mode is the candidate's declared kind — Issue Worker or PR Worker — and the Output Proposal schema derives from the candidate's declared output fields, carried to the container by the job manifest, rather than from a hardcoded implementer/reviewer `mode` (grilling 2026-09-03). The derived image bytes still carry no kind: the same image executes either kind, and the declaration decides (grilling 2026-08-28).
 - The identity spec is published with golden vectors (promoted from the existing control-side golden-hash tests) so any consumer can implement verification independently: [bench-identity-vectors.json](bench-identity-vectors.json), the machine-readable vectors file carrying the canonical serialization rules and, per vector, the input fields with every expected value (canonical identity string, instruction hash, identity triple, deterministic tag). The conformance tests recompute each vector through the production formula, so the file cannot drift from the code it documents.
 - A recorded identity is never trusted; it is a convenience the verifier checks (SilverquiLLM-bench#39 ruling, upheld). Verification is the full build-context authentication below, not an identity-field comparison.
 
@@ -66,29 +67,29 @@ The supported standalone build is the verify-and-build wrapper, and it operates 
 
 Raw `docker build` on the bundle directory remains mechanically possible — the bundle is a plain build context — but it is not an identity-verified build and must never produce trusted benchmark evidence; the wrapper is the supported path. No deployment machinery — Control Node, Node Daemon, heartbeats — participates. Fidelity comes from shared Dockerfile codegen plus byte-match verification, not from a second builder.
 
-### Run Contract — implementer mode
+### Run Contract — Issue Worker mode
 
-A bench implementer run is a production Implementer Run with the driver replaced by the bench harness. The bench driver materializes the same job directory the production driver would — manifest (`mode: run`, stamped `schema_version`), `input/prompt.md`, `input/issue.json`, the Context Tree for a synthetic GitHub-style issue — launches the container with the in-image agent harness as PID 1, and applies the Output Proposal after process exit exactly as the production driver would (SilverquiLLM-bench#39: full-fidelity imitation).
+A bench Issue Worker run is a production Issue Worker Run — an Implementer Run, for the shipped Implementer definition — with the driver replaced by the bench harness. The bench driver materializes the same job directory the production driver would — manifest (`mode: run`, stamped `schema_version`), `input/prompt.md`, `input/issue.json`, the Context Tree for a synthetic GitHub-style issue — launches the container with the in-image agent harness as PID 1, and applies the Output Proposal after process exit exactly as the production driver would (SilverquiLLM-bench#39: full-fidelity imitation).
 
-- The scaffolding prompt defaults to the production renderer, called through the exposed entry point below — a deviating prompt template is a benchmark-mode variable, recorded on the mode, never on the candidate (grilling 2026-08-28). The task itself arrives as the synthetic issue body plus Context Tree, exactly as production workers receive work.
+- The prompt is the candidate's own operator template plus the product Contract Appendix, rendered through the exposed entry point below; the template is identity-bearing, so a bench that substitutes a different template is benchmarking a different candidate (grilling 2026-09-03). The task itself arrives as the synthetic issue body plus Context Tree, exactly as production workers receive work.
 - The first-party gate runs (grilling 2026-08-28): a bench run without test→docs→lint measures a different thing than what deploys. The bench driver replays the production gate-step sequence over the jobs channel (`input/jobs/` ↔ `output/jobs/`); consequence for benchmark authoring, not for this contract — task repos must be gate-runnable.
-- Output: the implementer Output Proposal (pr-title, pr-description, decisions, commit-message, and the rest of the mode's fields), validated by the same rules the production driver applies.
+- Output: the Output Proposal over the candidate's declared output fields — for the shipped Implementer definition: pr title, pr body, Decisions Section entries, commit message (grilling 2026-09-03) — validated by the same rules the production driver applies.
 
-### Run Contract — review mode
+### Run Contract — PR Worker mode
 
-A bench review run is a production Review Run under the workspace-parity shape: sanitized PR-branch checkout with history, Context Tree parity (`input/issue/`, `input/pr/` including `base.md`, `changed-files.md`, `signals.md`), the judging agent running `git diff` itself.
+A bench PR Worker run is a production PR Worker Run — a Review Run, for the shipped Reviewer definition — under the workspace-parity shape: sanitized PR-branch checkout with history, Context Tree parity (`input/issue/`, `input/pr/` including `base.md`, `changed-files.md`, `signals.md`), the judging agent running `git diff` itself.
 
 - Constructibility requirement (grilling 2026-08-28): a Review Run job directory must be fully constructible from a synthetic issue, a git branch, and an implementer-contract output — no live GitHub PR. The bench driver composes `input/pr/body.md` from an implementer proposal exactly as the production driver composes a PR body (Closes line, narrative, Decisions Section), computes `base.md`/`changed-files.md`/`signals.md` from git, and leaves conversation surfaces empty for a first-round review. This one shape serves both bench styles — fixtures with planted known deficiencies, and replay-review of an implementer bench run's output.
-- Round pinning (grilling 2026-08-28): bench review runs use `round: 1, round_budget: 3` — production first-round conditions. On the final round `revise` is forbidden at write time, which would distort a benchmarked reviewer's verdict distribution.
-- Output: the reviewer Output Proposal unchanged — verdict enum, evidence prose, deviation and risk grades, revised-plan/resume-commit on revise. No structured findings field is added for benchmarking (grilling 2026-08-28): the evaluation side reads prose regardless, and the production contract is measured as deployed. Note the vocabulary: mechanical signals are driver-computed *inputs* to the judge, never reviewer output.
+- Round pinning (grilling 2026-08-28): bench PR Worker runs use round 1 against the candidate's declared `rounds` (grilling 2026-09-03) — production first-round conditions. On the final round a looping outcome (`revise`, for the shipped Reviewer) is forbidden at write time, which would distort a benchmarked reviewer's verdict distribution.
+- Output: the Output Proposal over the candidate's declared output fields, unchanged for benchmarking — for the shipped Reviewer definition: the Outcome Table choice, evidence prose, the deviation and risk label groups, and the PR comment plus resume point on the looping outcome (grilling 2026-09-03). No structured findings field is added for benchmarking (grilling 2026-08-28): the evaluation side reads prose regardless, and the production contract is measured as deployed. Note the vocabulary: mechanical signals are driver-computed *inputs* to the judge, never reviewer output.
 - Evaluation — whether the review found the known deficiencies, judged by another LLM over the proposal — is bench-side and out of this contract's scope (grilling 2026-08-28).
 
 ### Exposed entry points
 
 Driver behaviors the bench harness must reproduce byte-comparably are exposed as stable entry points in the worker package's public API rather than copied (grilling 2026-08-28) — hand-rolled copies would drift silently as production templates evolve:
 
-- Prompt renderers for both run kinds: issue fields + round + flags in, `input/prompt.md` bytes out.
-- PR-body composition: implementer proposal in, the PR body the production driver would publish out.
+- The prompt renderer for both kinds: the candidate's operator template, the product Contract Appendix, and the Run's fields (issue or PR fields, round, flags) in, `input/prompt.md` bytes out (grilling 2026-09-03).
+- PR-body composition: Issue Worker proposal in, the PR body the production driver would publish out.
 - The gate-step sequence the production driver runs.
 - `theozolith candidate export` / `verify` / the build wrapper (Control-package CLI — the resolution machinery lives there; the monorepo is public and pip-installable).
 
@@ -98,12 +99,12 @@ Every entry point maps to exactly one compatibility key (review 2026-08-28): the
 
 The implementation (the-ozolith#88) must land these test classes with the code — they pin the behaviors a consumer may rely on (review 2026-08-28):
 
-- **Golden identity vectors**: no knowledge; default knowledge target omitted from the canonical identity; non-default target included; model/effort materialization; at least the claude and codex adapters — without hardcoding the allowed adapter set into the format.
-- **Negative verification**: independent tampering with every identity-bearing manifest field; compiled knowledge bytes; the recorded knowledge pin; Dockerfile `FROM`, `RUN`, `COPY`, labels, and user; unexpected files, symlinks, traversal, and special files; missing, duplicate, malformed, and unknown manifest fields; unsupported bundle/identity versions — each must fail verification.
+- **Golden identity vectors**: no knowledge; default knowledge target omitted from the canonical identity; non-default target included; model/effort materialization; the prompt template pin (grilling 2026-09-03); at least the claude and codex adapters — without hardcoding the allowed adapter set into the format.
+- **Negative verification**: independent tampering with every identity-bearing manifest field; compiled knowledge bytes; the recorded knowledge pin; the prompt template bytes and its recorded pin; Dockerfile `FROM`, `RUN`, `COPY`, labels, and user; unexpected files, symlinks, traversal, and special files; missing, duplicate, malformed, and unknown manifest fields; unsupported bundle/identity versions — each must fail verification.
 - **Build lifecycle**: invalid bundles never invoke Docker; the wrapper builds the same private snapshot it verified; mutating the caller's original directory after staging cannot affect the build; cleanup after success, failure, timeout, and interruption; repeat builds keep the deterministic identity and tag; re-export after a moved base tag resolves a new digest and identity; a damaged archived-and-restored bundle fails until replaced or re-exported.
 - **Credentials**: public resolution is anonymous; private resolution and pull work through `DOCKER_CONFIG`; missing or refused credentials fail clearly with the host named; no secret appears in argv, manifest, bundle, logs, errors, image layers, or evidence.
 - **Sources**: local directories accepted; URLs, plain files, absent paths, and unsafe trees rejected.
-- **Run Contract**: byte-stable prompt rendering for both modes; PR-body composition; gate ordering; proposal validation; synthetic round-one review construction; schema-version mismatch refusal.
+- **Run Contract**: byte-stable prompt rendering for both kinds; Output Proposal schema derivation from declared output fields; PR-body composition; gate ordering; proposal validation; synthetic round-one review construction; schema-version mismatch refusal.
 
 ## Changelog
 
@@ -121,3 +122,4 @@ Every breaking change to a contract surface lands an entry here naming the bumpe
 | ADR-0052-codex-adapter-per-tool-knowledge | Per-tool knowledge compilation and the conditional `knowledge_target` identity key |
 | ADR-0054-candidate-bundle-bench-contract | The published bench contract: Candidate Bundle, identity spec, verified standalone build, and the Run Contract |
 | ADR-0055-flight-deck-live-surfaces | Agent Policy trees (and their pins) that join the bundle and candidate identity |
+| ADR-0057-declarative-worker-types | Worker types are declarations — kind, intake, outputs, prompt — not subclasses; the pipeline's actors are shipped default definitions |

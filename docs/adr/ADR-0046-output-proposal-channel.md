@@ -27,11 +27,15 @@ output half.
   boundary**. CLI validation is convenience, never the trust boundary: an agent
   writing the file by hand changes nothing, because the driver re-validates
   everything post-exit.
-- **Allowlist by schema**: forbidden mutations (base branch, issue state, labels,
-  needs_human, other PRs) are unrepresentable rather than validated away — there is
-  no field that could express them, and unknown fields are rejected. An absent field
-  is a no-op, never a clear.
-- Schemas are per worker type, keyed off the job manifest's mode.
+- **Allowlist by schema**: forbidden mutations (base branch, issue state, other PRs,
+  any label outside a declared group, and the Core Labels `in_progress` / `failed` /
+  `attempt-N` under every configuration) are unrepresentable rather than validated
+  away — there is no field that could express them, and unknown fields are rejected.
+  Labels are representable only through the definition's declared groups and Outcome
+  Table (amended 2026-09-03, #120). An absent field is a no-op, never a clear.
+- Schemas are derived per Worker-Type Definition from its declared output fields and
+  written into the job manifest, which the CLI reads (amended 2026-09-03, #120 — the
+  per-mode built-in schemas below are the shipped default definitions' declarations).
 - **Implementer fields**: `pr-title` (the descriptive part; the driver owns the
   `#N: ` prefix), `pr-description` (the narrative zone; the driver composes the PR
   body = Closes line + narrative + Decisions Section), the Decisions-Section entries
@@ -49,6 +53,18 @@ output half.
   final round writes for the human — signals, decisions requiring adjudication,
   findings. The driver renders the published verdict comment (human text + machine
   block) and applies labels from the validated proposal, exactly as before.
+- **Declared fields, pre-populated** (amended 2026-09-03, #120): the two field sets
+  above are the shipped Implementer's and Reviewer's declarations from the allowlist
+  {issue_body, issue_comment, issue_labels, pr_title, pr_body, pr_contents,
+  pr_labels, pr_comment, pr_resume_point}; a PR Worker writes to the linked issue
+  through the 1 issue = 1 PR link. Text fields are pre-populated with the current
+  agent-owned zone so edit = overwrite and absent = unchanged; driver-owned zones
+  (Closes line, Based-on, Decisions Section framing, the Resume-at zone) stay outside
+  the field. `pr_contents` implies the required `commit-message` and the mandatory
+  Decisions Section. The verdict is the Outcome Table — one declared outcome, whose
+  PR and issue label writes and companion-field requirements are config — and the
+  resume point is the typed `pr_resume_point`, stored in a driver-owned PR-body zone,
+  never a comment machine block.
 - The in-worktree `.theozolith/decisions.json` and its `_exclude_metadata` fence are
   retired; the proposal lives in the job dir, outside the checkout, and never needs
   excluding from commits.
@@ -143,6 +159,10 @@ output half.
 - **Coupling dispatch eligibility to schema version**: deferred — version skew fails
   loud pre-work and is visible in evidence; the coupling buys nothing until skew
   actually shows up at fleet scale.
+
+## Amendments
+
+- **2026-09-03 (#120, ADR-0057)**: the proposal schema is derived per Worker-Type Definition from its declared output fields (allowlist: issue_body, issue_comment, issue_labels, pr_title, pr_body, pr_contents, pr_labels, pr_comment, pr_resume_point) and carried in the job manifest; the built-in Implementer/Reviewer schemas become the shipped default definitions' declarations. Labels become representable — only through declared one_of groups and the Outcome Table, with the Core Labels and every undeclared label still unrepresentable. Text fields are pre-populated with the agent-owned zone (edit = overwrite, absent = unchanged; driver-owned zones untouched). The verdict generalizes to the Outcome Table; the resume point becomes the typed `pr_resume_point` output stored in a driver-owned PR-body zone instead of the verdict comment's machine block. Commit-message doctrine, driver-as-sole-boundary, schema versioning, and evidence are unchanged. Reason: new worker types must be config, so the output surface has to be declared rather than coded per type.
 
 ## Relevant PRs
 
