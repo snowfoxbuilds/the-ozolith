@@ -148,7 +148,7 @@ def create_app(
     app.state.store = store
     app.state.secret_store = secret_store
 
-    # ``github_clients`` is a per-repo client factory (ADR-0055): every
+    # ``github_clients`` is a per-repo client factory (ADR-0056): every
     # dispatch request names its repo, and all clients share the ONE control
     # PAT and api_url (v1 doctrine: one GitHub host per Control Node).
     # Memoized so a repo's rate-limit state lives in one client instance.
@@ -353,7 +353,7 @@ def create_app(
         _node_auth(request, str(body.get("node", "")) or None)
         event_type = _require(body, "type", str)
         if event_type in (EVENT_RUN, EVENT_REVIEW):
-            # Coordination events carry the repo they act in (ADR-0055):
+            # Coordination events carry the repo they act in (ADR-0056):
             # fail-closed, no compatibility fallback — a repo-less run or
             # review event can never key a coordination cache row.
             # Progress and error telemetry are unchanged.
@@ -385,7 +385,7 @@ def create_app(
             )
         worker = _require(body, "driver", str)
         login = _require(body, "login", str)
-        # The Claim Protocol is keyed by repository (ADR-0055): every request
+        # The Claim Protocol is keyed by repository (ADR-0056): every request
         # names the repo the Driver will check out and the Stack it runs as —
         # fail-closed, no compatibility fallback for a repo-less request.
         repo = _require(body, "repo", str)
@@ -396,7 +396,7 @@ def create_app(
         # pin. Fail-open on a broken Config Repo: an unreadable repo must
         # not silence dispatch — it is loudly visible everywhere else.
         # The same fail-open-on-broken-repo posture covers the config-
-        # distribution gate (ADR-0042) and the ADR-0055 Stack verification
+        # distribution gate (ADR-0042) and the ADR-0056 Stack verification
         # below. An ABSENT Config Repo (the ADR-0004 deletion-test boot) is
         # the other fail-open case, guarded explicitly: load_config answers
         # an EMPTY DeployConfig for a missing directory rather than raising,
@@ -411,7 +411,7 @@ def create_app(
         pin = config.product_version if config is not None else ""
         drivers_hash = config.drivers_hash if config is not None else ""
         if config is not None:
-            # Pinned-Build verification (ADR-0055), before the role branch:
+            # Pinned-Build verification (ADR-0056), before the role branch:
             # the named Stack must exist, be placed on the authenticated
             # node, and resolve to exactly the request's repo — else 403,
             # never a fallback to the request's repo. A verified request
@@ -422,7 +422,7 @@ def create_app(
                     status_code=403,
                     detail=(
                         f"stack {stack!r} is not in the Pinned Build;"
-                        f" request names {repo!r} (ADR-0055)"
+                        f" request names {repo!r} (ADR-0056)"
                     ),
                 )
             if named.node != node:
@@ -430,7 +430,7 @@ def create_app(
                     status_code=403,
                     detail=(
                         f"stack {stack!r} is placed on node {named.node!r}, not"
-                        f" {node!r}; request names {repo!r} (ADR-0055)"
+                        f" {node!r}; request names {repo!r} (ADR-0056)"
                     ),
                 )
             workspace = named.env.get("THEOZOLITH_REPO", "")
@@ -439,7 +439,7 @@ def create_app(
                     status_code=403,
                     detail=(
                         f"stack {stack!r} on node {named.node!r} resolves workspace"
-                        f" {workspace!r}; request names {repo!r} (ADR-0055)"
+                        f" {workspace!r}; request names {repo!r} (ADR-0056)"
                     ),
                 )
         # Off the event loop: the grant path does real GitHub round-trips
@@ -650,9 +650,10 @@ def create_app(
         if verb in ("recycle", "update") and store.release_quarantine(node):
             # Recycle/update is one of the two human quarantine releases
             # (ADR-0016; the other is the explicit unquarantine). Quarantine
-            # is node-scoped (ADR-0055): repo="" marks a node act.
+            # is node-scoped (ADR-0056): repo=None marks a node act — NULL,
+            # never a "" sentinel, on the one nullable cache column.
             store.record_janitor_action(
-                "", 0, "", "", f"node {node}: quarantine released by {verb} command"
+                None, 0, "", "", f"node {node}: quarantine released by {verb} command"
             )
         return {"id": command_id}
 
@@ -682,7 +683,7 @@ def create_app(
             store.queue_command(node, "update", None, False)
             if store.release_quarantine(node):
                 store.record_janitor_action(
-                    "", 0, "", "", f"node {node}: quarantine released by update fan-out"
+                    None, 0, "", "", f"node {node}: quarantine released by update fan-out"
                 )
         return {"version": version, "queued": nodes}
 
@@ -855,7 +856,7 @@ def create_app(
         released = store.release_quarantine(node)
         if released:
             store.record_janitor_action(
-                "", 0, "", "", f"node {node}: quarantine released by operator"
+                None, 0, "", "", f"node {node}: quarantine released by operator"
             )
         return {"released": released}
 

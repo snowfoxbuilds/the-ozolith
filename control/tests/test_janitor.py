@@ -57,6 +57,7 @@ def test_swept_evidence_releases_and_escalates_the_claim(control, github):
     assert control.admin("GET", "/api/v1/flags").json()["zombie_flags"] == []
     actions = control.store.janitor_actions()
     assert actions[0]["issue"] == 5 and "escalated" in actions[0]["reason"]
+    assert actions[0]["repo"] == "acme/sandbox"  # a repo-owned act names its repo
 
 
 def test_live_pushed_evidence_also_counts(control, github):

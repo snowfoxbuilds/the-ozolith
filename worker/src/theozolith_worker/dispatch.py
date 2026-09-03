@@ -58,7 +58,7 @@ class DispatchClient:
     Every request names ``repo`` (the repository this Driver will check out)
     and ``stack`` (the Stack it runs as) — the Claim Protocol is keyed by
     repository and the Control Node verifies the pair against the Pinned
-    Build (ADR-0055). Adding the required keyword-only constructor arguments
+    Build (ADR-0056). Adding the required keyword-only constructor arguments
     is a release-note-class ``theozolith_worker.api`` change (ADR-0042).
 
     ``on_error(error_class, message)`` is the theozolith.error hook (2026-07-21

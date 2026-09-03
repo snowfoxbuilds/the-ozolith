@@ -57,12 +57,12 @@ def test_old_schema_store_opens_with_backfilled_driver_column(tmp_path):
 
     columns = {r["name"] for r in store._db.execute("PRAGMA table_info(events)")}
     assert "driver" in columns and "worker" not in columns  # renamed, not duplicated
-    assert "repo" in columns  # ALTER-added (ADR-0055), NULL on legacy rows
+    assert "repo" in columns  # ALTER-added (ADR-0056), NULL on legacy rows
 
     # The old `worker` value is carried over as the backfill: the driver-keyed
     # liveness query sees it under `driver`.
     assert store.driver_last_seen("worker-a") == 1000.0
-    # The legacy fence (ADR-0055): a pre-ADR-0055 run event has no repo, so
+    # The legacy fence (ADR-0056): a pre-ADR-0056 run event has no repo, so
     # it never enters claim logic — yet stays readable as events history.
     assert store.live_claims() == []
     events = store.events(type="theozolith.run", issue=5)
@@ -113,8 +113,8 @@ def test_old_nodes_schema_gains_the_presence_bit_and_reads_fail_open(tmp_path):
     assert store.node_drivers_hash("box1") == ""
 
 
-# The six coordination cache tables exactly as they shipped before ADR-0055:
-# keyed by bare issue number, no repo anywhere — plus the pre-ADR-0055 drivers
+# The six coordination cache tables exactly as they shipped before ADR-0056:
+# keyed by bare issue number, no repo anywhere — plus the pre-ADR-0056 drivers
 # registry.
 _OLD_COORDINATION = """
 CREATE TABLE grants (
@@ -181,8 +181,8 @@ _SIX_CACHE_TABLES = (
 )
 
 
-def test_pre_adr0055_cache_tables_are_dropped_and_recreated_empty(tmp_path):
-    """The ADR-0055 re-key: a pre-ADR-0055 cache.db opens with the six
+def test_pre_adr0056_cache_tables_are_dropped_and_recreated_empty(tmp_path):
+    """The ADR-0056 re-key: a pre-ADR-0056 cache.db opens with the six
     coordination cache tables recreated EMPTY with the repo column — never a
     backfill (a guessed repo would be the wrong-repo collision the re-key
     prevents; the next dispatch pass rebuilds the rows from GitHub, which is
@@ -212,8 +212,13 @@ def test_pre_adr0055_cache_tables_are_dropped_and_recreated_empty(tmp_path):
 
     store = Store(path, clock=lambda: 200.0)
     for table in _SIX_CACHE_TABLES:
-        columns = {r["name"] for r in store._db.execute(f"PRAGMA table_info({table})")}
-        assert "repo" in columns, table
+        info = {r["name"]: r for r in store._db.execute(f"PRAGMA table_info({table})")}
+        assert "repo" in info, table
+        # janitor_actions.repo is the ONE nullable cache column — NULL marks
+        # a node-scoped act, never a '' sentinel; every other cache table's
+        # repo is NOT NULL (ADR-0056).
+        expect_notnull = 0 if table == "janitor_actions" else 1
+        assert info["repo"]["notnull"] == expect_notnull, table
         count = store._db.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
         assert count == 0, table  # recreated empty, never backfilled
     # The registry survived with its rows, repo/stack defaulting to ''.
@@ -227,7 +232,7 @@ def test_pre_adr0055_cache_tables_are_dropped_and_recreated_empty(tmp_path):
 
 def test_migrated_rig_rebuilds_grants_from_github_on_the_next_pass(tmp_path):
     """The drop is safe because the rebuild doctrine holds (ADR-0016): the
-    app opens a pre-ADR-0055 cache.db (tables recreated empty, old grant
+    app opens a pre-ADR-0056 cache.db (tables recreated empty, old grant
     gone) and the next dispatch pass re-derives the grant state from what
     GitHub answers — the cache was never the truth."""
     path = tmp_path / "data" / "cache" / "cache.db"

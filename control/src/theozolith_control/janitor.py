@@ -119,7 +119,7 @@ def sweep(
     log=_log,
 ) -> list[int]:
     """One zombie pass over ``client``'s repo; returns the issues escalated
-    with evidence. Claims from another repo are skipped (ADR-0055): this
+    with evidence. Claims from another repo are skipped (ADR-0056): this
     pass can only re-verify — and write — against the repo its client
     speaks for."""
     escalated: list[int] = []
@@ -242,7 +242,7 @@ def sweep_base_drift(
             log(f"janitor: base-drift check for PR #{pr.number} failed: {exc}")
     # Display rows for PRs that left the open pool (merged, closed) clear
     # here — the condition can no longer be re-verified, so it no longer
-    # holds. Scoped to this client's repo (ADR-0055): a sibling repo's rows
+    # holds. Scoped to this client's repo (ADR-0056): a sibling repo's rows
     # are another pass's to reconcile.
     for row in store.chained_dependents(client.repo):
         if row["dependent_pr"] not in seen:
@@ -352,7 +352,7 @@ def release_never_activated(
 ) -> list[int]:
     """Unwind grants with no claimed event inside the activation window
     (ADR-0017): the Control Node wrote these claims, so it reverts them.
-    Grant rows are (repo, issue)-keyed (ADR-0055): every store call uses
+    Grant rows are (repo, issue)-keyed (ADR-0056): every store call uses
     the row's own repo, and rows from another repo are skipped — this
     pass's GitHub unwind can only address the repo its client speaks for
     (an issue number means nothing outside its repo)."""

@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS events (
     round INTEGER,
     verdict TEXT,
     component TEXT,
-    -- The repository a run/review event acts in (ADR-0055). NULL on rows
+    -- The repository a run/review event acts in (ADR-0056). NULL on rows
     -- recorded before the column existed: kept as metrics history behind
     -- the claim-logic fence in live_claims(), never claim input.
     repo TEXT
@@ -198,10 +198,13 @@ CREATE TABLE IF NOT EXISTS unregistered_nodes (
     PRIMARY KEY (name, source)
 );
 -- The janitor's append ledger; every coordination row keys on the repo it
--- acted in (ADR-0055; repo '' = a node-scoped act, e.g. quarantine release).
+-- acted in (ADR-0056). The one nullable cache column: NULL marks a
+-- node-scoped act (e.g. quarantine release) — never a '' sentinel, which
+-- would read as a repo named nothing. The action kind decides the class
+-- at insert.
 CREATE TABLE IF NOT EXISTS janitor_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo TEXT NOT NULL,
+    repo TEXT,
     issue INTEGER NOT NULL,
     run_id TEXT NOT NULL,
     worker TEXT NOT NULL,
@@ -211,7 +214,7 @@ CREATE TABLE IF NOT EXISTS janitor_actions (
 -- Write-through claim grants awaiting activation (ADR-0017): a row lives
 -- from the GitHub claim write until the driver's claimed event lands; the
 -- janitor releases rows that outlive the activation window. Keyed by the
--- repository the grant was written in (ADR-0055): identical issue numbers
+-- repository the grant was written in (ADR-0056): identical issue numbers
 -- in two Bound Workspaces can never collide.
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL,
@@ -224,7 +227,7 @@ CREATE TABLE IF NOT EXISTS grants (
 );
 -- Driver registration (ADR-0017 prerequisite): each dispatch request
 -- carries the driver's GitHub login; the registry feeds the dashboard.
--- repo/stack record what the driver's last request named (ADR-0055).
+-- repo/stack record what the driver's last request named (ADR-0056).
 CREATE TABLE IF NOT EXISTS drivers (
     worker TEXT PRIMARY KEY,
     node TEXT NOT NULL DEFAULT '',
@@ -294,7 +297,7 @@ CREATE TABLE IF NOT EXISTS chained_dependents (
     last_seen REAL NOT NULL,
     PRIMARY KEY (repo, dependent_pr)
 );
--- Per-repo dispatch pause (ADR-0055): one repo's GitHub trouble degrades
+-- Per-repo dispatch pause (ADR-0056): one repo's GitHub trouble degrades
 -- to a recorded reason answer instead of a 500, and never pauses a
 -- sibling repo. Self-clearing: the repo's next successful pass deletes
 -- the row. Advisory display cache in the malformed_states mold.
@@ -376,7 +379,7 @@ EVICTION_WILDCARD = "*"
 @dataclass(frozen=True)
 class LiveClaim:
     """The latest non-terminal Run event for one (repo, issue) — the claim
-    key since ADR-0055."""
+    key since ADR-0056."""
 
     repo: str
     issue: int
@@ -422,9 +425,9 @@ class Store:
         ):
             if column not in present:
                 self._db.execute(f"ALTER TABLE commands ADD COLUMN {column} {decl}")
-        # The ADR-0055 re-key: every coordination cache table gains repo in
+        # The ADR-0056 re-key: every coordination cache table gains repo in
         # its primary key. These are caches (ADR-0016) rebuilt from GitHub by
-        # the next dispatch/janitor pass, so a pre-ADR-0055 database drops
+        # the next dispatch/janitor pass, so a pre-ADR-0056 database drops
         # and recreates them EMPTY — never a backfill (a guessed repo would
         # be exactly the wrong-repo collision the re-key exists to prevent).
         grant_columns = {r["name"] for r in self._db.execute("PRAGMA table_info(grants)")}
@@ -450,7 +453,7 @@ class Store:
         if "component" not in event_columns:  # theozolith.error filter column
             self._db.execute("ALTER TABLE events ADD COLUMN component TEXT")
         if "repo" not in event_columns:
-            # ADR-0055 extracted column. Pre-column rows stay NULL: metrics
+            # ADR-0056 extracted column. Pre-column rows stay NULL: metrics
             # history only, fenced out of claim logic in live_claims().
             self._db.execute("ALTER TABLE events ADD COLUMN repo TEXT")
         if "driver" not in event_columns:
@@ -859,7 +862,7 @@ class Store:
                 # Activation: the grant did its job; the events record owns
                 # claim tracking from here (ADR-0017). Keyed (repo, issue) —
                 # a repo-less event can never match a keyed grant row, so it
-                # activates nothing (ADR-0055).
+                # activates nothing (ADR-0056).
                 self._db.execute("DELETE FROM grants WHERE repo = ? AND issue = ?", (repo, issue))
             if node and phase == "failed":
                 self._bump_failures(node, issue, _str("run_id"))
@@ -976,8 +979,8 @@ class Store:
 
     def live_claims(self) -> list[LiveClaim]:
         """(repo, issue) pairs whose LATEST Run event is non-terminal
-        (claimed/gate/failed). The legacy fence (ADR-0055): rows whose repo
-        is NULL or empty are pre-ADR-0055 events kept as metrics history
+        (claimed/gate/failed). The legacy fence (ADR-0056): rows whose repo
+        is NULL or empty are pre-ADR-0056 events kept as metrics history
         only — they never enter claim logic."""
         with self._lock:
             rows = self._db.execute(
@@ -1004,7 +1007,7 @@ class Store:
     def run_states(self) -> list[dict[str, Any]]:
         """Per (repo, issue): the latest Run event, joined with the latest
         progress telemetry for that run_id (the dashboard's Runs view).
-        ``repo`` may be None on legacy pre-ADR-0055 rows — display keeps
+        ``repo`` may be None on legacy pre-ADR-0056 rows — display keeps
         them; claim logic (live_claims) does not."""
         with self._lock:
             rows = self._db.execute(
@@ -1464,7 +1467,7 @@ class Store:
 
     def zombie_flags(self, repo: str | None = None) -> list[dict[str, Any]]:
         """All flags (rows carry repo) or one repo's — the no-argument call
-        stays the /api/v1/flags and dashboard read (ADR-0055)."""
+        stays the /api/v1/flags and dashboard read (ADR-0056)."""
         query = "SELECT repo, issue, run_id, worker, node, flagged_at FROM zombie_flags"
         params: tuple = ()
         if repo is not None:
@@ -1581,7 +1584,7 @@ class Store:
             rows = self._db.execute(query + " ORDER BY repo, dependent_pr", params).fetchall()
         return [dict(r) for r in rows]
 
-    # -- per-repo dispatch pause (ADR-0055) -------------------------------------
+    # -- per-repo dispatch pause (ADR-0056) -------------------------------------
 
     def record_dispatch_pause(self, repo: str, reason: str) -> None:
         now = self._clock()
@@ -1820,10 +1823,11 @@ class Store:
     # -- janitor records --------------------------------------------------------
 
     def record_janitor_action(
-        self, repo: str, issue: int, run_id: str, worker: str, reason: str
+        self, repo: str | None, issue: int, run_id: str, worker: str, reason: str
     ) -> None:
-        """One ledger entry; ``repo=""`` marks a node-scoped act (quarantine
-        release), never an issue act (ADR-0055)."""
+        """One ledger entry; ``repo=None`` marks a node-scoped act (quarantine
+        release), never an issue act (ADR-0056) — NULL, never a ``""``
+        sentinel, on the one nullable cache column."""
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO janitor_actions (repo, issue, run_id, worker, reason, acted_at)"

@@ -52,7 +52,7 @@ def test_request_work_returns_the_granted_issue(control_node):
     granted = client.request_work("worker-a", "box1", "login-a")
     assert granted is not None and granted["number"] == 7
     # The request carries the driver's identity — registration included —
-    # and names its repo and Stack (ADR-0055).
+    # and names its repo and Stack (ADR-0056).
     assert seen == [
         {
             "role": "implementer",
@@ -89,7 +89,7 @@ def test_review_targets_and_pause(control_node):
     client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="rev-a")
     assert client.review_targets("reviewer-1", "box1", "login-r") == [11, 13]
     assert seen[-1]["role"] == "reviewer"
-    # The reviewer side names its repo and Stack too (ADR-0055).
+    # The reviewer side names its repo and Stack too (ADR-0056).
     assert seen[-1]["repo"] == "acme/sandbox" and seen[-1]["stack"] == "rev-a"
 
 
@@ -144,12 +144,12 @@ def test_unreachability_flag_tracks_the_last_pass(control_node):
 
 
 def test_repo_and_stack_refusals_log_without_backoff(control_node):
-    """ADR-0055: a 400 (repo-less request against a fail-closed endpoint) and
+    """ADR-0056: a 400 (repo-less request against a fail-closed endpoint) and
     a 403 (Pinned-Build verification refusal) are dispatch refusals, never
     unreachability — logged as `dispatch refused`, no backoff."""
     url, answers, _ = control_node
     answers.append((400, {"detail": "'repo' must be a non-empty str"}))
-    answers.append((403, {"detail": "stack 'impl-a' resolves workspace 'acme/other' (ADR-0055)"}))
+    answers.append((403, {"detail": "stack 'impl-a' resolves workspace 'acme/other' (ADR-0056)"}))
     logs: list[str] = []
     client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="impl-a", log=logs.append)
 

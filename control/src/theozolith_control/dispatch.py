@@ -94,7 +94,7 @@ class _PassReads:
 class Dispatcher:
     """One serialized grant path for the whole fleet (ADR-0017).
 
-    Every request names the repository the Driver will check out (ADR-0055):
+    Every request names the repository the Driver will check out (ADR-0056):
     the GitHub client is resolved per call through ``client_factory`` — a
     memoized per-repo factory over the one control PAT and api_url (v1
     doctrine: one GitHub host, one control PAT per Control Node). The single
@@ -205,7 +205,7 @@ class Dispatcher:
         (with an optional ``reason``) otherwise. GitHub trouble anywhere in
         the pass — the listing, a dependency read, a mid-grant write — is a
         recorded per-repo dispatch pause answered as a reason, never a 500
-        (ADR-0055); the repo's next pass that completes its GitHub reads
+        (ADR-0056); the repo's next pass that completes its GitHub reads
         clears the pause. A sibling repo's pass is untouched either way.
         """
         with self._lock:
@@ -339,7 +339,7 @@ class Dispatcher:
         no writes. The pin-eligibility gate applies here too — an off-pin
         node burns review rounds on the wrong product version — as does the
         identical config-distribution gate (ADR-0042). A failing listing is
-        the same per-repo dispatch pause as the implementer side (ADR-0055).
+        the same per-repo dispatch pause as the implementer side (ADR-0056).
 
         The listing arrives oldest-first (the client passes
         sort=created&direction=asc) and the order is passed through

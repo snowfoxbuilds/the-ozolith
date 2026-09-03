@@ -231,7 +231,7 @@ def run_event(
         "driver": config.worker_id,
         "node": config.node_name,
         "stack": config.stack,
-        # The repository the Run acts in (ADR-0055): coordination caches key
+        # The repository the Run acts in (ADR-0056): coordination caches key
         # on (repo, issue), and the Control Node refuses a run event without
         # it — fail-closed, no compatibility window.
         "repo": config.repo,
@@ -268,7 +268,7 @@ def review_event(
         "reviewer": config.worker_id,
         "node": config.node_name,
         "stack": config.stack,
-        # Required by the Control Node like the run event's (ADR-0055).
+        # Required by the Control Node like the run event's (ADR-0056).
         "repo": config.repo,
         "pr": pr,
         "issue": issue,

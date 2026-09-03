@@ -323,6 +323,22 @@ def test_zombie_malformed_and_quarantine_flags_are_visible(control: ControlRig):
     assert "quarantined" in page and "consecutive failed Runs" in page
 
 
+def test_janitor_ledger_renders_repo_keyed_and_node_scoped_rows(control: ControlRig):
+    """The ledger fragment shows owner/name#N where a repo is present and
+    only the reason (which names the node) otherwise (ADR-0056): a NULL-repo
+    node act never renders a repo reference, and same-numbered issues in two
+    repos stay distinguishable."""
+    login(control)
+    control.store.record_janitor_action("acme/sandbox", 5, "r1", "worker-a", "zombie escalated")
+    control.store.record_janitor_action(
+        None, 0, "", "", "node box1: quarantine released by operator"
+    )
+    page = control.client.get("/fragments/runs").text
+    assert "acme/sandbox#5: zombie escalated" in page
+    assert "node box1: quarantine released by operator" in page
+    assert "#0" not in page  # the node act carries no repo reference
+
+
 # -- the activity fragment (acceptance 3) ----------------------------------------
 
 

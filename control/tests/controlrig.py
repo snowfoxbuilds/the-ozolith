@@ -138,7 +138,7 @@ class ControlRig:
         self, node: str = "box1", *, workspace: str = "acme/sandbox", name: str = ""
     ) -> str:
         """A Pinned Build binding ``workspace`` to a Stack on ``node`` — what
-        the ADR-0055 dispatch verification checks a request against. The
+        the ADR-0056 dispatch verification checks a request against. The
         default name matches ``dispatch``'s default stack for the node, so a
         test that writes any config file and still dispatches scaffolds the
         binding its requests claim. Returns the Stack name."""
@@ -165,7 +165,7 @@ class ControlRig:
                 "driver": worker,
                 "node": node,
                 "login": f"ozolith-{worker}",
-                # Every request names its repo and Stack (ADR-0055); the
+                # Every request names its repo and Stack (ADR-0056); the
                 # default stack pairs with scaffold_stack's default name.
                 "repo": repo,
                 "stack": stack or f"worker-{node}",
@@ -191,7 +191,7 @@ def make_rig(
     secret_store = SecretStore(settings.store_db_path, clock=clock)
     box = SecretBox(generate_key())
     github = FakeGitHubLite()
-    # A per-repo client factory (ADR-0055); the rig's one fake answers for
+    # A per-repo client factory (ADR-0056); the rig's one fake answers for
     # every repo by default — two-repo tests pass a dict-backed factory.
     if github_clients is None and settings.coordination_jobs_enabled:
         github_clients = lambda repo: github  # noqa: E731

@@ -186,7 +186,7 @@ def test_events_require_a_type(control: ControlRig):
 
 
 def test_run_and_review_events_require_a_repo(control: ControlRig):
-    """ADR-0055 fail-closed ingest, no compatibility fallback: a repo-less
+    """ADR-0056 fail-closed ingest, no compatibility fallback: a repo-less
     run or review event can never key a coordination cache row, so it is
     refused outright; progress and error telemetry are unchanged."""
     for event in (run_event(5, "claimed"), review_event(11, 5, 1, "approve")):
@@ -557,6 +557,10 @@ def test_recycle_command_releases_the_quarantine(control: ControlRig):
     assert control.admin("GET", "/api/v1/flags").json()["quarantines"] != []
     control.admin("POST", "/api/v1/commands", {"node": "box1", "verb": "recycle"})
     assert control.admin("GET", "/api/v1/flags").json()["quarantines"] == []
+    # The release lands on the ledger as a node-scoped act: repo is NULL —
+    # the one nullable cache column, never a "" sentinel (ADR-0056).
+    (action,) = control.store.janitor_actions()
+    assert action["repo"] is None and "quarantine released" in action["reason"]
 
 
 def test_pending_lifecycle_command_pauses_grants_to_that_node(control: ControlRig):
@@ -726,12 +730,12 @@ def test_dispatch_registers_the_driver(control: ControlRig):
     assert drivers[0]["worker"] == "worker-a"
     assert drivers[0]["login"] == "ozolith-worker-a"
     assert drivers[0]["role"] == "implementer"
-    # The registry records what the request named (ADR-0055).
+    # The registry records what the request named (ADR-0056).
     assert drivers[0]["repo"] == "acme/sandbox"
     assert drivers[0]["stack"] == "worker-box1"
 
 
-# -- repo-keyed dispatch (ADR-0055): verification, isolation, per-repo pauses ------
+# -- repo-keyed dispatch (ADR-0056): verification, isolation, per-repo pauses ------
 
 
 def test_dispatch_requires_repo_stack_and_a_wellformed_repo(control: ControlRig):
@@ -795,7 +799,7 @@ def test_zero_stack_pinned_build_refuses_never_falls_open(control: ControlRig):
 
 
 def test_two_stacks_bound_to_two_repos_never_collide(tmp_path):
-    """The ADR-0055 acceptance: two Stacks bound to two Bound Workspaces on
+    """The ADR-0056 acceptance: two Stacks bound to two Bound Workspaces on
     one Control Node, dict-backed client factory. Each request is granted
     only from its own repo, and IDENTICAL issue numbers in the two repos
     hold distinct (repo, issue) rows in every coordination cache."""
@@ -893,7 +897,7 @@ def test_reviewer_listing_trouble_rides_the_same_pause(control: ControlRig):
 
 
 def test_failed_dependency_read_pauses_with_its_distinct_reason(control: ControlRig):
-    """The ADR-0053 fail-loud dependency read rides the ADR-0055 pause path
+    """The ADR-0053 fail-loud dependency read rides the ADR-0056 pause path
     — a reason answer plus a recorded pause, never a 500 — keeping its
     distinct granting-with-unknown-ordering text."""
     control.github.add_issue(2, labels={"plan_ready"}, assignees=[])

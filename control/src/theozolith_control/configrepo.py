@@ -790,7 +790,7 @@ def valid_workspace(value: str) -> bool:
     (``owner/name``). Deliberately NOT GitHub's full naming policy — only the
     two-component promise the schema makes. Rejects ``/repo``, ``owner/``,
     ``owner/repo/extra``, ``///``, and any empty or whitespace-only
-    component (ADR-0044 amendment). Public since ADR-0055: the dispatch
+    component (ADR-0044 amendment). Public since ADR-0056: the dispatch
     endpoint validates the request's ``repo`` with the same predicate."""
     parts = value.split("/")
     return len(parts) == 2 and all(part.strip() for part in parts)

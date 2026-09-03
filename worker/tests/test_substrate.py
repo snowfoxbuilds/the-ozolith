@@ -65,12 +65,12 @@ class LiveControl:
         self.repo = harness.fake.repo
         # The daemon-less harness config defaults its stack to the role;
         # LiveControl has no Config Repo, so dispatch is the fail-open dev
-        # door and any Stack name verifies trivially (ADR-0055).
+        # door and any Stack name verifies trivially (ADR-0056).
         self.stack = harness.worker_config.stack
         clients: dict[str, GitHubClient] = {}
 
         def github_clients(repo: str) -> GitHubClient:
-            # Per-repo factory (ADR-0055) over the harness's one fake GitHub.
+            # Per-repo factory (ADR-0056) over the harness's one fake GitHub.
             if repo not in clients:
                 clients[repo] = GitHubClient(
                     repo, "tok-control", transport=harness.fake, sleep=lambda s: None
@@ -168,7 +168,7 @@ def test_live_dispatch_claims_on_github_before_the_driver_acts(harness: Harness,
         # Activation: the claimed event landed, so the grant is retired.
         assert live.store.granted_issues(harness.fake.repo) == set()
         assert live.run_phases(issue) == ["claimed", "gate", "pr-open"]
-        # The request named its repo and Stack (ADR-0055): the registry
+        # The request named its repo and Stack (ADR-0056): the registry
         # recorded them, and the fail-closed event ingest accepted the
         # repo-carrying run events end to end.
         (driver_row,) = live.store.drivers()

@@ -54,7 +54,7 @@ Driver and harness communicate only through the job directory (`input/`, `output
 Both drivers support the continuous loop and `--once` (a single poll pass, the dev mode).
 A hand-run Driver (the daemon-less dev shape) defaults its `stack` to the role, but every
 dispatch request names its Stack and repo, verified against the Control Node's Pinned Build
-(ADR-0055) — so against a Control Node WITH a Pinned Build, export `THEOZOLITH_STACK`
+(ADR-0056) — so against a Control Node WITH a Pinned Build, export `THEOZOLITH_STACK`
 naming a real Stack placed on this node for this repo (a wrong or missing Stack is refused
 403; in production the Node Daemon injects it). A Control Node with no Config Repo at all
 (the ADR-0004 deletion-test boot) skips the verification — the fail-open dev door.
