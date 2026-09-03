@@ -371,7 +371,7 @@ def test_dockerctl_container_restart_policy_disappearance_reads_as_none(stderr):
     """A definitive `no such container`/`no such object` is positive evidence the
     container vanished between the listing and this inspect (a benign migration
     race), NOT a failed observation: it reads as None so the caller skips it
-    silently rather than emitting an infrastructure error (#114)."""
+    without an error event rather than emitting an infrastructure error (#114)."""
 
     def runner(args, timeout=None, env=None):
         return subprocess.CompletedProcess(args, 1, "", stderr)

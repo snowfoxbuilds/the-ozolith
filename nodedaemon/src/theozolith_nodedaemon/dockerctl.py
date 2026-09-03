@@ -300,7 +300,9 @@ class DockerCtl:
         - A definitive ``no such container``/``no such object`` is not a failed
           observation — it is positive evidence the container vanished between the
           listing and this inspect (a benign migration race). It returns ``None``
-          so the caller skips it silently, emitting no infrastructure error.
+          so the caller skips it without an error event — no ``theozolith.error``,
+          only an informational log — since a container that simply went away is
+          not an infrastructure fault.
         - Any OTHER non-zero result is a failed observation (dockerd unreachable, a
           transient 500) and RAISES ``DockerError`` with secret-free context — a
           failed read is never evidence the policy is already ``no``, so the

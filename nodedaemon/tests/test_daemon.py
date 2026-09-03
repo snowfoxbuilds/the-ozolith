@@ -2032,9 +2032,10 @@ def test_restart_policy_inspect_failure_is_isolated_emitted_and_retried(rig: Rig
 def test_restart_policy_migration_skips_a_vanished_container_without_error(rig: Rig):
     """A container listed for migration but GONE by the inspect is a benign race
     (the container disappeared between listing and inspection), not a failed
-    observation (#114): it is skipped silently — no docker update, and NO
-    theozolith.error, which for a container that simply went away would be
-    misleading — while a co-listed legacy container still migrates in the pass."""
+    observation (#114): it is skipped without an error event — no docker update and
+    NO theozolith.error, which for a container that simply went away would be
+    misleading, only an informational disappearance log — while a co-listed legacy
+    container still migrates in the pass."""
     deck = container_stack("flightdeck")
     worker = container_stack("workerdeck")
     rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
@@ -2057,6 +2058,51 @@ def test_restart_policy_migration_skips_a_vanished_container_without_error(rig: 
     # Isolation: the co-listed legacy container still migrated.
     assert worker_name in rig.docker.restart_policy_updates
     assert rig.docker.stacks[worker_name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_isolates_a_listing_failure_and_recovers_next_pass(rig: Rig):
+    """A failed container LISTING for the restart-policy migration is a failed
+    observation, never evidence of absence (#114): the pass performs no restart-
+    policy update and tears nothing down, logs the listing failure locally AND
+    emits a theozolith.error, and the rest of the reconcile pass still runs. The
+    reconcile cadence is the retry — once the listing fault clears, a legacy
+    `unless-stopped` container converges to `no` IN PLACE on the next pass."""
+    deck = container_stack("flightdeck")
+    _run_container(rig, deck)  # converge the legacy Stack so it exists at its spec
+    deck_name = "ozolith-stack-flightdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"  # an old-daemon container
+    rig.docker.restart_policy_updates.clear()
+    rig.docker.removed.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    # The list-all migration listing fails this pass; a freshly desired Stack is
+    # also present so its convergence proves the pass proceeds past the failure.
+    rig.docker.fail_stack_containers.add(None)
+    worker = container_stack("workerdeck")
+    worker_name = "ozolith-stack-workerdeck"
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # No migration action: nothing updated, nothing torn down, the legacy policy intact.
+    assert rig.docker.restart_policy_updates == []
+    assert deck_name not in rig.docker.removed
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "unless-stopped"
+    # The listing failure is logged locally AND emitted as a theozolith.error.
+    assert any("restart-policy migration: container listing failed" in line for line in rig.logs)
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) > errors_before
+    # Desired reconciliation still proceeds: the freshly desired Stack converged.
+    assert worker_name in rig.docker.stacks
+    assert rig.docker.stacks[worker_name]["state"] == "running"
+
+    # The reconcile cadence is the retry: once the fault clears the legacy policy
+    # converges to `no` in place — no recreate, no restart.
+    rig.docker.fail_stack_containers.discard(None)
+    rig.docker.removed.clear()
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+    assert deck_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "no"
+    assert deck_name not in rig.docker.removed  # converged in place, never torn down
 
 
 def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):

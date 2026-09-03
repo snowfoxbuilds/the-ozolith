@@ -2158,9 +2158,10 @@ class NodeDaemon:
 
         The two non-converged outcomes are kept distinct (#114). A container that
         DISAPPEARED between the listing and the inspect reads as ``None``: a benign
-        race, not a failed observation — it is skipped silently with no update and
-        no ``theozolith.error``, since emitting an infrastructure error for a
-        container that simply went away would be misleading. A GENUINE inspect
+        race, not a failed observation — it is skipped without an error event (no
+        update and no ``theozolith.error``), keeping only an informational
+        disappearance log, since emitting an infrastructure error for a container
+        that simply went away would be misleading. A GENUINE inspect
         failure instead RAISES ``DockerError`` (``container_restart_policy``),
         which propagates to the caller's ``_isolated`` wrapper — logged and emitted
         as an error, then retried next pass — and is never treated as converged.
