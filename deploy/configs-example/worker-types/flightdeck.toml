@@ -313,8 +313,9 @@ fi''',
     #     name is NOT a literal here (ADR-0048 amendment): the script reads
     #     $THEOZOLITH_KNOWLEDGE_TREE, injected control-side from the
     #     worker-type `knowledge` field above, and FAILS LOUD when the
-    #     selected tree has not converged onto this node — docker restart
-    #     policy retries until it has. Runtime values
+    #     selected tree has not converged onto this node — the Node Daemon's
+    #     reconcile loop then recreates the failed container on a later pass
+    #     (roughly the heartbeat cadence) until it has. Runtime values
     #     ($FLIGHTDECK_TS_HOSTNAME, $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at
     #     build — every script line is a single-quoted printf argument — and
     #     expand only at container start.
@@ -350,8 +351,9 @@ fi''',
     #         FOREVER, so "one attempt" alone never guaranteed prompt failure:
     #         invalid/expired keys and rejected flags fail immediately, a
     #         tailnet that never reaches Running fails at the 30s bound, and
-    #         Docker restart policy owns any retry — never an in-container
-    #         loop, and never an external `timeout` process;
+    #         the daemon's reconcile loop owns any retry — it recreates the
+    #         deck on a later pass (roughly the heartbeat cadence) — never an
+    #         in-container loop, and never an external `timeout` process;
     #       - after the session starts, a supervisor watches BOTH the daemon
     #         pid and the tmux session: dead tailscaled fails the container
     #         (dead one-hop access is an outage, not a healthy idle), a
@@ -366,7 +368,8 @@ fi''',
 '# /var/lib/theozolith/knowledge. The worker-type knowledge field selects the' \
 '# tree, control-injected as THEOZOLITH_KNOWLEDGE_TREE. FAIL LOUD when it is' \
 '# not available: a deck must never run with silently missing knowledge, and' \
-'# docker restart policy retries until the node converges the distribution.' \
+'# the daemon reconcile loop recreates the deck on a later pass (~heartbeat' \
+'# cadence), retrying until the node converges the distribution.' \
 ': "${THEOZOLITH_KNOWLEDGE_TREE:?flightdeck-start: THEOZOLITH_KNOWLEDGE_TREE is missing - the worker type must declare knowledge (ADR-0048)}"' \
 'KNOWLEDGE_TREE_DIR="/var/lib/theozolith/knowledge/${THEOZOLITH_KNOWLEDGE_TREE}"' \
 'if [ ! -d "$KNOWLEDGE_TREE_DIR" ]; then' \
@@ -413,7 +416,8 @@ fi''',
 'fi' \
 '# ADR-0055: the CLI Pin launch path. A deck whose worker type pins a CLI' \
 '# gets THEOZOLITH_WORKER_TYPE injected control-side; the container start' \
-'# refuses loudly (docker restart policy retries) until the export entry' \
+'# refuses loudly (the daemon reconcile loop recreates the deck on a later' \
+'# pass, ~heartbeat cadence, retrying) until the export entry' \
 '# identifies exactly the desired version - the identical check the shim' \
 '# repeats at every later launch - then the shim goes first on PATH for the' \
 '# tmux session and the autoupdater is disabled. Neither the previous' \
@@ -541,7 +545,8 @@ fi''',
 'done' \
 '# ONE BOUNDED attempt: --timeout=30s caps the wait for Running (the CLI' \
 '# default waits forever), so a stalled tailnet fails the container as' \
-'# promptly as a rejected key; Docker restart policy owns any retry.' \
+'# promptly as a rejected key; the daemon reconcile loop owns any retry,' \
+'# recreating the deck on a later pass (~heartbeat cadence).' \
 'if [ "$TS_ENROLL" = yes ]; then' \
 '  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" --timeout=30s || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, rejected flags, or 30s timeout)" >&2; exit 1; }' \
 '  # Success promotes the completion marker ATOMICALLY on the state volume' \

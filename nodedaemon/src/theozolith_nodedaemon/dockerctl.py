@@ -241,11 +241,20 @@ class DockerCtl:
         nothing is passed and the image's own ENTRYPOINT/CMD run unchanged."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
         self.remove(name)
+        # No Docker restart policy on daemon-managed Stack containers. The
+        # daemon is the sole reconciler of Stack desired state (NODE-SUBSTRATE.md)
+        # and already recreates a stopped/exited/crashed container on its next
+        # pass — with freshly materialized secrets. A Docker `--restart` policy
+        # would instead let dockerd restart these containers on host boot BEFORE
+        # the daemon has materialized their secrets onto the freshly-wiped tmpfs
+        # (`/run/theozolith` is a systemd RuntimeDirectory, so empty every boot):
+        # the restarted container's missing bind source is then auto-vivified by
+        # dockerd as a DIRECTORY, which both fails the mount (dir->file mismatch)
+        # and wedges the secret writer (#114). Leaving restart to the reconcile
+        # loop keeps secret materialization strictly ahead of every start.
         args = [
             "run",
             "--detach",
-            "--restart",
-            "unless-stopped",
             "--name",
             name,
             "--label",
@@ -276,6 +285,52 @@ class DockerCtl:
         if command:
             args.extend(command[1:])
         self._run(args)
+
+    def container_restart_policy(self, name: str) -> str | None:
+        """The configured restart-policy name of a container — ``no``, ``always``,
+        ``unless-stopped``, or ``on-failure`` — or ``None`` when the container has
+        DISAPPEARED.
+
+        Reads ``HostConfig.RestartPolicy.Name`` via ``docker inspect``. A
+        container created with no ``--restart`` flag reports ``no`` (older Docker
+        can report an empty string; the caller treats both as already-converged).
+
+        The two non-zero outcomes are kept DISTINCT (observation doctrine, #114):
+
+        - A definitive ``no such container``/``no such object`` is not a failed
+          observation — it is positive evidence the container vanished between the
+          listing and this inspect (a benign migration race). It returns ``None``
+          so the caller skips it without an error event — no ``theozolith.error``,
+          only an informational log — since a container that simply went away is
+          not an infrastructure fault.
+        - Any OTHER non-zero result is a failed observation (dockerd unreachable, a
+          transient 500) and RAISES ``DockerError`` with secret-free context — a
+          failed read is never evidence the policy is already ``no``, so the
+          migration caller surfaces it and retries on a later pass rather than
+          treating an unreadable container as converged.
+        """
+        proc = self._run(
+            ["inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", name],
+            check=False,
+            timeout=60,
+        )
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").lower()
+        if "no such container" in stderr or "no such object" in stderr:
+            return None  # gone between listing and inspect — a benign race
+        raise DockerError(
+            f"docker inspect failed for restart policy of {name}: {(proc.stderr or '').strip()}"
+        )
+
+    def set_restart_policy(self, name: str, policy: str = "no") -> None:
+        """Converge a container's restart policy IN PLACE, without recreating or
+        restarting it (``docker update --restart``). Used to retire the legacy
+        ``unless-stopped`` policy off daemon-managed single-image Stack containers
+        (#114) so dockerd never restarts them ahead of tmpfs secret
+        materialization on boot; the reconcile loop becomes the sole restarter.
+        Raises ``DockerError`` on failure so the caller can isolate and retry."""
+        self._run(["update", f"--restart={policy}", name], timeout=60)
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:
         """Compose-form container Stack: base file + overlays, in order."""

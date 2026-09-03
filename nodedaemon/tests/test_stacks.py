@@ -13,11 +13,13 @@ from theozolith_nodedaemon.stacks import (
     DRIVER_LAUNCHER,
     LauncherMissing,
     ProcessSupervisor,
+    SecretNameError,
     WireStack,
     materialize_secrets,
     resolve_launcher,
     secret_env_files,
     spec_fingerprint,
+    validate_stored_secret_name,
 )
 
 
@@ -149,6 +151,158 @@ def test_materialize_replaces_read_only_leaves_atomically(tmp_path: Path):
     assert (paths["a"].stat().st_mode & 0o777) == 0o444
     assert not stale_tmp.exists()
     assert [p.name for p in secrets_dir.iterdir()] == ["a"]
+
+
+def test_materialize_repairs_a_wrong_typed_target_from_the_boot_race(tmp_path: Path):
+    """A boot race (#114) can leave the secret leaf as a DIRECTORY: dockerd,
+    restarting a Stack container before the daemon materializes secrets on the
+    freshly-wiped tmpfs, auto-vivifies the missing bind source as one. os.replace
+    onto a directory raises IsADirectoryError forever, so the writer must self-
+    heal — remove any wrong-typed target — rather than stay permanently wedged.
+    A non-empty stray directory is cleared too (dockerd could have written into
+    it), and the leaf comes back a real 0444 file with the current value."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    stray = secrets_dir / "a"
+    stray.mkdir()  # dockerd's auto-vivified bind source
+    (stray / "leftover").write_text("junk")  # even non-empty, it must be cleared
+
+    paths = materialize_secrets(secrets_dir, {"a": "value-a"})
+
+    assert paths["a"].is_file()
+    assert paths["a"].read_text() == "value-a"
+    assert (paths["a"].stat().st_mode & 0o777) == 0o444
+    assert [p.name for p in secrets_dir.iterdir()] == ["a"]
+
+
+def test_materialize_repairs_a_symlink_target_without_following_it(tmp_path: Path):
+    """A wrong-typed target that is a symlink is removed as the link it is —
+    never followed to overwrite or recurse into whatever it points at. The
+    secret leaf must be a genuine regular file at the leaf path, not a link."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("do-not-touch")
+    (secrets_dir / "a").symlink_to(elsewhere)
+
+    paths = materialize_secrets(secrets_dir, {"a": "value-a"})
+
+    assert not paths["a"].is_symlink()
+    assert paths["a"].read_text() == "value-a"
+    assert elsewhere.read_text() == "do-not-touch"  # the link target is untouched
+
+
+# -- stored secret name safety (#114) --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "github-implementer",
+        "admin-token",
+        "anthropic-api-key",
+        "a",
+        "UPPER_case.mixed-1",  # a dot mid-name is fine
+        ".env",  # an ordinary dotfile leaf — a leading dot alone is legitimate
+        ".hidden",  # likewise
+        "backup.tmp",  # a trailing '.tmp' without a leading dot is not the temp namespace
+        "registry:ghcr.io",  # a colon is a legal leaf char; registry semantics guard elsewhere
+        "registry:localhost:5000",
+    ],
+)
+def test_validate_stored_secret_name_accepts_safe_leaves(name):
+    assert validate_stored_secret_name(name) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",  # empty
+        ".",  # the dir itself
+        "..",  # the parent
+        "a/b",  # a path component
+        "/etc/passwd",  # absolute
+        "../../etc/passwd",  # traversal
+        "sub/dir",  # a separator anywhere
+        "back\\slash",  # a Windows-style separator too
+        ".a.tmp",  # collides with the writer's '.<name>.tmp' temporary namespace
+        ".token.tmp",  # same reserved namespace, a realistic secret name
+        ".env.tmp",  # even a dotfile-shaped name is refused inside the temp namespace
+        "with\x00nul",  # an embedded NUL
+    ],
+)
+def test_validate_stored_secret_name_rejects_unsafe_leaves(name):
+    with pytest.raises(SecretNameError):
+        validate_stored_secret_name(name)
+
+
+def test_no_valid_name_can_collide_with_another_secrets_temp_path():
+    """The writer materializes every value through '.<name>.tmp'. That whole shape
+    is refused as a stored name, so no valid secret can BE another valid secret's
+    temp path — the collision safety holds for every batch processing order (#114).
+    Proven mechanically: for each valid leaf, its temp path is itself rejected."""
+    for name in ("env", "hidden", "token", ".env", ".hidden", "backup.tmp"):
+        validate_stored_secret_name(name)  # a valid stored name
+        temp_path_name = f".{name}.tmp"  # exactly what materialize_secrets writes through
+        with pytest.raises(SecretNameError):
+            validate_stored_secret_name(temp_path_name)
+
+
+@pytest.mark.parametrize("bad", [".", "..", "../evil", "sub/dir", ".a.tmp", "with\x00nul"])
+def test_materialize_rejects_unsafe_names_before_any_filesystem_mutation(tmp_path: Path, bad):
+    """The whole batch is prevalidated before a single write (#114): a `.`/`..`
+    or any other unsafe name aborts materialization before any mkdir, open,
+    chmod, rmtree, or replace runs — so an existing sibling secret and the parent
+    runtime directory are left exactly as they were, never partially mutated."""
+    secrets_dir = tmp_path / "secrets"
+    materialize_secrets(secrets_dir, {"keep": "sibling-value"})  # a pre-existing sibling
+    before = (secrets_dir / "keep").read_text()
+    sentinel = tmp_path / "sentinel"  # a file in the PARENT, to prove no traversal ran
+    sentinel.write_text("do-not-touch")
+
+    with pytest.raises(SecretNameError):
+        materialize_secrets(secrets_dir, {"OK_ENV": "new", bad: "attacker"})
+
+    assert (secrets_dir / "keep").read_text() == before  # sibling untouched
+    assert sentinel.read_text() == "do-not-touch"  # parent untouched
+    # The safe name from the aborted batch was never written (prevalidation is
+    # whole-batch, not first-unsafe): no partial materialization.
+    assert not (secrets_dir / "OK_ENV").exists()
+
+
+def test_materialize_valid_name_updates_atomically_and_stays_0444(tmp_path: Path):
+    """A valid ordinary name materializes, re-materializes (update) atomically,
+    and the leaf is 0444 both times — the safe-name path is unchanged by the
+    prevalidation guard."""
+    secrets_dir = tmp_path / "secrets"
+    first = materialize_secrets(secrets_dir, {"tok": "one"})
+    assert first["tok"].read_text() == "one"
+    assert (first["tok"].stat().st_mode & 0o777) == 0o444
+    second = materialize_secrets(secrets_dir, {"tok": "two"})
+    assert second["tok"].read_text() == "two"
+    assert (second["tok"].stat().st_mode & 0o777) == 0o444
+
+
+def test_materialize_dot_names_write_correctly_and_never_collide_by_order(tmp_path: Path):
+    """Ordinary dot-prefixed leaves ('.env', '.hidden') are legitimate secret
+    names and materialize as real 0444 leaves beside plain names — and because no
+    valid name is ever another's '.<name>.tmp' temp path, the batch is safe in ANY
+    processing order (#114). Materialized twice with the dict order reversed, every
+    value is correct and no '.tmp' residue survives."""
+    secrets_dir = tmp_path / "secrets"
+    forward = materialize_secrets(secrets_dir, {".env": "E1", ".hidden": "H1", "plain": "P1"})
+    assert forward[".env"].read_text() == "E1"
+    assert forward[".hidden"].read_text() == "H1"
+    assert forward["plain"].read_text() == "P1"
+    assert (forward[".env"].stat().st_mode & 0o777) == 0o444
+    assert (forward[".hidden"].stat().st_mode & 0o777) == 0o444
+
+    reverse = materialize_secrets(secrets_dir, {"plain": "P2", ".hidden": "H2", ".env": "E2"})
+    assert reverse[".env"].read_text() == "E2"
+    assert reverse[".hidden"].read_text() == "H2"
+    assert reverse["plain"].read_text() == "P2"
+    # Exactly the three leaves, no leftover temp file from either pass.
+    assert sorted(p.name for p in secrets_dir.iterdir()) == [".env", ".hidden", "plain"]
 
 
 def test_changed_env_recycles_even_with_the_same_command():

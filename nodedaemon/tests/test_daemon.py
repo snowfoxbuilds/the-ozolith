@@ -1064,6 +1064,66 @@ def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
     assert host_path == str(rig.config.secrets_dir / "admin-token")
 
 
+def test_boot_race_directory_at_the_secret_leaf_recovers_on_reconcile(rig: Rig):
+    """The #114 boot race, recovered end to end: a stray DIRECTORY at the secret
+    leaf — what dockerd auto-vivifies when it restarts a Stack container before
+    the daemon materializes secrets on the freshly-wiped tmpfs — no longer wedges
+    the writer. The self-healing materialize repairs it, the leaf becomes a real
+    file, and the container Stack converges instead of re-logging EISDIR forever."""
+    rig.control.secrets["admin-token"] = "the-admin-value"
+    # Stand in for dockerd's auto-vivified bind source: the leaf as a directory.
+    rig.config.secrets_dir.mkdir(parents=True, exist_ok=True)
+    (rig.config.secrets_dir / "admin-token").mkdir()
+    stack = container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+
+    rig.daemon.once()
+
+    leaf = rig.config.secrets_dir / "admin-token"
+    assert leaf.is_file() and leaf.read_text() == "the-admin-value"
+    assert "ozolith-stack-flightdeck" in rig.docker.stacks  # converged, not wedged
+    assert not any("Is a directory" in line for line in rig.logs)  # no EISDIR deadlock
+
+
+def test_secret_materialization_oserror_degrades_instead_of_raising(rig: Rig, monkeypatch):
+    """A materialization OSError — a full or read-only tmpfs, or a target the
+    writer could not repair — degrades like any other deploy-blocker (#114):
+    _pull_stack_secrets returns False rather than letting the OSError bubble to
+    the generic reconcile wrapper as an opaque 'reconcile failed: [Errno …]'. The
+    fault surfaces as a targeted error event and the container is never started."""
+    rig.control.secrets["admin-token"] = "the-admin-value"
+
+    def boom(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(daemon, "materialize_secrets", boom)
+    stack = WireStack.from_wire(
+        container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
+    )
+
+    assert rig.daemon._pull_stack_secrets(stack) is False  # returns, never raises
+    assert any("secret materialization failed" in line for line in rig.logs)
+    (event,) = [e for e in rig.control.events if e["type"] == "theozolith.error"]
+    assert "materialization failed" in event["message"]
+
+
+def test_invalid_secret_name_on_the_wire_degrades_the_stack(rig: Rig):
+    """Node-side defense in depth (#114): a stored secret name that is unsafe to
+    materialize but reaches the daemon anyway — control/daemon skew, or a control
+    that never applied the shared validator — is refused by the daemon's own
+    validate_stored_secret_name before any filesystem write. _pull_stack_secrets
+    degrades the one Stack (False + targeted error), never aborting the pass with a
+    ValueError, and nothing is written under (or above) the secrets dir."""
+    rig.control.secrets["../evil"] = "attacker"
+    stack = WireStack.from_wire(container_stack("flightdeck", secrets={"TOK": "../evil"}))
+
+    assert rig.daemon._pull_stack_secrets(stack) is False  # returns, never raises
+    assert any("invalid secret name" in line for line in rig.logs)
+    (event,) = [e for e in rig.control.events if e["type"] == "theozolith.error"]
+    assert "invalid secret name" in event["message"]
+    assert not (rig.config.secrets_dir.parent / "evil").exists()  # no traversal ran
+
+
 # -- queue-behind recycle/update (NODE-SUBSTRATE, grilling 2026-07-17) -----------
 
 
@@ -1840,6 +1900,209 @@ def test_changed_container_secret_mapping_recreates_it(rig: Rig):
     _run_container(rig, container_stack("flightdeck", secrets={"TOK": "b"}))
     assert rig.docker.stacks["ozolith-stack-flightdeck"]["env_files"]["TOK"].endswith("b")
     assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+# -- legacy restart-policy migration (#114) --------------------------------------
+
+
+def test_legacy_restart_policy_is_migrated_in_place_without_recreate(rig: Rig):
+    """A container an older daemon created carries `unless-stopped`; the reconcile
+    loop converges it to `no` IN PLACE — docker update, never a recreate (#114) —
+    even on the healthy path where convergence would otherwise skip the container.
+    No removal, no restart, converged exactly once, and idempotent thereafter."""
+    stack = container_stack("flightdeck")
+    _run_container(rig, stack)  # create the container at the current spec
+    name = "ozolith-stack-flightdeck"
+    assert rig.docker.restart_policy_updates == []  # a freshly-run container is already `no`
+    rig.docker.stacks[name]["restart_policy"] = "unless-stopped"  # simulate an old-daemon container
+    rig.docker.removed.clear()
+
+    _run_container(rig, stack)  # a later pass: same healthy spec
+
+    assert rig.docker.restart_policy_updates == [name]  # converged once, in place
+    assert rig.docker.stacks[name]["restart_policy"] == "no"
+    assert name not in rig.docker.removed  # never recreated or restarted
+    assert name in rig.docker.stacks  # still the same container
+
+    _run_container(rig, stack)  # idempotent: an already-`no` container is not touched again
+    assert rig.docker.restart_policy_updates == [name]
+
+
+def test_restart_policy_migration_failure_is_isolated_and_retried(rig: Rig):
+    """A failed restart-policy update is reported, isolated, and retried next pass
+    (#114): the docker-update failure emits a theozolith.error but never tears the
+    container down or blocks the Stack from converging, and the next pass retries."""
+    stack = container_stack("flightdeck")
+    _run_container(rig, stack)
+    name = "ozolith-stack-flightdeck"
+    rig.docker.stacks[name]["restart_policy"] = "unless-stopped"
+    rig.docker.fail_set_restart_policy.add(name)  # docker update fails this pass
+    rig.docker.removed.clear()
+
+    _run_container(rig, stack)
+
+    assert any("restart-policy migration" in line for line in rig.logs)
+    assert any(e["type"] == "theozolith.error" for e in rig.control.events)
+    assert rig.docker.stacks[name]["restart_policy"] == "unless-stopped"  # update did not take
+    assert name not in rig.docker.removed  # the container was never torn down
+    assert name in rig.docker.stacks  # and the Stack still converged
+
+    rig.docker.fail_set_restart_policy.discard(name)  # the fault clears
+    _run_container(rig, stack)  # the next pass retries and converges the policy
+    assert rig.docker.stacks[name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_covers_a_legacy_exited_container(rig: Rig):
+    """The migration listing is `--all` and docker update accepts any state, so a
+    legacy container that is exited or stuck in a restart loop — the boot-race
+    failure mode — has its policy converged before convergence recreates it (#114)."""
+    stack = container_stack("flightdeck", image="img:1")
+    name = "ozolith-stack-flightdeck"
+    rig.docker.images["img:1"] = {}  # so convergence does not defer on an unbuilt image
+    rig.docker.stacks[name] = {  # a desired but exited old-daemon container
+        "stack": "flightdeck",
+        "image": "img:1",
+        "state": "exited",
+        "restart_policy": "unless-stopped",
+        "theozolith.spec": "",
+    }
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+
+    rig.daemon.once()
+
+    assert name in rig.docker.restart_policy_updates  # the exited container was migrated
+    assert rig.docker.stacks[name]["restart_policy"] == "no"  # the recreated one carries no policy
+
+
+def test_restart_policy_migration_never_touches_compose_or_unlabeled_containers(rig: Rig):
+    """Only single-image Stack containers (the theozolith.stack label AND the
+    ozolith-stack- name prefix) are migrated (#114): a compose project's container
+    and any unrelated container — such as the Control Node's — are never updated."""
+    rig.docker.stacks["not-a-stack-container"] = {  # no ozolith-stack- prefix
+        "stack": "",
+        "image": "img:1",
+        "state": "running",
+        "restart_policy": "unless-stopped",
+    }
+    _run_container(rig, container_stack("flightdeck"))  # a normal single-image Stack (already `no`)
+
+    assert rig.docker.restart_policy_updates == []  # neither was migrated
+
+
+def test_restart_policy_inspect_failure_is_isolated_emitted_and_retried(rig: Rig):
+    """A GENERIC failure inspecting one container's restart policy is a failed
+    observation, never evidence it is already `no` (#114): it is logged locally,
+    emitted as a theozolith.error, and left for the next pass — never updated and
+    never torn down — while a co-listed legacy container STILL migrates in the same
+    pass and the desired Stack STILL converges. The next pass retries and converges
+    the faulted container once the fault clears."""
+    deck = container_stack("flightdeck")
+    worker = container_stack("workerdeck")
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # converge both so their spec labels match (no later recreate)
+    deck_name = "ozolith-stack-flightdeck"
+    worker_name = "ozolith-stack-workerdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"
+    rig.docker.stacks[worker_name]["restart_policy"] = "unless-stopped"
+    rig.docker.fail_restart_policy_inspect.add(deck_name)  # a genuine inspect fault
+    rig.docker.restart_policy_updates.clear()
+    rig.docker.removed.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # The faulted container: reported (log + error), never updated, never removed.
+    assert any("restart-policy migration" in line for line in rig.logs)
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) > errors_before
+    assert deck_name not in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "unless-stopped"
+    assert deck_name not in rig.docker.removed  # the fault never tore it down
+    assert deck_name in rig.docker.stacks  # and the Stack still converged
+    # Isolation: the co-listed legacy container migrated in the SAME pass.
+    assert worker_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[worker_name]["restart_policy"] == "no"
+
+    rig.docker.fail_restart_policy_inspect.discard(deck_name)  # the fault clears
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # the next pass retries and converges the policy
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_skips_a_vanished_container_without_error(rig: Rig):
+    """A container listed for migration but GONE by the inspect is a benign race
+    (the container disappeared between listing and inspection), not a failed
+    observation (#114): it is skipped without an error event — no docker update and
+    NO theozolith.error, which for a container that simply went away would be
+    misleading, only an informational disappearance log — while a co-listed legacy
+    container still migrates in the pass."""
+    deck = container_stack("flightdeck")
+    worker = container_stack("workerdeck")
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # converge both
+    deck_name = "ozolith-stack-flightdeck"
+    worker_name = "ozolith-stack-workerdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"
+    rig.docker.stacks[worker_name]["restart_policy"] = "unless-stopped"
+    rig.docker.vanished_before_inspect.add(deck_name)  # gone between listing and inspect
+    rig.docker.restart_policy_updates.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # The vanished container: skipped, never updated, no error emitted for it.
+    assert deck_name not in rig.docker.restart_policy_updates
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) == errors_before
+    assert any("disappeared before restart-policy migration" in line for line in rig.logs)
+    # Isolation: the co-listed legacy container still migrated.
+    assert worker_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[worker_name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_isolates_a_listing_failure_and_recovers_next_pass(rig: Rig):
+    """A failed container LISTING for the restart-policy migration is a failed
+    observation, never evidence of absence (#114): the pass performs no restart-
+    policy update and tears nothing down, logs the listing failure locally AND
+    emits a theozolith.error, and the rest of the reconcile pass still runs. The
+    reconcile cadence is the retry — once the listing fault clears, a legacy
+    `unless-stopped` container converges to `no` IN PLACE on the next pass."""
+    deck = container_stack("flightdeck")
+    _run_container(rig, deck)  # converge the legacy Stack so it exists at its spec
+    deck_name = "ozolith-stack-flightdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"  # an old-daemon container
+    rig.docker.restart_policy_updates.clear()
+    rig.docker.removed.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    # The list-all migration listing fails this pass; a freshly desired Stack is
+    # also present so its convergence proves the pass proceeds past the failure.
+    rig.docker.fail_stack_containers.add(None)
+    worker = container_stack("workerdeck")
+    worker_name = "ozolith-stack-workerdeck"
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # No migration action: nothing updated, nothing torn down, the legacy policy intact.
+    assert rig.docker.restart_policy_updates == []
+    assert deck_name not in rig.docker.removed
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "unless-stopped"
+    # The listing failure is logged locally AND emitted as a theozolith.error.
+    assert any("restart-policy migration: container listing failed" in line for line in rig.logs)
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) > errors_before
+    # Desired reconciliation still proceeds: the freshly desired Stack converged.
+    assert worker_name in rig.docker.stacks
+    assert rig.docker.stacks[worker_name]["state"] == "running"
+
+    # The reconcile cadence is the retry: once the fault clears the legacy policy
+    # converges to `no` in place — no recreate, no restart.
+    rig.docker.fail_stack_containers.discard(None)
+    rig.docker.removed.clear()
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+    assert deck_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "no"
+    assert deck_name not in rig.docker.removed  # converged in place, never torn down
 
 
 def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):
