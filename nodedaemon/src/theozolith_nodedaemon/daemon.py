@@ -39,6 +39,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -1566,6 +1567,24 @@ class NodeDaemon:
                 return "malformed", f"cli_platforms entry {key!r} is not {{package, integrity}}"
         return "ok", (tool, version, platforms)
 
+    def _materialize_cli_dir(self, path: Path, label: str) -> None:
+        """Ensure ``path`` is a REAL directory carrying the code-owned
+        cross-UID 0o755 mode. The intermediate cli directories are a trust
+        boundary: record writes, chmods, and installs all resolve through
+        them, and a symlinked one can point outside the mounted tree — every
+        "repair" through it would mutate its TARGET. So a symlink (or any
+        other non-directory shape) is repaired by removing the entry ITSELF
+        (an unlink — never a traversal into, chmod of, or delete under the
+        target) and creating a real directory in its place; the pass then
+        reconstructs records and install state from the durable wire. A
+        legitimate real directory is never touched beyond the per-pass mode
+        re-assert."""
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink()
+            self._log(f"cli {label} was not a real directory — replaced (its target untouched)")
+        path.mkdir(exist_ok=True)
+        os.chmod(path, 0o755)
+
     def _converge_cli(self) -> None:
         """Converge every pinned agent CLI (ADR-0055 point 5), isolated per
         worker type — one type's failure never blocks another's converge or
@@ -1609,11 +1628,17 @@ class NodeDaemon:
                 protected.add(name)
         attempted: dict[tuple[str, str], Exception | None] = {}
         for name, (tool, version, platforms) in wanted.items():
-            by_type = cli_root / tool / CLI_BY_TYPE_DIR
+            tool_root = cli_root / tool
+            by_type = tool_root / CLI_BY_TYPE_DIR
             try:
-                by_type.mkdir(parents=True, exist_ok=True)
-                os.chmod(by_type.parent, 0o755)  # code-owned cross-UID modes, per pass
-                os.chmod(by_type, 0o755)
+                # Both intermediate directories are trust boundaries: the
+                # record writes below, the install, and the entry re-point
+                # all resolve through them, so a symlinked shape is repaired
+                # FIRST — the link itself replaced with a real directory,
+                # its target never touched — and the code-owned cross-UID
+                # modes re-assert per pass.
+                self._materialize_cli_dir(tool_root, f"tool directory {tool!r}")
+                self._materialize_cli_dir(by_type, f"by-type directory under {tool!r}")
                 desired_path = by_type / f"{name}.desired"
                 text = version + "\n"
                 try:
@@ -1635,7 +1660,9 @@ class NodeDaemon:
                     # restrictive umask — the deck must always read it.
                     os.chmod(desired_path, 0o644)
             except OSError as exc:
-                message = f"cli pin for worker type {name!r}: desired record failed: {exc}"
+                message = (
+                    f"cli pin for worker type {name!r}: export tree or desired record failed: {exc}"
+                )
                 self._log(message)
                 self._emit_error(type(exc).__name__, message)
                 self._cli_failures[name] = (type(exc).__name__, message)
@@ -1706,6 +1733,18 @@ class NodeDaemon:
             by_type = tool_dir / CLI_BY_TYPE_DIR
             keep: set[str] = set()
             try:
+                if by_type.is_symlink():
+                    # Retiring enumerated records through a symlinked by-type
+                    # would unlink them at the TARGET — external content.
+                    # Remove the link itself (target and records untouched)
+                    # and treat this tool's records as absent; a wanted
+                    # type's converge already rebuilt a real directory
+                    # before this runs.
+                    by_type.unlink()
+                    self._log(
+                        f"cli by-type directory under {tool_dir.name!r} was a symlink"
+                        " — removed (its target untouched)"
+                    )
                 records = sorted(by_type.iterdir()) if by_type.is_dir() else []
                 for record in records:
                     if record.name.startswith("."):
@@ -1761,19 +1800,30 @@ class NodeDaemon:
     def _cli_applied_version(self, cli_root: Path, tool: str, name: str) -> str:
         """The version this worker type's export ACTUALLY serves — evidence,
         not memory (the _verify_applied_drivers posture), over the COMPLETE
-        path the deck launch gate walks: the DESIRED record must be a
+        path the deck launch gate walks. Every intermediate directory — the
+        tool directory, ``by-type``, and the version directory — must be a
+        REAL world-traversable directory: a symlinked one resolves elsewhere
+        (or dangles) inside the read-only deck mount, so records and binaries
+        read through it — however valid at the host-resolved target — vouch
+        for a path the gate cannot walk. The DESIRED record must be a
         world-readable regular file (never a symlink) whose recorded value —
         trailing newlines stripped, the shim's exact ``$(cat)`` parse — names
         the entry symlink's target version (the gate refuses on any mismatch,
-        so mid-upgrade skew is no applied version, not the old one); every
-        directory must be world-traversable, the version dir a REAL directory
-        (a symlink can resolve elsewhere or dangle inside the read-only
-        mount), and the binary a regular world-r+x file. The tree mounts into
-        containers running an arbitrary non-root UID — anything less and
-        status would report a convergence launches cannot see. '' when
-        absent, broken, unreadable, malformed, or mismatched; every
-        filesystem error is evidence of absence, never an escape into the
-        heartbeat."""
+        so mid-upgrade skew is no applied version, not the old one), and the
+        binary a regular world-r+x file. The tree mounts into containers
+        running an arbitrary non-root UID — anything less and status would
+        report a convergence launches cannot see. '' when absent, broken,
+        unreadable, malformed, or mismatched; every filesystem error is
+        evidence of absence, never an escape into the heartbeat."""
+
+        def lmode(path: Path) -> int:
+            # The entry's OWN mode — lstat never follows a symlink (a link is
+            # S_ISLNK, never a dir or regular file), and any error is
+            # evidence of absence, never an exception.
+            try:
+                return os.lstat(path).st_mode
+            except OSError:
+                return 0
 
         def grants(path: Path, bits: int) -> bool:
             try:
@@ -1781,7 +1831,10 @@ class NodeDaemon:
             except OSError:
                 return False
 
-        by_type = cli_root / tool / CLI_BY_TYPE_DIR
+        tool_root = cli_root / tool
+        by_type = tool_root / CLI_BY_TYPE_DIR
+        if not stat.S_ISDIR(lmode(tool_root)) or not stat.S_ISDIR(lmode(by_type)):
+            return ""
         entry = by_type / f"{name}.current"
         try:
             version = os.path.basename(os.readlink(entry).rstrip("/"))
@@ -1790,7 +1843,7 @@ class NodeDaemon:
         if not version:
             return ""
         desired_record = by_type / f"{name}.desired"
-        if desired_record.is_symlink() or not desired_record.is_file():
+        if not stat.S_ISREG(lmode(desired_record)):
             return ""
         if not grants(desired_record, 0o004):  # the gate's [ -r ] under the deck UID
             return ""
@@ -1800,13 +1853,13 @@ class NodeDaemon:
             return ""
         if recorded.rstrip(b"\n") != version.encode("utf-8"):
             return ""
-        version_dir = cli_root / tool / version
-        if version_dir.is_symlink():
+        version_dir = tool_root / version
+        if not stat.S_ISDIR(lmode(version_dir)):
             return ""
         binary = version_dir / cliinstall.CLI_BINARY_NAME
-        if not binary.is_file() or binary.is_symlink():
+        if not stat.S_ISREG(lmode(binary)):
             return ""
-        for directory in (cli_root, cli_root / tool, by_type, version_dir):
+        for directory in (cli_root, tool_root, by_type, version_dir):
             if not grants(directory, 0o001):
                 return ""
         if not grants(binary, 0o005):

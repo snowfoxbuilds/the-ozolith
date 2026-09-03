@@ -443,6 +443,47 @@ def test_symlinked_version_dir_is_never_served_and_is_reinstalled(tmp_path):
     assert decoy.read_bytes() == b"#!/bin/sh\necho decoy\n"  # external target untouched
 
 
+def test_symlinked_tool_root_is_refused_and_never_written_through(tmp_path):
+    """The TOOL directory is a trust boundary: the fast path, mode
+    normalization, the retire-aside rename, staging, and publication all
+    resolve through it, so a symlinked tool root — which can point outside
+    the mounted cli tree — is refused with the typed publish boundary before
+    anything is read from, chmod'd through, or written under it. The repair
+    lives in the daemon's converge pass (the link itself replaced with a
+    real directory); after that the same call installs normally."""
+    data = make_tarball(good_members())
+    external = tmp_path / "outside-the-tree"
+    (external / VERSION).mkdir(parents=True)
+    decoy = external / VERSION / "claude"
+    decoy.write_bytes(b"#!/bin/sh\necho decoy\n")
+    decoy.chmod(0o700)  # the fast path through the link would "repair" this to 0o755
+    snapshot = sorted(p.relative_to(external).as_posix() for p in external.rglob("*"))
+    cli_root = tmp_path / "cli"
+    cli_root.mkdir()
+    (cli_root / "claude").symlink_to(external)
+
+    def poisoned(url):
+        raise AssertionError("a symlinked tool root must fail before any download")
+
+    with pytest.raises(CliPublishFailed, match="tool directory is a symlink"):
+        ensure_cli_version(cli_root, "claude", VERSION, platform_map(data), fetch=poisoned)
+    # Refused, never accepted: the decoy was not served as the fast path or
+    # chmod'd, and nothing was staged, retired, or published at the target.
+    assert (cli_root / "claude").is_symlink()  # the link is left for the daemon repair
+    assert decoy.stat().st_mode & 0o777 == 0o700
+    assert sorted(p.relative_to(external).as_posix() for p in external.rglob("*")) == snapshot
+
+    # The daemon-layer repair (a real directory in the link's place) makes a
+    # RETRY of the identical call install normally.
+    (cli_root / "claude").unlink()
+    published = ensure_cli_version(
+        cli_root, "claude", VERSION, platform_map(data), fetch=fetching(data)
+    )
+    assert not (cli_root / "claude").is_symlink()
+    assert published.read_bytes() == BINARY
+    assert decoy.read_bytes() == b"#!/bin/sh\necho decoy\n"  # external target untouched
+
+
 def test_error_messages_never_carry_urls_or_member_contents(tmp_path):
     data = make_tarball([*good_members(), ("package/evil.sh", b"SECRETBODY", 0o755)])
     with pytest.raises(CliArchiveInvalid) as excinfo:

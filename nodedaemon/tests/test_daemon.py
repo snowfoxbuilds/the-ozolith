@@ -6174,6 +6174,10 @@ class FakeInstaller:
         self.repair = True
 
     def __call__(self, cli_root, tool, version, platforms, *, fetch=None, log=None):
+        if (Path(cli_root) / tool).is_symlink():  # real-installer parity
+            raise cliinstall.CliPublishFailed(
+                f"{tool} {version}: tool directory is a symlink — refusing to install through it"
+            )
         published = Path(cli_root) / tool / version / "claude"
         if published.is_file():
             if self.repair:
@@ -6573,6 +6577,179 @@ def test_cli_desired_record_is_launch_evidence(rig: Rig, installer, tmp_path):
     version_dir.unlink()
     os.replace(moved, version_dir)
     assert applied() == "2.1.257"  # every restoration re-closes the chain
+
+
+def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
+    rig: Rig, installer, tmp_path
+):
+    """The intermediate directories are part of the launch evidence: a
+    symlinked tool or by-type directory resolves elsewhere (or dangles)
+    inside the read-only deck mount, so records and binaries behind it —
+    however valid at the host-resolved target — vouch for a path the gate
+    cannot walk. No applied version, never the externally supplied one."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    cli_root = rig.config.cli_dir
+    tool_root = cli_root / "claude"
+
+    def applied() -> str:
+        return rig.daemon._cli_applied_version(cli_root, "claude", "flightdeck")
+
+    assert applied() == "2.1.257"  # the healthy baseline
+
+    # The whole TOOL directory a symlink — to the fully valid real tree.
+    hijacked = tmp_path / "external-tree"
+    os.replace(tool_root, hijacked)
+    tool_root.symlink_to(hijacked)
+    assert applied() == ""
+    tool_root.unlink()
+    os.replace(hijacked, tool_root)
+    assert applied() == "2.1.257"
+
+    # by-type a symlink — to the fully valid real desired/current records.
+    by_type = tool_root / "by-type"
+    os.replace(by_type, hijacked)
+    by_type.symlink_to(hijacked)
+    assert applied() == ""
+    by_type.unlink()
+    os.replace(hijacked, by_type)
+    assert applied() == "2.1.257"  # every restoration re-closes the chain
+
+
+def test_cli_symlinked_tool_dir_is_repaired_without_touching_the_target(
+    rig: Rig, installer, tmp_path
+):
+    """An ordinary convergence pass REPAIRS a symlinked tool directory: the
+    heartbeat computed before the repair reports the broken truth exactly
+    once, the pass replaces the link ITSELF with a real 0o755 directory and
+    reconstructs records and install from the durable wire (a re-download —
+    the store is a cache, never the external bytes), and the next beat
+    reports convergence — while the target tree behind the link, records and
+    binary included, stays byte-for-byte untouched."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    tool_root = rig.config.cli_dir / "claude"
+    hijacked = tmp_path / "external-tree"
+    os.replace(tool_root, hijacked)  # the fully valid tree, now external
+    tool_root.symlink_to(hijacked)
+    downloads = list(installer.calls)
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]  # the beat preceding this pass's repair
+    assert row["applied"] == "" and row["converged"] is False
+    assert any("was not a real directory" in line for line in rig.logs)
+    # Repaired in-tree: a REAL directory with fresh records and a reinstall.
+    assert tool_root.is_dir() and not tool_root.is_symlink()
+    assert _mode(tool_root) == 0o755
+    by_type = tool_root / "by-type"
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert installer.calls == [*downloads, ("claude", "2.1.257")]
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+    # The external target was never traversed, chmod'd, or deleted through:
+    # its records, entry, and binary are exactly the pre-hijack state.
+    assert (hijacked / "by-type" / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(hijacked / "by-type" / "flightdeck.current") == "../2.1.257"
+    assert (hijacked / "2.1.257" / "claude").read_bytes() == b"binary 2.1.257\n"
+
+
+def test_cli_symlinked_by_type_is_repaired_without_touching_the_records(
+    rig: Rig, installer, tmp_path
+):
+    """The by-type twin: the link itself is replaced with a real directory
+    and the records rewritten from the wire — the intact version directory
+    makes this a record-only repair (no re-download) — while the external
+    record tree behind the link is never modified or deleted."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    hijacked = tmp_path / "external-records"
+    os.replace(by_type, hijacked)  # fully valid desired/current records
+    by_type.symlink_to(hijacked)
+    downloads = list(installer.calls)
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "" and row["converged"] is False
+    assert by_type.is_dir() and not by_type.is_symlink()
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert installer.calls == downloads  # the version dir was intact: no download
+
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert (hijacked / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.257"
+
+
+def test_cli_retire_never_walks_a_symlinked_by_type(rig: Rig, installer, tmp_path):
+    """Retirement enumerates records to unlink; through a symlinked by-type
+    those records live at the TARGET. The retire pass removes the link
+    itself and treats the records as absent — the external records survive
+    even when nothing wants the tool any more (the unreferenced version dir
+    still prunes: the store is a cache, ADR-0024)."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    hijacked = tmp_path / "external-records"
+    os.replace(by_type, hijacked)
+    by_type.symlink_to(hijacked)
+
+    # The pin dropped: no wanted type repairs the tool, so retire itself
+    # must handle the symlink.
+    rig.control.heartbeat_answers.append(cli_response([image_recipe(name="flightdeck")]))
+    rig.daemon.once()
+    assert not by_type.is_symlink() and not by_type.exists()
+    assert (hijacked / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.257"
+    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+
+
+def test_cli_intermediate_repair_failure_is_contained_and_retried(
+    rig: Rig, installer, monkeypatch, tmp_path
+):
+    """A failing intermediate-directory repair takes the existing per-type
+    containment lane — log, typed theozolith.error, heartbeat last-failure
+    row, the rest of the pass untouched — and an ordinary later pass
+    completes the repair and reconverges."""
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    by_type = rig.config.cli_dir / "claude" / "by-type"
+    hijacked = tmp_path / "external-records"
+    os.replace(by_type, hijacked)
+    by_type.symlink_to(hijacked)
+    real_chmod = daemon.os.chmod
+
+    def failing_chmod(path, mode, *args, **kwargs):
+        if Path(path) == by_type:
+            raise PermissionError(1, "injected EPERM")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(daemon.os, "chmod", failing_chmod)
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    event = _find_error(rig, "injected EPERM")
+    assert event is not None and event["error_class"] == "PermissionError"
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+    rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["converged"] is False and row["error_class"] == "PermissionError"
+
+    monkeypatch.setattr(daemon.os, "chmod", real_chmod)
+    for _ in range(2):  # repair + reinstall, then the beat that reports it
+        rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
+        rig.daemon.once()
+    row = _cli_rows(rig)[0]
+    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["error_class"] == "" and row["error"] == ""
 
 
 def test_cli_installer_failure_class_rides_the_event_and_heartbeat(rig: Rig, installer):

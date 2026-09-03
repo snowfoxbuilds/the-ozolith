@@ -172,9 +172,15 @@ def ensure_cli_version(
     directory (present, but the binary missing or irregular — or the version
     directory itself a SYMLINK, which can point outside the mounted cli tree
     and resolve differently or dangle inside the deck container, so it is
-    never served) is renamed aside dot-prefixed and reinstalled. Every
-    failure raises a typed ``CliInstallError`` with staging cleaned and
-    nothing partial published."""
+    never served) is renamed aside dot-prefixed and reinstalled. The TOOL
+    directory is a trust boundary the same way: every operation here — the
+    fast path, mode normalization, the retire-aside rename, staging, and
+    publication — resolves through it, so a symlinked tool directory is
+    refused outright with the typed publish boundary before anything is read
+    or written through it (the daemon's converge pass owns that repair —
+    replacing the link itself with a real directory — after which a retry
+    installs normally). Every failure raises a typed ``CliInstallError``
+    with staging cleaned and nothing partial published."""
     fetch = fetch or _default_fetch
     cli_root = Path(cli_root)
     tool_root = cli_root / tool
@@ -191,6 +197,10 @@ def ensure_cli_version(
         )
     package = str(entry.get("package", ""))
     integrity = str(entry.get("integrity", ""))
+    if tool_root.is_symlink():
+        raise CliPublishFailed(
+            f"{tool} {version}: tool directory is a symlink — refusing to install through it"
+        )
     if published.is_file() and not published.is_symlink() and not version_dir.is_symlink():
         _normalize_export_modes(cli_root, tool_root, version_dir, published, tool, version)
         return published
