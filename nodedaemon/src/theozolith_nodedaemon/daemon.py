@@ -2130,8 +2130,11 @@ class NodeDaemon:
             rows = self._docker.stack_containers()
         except DockerError as exc:
             # A failed observation is never evidence of absence (observation
-            # doctrine): report it and let the next pass retry. Nothing here is
-            # destructive, so the reconcile pass continues.
+            # doctrine): log it locally AND emit a theozolith.error, then let the
+            # next pass retry. Nothing here is destructive — no container is
+            # migrated or updated on a failed listing — so the reconcile pass
+            # continues past it.
+            self._log(f"restart-policy migration: container listing failed: {exc}")
             self._emit_error(
                 type(exc).__name__,
                 f"restart-policy migration: container listing failed: {exc}",
@@ -2152,13 +2155,23 @@ class NodeDaemon:
 
     def _migrate_one_restart_policy(self, name: str) -> None:
         """Migrate one container's restart policy to ``no`` when it diverges.
-        A failed observation of the current policy is not treated as converged;
-        the next pass re-checks (observation doctrine). Only a policy that is
-        actually observed as non-``no`` is updated — a healthy already-converged
-        container is never touched, so there is no churn and no log spam."""
+
+        The two non-converged outcomes are kept distinct (#114). A container that
+        DISAPPEARED between the listing and the inspect reads as ``None``: a benign
+        race, not a failed observation — it is skipped silently with no update and
+        no ``theozolith.error``, since emitting an infrastructure error for a
+        container that simply went away would be misleading. A GENUINE inspect
+        failure instead RAISES ``DockerError`` (``container_restart_policy``),
+        which propagates to the caller's ``_isolated`` wrapper — logged and emitted
+        as an error, then retried next pass — and is never treated as converged.
+
+        Only a policy actually observed as non-``no`` is updated; a healthy
+        already-converged container is never touched, so there is no churn and no
+        log spam."""
         policy = self._docker.container_restart_policy(name)
         if policy is None:
-            self._log(f"stack container {name}: restart policy unobservable; retrying next pass")
+            # Gone between listing and inspect — nothing to migrate; not an error.
+            self._log(f"stack container {name}: disappeared before restart-policy migration")
             return
         if policy in ("", "no"):
             return  # already converged — no recreate, no update, no log

@@ -97,11 +97,15 @@ class FakeDocker:
         # order, so a test asserts a legacy container was converged to `no`
         # exactly once and an already-converged one is never touched. A container
         # in fail_set_restart_policy raises DockerError on update (isolation +
-        # retry test); one in fail_restart_policy_inspect reads as unobservable
-        # (None), the observation-doctrine path.
+        # retry test). The two non-converged inspect outcomes are modeled
+        # distinctly (observation doctrine): a name in fail_restart_policy_inspect
+        # RAISES DockerError (a genuine failed observation → isolated + emitted +
+        # retried), while one in vanished_before_inspect reads as None (a benign
+        # disappearance between listing and inspect → skipped, no error).
         self.restart_policy_updates: list[str] = []
         self.fail_set_restart_policy: set[str] = set()
         self.fail_restart_policy_inspect: set[str] = set()
+        self.vanished_before_inspect: set[str] = set()
 
     def add_run_container(self, name: str, run_id: str, owner: str) -> None:
         self.containers[name] = {
@@ -160,11 +164,17 @@ class FakeDocker:
         }
 
     def container_restart_policy(self, name: str) -> str | None:
-        # Mirrors DockerCtl.container_restart_policy (#114): None when the
-        # container cannot be inspected (missing, or fault-injected), else the
-        # stored policy — defaulting to `no` for any container seeded without one,
-        # exactly as a real `docker run` without `--restart` reports.
+        # Mirrors DockerCtl.container_restart_policy (#114), keeping the two
+        # non-zero inspect outcomes distinct. A fault-injected name RAISES
+        # DockerError (a genuine failed observation), exactly as a generic non-zero
+        # `docker inspect` does. A name that vanished between listing and inspect —
+        # modeled by vanished_before_inspect, or simply absent from stacks — reads
+        # as None (the definitive `no such container` race). Otherwise the stored
+        # policy, defaulting to `no` for a container seeded without one, exactly as
+        # a real `docker run` without `--restart` reports.
         if name in self.fail_restart_policy_inspect:
+            raise DockerError(f"restart-policy inspect failed for {name}")
+        if name in self.vanished_before_inspect:
             return None
         data = self.stacks.get(name)
         if data is None:

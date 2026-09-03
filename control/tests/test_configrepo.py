@@ -2289,16 +2289,28 @@ def test_validate_registry_secret_shape(name, value, ok):
 
 
 @pytest.mark.parametrize(
-    "bad", ["", ".", "..", "../evil", "a/b", "/abs", ".hidden", ".a.tmp", "with\x00nul"]
+    "bad", ["", ".", "..", "../evil", "a/b", "/abs", ".a.tmp", ".token.tmp", "with\x00nul"]
 )
 def test_validate_registry_secret_rejects_unsafe_stored_names(bad):
     """The WRITE surface (PUT /api/v1/secrets and the web form) refuses a stored
     name unsafe to materialize as a tmpfs leaf (#114) before it can be stored —
-    the same shared validator applied at config load and in the daemon."""
+    the same shared validator applied at config load and in the daemon. The
+    reservation is narrow: '.'/'..', separators, NUL, and the writer's
+    '.<name>.tmp' temporary namespace."""
     from theozolith_control.configrepo import validate_registry_secret
 
     with pytest.raises(ConfigRepoError):
         validate_registry_secret(bad, "some-value")
+
+
+@pytest.mark.parametrize("ok", [".env", ".hidden", "backup.tmp", "github-implementer"])
+def test_validate_registry_secret_accepts_ordinary_dot_names(ok):
+    """Ordinary dot-prefixed leaves ('.env', '.hidden') are legitimate secret
+    names, not traversals — only the '.<name>.tmp' temp namespace is reserved — so
+    the write surface accepts them (#114)."""
+    from theozolith_control.configrepo import validate_registry_secret
+
+    validate_registry_secret(ok, "some-value")  # no raise
 
 
 @pytest.mark.parametrize("site", ["worker-type", "stack", "generic-process", "generic-container"])

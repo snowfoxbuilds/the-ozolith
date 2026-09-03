@@ -112,12 +112,24 @@ def validate_stored_secret_name(name: str) -> str:
     direct child of the secrets dir: no input may escape it, alias a sibling, or
     resolve to the dir itself or its parent (#114).
 
-    Rejected: the empty string; a path separator (``/`` or ``\\``) or an
-    embedded NUL, which cover ``.``/``..`` used as components, absolute paths,
-    and every other multi-segment or traversing form; and any name in the
-    writer's temporary namespace — every temp file is ``.<name>.tmp``, so a
-    leading ``.`` is refused, which also subsumes bare ``.`` and ``..`` and
-    guarantees no stored name can collide with, or be mistaken for, a temp file.
+    Rejected:
+
+    - the empty string;
+    - an embedded NUL, or a path separator (``/`` or ``\\``), which together
+      cover absolute paths and every multi-segment or traversing form;
+    - the exact names ``.`` and ``..`` — the secrets dir itself and its parent;
+    - the writer's TEMPORARY namespace: every temp file is materialized as
+      ``.<name>.tmp``, so a name that both starts with ``.`` AND ends with
+      ``.tmp`` is refused. That reservation is narrow but complete — every
+      possible temp path (``.`` + a valid name + ``.tmp``) starts with ``.`` and
+      ends with ``.tmp``, so no valid stored name can equal, or be mistaken for,
+      another secret's temp file, for ANY batch processing order.
+
+    ALLOWED, deliberately: ordinary dot-prefixed leaves such as ``.env`` and
+    ``.hidden`` — a leading dot alone is a legitimate filename, not a traversal,
+    and only the ``.<...>.tmp`` shape collides with the writer. A trailing
+    ``.tmp`` without a leading dot (``backup.tmp``) is fine too — it is not in the
+    temp namespace.
 
     This is a PATH-SAFETY check only. Semantic name policy lives at the binding
     sites: the reserved identity slot names (ADR-0047) and the ``registry:<host>``
@@ -133,13 +145,16 @@ def validate_stored_secret_name(name: str) -> str:
         raise SecretNameError(
             f"secret name {name!r} must be a single path segment (no path separators)"
         )
-    if name.startswith("."):
-        # One rule covers '.', '..', and the writer's '.<name>.tmp' temporary
-        # namespace: a stored name can never traverse to the parent or collide
-        # with a temp file, whatever the batch's processing order.
+    if name in (".", ".."):
+        raise SecretNameError(f"secret name {name!r} must not be '.' or '..'")
+    if name.startswith(".") and name.endswith(".tmp"):
+        # The writer materializes through '.<name>.tmp'; every such temp path
+        # both starts with '.' and ends with '.tmp'. Reserving exactly that shape
+        # guarantees no valid stored name can collide with another secret's temp
+        # file, whatever the batch's processing order — while ordinary dot names
+        # ('.env', '.hidden') stay usable.
         raise SecretNameError(
-            f"secret name {name!r} must not start with '.'"
-            " (reserved for '.'/'..' and the writer's temporary files)"
+            f"secret name {name!r} is reserved: '.<name>.tmp' is the writer's temporary namespace"
         )
     return name
 

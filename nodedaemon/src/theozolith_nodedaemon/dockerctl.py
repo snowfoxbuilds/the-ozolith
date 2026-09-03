@@ -288,24 +288,38 @@ class DockerCtl:
 
     def container_restart_policy(self, name: str) -> str | None:
         """The configured restart-policy name of a container — ``no``, ``always``,
-        ``unless-stopped``, or ``on-failure`` — or ``None`` when it cannot be
-        observed.
+        ``unless-stopped``, or ``on-failure`` — or ``None`` when the container has
+        DISAPPEARED.
 
         Reads ``HostConfig.RestartPolicy.Name`` via ``docker inspect``. A
         container created with no ``--restart`` flag reports ``no`` (older Docker
         can report an empty string; the caller treats both as already-converged).
-        A failed inspect returns ``None``: a failed observation is never evidence
-        that the policy is already ``no`` (observation doctrine), so the migration
-        caller retries on a later pass rather than treating an unreadable
-        container as converged (#114)."""
+
+        The two non-zero outcomes are kept DISTINCT (observation doctrine, #114):
+
+        - A definitive ``no such container``/``no such object`` is not a failed
+          observation — it is positive evidence the container vanished between the
+          listing and this inspect (a benign migration race). It returns ``None``
+          so the caller skips it silently, emitting no infrastructure error.
+        - Any OTHER non-zero result is a failed observation (dockerd unreachable, a
+          transient 500) and RAISES ``DockerError`` with secret-free context — a
+          failed read is never evidence the policy is already ``no``, so the
+          migration caller surfaces it and retries on a later pass rather than
+          treating an unreadable container as converged.
+        """
         proc = self._run(
             ["inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", name],
             check=False,
             timeout=60,
         )
-        if proc.returncode != 0:
-            return None
-        return (proc.stdout or "").strip()
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").lower()
+        if "no such container" in stderr or "no such object" in stderr:
+            return None  # gone between listing and inspect — a benign race
+        raise DockerError(
+            f"docker inspect failed for restart policy of {name}: {(proc.stderr or '').strip()}"
+        )
 
     def set_restart_policy(self, name: str, policy: str = "no") -> None:
         """Converge a container's restart policy IN PLACE, without recreating or

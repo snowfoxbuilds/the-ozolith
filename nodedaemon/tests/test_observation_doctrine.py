@@ -353,15 +353,45 @@ def test_dockerctl_container_restart_policy_reads_the_inspect_format():
     assert ctl.container_restart_policy("ozolith-stack-deck") == "unless-stopped"
 
 
-def test_dockerctl_container_restart_policy_unobservable_reads_as_none():
-    """A failed inspect is never evidence the policy is already `no` (observation
-    doctrine): it reads as None so the migration retries a later pass (#114)."""
+def test_dockerctl_container_restart_policy_empty_output_reads_as_empty():
+    """Older Docker reports an empty policy string for a container run without
+    `--restart`; the caller treats it (like `no`) as already-converged."""
 
     def runner(args, timeout=None, env=None):
-        return subprocess.CompletedProcess(args, 1, "", "No such container")
+        return subprocess.CompletedProcess(args, 0, "\n", "")
+
+    ctl = DockerCtl(runner=runner)
+    assert ctl.container_restart_policy("ozolith-stack-deck") == ""
+
+
+@pytest.mark.parametrize(
+    "stderr", ["Error: No such container: ghost", "Error: No such object: ghost"]
+)
+def test_dockerctl_container_restart_policy_disappearance_reads_as_none(stderr):
+    """A definitive `no such container`/`no such object` is positive evidence the
+    container vanished between the listing and this inspect (a benign migration
+    race), NOT a failed observation: it reads as None so the caller skips it
+    silently rather than emitting an infrastructure error (#114)."""
+
+    def runner(args, timeout=None, env=None):
+        return subprocess.CompletedProcess(args, 1, "", stderr)
 
     ctl = DockerCtl(runner=runner)
     assert ctl.container_restart_policy("ghost") is None
+
+
+def test_dockerctl_container_restart_policy_raises_on_a_generic_inspect_failure():
+    """Any OTHER non-zero inspect is a failed observation (dockerd unreachable, a
+    transient 500) — never evidence the policy is already `no` (observation
+    doctrine): it RAISES DockerError so the migration surfaces it and retries a
+    later pass rather than treating an unreadable container as converged (#114)."""
+
+    def runner(args, timeout=None, env=None):
+        return subprocess.CompletedProcess(args, 1, "", "Cannot connect to the Docker daemon")
+
+    ctl = DockerCtl(runner=runner)
+    with pytest.raises(DockerError):
+        ctl.container_restart_policy("ozolith-stack-deck")
 
 
 def test_dockerctl_set_restart_policy_updates_in_place():

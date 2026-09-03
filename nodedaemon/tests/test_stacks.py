@@ -202,7 +202,10 @@ def test_materialize_repairs_a_symlink_target_without_following_it(tmp_path: Pat
         "admin-token",
         "anthropic-api-key",
         "a",
-        "UPPER_case.mixed-1",  # a dot mid-name is fine — only a LEADING dot is reserved
+        "UPPER_case.mixed-1",  # a dot mid-name is fine
+        ".env",  # an ordinary dotfile leaf — a leading dot alone is legitimate
+        ".hidden",  # likewise
+        "backup.tmp",  # a trailing '.tmp' without a leading dot is not the temp namespace
         "registry:ghcr.io",  # a colon is a legal leaf char; registry semantics guard elsewhere
         "registry:localhost:5000",
     ],
@@ -222,14 +225,27 @@ def test_validate_stored_secret_name_accepts_safe_leaves(name):
         "../../etc/passwd",  # traversal
         "sub/dir",  # a separator anywhere
         "back\\slash",  # a Windows-style separator too
-        ".hidden",  # a dotfile — reserved
         ".a.tmp",  # collides with the writer's '.<name>.tmp' temporary namespace
+        ".token.tmp",  # same reserved namespace, a realistic secret name
+        ".env.tmp",  # even a dotfile-shaped name is refused inside the temp namespace
         "with\x00nul",  # an embedded NUL
     ],
 )
 def test_validate_stored_secret_name_rejects_unsafe_leaves(name):
     with pytest.raises(SecretNameError):
         validate_stored_secret_name(name)
+
+
+def test_no_valid_name_can_collide_with_another_secrets_temp_path():
+    """The writer materializes every value through '.<name>.tmp'. That whole shape
+    is refused as a stored name, so no valid secret can BE another valid secret's
+    temp path — the collision safety holds for every batch processing order (#114).
+    Proven mechanically: for each valid leaf, its temp path is itself rejected."""
+    for name in ("env", "hidden", "token", ".env", ".hidden", "backup.tmp"):
+        validate_stored_secret_name(name)  # a valid stored name
+        temp_path_name = f".{name}.tmp"  # exactly what materialize_secrets writes through
+        with pytest.raises(SecretNameError):
+            validate_stored_secret_name(temp_path_name)
 
 
 @pytest.mark.parametrize("bad", [".", "..", "../evil", "sub/dir", ".a.tmp", "with\x00nul"])
@@ -265,6 +281,28 @@ def test_materialize_valid_name_updates_atomically_and_stays_0444(tmp_path: Path
     second = materialize_secrets(secrets_dir, {"tok": "two"})
     assert second["tok"].read_text() == "two"
     assert (second["tok"].stat().st_mode & 0o777) == 0o444
+
+
+def test_materialize_dot_names_write_correctly_and_never_collide_by_order(tmp_path: Path):
+    """Ordinary dot-prefixed leaves ('.env', '.hidden') are legitimate secret
+    names and materialize as real 0444 leaves beside plain names — and because no
+    valid name is ever another's '.<name>.tmp' temp path, the batch is safe in ANY
+    processing order (#114). Materialized twice with the dict order reversed, every
+    value is correct and no '.tmp' residue survives."""
+    secrets_dir = tmp_path / "secrets"
+    forward = materialize_secrets(secrets_dir, {".env": "E1", ".hidden": "H1", "plain": "P1"})
+    assert forward[".env"].read_text() == "E1"
+    assert forward[".hidden"].read_text() == "H1"
+    assert forward["plain"].read_text() == "P1"
+    assert (forward[".env"].stat().st_mode & 0o777) == 0o444
+    assert (forward[".hidden"].stat().st_mode & 0o777) == 0o444
+
+    reverse = materialize_secrets(secrets_dir, {"plain": "P2", ".hidden": "H2", ".env": "E2"})
+    assert reverse[".env"].read_text() == "E2"
+    assert reverse[".hidden"].read_text() == "H2"
+    assert reverse["plain"].read_text() == "P2"
+    # Exactly the three leaves, no leftover temp file from either pass.
+    assert sorted(p.name for p in secrets_dir.iterdir()) == [".env", ".hidden", "plain"]
 
 
 def test_changed_env_recycles_even_with_the_same_command():

@@ -1989,6 +1989,76 @@ def test_restart_policy_migration_never_touches_compose_or_unlabeled_containers(
     assert rig.docker.restart_policy_updates == []  # neither was migrated
 
 
+def test_restart_policy_inspect_failure_is_isolated_emitted_and_retried(rig: Rig):
+    """A GENERIC failure inspecting one container's restart policy is a failed
+    observation, never evidence it is already `no` (#114): it is logged locally,
+    emitted as a theozolith.error, and left for the next pass — never updated and
+    never torn down — while a co-listed legacy container STILL migrates in the same
+    pass and the desired Stack STILL converges. The next pass retries and converges
+    the faulted container once the fault clears."""
+    deck = container_stack("flightdeck")
+    worker = container_stack("workerdeck")
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # converge both so their spec labels match (no later recreate)
+    deck_name = "ozolith-stack-flightdeck"
+    worker_name = "ozolith-stack-workerdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"
+    rig.docker.stacks[worker_name]["restart_policy"] = "unless-stopped"
+    rig.docker.fail_restart_policy_inspect.add(deck_name)  # a genuine inspect fault
+    rig.docker.restart_policy_updates.clear()
+    rig.docker.removed.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # The faulted container: reported (log + error), never updated, never removed.
+    assert any("restart-policy migration" in line for line in rig.logs)
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) > errors_before
+    assert deck_name not in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "unless-stopped"
+    assert deck_name not in rig.docker.removed  # the fault never tore it down
+    assert deck_name in rig.docker.stacks  # and the Stack still converged
+    # Isolation: the co-listed legacy container migrated in the SAME pass.
+    assert worker_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[worker_name]["restart_policy"] == "no"
+
+    rig.docker.fail_restart_policy_inspect.discard(deck_name)  # the fault clears
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # the next pass retries and converges the policy
+    assert rig.docker.stacks[deck_name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_skips_a_vanished_container_without_error(rig: Rig):
+    """A container listed for migration but GONE by the inspect is a benign race
+    (the container disappeared between listing and inspection), not a failed
+    observation (#114): it is skipped silently — no docker update, and NO
+    theozolith.error, which for a container that simply went away would be
+    misleading — while a co-listed legacy container still migrates in the pass."""
+    deck = container_stack("flightdeck")
+    worker = container_stack("workerdeck")
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()  # converge both
+    deck_name = "ozolith-stack-flightdeck"
+    worker_name = "ozolith-stack-workerdeck"
+    rig.docker.stacks[deck_name]["restart_policy"] = "unless-stopped"
+    rig.docker.stacks[worker_name]["restart_policy"] = "unless-stopped"
+    rig.docker.vanished_before_inspect.add(deck_name)  # gone between listing and inspect
+    rig.docker.restart_policy_updates.clear()
+    errors_before = len([e for e in rig.control.events if e["type"] == "theozolith.error"])
+
+    rig.control.heartbeat_answers.append(heartbeat_response([deck, worker]))
+    rig.daemon.once()
+
+    # The vanished container: skipped, never updated, no error emitted for it.
+    assert deck_name not in rig.docker.restart_policy_updates
+    assert len([e for e in rig.control.events if e["type"] == "theozolith.error"]) == errors_before
+    assert any("disappeared before restart-policy migration" in line for line in rig.logs)
+    # Isolation: the co-listed legacy container still migrated.
+    assert worker_name in rig.docker.restart_policy_updates
+    assert rig.docker.stacks[worker_name]["restart_policy"] == "no"
+
+
 def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):
     """Recovery after a daemon restart / a manual start: a running container
     with no applied-spec label is not trusted — it is reconciled exactly once,

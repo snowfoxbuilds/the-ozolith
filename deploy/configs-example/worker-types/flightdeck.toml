@@ -313,8 +313,9 @@ fi''',
     #     name is NOT a literal here (ADR-0048 amendment): the script reads
     #     $THEOZOLITH_KNOWLEDGE_TREE, injected control-side from the
     #     worker-type `knowledge` field above, and FAILS LOUD when the
-    #     selected tree has not converged onto this node — docker restart
-    #     policy retries until it has. Runtime values
+    #     selected tree has not converged onto this node — the Node Daemon's
+    #     reconcile loop then recreates the failed container on a later pass
+    #     (roughly the heartbeat cadence) until it has. Runtime values
     #     ($FLIGHTDECK_TS_HOSTNAME, $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at
     #     build — every script line is a single-quoted printf argument — and
     #     expand only at container start.
