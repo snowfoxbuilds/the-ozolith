@@ -20,7 +20,15 @@ support waits for a future explicit decision — and corrected five defects in
 the first hardening: audit records are now written ahead of credential use,
 GraphQL `POST` redirects are refused, responses are budget-gated before any
 byte reaches the agent, every retry gets a fresh Run directory, and the
-credential's defense-in-depth claim is stated conditionally.
+credential's defense-in-depth claim is stated conditionally. A third review
+carried the human ruling on content trust — non-member GitHub content may be
+visible to autonomous agents, while pipeline authority stays narrow and
+driver-enforced, and the remaining prompt-injection exposure is an accepted
+residual risk — and completed the contract where the first two drafts still
+left security-sensitive guesswork: the socket is specified as a hostile HTTP
+ingress, the audit's preflight and redirect semantics are reconciled, the
+credential's confidentiality boundary is operator doctrine, the preflight
+defines the empty-repository edge, and the dependency prompt schema is exact.
 
 # ADR-0057: GitHub Relay — `gh` as the agent's read surface, credential-free by driver-side auth injection
 
@@ -55,6 +63,17 @@ first attempt, local retry, completion retry — already has its own `run_id`,
 its own job directory keyed by that id, and its own evidence bundle; the relay
 inherits that shape rather than inventing an attempt counter beside it.
 
+Two boundaries were reframed by the third review. The socket is reachable by
+every process in the container, so the relay's parser is a hostile-ingress
+parser: its guarantees must hold for arbitrary bytes, not for a well-behaved
+`gh`. And the human ruled the content-trust question that the Context Tree's
+OWNER/MEMBER filter had answered by omission: non-member GitHub content may be
+visible to autonomous agents. Total outside influence is not preventable —
+agents also have internet access — so visibility is broad, the pipeline's
+structural authority stays narrow and driver-enforced, and prompt injection
+is mitigated by explicit agent instructions and the human code-review gate,
+recorded as an accepted residual risk rather than claimed away.
+
 ## Decision
 
 1. **`gh` replaces the Context Tree as the agent's GitHub read surface.** The
@@ -63,14 +82,79 @@ inherits that shape rather than inventing an attempt counter beside it.
    and branch on resume rounds); the issue body; on a Review Run the PR body
    exactly as the driver composed it (narrative plus Decisions Section — the
    artifact under judgment); on resume rounds the revised plan; the
-   topologically ordered dependency issue numbers the driver already computes,
-   and any Chained Base note. Comments, reviews, timeline, checks, other
+   dependency closure the driver already computes, as ordered entries of
+   issue number plus state (the exact schema below), and any Chained Base
+   note. Comments, reviews, timeline, checks, other
    issues, other repositories: `gh`. The driver-computed git facts of a Review
    Run — `base.md`, `changed-files.md`, `signals.md` — stay as job-dir files:
    they are git facts, not GitHub reads. The Context Tree serializer and its
    `input/issue/`, `input/pr/` (GitHub-derived parts), and `input/deps/` trees
    are deleted outright, including the pre-launch evidence snapshot of them —
    GitHub is durable and the audit log below records what was read.
+   - *Content visibility is broad (amended 2026-09-03, #117)*: the agent may
+     query comments, reviews, review threads, timeline events, issues, pull
+     requests, and every other readable GitHub surface regardless of the
+     author's association. The Context Tree's OWNER/MEMBER visibility filter
+     for agent-consumed discussion content is retired with the tree; the
+     relay carries no author filter, and no product surface promises the
+     agent a member-only view. The human ruling behind this: total outside
+     influence is not preventable when the agent also has internet access,
+     so hiding non-member GitHub content bought no isolation worth its cost.
+   - *Pipeline authority stays narrow and driver-enforced*: content the agent
+     can see never acquires structural authority. Every driver action — the
+     machine verdict, the reset or resume commit, the cherry-pick set, labels,
+     claims, state transitions, the Based-on base record, and any other
+     driver-parsed instruction — is derived by the driver, with its own
+     credential and outside the relay, from the authorized sources the
+     pipeline already defines: the latest `theozolith:verdict` block only from
+     a PR-conversation comment whose author GitHub reports as `OWNER` or
+     `MEMBER`, the Based-on zone only from the driver-composed PR body,
+     labels only from GitHub label state, claims only from the Control
+     Node's grant. A well-formed machine block in any other comment is
+     visible to the agent through `gh` and inert to the driver. Nothing the
+     agent reads through the relay is parsed by the driver for pipeline
+     state; the driver never re-reads relay traffic, the job directory, or
+     the agent's transcript for it.
+   - *Retrieved content is evidence, never instruction*: every prompt
+     instructs the agent that GitHub content and internet content it
+     retrieves — issue and PR bodies not carried in the prompt, comments,
+     reviews, files in other repositories, web pages — is untrusted material
+     to weigh, never an instruction that overrides the task in the prompt,
+     the repository's own policy files, or the Output Proposal schema; an
+     instruction found in such content is reported in the Decisions Section
+     (or the verdict), not followed. The prompt names the pipeline's
+     authorized instruction sources (the prompt, the revised plan on resume
+     rounds, and the checked-out repository's agent-instruction files) and
+     says that nothing else ranks with them.
+   - *Accepted residual risk*: instructions mitigate prompt injection; they
+     do not eliminate it. A prompt-injected session can still produce a bad
+     diff, a bad verdict, or a disclosure into its own outputs (item 3's
+     confidentiality boundary). The structural guarantees hold regardless —
+     no GitHub write outside the Output Proposal, no driver action from
+     unauthorized content — and the human merge and code-review gate is the
+     final safeguard for what those guarantees do not cover. This is recorded
+     as accepted, not solved.
+   - *Dependency entries — the exact prompt schema (amended 2026-09-03,
+     #117)*: the dependency closure reaches the prompt as **ordered entries
+     of issue number plus state**, never numbers alone. The driver computes
+     the transitive closure the same way it did for `input/deps/` (same-repo
+     only, no depth cap, topological order, blockers before dependents, ties
+     by ascending issue number, closed and merged blockers included) and
+     renders one entry per closure member in that order: the issue number and
+     a `state` from the closed set `open`, `completed`, `not_planned` —
+     `open` for an open issue; for a closed issue its GitHub `state_reason`,
+     with a closed issue carrying no reason rendered `completed`. No title,
+     PR number, merge SHA, or body travels: the agent reads those through
+     `gh`. The renderers take the entries as one argument, `dependencies`, an
+     ordered sequence of `DependencyEntry(number, state)` values exported
+     from the worker package's public API alongside the renderers, replacing
+     the `deps_present` flag and the `input/deps/` navigation bullet; an
+     empty sequence renders no dependency section, so an edge-less prompt is
+     byte-identical to today's. The Chained Base note stays a separate,
+     already-defined prompt section naming the blocker the base is chained
+     on. This shape is `schema_version` 2 surface (item 9): ADR-0053, the
+     pipeline spec, the bench contract, and the golden prompt tests all
+     state it identically.
 2. **Read-only. The Output Proposal stays the sole mutation surface.** The
    relay permits REST `GET`/`HEAD` and single-operation GraphQL `query`
    documents — which `gh` sends as `POST /graphql` and the relay classifies by
@@ -144,15 +228,71 @@ inherits that shape rather than inventing an attempt counter beside it.
      `pulls?state=all&per_page=1`, `commits/{sha}/check-runs?per_page=1`
      (Checks), `commits/{sha}/status` (Commit statuses), `actions/runs?per_page=1`
      (Actions), and a one-field GraphQL `query` for the repository id (the
-     GraphQL endpoint through this token). An empty result set is a pass; a
-     401 or 403 fails; a 404 on the Actions listing after the repository
-     itself resolved records "Actions unavailable for this repository" in the
-     boot report rather than failing (a repository with Actions disabled has
-     no CI-run surface to promise); any other 404 fails. A failure names the
-     missing capability, the endpoint, and the host — never a credential
-     byte — and no claim is accepted while it stands. A missing, unreadable,
-     or expired token fails the same way (unreadable at config load; expired
-     as a 401). The product never probes with a mutation.
+     GraphQL endpoint through this token). Empty collections pass: an empty
+     issue, pull-request, check-run, commit-status, or workflow-run listing
+     proves the read and promises nothing further. The commit probe is the
+     exception, decided explicitly (amended 2026-09-03, #117): the Checks
+     and Commit-status probes need a real commit, and a worker cannot check
+     out or run against a repository that has none, so an **empty
+     repository** — the commits listing answering GitHub's empty-repository
+     409, an empty list, or a repository whose `default_branch` is absent or
+     resolves to no branch — is a pre-work refusal of the Bound Workspace
+     ("Bound Workspace <owner/name> has no commit on its default branch; the
+     worker cannot check out or run against it"), named as a workspace
+     condition, never as a missing capability. A probe commit that resolves
+     and then vanishes mid-preflight (a 404 or 422 on the check-run or
+     status probe after the listing yielded it — a force-push or branch
+     deletion racing the preflight) is re-resolved once from the listing;
+     if the second attempt fails too the preflight fails naming the race
+     ("probe commit unresolvable"), never a capability. Statuses are read by
+     capability: a 401 anywhere is the token itself — invalid, revoked, or
+     expired — and fails naming the token, not a capability; a 403 on one
+     probe is that capability missing, named; a 403 carrying
+     `X-RateLimit-Remaining: 0` is a rate-limit failure, named as such with
+     the reset time; a 404 on the Actions listing after the repository
+     itself resolved records "Actions unavailable for this repository" in
+     the boot report rather than failing (a repository with Actions disabled
+     has no CI-run surface to promise); any other 404 fails. The boot report
+     lists every capability with its own result — `verified`,
+     `unavailable`, or `not-probed` — and never summarizes as "all
+     capabilities verified" unless every probe, the commit-scoped ones
+     included, executed and passed; a preflight that stopped before the
+     commit-scoped probes reports them `not-probed` and fails. A failure
+     names the missing capability, the endpoint, and the host — never a
+     credential byte — and no claim is accepted while it stands. A missing,
+     unreadable, or expired token fails the same way (unreadable at config
+     load; expired as a 401). The product never probes with a mutation.
+   - *Preflight record — driver-originated, outside the per-Run sink
+     (amended 2026-09-03, #117)*: the preflight runs before any Run exists,
+     so it has no per-Run audit sink, and the write-ahead invariant of item
+     8 is scoped to agent-originated relay requests — the requests whose
+     author the driver does not control. The preflight's requests are
+     driver-chosen, fixed, and enumerated above; their record is the boot
+     report: per probe, the capability, the endpoint class, the upstream
+     status, and the decision, written to the driver's journal and to a
+     `gh-preflight.json` in driver-owned storage (outside every container
+     mount, overwritten per boot, never copied into any Run's evidence).
+     Redacted exactly as item 8 redacts: no credential byte, no header, no
+     response content, no upstream error text beyond the status. The
+     preflight's responses pass through the same response gate and are
+     discarded once read.
+   - *Confidentiality boundary — operator doctrine (amended 2026-09-03,
+     #117)*: the relay token's repository scope is also the agent's
+     data-access scope and therefore its potential disclosure scope. An
+     agent may place anything it can read into its working tree, its
+     transcript, its evidence bundle, its PR description, or the target PR
+     the driver creates automatically — all before any human merge, and the
+     transcript and evidence are retained. So: each Stack binds a token
+     scoped to its target repository where GitHub's token model allows it;
+     a token spanning several private repositories may be bound only when
+     every repository it covers belongs to the same permitted disclosure
+     domain as the target repository and its evidence storage; and an
+     operator must never bind a token able to read information that may not
+     be exposed to the target repository, its PRs, or its evidence bundles.
+     This is doctrine, not enforcement, because GitHub cannot prove the
+     absence of broader grants (the same fact behind the write guarantee
+     below); the boot report names the repository the preflight verified
+     and nothing about others.
    - *The credential guarantee, stated honestly (amended 2026-09-03, #117)*:
      operators must bind a GitHub.com fine-grained token carrying only the
      read permissions above. The preflight proves the required reads and
@@ -225,9 +365,16 @@ inherits that shape rather than inventing an attempt counter beside it.
      decision that names an explicit host allowlist and strips the credential
      before the redirected hop.
    - A redirect answer is evaluated before any of its body is delivered
-     (item 6), and each redirect decision is one audit record — status,
-     decision, reason code, and the `Location`'s scheme and host only, never
-     its path or query, which may carry a signed token.
+     (item 6), and every redirect decision of a request is recorded in that
+     request's single completion record (item 8; amended 2026-09-03, #117 —
+     one record per request, never one per hop): a bounded `redirects` array
+     of at most three entries, each carrying the hop number, the upstream
+     status, the decision, the reason code, and the `Location`'s scheme and
+     host only, never its path or query, which may carry a signed token.
+   - The hostile-ingress rules of item 6 apply to the resolved `Location`
+     as they apply to a client path: the redirected path is canonicalized
+     by the same rules before the denylist and method policy see it, and an
+     ambiguous spelling refuses the hop.
 6. **Transport: a socket file inside the job dir; the relay is a per-Run driver
    child with per-Run budgets and a pre-delivery response gate.** The socket
    lives at the job-dir root (never under `input/`) and reaches the container
@@ -271,6 +418,102 @@ inherits that shape rather than inventing an attempt counter beside it.
      gate before item 5 decides it, so no redirect body is ever delivered.
      The relay asks the upstream for identity encoding and hands the client
      plain bytes.
+   - *Ingress contract — the socket is hostile (amended 2026-09-03, #117)*:
+     any process in the container can connect, so the relay parses the
+     socket as untrusted input and none of its guarantees depend on the
+     client being `gh`. The parser is stdlib-only (ADR-0010) and fail-closed:
+     everything below refuses with a 4xx-class answer carrying a stable
+     reason code, writes a `refused` intent record (item 8) when a request
+     line was parsed, and counts against the request budget.
+     - *Connections*: one request per connection. The relay answers every
+       request with `Connection: close`, closes after the response, and
+       never reads a second request on a connection — bytes after the
+       declared end of the body are discarded, never parsed, so pipelining
+       and request smuggling have no second request to reach. At most 8
+       connections may be open per Run (4 in flight under the concurrency
+       budget, 4 waiting); a further connection is accepted and closed with
+       the busy refusal without reading it. Inbound reads are bounded in
+       time: 10 s to receive the complete request head, 30 s to receive the
+       complete body, and no idle allowance — a connection that sends
+       nothing for 10 s, or sends the head and stops, is closed. Connection-
+       level rejections (the cap, a timeout before a request line) write no
+       per-event record — they are counted in the summary's connection
+       counters (item 8), which is bounded by construction.
+     - *Request line*: `HTTP/1.1` exactly; any other version refuses (`505`).
+       The request-target must be origin-form — a path beginning with `/`,
+       optionally followed by `?` and a query; absolute-form,
+       authority-form, and asterisk-form refuse, as does any fragment. The
+       method token is `GET`, `HEAD`, or `POST` (the last only with the
+       canonical path `/graphql`); `CONNECT`, `OPTIONS`, `TRACE`, every other
+       token, and any upgrade attempt refuse. The request line is at most 8
+       KiB, the path at most 4 KiB, the query at most 4 KiB.
+     - *Headers*: at most 64 fields and 16 KiB in total, no field over 8
+       KiB; names are RFC 9110 tokens matched case-insensitively, values
+       printable ASCII with tab, and any CR, LF, NUL, control byte, or
+       non-ASCII byte anywhere in the head refuses. Obsolete line folding
+       refuses. Framing is exact: a body is admitted only with a single
+       `Content-Length` (decimal digits only, no sign, no duplicate or
+       comma-joined value, at most the request-body budget) or a single
+       `Transfer-Encoding: chunked` (the bare token, no other coding, no
+       chunk extensions, no trailers, sizes as bare hexadecimal, the decoded
+       total under the same budget); both headers present, either header
+       repeated or conflicting, any other transfer coding, `Expect`,
+       `Upgrade`, `Connection` naming an upgrade, `TE`, or `Trailer`
+       refuses. A body on `GET` or `HEAD` refuses. A declared body that does
+       not arrive in full within the read limit refuses.
+     - *Path canonicalization, before classification*: the raw path is
+       percent-decoded once and normalized before item 4's denylist, item
+       5's method policy, and the `/graphql` match see it, and the
+       canonical form is what item 8 records. Fail closed on every ambiguous
+       spelling: a percent-decoded byte that is `/`, `\`, `%`, `?`, `#`,
+       NUL, a control byte, or a non-ASCII byte; a literal backslash; an
+       empty segment (`//`) or trailing slash; a `.` or `..` segment; a
+       malformed or partial escape; a second layer of encoding; any
+       character outside the unreserved set, `/`, and the sub-delimiters
+       GitHub's API paths use. Nothing is resolved or collapsed — a path
+       needing normalization refuses rather than being fixed. The query is
+       parsed as `name=value` pairs, each name and value percent-decoded
+       once under the same byte rules, and re-encoded canonically for the
+       upstream request.
+     - *Upstream reconstruction*: the upstream request is built from the
+       validated method, the canonical path, the re-encoded query, the
+       allowlisted headers below, the injected `Authorization`, and the
+       buffered body of exactly the declared length; no raw client byte is
+       ever copied onto the upstream connection. Framing is the relay's:
+       `Content-Length` recomputed from the buffered body, `Host` set to
+       `api.github.com`, `Accept-Encoding: identity`, and a fixed
+       `User-Agent` naming the relay and its version.
+     - *Client-header allowlist*: forwarded, each at most once and at most
+       1 KiB: `Accept`, `Content-Type` (on `POST` only, and only
+       `application/json` with an optional charset), `X-GitHub-Api-Version`,
+       `GraphQL-Features`, `If-None-Match`, `If-Modified-Since`. Every other
+       header is stripped and, where the upstream needs one, rebuilt by the
+       relay: `Host`, `Authorization`, the sentinel and any other credential
+       header, `Proxy-Authorization` and every `Proxy-*`, `Connection` and
+       every header it names, `Keep-Alive`, `Transfer-Encoding`,
+       `Content-Length`, `TE`, `Trailer`, `Upgrade`, `Expect`, `Forwarded`,
+       every `X-Forwarded-*`, `Via`, `Cookie`, `Accept-Encoding`,
+       `User-Agent`, `Origin`, `Referer`, `Range`, and any header not in the
+       allowlist.
+     - *Response-header allowlist*: delivered after the gate, from the final
+       upstream response only: `Content-Type`, `Date`, `ETag`,
+       `Last-Modified`, `Cache-Control`, `Vary`, `Link`, `Retry-After`,
+       every `X-RateLimit-*`, `X-GitHub-Request-Id`, `X-GitHub-Media-Type`,
+       `X-GitHub-Api-Version-Selected`. Framing is recomputed after
+       buffering — `Content-Length` from the delivered body (omitted on
+       `HEAD`), `Connection: close`, never chunked. Everything else is
+       stripped: `Location` (redirects are decided, never delivered),
+       `Set-Cookie`, `Transfer-Encoding`, `Content-Encoding`, `Connection`,
+       `Keep-Alive`, `Server`, `Alt-Svc`, `Strict-Transport-Security`,
+       `Content-Security-Policy`, `X-OAuth-Scopes` and
+       `X-Accepted-OAuth-Scopes` (they describe the credential), and any
+       header not in the allowlist.
+     - *Content encoding*: the relay requests identity and refuses any
+       upstream response carrying a non-identity `Content-Encoding` (`gzip`,
+       `deflate`, `br`, or anything else) with the 502-class refusal; it
+       never decodes. The gate therefore counts exactly the bytes the agent
+       would receive, and the 64 MiB worst case of item 6 is a bound on real
+       bytes, not on compressed ones.
    - *Lifetime and bootstrap*: the relay lives for the agent phase only —
      created before launch, unlinked when the agent exits, so gate jobs —
      repo-declared commands running agent-authored code — never see GitHub.
@@ -291,8 +534,12 @@ inherits that shape rather than inventing an attempt counter beside it.
 8. **Audit, not reproduction — write-ahead, in a sink the container cannot
    reach.** The audit log is the security-relevant record of what the
    credential was asked to do, so nothing the run container can write,
-   replace, link, or name may be its source of truth, and no credentialed
-   request may exist without a record written before it.
+   replace, link, or name may be its source of truth, and no
+   **agent-originated** relay request may reach the credential without a
+   record written before it (scoped 2026-09-03, #117: the driver's own
+   boot preflight is recorded by item 3's preflight record, outside any
+   per-Run sink — the invariant guards the requests whose author the driver
+   does not control).
    - *Sink*: the relay creates the authoritative `gh-audit.jsonl` in
      driver-owned storage outside every container mount — beside the trusted
      input snapshot the driver already keeps, in the per-Run directory keyed
@@ -318,8 +565,11 @@ inherits that shape rather than inventing an attempt counter beside it.
      delivered, refused at the response gate, redirected and refused, timed
      out, or aborted — the relay appends a **completion record** correlated
      to the intent by sequence number, carrying the upstream status, the
-     actual request and response byte counts, every redirect decision of item
-     5, and the terminal reason. If the completion append fails, the intent
+     actual request and response byte counts, the request's redirect
+     decisions of item 5 as one bounded `redirects` array (at most three
+     entries, one per hop attempted; empty when no redirect was answered),
+     and the terminal reason. Two records per request is the whole
+     protocol: a redirect never adds a record. If the completion append fails, the intent
      record already proves the credential use; the relay enters the
      audit-unavailable state and forwards nothing further. Capacity is
      reserved up front so the relay can never finish an upstream call and
@@ -335,8 +585,12 @@ inherits that shape rather than inventing an attempt counter beside it.
      canonical encoding (literal values only for `owner`, `name`, `repo`,
      `number`, `first`, `last`, `states`, under the same printable cap);
      decision with a reason code from a closed enum, never client text; the
-     budgets reserved (intent) or the upstream status, byte counts, redirect
-     decisions, and terminal reason (completion). Never recorded:
+     budgets reserved (intent) or the upstream status, byte counts, the
+     bounded `redirects` array, and terminal reason (completion). The 4 KiB
+     record cap is sized with the three-entry array inside it, so a
+     completion record never overflows into the truncation marker because
+     of redirects; capacity reservation counts exactly one intent, one
+     completion, and the terminal record per request. Never recorded:
      credentials, the sentinel, `Authorization` or any other header, request
      bodies, response bodies, upstream error text, refusal message text,
      repository content, or any bytes copied from the client beyond the
@@ -363,13 +617,30 @@ inherits that shape rather than inventing an attempt counter beside it.
      `indeterminate`: intent with neither a completion nor any terminal
      accounting — the relay died between intent and completion, so whether
      the upstream connection was opened is unknown), aggregate request and
-     response bytes, budgets hit, termination reason (`clean`, `killed`,
-     `crashed`, `orphaned`), audit-failure flag — and publishes both into the
-     evidence bundle from the sink. An `indeterminate` request is therefore
-     always distinguishable from one that never passed authorization: the
-     latter has a `refused` intent or no record at all. The summary detects
+     response bytes, redirects followed and refused, connection counters
+     (accepted, refused at the cap, closed on a read timeout), budgets hit,
+     termination reason (`clean`, `killed`, `crashed`, `orphaned`),
+     audit-failure flag — and publishes both into the evidence bundle from
+     the sink. An `indeterminate` request is therefore always
+     distinguishable from one that never passed authorization: the latter
+     has a `refused` intent or no record at all. The summary detects
      collection errors (a truncated copy, a missed publish); it is not a
-     tamper seal, since nothing untrusted ever reaches the sink. The sink is
+     tamper seal, since nothing untrusted ever reaches the sink.
+   - *Short writes and malformed records (amended 2026-09-03, #117)*: a
+     short write is an audit failure like any other — the relay enters
+     audit-unavailable and writes nothing further, so the sink can end in a
+     partial line but never contains a partial line followed by a complete
+     one. Publication never depends on the sink parsing: the driver copies
+     the sink byte-for-byte and digests the bytes, then parses it line by
+     line for the summary, which reports `records_parsed`, the byte offset
+     and length of any unparseable tail (a line without its newline, or a
+     line that is not a complete JSON object of a known kind), and the
+     terminal record's state — `present`, `missing`, or `malformed` —
+     separately from the driver-observed termination reason, so a clean
+     exit with no terminal record and a crash with a torn one are both
+     diagnosable from the summary alone. A request whose completion record
+     is the unparseable tail counts as `incomplete`, never `complete`.
+     The sink is
      deleted only once the bundle is durably pushed: while a push fails it
      stays and the existing evidence retry carries it; a sink orphaned by a
      driver crash is published by the boot-time evidence sweep as
@@ -377,8 +648,12 @@ inherits that shape rather than inventing an attempt counter beside it.
      progress telemetry. Full input reproducibility is knowingly given up:
      requests are the record, and responses remain recoverable from GitHub.
 9. **Run Contract surface (`schema_version` 2).** The job dir gains the socket,
+   the prompt renderers take the ordered dependency entries of item 1 (a
+   `dependencies` sequence of `DependencyEntry(number, state)` in place of
+   the `deps_present` flag — the public signature the bench replays),
    `worker`'s public API exports the relay as an entry point with an injectable
-   upstream, and the bench driver runs the identical policy, never a copy. Two
+   upstream, and the bench driver runs the identical policy — ingress
+   contract included — never a copy. Two
    upstream modes exist: **live** (a GitHub.com credential source, `_FILE`
    style, never argv — the host is fixed by item 3) and **none** — the relay
    refuses every request with an explicit message ("This benchmark run has no
@@ -447,18 +722,93 @@ inherits that shape rather than inventing an attempt counter beside it.
       not accept fails pre-work as an infra-class failure exactly as today,
       and a job dir still carrying Context Tree paths is neither read nor
       tolerated — they are unknown entries.
+    - *Upgrade from `schema_version` 1 (amended 2026-09-03, #117)*: the
+      upgrade is deliberate at both ends. The driver writes only the version
+      2 layout — it never materializes `input/issue/`, the GitHub-derived
+      parts of `input/pr/`, or `input/deps/`, and a version 2 job directory
+      found to contain any of them before launch refuses the Run pre-work as
+      infra-class (a driver-authored directory that is not what the driver
+      writes is a bug or tampering, never something to clean and continue).
+      Version 1 job directories and trusted snapshots left on a node from
+      before the upgrade are orphans: the boot sweep publishes each under
+      the contract its own manifest names — the Context Tree snapshot
+      included, since that was that Run's real input — and then removes
+      them; nothing re-runs, reads, or migrates them. Mixed versions fail
+      closed everywhere they can meet: a manifest stamped 1 is never
+      launched by a version 2 driver, an image whose `format-output` CLI
+      accepts only version 1 refuses a version 2 manifest at its first
+      invocation exactly as today's skew rule says, and the bench refuses a
+      job directory whose manifest version and layout disagree. There is no
+      compatibility window and no dual-version driver.
 11. **Test obligations for the implementation PR.** With the lexer fixture
     corpus and the pinned-`gh` wire shapes of item 4, the implementation
     must land tests for:
+    - content trust and driver authority (negative, driver-side) — a
+      well-formed `theozolith:verdict` block in a PR-conversation comment
+      from a COLLABORATOR, CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER,
+      NONE, or association-less author, and in a review comment or review
+      body from any author, never becomes the selected verdict, never
+      designates the reset or resume commit or cherry-pick set, never moves a
+      label, never affects a claim, and never triggers a state transition,
+      while an OWNER or MEMBER comment's block still does; the same comment
+      is readable through the relay in the same Run (visibility proven
+      broad, authority proven narrow, in one test); a Based-on zone planted
+      in a comment rather than the PR body is ignored; the driver's
+      verdict, base, label, and claim reads are shown to run outside the
+      relay with the driver credential; and the prompt's retrieved-content
+      rule is present byte-exact in both renderers;
+    - dependency prompt schema — golden prompts for no edges (byte-identical
+      to the edge-less prompt), one open blocker, a mixed chain of
+      `open`, `completed`, and `not_planned` entries in topological order,
+      and a chain with the Chained Base note, for both renderers through
+      the public `dependencies` signature; the state derivation from
+      `state`/`state_reason` including a closed issue with no reason;
     - host and token contract — a GHES host in every canonicalizer spelling
       refused at config load and at driver boot before any preflight, relay,
       socket, container, claim, or Review Run, with the V1 message; no
       classic-token fallback (a `ghp_`, OAuth, App, and unrecognized token
       form each refused by name; the driver PAT never read by the relay under
-      any failure); the preflight — each missing capability failing by name,
-      empty result sets passing, expired and unreadable tokens, the
-      Actions-unavailable case, an accidentally broad token passing with no
-      message overclaiming, and no credential byte in any message;
+      any failure); the preflight — each missing capability failing by name
+      on a capability-specific 403, a 401 on any probe failing as the token,
+      a rate-limit 403 named as such, empty issue, PR, check, status, and
+      workflow collections passing, an empty repository (409, empty listing,
+      and missing default branch each) refused pre-work as a workspace
+      condition and not a capability, a probe commit deleted between the
+      listing and the commit-scoped probes re-resolved once and then failing
+      by name, the Actions-unavailable case recorded and passing, the boot
+      report per capability with `not-probed` shown whenever commit-scoped
+      probes did not execute and no "all verified" summary in that case,
+      the preflight record written outside any Run sink with no credential,
+      header, or response content, expired and unreadable tokens, an
+      accidentally broad token passing with no message overclaiming, and no
+      credential byte in any message;
+    - ingress (hostile client, never `gh`) — a slow-loris head and a
+      slow body each closed at the read limit; idle connections closed;
+      connections beyond the cap refused unread with the counter moving;
+      a pipelined second request on one connection discarded, never
+      forwarded; request-line, header-count, header-byte, path, and query
+      limits each at exactly-at and one-over; `HTTP/1.0`, `HTTP/2` preface,
+      absolute-form, authority-form, asterisk-form, and fragment targets
+      refused; `CONNECT`, `OPTIONS`, `TRACE`, `PUT`, `PATCH`, `DELETE`, a
+      `POST` off `/graphql`, and a body on `GET` refused; obsolete folding,
+      CR/LF/NUL/control/non-ASCII bytes in names and values, duplicate and
+      conflicting `Content-Length`, `Content-Length` with
+      `Transfer-Encoding`, chunked with extensions or trailers, `gzip` and
+      `identity` transfer codings, `Expect`, `Upgrade`, and `TE` each
+      refused — the classic smuggling shapes (CL.TE, TE.CL, TE.TE) proven to
+      produce exactly one refused request and zero upstream requests; the
+      encoded-denylist matrix — `%2F`, `%5C`, `%2e%2e`, `%00`, `%25`,
+      double encoding, backslash, `//`, trailing slash, `.` and `..`
+      segments, and a non-ASCII byte — each refused before the denylist
+      rather than normalized past it, and the canonical spelling of a
+      denylisted path refused by the denylist; every stripped client header
+      proven absent upstream and every allowlisted one forwarded once; the
+      upstream request byte-compared against reconstruction from validated
+      parts; every stripped response header proven absent downstream,
+      `Location` never delivered, framing recomputed, `Content-Length`
+      omitted on `HEAD`; a `gzip`, `br`, `deflate`, and unknown
+      `Content-Encoding` response each refused undecoded with no downstream
+      byte;
     - write-ahead audit — no credentialed request without a durable intent
       record (an injected intent-write failure proves no upstream connection
       is opened); intent and completion records correlating exactly; a
@@ -467,7 +817,14 @@ inherits that shape rather than inventing an attempt counter beside it.
       that guarantees room for completion and terminal records at the file
       cap; crashes injected after intent, during upstream, and after
       completion each leaving an `indeterminate` request diagnosable in the
-      published summary; audit-path tampering — attempted unlink,
+      published summary; a short write and a torn final line each freezing
+      the relay and publishing with the unparseable tail's offset reported
+      and the affected request counted `incomplete`; a missing and a
+      malformed terminal record each reported distinctly from the
+      termination reason; the redirect array — zero, one, and three entries
+      in one completion record, never a second record, and a 4 KiB
+      completion record with three entries never truncated; the preflight
+      writing no per-Run record; audit-path tampering — attempted unlink,
       replacement, truncation, symlink substitution, a forged pre-existing
       log at the sink path, concurrent writers, and a crash during final
       publication — each leaving the published record intact or the failure
@@ -491,14 +848,32 @@ inherits that shape rather than inventing an attempt counter beside it.
       mid-body, an interrupted spool, spool disk exhaustion, and proof that
       no downstream byte precedes budget validation and that every spool is
       deleted on every path including the boot sweep;
-    - lifecycle — shutdown with active requests; socket and sink cleanup
-      after every exit path; a pre-existing socket-path entry in a fresh job
-      directory failing loud; local and completion retries each getting a
-      fresh job directory, socket, relay, and sink, with completion carryover
-      containing only the enumerated state; parallel-Run isolation; driver
-      restart and orphan sweep; evidence-push failure retaining the sink;
-      bench `live` and `none` parity through the exported entry point; no
-      relay reachable during gate jobs;
+    - lifecycle, concurrency, and recovery — shutdown with active requests;
+      socket, sink, and spool cleanup after every exit path; a pre-existing
+      socket-path entry in a fresh job directory failing loud; local and
+      completion retries each getting a fresh `run_id`, job directory,
+      socket, relay child, audit sink, spool lifecycle, and evidence bundle,
+      with completion carryover containing only the enumerated state;
+      parallel Runs on one node isolated across every one of those; a
+      request flood and a parser crash taking only the relay child, the
+      driver and Run surviving; driver restart and orphan sweep publishing
+      the sink as `orphaned` and deleting the spool; container interruption
+      running the shutdown path; evidence-push failure retaining the sink
+      through the retry and deleting it only after a durable push; no relay
+      reachable during gate jobs;
+    - upgrade — a version 1 job directory left from before the upgrade
+      published by the boot sweep under its own manifest and removed, never
+      launched; a version 2 job directory containing any retired Context
+      Tree path refused pre-work; a manifest stamped 1 refused by a version
+      2 driver; a version 1 `format-output` CLI refusing a version 2
+      manifest; the bench refusing a manifest whose version and layout
+      disagree;
+    - bench — `live` and `none` parity through the exported entry point,
+      the same ingress, policy, gate, redirect, and audit fixtures passing
+      unchanged against the bench driver, `none` producing only `refused`
+      intents and the recorded `gh_upstream: none`, `live` against a
+      scratch repository exercising the host pin with the bench-owned
+      credential source never in argv;
     - and, throughout, no credential in argv, the agent's environment, logs,
       errors, evidence, audit metadata, request echoes, redirect targets, or
       refused requests; every refusal and diagnostic message byte-exact and
@@ -521,7 +896,17 @@ inherits that shape rather than inventing an attempt counter beside it.
   a clean 502; a missing read capability, an unsupported host, or a wrong
   token form surfaces at boot, not as a mid-Run 403; the Context Tree
   serializer, its evidence snapshot, and the navigation guide are deleted
-  rather than maintained beside a second source.
+  rather than maintained beside a second source; the agent sees the whole
+  conversation, non-member comments included, while no comment of any
+  author can move a verdict, a commit, a label, a claim, or a transition —
+  visibility and authority are decided separately and each is stated
+  plainly; the socket's parser is specified against hostile bytes, so the
+  read-only, host-pin, denylist, and byte-budget guarantees hold for any
+  client the container can run, and a smuggled, encoded, or compressed
+  shape has a defined refusal rather than an implementer's guess; an empty
+  repository fails at boot as a workspace condition, and a boot report never
+  says "verified" about a probe that did not run; the dependency closure has
+  one shape in every document and the renderer signature.
 - **Negative**: a Run's inputs are no longer fully reproducible from its
   evidence bundle; a second GitHub credential per worker type is operator
   work, and its permission matrix is longer than the first draft promised; an
@@ -536,13 +921,28 @@ inherits that shape rather than inventing an attempt counter beside it.
   the sink and the spool; raw CI log and artifact bytes are not served in v1;
   review mode's constructible-without-GitHub property now yields a recorded
   mode deviation rather than production fidelity; a bench run at full
-  fidelity needs the bench side to provision real GitHub objects.
-- **Neutral**: amends ADR-0013 (channel clause), ADR-0053 (Context Tree
-  closure and Review Run parity clauses), and ADR-0054 with BENCH-CONTRACT.md
-  (`schema_version` 2, relay entry point, upstream modes); ADR-0046,
-  ADR-0010, and ADR-0056's host canonicalizer are explicitly unchanged; the
-  per-Run `run_id`, job directory, and evidence bundle contract is reused,
-  not extended; the glossary gains GitHub Relay and retires Context Tree; the
+  fidelity needs the bench side to provision real GitHub objects; a
+  prompt-injected session can be steered by any GitHub or internet content
+  it reads — accepted, with instructions as mitigation and the human merge
+  gate as the safeguard, never claimed eliminated; the relay token's scope
+  is a disclosure scope the product cannot verify, so token binding carries
+  operator doctrine the product can only document; the ingress contract
+  refuses some technically valid HTTP (keep-alive, pipelining, chunk
+  extensions, compressed responses, every non-allowlisted header), which
+  binds the relay to the pinned `gh` version's wire behavior and makes a
+  `gh` bump a relay-fixture change; one request per connection costs a
+  connection setup per `gh` call.
+- **Neutral**: amends ADR-0013 (channel clause), ADR-0017 (the Context
+  Tree amendments' visibility filter is retired and the authorized-source
+  rule for driver-parsed machine blocks restated as the surviving boundary),
+  ADR-0053 (Context Tree closure and Review Run parity clauses; the exact
+  dependency-entry schema), ADR-0056 (the read surface is no longer bound to
+  one repository; cross-repo Dependency Edges stay malformed on the grounds
+  that survive), and ADR-0054 with BENCH-CONTRACT.md (`schema_version` 2,
+  relay entry point, upstream modes, ingress contract); ADR-0046, ADR-0010,
+  and ADR-0056's host canonicalizer are explicitly unchanged; the per-Run
+  `run_id`, job directory, and evidence bundle contract is reused, not
+  extended; the glossary gains GitHub Relay and retires Context Tree; the
   ADR-0017 "context is read at checkout" clause now means the agent reads it
   live through the relay; the preflight proves presence of reads, not absence
   of writes — the only proof GitHub's API offers.
@@ -553,6 +953,57 @@ inherits that shape rather than inventing an attempt counter beside it.
   conversation confuse the agent about which is canonical, and the snapshot's
   determinism benefit is worth less than the maintenance of a second surface;
   the prompt's inline task statement keeps the bench runnable without it.
+- **Keeping the OWNER/MEMBER visibility filter at the relay**: rejected
+  (2026-09-03, #117) — it would require the relay to parse and rewrite
+  every REST and GraphQL response shape that can carry a comment, which is
+  GitHub's schema again; it protects against nothing the agent's internet
+  access does not already expose; and it conflates two questions the human
+  ruled separately — what the agent may see (broad) and what may move the
+  pipeline (only the driver, from authorized sources). The filter survives
+  exactly where it was load-bearing: the driver's own selection of machine
+  blocks.
+- **Claiming that instructions prevent prompt injection**: rejected — no
+  instruction makes retrieved text inert to a model; the product states the
+  structural guarantees it has (no write outside the Output Proposal, no
+  driver action from unauthorized content) and records the rest as an
+  accepted residual risk absorbed by the human gate.
+- **Forwarding raw client bytes upstream after inspection**: rejected
+  (2026-09-03, #117) — an inspected byte stream is still the client's
+  framing, and every smuggling shape is a disagreement between two parsers
+  about where a request ends; rebuilding the upstream request from
+  validated parts leaves exactly one parser's opinion on the wire.
+- **Keep-alive and pipelining on the socket**: rejected — a second request
+  on a connection is the surface request smuggling needs; one request per
+  connection costs a Unix-socket connect per `gh` call and removes the
+  class.
+- **Normalizing ambiguous paths instead of refusing them**: rejected — a
+  normalizer is a second opinion about what the client meant, and the
+  denylist would be applied to that opinion; refusing every spelling that
+  needs normalization keeps the denylist applied to the only spelling that
+  exists.
+- **Decoding compressed upstream responses under the byte gate**: rejected
+  (2026-09-03, #117) — identity encoding is a request the relay controls,
+  and a decoder inside the gate is more trusted code holding attacker-shaped
+  input for a case the upstream should never produce; a compressed response
+  is refused as an anomaly.
+- **One audit record per redirect hop**: rejected — it breaks the two-
+  records-per-request accounting the outcome counts depend on, complicates
+  capacity reservation, and can interleave with other requests' records
+  under concurrency; a bounded array in the completion record carries the
+  same facts.
+- **Passing the preflight on an empty repository**: rejected — "every empty
+  result passes" applied to the commit listing would mark Checks and Commit
+  statuses verified without ever probing them, and a worker cannot check
+  out a repository with no commit anyway; the honest outcome is a workspace
+  refusal, and the boot report never says "verified" about a probe that did
+  not run.
+- **Dependency numbers only in the prompt**: rejected (2026-09-03, #117) —
+  the agent needs a blocker's state to know whether to read its unlanded
+  PR's Decisions Section or its merged code, ADR-0053 already promised the
+  state, and a bare list would make each Run spend `gh` calls rediscovering
+  facts the driver just computed; numbers with a title or PR number were
+  rejected the other way — anything beyond the state is content the agent
+  reads live.
 - **A mutation allowlist through the relay** (e.g. comment on the claimed PR):
   rejected — it competes with the Output Proposal, collides with the driver's
   fixed verdict-publication order and the ban on parsing pipeline state from
@@ -633,11 +1084,43 @@ inherits that shape rather than inventing an attempt counter beside it.
 - **Relay alive for the whole container**: rejected — gate steps run
   agent-authored code and need no GitHub.
 
+## Amendments
+
+- **2026-09-03 (#117, second review)**: V1 supports GitHub.com only — a
+  GHES host fails closed at config load and driver boot, no classic-token
+  fallback exists (decision 3, 5). The audit became write-ahead with an
+  audit-unavailable state and outcome counts (decision 8), GraphQL `POST`
+  redirects are refused and REST redirects followed only method-preserving
+  with every hop revalidated (decision 5), responses are gated whole before
+  delivery (decision 6), every retry is a fresh Run with a fresh job
+  directory, socket, relay, and sink (decision 10), and the credential
+  guarantee is stated conditionally on operator provisioning (decision 3).
+- **2026-09-03 (#117, third review)**: content trust ruled — non-member
+  GitHub content is visible to agents, the Context Tree's OWNER/MEMBER
+  visibility filter is retired with the tree, driver-parsed machine blocks
+  still come only from the pipeline's authorized sources, retrieved content
+  is evidence never instruction, and prompt injection is an accepted
+  residual risk (decision 1). The socket is specified as a hostile HTTP
+  ingress with exact limits, rejections, path canonicalization, upstream
+  reconstruction, header allowlists, and compressed-response refusal
+  (decision 6). The write-ahead invariant is scoped to agent-originated
+  requests with a separate preflight record, redirect decisions live in one
+  bounded array per completion record, and short writes and torn records
+  have defined publication semantics (decisions 3, 5, 8). The credential's
+  confidentiality boundary is operator doctrine, the preflight refuses an
+  empty repository and reports per capability, the dependency closure has
+  one exact prompt schema, and the `schema_version` 1→2 upgrade fails closed
+  on mixed versions (decisions 1, 3, 9, 10). Test obligations extended
+  accordingly (decision 11).
+
 ## Relevant PRs
 
 - #117 — records this decision and the amendments it makes to ADR-0013,
-  ADR-0053, ADR-0054, the pipeline spec, the bench contract, and the
-  glossary; its first review folded in the five hardening items named in the
-  provenance, and its second review carried the GitHub.com-only ruling and
-  the write-ahead audit, GraphQL-redirect, response-gate, per-Run retry, and
-  credential-guarantee corrections.
+  ADR-0017, ADR-0053, ADR-0054, ADR-0056, the pipeline spec, the bench
+  contract, and the glossary; its first review folded in the five hardening
+  items named in the provenance, its second review carried the
+  GitHub.com-only ruling and the write-ahead audit, GraphQL-redirect,
+  response-gate, per-Run retry, and credential-guarantee corrections, and its
+  third review carried the content-trust ruling and completed the ingress,
+  audit, confidentiality, preflight, dependency-schema, and upgrade
+  contracts.
