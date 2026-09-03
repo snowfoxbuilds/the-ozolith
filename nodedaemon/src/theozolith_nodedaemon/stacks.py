@@ -200,11 +200,14 @@ class ProcessSupervisor:
         self._popen = popen
         self._log = log
         # Where the generic Driver launcher is resolved from (ADR-0020/0041):
-        # the daemon's own venv bin/, i.e. the directory holding this
-        # interpreter. Never a spec input — see spec_fingerprint.
-        self._launcher_dir = (
-            Path(sys.executable).resolve().parent if launcher_dir is None else launcher_dir
-        )
+        # the daemon's own venv bin/. Derived from sys.prefix (the venv root,
+        # read from pyvenv.cfg), NOT sys.executable: python3 -m venv creates
+        # bin/python as a symlink to the system interpreter, so
+        # Path(sys.executable).resolve() follows it out of the venv and lands
+        # in /usr/bin, where no launcher is installed (#94). sys.prefix also
+        # backs daemon.py's _venv_writable, so preflight and launcher agree on
+        # which environment they mean. Never a spec input — see spec_fingerprint.
+        self._launcher_dir = Path(sys.prefix) / "bin" if launcher_dir is None else launcher_dir
         self._children: dict[str, Child] = {}
         self._last_exit: dict[str, int] = {}
 
