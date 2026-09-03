@@ -1,8 +1,6 @@
-Status: ACCEPTED — amended 2026-08-04 by ADR-0036 (browser enablement becomes lazy; `origin-init` returns in changed form — see Amendments)
+Status: ACCEPTED
 
 Date: 2026-08-01
-
-Provenance: chat working session 2026-08-01, prompted by the first bare-metal deployment report (portless origin vs. 8443 bind — connection refused with serve running). Amends ADR-0022 (the slug public origin is retired) and ADR-0023 (first-run handoff, CA trust demoted to optional, root-mediated bare-metal setup); consumes ADR-0031 (the persisted control IP becomes the browser address too). ADR-0027's login rate limit is unchanged and now load-bearing.
 
 # ADR-0034: IP-based browser origin, optional CA trust, root-mediated bare-metal setup
 
@@ -39,7 +37,7 @@ ADR-0022/0023 rejected an IP-literal origin on three grounds. Two have aged out:
 - On the Control Node, admin subcommands (`build`, `update`, `join-token`, `secret`, …) read the admin token from the system data dir and are run with `sudo`. Remote/unprivileged use is unchanged: `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN` + `THEOZOLITH_TLS_CA`.
 - Migration for existing deployments needs **no CA rotation and no node re-paste**: the server certificate has carried `control_ip` in its SAN since ADR-0031, so IP browsing verifies immediately; the slug origin config is dropped on update, and stale hosts entries or trusted CAs are harmless leftovers. A pre-ADR home-dir install relocates without re-init via the recover machinery — stop serve, copy the partition to `/var/lib/theozolith-control`, `sudo theozolith recover` (validates, re-mints the server cert from the same CA, installs the unit), start the service; the exact sequence is documented in deploy/README.md § Backup and recovery. A deployment with no nodes and no secrets simply re-runs `sudo theozolith init` instead.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Keep the slug origin alongside the IP origin**: once the IP works with zero setup, the slug is a dead entropy layer nobody provisions DNS for; carrying both doubles the accepted-origin set, the session-table shape, and the handoff text for a step no one performs.
 - **Flip serve's default bind to 443**: breaks hand-run dev (bind: permission denied) and forces compose churn, for no user-visible gain over the unit passing `--port 443`.
@@ -48,6 +46,10 @@ ADR-0022/0023 rejected an IP-literal origin on three grounds. Two have aged out:
 - **HSTS for the dashboard**: hard-blocks the click-through path that is now the default UX.
 - **A public-domain certificate as the default**: an external dependency (domain, ACME, egress) in a product whose deletion test is "docker + package + init output"; it stays the documented opt-in.
 
-## Amendments (2026-08-04, ADR-0036)
+## Amendments
 
-- **Browser enablement becomes lazy**: `init` no longer prompts for the admin password and mints the server certificate with IP SANs only; the browser surface stays off until the reinstated `origin-init` persists a browser origin and takes the password. This ADR's IP origin remains the offered default there, and an operator-supplied hostname origin becomes the one hostname re-entry point (no slug, no DNS machinery returns). The TrueNAS-model TLS posture, the root-mediated installer, and the node channel are untouched. See ADR-0036.
+- **2026-08-04 (ADR-0036)**: Browser enablement becomes lazy — `init` no longer prompts for the admin password and mints the server certificate with IP SANs only; the browser surface stays off until the reinstated `origin-init` persists a browser origin and takes the password. This ADR's IP origin remains the offered default there, and an operator-supplied hostname origin becomes the one hostname re-entry point (no slug, no DNS machinery returns). The TrueNAS-model TLS posture, the root-mediated installer, and the node channel are untouched.
+
+## Relevant PRs
+
+- #12 — round 2 revision confining the root installer's recursive ownership handover to exactly its own leaf directory (`/var/lib/theozolith-control`).

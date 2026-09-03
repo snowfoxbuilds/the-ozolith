@@ -2,11 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-04
 
-Provenance: delegated decision from the M8 brief (Single-Node Deployment, status CLI, events read API), implementing the "Grilling 2026-08-04 (late)" ruling in NODE-SUBSTRATE.md. Amends ADR-0023 (init scope: the admin password leaves init) and ADR-0034 (the browser address becomes lazy and may again carry a hostname; the IP-origin decision otherwise stands). ADR-0022's fail-closed origin posture is preserved and moved from serve startup into the request path.
-
 # ADR-0036: Lazy browser enablement — the init / origin-init split
 
 ## Context
+
+This is a delegated decision from the M8 brief (Single-Node Deployment, status CLI, events read API), implementing the "Grilling 2026-08-04 (late)" ruling in NODE-SUBSTRATE.md; it amends ADR-0023 (init scope: the admin password leaves init) and ADR-0034 (the browser address becomes lazy and may again carry a hostname; the IP-origin decision otherwise stands), and preserves ADR-0022's fail-closed origin posture while moving it from serve startup into the request path.
 
 ADR-0023 made `init` a unified first run ending in an admin-password prompt and a browser handoff; ADR-0034 retired the slug origin and `origin-init`, making the browser origin the persisted control IP — but kept the password prompt inside init. The 2026-08-04 grilling ruled the browser surface optional: a Single-Node Deployment bootstraps and operates entirely from the terminal (`theozolith status` now, the Operator TUI in M9), so the two browser-only credentials — the origin browsers may dial and the admin password — must not be demanded before anyone wants a browser. The web UI itself is frozen at shipped M4/M5 scope.
 
@@ -61,7 +61,7 @@ The browser credentials are optional-but-consistent: no `browser_origin` → a m
 - **Negative**: existing deployments upgrade into the disabled state — the dashboard refuses until `origin-init` is re-run once (manual migration note in the PR; no automated migration per the M8 brief). The password is re-entered at that point.
 - **Neutral**: `tls-init --host` remains the additive path for extra **IP** SANs (it always preserves the control IP, loopback, and any enabled browser-origin host); ADR-0027's rate limit, ADR-0022's cookie shape, and the frozen web scope are untouched.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Keep the password in init, defer only the origin**: leaves setup demanding a browser credential no terminal-only operator uses, and splits the browser-only pair across two ceremonies — the ruling's point is that they travel together.
 - **A separate `browser_enabled` boolean beside a derived origin**: two fields that can disagree; the persisted origin's presence *is* the enablement bit.

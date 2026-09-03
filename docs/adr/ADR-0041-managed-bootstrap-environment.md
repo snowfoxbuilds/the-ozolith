@@ -1,12 +1,12 @@
-Status: ACCEPTED (amended by ADR-0051: after installing the wheels and publishing the links, the shim chains into `theozolith build --dist … --if-initialized` — `sudo python3 build.py` publishes to the fleet when this box runs an initialized Control Node, and skips with a notice when it does not; `--no-publish` opts out)
+Status: ACCEPTED
 
 Date: 2026-08-05
-
-Provenance: interactive ruling 2026-08-05 — the venv-first bootstrap was operator-managed friction on PEP 668 distros. Amends ADR-0023's bootstrap-from-source bullet and ADR-0030's shim description: the entry file and the shared build implementation are unchanged, the managed invocation is not — it gains sudo (`sudo python3 build.py`). Consumes ADR-0034 (world-reachable system-path exec policy) and ADR-0037's refuse-with-remediation posture.
 
 # ADR-0041: build.py owns the bootstrap environment
 
 ## Context
+
+This decision follows an interactive ruling (2026-08-05): the venv-first bootstrap was operator-managed friction on PEP 668 distros.
 
 Modern Debian/Ubuntu interpreters are externally managed (PEP 668): `pip install` into the distro Python refuses outright. The documented bootstrap therefore grew three manual environment steps — `sudo python3 -m venv /opt/theozolith`, run build.py with that venv's interpreter, symlink the CLI into `/usr/local/bin` — leaking environment management into the operator surface. The node-shaped install never had this problem: `install-nodedaemon.sh` builds the `/opt/theozolith` venv itself. The control-shaped bootstrap should own its environment the same way.
 
@@ -27,9 +27,13 @@ Modern Debian/Ubuntu interpreters are externally managed (PEP 668): `pip install
 - **Negative**: the shim gains environment and publication logic (pinned by the shim tests: root refusal, non-venv refusal, ensurepip remediation, create-and-re-exec argv fidelity, reuse, loop guard, broken-venv refusals, the pip-module preflight, exec-failure remediation, collision refusals, per-destination atomic publication with invocation-owned temporary names, interruption convergence, main()-level orchestration of both passes, and the cleanup contract); the linked-entry-point set and the re-exec marker are two more small contracts.
 - **Neutral**: the previously documented `sudo /opt/theozolith/bin/python build.py` still works — running inside the target venv short-circuits straight to build-and-install — and links hand-made by the pre-ADR-0041 documented bootstrap (`ln -sf /opt/theozolith/bin/theozolith …`) are adopted as this installation's own. `PIP_BREAK_SYSTEM_PACKAGES` remains available user-side but is no longer relevant to any documented flow.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **`pip install --break-system-packages` in the shim**: installs control's dependency closure (FastAPI, Textual, cryptography, …) into apt-managed site-packages, where upgrades can shadow distro-owned packages — the flag's name is literal — and forces the override on every operator instead of the one box that might want it.
 - **A `build.sh` wrapper owning the venv**: `python3 build.py` is settled across ADR-0023/0030, the NODE-SUBSTRATE grilling, and the remediation strings init prints; env-setup in bash would leave the tested surface and add a third layer to "one implementation, two entry paths" — and buys nothing, since the pre-exec phase needs only the stdlib `venv` module.
 - **Requiring system pip and building wheels outside the venv**: adds `python3-pip` as a second OS prerequisite and splits the flow across two interpreters; the re-exec needs one prerequisite and one interpreter.
 - **Auto-installing `python3-venv` when missing**: a root path never package-manages on its own; refuse with the exact remediation instead.
+
+## Amendments
+
+- **2026-08-26 (ADR-0051)**: after installing the wheels and publishing the links, the shim chains into `theozolith build --dist … --if-initialized` — `sudo python3 build.py` publishes to the fleet when this box runs an initialized Control Node, and skips with a notice when it does not; `--no-publish` opts out.

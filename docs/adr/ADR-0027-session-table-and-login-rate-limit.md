@@ -2,13 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-07-28
 
-Provenance: delegated decision from the M7 brief; implements ADR-0023's admin-password-and-sessions contract (superseding ADR-0018's session section).
-
 # ADR-0027: Session-table schema and login rate-limit parameters
 
 ## Context
 
-ADR-0023 fixed the policy: server-side revocable sessions in `cache.db`, a cookie carrying only a random 128-bit id, absolute 30-day default expiry, logout deletes the row, password change truncates the table, constant-time comparison plus rate limiting on the login form. Schema and parameters were delegated.
+ADR-0023 fixed the policy: server-side revocable sessions in `cache.db`, a cookie carrying only a random 128-bit id, absolute 30-day default expiry, logout deletes the row, password change truncates the table, constant-time comparison plus rate limiting on the login form. Schema and parameters were delegated (M7 brief).
 
 ## Decision
 
@@ -36,8 +34,12 @@ CREATE TABLE sessions (
 
 The failure window is **per-process memory** (2026-07-28 note, PR #9 review): a `serve` restart clears it, and the design assumes the single-process `serve` the product ships — a multi-worker deployment would multiply the budget by the worker count. Accepted: restarting the Control Node to reset the limiter is operator action, sessions themselves are durable in `cache.db`, and the scrypt cost plus the 60-second window still bound online guessing to a rate that never threatens the password space.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **Storing raw session ids**: a cache.db copy (backups explicitly exclude it, but still) would be a cookie jar.
 - **Sliding expiry**: converts "absolute expiry, default 30 days" into "forever for a daily user" — revocation semantics stay crisp with one absolute stamp.
 - **Per-IP token buckets with persistence**: state and eviction machinery defending against a threat model (distributed online guessing on a trusted LAN) the deployment shape excludes.
+
+## Relevant PRs
+
+- #9 — review that established the login rate-limit failure window is per-process memory.

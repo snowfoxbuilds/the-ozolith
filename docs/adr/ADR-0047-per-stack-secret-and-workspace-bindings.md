@@ -2,8 +2,6 @@ Status: ACCEPTED
 
 Date: 2026-08-17
 
-Provenance: issue #60.
-
 # ADR-0047: Per-Stack secret and workspace bindings — the type declares the contract, the Stack binds the placement
 
 ## Context
@@ -91,3 +89,10 @@ store names.
 - **A required-slot keyword (e.g. `required = true`)**: rejected — the
   empty string already says it, and a second spelling of "no default"
   invites drift.
+
+## Relevant PRs
+
+- #58 — proactive usage-limit gating, cited in Context as a case this
+  change enables (per-account gating when nodes use distinct accounts).
+- #60 — the issue this ADR resolves: per-Stack secret bindings letting
+  same-type Stacks bind distinct secret values.

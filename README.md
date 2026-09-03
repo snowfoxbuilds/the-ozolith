@@ -18,13 +18,13 @@ An open-source agent-orchestration platform that addresses the pain points of ru
 
 One Control Node, plus a Node Daemon on every box that should run Stacks. The per-box
 footprint is docker + the TheOzolith package + `theozolith init` output — there is no `.env`
-(the deletion test as restated by ADR-0023/0034). Operations, backup/recovery, the
+(the deletion test). Operations, backup/recovery, the
 daemon-less one-box dev shape, and cleanup live in [deploy/README.md](deploy/README.md); this
 is the orientation path.
 
 > **No published releases yet — everything builds from a checkout of this repo.** Bootstrap the
 > CLI with `sudo python3 build.py` — on a box already running an initialized Control Node the
-> same command also publishes the build to the fleet (ADR-0051; `--no-publish` defers).
+> same command also publishes the build to the fleet (`--no-publish` defers).
 > `theozolith build` remains the publish-without-reinstall fast path from a clean source
 > checkout. The release-based paths (`theozolith update`'s version pin and the fresh-box
 > `curl … | sudo bash` installer) activate once releases are cut.
@@ -33,11 +33,11 @@ Prerequisites:
 
 - **Control Node**: any box with docker + the compose plugin (the Pi in the reference
   deployment) and a checkout of this repo. **Give it a static IP or DHCP reservation** — the
-  channel is IP-only (ADR-0034): nodes and browsers dial the control IP directly, no DNS.
+  channel is IP-only: nodes and browsers dial the control IP directly, no DNS.
 - **Every physical node**: systemd Linux, docker with the compose plugin, python3 ≥ 3.11.
 - **For the coding pipeline**: a target GitHub repo and machine-user PATs for the Implementer,
   the Reviewer, and the Control Node — three distinct GitHub identities, so no self-grading by
-  construction (ADR-0008, ADR-0017).
+  construction.
 
 ### 1. Set up the Control Node
 
@@ -59,13 +59,13 @@ sudo theozolith init                         # auto-detects the IP; --ip to corr
 sudo systemctl start theozolith-control.service
 ```
 
-`init` (ADR-0023/0034/0036) composes the machine surface in one run: master key → admin
+`init` composes the machine surface in one run: master key → admin
 bearer token → the persisted control address → per-deployment CA + server certificate with IP
 SANs → the **operator handoff**. No DNS, no password prompt, no browser step: the bearer API
 serves everything. `--ip` names the LAN address nodes will dial — **required in the compose
 flow** (a container can't auto-detect it); bare metal auto-detects. All state lands under
 `~/.theozolith/` (`/var/lib/theozolith-control/` on a root-mediated install), partitioned by
-durability class (ADR-0024); backup is a copy of that folder minus `cache/`.
+durability class; backup is a copy of that folder minus `cache/`.
 
 Turn on the browser dashboard only when you want it — it stays off until you opt in:
 
@@ -74,7 +74,7 @@ theozolith origin-init      # asks for the browser origin (IP by default) + admi
                             # re-mints the server cert from the same CA
 ```
 
-**One-box shortcut** (ADR-0037): `sudo theozolith init --with-local-node` also installs a Node
+**One-box shortcut**: `sudo theozolith init --with-local-node` also installs a Node
 Daemon on the same box and runs the join flow internally (loopback dial, machine-consumed join
 string), then seeds the Config Repo with a complete worker Stack staged at `state = "stopped"`
 and a README naming the finish line. Nothing deploys until you pin the image, enter secrets,
@@ -98,7 +98,7 @@ here — a node box has no Control Node), then run the printed
 anything**, exchanges the single-use join token for the node's own non-expiring per-node token,
 persists everything under `/var/lib/theozolith`, and enables the systemd unit
 (`KillMode=control-group`: every TheOzolith process on the node dies with the daemon).
-Provisioning **is** registration (ADR-0023): the node exists the moment the exchange succeeds and
+Provisioning **is** registration: the node exists the moment the exchange succeeds and
 heartbeats within the interval (60 s default). Join tokens default to 1 hour / single use;
 `--ttl`/`--uses` widen them for batches, `theozolith join-token revoke <id>` is the backstop.
 
@@ -107,7 +107,7 @@ heartbeats within the interval (60 s default). Join tokens default to 1 hour / s
 A worker is a **worker type** placed by a thin **Stack**, declared in your **Config Repo** —
 the human-authored tree `theozolith init` scaffolds at `config-src/` beside the data dir
 (keep it there, move it anywhere, or host it on a git server). `deploy/configs-example/` is a
-complete starter to copy in and adjust. The Config Repo is the source of truth (ADR-0006/0048);
+complete starter to copy in and adjust. The Config Repo is the source of truth;
 `theozolith config ingest` turns it into the machine-owned **pinned build** (`configs/`) the
 service actually loads — never hand-edit that one. For a pipeline worker, first label the
 target repo once:
@@ -127,12 +127,12 @@ Then, in the Config Repo:
    See `deploy/configs-example/worker-types/claude-dev.toml` (Implementer) and
    `claude-review.toml` (Reviewer — its **own** GitHub identity, no self-grading).
 2. **Place it with a Stack** — `stacks/<name>.toml`: `worker_type`, `node` (exact node name),
-   `state`, plus optional per-placement bindings (ADR-0047): a `workspace` repointing the
+   `state`, plus optional per-placement bindings: a `workspace` repointing the
    target repo, a `[secrets]` table rebinding the type's slots (distinct credentials per
    Stack — e.g. one machine account per repo), and an `[env]` of expert overrides. See
    `deploy/configs-example/stacks/implementer.toml`. The Implementer/Reviewer resolve to
    **process** Stacks; the Flight Deck resolves to a **container** Stack. (The Control Node is
-   never a Stack — a `stacks/control.toml` is rejected at validation, ADR-0035.)
+   never a Stack — a `stacks/control.toml` is rejected at validation.)
 3. **Enter its secrets** — each name the type references, once:
 
    ```sh
@@ -162,16 +162,16 @@ driverless worker type — see step 4.
 **Knowledge on a laptop** — the knowledge machinery is standalone (no cluster required):
 `pip install ./knowledge`, then `theozolith-knowledge sync` a knowledge repo into your
 `~/.claude`, or `bake` a pinned Knowledge Source into a container image at build time.
-`--tool` selects the compiler: `claude` (the default) or `codex` (ADR-0052 — targets
+`--tool` selects the compiler: `claude` (the default) or `codex` (targets
 `~/.codex`, global scope only; `AGENTS.md` and skills copy verbatim, `agents/codex/`
 becomes custom prompts, workflows have no codex home). See
 [knowledge/README.md](knowledge/README.md).
 
-**Knowledge on the fleet (ADR-0048)** — deployment knowledge lives IN the Config Repo: a
+**Knowledge on the fleet** — deployment knowledge lives IN the Config Repo: a
 `knowledge/<name>/` directory holds one knowledge root (`skills/`, `agents/`, `workflows/`,
 `AGENTS.md`), referenced from worker types as `knowledge = "knowledge/<name>"`. Ingest compiles
 it once per registered tool into `knowledge/<name>/<tool>/` in the pinned build and records one
-content-hash pin per `(tree, tool)`, keyed `"<name>/<tool>"` (ADR-0052). Driver workers **bake**
+content-hash pin per `(tree, tool)`, keyed `"<name>/<tool>"`. Driver workers **bake**
 their adapter's compiled view into their derived images (an edit re-tags exactly the types whose
 tool's view changed → nodes rebuild → new Runs carry it). The **Flight Deck** (a driverless worker type,
 `deploy/configs-example/worker-types/flightdeck.toml`) never bakes: its `knowledge` field
@@ -186,7 +186,7 @@ trees on agent-CLI restart — no rebuild, no recreate, no sync step. Changing w
 > nothing can write through the links). There is no writable clone and no promote workflow
 > anymore; the Config Repo commit + ingest IS the promotion.
 
-**Custom workers (ADR-0042)** — a worker type can name a driver that lives in your Config Repo
+**Custom workers** — a worker type can name a driver that lives in your Config Repo
 instead of a built-in one: a new pipeline worker with no product fork. Author `drivers/<name>.py`
 exporting a top-level `Driver` class subclassing `theozolith_worker.api.Worker` (`api` is the one
 stable import), point a worker type at it with `driver = "drivers/<name>"`, and place it with a
@@ -197,7 +197,7 @@ the node restarts the driver on the new code (queued behind any in-flight Run). 
 complete staged example.
 
 > **`drivers/` is git-native only** and the web UI refuses to touch it: **Config Repo write
-> access equals code execution with driver credentials on nodes** (ADR-0042). Treat it exactly as
+> access equals code execution with driver credentials on nodes**. Treat it exactly as
 > you treat merge access to product code.
 
 Full depth — ingest/rebuild mechanics, volume cardinality, custom-driver dispatch gate and
@@ -236,17 +236,17 @@ theozolith status              # fleet health table; exit 0 healthy / 1 degraded
 theozolith status --json       # the parsing contract (the table is for humans)
 theozolith top                 # full-screen Operator TUI: fleet, Stacks & Runs, events, errors
 theozolith flags               # zombie / malformed / quarantine flags
-theozolith unquarantine --node box1     # human-only dispatch-quarantine release (ADR-0016)
+theozolith unquarantine --node box1     # human-only dispatch-quarantine release
 ```
 
-`theozolith status`/`top` are pure API consumers (ADR-0038/0039) — no local systemd/docker
+`theozolith status`/`top` are pure API consumers — no local systemd/docker
 probing. On the Control Node they need no environment (run under `sudo` on a root install);
 elsewhere set `CONTROL_NODE_URL` + `THEOZOLITH_ADMIN_TOKEN` + `THEOZOLITH_TLS_CA`. The optional
 dashboard (after `origin-init`, behind the admin password) shows the same fleet — including
 unregistered nodes awaiting a join paste — Run progress, `theozolith.error` summaries, secret
 entry, settings (committed to `control.toml`), join tokens, and the web terminal.
 
-**Watch Runs directly** — Runs are headless (ADR-0019): there is no session to attach to and no
+**Watch Runs directly** — Runs are headless: there is no session to attach to and no
 mid-Run steering. Watch progress on the dashboard/TUI, read the evidence bundle afterwards, or
 kill the Run (`recycle`):
 
@@ -262,14 +262,14 @@ web terminal. Its GitHub credential is a dedicated **no-merge** machine identity
 by construction. Don't leave Flight Deck sessions running unattended.
 
 Updating the product across the fleet (with no releases yet, `sudo python3 build.py` — one
-command to update this box's CLI and publish, ADR-0051 — or `theozolith build` to publish
+command to update this box's CLI and publish — or `theozolith build` to publish
 without reinstalling; `theozolith update`'s release-pin path activates once releases exist),
 backup and recovery, and the daemon-less dev shape are covered in
 [deploy/README.md](deploy/README.md).
 
 ## Further Reading
 
-- [AGENTS.md](AGENTS.md) — project index, conventions, and the spec/ADR map.
+- [AGENTS.md](AGENTS.md) — project index, conventions, and the spec index.
 - [CONTEXT.md](CONTEXT.md) — domain glossary; every spec, driver, and agent instruction uses
   these terms exactly.
 - Component READMEs — [knowledge/](knowledge/README.md) (knowledge machinery),
@@ -280,8 +280,8 @@ backup and recovery, and the daemon-less dev shape are covered in
 - Specs — [ARCHITECTURE.md](docs/specs/ARCHITECTURE.md),
   [AGENTIC-CODING-PIPELINE.md](docs/specs/AGENTIC-CODING-PIPELINE.md), and
   [NODE-SUBSTRATE.md](docs/specs/NODE-SUBSTRATE.md).
-- [Architecture Decision Records](docs/adr/) — the numbered ADRs referenced throughout this
-  document.
+- [Architecture Decision Records](docs/adr/) — the numbered design decisions; reach the ones
+  behind a given spec through that spec's Relevant ADRs appendix.
 
 ## Development
 

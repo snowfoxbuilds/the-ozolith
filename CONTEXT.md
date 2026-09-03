@@ -202,17 +202,17 @@ One ephemeral container lifecycle executing one agent session: exactly one headl
 
 *Avoid*: "job"; "task" (that is the issue); bare "Run" where the kind matters.
 
-**Skill**
-
-A reusable instruction module: a folder containing `SKILL.md` plus optional scripts and reference files.
-
-*Avoid*: "claude agent", "prompt".
-
 **Single-Node Deployment**
 
 A deployment shape where the Control Node and one Container-Host share a physical machine, bootstrapped by `sudo theozolith init --with-local-node` (standard init plus an internally executed, resumable join flow; ADR-0032 retired the `theozolith-control` command spelling). Uses the same provisioning, Stack, and update mechanisms as any fleet — nothing downstream knows it is single-node.
 
 *Avoid*: "single-node mode" (implies a separate code path or product mode); skipping the join mechanism (it runs, machine-consumed).
+
+**Skill**
+
+A reusable instruction module: a folder containing `SKILL.md` plus optional scripts and reference files.
+
+*Avoid*: "claude agent", "prompt".
 
 **Stack**
 

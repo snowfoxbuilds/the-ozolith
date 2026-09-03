@@ -1,8 +1,6 @@
 Status: ACCEPTED
-Date: 2026-09-02
 
-Provenance: issue #95 (grilling 2026-09-02; hardened same day by post-merge
-review of PR #97).
+Date: 2026-09-02
 
 # ADR-0055: Flight Deck live surfaces — Agent Policy trees and CLI Pins delivered without container recreate
 
@@ -39,6 +37,17 @@ the forward-compatibility hole one level down, and the CLI ships one
 platform package per (OS, architecture, libc) tuple — each with its own
 tarball and integrity — so a single recorded integrity cannot
 authenticate every package a heterogeneous fleet selects.
+
+This decision amends ADR-0044 (the customization tuple gains `policy` and
+`cli`; on a driverless type both are declared but not identity-bearing),
+ADR-0045 (policy trees are validated at ingest and config load by a safe-key
+allowlist strictly stronger than the managed-scope conflict scan, which keeps
+its driver-image build-gate site; the "never overwrites operator policy"
+clause now also reads "operator policy is a reviewed, allowlist-validated
+Config Repo tree"), and ADR-0048 (the Config Repo gains `policy/`, the pinned
+build gains `[cli]` pins carrying the per-platform integrity map, and the
+config distribution carries the policy tree — the mechanical-pin doctrine
+extends to the agent CLI).
 
 ## Decision
 
@@ -327,16 +336,7 @@ behavior. The implementing PRs must demonstrate at minimum:
   future key becomes a silent execution or identity surface; hence the
   allowlist.
 
-## Amends
+## Relevant PRs
 
-- **ADR-0044**: the customization tuple gains `policy` and `cli`; on a
-  driverless type both are declared but not identity-bearing.
-- **ADR-0045**: policy trees are validated at ingest and config load by a
-  safe-key allowlist strictly stronger than the managed-scope conflict scan
-  (which keeps its driver-image build-gate site); the "never overwrites
-  operator policy" clause now also reads "operator policy is a reviewed,
-  allowlist-validated Config Repo tree".
-- **ADR-0048**: the Config Repo gains `policy/`, the pinned build gains
-  `[cli]` pins carrying the per-platform integrity map, and the config
-  distribution carries the policy tree; the mechanical-pin doctrine
-  extends to the agent CLI.
+- #95 — grilling session (2026-09-02) that settled this decision.
+- #97 — post-merge review that hardened the first draft: the safe-key allowlist closing the identity denylist gap, the pin-as-requirement fix, separating integrity from safe extraction, closing the interior-of-an-admitted-key hole, and the per-platform integrity map.

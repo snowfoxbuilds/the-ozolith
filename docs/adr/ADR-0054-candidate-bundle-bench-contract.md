@@ -1,4 +1,5 @@
 Status: ACCEPTED
+
 Date: 2026-08-28
 
 # ADR-0054: Candidate Bundles and the published bench contract

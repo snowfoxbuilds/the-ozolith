@@ -2,11 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-04
 
-Provenance: delegated decision from the M8 brief — the events read endpoint's shape, cursor encoding, default page size, and eviction indicator. Amends ADR-0015 (the control-plane API gains its first read view over stored events) under the "Grilling 2026-08-04" rulings in NODE-SUBSTRATE.md; consumes ADR-0016/0024 (cache-not-archive, cache.db).
-
 # ADR-0038: `GET /api/v1/events` — read view, cursor, and the eviction indicator
 
 ## Context
+
+This is a delegated decision from the M8 brief — the events read endpoint's shape, cursor encoding, default page size, and eviction indicator — implementing the "Grilling 2026-08-04" rulings in NODE-SUBSTRATE.md; it amends ADR-0015 (the control-plane API gains its first read view over stored events) and consumes ADR-0016/0024 (cache-not-archive, cache.db).
 
 ADR-0015 defined `POST /api/v1/events` (ingest) and no read surface; the dashboard reads events through server-rendered fragments. The Operator TUI ruling adds `GET /api/v1/events`: a bearer-auth JSON view over stored rows — known and unknown types alike, rendering is the client's job — with node/component/type filters and cursor + `since` pagination, honestly reporting when eviction has removed history. The events table's `AUTOINCREMENT` id is monotonic and never reused; eviction (`evict_progress`, ADR-0016's ~10 GB budget) deletes only `theozolith.run.progress` and `theozolith.error` rows, oldest-first, and today records no evidence it ever ran.
 
@@ -42,7 +42,7 @@ The response contract is explicit about the two questions a client can ask:
 
 A **legacy** pre-amendment watermark row (the earlier single-row shape) has unknowable scope and reads conservatively: any filtered query is incomplete against it, and its 0 timestamp (unknown reach) is incomplete for any window. All evidence lives in `cache.db` and dies with it: deleting the cache is the documented recovery move (ADR-0024) and yields an honestly empty store, not a false incompleteness claim about rows that no longer exist to be missing.
 
-## Alternatives rejected
+## Alternatives Considered
 
 - **A page-relative eviction flag** (recomputed per returned page against the evicted id range): eviction interleaves with kept terminal events, so the id range has holes and the flag becomes a per-page computation clients would have to trust blindly; the per-scope timestamp comparison is O(scopes), exact for the filter + `since` shape status depends on, and conservative everywhere else.
 - **A purely global flag** (true forever after any eviction, for any query): overstates incompleteness — a progress eviction would degrade an error-only `status` verdict for the rest of the cache's life over one long-past budget sweep. Kept only as the separate, honestly-named `any_evicted` field.

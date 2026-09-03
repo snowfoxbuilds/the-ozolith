@@ -18,11 +18,13 @@ The original pipeline parked Runs mid-execution on judgment-call findings (WIP b
 - **Round budget**: 3 review rounds per issue, tracked as attempt-N on the PR at each revise verdict. Runs that produce no PR (crash, infra failure) consume no rounds; the zombie janitor re-queues them.
 - **Advisor and Speculative Runs are removed** from the design entirely.
 - **The gate is first-party and Worker-side** (no-mistakes concepts, no no-mistakes dependency): test → docs → lint → push → PR → CI, structured findings, safe mechanical auto-fixes. Adversarial review is not a gate step; the gate never blocks PR creation.
+
 ## Consequences
 
 - **Positive**: the park/resume machinery is deleted; the park-vs-fail classification burden on the Worker dissolves into "PR produced or not"; single writer per object per phase (Worker owns pre-PR issue state, Reviewer owns everything post-PR); the queue rule holds (Workers poll plan_ready issues, Reviewer polls pr_ready PRs, human polls needs_human); the stronger model plans retries instead of the Worker re-deriving intent from objections; no-self-grading is enforced by construction (separate process and identity, not a prompt boundary); Reviewer downtime degrades throughput but never correctness — all state lives on GitHub.
 - **Negative**: a wrong early decision costs a full Run plus a review round instead of one parked question; complete implementations anchor both Reviewer and human (accepted for single-operator V1 — the human merge gate is the backstop); a second long-lived component and machine-user PAT ship in V1; the Reviewer's plan_ready re-queue is an agent exercising explicitly delegated human authority and must be recorded as such.
 - **Neutral**: the Handoff Doc schema survives as the Decisions Section (ADR-0003 amended); the resume-from-WIP carryover exception generalizes to the Reviewer-designated resume commit on the shared PR branch.
+
 ## Alternatives Considered
 
 - **Keep park/resume, add an aborted class and on-fail attempt accounting**: rejected — fixes the accounting but keeps the mid-Run classification burden on the Worker and adds resume-scheduling complexity the queue rule cannot express.

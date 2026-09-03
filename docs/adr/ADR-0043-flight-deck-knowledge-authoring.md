@@ -1,9 +1,11 @@
-Status: ACCEPTED — amended by ADR-0048 (2026-08-18, #62): the shared writable clone, promote workflow, and `knowledge-<worker-type>` volume are RETIRED; the Flight Deck's knowledge surface is a read-only bind-mount of the node's applied pinned knowledge tree, updated via config distribution and picked up on agent-CLI restart. Authoring moves to the Config Repo; git remains the only transport, no sync daemon as ever.
+Status: ACCEPTED
+
 Date: 2026-08-09
 
 # ADR-0043: Flight Deck knowledge authoring and sharing
 
 ## Context
+
 ~/.claude conflates two classes of content: runtime state (sessions,
 transcripts, --resume) and knowledge (skills, subagents, workflows).
 Workers bake knowledge at pin time (ADR-0009), but the Flight Deck is
@@ -11,6 +13,7 @@ where humans author knowledge, and multiple Flight Decks of the same
 worker type should not hold divergent copies.
 
 ## Decision
+
 Split ~/.claude by class:
 - **Runtime state**: per-Flight-Deck named state volume. Never shared,
   never reaches workers.
@@ -28,6 +31,7 @@ Split ~/.claude by class:
   node's shared clone, pull in the other's. No auto-sync daemon.
 
 ## Consequences
+
 - **Positive**: edit once per type per node; workers stay reproducible;
   the prompt-injection persistence channel into Runs stays closed.
 - **Negative**: uncommitted scratch can diverge across nodes until
@@ -40,9 +44,18 @@ Split ~/.claude by class:
   `/etc/theozolith/model`, never any `~/.claude` path (ADR-0045 §4).
 
 ## Alternatives Considered
+
 - **Per-Flight-Deck private clones**: rejected — skill edits in one
   repo's Flight Deck should transfer to another's.
 - **Mounting knowledge into worker Runs**: rejected — breaks Run
   reproducibility and opens a prompt-injection persistence channel.
 - **Auto-sync daemon**: rejected — new machinery, conflict surface,
   silent propagation of uncommitted scratch.
+
+## Amendments
+
+- **2026-08-18 (#62)**: the shared writable clone, promote workflow, and `knowledge-<worker-type>` volume are RETIRED; the Flight Deck's knowledge surface is a read-only bind-mount of the node's applied pinned knowledge tree, updated via config distribution and picked up on agent-CLI restart. Authoring moves to the Config Repo; git remains the only transport, no sync daemon as ever.
+
+## Relevant PRs
+
+- #62 — the ADR-0048 amendment retiring the shared writable clone in favor of a read-only bind-mount of the applied pinned knowledge tree.

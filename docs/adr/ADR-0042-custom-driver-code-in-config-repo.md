@@ -2,11 +2,11 @@ Status: ACCEPTED
 
 Date: 2026-08-08
 
-Provenance: grilling 2026-08-06/08 (driver customization thread).
-
 # ADR-0042: Custom driver code in the Config Repo, delivered as a hash-pinned config distribution
 
 ## Context
+
+This decision follows the 2026-08-06/08 grilling (driver customization thread).
 
 ADR-0020 made inheritance the code-level extension surface (custom worker types extend the
 base Worker), but no delivery mechanism existed: nodes never pull source or build the product,
@@ -46,7 +46,7 @@ repo). That boundary outranks ADR-0007's "pure data, no machinery" charter.
 - Routine product updates can leave a custom driver on a stale API; this surfaces as an
   advisory stamp, then a visible crash — never a silent wrong behavior guarantee.
 
-## Alternatives
+## Alternatives Considered
 
 - Product-checkout fork via theozolith build: zero new machinery, but publishes custom
   worker definitions (public repo). Rejected on ADR-0004.
