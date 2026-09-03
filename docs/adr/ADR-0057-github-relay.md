@@ -41,7 +41,16 @@ it authorizes anything, so no record ever collapses into a marker; the relay
 has one terminal record and one shutdown sequence whatever ends acceptance;
 the counters distinguish request lines seen from request budget spent and
 are unknown, never fabricated, when the terminal record is absent; and the
-redirect summary admits the fourth entry a hop-limit refusal produces.
+redirect summary admits the fourth entry a hop-limit refusal produces. A
+sixth review made the refusal schemas total: a request line the parser
+rejects — an unknown or oversized method, a non-origin-form target, a
+malformed path, query, or GraphQL body — leaves a bounded record in a tagged
+form that names the failed stage and identifies the input by length and
+digest, never by copying, repairing, or inventing a target; a refused
+redirect's scheme and host are recorded as classifications and digests
+rather than uncontrolled text, with the serialized bound stated; and the
+audit's claim is stated exactly — an intent or redirect-intent record proves
+that credential use was authorized, never that a request was sent.
 
 # ADR-0057: GitHub Relay — `gh` as the agent's read surface, credential-free by driver-side auth injection
 
@@ -398,8 +407,11 @@ recorded as an accepted residual risk rather than claimed away.
      most four entries (amended 2026-09-03, #117, fifth review — three
      followed hops plus the fourth redirect answer refused at the hop
      limit) — hop number, upstream status, decision, reason code, and the
-     `Location`'s scheme and host only — as a triage summary that never
-     substitutes for the pre-hop record. No record stores a
+     resolved `Location`'s scheme and host only, each as the bounded
+     representation of item 8 (a closed scheme classification; a host
+     literal only when valid, otherwise its length and digest with its
+     validity status; amended 2026-09-03, #117, sixth review) — as a triage
+     summary that never substitutes for the pre-hop record. No record stores a
      `Location` path or query literally: a redirect-intent record carries
      the canonical target path and the redacted query representation of
      item 8 — names, lengths, and digests — because a signed URL's query is
@@ -463,10 +475,17 @@ recorded as an accepted residual risk rather than claimed away.
      socket as untrusted input and none of its guarantees depend on the
      client being `gh`. The parser is stdlib-only (ADR-0010) and fail-closed:
      everything below refuses with a 4xx-class answer carrying a stable
-     reason code, writes a `refused` intent record (item 8) when a request
-     line was parsed — in its full form or its bounded refusal form, and
-     not at all under the audit-budget-exhausted or audit-unavailable
-     state — and counts against the request budget.
+     reason code, writes a `refused` intent record (item 8) for every
+     request line seen — in whichever tagged target form the input admits:
+     the full form, the digest form, or the invalid form that names the
+     failed stage without inventing a target (amended 2026-09-03, #117,
+     sixth review) — and not at all under the audit-budget-exhausted or
+     audit-unavailable state — and counts against the request budget. A
+     request line is *seen* when its line end arrives within the
+     request-line limit; whether it then validates is a separate question,
+     and a connection whose bytes reach the limit before a line end has no
+     seen request line — it is refused, closed, and counted in
+     `no_request`.
      - *Connections*: one request per connection. The relay answers every
        request with `Connection: close`, closes after the response, and
        never reads a second request on a connection — bytes after the
@@ -478,7 +497,8 @@ recorded as an accepted residual risk rather than claimed away.
        time: 10 s to receive the complete request head, 30 s to receive the
        complete body, and no idle allowance — a connection that sends
        nothing for 10 s, or sends the head and stops, is closed. Connection-
-       level rejections (the cap, a timeout before a request line) write no
+       level rejections (the cap, a timeout before a request line, a first
+       line reaching the request-line limit before its end) write no
        per-event record — they are counted in the connection counters below,
        which are bounded by construction.
      - *Connection budget (amended 2026-09-03, #117, fourth review)*: every
@@ -511,9 +531,11 @@ recorded as an accepted residual risk rather than claimed away.
        facts of the summary — the termination reason, the terminal
        record's state, and the audit-failure report — never from the
        termination reason alone. The counters are `accepted` (bounded by
-       the connection budget), `busy_refused`, `no_request` (closed by the
-       peer or timed out before a complete request line — the empty and
-       partial cases), `requests_seen` (request lines parsed, bounded by
+       the connection budget), `busy_refused`, `no_request` (no request
+       line seen: closed by the peer or timed out before a complete request
+       line, or the request-line limit reached before a line end — the
+       empty, partial, and over-long cases; amended 2026-09-03, #117,
+       sixth review), `requests_seen` (request lines seen, bounded by
        `accepted`, since a request line parsed after the request budget is
        spent is still seen and still answered), and `requests_charged`
        (request lines charged against the 2,000-request budget, bounded by
@@ -529,23 +551,35 @@ recorded as an accepted residual risk rather than claimed away.
        receives the stable refusal, and the connection budget bounds how
        many such refusals exist. The eight-open, four-in-flight, and
        one-request-per-connection rules stand as stated.
-     - *Request line*: `HTTP/1.1` exactly; any other version refuses (`505`).
-       The request-target must be origin-form — a path beginning with `/`,
-       optionally followed by `?` and a query; absolute-form,
+     - *Request line*: a seen request line is split at its first two `SP`
+       bytes into a method token, a request-target, and a version — a part
+       the line does not delimit is empty — and validated in a fixed order,
+       the first failure naming the refusal's stage (amended 2026-09-03,
+       #117, sixth review): `HTTP/1.1` exactly; any other version refuses
+       (`505`). The request-target must be origin-form — a path beginning
+       with `/`, optionally followed by `?` and a query; absolute-form,
        authority-form, and asterisk-form refuse, as does any fragment. The
        method token is `GET`, `HEAD`, or `POST` (the last only with the
        canonical path `/graphql`); `CONNECT`, `OPTIONS`, `TRACE`, every other
-       token, and any upgrade attempt refuse. The request line is at most 8
-       KiB, the path at most 4 KiB, the query at most 4 KiB. These are
-       admission limits on the parser, not a promise that every admitted
-       target is recordable (amended 2026-09-03, #117, fifth review): item
-       8 serializes the intent record for an admitted target and refuses
-       the request as `audit-unrepresentable` when that record would not
-       fit the record cap, so a target can pass every host, method, path,
+       token — a 5,000-byte token in a line under the limit included — and
+       any upgrade attempt refuse. The request line is at most 8 KiB, the
+       path at most 4 KiB, the query at most 4 KiB. These are admission
+       limits on the parser, not a promise that every admitted target is
+       recordable (amended 2026-09-03, #117, fifth review): item 8
+       serializes the intent record for an admitted target and refuses the
+       request as `audit-unrepresentable` when that record would not fit
+       the record cap, so a target can pass every host, method, path,
        query, and denylist check here and still be refused there. The
        limits are not narrowed to close that gap — they bound the ingress,
        the record cap bounds the sink, and the pinned `gh` approaches
-       neither.
+       neither. Validation here gates the authorization record, not the
+       refusal record (sixth review): a request must pass every check
+       before item 8 serializes the full-form record that can authorize
+       it, while a request that fails any check is recorded in the form
+       its input admits — the full or digest form once the target
+       validated, the invalid form when it did not — under the reason of
+       the check that refused it, so the record never claims a target the
+       parser did not validate.
      - *Headers*: at most 64 fields and 16 KiB in total, no field over 8
        KiB; names are RFC 9110 tokens matched case-insensitively, values
        printable ASCII with tab, and any CR, LF, NUL, control byte, or
@@ -711,18 +745,29 @@ recorded as an accepted residual risk rather than claimed away.
      receives the `audit-unavailable` refusal. A serialization that would
      exceed the cap authorizes nothing: the relay refuses the request
      before any upstream I/O with the reason `audit-unrepresentable` and
-     writes, in place of the full record, the bounded **refusal form** of
-     the intent record — the same sequence, kind, timestamp, method, and
-     decision, with the target identified by the byte length and sha256
-     of its canonical path and canonical query and the GraphQL metadata
-     by its counts and digests — which fits the cap by construction. No
-     record is ever truncated and no marker ever stands in for one: a
-     record is written whole in its full form or its refusal form, or not
-     at all. A request refused during classification, or by any budget but
-     the audit budget, likewise writes one intent record carrying
-     `decision: refused` and its reason — in the full form when that fits
-     and the refusal form otherwise — and never proceeds; a refusal for
-     the audit budget itself writes nothing, below. When a REST
+     writes, in place of the full record, the intent record in the
+     bounded **digest form** of the target representation below — the same
+     sequence, kind, timestamp, method classification, and decision, with
+     the target identified by the byte length and sha256 of its canonical
+     path and canonical query and the GraphQL metadata by its counts and
+     digests — which fits the cap by construction. No record is ever
+     truncated and no marker ever stands in for one: a record is written
+     whole in one of the tagged forms, or not at all. Every other refusal
+     of a seen request line likewise writes one intent record carrying
+     `decision: refused` and the reason of the check that refused it —
+     never `audit-unrepresentable`, which names only the case where size
+     alone stopped an otherwise authorizable request (amended 2026-09-03,
+     #117, sixth review) — and never proceeds: a request whose target
+     validated and was then refused by classification, the denylist, the
+     method policy, a malformed header, framing, or body, an unclassifiable
+     GraphQL document, or any budget but the audit budget is recorded in
+     the full form when that fits and the digest form otherwise; a request
+     line the parser rejected before its target validated — an unknown or
+     oversized method token, a non-origin-form target, a malformed path or
+     query — is recorded in the **invalid form**, which names the failed
+     stage and identifies the input by length and digest and can carry no
+     canonical target because none exists. A refusal for the audit budget
+     itself writes nothing, below. When a REST
      `GET`/`HEAD` answer is a redirect that item 5 decides to follow, the
      hop is authorized the same way (fourth review): the relay serializes
      a **redirect-intent record** — correlated to the intent by sequence
@@ -739,8 +784,16 @@ recorded as an accepted residual risk rather than claimed away.
      that hop's entry in the completion record's summary, correlated by
      sequence and hop number — so a hop refused by item 5's policy and a
      hop refused as unrepresentable are recorded alike, and a
-     redirect-intent record exists exactly for the hops the credential
-     reached. After the upstream operation finishes — delivered, refused
+     redirect-intent record exists exactly for the hops whose credential
+     use was authorized. That is the whole of what an intent or
+     redirect-intent record proves (amended 2026-09-03, #117, sixth
+     review): the relay committed to attaching the credential to that
+     target, never that the request was sent — a crash after the record's
+     `fdatasync` and before the send leaves a target that may or may not
+     have been contacted, which is exactly the `indeterminate` outcome of
+     the publication rules below, and no record, message, or summary field
+     claims that a hop definitely occurred. After the upstream operation
+     finishes — delivered, refused
      at the response gate, redirected and refused, timed out, or aborted —
      the relay appends a **completion record** correlated to the intent by
      sequence number, carrying the outcome, the upstream status, the
@@ -751,8 +804,11 @@ recorded as an accepted residual risk rather than claimed away.
      limit is the longest case (fifth review); empty when none. The
      completion record copies no routing metadata — no path, query, or
      GraphQL field — because the intent and redirect-intent records
-     already carry it, so its size is bounded by construction and it is
-     never refused for size. The array is a triage summary; the
+     already carry it, and a refused hop's `Location` enters it only as
+     the bounded scheme classification and host representation of the
+     record shape below, never as text (sixth review), so its size is
+     bounded by construction and it is never refused for size, whatever
+     the upstream put in `Location`. The array is a triage summary; the
      redirect-intent records are the authorization, and a crash at any
      point leaves the last target whose credential use was authorized
      identifiable from the sink alone — the intent's path when no
@@ -761,7 +817,7 @@ recorded as an accepted residual risk rather than claimed away.
      intent, zero to three redirect-intents, one completion — or one
      record when refused, and the Run at most one terminal record. If the
      completion append fails, the intent and redirect-intent records
-     already prove the credential use; the relay enters the
+     already record what was authorized; the relay enters the
      audit-unavailable state and forwards nothing further. Capacity is
      reserved up front so the relay can never send a hop or finish an
      upstream call and then lack room for its record: under the relay's
@@ -788,7 +844,9 @@ recorded as an accepted residual risk rather than claimed away.
      refusal and the audit-budget-exhausted state are refusals of the
      sink's own limits: neither weakens the host, method, path, query, or
      denylist checks that precede them, and a request must pass all of
-     those before its record is ever serialized.
+     those before its authorization record is ever serialized — its
+     refusal record, by contrast, is serialized for any seen request line,
+     in the form the input admits (sixth review).
    - *Record shape — one explicit schema per kind, redacted by construction
      (amended 2026-09-03, #117, fifth review)*: every record is one line of
      ASCII-escaped JSON, so invalid UTF-8 and control bytes cannot reach
@@ -797,58 +855,107 @@ recorded as an accepted residual risk rather than claimed away.
      replaced by a marker to fit the cap. Common to every record: the
      record kind (`intent`, `redirect-intent`, `completion`, `terminal`)
      and a timestamp. Common to every per-request record: the request's
-     sequence number, assigned to every parsed request line, 1-based and
-     dense, so the highest sequence issued equals `requests_seen` and a
+     sequence number, assigned to every seen request line (item 6),
+     1-based and dense, so the highest sequence issued equals
+     `requests_seen` and a
      sequence with no intent record is a request refused without a record
      under the audit-budget-exhausted or audit-unavailable state.
-     - **Target representation**, shared by the intent's full form and the
-       redirect-intent: the method; the canonical path; and the query
-       reduced to its canonical parameter names in wire order plus each
-       decoded value's byte length and sha256 — literal values only for
-       the enumerated routing parameters `page`, `per_page`, `state`,
-       `sort`, `direction`, and only when printable ASCII under 256 bytes,
-       omitted otherwise while the length and digest stay. For `POST
-       /graphql`: the operation type; the operation name when at most 128
-       bytes, otherwise its byte length and sha256 in its place; and the
-       variables as name, JSON type, byte length, and sha256 of the
-       canonical encoding — literal values only for `owner`, `name`,
-       `repo`, `number`, `first`, `last`, `states`, under the same printable
-       cap. Every optional literal is therefore either present whole under
-       a fixed cap or absent, never cut.
+     - **Target representation**, tagged by `form` and total over every
+       seen request line (amended 2026-09-03, #117, sixth review): the
+       method is always a **closed classification** — `GET`, `HEAD`,
+       `POST`, `CONNECT`, `OPTIONS`, `TRACE`, `PUT`, `PATCH`, `DELETE`, or
+       `other`, the last carrying the token's byte length and sha256 in
+       place of any literal, so no record holds an unbounded method
+       string; a validated target's method is necessarily one of the first
+       three. The three forms:
+       - the **full form** (`form: full`), the only form that can
+         authorize: the method; the canonical path; and the query reduced
+         to its canonical (re-encoded) parameter names in wire order plus
+         each decoded value's byte length and sha256 — literal values only
+         for the enumerated routing parameters `page`, `per_page`,
+         `state`, `sort`, `direction`, and only when printable ASCII under
+         256 bytes, omitted otherwise while the length and digest stay.
+         For `POST /graphql` the GraphQL metadata is tagged `parsed: true`
+         with the operation type; the operation name when at most 128
+         bytes, otherwise its byte length and sha256 in its place; and the
+         variables as name, JSON type, byte length, and sha256 of the
+         canonical encoding — literal values only for `owner`, `name`,
+         `repo`, `number`, `first`, `last`, `states`, under the same
+         printable cap — or tagged `parsed: false` with nothing more when
+         the body was not JSON, not a classifiable single-operation
+         document, or never read because an earlier check refused the
+         request; for any other request the GraphQL metadata is `null`.
+         Every optional literal is therefore either present whole under a
+         fixed cap or absent, never cut. The full form is measured before
+         it is written and has no static bound.
+       - the **digest form** (`form: digest`), for a validated target
+         whose full form would not fit the cap: the method; the byte
+         length and sha256 of the canonical path; the pair count, byte
+         length, and sha256 of the canonical query; and the GraphQL
+         metadata as `parsed: true` with the operation type, the variable
+         count, and the sha256 of the canonical variables encoding, or
+         `parsed: false`, or `null`, under the rule above. A fixed set of
+         fixed-size fields.
+       - the **invalid form** (`form: invalid`), for a seen request line
+         that never yielded a validated target: the `stage` that refused
+         it, from the closed set `request-line`, `version`, `target-form`,
+         `method`, `path`, `query`, in the order item 6 validates;
+         the method classification; the byte length and sha256 of the raw
+         request-target as item 6 delimits it; and GraphQL metadata
+         `null`. Nothing is repaired, canonicalized, or copied: no
+         canonical path is invented for a path that failed, no raw target
+         byte is recorded, and the digest identifies the input without
+         reproducing it.
+       Only the full form authorizes; the digest and invalid forms never
+       authorize anything, whatever decision field accompanies them.
      - **`intent`** (mandatory: sequence, kind, timestamp, decision, the
        reason code on refusal, target): `decision` is `authorized` or
        `refused`, the reason a code from a closed enum, never client text;
-       the target is the representation above in the **full form**, plus
-       the budgets reserved when authorized. The full form is serialized
-       and measured before it authorizes anything; when it would exceed
-       the record cap the record is written in the **refusal form**
-       instead — decision `refused`, reason `audit-unrepresentable`, and
-       the target as the method with the byte length and sha256 of the
-       canonical path, the pair count, byte length, and sha256 of the
-       canonical query, and for GraphQL the operation type with the
-       variable count and the sha256 of the canonical variables encoding —
-       a fixed set of fixed-size fields that fits the cap by construction.
-       The refusal form identifies a target the credential never touched;
-       it is never the form of an `authorized` record.
+       an `authorized` record carries the target in the full form only,
+       plus the budgets reserved. The full form is serialized and measured
+       before it authorizes anything; when it would exceed the record cap
+       the record is written in the digest form with decision `refused`
+       and reason `audit-unrepresentable`, the reason reserved for that
+       case alone. A `refused` record carries the reason of the check
+       that refused it and the target in the form the input admits —
+       full when that fits, digest when it does not, invalid when the
+       target never validated (sixth review) — so a malformed request
+       keeps its malformed-input reason and a policy refusal keeps its
+       policy reason, and neither ever acquires a target it did not have.
      - **`redirect-intent`** (mandatory: sequence, kind, timestamp, hop
        number 1 to 3, decision `authorized`, target): the hop's target in
        the full form only. There is no refusal form for a hop: a hop whose
        record would not fit is refused, every refused hop is recorded in
        the completion record's summary, and a redirect-intent record
-       exists exactly for the hops the credential reached.
+       exists exactly for the hops whose credential use was authorized —
+       proof of the authorization, never of the send (sixth review).
      - **`completion`** (mandatory: sequence, kind, timestamp, outcome,
        upstream status or `null`, request bytes, response bytes,
        `redirects`): the outcome from a closed enum (`delivered`,
        `refused-gate`, `refused-redirect`, `timeout`, `upstream-error`,
        `aborted`), the final upstream status, the actual byte counts, and
        the `redirects` array of at most four entries — each the hop
-       number, the upstream status, the decision, the reason code, and the
-       `Location`'s scheme and host only, the host cut at 256 bytes (a hop
-       with a longer host was refused, so nothing that authorized anything
-       is lost). No target, query, or GraphQL field is copied here. The
-       schema is closed and every field bounded, so a completion record
-       fits the cap by construction and is never refused for size; the
-       implementation asserts the bound with a four-entry fixture.
+       number, the upstream status, the decision (`followed` or
+       `refused`), the reason code, and the resolved `Location`'s scheme
+       and host in the bounded representation of the sixth review: the
+       **scheme** as a closed classification — `https`, `http`, `other`
+       (any other syntactically valid scheme, however long), `invalid`
+       (a `Location` that is not a single parseable URI reference, or
+       whose scheme part is not a scheme token), `absent` (no `Location`
+       header) — and the **host** as a validity status with a bounded
+       payload — `valid` (a reg-name or IP literal in the RFC 3986 host
+       character set of at most 253 bytes, recorded literally),
+       `oversized` (in that character set but longer, recorded as byte
+       length and sha256), `invalid` (anything else — a host outside that
+       character set, an authority carrying user-info or percent-encoding,
+       an empty host — recorded as the byte length and sha256 of the
+       authority as the relay delimited it), `absent` (no authority) —
+       never a port, user-info, path, query, or fragment, and never text
+       the upstream chose. No target, query, or GraphQL field is copied
+       here. The schema is closed and every field bounded, so a completion
+       record fits the cap by construction and is never refused for size,
+       whatever the upstream put in `Location`; the implementation asserts
+       the bound with a four-entry fixture at every field's maximal width.
      - **`terminal`** (mandatory: kind, timestamp, reason, the exhaustion
        flags, the counters): the reason acceptance ended (`agent-exit` or
        `connection-budget-exhausted`); the `connection_budget_exhausted`,
@@ -860,13 +967,35 @@ recorded as an accepted residual risk rather than claimed away.
      Never recorded, in any kind: credentials, the sentinel,
      `Authorization` or any other header, request bodies, response bodies,
      upstream error text, refusal message text, repository content, a
-     `Location` path or query, or any bytes copied from the client beyond
-     the fields above. A record is at most 4 KiB, enforced before the
-     write and never by cutting — a full-form intent that would exceed it
-     becomes a refusal, a redirect-intent that would exceed it refuses its
-     hop, and the completion and terminal kinds cannot exceed it — and the
-     file at most 16 MiB per Run under the reservation rules above, so a
-     refusal can never grow the log past its cap.
+     `Location` path, query, port, or user-info, a raw request-target, a
+     method token, or any bytes copied from the client or the upstream
+     beyond the fields above. A record is at most 4 KiB, enforced before
+     the write and never by cutting — a full-form intent that would exceed
+     it becomes a digest-form refusal, a redirect-intent that would exceed
+     it refuses its hop, and the digest and invalid intent forms and the
+     completion and terminal kinds cannot exceed it — and the file at most
+     16 MiB per Run under the reservation rules above, so a refusal can
+     never grow the log past its cap.
+     - *Serialized bound of the fixed forms (amended 2026-09-03, #117,
+       sixth review)*: every field of the digest form, the invalid form,
+       the completion, and the terminal belongs to one of five classes
+       with a fixed maximal width in ASCII-escaped JSON — a key or a
+       closed-enum value of at most 32 bytes; a sha256 as exactly 64
+       lowercase hexadecimal bytes; the timestamp as RFC 3339 UTC at
+       microsecond precision, exactly 27 bytes; an integer of at most 20
+       digits (every counter and length is bounded far below that); and a
+       host literal of at most 253 bytes from the RFC 3986 host character
+       set. None of these contains a byte JSON must escape, so escaping
+       adds nothing to a fixed form, and the punctuation is fixed by the
+       schema — two quotes, a colon, and a comma per field, braces and
+       brackets per object and array. With every field at its widest, the
+       longest fixed form is a four-entry completion whose four hosts are
+       253-byte literals: under 3,400 bytes, more than 700 bytes under the
+       cap; the digest-host completion is under 2,900 bytes and the
+       invalid-form, digest-form, and terminal shapes each under 1,400.
+       The implementation asserts each of those maximal serializations
+       under the cap as a fixture, and any schema change that adds a field
+       re-derives the bound.
    - *Audit unavailable*: the state a failed audit write (error, disk full,
      closed descriptor, short write, a failed `fdatasync`) puts the relay
      in. The process stays up and keeps answering the socket; it forwards
@@ -902,7 +1031,10 @@ recorded as an accepted residual risk rather than claimed away.
      report leaves uncompleted is `incomplete`, whether the credential had
      been sent or not; `indeterminate`: intent without a completion and no
      audit-failure report — the relay died between intent and completion,
-     so whether the upstream connection was opened is unknown), aggregate
+     so whether the upstream connection was opened is unknown; a crash
+     after a redirect-intent's `fdatasync` and before its send is the
+     same case, the hop's authorization recorded and its contact unknown,
+     sixth review), aggregate
      request and response bytes, redirect-intent records written, redirects
      followed and refused, `records_parsed` by kind — the driver's own
      count of what it parsed, labeled as such and never presented as the
@@ -1001,7 +1133,11 @@ recorded as an accepted residual risk rather than claimed away.
    GraphQL, and answering them means emulating GitHub's schema. Both modes
    run the same write-ahead audit sink, budgets, response gate, and redirect
    rules; the `none` upstream simply never receives a request, so every
-   record it produces is a `refused` intent.
+   record it produces is a `refused` intent — the ingress refusals under
+   their own reasons and in their own tagged forms, exactly as in
+   production, and every request that validates under the no-upstream
+   reason (amended 2026-09-03, #117, sixth review); no mode ever contacts
+   an upstream for a request the ingress refused.
 10. **Lifecycle and failure semantics, in order.** Configure (the slot is
     declared; ADR-0047 refuses an unbound or unreadable binding, and item 3
     refuses an unsupported host, at config load) → driver boot: host check,
@@ -1063,13 +1199,16 @@ recorded as an accepted residual risk rather than claimed away.
       socket, deletes the spool, records `crashed`, and does not restart the
       relay (the agent's further calls fail at connect; the Run continues
       on its prompt); a crash after an intent record and before the
-      upstream connection, during the upstream request, between redirect
-      hops, or after completion but before the completion record all leave
-      the same evidence — an intent, with whatever redirect-intent records
-      preceded the crash, and no completion — which the summary reports as
-      `indeterminate`; the credential is treated as possibly used, and the
-      last target whose use was authorized is the highest-hop
-      redirect-intent record's path, or the intent's when none follows. A
+      upstream connection, after a redirect-intent record's `fdatasync`
+      and before that hop is sent, during the upstream request, between
+      redirect hops, or after completion but before the completion record
+      all leave the same evidence — an intent, with whatever
+      redirect-intent records preceded the crash, and no completion —
+      which the summary reports as `indeterminate`; the credential is
+      treated as possibly used against every recorded target, none of
+      them claimed contacted (sixth review), and the last target whose
+      use was authorized is the highest-hop redirect-intent record's path,
+      or the intent's when none follows. A
       driver crash takes the relay with the cgroup (ADR-0013 kill-the-tree)
       and leaves the sink and any spool for the boot sweep, which publishes
       the sink as `orphaned` and deletes the spool; stale-socket cleanup is
@@ -1169,7 +1308,9 @@ recorded as an accepted residual risk rather than claimed away.
       `Location` never delivered, framing recomputed, `Content-Length`
       omitted on `HEAD`; a `gzip`, `br`, `deflate`, and unknown
       `Content-Encoding` response each refused undecoded with no downstream
-      byte;
+      byte; a request line at exactly the limit seen and refused with a
+      record, one byte over closed with no seen request line and
+      `no_request` moved (sixth review);
     - connection budget — a client opening and closing empty connections,
       sending partial request lines, and letting reads time out at a high
       sequential rate, each charged exactly one unit at accept; busy
@@ -1225,7 +1366,11 @@ recorded as an accepted residual risk rather than claimed away.
       injected after intent, during upstream, before and after each of
       three redirect hops, and after completion each leaving an
       `indeterminate` request whose last authorized target is identifiable
-      from the sink alone; an audit-unavailable Run publishing with the
+      from the sink alone; a crash injected after a redirect-intent's
+      `fdatasync` and before its send leaving the hop's authorization
+      recorded, its contact unknown, the request `indeterminate`, and no
+      summary field, message, or count claiming the hop occurred (sixth
+      review); an audit-unavailable Run publishing with the
       terminal record `missing`, the audit-failure report present, and every
       uncompleted intent counted `incomplete`, never `indeterminate`; a
       short write and a torn final line each freezing the relay and
@@ -1250,13 +1395,55 @@ recorded as an accepted residual risk rather than claimed away.
       refused as `audit-unrepresentable` with the refusal-form intent
       record present, no upstream connection, and no credential use; a
       full-form record serialized to exactly the cap written whole and one
-      byte over refused; a followed redirect whose redirect-intent record
+      byte over refused in the digest form with every mandatory field
+      retained and no credential use after any digest-form or
+      invalid-form record; a followed redirect whose redirect-intent record
       would exceed the cap refused at that hop with no redirect-intent
       record, no credential on the hop, and the completion's entry
       carrying `audit-unrepresentable`; every mandatory field present in
       every record of every kind across the whole fixture corpus, with no
       marker or shortened field anywhere in the sink; and the completion
       and terminal kinds shown under the cap at their maximal shape;
+    - refusal totality (sixth review) — `GET /%G1`, a malformed query
+      escape, an absolute-form, authority-form, and asterisk-form target,
+      a fragment, an `HTTP/1.0` version, a 5,000-byte method token in a
+      request line under 8 KiB, and an empty request line each refused
+      with an invalid-form intent record naming the stage that refused
+      it, the method classification (`other` with byte length 5,000 and
+      the digest for the long token), the raw request-target's byte
+      length and sha256, no canonical path, no raw byte, and the
+      malformed-input reason — never `audit-unrepresentable` — with no
+      upstream connection; a `POST /graphql` with invalid JSON, a
+      multi-operation document, and an unclassifiable document each
+      refused with a full-form record carrying the canonical target and
+      GraphQL metadata `parsed: false` under its own reason; a validated
+      target refused by the denylist, the method policy, or a header,
+      framing, or body check whose full form would not fit recorded in
+      the digest form under the original reason; every mandatory field
+      present in every refusal record; the same fixture corpus, ingress
+      behavior, and records produced by the production driver and the
+      bench driver in `live` and `none` modes, `none` contacting no
+      upstream for any input; and the shutdown, audit-failure,
+      reservation, retention, and recovery fixtures above passing
+      unchanged under the tagged forms, which change what a refusal
+      record contains and never when a record is written or what any
+      other record proves;
+    - bounded redirect metadata (sixth review) — a refused `Location`
+      with a 5,000-byte scheme recorded as scheme `other` or `invalid`
+      and nothing longer; a missing `Location`, a duplicated one, an
+      unparseable one, and a scheme-relative one each recorded under the
+      matching classification; a host of 253 bytes recorded literally, of
+      254 bytes as `oversized` with length and digest, and hosts carrying
+      user-info, percent-encoding, a control or non-ASCII byte, a `"`, or
+      a `\` each recorded as `invalid` with length and digest and no
+      escaped byte in the record; every entry's port, user-info, path,
+      query, and fragment absent; a four-entry completion at every
+      field's maximal width — four 253-byte literal hosts, the widest
+      enum values, 20-digit integers — serialized under the cap with its
+      byte count asserted, and the digest-host, invalid-form,
+      digest-form, and terminal maximal shapes likewise; and every
+      mandatory completion field present, with no whole-record truncation
+      and no missing completion for any hostile `Location`;
     - one terminal, one shutdown — audit-budget exhaustion with concurrent
       requests holding reservations, each finishing with its hops and
       completion written and every later request refused with the stable
@@ -1318,7 +1505,8 @@ recorded as an accepted residual risk rather than claimed away.
       disagree;
     - bench — `live` and `none` parity through the exported entry point,
       the same ingress, policy, gate, redirect, audit, representability,
-      shutdown, counter, and redirect-accounting fixtures passing unchanged
+      refusal-totality, bounded-redirect-metadata, shutdown, counter, and
+      redirect-accounting fixtures passing unchanged
       against the bench driver in both modes, `none` producing only
       `refused` intents and the recorded `gh_upstream: none`, `live`
       against a scratch repository exercising the host pin with the
@@ -1368,10 +1556,16 @@ recorded as an accepted residual risk rather than claimed away.
   unambiguously; every audit record kind has a schema that is checked
   before it authorizes anything, so a record that exists says exactly what
   was authorized and a request the sink cannot describe is refused rather
-  than half-recorded; acceptance ends once and the terminal record is
-  written once, however it ends, and a missing terminal leaves the
-  counters unknown rather than wrong; and no document states the successor
-  schema version as current before the code does.
+  than half-recorded; every refused request line, a malformed one
+  included, leaves a bounded record naming the stage that refused it and
+  identifying the input by digest, without repairing, copying, or
+  inventing a target, and no `Location` the upstream can send enlarges or
+  displaces a completion record; the audit's claim is stated at exactly
+  its strength — authorization, never transmission — so no summary field
+  asserts a send the relay cannot prove; acceptance ends once and the
+  terminal record is written once, however it ends, and a missing terminal
+  leaves the counters unknown rather than wrong; and no document states
+  the successor schema version as current before the code does.
 - **Negative**: a Run's inputs are no longer fully reproducible from its
   evidence bundle; a second GitHub credential per worker type is operator
   work, and its permission matrix is longer than the first draft promised; an
@@ -1406,7 +1600,12 @@ recorded as an accepted residual risk rather than claimed away.
   both limits; the relay carries a second channel to the driver, the
   audit-failure and exit reports, beside the sink; after any audit failure
   the Run's counters are unknown, because the only record that carries
-  them is one the state forbids; and the accepted successor
+  them is one the state forbids; the audit schema carries three tagged
+  target forms, a method classification, and a scheme and host
+  representation that the implementation must keep total by construction,
+  and a refused hostile `Location` or malformed request line is
+  diagnosable only by classification and digest, never by its text; and
+  the accepted successor
   `schema_version` stays reserved until one implementation PR lands its
   activation whole, which sizes that PR.
 - **Neutral**: amends ADR-0013 (channel clause), ADR-0017 (the Context
@@ -1494,7 +1693,7 @@ recorded as an accepted residual risk rather than claimed away.
   record and lives in the completion summary; giving the representability
   refusal a record of its own would make two kinds of refused hop with
   two shapes, and a redirect-intent record that exists would no longer
-  mean the credential reached that hop.
+  mean that hop's credential use was authorized.
 - **Writing the terminal record at audit-budget exhaustion**: rejected —
   reserved requests finish after that moment and their completions would
   follow the terminal, exhaustion is not the end of acceptance, and a
@@ -1512,6 +1711,37 @@ recorded as an accepted residual risk rather than claimed away.
   be answered by a fourth redirect the hop limit refuses, and that refusal
   is a decision the summary must show; four entries, three
   redirect-intent records.
+- **One refusal form requiring a literal method and a canonical target**
+  (the fifth review's shape): rejected (2026-09-03, #117, sixth review) —
+  a request line the parser rejects has no canonical path, query, or
+  GraphQL metadata to record, so a single form would force the relay to
+  invent, repair, or copy input to fill it, and a literal method field is
+  unbounded; the tagged forms make every refusal representable from
+  exactly what the parser established, and `audit-unrepresentable` keeps
+  its one meaning.
+- **Recording the raw request-target or method token of a malformed
+  request**: rejected — the bytes are unbounded up to the request-line
+  limit, may carry a credential the client put there, and the sink is a
+  security record, not a debugging capture; the byte length and sha256
+  identify the input for correlation without reproducing it.
+- **Repairing invalid input to record a canonical path**: rejected — a
+  repaired path names a target the relay never validated and would make
+  the record claim more than the parser knew; the invalid form names the
+  failed stage and nothing beyond it.
+- **A literal scheme and a host cut at 256 bytes** (the fifth review's
+  completion entry): rejected — a cut host is uncontrolled upstream text
+  partially copied, a literal scheme is unbounded, and a `Location` that
+  does not parse has neither; a closed scheme classification and a host
+  validity status with a literal only when valid keep the completion
+  bounded by construction for any `Location`.
+- **Treating an intent or redirect-intent record as proof that the
+  request was sent**: rejected — no write-ahead record can prove a later
+  send, and only the completion, written after the fact, says what
+  happened; the record proves the authorization, the crash after its sync
+  and before the send is the `indeterminate` outcome the summary already
+  distinguishes, and no new protocol (a pre-send marker, a post-send
+  record) is added, since each would reopen the ordering questions the
+  fifth review closed.
 - **Stating `schema_version` 2 as current before the implementation lands,
   with a red drift-lock as the interim**: rejected (2026-09-03, #117, fourth
   review) — the drift-lock exists to make disagreement between the code
@@ -1702,6 +1932,22 @@ recorded as an accepted residual risk rather than claimed away.
   `requests_charged`, and the summary reports counters unknown when the
   terminal record is absent (decisions 6, 8, 10). Test obligations
   extended accordingly (decision 11).
+- **2026-09-03 (#117, sixth review)**: the refusal schemas are total over
+  rejected input — the target representation is tagged (full, digest,
+  invalid), the method is a closed classification with length and digest
+  for unknown tokens, GraphQL metadata is explicitly `parsed: false` when
+  a body could not be classified, a request line rejected before its
+  target validated is recorded in the invalid form naming the failed
+  stage with the raw target's length and digest, and
+  `audit-unrepresentable` names only the oversized otherwise-authorizable
+  case while every other refusal keeps its own reason (decisions 6, 8,
+  9). The completion's redirect entries carry a closed scheme
+  classification and a host validity status with a literal only when
+  valid, and the serialized bound of every fixed form is stated
+  (decisions 5, 8). The evidence wording is exact: an intent or
+  redirect-intent record proves that credential use was authorized, never
+  that a request was sent (decisions 8, 10). Test obligations extended
+  accordingly (decision 11).
 
 ## Relevant PRs
 
@@ -1718,4 +1964,7 @@ recorded as an accepted residual risk rather than claimed away.
   write-ahead, bounded connection attempts, and gave the query its own
   grammar, and its fifth review gave every audit record an explicit
   size-checked schema, one terminal and shutdown model, separate request
-  counters, and four-entry redirect accounting.
+  counters, and four-entry redirect accounting, and its sixth review made
+  the refusal schemas total over malformed input, bounded the
+  refused-redirect metadata, and stated the audit's evidence claim
+  exactly.
