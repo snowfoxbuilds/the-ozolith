@@ -57,5 +57,12 @@ Owned hardware, cgroup kill semantics, IP-only control channel, local image buil
 
 | ADR | Decision |
 | --- | --- |
+| ADR-0002-advisory-control-node | GitHub owns coordination state; the Control Node is advisory, never a second source of truth |
+| ADR-0005-theozolith-owns-node-substrate | TheOzolith owns and ships the node substrate; an admission rule keeps it to invariants a coding-fleet adopter would want |
+| ADR-0008-reviewer-owned-state-best-effort-pr | A separate Reviewer actor — own identity, stronger model, no self-grading by construction — owns all post-PR state |
+| ADR-0013-node-resident-drivers-per-run-containers | Credentialed node-resident drivers with credential-free, per-Run containers under cgroup kill-the-tree semantics |
 | ADR-0017-control-node-claim-dispatch | GitHub owns coordination state; the Control Node is the single write-through claim writer, never a second source of truth |
-| ADR-0019-headless-runs-and-flight-deck | Runs execute headless (transactions, not sessions); interactivity lives only in the Flight Deck |
+| ADR-0019-headless-runs-and-flight-deck | Runs execute headless (transactions, not sessions); interactivity — and its supervised, no-merge machine identity — lives only in the Flight Deck |
+| ADR-0044-worker-type-def-owns-customization | The Agent adapter is the swappable variable; the harness is immutable plumbing (the customization tuple) |
+| ADR-0045-model-effort-baked-into-derived-image | Model and reasoning effort are materialized into the adapter's native config, never invocation flags; in-flight policy rides native hooks |
+| ADR-0052-codex-adapter-per-tool-knowledge | A second Agent adapter via a per-tool compiler registry — thin-adapter pluggability, the ADR-0044 promise kept |

@@ -10,7 +10,7 @@ Three codebases were converging on the same substrate: snow-maker (coding pipeli
 
 ## Decision
 
-One public monorepo, TheOzolith, with separable, independently installable components: knowledge/ (agent-knowledge machinery: config format, per-tool compilers such as [AGENTS.md-to-CLAUDE.md](http://agents.md-to-claude.md/) generation and skill placement, sync engine), worker/, control/, nodeagent/, deploy/. snow-maker is renamed and absorbed. homeserver sunsets by reduction: once its workloads migrate onto the Node Agent, what remains is data in the private config repo.
+One public monorepo, TheOzolith, with separable, independently installable components: knowledge/ (agent-knowledge machinery: config format, per-tool compilers such as AGENTS.md-to-CLAUDE.md generation and skill placement, sync engine), worker/, control/, nodeagent/, deploy/. snow-maker is renamed and absorbed. homeserver sunsets by reduction: once its workloads migrate onto the Node Agent, what remains is data in the private config repo.
 
 All private content — deployment declarations (Stacks, worker types, overlays, secret names) and agent knowledge (skills, subagents, workflows) — lives in one private config repo of pure data, no machinery. Worker types reference it as a Knowledge Source (git URL + pin) baked into derived images at build time; the same content syncs to laptop tool dirs.
 
