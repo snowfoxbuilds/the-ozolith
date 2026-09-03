@@ -34,7 +34,14 @@ accepted successor that the implementation PR activates atomically, nowhere
 described as current before then; every credentialed redirect hop has its own
 durable pre-hop audit record; every accepted connection consumes a finite
 per-Run budget whose exhaustion closes the listener; and the query string has
-a canonicalization grammar of its own, separate from the path's.
+a canonicalization grammar of its own, separate from the path's. A fifth
+review made the accepted contract implementable end to end: every audit
+record kind has an explicit schema that is serialized and size-checked before
+it authorizes anything, so no record ever collapses into a marker; the relay
+has one terminal record and one shutdown sequence whatever ends acceptance;
+the counters distinguish request lines seen from request budget spent and
+are unknown, never fabricated, when the terminal record is absent; and the
+redirect summary admits the fourth entry a hop-limit refusal produces.
 
 # ADR-0057: GitHub Relay — `gh` as the agent's read surface, credential-free by driver-side auth injection
 
@@ -388,9 +395,11 @@ recorded as an accepted residual risk rather than claimed away.
      record never named, and a record written after the fact is not
      write-ahead for that hop). The completion record additionally carries
      the request's redirect decisions as one bounded `redirects` array of at
-     most three entries — hop number, upstream status, decision, reason
-     code, and the `Location`'s scheme and host only — as a triage summary
-     that never substitutes for the pre-hop record. No record stores a
+     most four entries (amended 2026-09-03, #117, fifth review — three
+     followed hops plus the fourth redirect answer refused at the hop
+     limit) — hop number, upstream status, decision, reason code, and the
+     `Location`'s scheme and host only — as a triage summary that never
+     substitutes for the pre-hop record. No record stores a
      `Location` path or query literally: a redirect-intent record carries
      the canonical target path and the redacted query representation of
      item 8 — names, lengths, and digests — because a signed URL's query is
@@ -455,7 +464,9 @@ recorded as an accepted residual risk rather than claimed away.
      client being `gh`. The parser is stdlib-only (ADR-0010) and fail-closed:
      everything below refuses with a 4xx-class answer carrying a stable
      reason code, writes a `refused` intent record (item 8) when a request
-     line was parsed, and counts against the request budget.
+     line was parsed — in its full form or its bounded refusal form, and
+     not at all under the audit-budget-exhausted or audit-unavailable
+     state — and counts against the request budget.
      - *Connections*: one request per connection. The relay answers every
        request with `Connection: close`, closes after the response, and
        never reads a second request on a connection — bytes after the
@@ -484,25 +495,40 @@ recorded as an accepted residual risk rather than claimed away.
        and a connection still queued in the listen backlog is reset when
        the listener closes — at no cost to the relay: there is no
        accept-and-refuse loop after exhaustion, bounded or otherwise. The
-       relay then runs its ordinary shutdown (item 10): it finishes or
-       aborts the connections already accepted (at most eight), writes their
-       completion records, writes the terminal record with reason
-       `connection-budget-exhausted`, deletes any spool, and exits clean;
-       the driver records the termination reason `exhausted` — never
-       `crashed`, since the exit status is zero and the terminal record
-       names the cause — and the Run continues on its prompt as after any
-       relay exit. The connection counters are `accepted` (bounded by the
-       connection budget), `busy_refused`, `no_request` (closed by the peer
-       or timed out before a complete request line — the empty and partial
-       cases), and `requests` (a request line parsed; bounded by the request
-       budget), plus a `connection_budget_exhausted` flag; each is an exact
-       integer bounded by the connection budget, so no counter can saturate
-       or wrap, and all of them appear in the terminal record and in the
-       published summary (item 8). The request budget is unchanged: a
-       request line parsed after it is spent still receives the stable
-       refusal, and the connection budget bounds how many such refusals
-       exist. The eight-open, four-in-flight, and one-request-per-connection
-       rules stand as stated.
+       relay then runs the one shutdown sequence of item 10 (amended
+       2026-09-03, #117, fifth review): the connections already accepted
+       (at most eight) finish under their own timeouts, their completion
+       records are written where the audit state permits, the single
+       terminal record is written with reason `connection-budget-exhausted`
+       into the room reserved at sink creation — unless the relay is
+       audit-unavailable, in which case no terminal record is written and
+       the listener still closes — any spool is deleted, the exit report of
+       item 8 names `connection-budget-exhausted`, and the relay exits with
+       status zero; the driver records the termination reason `exhausted`
+       from that report, never from the terminal record and never as
+       `crashed`, and the Run continues on its prompt as after any relay
+       exit. Whether the exit was healthy is read from three separate
+       facts of the summary — the termination reason, the terminal
+       record's state, and the audit-failure report — never from the
+       termination reason alone. The counters are `accepted` (bounded by
+       the connection budget), `busy_refused`, `no_request` (closed by the
+       peer or timed out before a complete request line — the empty and
+       partial cases), `requests_seen` (request lines parsed, bounded by
+       `accepted`, since a request line parsed after the request budget is
+       spent is still seen and still answered), and `requests_charged`
+       (request lines charged against the 2,000-request budget, bounded by
+       that budget — `min(requests_seen, 2000)` while the accounting is
+       intact, and the terminal record states both so the summary can
+       check it), plus the `connection_budget_exhausted`,
+       `request_budget_exhausted`, and `audit_budget_exhausted` flags; each
+       is an exact integer bounded by the connection budget, so no counter
+       can saturate or wrap, and all of them live in the terminal record
+       alone (item 8) — the summary copies them from a present, well-formed
+       terminal record and reports them unknown otherwise. The request
+       budget is unchanged: a request line parsed after it is spent still
+       receives the stable refusal, and the connection budget bounds how
+       many such refusals exist. The eight-open, four-in-flight, and
+       one-request-per-connection rules stand as stated.
      - *Request line*: `HTTP/1.1` exactly; any other version refuses (`505`).
        The request-target must be origin-form — a path beginning with `/`,
        optionally followed by `?` and a query; absolute-form,
@@ -510,7 +536,16 @@ recorded as an accepted residual risk rather than claimed away.
        method token is `GET`, `HEAD`, or `POST` (the last only with the
        canonical path `/graphql`); `CONNECT`, `OPTIONS`, `TRACE`, every other
        token, and any upgrade attempt refuse. The request line is at most 8
-       KiB, the path at most 4 KiB, the query at most 4 KiB.
+       KiB, the path at most 4 KiB, the query at most 4 KiB. These are
+       admission limits on the parser, not a promise that every admitted
+       target is recordable (amended 2026-09-03, #117, fifth review): item
+       8 serializes the intent record for an admitted target and refuses
+       the request as `audit-unrepresentable` when that record would not
+       fit the record cap, so a target can pass every host, method, path,
+       query, and denylist check here and still be refused there. The
+       limits are not narrowed to close that gap — they bound the ingress,
+       the record cap bounds the sink, and the pinned `gh` approaches
+       neither.
      - *Headers*: at most 64 fields and 16 KiB in total, no field over 8
        KiB; names are RFC 9110 tokens matched case-insensitively, values
        printable ASCII with tab, and any CR, LF, NUL, control byte, or
@@ -665,123 +700,239 @@ recorded as an accepted residual risk rather than claimed away.
      applicable budget (item 6) — including audit capacity for the intent
      record, up to three redirect-intent records, and the completion record
      (the terminal record's capacity is reserved once per Run when the sink
-     is created; fourth review). Then it appends an **intent record** to the
-     sink with a single write followed by `fdatasync`. Only that durable
-     write authorizes credential use against the request's original target:
-     the upstream connection is opened and the credential attached only
-     after it returns, and if it fails no connection is attempted and no
-     credential is touched — the client receives the `audit-unavailable`
-     refusal. A request refused during classification or reservation writes
-     one intent record carrying `decision: refused` and its reason, and
-     never proceeds. When a REST `GET`/`HEAD` answer is a redirect that item
-     5 decides to follow, the hop is authorized the same way (amended
-     2026-09-03, #117, fourth review): the relay appends and `fdatasync`s a
-     **redirect-intent record** — correlated to the intent by sequence
+     is created; fourth review). Then it serializes the **intent record**
+     in full and measures it (amended 2026-09-03, #117, fifth review): a
+     serialization within the record cap of the record shape below is
+     appended to the sink with a single write followed by `fdatasync`, and
+     only that durable write authorizes credential use against the
+     request's original target — the upstream connection is opened and the
+     credential attached only after it returns, and if it fails no
+     connection is attempted and no credential is touched; the client
+     receives the `audit-unavailable` refusal. A serialization that would
+     exceed the cap authorizes nothing: the relay refuses the request
+     before any upstream I/O with the reason `audit-unrepresentable` and
+     writes, in place of the full record, the bounded **refusal form** of
+     the intent record — the same sequence, kind, timestamp, method, and
+     decision, with the target identified by the byte length and sha256
+     of its canonical path and canonical query and the GraphQL metadata
+     by its counts and digests — which fits the cap by construction. No
+     record is ever truncated and no marker ever stands in for one: a
+     record is written whole in its full form or its refusal form, or not
+     at all. A request refused during classification, or by any budget but
+     the audit budget, likewise writes one intent record carrying
+     `decision: refused` and its reason — in the full form when that fits
+     and the refusal form otherwise — and never proceeds; a refusal for
+     the audit budget itself writes nothing, below. When a REST
+     `GET`/`HEAD` answer is a redirect that item 5 decides to follow, the
+     hop is authorized the same way (fourth review): the relay serializes
+     a **redirect-intent record** — correlated to the intent by sequence
      number, carrying the hop number (1 to 3), the canonical target path,
-     and the redacted query representation of the record shape below, never
-     a `Location` byte literally — and attaches the credential to that hop
-     only after the write returns; if the append fails the hop is not sent,
-     no credential touches it, and the relay enters audit-unavailable under
-     the rules below. A hop item 5 refuses writes no redirect-intent record —
-     it is never sent — and appears only in the completion record's summary.
-     After the upstream operation finishes — delivered, refused at the
-     response gate, redirected and refused, timed out, or aborted — the relay
-     appends a **completion record** correlated to the intent by sequence
-     number, carrying the upstream status, the actual request and response
-     byte counts, the request's redirect decisions of item 5 as one bounded
-     `redirects` array (at most three entries, one per redirect answered,
-     followed or refused; empty when none), and the terminal reason. The
-     array is a triage summary; the redirect-intent records are the
-     authorization, and a crash at any point leaves the last target whose
-     credential use was authorized identifiable from the sink alone — the
-     intent's path when no redirect-intent record follows it, otherwise the
-     path of the highest hop number. A request therefore costs two to five
-     records — one intent, zero to three redirect-intents, one completion —
-     and the Run one terminal record. If the completion append fails, the
-     intent and redirect-intent records already prove the credential use;
-     the relay enters the audit-unavailable state and forwards nothing
-     further. Capacity is reserved up front so the relay can never send a
-     hop or finish an upstream call and then lack room for its record: each
-     request reserves one intent, three redirect-intent, and one completion
-     record at the 4 KiB cap under the relay's lock before its intent is
-     written; the redirect-intent capacity it did not use is released only
-     once its completion record has been written — never earlier, since a
-     released reservation is claimable by a concurrent request and a hop
-     must never find its reserved room gone; and the terminal record's
-     capacity, reserved at sink creation, is never released. When a
-     reservation would cross the 16 MiB file cap the relay writes the
-     terminal `audit-budget-exhausted` record into that reserved room and
-     refuses every further request without writing again, while a request
-     already holding its reservation completes normally, its room having
-     been reserved before the cap was reached.
-   - *Record shape, redacted by construction*: sequence number; record kind
-     (`intent`, `redirect-intent`, `completion`, `terminal`); timestamp;
-     method; canonical path, with the query reduced to its canonical
-     parameter names in wire order plus each decoded value's byte length and
-     sha256 (literal values only for the enumerated routing parameters
-     `page`, `per_page`, `state`, `sort`, `direction`, and only when printable
-     ASCII under 256 bytes) — the one query representation every record kind
-     uses, an intent for the client's target and a redirect-intent for a
-     hop's; GraphQL operation type and name (capped at 128
-     bytes); variables as name, JSON type, byte length, and sha256 of the
-     canonical encoding (literal values only for `owner`, `name`, `repo`,
-     `number`, `first`, `last`, `states`, under the same printable cap);
-     decision with a reason code from a closed enum, never client text; the
-     budgets reserved (intent); the hop number and the canonical target path
-     with its query representation (redirect-intent); or the upstream
-     status, byte counts, the bounded `redirects` array, and terminal reason
-     (completion); the connection counters and the reason (terminal). The 4
-     KiB record cap is sized with the three-entry array inside it, so a
-     completion record never overflows into the truncation marker because
-     of redirects; capacity reservation counts one intent, three
-     redirect-intent, and one completion record per request, and one
-     terminal record per Run (fourth review). Never recorded:
-     credentials, the sentinel, `Authorization` or any other header, request
-     bodies, response bodies, upstream error text, refusal message text,
-     repository content, a `Location` path or query, or any bytes copied
-     from the client beyond the fields above; every string is ASCII-escaped
-     JSON, so invalid UTF-8 and control bytes cannot reach the file
-     unescaped. A record is at most 4 KiB — one that would exceed it is
-     replaced by a fixed-size truncation marker — and the file at most 16
-     MiB per Run: when a reservation would cross that cap the relay writes
-     one terminal `audit-budget-exhausted` record into the room reserved at
-     sink creation and refuses every further request without writing again,
-     so a refusal can never grow the log.
+     and the redacted query representation of the record shape below,
+     never a `Location` byte literally — measures it, and, when it fits
+     the cap, appends and `fdatasync`s it and attaches the credential to
+     that hop only after the write returns; if the append fails the hop is
+     not sent, no credential touches it, and the relay enters
+     audit-unavailable under the rules below. A redirect-intent record that
+     would exceed the cap is not written, and the hop is refused with the
+     reason `audit-unrepresentable` (fifth review): the request ends there,
+     and the refusal is recorded where every refused hop is recorded — as
+     that hop's entry in the completion record's summary, correlated by
+     sequence and hop number — so a hop refused by item 5's policy and a
+     hop refused as unrepresentable are recorded alike, and a
+     redirect-intent record exists exactly for the hops the credential
+     reached. After the upstream operation finishes — delivered, refused
+     at the response gate, redirected and refused, timed out, or aborted —
+     the relay appends a **completion record** correlated to the intent by
+     sequence number, carrying the outcome, the upstream status, the
+     actual request and response byte counts, and the request's redirect
+     decisions of item 5 as one bounded `redirects` array of at most four
+     entries — one per redirect answered, followed or refused; three
+     followed hops and then a fourth redirect answer refused at the hop
+     limit is the longest case (fifth review); empty when none. The
+     completion record copies no routing metadata — no path, query, or
+     GraphQL field — because the intent and redirect-intent records
+     already carry it, so its size is bounded by construction and it is
+     never refused for size. The array is a triage summary; the
+     redirect-intent records are the authorization, and a crash at any
+     point leaves the last target whose credential use was authorized
+     identifiable from the sink alone — the intent's path when no
+     redirect-intent record follows it, otherwise the path of the highest
+     hop number. A request therefore costs two to five records — one
+     intent, zero to three redirect-intents, one completion — or one
+     record when refused, and the Run at most one terminal record. If the
+     completion append fails, the intent and redirect-intent records
+     already prove the credential use; the relay enters the
+     audit-unavailable state and forwards nothing further. Capacity is
+     reserved up front so the relay can never send a hop or finish an
+     upstream call and then lack room for its record: under the relay's
+     lock and before its intent is written, a request being refused
+     reserves one record's room at the 4 KiB cap and a request being
+     authorized reserves five — one intent, three redirect-intent, one
+     completion; the difference between the reservation and the bytes
+     actually written is released only once the request's last record —
+     the refused intent, or the completion — has been written, never
+     earlier, since a released reservation is claimable by a concurrent
+     request and a hop must never find its reserved room gone; and the
+     terminal record's capacity, reserved at sink creation, is never
+     released. When a reservation would cross the 16 MiB file cap the
+     relay enters the **audit-budget-exhausted** state (amended
+     2026-09-03, #117, fifth review): it authorizes no further upstream
+     request and writes no further per-request record — every later
+     request receives item 6's stable budget refusal without any record —
+     while every request already holding its reservation finishes
+     normally, hops and completion included, its room having been reserved
+     before the cap was reached; acceptance continues within the
+     connection budget, and the exhaustion is noted for the terminal
+     record, which is written only at shutdown, in its reserved room,
+     never at the moment of exhaustion. The `audit-unrepresentable`
+     refusal and the audit-budget-exhausted state are refusals of the
+     sink's own limits: neither weakens the host, method, path, query, or
+     denylist checks that precede them, and a request must pass all of
+     those before its record is ever serialized.
+   - *Record shape — one explicit schema per kind, redacted by construction
+     (amended 2026-09-03, #117, fifth review)*: every record is one line of
+     ASCII-escaped JSON, so invalid UTF-8 and control bytes cannot reach
+     the file unescaped, and every field named mandatory below is present
+     in every record of its kind — none may be dropped, shortened, or
+     replaced by a marker to fit the cap. Common to every record: the
+     record kind (`intent`, `redirect-intent`, `completion`, `terminal`)
+     and a timestamp. Common to every per-request record: the request's
+     sequence number, assigned to every parsed request line, 1-based and
+     dense, so the highest sequence issued equals `requests_seen` and a
+     sequence with no intent record is a request refused without a record
+     under the audit-budget-exhausted or audit-unavailable state.
+     - **Target representation**, shared by the intent's full form and the
+       redirect-intent: the method; the canonical path; and the query
+       reduced to its canonical parameter names in wire order plus each
+       decoded value's byte length and sha256 — literal values only for
+       the enumerated routing parameters `page`, `per_page`, `state`,
+       `sort`, `direction`, and only when printable ASCII under 256 bytes,
+       omitted otherwise while the length and digest stay. For `POST
+       /graphql`: the operation type; the operation name when at most 128
+       bytes, otherwise its byte length and sha256 in its place; and the
+       variables as name, JSON type, byte length, and sha256 of the
+       canonical encoding — literal values only for `owner`, `name`,
+       `repo`, `number`, `first`, `last`, `states`, under the same printable
+       cap. Every optional literal is therefore either present whole under
+       a fixed cap or absent, never cut.
+     - **`intent`** (mandatory: sequence, kind, timestamp, decision, the
+       reason code on refusal, target): `decision` is `authorized` or
+       `refused`, the reason a code from a closed enum, never client text;
+       the target is the representation above in the **full form**, plus
+       the budgets reserved when authorized. The full form is serialized
+       and measured before it authorizes anything; when it would exceed
+       the record cap the record is written in the **refusal form**
+       instead — decision `refused`, reason `audit-unrepresentable`, and
+       the target as the method with the byte length and sha256 of the
+       canonical path, the pair count, byte length, and sha256 of the
+       canonical query, and for GraphQL the operation type with the
+       variable count and the sha256 of the canonical variables encoding —
+       a fixed set of fixed-size fields that fits the cap by construction.
+       The refusal form identifies a target the credential never touched;
+       it is never the form of an `authorized` record.
+     - **`redirect-intent`** (mandatory: sequence, kind, timestamp, hop
+       number 1 to 3, decision `authorized`, target): the hop's target in
+       the full form only. There is no refusal form for a hop: a hop whose
+       record would not fit is refused, every refused hop is recorded in
+       the completion record's summary, and a redirect-intent record
+       exists exactly for the hops the credential reached.
+     - **`completion`** (mandatory: sequence, kind, timestamp, outcome,
+       upstream status or `null`, request bytes, response bytes,
+       `redirects`): the outcome from a closed enum (`delivered`,
+       `refused-gate`, `refused-redirect`, `timeout`, `upstream-error`,
+       `aborted`), the final upstream status, the actual byte counts, and
+       the `redirects` array of at most four entries — each the hop
+       number, the upstream status, the decision, the reason code, and the
+       `Location`'s scheme and host only, the host cut at 256 bytes (a hop
+       with a longer host was refused, so nothing that authorized anything
+       is lost). No target, query, or GraphQL field is copied here. The
+       schema is closed and every field bounded, so a completion record
+       fits the cap by construction and is never refused for size; the
+       implementation asserts the bound with a four-entry fixture.
+     - **`terminal`** (mandatory: kind, timestamp, reason, the exhaustion
+       flags, the counters): the reason acceptance ended (`agent-exit` or
+       `connection-budget-exhausted`); the `connection_budget_exhausted`,
+       `request_budget_exhausted`, and `audit_budget_exhausted` flags; and
+       item 6's counters `accepted`, `busy_refused`, `no_request`,
+       `requests_seen`, and `requests_charged`. Written at most once per
+       Run, only at shutdown, and only when the relay is not
+       audit-unavailable (below). Fixed fields, bounded by construction.
+     Never recorded, in any kind: credentials, the sentinel,
+     `Authorization` or any other header, request bodies, response bodies,
+     upstream error text, refusal message text, repository content, a
+     `Location` path or query, or any bytes copied from the client beyond
+     the fields above. A record is at most 4 KiB, enforced before the
+     write and never by cutting — a full-form intent that would exceed it
+     becomes a refusal, a redirect-intent that would exceed it refuses its
+     hop, and the completion and terminal kinds cannot exceed it — and the
+     file at most 16 MiB per Run under the reservation rules above, so a
+     refusal can never grow the log past its cap.
    - *Audit unavailable*: the state a failed audit write (error, disk full,
-     closed descriptor, short write) puts the relay in. The process stays up
-     and keeps answering the socket; it forwards nothing, attaches the
-     credential to nothing, and returns the fixed `audit-unavailable` refusal
-     without writing again — no completion record for a request in flight,
-     and no terminal record at shutdown either: the state permits no further
-     sink write of any kind (amended 2026-09-03, #117, fourth review). The
-     failure is therefore reported to the driver outside the sink — a
-     structured `theozolith.error` naming the record kind that failed, the
-     request sequence number, and the hop number where one applies (never a
-     path, query, or byte of the record), followed by a non-zero exit status
-     at shutdown — and the driver holds that report as the audit-failure
-     accounting the published summary relies on. The Run's evidence records
-     `gh_audit: failed`, and the Run continues on the task in its prompt.
+     closed descriptor, short write, a failed `fdatasync`) puts the relay
+     in. The process stays up and keeps answering the socket; it forwards
+     nothing, attaches the credential to nothing, and returns the fixed
+     `audit-unavailable` refusal without writing again — no completion
+     record for a request in flight, no redirect-intent, and no terminal
+     record at shutdown either: the state permits no further sink write of
+     any kind (amended 2026-09-03, #117, fourth review), and it takes
+     precedence over every other shutdown rule (fifth review): a
+     connection-budget exhaustion or an agent exit that follows still ends
+     acceptance, closes the listener, unlinks the socket, and runs the
+     shutdown sequence of item 10, but writes no terminal record and
+     touches no credential. The failure is reported to the driver outside
+     the sink — a structured `theozolith.error` naming the record kind
+     that failed, the request sequence number, and the hop number where
+     one applies (never a path, query, or byte of the record) — and the
+     driver holds that report as the audit-failure accounting the
+     published summary relies on. The relay's exit status is not the audit
+     signal: the relay exits with status zero whenever it completed the
+     shutdown sequence with whatever writes the state permitted, and the
+     exit report below carries the audit state, so the driver never reads
+     a healthy audit into a zero status or a crash into a non-zero one.
+     The Run's evidence records `gh_audit: failed`, and the Run continues
+     on the task in its prompt.
    - *Publication*: after the agent phase ends and the relay has exited, the
      driver fsyncs the sink, writes `gh-audit.summary.json` beside it —
      record count, byte count, sha256, request counts by outcome (`complete`:
-     intent with its completion; `refused`: refused before any upstream I/O;
-     `incomplete`: intent without a completion in a Run for which the driver
-     holds the relay's audit-failure report — the relay was alive and, by
-     the audit-unavailable rules, could write nothing more, so every intent
-     the report leaves uncompleted is `incomplete`, whether the credential
-     had been sent or not; `indeterminate`: intent without a completion and
-     no audit-failure report — the relay died between intent and completion,
+     intent with its completion; `refused`: refused before any upstream I/O,
+     the `audit-unrepresentable` refusal included; `incomplete`: intent
+     without a completion in a Run for which the driver holds the relay's
+     audit-failure report — the relay was alive and, by the
+     audit-unavailable rules, could write nothing more, so every intent the
+     report leaves uncompleted is `incomplete`, whether the credential had
+     been sent or not; `indeterminate`: intent without a completion and no
+     audit-failure report — the relay died between intent and completion,
      so whether the upstream connection was opened is unknown), aggregate
      request and response bytes, redirect-intent records written, redirects
-     followed and refused, the connection counters of item 6 (`accepted`,
-     `busy_refused`, `no_request`, `requests`, and the
-     `connection_budget_exhausted` flag), budgets hit, termination reason
-     (`clean`, `exhausted`, `killed`, `crashed`, `orphaned`), and the
-     audit-failure report itself (`null`, or the record kind, sequence
-     number, and hop the relay named) — and publishes both into the evidence
-     bundle from the sink. An `indeterminate` request is therefore always
-     distinguishable from one that never passed authorization: the latter
-     has a `refused` intent or no record at all. The summary detects
+     followed and refused, `records_parsed` by kind — the driver's own
+     count of what it parsed, labeled as such and never presented as the
+     relay's counters — the terminal record's counters and flags (item 6),
+     copied only from a `present` terminal record and reported unknown
+     (`null`) whenever the terminal record is `missing` or `malformed`,
+     never as zero and never reconstructed from the parsed records
+     (amended 2026-09-03, #117, fifth review), budgets hit, the
+     driver-observed termination reason (`clean`, `exhausted`, `killed`,
+     `crashed`, `orphaned`), and the audit-failure report itself (`null`,
+     or the record kind, sequence number, and hop the relay named) — and
+     publishes both into the evidence bundle from the sink. The
+     termination reason is read from the relay's **exit report** (fifth
+     review) — one structured line the relay sends the driver over the
+     same channel as the audit-failure report, last before it exits,
+     naming what ended acceptance (`agent-exit` or
+     `connection-budget-exhausted`) and the audit state (`ok`,
+     `budget-exhausted`, or `unavailable`) — together with the exit status
+     and the driver's own observation: `clean` is an exit report naming
+     `agent-exit` with status zero after the driver ended the agent phase;
+     `exhausted` is an exit report naming `connection-budget-exhausted`
+     with status zero, whether or not the agent phase had ended; `killed`
+     is the bounded wait elapsing; `crashed` is every other exit — a
+     non-zero status, no exit report, or a report the driver's observation
+     contradicts; `orphaned` is the boot sweep. The exit report carries no
+     counters — those live in the terminal record alone, so one count has
+     one source — and it never substitutes for the terminal record, which
+     is the sink's own evidence. An `indeterminate` request is therefore
+     always distinguishable from one that never passed authorization: the
+     latter has a `refused` intent or no record at all. The summary detects
      collection errors (a truncated copy, a missed publish); it is not a
      tamper seal, since nothing untrusted ever reaches the sink.
    - *Short writes and malformed records (amended 2026-09-03, #117)*: a
@@ -793,22 +944,30 @@ recorded as an accepted residual risk rather than claimed away.
      line for the summary, which reports `records_parsed`, the byte offset
      and length of any unparseable tail (a line without its newline, or a
      line that is not a complete JSON object of a known kind), and the
-     terminal record's state — `present`, `missing`, or `malformed` —
-     separately from the driver-observed termination reason, so a clean
-     exit with no terminal record and a crash with a torn one are both
-     diagnosable from the summary alone. A request whose completion record
-     is the unparseable tail counts as `incomplete`, never `complete`. A Run
-     that went audit-unavailable always publishes with the terminal record
-     `missing` and the audit-failure report present — that pair is the
-     expected signature of the state, distinct from a crash (terminal
-     `missing`, no report, termination `crashed`) and from a healthy Run
-     (terminal `present`, no report). The sink is
-     deleted only once the bundle is durably pushed: while a push fails it
-     stays and the existing evidence retry carries it; a sink orphaned by a
-     driver crash is published by the boot-time evidence sweep as
-     `terminated: orphaned` and then removed. A `gh` call counter joins
-     progress telemetry. Full input reproducibility is knowingly given up:
-     requests are the record, and responses remain recoverable from GitHub.
+     terminal record's state — `present`, `missing`, or `malformed` — from
+     the bytes alone, separately from the driver-observed termination
+     reason and separately from the audit-failure report (fifth review),
+     so every combination is diagnosable from the summary: a clean exit
+     with no terminal record, a crash with a torn one, and the three
+     shapes a failed terminal write leaves — no bytes (`missing`, with the
+     report naming kind `terminal`), a torn record (`malformed`, same
+     report), or a complete record whose `fdatasync` failed (`present`,
+     same report — the bytes were read back, their durability is unproven,
+     and the report says so). A request whose completion record is the
+     unparseable tail counts as `incomplete`, never `complete`. Healthy is
+     a conjunction, never one field: termination `clean` or `exhausted`,
+     terminal `present`, report `null`. A Run that went audit-unavailable
+     before shutdown publishes with the terminal record `missing` and the
+     audit-failure report present, whatever its termination reason —
+     `exhausted` beside a report is an exhausted, unhealthy Run, never a
+     healthy one — distinct from a crash (terminal `missing`, no report,
+     termination `crashed`). The sink is deleted only once the bundle is
+     durably pushed: while a push fails it stays and the existing evidence
+     retry carries it; a sink orphaned by a driver crash is published by
+     the boot-time evidence sweep as `terminated: orphaned`, its counters
+     unknown, and then removed. A `gh` call counter joins progress
+     telemetry. Full input reproducibility is knowingly given up: requests
+     are the record, and responses remain recoverable from GitHub.
 9. **Run Contract surface — `schema_version` 2, the accepted successor that
    the implementation PR activates (amended 2026-09-03, #117, fourth
    review).** The currently implemented Run Contract is `schema_version` 1,
@@ -858,19 +1017,30 @@ recorded as an accepted residual risk rather than claimed away.
     connection with the credential, apply the redirect rule per hop (item
     5) — appending and syncing a redirect-intent record before each followed
     hop's credential use (item 8) — read the whole response through the gate
-    (item 6), deliver or refuse, append the completion record (item 8) → on
-    agent exit: stop accepting — close the listener and unlink the socket —
-    abort in-flight upstream requests (a client mid-request sees a closed
-    connection; each aborted request gets a completion record with reason
-    `aborted`, and if that append fails the relay is audit-unavailable,
-    writes no terminal record, and the driver's audit-failure accounting of
-    item 8 covers every uncompleted intent), write the terminal record,
-    delete any spool, exit; on connection-budget exhaustion (item 6) the
-    same shutdown runs while the agent is still alive, except that the
-    connections already accepted finish under their own timeouts before the
-    terminal record is written; in either case the driver waits a bounded
-    interval, then kills the relay and records `killed` → publish the sink
-    (item 8) → run gates with no socket present →
+    (item 6), deliver or refuse, append the completion record (item 8) →
+    shutdown, one sequence whatever ends acceptance (amended 2026-09-03,
+    #117, fifth review): acceptance ends exactly once, on the first of
+    agent exit or connection-budget exhaustion — close the listener and
+    unlink the socket — then the connections already accepted are drained:
+    on agent exit in-flight upstream requests are aborted (a client
+    mid-request sees a closed connection; each aborted request gets a
+    completion record with outcome `aborted`), on connection-budget
+    exhaustion they finish under their own timeouts while the agent is
+    still alive, and an agent exit arriving during that drain aborts what
+    remains; every completion record the audit state permits is written
+    (a failed append makes the relay audit-unavailable, and the driver's
+    audit-failure accounting of item 8 covers every uncompleted intent);
+    then, with no accepted work outstanding, the terminal record is written
+    exactly once, into its reserved room, naming what ended acceptance and
+    carrying the `audit_budget_exhausted` flag when that state was reached
+    — or not at all when the relay is audit-unavailable, which no later
+    event overrides; any spool is deleted; the exit report is sent; the
+    relay exits with status zero. Audit-budget exhaustion is not a shutdown
+    trigger: it stops authorizations and per-request records, and the
+    relay keeps answering until acceptance ends as above. The driver waits
+    a bounded interval for the exit, then kills the relay and records
+    `killed` → publish the sink (item 8) → run gates with no socket present
+    →
     clean the job directory and any spool (the sink is in another tree and
     untouched) → retain or push evidence, deleting the sink only after a
     durable push.
@@ -885,9 +1055,11 @@ recorded as an accepted residual risk rather than claimed away.
       no socket, spool, audit record, or budget state travels with them. The
       previous Run's sink stays attached to that Run's evidence bundle.
     - *Crash points*: a relay exit before agent exit is detected as child
-      exit — a zero status with a terminal record naming
+      exit — a zero status with an exit report naming
       `connection-budget-exhausted` is the `exhausted` termination of item
-      6; any other early exit or hang is a crash: the driver unlinks the
+      6, read from the report and never inferred from the terminal record,
+      which an audit-unavailable relay cannot have written (fifth review);
+      any other early exit or hang is a crash: the driver unlinks the
       socket, deletes the spool, records `crashed`, and does not restart the
       relay (the agent's further calls fail at connect; the Run continues
       on its prompt); a crash after an intent record and before the
@@ -1004,15 +1176,21 @@ recorded as an accepted residual risk rather than claimed away.
       refusals above the open cap charged the same; the accept that spends
       the last unit served, the listener closed and the socket unlinked
       before the next accept, every later connect failing in the kernel,
-      no accept-and-refuse loop; the relay exiting clean with the terminal
-      record naming `connection-budget-exhausted` and the driver recording
-      `exhausted`, not `crashed`; the request budget exhausted first
-      answering at most (connection budget − request budget) further
-      connections with the stable refusal before acceptance ends; the
-      counters exact, bounded by the budget, and identical in the terminal
-      record and the summary; in-flight connections at exhaustion completed
-      or aborted with their completion records; and the socket, spool, and
-      sink cleanup unchanged on this exit path;
+      no accept-and-refuse loop; the connections held at exhaustion
+      finishing under their own timeouts with their completion records,
+      the single terminal record written after them naming
+      `connection-budget-exhausted`, the exit report naming the same, and
+      the driver recording `exhausted` from the report, not `crashed`;
+      more than 2,000 parsed request lines within 4,000 accepted
+      connections — every line past the request budget answered with the
+      stable refusal and recorded as a refused intent while the audit
+      budget lasts, `requests_seen` and `requests_charged` exact and
+      separate, `requests_charged` never above 2,000, and
+      `request_budget_exhausted` set — with at most (connection budget −
+      request budget) such refusals before acceptance ends; the counters
+      exact, bounded by the budget, present in the terminal record, and
+      copied rather than recomputed into the summary; and the socket,
+      spool, and sink cleanup unchanged on this exit path;
     - query grammar — byte-exact pinned-`gh` fixtures pinning the upstream
       request line the relay sends: `gh search issues` and `gh search prs`
       with `repo:OWNER/REPO` and `is:`, `state:`, `author:`, and `label:`
@@ -1030,21 +1208,20 @@ recorded as an accepted residual risk rather than claimed away.
       permitted path permitted with any well-formed query, and no query
       value ever changing a classification or denylist decision;
     - write-ahead audit — no credentialed request without a durable intent
-      record (an injected intent-write failure proves no upstream connection
-      is opened); no credentialed redirect hop without a durable
-      redirect-intent record (an injected redirect-intent-write failure on
-      hop one, two, and three each proves that hop is never sent, no
-      credential reaches it, and the relay freezes audit-unavailable with no
-      completion and no terminal record); intent, redirect-intent, and
-      completion records correlating exactly by sequence and hop number
-      under concurrent requests whose records interleave; a
+      record (an injected intent-write failure, and an injected `fdatasync`
+      failure, each prove no upstream connection is opened); no
+      credentialed redirect hop without a durable redirect-intent record
+      (an injected redirect-intent-write failure on hop one, two, and three
+      each proves that hop is never sent, no credential reaches it, and the
+      relay freezes audit-unavailable with no completion and no terminal
+      record); intent, redirect-intent, and completion records correlating
+      exactly by sequence and hop number under concurrent requests whose
+      records interleave, the sequence dense over parsed request lines; a
       completion-write failure leaving the intent and freezing the relay in
       audit-unavailable while the process keeps refusing; the reservation
       that guarantees room for three redirect-intents and the completion at
-      the file cap, unused redirect-intent capacity released only after the
-      completion record and never claimable by a concurrent request before
-      it, and exhaustion writing the terminal record into its reserved room
-      while a request already holding a reservation completes; crashes
+      the file cap, unused capacity released only after the request's last
+      record and never claimable by a concurrent request before it; crashes
       injected after intent, during upstream, before and after each of
       three redirect hops, and after completion each leaving an
       `indeterminate` request whose last authorized target is identifiable
@@ -1053,17 +1230,53 @@ recorded as an accepted residual risk rather than claimed away.
       uncompleted intent counted `incomplete`, never `indeterminate`; a
       short write and a torn final line each freezing the relay and
       publishing with the unparseable tail's offset reported and the
-      affected request counted `incomplete`; a missing and a malformed
-      terminal record each reported distinctly from the termination reason;
-      the redirect array — zero, one, and three entries in one completion
-      record beside the matching redirect-intent records, and a 4 KiB
-      completion record with three entries never truncated; no `Location`
-      path or query byte in any record; the preflight writing no per-Run
-      record; audit-path tampering — attempted unlink,
+      affected request counted `incomplete`; the redirect accounting —
+      zero, one, three, and four entries in one completion record beside
+      the matching redirect-intent records, three followed hops and then a
+      fourth redirect answer refused at the hop limit producing four
+      entries, exactly three redirect-intent records, and no fourth
+      redirected upstream request, and a four-entry completion record with
+      a 256-byte host in every entry under the cap by construction; no
+      `Location` path or query byte in any record; the preflight writing no
+      per-Run record; audit-path tampering — attempted unlink,
       replacement, truncation, symlink substitution, a forged pre-existing
       log at the sink path, concurrent writers, and a crash during final
       publication — each leaving the published record intact or the failure
       visible;
+    - audit representability — a 4,096-byte path at the admission limit,
+      the maximum query metadata (32 pairs at their length limits), and
+      oversized GraphQL metadata (a variable set whose names, types,
+      lengths, and digests exceed the cap) each admitted by the parser and
+      refused as `audit-unrepresentable` with the refusal-form intent
+      record present, no upstream connection, and no credential use; a
+      full-form record serialized to exactly the cap written whole and one
+      byte over refused; a followed redirect whose redirect-intent record
+      would exceed the cap refused at that hop with no redirect-intent
+      record, no credential on the hop, and the completion's entry
+      carrying `audit-unrepresentable`; every mandatory field present in
+      every record of every kind across the whole fixture corpus, with no
+      marker or shortened field anywhere in the sink; and the completion
+      and terminal kinds shown under the cap at their maximal shape;
+    - one terminal, one shutdown — audit-budget exhaustion with concurrent
+      requests holding reservations, each finishing with its hops and
+      completion written and every later request refused with the stable
+      message and no record, followed by connection exhaustion and the
+      ordinary drain, with exactly one terminal record written last,
+      naming `connection-budget-exhausted` with `audit_budget_exhausted`
+      set; an audit failure before connection exhaustion — the listener
+      still closing and the socket unlinked at exhaustion, no terminal
+      record written, the exit report naming `connection-budget-exhausted`
+      with the audit state `unavailable`, the driver recording `exhausted`
+      beside the report, the counters unknown, and the summary never
+      labeling the Run healthy; an agent exit arriving during an
+      exhaustion drain aborting what remains with one terminal record; a
+      terminal short write, a torn terminal, and a terminal `fdatasync`
+      failure each reported from the bytes as `missing`, `malformed`, or
+      `present` with the report naming kind `terminal`, distinct from the
+      termination reason; and crashes and orphan publication with absent
+      final counters — every counter `null` in the summary,
+      `records_parsed` labeled as the driver's own parse, and no zero or
+      reconstructed count anywhere;
     - redaction and budgets — oversized variables, many maximum-size
       requests, hostile query strings, invalid UTF-8 and control bytes,
       secret-shaped values, exhaustion of every budget with its exact
@@ -1104,11 +1317,12 @@ recorded as an accepted residual risk rather than claimed away.
       manifest; the bench refusing a manifest whose version and layout
       disagree;
     - bench — `live` and `none` parity through the exported entry point,
-      the same ingress, policy, gate, redirect, and audit fixtures passing
-      unchanged against the bench driver, `none` producing only `refused`
-      intents and the recorded `gh_upstream: none`, `live` against a
-      scratch repository exercising the host pin with the bench-owned
-      credential source never in argv;
+      the same ingress, policy, gate, redirect, audit, representability,
+      shutdown, counter, and redirect-accounting fixtures passing unchanged
+      against the bench driver in both modes, `none` producing only
+      `refused` intents and the recorded `gh_upstream: none`, `live`
+      against a scratch repository exercising the host pin with the
+      bench-owned credential source never in argv;
     - and, throughout, no credential in argv, the agent's environment, logs,
       errors, evidence, audit metadata, request echoes, redirect targets, or
       refused requests; every refusal and diagnostic message byte-exact and
@@ -1151,8 +1365,13 @@ recorded as an accepted residual risk rather than claimed away.
   names the last authorized target after any crash; a connection flood ends
   in a closed listener, never a busy loop; the query grammar accepts every
   search the pinned `gh` emits and refuses what it cannot decode
-  unambiguously; and no document states the successor schema version as
-  current before the code does.
+  unambiguously; every audit record kind has a schema that is checked
+  before it authorizes anything, so a record that exists says exactly what
+  was authorized and a request the sink cannot describe is refused rather
+  than half-recorded; acceptance ends once and the terminal record is
+  written once, however it ends, and a missing terminal leaves the
+  counters unknown rather than wrong; and no document states the successor
+  schema version as current before the code does.
 - **Negative**: a Run's inputs are no longer fully reproducible from its
   evidence bundle; a second GitHub credential per worker type is operator
   work, and its permission matrix is longer than the first draft promised; an
@@ -1181,9 +1400,15 @@ recorded as an accepted residual risk rather than claimed away.
   connection setup per `gh` call; after the connection budget the agent's
   `gh` sees a connect failure instead of the stable refusal message;
   canonical query re-encoding rewrites the client's spelling, so a fixture
-  pins the relay's form rather than the client's bytes; and the accepted
-  successor `schema_version` stays reserved until one implementation PR
-  lands its activation whole, which sizes that PR.
+  pins the relay's form rather than the client's bytes; a target the
+  parser admits can still be refused because its record would not fit — a
+  case only hostile input reaches, since the pinned `gh` stays far under
+  both limits; the relay carries a second channel to the driver, the
+  audit-failure and exit reports, beside the sink; after any audit failure
+  the Run's counters are unknown, because the only record that carries
+  them is one the state forbids; and the accepted successor
+  `schema_version` stays reserved until one implementation PR lands its
+  activation whole, which sizes that PR.
 - **Neutral**: amends ADR-0013 (channel clause), ADR-0017 (the Context
   Tree amendments' visibility filter is retired and the authorized-source
   rule for driver-parsed machine blocks restated as the surviving boundary),
@@ -1249,6 +1474,44 @@ recorded as an accepted residual risk rather than claimed away.
   shape is met by correlating each redirect-intent record by sequence and
   hop number, which interleaves safely under concurrency, and by reserving
   three hops' capacity per request.
+- **Truncating an oversize record to a fixed marker** (the fourth review's
+  shape): rejected (2026-09-03, #117, fifth review) — a marker written in
+  place of an intent or redirect-intent records that a credentialed
+  request or hop happened without saying where, so the write-ahead
+  invariant would be satisfied by a record that names no target;
+  serializing and measuring before the write, refusing what does not fit,
+  and giving every kind a schema whose mandatory fields cannot be dropped
+  makes every record that exists say what it authorized.
+- **Raising the record cap so every admitted target fits**: rejected — the
+  path and query limits bound the ingress and the record cap bounds the
+  sink, and they answer different questions; a cap sized to the largest
+  admissible target would let a hostile client spend the audit budget in
+  a fraction of the requests, while the pinned `gh` never approaches
+  either limit, so the honest shape is a separate `audit-unrepresentable`
+  refusal that only hostile input reaches.
+- **A refusal-form redirect-intent record for an unrepresentable hop**:
+  rejected — a hop refused by policy already writes no redirect-intent
+  record and lives in the completion summary; giving the representability
+  refusal a record of its own would make two kinds of refused hop with
+  two shapes, and a redirect-intent record that exists would no longer
+  mean the credential reached that hop.
+- **Writing the terminal record at audit-budget exhaustion**: rejected —
+  reserved requests finish after that moment and their completions would
+  follow the terminal, exhaustion is not the end of acceptance, and a
+  later agent exit or connection exhaustion would then face a second
+  terminal write or none; one terminal, written last, carries the
+  exhaustion as a flag.
+- **Deriving the termination reason or the counters from the terminal
+  record**: rejected — the terminal record is sink evidence an
+  audit-unavailable relay cannot write, so an exhausted relay in that
+  state would be reported as crashed or its counters invented; the exit
+  report carries how acceptance ended, the terminal record alone carries
+  the counters, and the summary reports unknown where the record is
+  absent rather than zero or a reconstruction.
+- **A three-entry redirect summary**: rejected — three followed hops can
+  be answered by a fourth redirect the hop limit refuses, and that refusal
+  is a decision the summary must show; four entries, three
+  redirect-intent records.
 - **Stating `schema_version` 2 as current before the implementation lands,
   with a red drift-lock as the interim**: rejected (2026-09-03, #117, fourth
   review) — the drift-lock exists to make disagreement between the code
@@ -1421,6 +1684,24 @@ recorded as an accepted residual risk rather than claimed away.
   characters as data, canonical re-encoding, no part in policy — and the
   pinned-`gh` fixture corpus covers the search and query shapes (decisions
   4, 6). Test obligations extended accordingly (decision 11).
+- **2026-09-03 (#117, fifth review)**: every audit record kind has an
+  explicit schema with mandatory fields; an intent or redirect-intent is
+  serialized and measured before it authorizes anything, a full form that
+  would exceed the cap becomes the bounded refusal form (intent) or
+  refuses the hop (redirect-intent) as `audit-unrepresentable`, and no
+  truncation marker exists; the completion record copies no routing
+  metadata and admits four redirect entries — three followed hops plus
+  the hop-limit refusal (decisions 5, 6, 8). One shutdown sequence:
+  acceptance ends once, accepted work drains, and the terminal record is
+  written at most once, last, in its reserved room — never at
+  audit-budget exhaustion, which only stops authorizations and
+  per-request records, and never under audit-unavailable, which takes
+  precedence even over connection exhaustion; the relay's exit report
+  carries how acceptance ended and the audit state, the terminal record
+  alone carries the counters, `requests_seen` is distinguished from
+  `requests_charged`, and the summary reports counters unknown when the
+  terminal record is absent (decisions 6, 8, 10). Test obligations
+  extended accordingly (decision 11).
 
 ## Relevant PRs
 
@@ -1435,4 +1716,6 @@ recorded as an accepted residual risk rather than claimed away.
   contracts, and its fourth review reserved `schema_version` 2 as the
   accepted successor with atomic activation, made every redirect hop
   write-ahead, bounded connection attempts, and gave the query its own
-  grammar.
+  grammar, and its fifth review gave every audit record an explicit
+  size-checked schema, one terminal and shutdown model, separate request
+  counters, and four-entry redirect accounting.
