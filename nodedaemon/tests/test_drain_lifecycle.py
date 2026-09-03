@@ -51,7 +51,6 @@ class LifecycleRig:
             data_dir=tmp_path / "data",
             config_repo=tmp_path / "configs",
             admin_token="admin-token",
-            repo=None,
             github_token=None,
             api_url="",
             offpin_beats=offpin_beats,

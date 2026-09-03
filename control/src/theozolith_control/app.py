@@ -910,6 +910,16 @@ def create_app(
             # Per-repo dispatch pauses (ADR-0056): a self-clearing row recorded
             # when a repo's GitHub reads fail — surfaced, never a 500.
             "dispatch_pauses": store.dispatch_pauses(),
+            # Unfinished coordination in UNBOUND repos (ADR-0056): pending
+            # grants, live claims, zombie flags, waits, malformed states,
+            # chained dependents, and pauses whose repo the Pinned Build no
+            # longer binds — surfaced so an operator sees what an unbound repo
+            # left behind. Read-only, GitHub-free, and self-clearing on rebind.
+            # An unreadable build degrades to [] (the bound set is unknowable,
+            # so nothing can be called unbound) — the janitor's own posture.
+            "unbound_obligations": (
+                store.unbound_obligations(set(config.bound_repos())) if config else []
+            ),
             # The read-only settings view (ADR-0040): the address fields and
             # the EFFECTIVE tier-2 values this serve is running with
             # (control.toml overlaid with env overrides — what is live, not

@@ -222,6 +222,68 @@ def test_repo_less_legacy_events_are_skipped_never_rows():
     assert rows[0].repo == "acme/sandbox"
 
 
+def test_two_bound_workspaces_sharing_an_issue_number_are_distinct_rows():
+    """Two Bound Workspaces can share an issue number (ADR-0056): the index is
+    keyed by (repo, issue), so each becomes its own row with links built from
+    its OWN repo — neither shadows the other."""
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(20, 7, "pr-open", run_id="rA", pr=11, repo="acme/app"),
+                    run_event(10, 7, "claimed", run_id="rB", repo="acme/infra"),
+                ]
+            )
+        }
+    )
+    rows = {r.repo: r for r in model.run_rows(index)}
+    assert set(rows) == {"acme/app", "acme/infra"}
+    assert rows["acme/app"].issue == 7 and rows["acme/infra"].issue == 7
+    assert rows["acme/app"].pr_url == "https://github.com/acme/app/pull/11"
+    assert rows["acme/infra"].issue_url == "https://github.com/acme/infra/issues/7"
+
+
+def test_pause_notice_lists_each_repo_and_is_empty_when_none():
+    assert model.pause_notice(state_doc(dispatch_pauses=[])) == ""
+    text = model.pause_notice(
+        state_doc(
+            dispatch_pauses=[
+                {"repo": "acme/app", "reason": "GitHub 503", "first_seen": NOW, "last_seen": NOW},
+                {"repo": "acme/infra", "reason": "", "first_seen": NOW, "last_seen": NOW},
+            ]
+        )
+    )
+    assert "dispatch paused: acme/app — GitHub 503" in text
+    assert "dispatch paused: acme/infra — unspecified" in text  # blank reason is labeled
+
+
+def test_unbound_notice_lists_each_obligation_and_is_empty_when_none():
+    assert model.unbound_notice(state_doc(unbound_obligations=[])) == ""
+    text = model.unbound_notice(
+        state_doc(
+            unbound_obligations=[
+                {
+                    "kind": "grant",
+                    "repo": "acme/gone",
+                    "ref": "acme/gone#7",
+                    "reason": "pending grant to worker-a awaiting activation",
+                    "since": NOW - 600,
+                },
+                {
+                    "kind": "chained",
+                    "repo": "acme/gone",
+                    "ref": "acme/gone PR #12",
+                    "reason": "chained dependent of #3 (closed unmerged)",
+                    "since": NOW - 60,
+                },
+            ]
+        )
+    )
+    assert "operator-owned, no GitHub cleanup" in text
+    assert "unbound grant acme/gone#7 — pending grant to worker-a awaiting activation" in text
+    assert "unbound chained acme/gone PR #12 — chained dependent of #3 (closed unmerged)" in text
+
+
 def test_run_index_bootstrap_is_complete_across_page_boundaries():
     """The 500-row bound is on EVENTS, not issues: an older active issue
     whose latest event fell off the first page must stay visible. Two pages,

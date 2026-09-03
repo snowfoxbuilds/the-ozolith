@@ -276,6 +276,31 @@ def test_dispatch_pause_degrades_with_its_repo_and_reason(tmp_path):
     assert "REPO" in joined and "GitHub 502" in joined  # the paused table renders
 
 
+def test_unbound_obligations_render_without_degrading_the_verdict(tmp_path):
+    """Unbinding a repo leaves visible operator-owned obligations (ADR-0056):
+    they render in a table but are NOT a health verdict — surfaced, never a
+    health downgrade (the janitor writes no GitHub over them either)."""
+    state = state_doc(
+        repos=["acme/app"],
+        unbound_obligations=[
+            {
+                "kind": "grant",
+                "repo": "acme/gone",
+                "ref": "acme/gone#7",
+                "reason": "pending grant to worker-a awaiting activation",
+                "since": NOW - 600,
+            }
+        ],
+    )
+    assert statuscli.evaluate(state, no_errors()) == []  # surfaced, not degraded
+    code, lines = _run(tmp_path, state)
+    assert code == 0  # healthy verdict despite the obligation
+    joined = "\n".join(lines)
+    assert "unbound coordination obligations" in joined
+    assert "acme/gone#7" in joined
+    assert "pending grant to worker-a awaiting activation" in joined
+
+
 # -- exit 2: the read failed (acceptance 8) --------------------------------------
 
 

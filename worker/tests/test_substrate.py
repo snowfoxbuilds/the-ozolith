@@ -45,7 +45,6 @@ class LiveControl:
             data_dir=data_dir,
             config_repo=data_dir / "configs",
             admin_token="admin-token",
-            repo=harness.fake.repo,
             github_token="tok-control",
             api_url="",
         )

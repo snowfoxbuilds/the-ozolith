@@ -628,13 +628,48 @@ def test_sweep_pass_rereads_the_bound_set_each_pass(control):
     assert ESCALATE in two.writes
 
 
-def test_sweep_pass_logs_unbound_claims_and_links_without_writing(control, capsys):
-    """A live claim or chained-dependent link whose repo the Pinned Build no
-    longer binds is logged every pass — no GitHub write, no flag row
+def _seed_every_unbound_class(control, repo: str) -> None:
+    """One row of every implemented coordination class in ``repo`` — the
+    complete unbound-obligation surface (ADR-0056). Events go through the
+    store directly so no dispatch/authorization path is exercised."""
+    store = control.store
+    store.record_grant(repo, 5, "worker-a", "box1", "ozolith-worker-a")
+    store.record_event(run_event(9, "claimed", repo=repo))
+    store.flag_zombie(repo, 10, "r9", "worker-a", "box1")
+    store.record_wait(repo, 11, "blocked by #3")
+    store.record_malformed(repo, 13, "failed + plan_ready")
+    store.record_chained_dependent(repo, 12, 3, 7, "closed unmerged", "a" * 40)
+    store.record_dispatch_pause(repo, "GitHub 500")
+
+
+def test_unbound_obligations_covers_every_class_and_omits_bound(control):
+    """The unbound scan spans every implemented coordination class — pending
+    grants, live claims, zombie flags, waits, malformed states, chained
+    dependents, and pauses — lists only unbound repos, and stays sorted
     (ADR-0056)."""
+    _seed_every_unbound_class(control, "acme/unbound")
+    _seed_every_unbound_class(control, "acme/bound")  # a bound repo is never listed
+
+    rows = control.store.unbound_obligations({"acme/bound"})
+    assert {r["kind"] for r in rows} == {
+        "grant",
+        "claim",
+        "zombie",
+        "wait",
+        "malformed",
+        "chained",
+        "pause",
+    }
+    assert all(r["repo"] == "acme/unbound" for r in rows)
+    assert rows == sorted(rows, key=lambda r: (r["repo"], r["kind"], r["ref"]))
+
+
+def test_sweep_pass_logs_every_unbound_class_without_writing(control, capsys):
+    """Every unfinished coordination class whose repo the Pinned Build no
+    longer binds is logged each pass, and none of it touches GitHub — the log
+    reads the same store scan the operator surfaces do (ADR-0056)."""
     bound = FakeGitHubLite("acme/bound")
-    control.node_post("/api/v1/events", run_event(9, "claimed", repo="acme/unbound"))
-    control.store.record_chained_dependent("acme/unbound", 12, 3, 7, "closed unmerged", "a" * 40)
+    _seed_every_unbound_class(control, "acme/unbound")
 
     cli._sweep_pass(
         control.settings,
@@ -644,9 +679,92 @@ def test_sweep_pass_logs_unbound_claims_and_links_without_writing(control, capsy
         client_for=lambda repo: bound,
     )
     out = capsys.readouterr().out
-    assert "live claim acme/unbound#9 is in an unbound repo" in out
-    assert "chained dependent acme/unbound#12 is in an unbound repo" in out
+    assert "unbound grant acme/unbound#5" in out
+    assert "unbound claim acme/unbound#9" in out
+    assert "unbound zombie acme/unbound#10" in out
+    assert "unbound wait acme/unbound#11" in out
+    assert "unbound malformed acme/unbound#13" in out
+    assert "unbound chained acme/unbound PR #12" in out
+    assert "unbound pause acme/unbound" in out
     assert bound.writes == []  # no GitHub write for withdrawn coverage
+
+
+def test_an_unbound_pending_grant_is_surfaced_in_every_operator_view(control, capsys):
+    """The pending-grant lifecycle (ADR-0056): a grant written before its repo
+    was unbound is not a live claim and the per-repo sweep no longer covers it,
+    so it must still show up in the log, the state document, ``theozolith
+    status``, and the TUI — and the sweep never constructs a client for the
+    unbound repo, so no GitHub read or write occurs."""
+    from theozolith_control import statuscli
+    from theozolith_control.tui import model
+
+    control.store.record_grant("acme/unbound", 7, "worker-a", "box1", "ozolith-worker-a")
+    control.scaffold_stack(workspace="acme/bound")  # the only Bound Workspace now
+
+    # state: /api/v1/state lists it under unbound_obligations, not repos.
+    state = control.admin("GET", "/api/v1/state").json()
+    assert state["repos"] == ["acme/bound"]
+    grants = [o for o in state["unbound_obligations"] if o["kind"] == "grant"]
+    assert grants and grants[0]["ref"] == "acme/unbound#7"
+
+    # status + TUI render it from that same document.
+    lines: list[str] = []
+    statuscli.render(state, [], lines.append)
+    assert any("acme/unbound#7" in line for line in lines)
+    assert "unbound grant acme/unbound#7" in model.unbound_notice(state)
+
+    # the sweep binds only acme/bound: acme/unbound never gets a client, so no
+    # GitHub read or write happens for it — and it is logged.
+    touched: list[str] = []
+
+    def client_for(repo: str):
+        touched.append(repo)
+        return FakeGitHubLite(repo)
+
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/bound"),
+        client_for=client_for,
+    )
+    out = capsys.readouterr().out
+    assert "unbound grant acme/unbound#7" in out
+    assert "acme/unbound" not in touched  # no client → no GitHub read or write
+
+
+def test_rebinding_a_repo_drops_its_unbound_notices_and_resumes_reconciliation(control):
+    """Rebinding an unbound repo removes its rows from the unbound view with no
+    migration, and the next sweep reconciles it through its own client again
+    (ADR-0056)."""
+    gh = FakeGitHubLite("acme/app")
+    _ready_zombie(control, "acme/app", gh)  # a swept zombie, ready to escalate
+
+    # While acme/app is UNBOUND its claim is an obligation, and a sweep binding
+    # only acme/other never constructs a client for it — no GitHub, no escalate.
+    assert any(o["repo"] == "acme/app" for o in control.store.unbound_obligations({"acme/other"}))
+    touched: list[str] = []
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/other"),
+        client_for=lambda repo: (touched.append(repo), FakeGitHubLite(repo))[1],
+    )
+    assert "acme/app" not in touched
+    assert ESCALATE not in gh.writes
+
+    # Rebind acme/app: it drops out of the unbound view (no migration)...
+    assert not any(o["repo"] == "acme/app" for o in control.store.unbound_obligations({"acme/app"}))
+    # ...and the next sweep reconciles it through its own client, escalating.
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/app"),
+        client_for=lambda repo: gh,
+    )
+    assert ESCALATE in gh.writes  # reconciliation resumed, unchanged
 
 
 def test_sweep_pass_unreadable_config_sweeps_nothing_but_still_evicts(control, capsys):

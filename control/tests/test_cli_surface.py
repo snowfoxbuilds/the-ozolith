@@ -438,3 +438,49 @@ def test_janitor_once_with_an_unreadable_config_fails_loud(tmp_path, monkeypatch
     (images / "x.toml").write_text("")
     with pytest.raises(SystemExit, match="config unreadable"):
         _janitor_once(None)
+
+
+def test_janitor_once_loads_the_pinned_build_once_and_sweeps_that_snapshot(tmp_path, monkeypatch):
+    """The one-shot janitor is single-snapshot (ADR-0056): it loads the Pinned
+    Build EXACTLY once and feeds that validated snapshot straight into the
+    sweep through its load seam — never a second disk read that could take
+    serve's fail-open path if the build changed or broke between reads."""
+    from theozolith_control import cli, configrepo
+    from theozolith_control.cli import _janitor_once
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CONTROL_GITHUB_TOKEN", "gh")
+    monkeypatch.delenv("THEOZOLITH_REPO", raising=False)
+
+    snapshot = configrepo.DeployConfig(
+        commit="c",
+        stacks=(
+            configrepo.StackDef(
+                name="g",
+                kind="process",
+                node="box1",
+                worker_type="claude-dev",
+                env={"THEOZOLITH_REPO": "acme/app"},
+            ),
+        ),
+        worker_types={},
+    )
+    loads = 0
+
+    def counting_load(_config_repo):
+        nonlocal loads
+        loads += 1
+        return snapshot
+
+    monkeypatch.setattr(configrepo, "load_config", counting_load)
+
+    swept: dict = {}
+
+    def fake_sweep_pass(settings, store, *, load, **_kw):
+        swept["config"] = load()  # the seam hands back the SAME object, no reload
+
+    monkeypatch.setattr(cli, "_sweep_pass", fake_sweep_pass)
+
+    assert _janitor_once(None) == 0
+    assert loads == 1  # the Pinned Build was read exactly once
+    assert swept["config"] is snapshot  # and that exact validated snapshot was swept

@@ -168,23 +168,20 @@ def coordination_notice(
 
 def _log_unbound_obligations(store: Store, bound: set[str]) -> None:
     """Honest visibility for coordination state in UNBOUND repos (ADR-0056):
-    a live claim or a chained-dependent link whose repo the Pinned Build no
-    longer binds is logged every pass — log lines ONLY, never a GitHub write
-    and never a flag row (rebinding the repo resumes reconciliation unchanged;
-    leftover GitHub state is explicitly the operator's). Authorization-lease
-    rows join this scan with the lease follow-up issues, not here."""
-    for claim in store.live_claims():
-        if claim.repo and claim.repo not in bound:
-            _log(
-                f"janitor: live claim {claim.repo}#{claim.issue} is in an unbound repo"
-                " — coordination coverage withdrawn, no GitHub write (ADR-0056)"
-            )
-    for row in store.chained_dependents():
-        if row["repo"] and row["repo"] not in bound:
-            _log(
-                f"janitor: chained dependent {row['repo']}#{row['dependent_pr']} is in an"
-                " unbound repo — base-drift coverage withdrawn"
-            )
+    every unfinished coordination row whose repo the Pinned Build no longer
+    binds — pending grants, live claims, zombie flags, dispatch waits,
+    malformed states, chained dependents, and dispatch pauses — is logged
+    every pass. Log lines ONLY, never a GitHub write and never a flag row
+    (rebinding the repo resumes reconciliation unchanged; leftover GitHub
+    state is explicitly the operator's). The scan is the store's read model,
+    so the log, the state document, and the operator surfaces list the exact
+    same obligations. Authorization-lease rows join it with the lease
+    follow-up issues, not here."""
+    for row in store.unbound_obligations(bound):
+        _log(
+            f"janitor: unbound {row['kind']} {row['ref']} — {row['reason']}"
+            " (coverage withdrawn, no GitHub write; ADR-0056)"
+        )
 
 
 def _sweep_pass(
@@ -1266,16 +1263,19 @@ def _janitor_once(args) -> int:
         )
     # A human command owes a loud answer (the deliberate contrast with serve's
     # fail-open sweep skip): an unreadable Pinned Build exits nonzero, never a
-    # silent no-op pass.
+    # silent no-op pass. The Pinned Build is loaded EXACTLY ONCE here and that
+    # snapshot is fed straight into the sweep through its load seam — never a
+    # second disk read, which could take serve's fail-open path if the build
+    # changed or broke between the two reads (single-snapshot one-shot).
     try:
-        bound = configrepo.load_config(settings.config_repo).bound_repos()
+        config = configrepo.load_config(settings.config_repo)
     except configrepo.ConfigRepoError as exc:
         raise SystemExit(f"error: config unreadable: {exc}") from exc
     store = Store(settings.cache_db_path)
-    if not bound:
+    if not config.bound_repos():
         _log("janitor: no Bound Workspaces — nothing to sweep")
         return 0
-    _sweep_pass(settings, store)
+    _sweep_pass(settings, store, load=lambda: config)
     _log("janitor: pass complete")
     return 0
 

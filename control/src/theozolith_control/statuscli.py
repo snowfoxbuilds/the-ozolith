@@ -268,6 +268,23 @@ def render(state: dict[str, Any], reasons: list[str], out) -> None:
             )
         out("dispatch paused:")
         _table(rows, out)
+    # Unfinished coordination in unbound repos (ADR-0056): what a repo the
+    # Pinned Build no longer binds left behind — operator-owned, never a
+    # GitHub cleanup the Control Node performs. Surfaced, not a health verdict.
+    unbound = state.get("unbound_obligations") or []
+    if unbound:
+        rows = [["KIND", "REFERENCE", "DETAIL", "SINCE"]]
+        for row in unbound:  # the store already sorts by (repo, kind, ref)
+            rows.append(
+                [
+                    str(row.get("kind") or ""),
+                    str(row.get("ref") or ""),
+                    str(row.get("reason") or ""),
+                    _age(now, float(row.get("since") or 0.0)),
+                ]
+            )
+        out("unbound coordination obligations (repo no longer bound — operator-owned):")
+        _table(rows, out)
     nodes = state.get("nodes") or []
     if nodes:
         rows = [["NODE", "HEALTH", "VERSION", "LAST SEEN"]]

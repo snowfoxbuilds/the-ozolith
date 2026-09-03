@@ -304,6 +304,17 @@ def flags_view(store: Store, *, now: float | None = None) -> dict[str, Any]:
         "chained": [
             {**row, "last_seen": ago(now - row["last_seen"])} for row in store.chained_dependents()
         ],
+        # Per-repo dispatch pauses (ADR-0056): a Bound Workspace whose GitHub
+        # reads failed degrades to a self-clearing pause row, surfaced here
+        # with both ages so a pause alone raises the Needs-attention section.
+        "pauses": [
+            {
+                **row,
+                "first_seen": ago(now - row["first_seen"]),
+                "last_seen": ago(now - row["last_seen"]),
+            }
+            for row in store.dispatch_pauses()
+        ],
         "quarantines": [
             {**row, "since": ago(now - row["since"]) if row["since"] else ""}
             for row in store.quarantines()

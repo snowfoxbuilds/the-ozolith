@@ -86,6 +86,44 @@ async def test_panels_render_from_the_api_documents():
 
 
 @pytest.mark.asyncio
+async def test_pause_and_unbound_notices_display_from_the_state_document():
+    """The Stacks & Runs pane surfaces per-repo dispatch pauses and unbound
+    coordination obligations from the state document (ADR-0056)."""
+    fake = FakeClient()
+    fake.state_doc["dispatch_pauses"] = [
+        {"repo": "acme/app", "reason": "GitHub 503", "first_seen": NOW - 300, "last_seen": NOW - 30}
+    ]
+    fake.state_doc["unbound_obligations"] = [
+        {
+            "kind": "grant",
+            "repo": "acme/gone",
+            "ref": "acme/gone#7",
+            "reason": "pending grant to worker-a awaiting activation",
+            "since": NOW - 600,
+        }
+    ]
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        pauses = app.query_one("#pauses-notice", Static)
+        unbound = app.query_one("#unbound-notice", Static)
+        assert pauses.display is True
+        assert "dispatch paused: acme/app" in str(pauses.content)
+        assert unbound.display is True
+        assert "unbound grant acme/gone#7" in str(unbound.content)
+
+
+@pytest.mark.asyncio
+async def test_pause_and_unbound_notices_hidden_when_the_document_is_clean():
+    """No pause, no unbound obligation: both notices stay hidden (ADR-0056)."""
+    app = make_app(FakeClient())  # tuirig's state doc defaults both to []
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        assert app.query_one("#pauses-notice", Static).display is False
+        assert app.query_one("#unbound-notice", Static).display is False
+
+
+@pytest.mark.asyncio
 async def test_run_detail_labels_the_advisory_tail_with_its_byte_count():
     fake = FakeClient()
     fake.events_pages["theozolith.run"] = page([run_event(30, 7, "gate", run_id="r2", attempt=2)])

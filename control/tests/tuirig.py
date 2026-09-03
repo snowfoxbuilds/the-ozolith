@@ -58,6 +58,7 @@ def state_doc(**over: Any) -> dict[str, Any]:
         "unregistered_nodes": [],
         "repos": ["acme/sandbox"],
         "dispatch_pauses": [],
+        "unbound_obligations": [],
         "control_toml": {
             "control_ip": "203.0.113.5",
             "control_port": 443,

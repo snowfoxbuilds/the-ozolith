@@ -487,6 +487,24 @@ def pause_notice(state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def unbound_notice(state: dict[str, Any]) -> str:
+    """The unbound-obligation lines for the Runs panel (ADR-0056): one
+    ``unbound <kind> <ref> — <reason>`` per coordination row whose repo the
+    Pinned Build no longer binds (server-derived — the store scans every
+    class), empty when none. What an unbound repo left behind is the
+    operator's to clean up; the Control Node writes no GitHub over it, so the
+    TUI only surfaces it. Pure over ``state['unbound_obligations']``."""
+    lines = [
+        f"unbound {row.get('kind')} {row.get('ref')} — {row.get('reason') or 'unspecified'}"
+        for row in state.get("unbound_obligations") or []
+    ]
+    if not lines:
+        return ""
+    return "unbound coordination obligations (operator-owned, no GitHub cleanup):\n" + "\n".join(
+        lines
+    )
+
+
 def timeout_budget_seconds(state: dict[str, Any], stack: str) -> float:
     """The Run timeout budget for a Stack: its THEOZOLITH_AGENT_TIMEOUT_SECONDS
     env declaration when one is set (Stack names are file stems — unique

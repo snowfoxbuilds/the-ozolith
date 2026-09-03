@@ -35,9 +35,15 @@
 </table>
 {% else %}<p class="muted">No Runs on record.</p>{% endif %}
 
-{% if flags.zombies or flags.malformed or flags.waits or flags.chained or flags.quarantines %}
+{% if flags.zombies or flags.malformed or flags.waits or flags.chained or flags.pauses or flags.quarantines %}
 <h3>Needs attention</h3>
 <ul class="flags">
+  {% for p in flags.pauses %}
+  <li><span class="badge b-serious">● dispatch paused</span>
+      {{ p.repo }}: {{ p.reason }} <span class="muted">(per-repo pause, ADR-0056;
+      first seen {{ p.first_seen }}, latest {{ p.last_seen }}; self-clearing on the
+      repo's next successful pass)</span></li>
+  {% endfor %}
   {% for z in flags.zombies %}
   <li><span class="badge b-warning">● zombie</span>
       {{ z.repo }}#{{ z.issue }} · run <code>{{ z.run_id }}</code> · {{ z.worker }}@{{ z.node }}

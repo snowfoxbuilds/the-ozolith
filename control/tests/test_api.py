@@ -1177,6 +1177,8 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     assert state["repos"] == ["acme/sandbox"]
     assert "repo" not in state
     assert state["dispatch_pauses"] == []
+    # Fully bound, no leftover coordination: the unbound scan is empty.
+    assert state["unbound_obligations"] == []
     toml_view = state["control_toml"]
     assert toml_view["control_ip"] == "203.0.113.5"
     assert toml_view["control_port"] == 443
@@ -1187,6 +1189,27 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     # state carries no attach argv — it is consumed control-side only.
     config = control.heartbeat(node="box1").json()["config"]
     assert all("attach" not in stack for stack in config["stacks"])
+
+
+def test_state_degrades_to_empty_on_an_unreadable_pinned_build(control: ControlRig):
+    """A broken Pinned Build must not blind the read model (ADR-0056): the
+    state document still answers 200, ``repos`` degrades to [], and
+    ``unbound_obligations`` degrades to [] — the bound set is unknowable, so
+    nothing can be called unbound (never 'everything is unbound'), even with
+    coordination rows already in the cache."""
+    # A cache row that WOULD be an unbound obligation were the build readable.
+    control.store.record_grant("acme/orphan", 4, "worker-a", "box1", "ozolith-worker-a")
+    # images/ with a member is a hard config load error (ADR-0044).
+    images = control.settings.config_repo / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    (images / "x.toml").write_text("", encoding="utf-8")
+
+    resp = control.admin("GET", "/api/v1/state")
+    assert resp.status_code == 200  # still answers, never a 500
+    state = resp.json()
+    assert state["repos"] == []
+    assert state["unbound_obligations"] == []
+    assert "repo" not in state
 
 
 # -- config distribution (ADR-0042) ---------------------------------------------

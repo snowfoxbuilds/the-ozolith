@@ -310,6 +310,7 @@ class TopApp(App):
             with TabPane("Stacks & Runs", id="runs"):
                 yield DataTable(id="stacks")
                 yield Static("", id="pauses-notice", classes="notice")
+                yield Static("", id="unbound-notice", classes="notice")
                 yield Static("", id="runs-notice", classes="notice")
                 yield DataTable(id="runs-table")
                 with VerticalScroll():
@@ -518,6 +519,11 @@ class TopApp(App):
         pause_text = model.pause_notice(state)
         pauses_notice.update(_untrusted(pause_text))
         pauses_notice.display = bool(pause_text)
+
+        unbound_notice = self.query_one("#unbound-notice", Static)
+        unbound_text = model.unbound_notice(state)
+        unbound_notice.update(_untrusted(unbound_text))
+        unbound_notice.display = bool(unbound_text)
 
         runs = self.query_one("#runs-table", DataTable)
         runs.clear()

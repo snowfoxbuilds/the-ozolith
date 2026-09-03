@@ -32,9 +32,16 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   claim is released and escalated `failed` + `needs_human` with the evidence link. Also
   releases never-activated dispatch grants (no claimed event within the activation
   window). Every pass sweeps each Bound Workspace with its own per-repo client and
-  per-repo isolation — one repo's GitHub trouble never starves the others — and logs any
-  live claim whose repo the Pinned Build no longer binds (coverage withdrawn, no GitHub
-  write).
+  per-repo isolation — one repo's GitHub trouble never starves the others. Unbinding a
+  repo is never a GitHub cleanup: whatever coordination it left behind — pending grants,
+  live claims, zombie flags, dispatch waits, malformed states, chained dependents, and
+  pauses — stays visible as an *unbound obligation* on every operator surface (the state
+  document, `theozolith status`, the dashboard, the Operator TUI) and in the janitor log,
+  but the Control Node writes no GitHub over it (leftover GitHub state is the operator's;
+  rebinding the same repo resumes reconciliation and drops the rows on the next pass).
+  `theozolith janitor --once` reads the Pinned Build exactly once and sweeps that snapshot
+  (fail-loud on an unreadable build); the serve loop re-reads the bound set each pass and
+  degrades quietly instead.
 - **Secret store** — values entered once via `theozolith secret set` or the
   dashboard's web form (both write through the same store), encrypted at rest (Fernet,
   file-held master key), pull-only and node-scoped, TLS mandatory, never displayed.
