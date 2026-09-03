@@ -364,3 +364,123 @@ def test_config_ingest_dry_run_discovery_leaves_the_filesystem_untouched(tmp_pat
     assert tree(data_dir) == before
     assert not (data_dir / "secrets").exists()  # in particular: no key, no store
     assert not (data_dir / "configs").exists()  # ... and no pinned build
+
+
+# -- coordination notice + janitor --once (ADR-0056) -----------------------------
+
+
+def test_coordination_notice_states_every_case(tmp_path):
+    """The serve startup line (ADR-0056): DISABLED without a PAT, the Bound
+    Workspaces named with one, the no-Bound-Workspaces guidance when none, and
+    a non-fatal note when the Pinned Build is unreadable."""
+    from theozolith_control import cli, configrepo
+    from theozolith_control.settings import load_settings
+
+    base = {"THEOZOLITH_DATA_DIR": str(tmp_path)}
+    no_pat = load_settings(base)
+    with_pat = load_settings({**base, "CONTROL_GITHUB_TOKEN": "gh"})
+    empty = configrepo.DeployConfig(commit="c", stacks=(), worker_types={})
+    bound = configrepo.DeployConfig(
+        commit="c",
+        stacks=(
+            configrepo.StackDef(
+                name="g",
+                kind="process",
+                node="box1",
+                worker_type="claude-dev",
+                env={"THEOZOLITH_REPO": "acme/app"},
+            ),
+        ),
+        worker_types={},
+    )
+
+    def broken():
+        raise configrepo.ConfigRepoError("bad pins")
+
+    assert "DISABLED" in cli.coordination_notice(no_pat, lambda: empty)
+    assert "no Bound Workspaces" in cli.coordination_notice(with_pat, lambda: empty)
+    assert "active on acme/app" in cli.coordination_notice(with_pat, lambda: bound)
+    assert "unreadable" in cli.coordination_notice(with_pat, broken)
+
+
+def test_janitor_once_without_a_pat_fails_loud(tmp_path, monkeypatch):
+    from theozolith_control.cli import _janitor_once
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("CONTROL_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("THEOZOLITH_REPO", raising=False)
+    with pytest.raises(SystemExit, match="CONTROL_GITHUB_TOKEN"):
+        _janitor_once(None)
+
+
+def test_janitor_once_with_no_bound_workspaces_exits_zero(tmp_path, monkeypatch, capsys):
+    from theozolith_control.cli import _janitor_once
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CONTROL_GITHUB_TOKEN", "gh")
+    monkeypatch.delenv("THEOZOLITH_REPO", raising=False)
+    assert _janitor_once(None) == 0
+    assert "no Bound Workspaces" in capsys.readouterr().out
+
+
+def test_janitor_once_with_an_unreadable_config_fails_loud(tmp_path, monkeypatch):
+    """A human command owes a loud answer — the deliberate contrast with
+    serve's fail-open sweep skip (ADR-0056)."""
+    from theozolith_control.cli import _janitor_once
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CONTROL_GITHUB_TOKEN", "gh")
+    monkeypatch.delenv("THEOZOLITH_REPO", raising=False)
+    # images/ is a hard load error (ADR-0044) — a reliable ConfigRepoError.
+    images = tmp_path / "configs" / "images"
+    images.mkdir(parents=True)
+    (images / "x.toml").write_text("")
+    with pytest.raises(SystemExit, match="config unreadable"):
+        _janitor_once(None)
+
+
+def test_janitor_once_loads_the_pinned_build_once_and_sweeps_that_snapshot(tmp_path, monkeypatch):
+    """The one-shot janitor is single-snapshot (ADR-0056): it loads the Pinned
+    Build EXACTLY once and feeds that validated snapshot straight into the
+    sweep through its load seam — never a second disk read that could take
+    serve's fail-open path if the build changed or broke between reads."""
+    from theozolith_control import cli, configrepo
+    from theozolith_control.cli import _janitor_once
+
+    monkeypatch.setenv("THEOZOLITH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CONTROL_GITHUB_TOKEN", "gh")
+    monkeypatch.delenv("THEOZOLITH_REPO", raising=False)
+
+    snapshot = configrepo.DeployConfig(
+        commit="c",
+        stacks=(
+            configrepo.StackDef(
+                name="g",
+                kind="process",
+                node="box1",
+                worker_type="claude-dev",
+                env={"THEOZOLITH_REPO": "acme/app"},
+            ),
+        ),
+        worker_types={},
+    )
+    loads = 0
+
+    def counting_load(_config_repo):
+        nonlocal loads
+        loads += 1
+        return snapshot
+
+    monkeypatch.setattr(configrepo, "load_config", counting_load)
+
+    swept: dict = {}
+
+    def fake_sweep_pass(settings, store, *, load, **_kw):
+        swept["config"] = load()  # the seam hands back the SAME object, no reload
+
+    monkeypatch.setattr(cli, "_sweep_pass", fake_sweep_pass)
+
+    assert _janitor_once(None) == 0
+    assert loads == 1  # the Pinned Build was read exactly once
+    assert swept["config"] is snapshot  # and that exact validated snapshot was swept

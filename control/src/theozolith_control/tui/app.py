@@ -309,6 +309,8 @@ class TopApp(App):
                 yield DataTable(id="commands")
             with TabPane("Stacks & Runs", id="runs"):
                 yield DataTable(id="stacks")
+                yield Static("", id="pauses-notice", classes="notice")
+                yield Static("", id="unbound-notice", classes="notice")
                 yield Static("", id="runs-notice", classes="notice")
                 yield DataTable(id="runs-table")
                 with VerticalScroll():
@@ -419,7 +421,7 @@ class TopApp(App):
             self._refreshing = False
         self.freshness.succeed(self._clock())
         self.state_doc = bundle["state"]
-        self.run_rows = model.run_rows(self.runs_index, self.state_doc.get("repo"))
+        self.run_rows = model.run_rows(self.runs_index)
         if "events" in bundle:
             fresh, evicted, gap = bundle["events"]
             if gap:
@@ -513,18 +515,29 @@ class TopApp(App):
         runs_notice.update(notice_text)
         runs_notice.display = bool(notice_text)
 
+        pauses_notice = self.query_one("#pauses-notice", Static)
+        pause_text = model.pause_notice(state)
+        pauses_notice.update(_untrusted(pause_text))
+        pauses_notice.display = bool(pause_text)
+
+        unbound_notice = self.query_one("#unbound-notice", Static)
+        unbound_text = model.unbound_notice(state)
+        unbound_notice.update(_untrusted(unbound_text))
+        unbound_notice.display = bool(unbound_text)
+
         runs = self.query_one("#runs-table", DataTable)
         runs.clear()
         for run in self.run_rows:
             runs.add_row(
-                f"#{run.issue}",
+                f"{run.repo}#{run.issue}",
                 run.phase,
                 str(run.attempt or "-"),
                 f"{run.driver} · {run.node}",
                 run.run_id,
                 f"#{run.pr}" if run.pr else "-",
                 model.ago(now - run.last_event_at),
-                key=str(run.issue),  # unique by construction (latest per issue)
+                # Unique by construction (latest per (repo, issue), ADR-0056).
+                key=f"{run.repo}#{run.issue}",
             )
         self._render_run_detail()
 
@@ -592,7 +605,7 @@ class TopApp(App):
     def _render_run_detail(self) -> None:
         detail = self.query_one("#run-detail", Static)
         run = next(
-            (r for r in self.run_rows if str(r.issue) == self._selected_run),
+            (r for r in self.run_rows if f"{r.repo}#{r.issue}" == self._selected_run),
             self.run_rows[0] if self.run_rows else None,
         )
         if run is None:
@@ -602,7 +615,7 @@ class TopApp(App):
         budget = model.timeout_budget_seconds(self.state_doc, run.stack)
         lines = Text()
         lines.append(
-            f"run {run.run_id or '?'} · issue #{run.issue} · {run.driver} · {run.node}"
+            f"run {run.run_id or '?'} · {run.repo}#{run.issue} · {run.driver} · {run.node}"
             f" · stack {run.stack or '?'}\n"
         )
         lines.append(

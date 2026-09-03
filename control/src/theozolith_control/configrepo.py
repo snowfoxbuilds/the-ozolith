@@ -741,6 +741,29 @@ class DeployConfig:
     def stacks_for(self, node: str) -> list[StackDef]:
         return [stack for stack in self.stacks if stack.node == node]
 
+    def bound_repos(self) -> list[str]:
+        """The Bound Workspaces (ADR-0056): the workspaces of resolved
+        driver-bearing (process-kind) Stacks, REGARDLESS of desired state —
+        a stopped Implementer's zombie claims still need the janitor. Read
+        from the INJECTED env, not a retained workspace field: the resolved
+        Stack carries the outcome in ``THEOZOLITH_REPO`` (``_resolve_worker_stack``
+        never sets ``workspace=`` on the concrete StackDef), and a Stack's
+        ``[env]`` deliberately overrides the typed workspace binding — the env
+        value is exactly what the Driver will check out, which is what
+        coordination must cover. A driver-bearing Stack is precisely one that
+        resolved from a worker type to process kind; a driverless Flight Deck
+        resolves to container kind and a generic Stack has no worker type, so
+        both are excluded. An empty override binds nothing (defensive)."""
+        return sorted(
+            {
+                repo
+                for stack in self.stacks
+                if stack.worker_type
+                and stack.kind == "process"
+                and (repo := stack.env.get("THEOZOLITH_REPO", ""))
+            }
+        )
+
     def secret_names_for(self, node: str) -> set[str]:
         """The node-scoping rule: only secrets referenced by Stacks placed
         on the node may be pulled by it (NODE-SUBSTRATE.md). This includes the

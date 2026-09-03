@@ -323,6 +323,21 @@ def test_zombie_malformed_and_quarantine_flags_are_visible(control: ControlRig):
     assert "quarantined" in page and "consecutive failed Runs" in page
 
 
+def test_dispatch_pause_is_visible_with_repo_reason_and_age(control: ControlRig):
+    """A per-repo dispatch pause raises the Needs-attention section on its own
+    (ADR-0056): the repo, the reason, and both ages render — escaped, since the
+    reason is failure text — with no other flag present."""
+    login(control)
+    control.store.record_dispatch_pause("acme/sandbox", "GitHub 503 <listing failed>")
+    control.clock.advance(120)  # the pause ages on the store clock
+    page = control.client.get("/fragments/runs").text
+    assert "Needs attention" in page  # a pause alone makes the section visible
+    assert "dispatch paused" in page
+    assert "acme/sandbox" in page
+    assert "GitHub 503 &lt;listing failed&gt;" in page  # escaped, not interpreted
+    assert "first seen" in page and "latest" in page  # both ages rendered
+
+
 def test_janitor_ledger_renders_repo_keyed_and_node_scoped_rows(control: ControlRig):
     """The ledger fragment shows owner/name#N where a repo is present and
     only the reason (which names the node) otherwise (ADR-0056): a NULL-repo
@@ -337,6 +352,24 @@ def test_janitor_ledger_renders_repo_keyed_and_node_scoped_rows(control: Control
     assert "acme/sandbox#5: zombie escalated" in page
     assert "node box1: quarantine released by operator" in page
     assert "#0" not in page  # the node act carries no repo reference
+
+
+def test_two_bound_workspaces_render_distinct_linked_rows(control: ControlRig):
+    """Two Bound Workspaces sharing an issue number render two Runs rows, each
+    with its own owner/name#N issue link, per-row PR link, and per-row
+    evidence link on the run id (ADR-0056)."""
+    login(control)
+    control.node_post(
+        "/api/v1/events", run_event(7, "pr-open", run_id="rA", pr=11, repo="acme/app")
+    )
+    control.node_post("/api/v1/events", run_event(7, "claimed", run_id="rB", repo="acme/infra"))
+    page = control.client.get("/fragments/runs").text
+    assert "acme/app#7" in page and "acme/infra#7" in page
+    assert "github.com/acme/app/issues/7" in page
+    assert "github.com/acme/infra/issues/7" in page
+    assert "github.com/acme/app/pull/11" in page  # per-row PR link
+    # The run id links to that row's own repo evidence directory.
+    assert "github.com/acme/app/tree/theozolith/evidence/runs/issue-7" in page
 
 
 # -- the activity fragment (acceptance 3) ----------------------------------------

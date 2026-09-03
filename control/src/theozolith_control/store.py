@@ -1460,6 +1460,20 @@ class Store:
             )
         return cursor.rowcount > 0
 
+    def grants(self) -> list[dict[str, Any]]:
+        """Every write-through grant awaiting activation (ADR-0017), all
+        repos. Distinct from ``expired_grants`` (age-filtered) and
+        ``granted_issues`` (one repo): the whole pending set, so the
+        unbound-obligation scan can surface a grant written before its repo
+        was unbound — a pending grant is not a live claim and the per-repo
+        sweep no longer covers it."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT repo, issue, worker, node, login, granted_at FROM grants"
+                " ORDER BY repo, issue"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # -- node health: the quarantine gate (ADR-0016) ---------------------------
 
     def node_quarantine(self, node: str) -> str | None:
@@ -1648,6 +1662,92 @@ class Store:
                 "SELECT repo, reason, first_seen, last_seen FROM dispatch_pauses ORDER BY repo"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- unbound-obligation visibility (ADR-0056) ------------------------------
+
+    def unbound_obligations(self, bound: set[str]) -> list[dict[str, Any]]:
+        """Every unfinished coordination row whose repo the Pinned Build no
+        longer binds (ADR-0056), across ALL implemented classes: pending
+        grants, live claims, zombie flags, dispatch waits, malformed states,
+        chained dependents, and per-repo dispatch pauses. Read-only and
+        GitHub-free — the per-repo sweep skips an unbound repo entirely, so
+        this is how an operator still sees what that repo left behind
+        (leftover GitHub state is explicitly the operator's; rebinding the
+        repo resumes reconciliation and drops these rows on the next pass).
+
+        Normalized to ``{kind, repo, ref, reason, since}`` — one row shape for
+        every operator surface (the state document, ``theozolith status``, the
+        Operator TUI, and the janitor log) — sorted by (repo, kind, ref) for a
+        stable listing. ``since`` is a raw store-clock timestamp; render layers
+        age it against ``state['now']``.
+
+        Authorization leases (ADR-0056) are a DELIBERATE omission here: the
+        lease store lands with the lease follow-up issues, and its rows join
+        this scan then, not now."""
+        rows: list[dict[str, Any]] = []
+
+        def add(kind: str, repo: str, ref: str, reason: str, since: float) -> None:
+            rows.append({"kind": kind, "repo": repo, "ref": ref, "reason": reason, "since": since})
+
+        for grant in self.grants():
+            if grant["repo"] not in bound:
+                add(
+                    "grant",
+                    grant["repo"],
+                    f"{grant['repo']}#{grant['issue']}",
+                    f"pending grant to {grant['worker'] or 'a worker'} awaiting activation",
+                    grant["granted_at"],
+                )
+        for claim in self.live_claims():
+            if claim.repo not in bound:
+                add(
+                    "claim",
+                    claim.repo,
+                    f"{claim.repo}#{claim.issue}",
+                    f"live claim (run {claim.run_id or 'unknown'})",
+                    claim.last_event_at,
+                )
+        for flag in self.zombie_flags():
+            if flag["repo"] not in bound:
+                add(
+                    "zombie",
+                    flag["repo"],
+                    f"{flag['repo']}#{flag['issue']}",
+                    f"zombie flag (run {flag['run_id'] or 'unknown'})",
+                    flag["flagged_at"],
+                )
+        for wait in self.dispatch_waits():
+            if wait["repo"] not in bound:
+                add(
+                    "wait",
+                    wait["repo"],
+                    f"{wait['repo']}#{wait['issue']}",
+                    wait["reason"],
+                    wait["last_seen"],
+                )
+        for row in self.malformed_states():
+            if row["repo"] not in bound:
+                add(
+                    "malformed",
+                    row["repo"],
+                    f"{row['repo']}#{row['issue']}",
+                    row["detail"],
+                    row["last_seen"],
+                )
+        for row in self.chained_dependents():
+            if row["repo"] not in bound:
+                add(
+                    "chained",
+                    row["repo"],
+                    f"{row['repo']} PR #{row['dependent_pr']}",
+                    f"chained dependent of #{row['blocker_issue']} ({row['blocker_state']})",
+                    row["last_seen"],
+                )
+        for row in self.dispatch_pauses():
+            if row["repo"] not in bound:
+                add("pause", row["repo"], row["repo"], row["reason"], row["last_seen"])
+        rows.sort(key=lambda o: (o["repo"], o["kind"], o["ref"]))
+        return rows
 
     # -- commands ------------------------------------------------------------
 

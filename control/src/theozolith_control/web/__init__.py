@@ -25,7 +25,7 @@ import secrets
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -285,7 +285,14 @@ def mount_web(
     def dashboard(request: Request):
         if not sessions.authorized(request):
             return _login_redirect()
-        return _page(request, "dashboard.html", {"repo": settings.repo})
+        # The Bound Workspaces this Control Node coordinates (ADR-0056), or []
+        # when the Pinned Build is unreadable — the header degrades, the page
+        # still renders.
+        try:
+            repos = _config().bound_repos()
+        except HTTPException:
+            repos = []
+        return _page(request, "dashboard.html", {"repos": repos})
 
     def _fragment(request: Request, name: str, context_for: dict | None = None):
         if not sessions.authorized(request):
@@ -301,7 +308,7 @@ def mount_web(
         return _fragment(
             request,
             "_runs.html",
-            {"runs": views.runs_view(store, settings.repo), "flags": views.flags_view(store)},
+            {"runs": views.runs_view(store), "flags": views.flags_view(store)},
         )
 
     @app.get("/fragments/activity", response_class=HTMLResponse)

@@ -206,6 +206,14 @@ def evaluate(state: dict[str, Any], errors: dict[str, Any]) -> list[str]:
                 f" desired {want}, actual {have}"
             )
 
+    # Per-repo dispatch pauses (ADR-0056): a Bound Workspace whose GitHub
+    # reads failed degrades the verdict — repo-scoped coordination trouble,
+    # below node-health conditions, above advisory telemetry.
+    for row in sorted(state.get("dispatch_pauses") or [], key=lambda p: p.get("repo") or ""):
+        reasons.append(
+            f"dispatch paused for {row.get('repo')}: {row.get('reason') or 'unspecified'}"
+        )
+
     recent = errors.get("events") or []
     if recent:
         latest = recent[0].get("payload") or {}
@@ -260,6 +268,40 @@ def render(state: dict[str, Any], reasons: list[str], out) -> None:
     pin = state.get("product_pin")
     drivers_hash = state.get("config_drivers_hash")
     out(f"product pin: {pin or '(none)'}")
+    # The Bound Workspaces this Control Node coordinates (ADR-0056), and any
+    # per-repo dispatch pauses beneath them.
+    repos = state.get("repos") or []
+    out(f"coordinating: {', '.join(repos) if repos else '(no Bound Workspaces)'}")
+    pauses = state.get("dispatch_pauses") or []
+    if pauses:
+        rows = [["REPO", "REASON", "SINCE"]]
+        for row in sorted(pauses, key=lambda p: p.get("repo") or ""):
+            rows.append(
+                [
+                    str(row.get("repo") or ""),
+                    str(row.get("reason") or ""),
+                    _age(now, float(row.get("first_seen") or 0.0)),
+                ]
+            )
+        out("dispatch paused:")
+        _table(rows, out)
+    # Unfinished coordination in unbound repos (ADR-0056): what a repo the
+    # Pinned Build no longer binds left behind — operator-owned, never a
+    # GitHub cleanup the Control Node performs. Surfaced, not a health verdict.
+    unbound = state.get("unbound_obligations") or []
+    if unbound:
+        rows = [["KIND", "REFERENCE", "DETAIL", "SINCE"]]
+        for row in unbound:  # the store already sorts by (repo, kind, ref)
+            rows.append(
+                [
+                    str(row.get("kind") or ""),
+                    str(row.get("ref") or ""),
+                    str(row.get("reason") or ""),
+                    _age(now, float(row.get("since") or 0.0)),
+                ]
+            )
+        out("unbound coordination obligations (repo no longer bound — operator-owned):")
+        _table(rows, out)
     nodes = state.get("nodes") or []
     if nodes:
         rows = [["NODE", "HEALTH", "VERSION", "LAST SEEN"]]

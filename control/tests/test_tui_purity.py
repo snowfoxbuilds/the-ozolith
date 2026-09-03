@@ -228,7 +228,7 @@ def test_model_runs_align_with_the_real_events_documents(control: ControlRig):
     index = model.RunIndex()
     index.refresh(fetch("theozolith.run"), fetch("theozolith.run.progress"))
     assert not index.truncated
-    rows = {r.issue: r for r in model.run_rows(index, state["repo"])}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert set(rows) == {3, 7}  # issue 3's latest event sat beyond page one
     live = rows[7]
     assert live.phase == "gate" and not live.terminal

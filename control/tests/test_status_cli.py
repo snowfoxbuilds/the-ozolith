@@ -238,6 +238,69 @@ def test_incomplete_error_history_never_reads_healthy(tmp_path):
     assert doc["errors"]["evicted"] is True  # the raw document rides along
 
 
+# -- coordination surfaces (ADR-0056) --------------------------------------------
+
+
+def test_coordinating_line_lists_the_bound_workspaces(tmp_path):
+    code, lines = _run(tmp_path, state_doc(repos=["acme/app", "acme/infra"]))
+    assert code == 0
+    assert "coordinating: acme/app, acme/infra" in "\n".join(lines)
+
+
+def test_no_bound_workspaces_reads_explicitly(tmp_path):
+    code, lines = _run(tmp_path, state_doc())  # no repos key
+    assert code == 0
+    assert "coordinating: (no Bound Workspaces)" in "\n".join(lines)
+
+
+def test_dispatch_pause_degrades_with_its_repo_and_reason(tmp_path):
+    """A per-repo dispatch pause degrades the verdict and prints a paused
+    table (ADR-0056), below node-health and above advisory telemetry."""
+    state = state_doc(
+        repos=["acme/app"],
+        dispatch_pauses=[
+            {
+                "repo": "acme/app",
+                "reason": "GitHub 502",
+                "first_seen": NOW - 30,
+                "last_seen": NOW - 5,
+            }
+        ],
+    )
+    reasons = statuscli.evaluate(state, no_errors())
+    assert reasons == ["dispatch paused for acme/app: GitHub 502"]
+    code, lines = _run(tmp_path, state)
+    assert code == 1
+    joined = "\n".join(lines)
+    assert lines[0] == "degraded: dispatch paused for acme/app: GitHub 502"
+    assert "REPO" in joined and "GitHub 502" in joined  # the paused table renders
+
+
+def test_unbound_obligations_render_without_degrading_the_verdict(tmp_path):
+    """Unbinding a repo leaves visible operator-owned obligations (ADR-0056):
+    they render in a table but are NOT a health verdict — surfaced, never a
+    health downgrade (the janitor writes no GitHub over them either)."""
+    state = state_doc(
+        repos=["acme/app"],
+        unbound_obligations=[
+            {
+                "kind": "grant",
+                "repo": "acme/gone",
+                "ref": "acme/gone#7",
+                "reason": "pending grant to worker-a awaiting activation",
+                "since": NOW - 600,
+            }
+        ],
+    )
+    assert statuscli.evaluate(state, no_errors()) == []  # surfaced, not degraded
+    code, lines = _run(tmp_path, state)
+    assert code == 0  # healthy verdict despite the obligation
+    joined = "\n".join(lines)
+    assert "unbound coordination obligations" in joined
+    assert "acme/gone#7" in joined
+    assert "pending grant to worker-a awaiting activation" in joined
+
+
 # -- exit 2: the read failed (acceptance 8) --------------------------------------
 
 

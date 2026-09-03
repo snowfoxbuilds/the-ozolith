@@ -56,7 +56,9 @@ def state_doc(**over: Any) -> dict[str, Any]:
         "commands": [],
         "provisioned_nodes": [],
         "unregistered_nodes": [],
-        "repo": "acme/sandbox",
+        "repos": ["acme/sandbox"],
+        "dispatch_pauses": [],
+        "unbound_obligations": [],
         "control_toml": {
             "control_ip": "203.0.113.5",
             "control_port": 443,
@@ -87,6 +89,7 @@ def run_event(
     pr: int | None = None,
     failure_class: str | None = None,
     at: float = NOW - 60,
+    repo: str | None = "acme/sandbox",
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "theozolith.run",
@@ -97,6 +100,9 @@ def run_event(
         "run_id": run_id,
         "phase": phase,
     }
+    # A repo-less event models a pre-ADR-0056 legacy row (skipped by run_rows).
+    if repo is not None:
+        payload["repo"] = repo
     if attempt is not None:
         payload["attempt"] = attempt
     if pr is not None:

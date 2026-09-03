@@ -79,10 +79,48 @@ async def test_panels_render_from_the_api_documents():
         assert "queued behind run r7" in command_rows[0][5]
         assert rows(app, "#stacks")[0][:5] == ["box1", "deck", "container", "running", "running"]
         run_rows = rows(app, "#runs-table")
-        assert run_rows[0][0] == "#7" and run_rows[0][1] == "gate"
+        assert run_rows[0][0] == "acme/sandbox#7" and run_rows[0][1] == "gate"
         settings = dict((r[0], r[1]) for r in rows(app, "#settings-table"))
         assert settings["control_ip"] == "203.0.113.5"
         assert settings["heartbeat_seconds"] == "60.0"
+
+
+@pytest.mark.asyncio
+async def test_pause_and_unbound_notices_display_from_the_state_document():
+    """The Stacks & Runs pane surfaces per-repo dispatch pauses and unbound
+    coordination obligations from the state document (ADR-0056)."""
+    fake = FakeClient()
+    fake.state_doc["dispatch_pauses"] = [
+        {"repo": "acme/app", "reason": "GitHub 503", "first_seen": NOW - 300, "last_seen": NOW - 30}
+    ]
+    fake.state_doc["unbound_obligations"] = [
+        {
+            "kind": "grant",
+            "repo": "acme/gone",
+            "ref": "acme/gone#7",
+            "reason": "pending grant to worker-a awaiting activation",
+            "since": NOW - 600,
+        }
+    ]
+    app = make_app(fake)
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        pauses = app.query_one("#pauses-notice", Static)
+        unbound = app.query_one("#unbound-notice", Static)
+        assert pauses.display is True
+        assert "dispatch paused: acme/app" in str(pauses.content)
+        assert unbound.display is True
+        assert "unbound grant acme/gone#7" in str(unbound.content)
+
+
+@pytest.mark.asyncio
+async def test_pause_and_unbound_notices_hidden_when_the_document_is_clean():
+    """No pause, no unbound obligation: both notices stay hidden (ADR-0056)."""
+    app = make_app(FakeClient())  # tuirig's state doc defaults both to []
+    async with app.run_test(size=(120, 50)):
+        await app.refresh_now()
+        assert app.query_one("#pauses-notice", Static).display is False
+        assert app.query_one("#unbound-notice", Static).display is False
 
 
 @pytest.mark.asyncio
@@ -210,7 +248,10 @@ async def test_runs_panel_keeps_issues_beyond_the_first_event_page():
     async with app.run_test(size=(120, 50)):
         await app.refresh_now()
         run_rows = rows(app, "#runs-table")
-        assert [r[0] for r in run_rows] == ["#3", "#7"]  # the older issue survives
+        assert [r[0] for r in run_rows] == [
+            "acme/sandbox#3",
+            "acme/sandbox#7",
+        ]  # the older issue survives
         assert app.query_one("#runs-notice", Static).display is False  # complete: no notice
 
 
@@ -228,7 +269,10 @@ async def test_progress_eviction_degrades_telemetry_without_removing_the_run():
     async with app.run_test(size=(120, 50)):
         await app.refresh_now()
         run_rows = rows(app, "#runs-table")
-        assert [r[0] for r in run_rows] == ["#3", "#5"]  # both Runs still listed
+        assert [r[0] for r in run_rows] == [
+            "acme/sandbox#3",
+            "acme/sandbox#5",
+        ]  # both Runs still listed
         # The live Run's detail renders missing telemetry as unavailable —
         # honestly, without dropping the row.
         detail = str(app.query_one("#run-detail", Static).content)

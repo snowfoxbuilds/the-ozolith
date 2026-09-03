@@ -44,6 +44,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -129,15 +130,105 @@ def _admin_env(args) -> tuple[str, str, str | None]:
 EVICTION_EVERY_SECONDS = 3600.0  # scanning progress payloads is not a per-minute job
 
 
-def _sweep_pass(settings: ControlSettings, store: Store, client, *, evict: bool = True) -> None:
-    """One janitor pass: zombie escalation, never-activated grant release,
-    the base-drift lane (ADR-0053), and (on its slower cadence)
-    progress-telemetry eviction (ADR-0016/0017)."""
-    janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
-    janitor.release_never_activated(
-        store, client, window_seconds=settings.activation_window_seconds, log=_log
+def _default_client_for(settings: ControlSettings) -> Callable[[str], Any]:
+    """A per-repo GitHubClient over the one control PAT (ADR-0056, v1: one
+    GitHub host + one PAT per Control Node). The sibling's memoized factory is
+    a closure private to create_app, so the sweep loop constructs directly."""
+    from theozolith_worker.githubapi import GitHubClient
+
+    return lambda repo: GitHubClient(repo, settings.github_token or "", settings.api_url)
+
+
+def coordination_notice(
+    settings: ControlSettings, load: Callable[[], configrepo.DeployConfig]
+) -> str:
+    """The serve startup line describing coordination (ADR-0056). With a PAT,
+    name the Bound Workspaces the sweep loop will cover (the loop re-reads the
+    bound set each pass, so a broken build is not fatal); without one, the
+    pipeline pauses — there is no second claim path. Pure and testable."""
+    if not settings.coordination_jobs_enabled:
+        return (
+            "claim dispatch + janitor DISABLED — the pipeline pauses"
+            " (set CONTROL_GITHUB_TOKEN; ADR-0017/ADR-0056)"
+        )
+    try:
+        bound = load().bound_repos()
+    except configrepo.ConfigRepoError as exc:
+        return (
+            f"claim dispatch + janitor active — Pinned Build unreadable ({exc});"
+            " the sweep loop re-reads the bound set each pass"
+        )
+    if bound:
+        return f"claim dispatch + janitor active on {', '.join(bound)}"
+    return (
+        "claim dispatch + janitor active — no Bound Workspaces yet (declare a"
+        " driver-bearing Stack and run 'theozolith config ingest')"
     )
-    janitor.sweep_base_drift(store, client, log=_log)
+
+
+def _log_unbound_obligations(store: Store, bound: set[str]) -> None:
+    """Honest visibility for coordination state in UNBOUND repos (ADR-0056):
+    every unfinished coordination row whose repo the Pinned Build no longer
+    binds — pending grants, live claims, zombie flags, dispatch waits,
+    malformed states, chained dependents, and dispatch pauses — is logged
+    every pass. Log lines ONLY, never a GitHub write and never a flag row
+    (rebinding the repo resumes reconciliation unchanged; leftover GitHub
+    state is explicitly the operator's). The scan is the store's read model,
+    so the log, the state document, and the operator surfaces list the exact
+    same obligations. Authorization-lease rows join it with the lease
+    follow-up issues, not here."""
+    for row in store.unbound_obligations(bound):
+        _log(
+            f"janitor: unbound {row['kind']} {row['ref']} — {row['reason']}"
+            " (coverage withdrawn, no GitHub write; ADR-0056)"
+        )
+
+
+def _sweep_pass(
+    settings: ControlSettings,
+    store: Store,
+    *,
+    evict: bool = True,
+    load: Callable[[], configrepo.DeployConfig] | None = None,
+    client_for: Callable[[str], Any] | None = None,
+) -> None:
+    """One janitor pass over EVERY Bound Workspace (ADR-0056): each bound repo
+    gets one per-repo client and the three lanes (zombie escalation,
+    never-activated grant release, base drift, ADR-0016/0017/0053), isolated
+    so one repo's GitHub trouble never starves the others. Then, on its slower
+    cadence, progress-telemetry eviction (ADR-0016) — repo-agnostic
+    housekeeping that runs even when the Pinned Build is unreadable.
+
+    The bound set is re-read every pass: a re-ingest binds or unbinds repos
+    with no serve restart. ``load``/``client_for`` are injectable for tests,
+    defaulting to the live Pinned Build and a direct per-repo client."""
+    load = load or (lambda: configrepo.load_config(settings.config_repo))
+    client_for = client_for or _default_client_for(settings)
+    try:
+        config: configrepo.DeployConfig | None = load()
+    except configrepo.ConfigRepoError as exc:
+        # The deliberate contrast with `janitor --once` (which fails loud): the
+        # serve loop degrades — log and sweep nothing this pass, still evict.
+        _log(f"janitor: config unreadable ({exc}); sweeping no repos this pass")
+        config = None
+    bound = config.bound_repos() if config is not None else []
+    for repo in bound:
+        try:
+            client = client_for(repo)
+            janitor.sweep(store, client, grace_seconds=settings.zombie_grace_seconds, log=_log)
+            janitor.release_never_activated(
+                store, client, window_seconds=settings.activation_window_seconds, log=_log
+            )
+            janitor.sweep_base_drift(store, client, log=_log)
+        except Exception as exc:
+            # The per-claim isolation shape (janitor.py), one level up: a
+            # deleted repo or a transient GitHub outage on one Bound Workspace
+            # must never starve the others' sweeps.
+            _log(f"janitor: repo {repo} sweep failed: {exc}")
+    if config is not None:
+        # Only with a real bound set: a config we could not read is not
+        # evidence that every live claim's repo is unbound.
+        _log_unbound_obligations(store, set(bound))
     if evict:
         evicted = store.evict_progress(settings.tail_budget_bytes)
         if evicted:
@@ -148,16 +239,13 @@ def _sweep_loop(settings: ControlSettings, store: Store, stop: threading.Event) 
     """The janitor on its cadence, in one thread (ADR-0015)."""
     import time as _time
 
-    from theozolith_worker.githubapi import GitHubClient
-
-    client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
     next_eviction = 0.0
     while not stop.wait(settings.janitor_sweep_seconds):
         evict = _time.monotonic() >= next_eviction
         if evict:
             next_eviction = _time.monotonic() + EVICTION_EVERY_SECONDS
         try:
-            _sweep_pass(settings, store, client, evict=evict)
+            _sweep_pass(settings, store, evict=evict)
         except Exception as exc:
             _log(f"janitor sweep failed: {exc}")
 
@@ -243,12 +331,7 @@ def _serve(args) -> int:
         threading.Thread(
             target=_sweep_loop, args=(settings, store, stop), daemon=True, name="sweeps"
         ).start()
-        _log(f"claim dispatch + janitor active on {settings.repo}")
-    else:
-        _log(
-            "claim dispatch + janitor DISABLED — the pipeline pauses"
-            " (set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN; ADR-0017)"
-        )
+    _log(coordination_notice(settings, lambda: configrepo.load_config(settings.config_repo)))
 
     _log(f"control node bound to {args.host}:{args.port} (TLS {'on' if tls else 'OFF — dev mode'})")
     if browser_origin is not None:
@@ -1173,14 +1256,26 @@ def _rotate_key(args) -> int:
 
 
 def _janitor_once(args) -> int:
-    from theozolith_worker.githubapi import GitHubClient
-
     settings = load_settings()
     if not settings.coordination_jobs_enabled:
-        raise SystemExit("error: set THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN")
-    client = GitHubClient(settings.repo or "", settings.github_token or "", settings.api_url)
+        raise SystemExit(
+            "error: set CONTROL_GITHUB_TOKEN (the control PAT enables coordination; ADR-0056)"
+        )
+    # A human command owes a loud answer (the deliberate contrast with serve's
+    # fail-open sweep skip): an unreadable Pinned Build exits nonzero, never a
+    # silent no-op pass. The Pinned Build is loaded EXACTLY ONCE here and that
+    # snapshot is fed straight into the sweep through its load seam — never a
+    # second disk read, which could take serve's fail-open path if the build
+    # changed or broke between the two reads (single-snapshot one-shot).
+    try:
+        config = configrepo.load_config(settings.config_repo)
+    except configrepo.ConfigRepoError as exc:
+        raise SystemExit(f"error: config unreadable: {exc}") from exc
     store = Store(settings.cache_db_path)
-    _sweep_pass(settings, store, client)
+    if not config.bound_repos():
+        _log("janitor: no Bound Workspaces — nothing to sweep")
+        return 0
+    _sweep_pass(settings, store, load=lambda: config)
     _log("janitor: pass complete")
     return 0
 

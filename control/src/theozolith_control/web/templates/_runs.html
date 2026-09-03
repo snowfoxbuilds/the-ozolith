@@ -8,12 +8,13 @@
   <tbody>
   {% for run in runs %}
     <tr>
-      <td>{% if run.issue_url %}<a href="{{ run.issue_url }}">#{{ run.issue }}</a>
-          {% else %}#{{ run.issue }}{% endif %}</td>
+      <td>{% if run.issue_url %}<a href="{{ run.issue_url }}">{{ run.repo }}#{{ run.issue }}</a>
+          {% elif run.repo %}{{ run.repo }}#{{ run.issue }}{% else %}#{{ run.issue }}{% endif %}</td>
       <td><span class="badge b-{{ run.status }}">● {{ run.phase }}</span></td>
       <td>{{ run.attempt or "–" }}</td>
       <td>{{ run.driver }} · {{ run.node }}</td>
-      <td><code>{{ run.run_id }}</code></td>
+      <td>{% if run.evidence_url %}<a href="{{ run.evidence_url }}"><code>{{ run.run_id }}</code></a>
+          {% else %}<code>{{ run.run_id }}</code>{% endif %}</td>
       <td>{% if run.pr_url %}<a href="{{ run.pr_url }}">#{{ run.pr }}</a>{% else %}–{% endif %}</td>
       <td class="muted">{{ run.last_event }}</td>
       <td>
@@ -34,26 +35,32 @@
 </table>
 {% else %}<p class="muted">No Runs on record.</p>{% endif %}
 
-{% if flags.zombies or flags.malformed or flags.waits or flags.chained or flags.quarantines %}
+{% if flags.zombies or flags.malformed or flags.waits or flags.chained or flags.pauses or flags.quarantines %}
 <h3>Needs attention</h3>
 <ul class="flags">
+  {% for p in flags.pauses %}
+  <li><span class="badge b-serious">● dispatch paused</span>
+      {{ p.repo }}: {{ p.reason }} <span class="muted">(per-repo pause, ADR-0056;
+      first seen {{ p.first_seen }}, latest {{ p.last_seen }}; self-clearing on the
+      repo's next successful pass)</span></li>
+  {% endfor %}
   {% for z in flags.zombies %}
   <li><span class="badge b-warning">● zombie</span>
-      issue #{{ z.issue }} · run <code>{{ z.run_id }}</code> · {{ z.worker }}@{{ z.node }}
+      {{ z.repo }}#{{ z.issue }} · run <code>{{ z.run_id }}</code> · {{ z.worker }}@{{ z.node }}
       silent since {{ z.flagged }} — awaiting swept evidence (flag only, ADR-0016)</li>
   {% endfor %}
   {% for m in flags.malformed %}
   <li><span class="badge b-serious">● malformed</span>
-      issue #{{ m.issue }}: {{ m.detail }} <span class="muted">(seen {{ m.last_seen }})</span></li>
+      {{ m.repo }}#{{ m.issue }}: {{ m.detail }} <span class="muted">(seen {{ m.last_seen }})</span></li>
   {% endfor %}
   {% for w in flags.waits %}
   <li><span class="badge b-warning">● waiting</span>
-      issue #{{ w.issue }}: {{ w.reason }} <span class="muted">(dependency wait, ADR-0053;
+      {{ w.repo }}#{{ w.issue }}: {{ w.reason }} <span class="muted">(dependency wait, ADR-0053;
       seen {{ w.last_seen }})</span></li>
   {% endfor %}
   {% for c in flags.chained %}
   <li><span class="badge b-serious">● chained dependent</span>
-      PR #{{ c.dependent_pr }} is based on issue #{{ c.blocker_issue }}, whose
+      {{ c.repo }}#{{ c.dependent_pr }} is based on issue #{{ c.blocker_issue }}, whose
       PR #{{ c.blocker_pr }} is {{ c.blocker_state }} — blocker rejected/abandoned;
       human call, no automated write (ADR-0053) <span class="muted">(seen {{ c.last_seen }})</span></li>
   {% endfor %}

@@ -107,7 +107,6 @@ class LiveControl:
             data_dir=tmp_path / "data",
             config_repo=tmp_path / "configs",
             admin_token="admin-token",
-            repo=None,
             github_token=None,
             api_url="",
             # The persisted control address (ADR-0031/0034): the join
