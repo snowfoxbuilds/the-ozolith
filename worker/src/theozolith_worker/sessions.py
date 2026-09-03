@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from theozolith_worker.containers import ContainerSpec, Engine
+from theozolith_worker.containers import ContainerSpec, Engine, EngineError
 from theozolith_worker.jobdir import (
     PHASE_DONE,
     PHASE_FAILED,
@@ -141,6 +141,14 @@ class ContainerSession:
                 self._sequence += 1
                 write_job_request(self._job, JobRequest(f"{self._sequence:03d}-shutdown", ""))
                 self._engine.wait(self._spec.name, SHUTDOWN_WAIT_SECONDS)
+        except EngineError:
+            # Best-effort graceful shutdown only (observation doctrine, grilling
+            # 2026-09-02): an unobservable container at session END must never
+            # escape finish() and, via `finally: session.finish()` on the Run's
+            # success path, reclassify an already-completed Run as an infra
+            # failure. The force-remove below still runs, so container lifetime =
+            # Run lifetime is preserved regardless.
+            pass
         finally:
             # Container lifetime = Run lifetime, no matter what happened.
             self._engine.remove(self._spec.name)

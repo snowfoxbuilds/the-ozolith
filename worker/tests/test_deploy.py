@@ -813,6 +813,22 @@ def test_configs_example_flightdeck_policy_wiring(example_config):
     assert claude_dev["policy_pin"] == config.worker_types["claude-dev"].policy_pin
 
 
+def test_configs_example_flightdeck_tmpfs_mount(example_config):
+    """#109: the example Flight Deck declares a RAM-backed tmpfs /tmp so its
+    heavy scratch I/O lands off the overlay writable layer (the layer whose
+    size walk raced `docker ps` into a transient 500). The worker-type field is
+    driverless-only, resolves onto the Stack verbatim (container paths only, no
+    {stack} substitution), and — being node-side runtime state, not image
+    identity — never enters the wire recipe."""
+    config = example_config
+    flightdeck = next(s for s in config.stacks if s.name == "flightdeck")
+    wt = config.worker_types["flightdeck"]
+    assert wt.tmpfs == ("/tmp:size=8g",)
+    assert flightdeck.tmpfs == ("/tmp:size=8g",)  # resolved onto the Stack verbatim
+    # tmpfs is runtime state, not image identity: the recipe carries no such key.
+    assert "tmpfs" not in wt.recipe_wire()
+
+
 def test_configs_example_flightdeck_github_workspace_wiring(example_config):
     """snow-maker container-setup parity (dev-dockers/setup.sh + Dockerfile):
     the deck ships the GitHub CLI from GitHub's own apt repo plus the

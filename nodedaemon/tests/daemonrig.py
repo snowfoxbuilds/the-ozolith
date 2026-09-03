@@ -80,6 +80,15 @@ class FakeDocker:
         self.fail_compose_down: set[str] = set()
         self.fail_compose_up: set[str] = set()
         self.fail_image_exists: set[str] = set()
+        # Observation-failure injection (#109): a `stack_containers(stack)` whose
+        # argument is in this set raises DockerError (None — the list-all call —
+        # matches a None member), a `compose_ps` of a project here raises, and
+        # `run_containers` raises whenever the flag is set. A failed docker read
+        # is never a coerced empty listing (the fail-closed observation
+        # doctrine); no test pinned this behavior before.
+        self.fail_stack_containers: set[str | None] = set()
+        self.fail_compose_ps: set[str] = set()
+        self.fail_run_containers: bool = False
         # Compose projects that are present but NOT running (stopped/exited): a
         # `compose_ps` for one of these reports a non-running row, so the daemon's
         # liveness check treats it as down and brings it up again.
@@ -96,9 +105,13 @@ class FakeDocker:
     # -- observation (DockerCtl surface) -----------------------------------
 
     def run_containers(self) -> list[dict[str, str]]:
+        if self.fail_run_containers:
+            raise DockerError("run-container listing failed")
         return [dict(row) for row in self.containers.values()]
 
     def stack_containers(self, stack: str | None = None) -> list[dict[str, str]]:
+        if stack in self.fail_stack_containers:
+            raise DockerError(f"stack_containers failed for {stack}")
         rows = []
         for name, data in self.stacks.items():
             if stack is None or data["stack"] == stack:
@@ -115,7 +128,7 @@ class FakeDocker:
     # -- container Stacks ----------------------------------------------------
 
     def run_stack_container(
-        self, stack, image, *, env_files, env, ports, volumes, command=None, spec=""
+        self, stack, image, *, env_files, env, ports, volumes, tmpfs=None, command=None, spec=""
     ) -> None:
         self.remove(f"ozolith-stack-{stack}")  # faithful to DockerCtl: rm --force first
         self.stacks[f"ozolith-stack-{stack}"] = {
@@ -126,6 +139,7 @@ class FakeDocker:
             "env": dict(env),
             "ports": list(ports),
             "volumes": list(volumes),
+            "tmpfs": list(tmpfs or []),
             "command": list(command or []),
             # Mirrors the real LABEL_STACK_SPEC label; stack_containers surfaces
             # it as a row key, exactly as DockerCtl._ps flattens labels.

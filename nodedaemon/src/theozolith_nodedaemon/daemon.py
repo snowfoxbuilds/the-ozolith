@@ -66,6 +66,7 @@ from theozolith_nodedaemon.dockerctl import (
     LABEL_STACK_SPEC,
     STACK_CONTAINER_PREFIX,
     DockerCtl,
+    DockerError,
 )
 from theozolith_nodedaemon.stacks import (
     DRIVER_LAUNCHER,
@@ -124,6 +125,22 @@ def _wheel_dist_name(path: str) -> str:
 ERROR_EVENT = "theozolith.error"
 ERROR_MESSAGE_CHARS = 2_000
 ERROR_CONTEXT_CHARS = 8_000
+
+# The string-sentinel error class for a docker observation that failed (a
+# listing or inspection raised): the heartbeat status path reports the Stack
+# `unknown` and withholds its container-evidence rows, and this event names
+# what could not be observed (precedent: the "config-dist-missing" sentinel).
+DOCKER_OBSERVATION_FAILED = "docker-observation-failed"
+
+# A single-image container replacement is never silent (NODE-SUBSTRATE
+# observation doctrine, grilling 2026-09-02): every legitimate recreate logs
+# its reason AND emits this namespaced typed event. Control stores unknown
+# namespaced event types generically (app.py, ADR's typed-event bullet), so no
+# control-side change is needed.
+STACK_REPLACE_EVENT = "theozolith.stack-replace"
+# The observation-error detail carried in the heartbeat's per-Stack `detail`
+# string is capped so a long docker stderr cannot bloat the heartbeat.
+OBSERVATION_DETAIL_CHARS = 200
 
 # Unreachable-Control-Node backoff cap (revision ruling amending ADR-0015).
 BACKOFF_CAP_SECONDS = 300.0
@@ -462,27 +479,44 @@ class NodeDaemon:
             if stack.kind == "process":
                 state, detail = self._supervisor.status(stack.name)
             else:
-                rows = (
-                    self._docker.compose_ps(f"ozolith-{stack.name}")
-                    if stack.compose_files
-                    else self._docker.stack_containers(stack.name)
-                )
-                running = [r for r in rows if r.get("state") == "running"]
-                state = "running" if running else "stopped"
-                detail = "; ".join(r.get("status", "") for r in rows[:3])
-                # Live container evidence for the web terminal (ADR-0019):
-                # the Flight Deck and other container Stacks attach through
-                # these records; run containers are never attach targets.
-                stack_containers.extend(
-                    {
-                        "name": str(row.get("name", "")),
-                        "stack": stack.name,
-                        "state": str(row.get("state", "")),
-                        "status": str(row.get("status", "")),
-                    }
-                    for row in rows
-                    if row.get("name")
-                )
+                try:
+                    rows = (
+                        self._docker.compose_ps(f"ozolith-{stack.name}")
+                        if stack.compose_files
+                        else self._docker.stack_containers(stack.name)
+                    )
+                except DockerError as exc:
+                    # Observation doctrine (grilling 2026-09-02): a failed read
+                    # is never evidence of absence. Report the Stack `unknown`
+                    # (never stopped/absent) and WITHHOLD its container-evidence
+                    # rows — control's server-derived attach targets and the TUI
+                    # must never resolve from unverified state — then continue
+                    # the loop for the other Stacks. The failure is visible
+                    # through the observation event. The `(drained)` suffix
+                    # below still applies to the detail.
+                    state = "unknown"
+                    detail = f"observation failed: {exc}"[:OBSERVATION_DETAIL_CHARS]
+                    self._emit_error(
+                        DOCKER_OBSERVATION_FAILED,
+                        f"stack {stack.name}: container observation failed: {exc}",
+                    )
+                else:
+                    running = [r for r in rows if r.get("state") == "running"]
+                    state = "running" if running else "stopped"
+                    detail = "; ".join(r.get("status", "") for r in rows[:3])
+                    # Live container evidence for the web terminal (ADR-0019):
+                    # the Flight Deck and other container Stacks attach through
+                    # these records; run containers are never attach targets.
+                    stack_containers.extend(
+                        {
+                            "name": str(row.get("name", "")),
+                            "stack": stack.name,
+                            "state": str(row.get("state", "")),
+                            "status": str(row.get("status", "")),
+                        }
+                        for row in rows
+                        if row.get("name")
+                    )
             if stack.name in self._drained:
                 detail = (detail + " (drained)").strip()
             stacks.append(
@@ -509,11 +543,22 @@ class NodeDaemon:
         # blocker; control pairs it with its own divergence check, so that is
         # harmless. Run-id/stack-name references only; "" = free to converge.
         current_blocker = self._inflight_blocker(None)
+        try:
+            run_containers = self._docker.run_containers()
+        except DockerError as exc:
+            # Same doctrine for the labeled run-container listing: report an
+            # empty list for THIS beat (the key MUST stay present — the channel
+            # invariant asserts the exact top-level key set and control's parse
+            # expects it) and surface the failure as an observation event.
+            # Nothing destructive keys off these rows: reaping does its own
+            # listing, which now raises into the reconcile catch.
+            run_containers = []
+            self._emit_error(DOCKER_OBSERVATION_FAILED, f"run-container listing failed: {exc}")
         return {
             "node": self._config.node,
             "version": self._config.version,
             "stacks": stacks,
-            "run_containers": self._docker.run_containers(),
+            "run_containers": run_containers,
             "stack_containers": stack_containers,
             "images": [image_status(self._docker, img) for img in self._images().values()],
             "config_commit": self._desired.get("commit", ""),
@@ -623,24 +668,43 @@ class NodeDaemon:
             self._completed.append(command_id)
             _atomic_json(self._acks_path, self._completed)
 
-    def _emit_error(self, error_class: str, message: str, context: str = "") -> None:
-        """Best-effort theozolith.error summary; never raises, never loops
-        (an emission failure is itself only logged)."""
+    def _emit_event(self, event: dict[str, Any]) -> None:
+        """Best-effort typed-event emission shared by every emitter; never
+        raises, never loops (a delivery failure is itself only logged), so
+        advisory telemetry can never abort a reconcile pass."""
         if self._client is None:
             return
         try:
-            self._client.emit_event(
-                {
-                    "type": ERROR_EVENT,
-                    "node": self._config.node,
-                    "component": "node-daemon",
-                    "error_class": error_class,
-                    "message": message[:ERROR_MESSAGE_CHARS],
-                    "context": context[-ERROR_CONTEXT_CHARS:],
-                }
-            )
+            self._client.emit_event(event)
         except Exception as exc:
-            self._log(f"error event not delivered ({error_class}): {exc}")
+            self._log(f"event not delivered ({event.get('type', '?')}): {exc}")
+
+    def _emit_error(self, error_class: str, message: str, context: str = "") -> None:
+        """Best-effort theozolith.error summary (delegates to _emit_event)."""
+        self._emit_event(
+            {
+                "type": ERROR_EVENT,
+                "node": self._config.node,
+                "component": "node-daemon",
+                "error_class": error_class,
+                "message": message[:ERROR_MESSAGE_CHARS],
+                "context": context[-ERROR_CONTEXT_CHARS:],
+            }
+        )
+
+    def _emit_stack_replace(self, stack: str, reason: str, detail: str = "") -> None:
+        """The mandatory namespaced replacement event beside every single-image
+        recreate log line (observation doctrine): what was replaced and why."""
+        self._emit_event(
+            {
+                "type": STACK_REPLACE_EVENT,
+                "node": self._config.node,
+                "component": "node-daemon",
+                "stack": stack,
+                "reason": reason,
+                "detail": detail[:ERROR_MESSAGE_CHARS],
+            }
+        )
 
     def _live_jobs_dir(self, stack: WireStack) -> Path:
         """The jobs directory the currently running child was LAUNCHED with —
@@ -736,7 +800,10 @@ class NodeDaemon:
     def _remove_single_image(self, name: str) -> None:
         """Remove this name's labeled single-image Stack container, if one is
         present. A no-op when no single-image form exists (a process or compose
-        Stack, or an ordinary start)."""
+        Stack, or an ordinary start). A FAILED observation raises DockerError
+        (fail-closed, observation doctrine) rather than silently skipping the
+        removal — the caller's catch surfaces it and the reconcile cadence
+        retries; a needed removal is never lost to a coerced empty listing."""
         if self._docker.stack_containers(name):
             self._docker.remove(f"{STACK_CONTAINER_PREFIX}{name}")
 
@@ -2131,22 +2198,27 @@ class NodeDaemon:
 
     def _container_fingerprint(self, stack: WireStack) -> str:
         """The effective runtime spec of a single-image container Stack: image
-        tag, command, env, secret mapping, ports, volumes. A change to any of
-        these replaces the running container. Secret VALUES never enter this —
-        only the mapping (ENV -> secret name) does (ADR-0044 amendment)."""
-        return hashlib.sha256(
-            json.dumps(
-                {
-                    "image": stack.image,
-                    "command": stack.command,
-                    "env": stack.env,
-                    "secrets": stack.secrets,
-                    "ports": list(stack.ports),
-                    "volumes": list(stack.volumes),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        tag, command, env, secret mapping, ports, volumes, tmpfs. A change to
+        any of these replaces the running container. Secret VALUES never enter
+        this — only the mapping (ENV -> secret name) does (ADR-0044 amendment).
+
+        The ``tmpfs`` key is included CONDITIONALLY — only when non-empty —
+        following the ADR-0052/0055 conditional-hash-key precedent: every
+        existing tmpfs-less fingerprint stays byte-identical, so this daemon
+        update alone recreates nothing fleet-wide; adopting (or later dropping)
+        a mount changes the fingerprint and recreates exactly once — the
+        quiet-moment recreate that belongs to the config-side rollout."""
+        identity: dict[str, object] = {
+            "image": stack.image,
+            "command": stack.command,
+            "env": stack.env,
+            "secrets": stack.secrets,
+            "ports": list(stack.ports),
+            "volumes": list(stack.volumes),
+        }
+        if stack.tmpfs:
+            identity["tmpfs"] = list(stack.tmpfs)
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _converge_container(self, stack: WireStack, want_running: bool) -> None:
         # A process child still tracked under this name means the Stack flipped
@@ -2276,6 +2348,15 @@ class NodeDaemon:
                 f"stack {stack.name}: single-image->compose;"
                 " removing the single-image container before compose up"
             )
+            # The single-image container is being replaced by the compose form:
+            # loud like every other replacement (observation doctrine). The
+            # compose->single-image direction emits the same reason in
+            # _converge_single_image, so both transition directions are visible.
+            self._emit_stack_replace(
+                stack.name,
+                "compose-transition",
+                "single-image->compose: removing the single-image container for compose up",
+            )
             self._remove_single_image(stack.name)
         self._docker.compose(f"ozolith-{stack.name}", files, "up")
         # Confirm APPLIED after a successful up — best-effort: a failure to persist
@@ -2346,6 +2427,26 @@ class NodeDaemon:
                 " composing the old project down before docker run"
             )
             self._compose_down(stack.name)
+        # Every single-image (re)create is LOUD (observation doctrine, grilling
+        # 2026-09-02): immediately before the run — past every deferral gate, so
+        # a deferred pass emits nothing — name WHY, first match wins, and emit
+        # the namespaced replacement event beside the log line. Reasons are read
+        # from the pre-teardown observation captured above.
+        if compose_tracked:
+            reason = "compose-transition"
+            detail = "compose->single-image: composed the old project down before docker run"
+        elif running and not running[0].get(LABEL_STACK_SPEC):
+            reason = "missing-spec-label"
+            detail = "running container carries no applied-spec label; reconciling once"
+        elif running:
+            reason = "spec-mismatch"
+            applied = running[0].get(LABEL_STACK_SPEC, "") or "(none)"
+            detail = f"applied spec {applied} -> wanted {want}"
+        else:
+            reason = "no-running-container"
+            detail = "no running container (first create, stopped rows only, or process->container)"
+        self._log(f"stack {stack.name}: replacing single-image container ({reason}): {detail}")
+        self._emit_stack_replace(stack.name, reason, detail)
         self._docker.run_stack_container(
             stack.name,
             stack.image,
@@ -2353,6 +2454,9 @@ class NodeDaemon:
             env=stack.env,
             ports=list(stack.ports),
             volumes=list(stack.volumes),
+            # tmpfs mounts ride beside volumes (grilling 2026-09-02); empty by
+            # default, so a tmpfs-less Stack behaves exactly as before.
+            tmpfs=list(stack.tmpfs),
             # Optional start command for the single-image form — how the
             # Flight Deck starts its named tmux session (ADR-0019). Parsed
             # with the same shlex argv semantics as process Stacks; DockerCtl

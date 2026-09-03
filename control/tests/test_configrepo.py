@@ -285,6 +285,82 @@ def test_stack_placeholder_is_not_substituted_on_generic_stack_volumes(tmp_path)
     assert stack.volumes == ("{stack}-data:/data",)  # literal, unresolved
 
 
+# -- tmpfs Stack field (#109, grilling 2026-09-02) -------------------------------
+
+
+def test_tmpfs_on_a_driverless_worker_type_resolves_verbatim(tmp_path):
+    """A driverless (Flight Deck) type's tmpfs rides through to the resolved
+    Stack with NO {stack} substitution — tmpfs entries are container paths only,
+    unlike volumes (per-instance named-volume identity)."""
+    write(
+        tmp_path,
+        "worker-types/flightdeck.toml",
+        f'base = "{BASE}"\ncommand = "sleep 30"\nworkspace = "acme/sandbox"\n'
+        'tmpfs = ["/tmp:size=8g", "/scratch"]\n',
+    )
+    thin_stack(tmp_path, "flightdeck", "flightdeck")
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "flightdeck")
+    assert stack.tmpfs == ("/tmp:size=8g", "/scratch")
+
+
+def test_tmpfs_on_a_generic_container_stack_parses(tmp_path):
+    write(
+        tmp_path,
+        "stacks/plain.toml",
+        'kind = "container"\nnode = "box1"\nimage = "busybox"\ntmpfs = ["/tmp:size=1g"]\n',
+    )
+    stack = next(s for s in load_config(tmp_path).stacks if s.name == "plain")
+    assert stack.tmpfs == ("/tmp:size=1g",)
+
+
+def test_tmpfs_rejected_on_a_thin_worker_type_stack(tmp_path):
+    """A thin worker-type Stack declaring tmpfs is rejected by name, exactly
+    like volumes — the field belongs on the worker-type definition."""
+    driver_type(tmp_path, "claude-dev")
+    thin_stack(tmp_path, "impl", "claude-dev", tmpfs='["/tmp:size=1g"]')
+    with pytest.raises(ConfigRepoError, match=r"'tmpfs' moved to worker-types/claude-dev.toml"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "tmp:size=1g",  # relative path (no leading /)
+        "/tmp:",  # empty opts suffix
+        "/tmp:size 1g",  # whitespace in opts
+    ],
+)
+def test_tmpfs_malformed_entry_fails_naming_the_file(tmp_path, entry):
+    write(
+        tmp_path,
+        "stacks/plain.toml",
+        f'kind = "container"\nnode = "box1"\nimage = "busybox"\ntmpfs = ["{entry}"]\n',
+    )
+    with pytest.raises(ConfigRepoError, match=r"stacks/plain.toml"):
+        load_config(tmp_path)
+
+
+def test_tmpfs_travels_the_wire(tmp_path):
+    """StackDef.as_wire -> WireStack.from_wire carries tmpfs; a Stack without it
+    round-trips to an empty tuple (absent key -> empty, advisory skew)."""
+    write(
+        tmp_path,
+        "stacks/deck.toml",
+        'kind = "container"\nnode = "box1"\nimage = "busybox"\ntmpfs = ["/tmp:size=2g"]\n',
+    )
+    write(tmp_path, "stacks/plain.toml", 'kind = "container"\nnode = "box1"\nimage = "busybox"\n')
+    wire = load_config(tmp_path).desired_state_for("box1")["stacks"]
+    by_name = {s["name"]: s for s in wire}
+    assert by_name["deck"]["tmpfs"] == ["/tmp:size=2g"]
+    assert WireStack.from_wire(by_name["deck"]).tmpfs == ("/tmp:size=2g",)
+    # Absent on the source Stack -> empty on the wire and in the daemon model.
+    assert by_name["plain"]["tmpfs"] == []
+    assert WireStack.from_wire(by_name["plain"]).tmpfs == ()
+    # And a wire dict with no tmpfs key at all still degrades to empty.
+    no_key = {k: v for k, v in by_name["plain"].items() if k != "tmpfs"}
+    assert WireStack.from_wire(no_key).tmpfs == ()
+
+
 # -- per-Stack bindings (ADR-0047) -----------------------------------------------
 
 
@@ -1118,9 +1194,11 @@ def test_workspace_must_be_owner_name(tmp_path):
         load_config(tmp_path)
 
 
-@pytest.mark.parametrize("field", ["command", "volumes"])
+@pytest.mark.parametrize("field", ["command", "volumes", "tmpfs"])
 def test_driverless_fields_are_rejected_with_a_driver(tmp_path, field):
-    value = '"x"' if field == "command" else '["v:/p"]'
+    # tmpfs carries a shape-valid entry so the driverless-only rejection (not the
+    # tmpfs lint) is what fires — the field is driver-forbidden even when valid.
+    value = {"command": '"x"', "volumes": '["v:/p"]', "tmpfs": '["/tmp:size=1g"]'}[field]
     write(
         tmp_path,
         "worker-types/i.toml",

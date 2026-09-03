@@ -35,6 +35,59 @@ class DockerError(RuntimeError):
     """A docker operation failed."""
 
 
+def _decode_ps_rows(stdout: str, verb: str) -> list[dict]:
+    """Parse a docker/compose ``ps`` JSON-lines listing, fail-closed.
+
+    A failed observation is never evidence of absence, and neither is an
+    unparseable one (NODE-SUBSTRATE observation doctrine, grilling 2026-09-02):
+    empty stdout is the legitimate zero-container result, but EVERY non-empty
+    row must be well-formed. A row that is not valid JSON, or is valid JSON that
+    is not an object, RAISES ``DockerError``. A malformed row is never silently
+    skipped, so a mixture of good and bad rows fails the whole observation
+    rather than returning a partial listing that under-counts containers (the
+    same class of bug as coercing a 500 to empty). Field-shape validation is the
+    caller's, on the object this returns.
+    """
+    rows: list[dict] = []
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue  # a blank separator carries no record (empty stdout => [])
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise DockerError(f"docker {verb} returned malformed JSON: {line[:120]!r}") from exc
+        if not isinstance(data, dict):
+            raise DockerError(
+                f"docker {verb} returned an unexpected JSON shape "
+                f"({type(data).__name__}, expected object): {line[:120]!r}"
+            )
+        rows.append(data)
+    return rows
+
+
+def _require_str_fields(row: dict, fields: tuple[str, ...], verb: str) -> None:
+    """Every named field of the supported ``ps`` shape must be PRESENT and a
+    string. The explicit ``{{json .Field}}`` format guarantees each field as a
+    JSON string on every row, so a missing key, a JSON ``null``, or any other
+    type is malformed observation data — never an optional value to default.
+    Each case raises ``DockerError`` naming only the verb and field (no
+    unbounded row content). Defaulting instead would let a null ``State`` read
+    as stopped, or a null/absent ``Labels`` collapse to an empty label set that
+    provokes a missing-spec replacement — the whole observation is rejected here,
+    before any destructive consumer can act on a fabricated shape."""
+    for key in fields:
+        if key not in row:
+            raise DockerError(f"docker {verb} row is missing required field {key!r}")
+        value = row[key]
+        if value is None:
+            raise DockerError(f"docker {verb} row field {key!r} is null (expected string)")
+        if not isinstance(value, str):
+            raise DockerError(
+                f"docker {verb} row field {key!r} has unexpected type "
+                f"{type(value).__name__} (expected string)"
+            )
+
+
 class DockerCtl:
     def __init__(self, runner: Runner | None = None, binary: str = "docker"):
         self._binary = binary
@@ -63,19 +116,38 @@ class DockerCtl:
     # -- observation ---------------------------------------------------------
 
     def _ps(self, label_filter: str) -> list[dict[str, str]]:
+        # A failed observation is never evidence of absence (NODE-SUBSTRATE
+        # observation doctrine, grilling 2026-09-02): a non-zero exit RAISES
+        # DockerError (check defaults True) rather than coercing to an empty
+        # listing — every consumer that would act destructively on "no
+        # containers" now surfaces the failure instead. NO in-call retry: the
+        # ~60s reconcile pass cadence is the retry. The PARSE is fail-closed
+        # too (_decode_ps_rows): a non-empty listing with a malformed or
+        # wrong-shape row raises rather than return a partial, under-counting
+        # result — an unparseable read is as blind as a non-zero one.
+        #
+        # The explicit per-field format is deliberate, NOT `{{json .}}`: the
+        # whole-struct form makes the docker CLI request container sizes
+        # (size=1), an overlay-snapshot walk that races this repo's own temp
+        # churn and returns a transient dockerd 500 (the #109 root cause). This
+        # format references no `.Size`, so no size walk happens; the row shape
+        # (name/state/status + flattened labels) is byte-for-byte what every
+        # consumer already reads.
         proc = self._run(
-            ["ps", "--all", "--filter", f"label={label_filter}", "--format", "{{json .}}"],
-            check=False,
+            [
+                "ps",
+                "--all",
+                "--filter",
+                f"label={label_filter}",
+                "--format",
+                '{"Names":{{json .Names}},"State":{{json .State}},'
+                '"Status":{{json .Status}},"Labels":{{json .Labels}}}',
+            ],
             timeout=60,
         )
-        if proc.returncode != 0:
-            return []
         rows = []
-        for line in (proc.stdout or "").splitlines():
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for data in _decode_ps_rows(proc.stdout, "ps"):
+            _require_str_fields(data, ("Names", "State", "Status", "Labels"), "ps")
             labels = dict(
                 item.partition("=")[::2]
                 for item in (data.get("Labels") or "").split(",")
@@ -153,6 +225,7 @@ class DockerCtl:
         env: dict[str, str],
         ports: list[str],
         volumes: list[str],
+        tmpfs: list[str] | None = None,
         command: list[str] | None = None,
         spec: str = "",
     ) -> None:
@@ -193,6 +266,12 @@ class DockerCtl:
             args += ["--publish", port]
         for volume in volumes:
             args += ["--volume", volume]
+        # tmpfs mounts (grilling 2026-09-02): each entry is docker's own
+        # `--tmpfs` value syntax (`/path` or `/path:opts`), emitted in declared
+        # order. RAM-backed scratch off the overlay writable layer — invisible
+        # to the size walk that made `docker ps` racy at the source.
+        for entry in tmpfs or []:
+            args += ["--tmpfs", entry]
         args.append(image)
         if command:
             args.extend(command[1:])
@@ -212,28 +291,31 @@ class DockerCtl:
         self._run(args, timeout=600)
 
     def compose_ps(self, project: str) -> list[dict[str, str]]:
-        """Containers of one compose project (status reporting)."""
+        """Containers of one compose project (status reporting).
+
+        Fail-closed like ``_ps`` (observation doctrine): a non-zero exit RAISES
+        rather than coercing to an empty listing, and so does a non-empty
+        listing carrying a malformed or non-object row (_decode_ps_rows) — a
+        partial parse never under-counts a running project into "gone". Unlike
+        ``docker ps``, this needs no explicit no-size format — ``docker compose
+        ps`` computes
+        container size only behind its opt-in ``--size``/``-s`` flag (the
+        list-API WithSize option is set only then), so ``--format json`` without
+        it triggers no overlay-snapshot walk (#109 Decisions Section)."""
         proc = self._run(
             ["compose", "--project-name", project, "ps", "--all", "--format", "json"],
-            check=False,
             timeout=60,
         )
-        if proc.returncode != 0:
-            return []
         rows = []
-        for line in (proc.stdout or "").splitlines():
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict):
-                rows.append(
-                    {
-                        "name": data.get("Name", ""),
-                        "state": (data.get("State") or "").lower(),
-                        "status": data.get("Status", ""),
-                    }
-                )
+        for data in _decode_ps_rows(proc.stdout, "compose ps"):
+            _require_str_fields(data, ("Name", "State", "Status"), "compose ps")
+            rows.append(
+                {
+                    "name": data.get("Name", ""),
+                    "state": (data.get("State") or "").lower(),
+                    "status": data.get("Status", ""),
+                }
+            )
         return rows
 
     # -- images ------------------------------------------------------------------
