@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-08-28
+Last updated: 2026-09-03
 
 # Bench Contract
 
@@ -16,7 +16,7 @@ SilverquiLLM-bench adopts the ruling that a Benchmark Candidate IS a worker-type
 
 The contract has four parts: the Candidate Bundle format, the identity spec (with verifier and golden vectors), the standalone build path, and the Run Contract (job directory plus exposed driver behaviors) for both run kinds. TheOzolith owns all four; the bench side owns benchmark modes, task synthesis, evaluation, results, and scheduling — nothing bench-side is ever load-bearing for the pipeline (grilling 2026-08-28).
 
-Versioning promise (grilling 2026-08-28): visibility, not immutability. No part of this contract ever changes behavior silently — every breaking change bumps the compatibility key that owns the changed surface and lands an entry in the Changelog below. There are no compatibility windows: a consumer pins a version and re-syncs when it upgrades.
+Versioning promise (grilling 2026-08-28): visibility, not immutability. No part of this contract ever changes behavior silently — every breaking change bumps the compatibility key that owns the changed surface and lands an entry in the Changelog below, and the decision behind each bump is recorded in its governing ADR (see Relevant ADRs). There are no compatibility windows: a consumer pins a version and re-syncs when it upgrades.
 
 Three compatibility keys own the entire contract; every public surface maps to exactly one of them (review 2026-08-28):
 
