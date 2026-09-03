@@ -1,6 +1,6 @@
 Status: ACCEPTED
 
-Date: 2026-08-10 (consolidated 2026-08-14)
+Date: 2026-08-10
 
 # ADR-0045: Model and reasoning effort are typed fields baked into the derived image, held by best effort
 
@@ -216,6 +216,11 @@ Stated plainly, per the operator ruling:
 
 ## Amendments
 
+- **2026-08-14 (#40)**: consolidated — the earlier multi-round fail-closed
+  pre-release-proof revision (per-Run canaries, a gated stdin probe turn,
+  task-file withholding, a sealed settings-source-free task session) is
+  replaced by the current detect-and-kill design; the superseded exploration
+  is preserved in PR #40 (see the corresponding Alternatives entry).
 - **2026-08-26**: a second adapter (codex) exists at a deliberately
   weaker enforcement ceiling — PROBE + STATIC only (baked
   theozolith-owned config, one driver-boot probe reading the CLI's

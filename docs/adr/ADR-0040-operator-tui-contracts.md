@@ -1,6 +1,6 @@
 Status: ACCEPTED
 
-Date: 2026-08-05 (M9 correction pass folded in the same day: the failure-class ruling accepted, degraded attach fails closed, the run reduction made complete across event pages, Stacks render the desired/actual union, client-side follow gaps disclosed)
+Date: 2026-08-05
 
 # ADR-0040: Operator TUI contracts — read-model keys, pure-consumer enforcement, and the terminal failure-class channel
 
