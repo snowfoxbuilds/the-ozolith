@@ -13,11 +13,13 @@ from theozolith_nodedaemon.stacks import (
     DRIVER_LAUNCHER,
     LauncherMissing,
     ProcessSupervisor,
+    SecretNameError,
     WireStack,
     materialize_secrets,
     resolve_launcher,
     secret_env_files,
     spec_fingerprint,
+    validate_stored_secret_name,
 )
 
 
@@ -188,6 +190,81 @@ def test_materialize_repairs_a_symlink_target_without_following_it(tmp_path: Pat
     assert not paths["a"].is_symlink()
     assert paths["a"].read_text() == "value-a"
     assert elsewhere.read_text() == "do-not-touch"  # the link target is untouched
+
+
+# -- stored secret name safety (#114) --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "github-implementer",
+        "admin-token",
+        "anthropic-api-key",
+        "a",
+        "UPPER_case.mixed-1",  # a dot mid-name is fine — only a LEADING dot is reserved
+        "registry:ghcr.io",  # a colon is a legal leaf char; registry semantics guard elsewhere
+        "registry:localhost:5000",
+    ],
+)
+def test_validate_stored_secret_name_accepts_safe_leaves(name):
+    assert validate_stored_secret_name(name) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",  # empty
+        ".",  # the dir itself
+        "..",  # the parent
+        "a/b",  # a path component
+        "/etc/passwd",  # absolute
+        "../../etc/passwd",  # traversal
+        "sub/dir",  # a separator anywhere
+        "back\\slash",  # a Windows-style separator too
+        ".hidden",  # a dotfile — reserved
+        ".a.tmp",  # collides with the writer's '.<name>.tmp' temporary namespace
+        "with\x00nul",  # an embedded NUL
+    ],
+)
+def test_validate_stored_secret_name_rejects_unsafe_leaves(name):
+    with pytest.raises(SecretNameError):
+        validate_stored_secret_name(name)
+
+
+@pytest.mark.parametrize("bad", [".", "..", "../evil", "sub/dir", ".a.tmp", "with\x00nul"])
+def test_materialize_rejects_unsafe_names_before_any_filesystem_mutation(tmp_path: Path, bad):
+    """The whole batch is prevalidated before a single write (#114): a `.`/`..`
+    or any other unsafe name aborts materialization before any mkdir, open,
+    chmod, rmtree, or replace runs — so an existing sibling secret and the parent
+    runtime directory are left exactly as they were, never partially mutated."""
+    secrets_dir = tmp_path / "secrets"
+    materialize_secrets(secrets_dir, {"keep": "sibling-value"})  # a pre-existing sibling
+    before = (secrets_dir / "keep").read_text()
+    sentinel = tmp_path / "sentinel"  # a file in the PARENT, to prove no traversal ran
+    sentinel.write_text("do-not-touch")
+
+    with pytest.raises(SecretNameError):
+        materialize_secrets(secrets_dir, {"OK_ENV": "new", bad: "attacker"})
+
+    assert (secrets_dir / "keep").read_text() == before  # sibling untouched
+    assert sentinel.read_text() == "do-not-touch"  # parent untouched
+    # The safe name from the aborted batch was never written (prevalidation is
+    # whole-batch, not first-unsafe): no partial materialization.
+    assert not (secrets_dir / "OK_ENV").exists()
+
+
+def test_materialize_valid_name_updates_atomically_and_stays_0444(tmp_path: Path):
+    """A valid ordinary name materializes, re-materializes (update) atomically,
+    and the leaf is 0444 both times — the safe-name path is unchanged by the
+    prevalidation guard."""
+    secrets_dir = tmp_path / "secrets"
+    first = materialize_secrets(secrets_dir, {"tok": "one"})
+    assert first["tok"].read_text() == "one"
+    assert (first["tok"].stat().st_mode & 0o777) == 0o444
+    second = materialize_secrets(secrets_dir, {"tok": "two"})
+    assert second["tok"].read_text() == "two"
+    assert (second["tok"].stat().st_mode & 0o777) == 0o444
 
 
 def test_changed_env_recycles_even_with_the_same_command():

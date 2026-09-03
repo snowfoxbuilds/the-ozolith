@@ -915,3 +915,20 @@ def test_web_secret_form_enforces_the_registry_shape_guard(control: ControlRig):
     )
     assert good.status_code == 303
     assert "registry:ghcr.io" in control.secret_store.secret_names()
+
+
+def test_secret_write_surfaces_reject_an_unsafe_stored_name(control: ControlRig):
+    """Both admin write surfaces refuse a stored name unsafe to materialize as a
+    tmpfs leaf (#114): PUT /api/v1/secrets/{name} and the web form each 400 and
+    store nothing — the shared validator, before the value reaches the store."""
+    login(control)
+    # The API path param — a leading-dot name is reserved (dotfile / temp
+    # namespace) and never routes into the store.
+    api = control.admin("PUT", "/api/v1/secrets/.hidden", body={"value": "v"})
+    assert api.status_code == 400
+    # The web form — a traversing name is refused the same way.
+    form = control.client.post(
+        "/secrets", data={"name": "../evil", "value": "v"}, follow_redirects=False
+    )
+    assert form.status_code == 400
+    assert control.secret_store.secret_names() == []

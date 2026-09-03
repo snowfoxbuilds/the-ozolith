@@ -93,7 +93,58 @@ class WireStack:
 # -- secrets: tmpfs materialization + VAR_FILE wiring ---------------------------
 
 
-def _clear_wrong_typed_target(target: Path) -> None:
+class SecretNameError(ValueError):
+    """A stored secret NAME is not a safe single leaf under the secrets dir.
+
+    Raised by :func:`validate_stored_secret_name`. Subclasses ``ValueError`` so
+    control can translate it into its own config/HTTP error at the binding and
+    write surfaces; the daemon catches it to degrade a single Stack rather than
+    abort a whole reconcile pass (#114)."""
+
+
+def validate_stored_secret_name(name: str) -> str:
+    """Validate a stored secret NAME and return it unchanged, or raise
+    :class:`SecretNameError`.
+
+    A stored secret name is the key a value is filed under in the Control Node's
+    Fernet store AND the leaf filename it materializes to under the node's tmpfs
+    secrets dir (:func:`materialize_secrets`). It must therefore name exactly ONE
+    direct child of the secrets dir: no input may escape it, alias a sibling, or
+    resolve to the dir itself or its parent (#114).
+
+    Rejected: the empty string; a path separator (``/`` or ``\\``) or an
+    embedded NUL, which cover ``.``/``..`` used as components, absolute paths,
+    and every other multi-segment or traversing form; and any name in the
+    writer's temporary namespace — every temp file is ``.<name>.tmp``, so a
+    leading ``.`` is refused, which also subsumes bare ``.`` and ``..`` and
+    guarantees no stored name can collide with, or be mistaken for, a temp file.
+
+    This is a PATH-SAFETY check only. Semantic name policy lives at the binding
+    sites: the reserved identity slot names (ADR-0047) and the ``registry:<host>``
+    credential class (ADR-0049) are enforced separately — a colon is a legal leaf
+    character, so ``registry:<host>`` names pass here. The SAME function is the
+    one shared validator applied at config load, the admin write surfaces, and
+    here as node-side defense in depth, so the three layers cannot drift."""
+    if not name:
+        raise SecretNameError("secret name must not be empty")
+    if "\x00" in name:
+        raise SecretNameError("secret name must not contain a NUL byte")
+    if "/" in name or "\\" in name:
+        raise SecretNameError(
+            f"secret name {name!r} must be a single path segment (no path separators)"
+        )
+    if name.startswith("."):
+        # One rule covers '.', '..', and the writer's '.<name>.tmp' temporary
+        # namespace: a stored name can never traverse to the parent or collide
+        # with a temp file, whatever the batch's processing order.
+        raise SecretNameError(
+            f"secret name {name!r} must not start with '.'"
+            " (reserved for '.'/'..' and the writer's temporary files)"
+        )
+    return name
+
+
+def _clear_wrong_typed_target(secrets_dir: Path, target: Path) -> None:
     """Remove ``target`` unless it is already a regular file, so the atomic
     ``os.replace`` in :func:`materialize_secrets` can lay the secret leaf down.
 
@@ -105,7 +156,14 @@ def _clear_wrong_typed_target(target: Path) -> None:
     never be defeated by a stray inode, so any non-regular target — a directory
     (even a non-empty one), or any other type — is cleared here first. ``lstat``,
     never ``stat``, so a symlink is removed as the link it is rather than
-    followed to overwrite or recurse into whatever it points at."""
+    followed to overwrite or recurse into whatever it points at.
+
+    Before ANY deletion, the target is mechanically proven to be a direct child
+    of ``secrets_dir`` — belt-and-suspenders behind ``validate_stored_secret_name``
+    (#114): a deletion here must never touch the secrets dir itself, its parent,
+    or a path outside it, whatever a name upstream might have let through."""
+    if target.parent != secrets_dir or target.name in ("", ".", ".."):
+        raise SecretNameError(f"refusing to clear {target}: not a direct child of {secrets_dir}")
     try:
         mode = os.lstat(target).st_mode
     except FileNotFoundError:
@@ -133,6 +191,13 @@ def materialize_secrets(secrets_dir: Path, values: dict[str, str]) -> dict[str, 
     into it, while every unmounted sibling stays sealed behind the directory.
     Updates stay atomic (temp file + replace): a reader never observes a
     partial value."""
+    # Prevalidate the ENTIRE key set before touching the filesystem (#114): one
+    # unsafe name aborts the whole batch before any mkdir, open, chmod, unlink,
+    # rmtree, or replace runs, so a bad name can never provoke a partial
+    # materialization that already acted on the safe names. Node-side defense in
+    # depth behind the identical control-side binding and write-surface guards.
+    for name in values:
+        validate_stored_secret_name(name)
     secrets_dir.mkdir(parents=True, exist_ok=True)
     secrets_dir.chmod(0o700)
     paths: dict[str, Path] = {}
@@ -149,8 +214,9 @@ def materialize_secrets(secrets_dir: Path, values: dict[str, str]) -> dict[str, 
             os.fchmod(handle.fileno(), 0o444)
         # Self-heal a wrong-typed target before the atomic replace: os.replace
         # onto a directory (a boot race can leave one here — #114) raises EISDIR
-        # forever, so remove any non-regular target first.
-        _clear_wrong_typed_target(target)
+        # forever, so remove any non-regular target first. The clearer re-proves
+        # the target is a direct child of secrets_dir before it deletes anything.
+        _clear_wrong_typed_target(secrets_dir, target)
         os.replace(tmp, target)
         paths[name] = target
     return paths
