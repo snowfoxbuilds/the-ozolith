@@ -16,7 +16,7 @@ SilverquiLLM-bench adopts the ruling that a Benchmark Candidate IS a worker-type
 
 The contract has four parts: the Candidate Bundle format, the identity spec (with verifier and golden vectors), the standalone build path, and the Run Contract (job directory plus exposed driver behaviors) for both run kinds. TheOzolith owns all four; the bench side owns benchmark modes, task synthesis, evaluation, results, and scheduling — nothing bench-side is ever load-bearing for the pipeline (grilling 2026-08-28).
 
-Versioning promise (grilling 2026-08-28): visibility, not immutability. No part of this contract ever changes behavior silently — every breaking change bumps the compatibility key that owns the changed surface, and the decision behind each bump is recorded in the governing ADR (see Relevant ADRs). There are no compatibility windows: a consumer pins a version and re-syncs when it upgrades.
+Versioning promise (grilling 2026-08-28): visibility, not immutability. No part of this contract ever changes behavior silently — every breaking change bumps the compatibility key that owns the changed surface and lands an entry in the Changelog below, and the decision behind each bump is recorded in its governing ADR (see Relevant ADRs). There are no compatibility windows: a consumer pins a version and re-syncs when it upgrades.
 
 Three compatibility keys own the entire contract; every public surface maps to exactly one of them (review 2026-08-28):
 
@@ -104,6 +104,13 @@ The implementation (the-ozolith#88) must land these test classes with the code �
 - **Credentials**: public resolution is anonymous; private resolution and pull work through `DOCKER_CONFIG`; missing or refused credentials fail clearly with the host named; no secret appears in argv, manifest, bundle, logs, errors, image layers, or evidence.
 - **Sources**: local directories accepted; URLs, plain files, absent paths, and unsafe trees rejected.
 - **Run Contract**: byte-stable prompt rendering for both modes; PR-body composition; gate ordering; proposal validation; synthetic round-one review construction; schema-version mismatch refusal.
+
+## Changelog
+
+Every breaking change to a contract surface lands an entry here naming the bumped key (see Contract surface and versioning).
+
+- **2026-09-02** — Agent Policy trees join the bundle: `bundle_format_version` 2 — `candidate.json` gains the required `policy`/`policy_pin` keys and the layout allowlist gains `policy/`; `identity_spec_version` 2 — the canonical serialization gains the conditional `policy`/`policy_pin` keys (every pre-existing vector's expected values are byte-identical; a v1-stamped bundle is refused with the re-export message). `schema_version` unchanged.
+- **2026-08-28** — initial published contract: `schema_version` 1 (Run Contract), `bundle_format_version` 1 (Candidate Bundle and verified build), `identity_spec_version` 1 (candidate identity).
 
 ## Relevant ADRs
 

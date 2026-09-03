@@ -83,3 +83,11 @@ Transcript tails, event payloads, error messages, and every other agent-adjacent
 - **OSC 52 clipboard delivery for attach**: silent failure on unsupported terminals; print-only is the floor every terminal has.
 - **Blocking (modal) unreachable handling**: hides the last known fleet state exactly when it matters most.
 - **A TUI `--force` on commands**: kill-the-tree from a full-screen surface invites reflex-clicking; the CLI form remains the deliberate path.
+
+## Amendments
+
+- **2026-08-05 (#18)**: same-day M9 correction pass, folded into the decision above rather than left as later revisions — the terminal failure-class ruling accepted (failed/escalated `theozolith.run` events carry `failure_class`), degraded-mode attach fails closed instead of presenting a frozen heartbeat snapshot as live, the Runs index made complete across event pages rather than a single-page snapshot, Stacks render the desired/actual union so drift is never hidden, and client-side follow-gap skips disclosed on the affected panel.
+
+## Relevant PRs
+
+- #18 — implementation PR; the M9 Operator TUI (`theozolith top`), carrying the same-day correction pass folded into this ADR.
