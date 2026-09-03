@@ -1,4 +1,4 @@
-Status: ACCEPTED
+Status: SUPERSEDED by ADR-0057
 
 Date: 2026-07-21
 
@@ -27,3 +27,7 @@ Naming grilling 2026-07-21. "Worker" named the implementation actor specifically
 - **Flat rename Worker → Implementer everywhere** (rejected: cascades through shipped code surfaces and forfeits the natural base-type reading of "worker").
 - **New base term (e.g. "Actor") with Worker kept as the implementer** (rejected: Worker already reads generic; a second abstract noun adds vocabulary without adding meaning).
 - **Composition over inheritance in code** (deferred, not rejected: the ruling mandates inheritance to strengthen the taxonomy; keep the hierarchy one level deep and the variance in narrow seams to retain composition's benefits).
+
+## Amendments
+
+- **2026-09-03 (#120, ADR-0057)**: superseded. Worker stays the base abstraction and the names Implementer, Reviewer, Initializer, and Flight Deck stand, but worker types differ by declaration, not subclass: a Worker-Type Definition declares its kind (`on = "issue" | "pr"` — Issue Worker or PR Worker), Intake, outputs with an Outcome Table, prompt, and `rounds`, and the three built-ins become the shipped default definitions. The inheritance extension surface ("custom worker types extend the base or a built-in") is retired — a new worker type is a new definition in the Config Repo. Reason: Baseline Risk routing needed reduced and thorough review as two worker types, and the operator wants new workers (a PR-triggered tester, for example) to be config, not code.

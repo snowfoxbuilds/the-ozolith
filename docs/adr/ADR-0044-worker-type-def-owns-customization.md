@@ -17,7 +17,10 @@ image + setup instructions, Knowledge Source (git URL + pin), driver
 reference (`builtin:<name>` / `drivers/<name>`), Agent adapter,
 workspace (target repo), and secret names. *(Amended by ADR-0047:
 workspace and secret names are the type's defaults; a Stack may rebind
-either per placement — see Amendments.)* The **Agent adapter**
+either per placement — see Amendments.)* *(Amended 2026-09-03, #120:
+the tuple also declares what the worker does — kind `on`, Intake,
+outputs with an Outcome Table and label groups, the prompt reference,
+`rounds`, and `chain_on`; see Amendments.)* The **Agent adapter**
 (which one-shot CLI the harness invokes — Claude Code, Pi) is the
 variable; the harness itself is immutable plumbing. A **Stack** stays
 the thin generic unit: worker type + placement + desired state. The
@@ -98,6 +101,25 @@ Flight Deck worker type has the identical shape minus the driver.
     or CLI version change is live at the next agent-CLI launch (the CLI
     pin-strict: new launches refuse until the exact pinned version has
     converged on the node).
+- **2026-09-03 (#120)**: the tuple gains the declarative worker fields
+  (ADR-0057): `on = "issue" | "pr"` (Issue Worker / PR Worker),
+  `[intake] requires / excludes / one_of / consumes`, `[output] fields`
+  (allowlist over issue_body, issue_comment, issue_labels, pr_title,
+  pr_body, pr_contents, pr_labels, pr_comment, pr_resume_point),
+  `[output.outcome]` (the Outcome Table), `[output.pr_labels]` /
+  `[output.issue_labels]` one_of groups, `[output.mirror] issue_to_pr`,
+  `prompt = "prompts/<name>.md"`, `rounds` (PR Workers, required), and
+  `[chain_on]`. Unknown definition keys are refused at ingest (as Stack
+  keys already are). Identity treatment: the **prompt** is
+  identity-bearing — its content hash enters the instruction hash, so a
+  different prompt is a different candidate (ADR-0054) — even though it
+  is delivered driver-side through the Config Distribution, never baked;
+  the routing and behaviour fields (`on`, intake, output, `rounds`,
+  `chain_on`) join the driver/workspace/secrets class: they change what
+  the driver does, not the image, and trigger no rebuild. Implementer,
+  Reviewer, and Initializer become shipped default definitions. Reason:
+  worker behaviour moved from code (ADR-0020 subclasses) into the
+  definition so new worker types are config.
 
 ## Relevant PRs
 

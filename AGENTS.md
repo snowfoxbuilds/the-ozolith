@@ -20,6 +20,7 @@ Each spec's own Relevant ADRs appendix reaches the decisions behind it; the amen
 | --- | --- |
 | docs/specs/DIRECTION.md | Motivation, core theses, and non-goals — the direction the design serves |
 | docs/specs/ARCHITECTURE.md | Monorepo layout, components, and sync model |
-| docs/specs/AGENTIC-CODING-PIPELINE.md | Staged autonomous development: issues, gate, human merge |
+| docs/specs/AGENTIC-CODING-PIPELINE.md | Staged autonomous development: issues, gate, human merge — the shipped configuration of the Worker Model |
+| docs/specs/WORKER-MODEL.md | Declarative worker types: Issue and PR Worker kinds, intake, claims, outputs and the Outcome Table, prompt, rounds |
 | docs/specs/NODE-SUBSTRATE.md | Cluster substrate: Control Node, Node Daemon, Config Repo, secrets, extension points |
-| docs/specs/BENCH-CONTRACT.md | Bench export surface: Candidate Bundles, identity spec + verifier, standalone build, and the Run Contract for implementer and review benchmark modes |
+| docs/specs/BENCH-CONTRACT.md | Bench export surface: Candidate Bundles, identity spec + verifier, standalone build, and the Run Contract for Issue Worker and PR Worker benchmark modes |
