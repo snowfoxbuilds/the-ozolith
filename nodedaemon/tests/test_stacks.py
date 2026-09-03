@@ -4,6 +4,7 @@ wire-model and materialization units."""
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -209,6 +210,38 @@ def test_driver_launcher_resolves_to_the_venv_absolute_path(tmp_path: Path):
     (argv, env) = popen.calls[0]
     assert argv == [str(launcher_dir / "theozolith-driver"), "builtin:implementer", "--loop"]
     assert env["THEOZOLITH_RUN_IMAGE"] == "x:1"  # env still flows through
+
+
+def test_default_launcher_dir_is_the_venv_not_the_symlinked_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The DEFAULT launcher_dir (no injection) is the venv bin/, derived from
+    sys.prefix — never the directory sys.executable's symlink resolves to.
+    python3 -m venv makes bin/python a symlink to the system interpreter, so
+    Path(sys.executable).resolve().parent lands in /usr/bin, where no launcher
+    is installed (#94). Builds that real on-disk shape and asserts the default
+    still resolves the launcher inside the venv."""
+    venv = tmp_path / "venv"
+    venv_bin = venv / "bin"
+    _installed_launcher(venv_bin)  # <venv>/bin/theozolith-driver, executable
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\nversion = 3.12.0\n")
+    system_bin = tmp_path / "usr" / "bin"  # the interpreter lives OUTSIDE the venv
+    system_bin.mkdir(parents=True)
+    system_python = system_bin / "python3.12"
+    system_python.write_text("")
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(system_python)  # exactly what `python -m venv` does
+
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    # Guard: the symlink really does escape the venv, so this test would pass
+    # trivially against the old .resolve()-based default only if that trap
+    # were absent — it is not.
+    assert Path(sys.executable).resolve().parent == system_bin != venv_bin
+
+    supervisor = ProcessSupervisor(log=lambda *_: None)  # no launcher_dir
+    argv = supervisor.resolve_command("theozolith-driver builtin:implementer --loop")
+    assert argv == [str(venv_bin / "theozolith-driver"), "builtin:implementer", "--loop"]
 
 
 def test_non_launcher_command_keeps_path_semantics(tmp_path: Path):
