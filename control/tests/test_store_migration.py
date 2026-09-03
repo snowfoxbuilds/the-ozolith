@@ -12,6 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from controlrig import make_rig
 from theozolith_control.store import Store
 
 # The events table exactly as it shipped before the ADR-0020 sweep: a `worker`
@@ -56,13 +57,19 @@ def test_old_schema_store_opens_with_backfilled_driver_column(tmp_path):
 
     columns = {r["name"] for r in store._db.execute("PRAGMA table_info(events)")}
     assert "driver" in columns and "worker" not in columns  # renamed, not duplicated
+    assert "repo" in columns  # ALTER-added (ADR-0056), NULL on legacy rows
 
     # The old `worker` value is carried over as the backfill: the driver-keyed
-    # liveness query and the live-claim reader both see it under `driver`.
+    # liveness query sees it under `driver`.
     assert store.driver_last_seen("worker-a") == 1000.0
-    claims = store.live_claims()
-    assert len(claims) == 1
-    assert claims[0].driver == "worker-a" and claims[0].issue == 5
+    # The legacy fence (ADR-0056): a pre-ADR-0056 run event has no repo, so
+    # it never enters claim logic — yet stays readable as events history.
+    assert store.live_claims() == []
+    events = store.events(type="theozolith.run", issue=5)
+    assert len(events) == 1 and events[0]["phase"] == "claimed"
+    # Legacy rows surface in the display read model with repo None.
+    (state,) = store.run_states()
+    assert state["issue"] == 5 and state["repo"] is None
 
 
 # A nodes table as it shipped in the FIRST config-distribution cut (ADR-0042):
@@ -134,3 +141,158 @@ def test_old_db_gains_the_cli_status_table(tmp_path):
     assert rows[0]["error_message"].startswith("claude 2.1.257")
     store.record_cli_status("box1", [])
     assert store.fleet_state()["cli_status"] == []
+
+
+# The six coordination cache tables exactly as they shipped before ADR-0056:
+# keyed by bare issue number, no repo anywhere — plus the pre-ADR-0056 drivers
+# registry.
+_OLD_COORDINATION = """
+CREATE TABLE grants (
+    issue INTEGER PRIMARY KEY,
+    worker TEXT NOT NULL,
+    node TEXT NOT NULL DEFAULT '',
+    login TEXT NOT NULL,
+    granted_at REAL NOT NULL
+);
+CREATE TABLE malformed_states (
+    issue INTEGER PRIMARY KEY,
+    detail TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+CREATE TABLE dispatch_waits (
+    issue INTEGER PRIMARY KEY,
+    reason TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+CREATE TABLE zombie_flags (
+    issue INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    worker TEXT NOT NULL DEFAULT '',
+    node TEXT NOT NULL DEFAULT '',
+    flagged_at REAL NOT NULL,
+    PRIMARY KEY (issue, run_id)
+);
+CREATE TABLE janitor_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    acted_at REAL NOT NULL
+);
+CREATE TABLE chained_dependents (
+    dependent_pr INTEGER PRIMARY KEY,
+    blocker_issue INTEGER NOT NULL,
+    blocker_pr INTEGER NOT NULL,
+    blocker_state TEXT NOT NULL,
+    recorded_sha TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+CREATE TABLE drivers (
+    worker TEXT PRIMARY KEY,
+    node TEXT NOT NULL DEFAULT '',
+    login TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    registered_at REAL NOT NULL,
+    last_dispatch_at REAL NOT NULL
+);
+"""
+
+_SIX_CACHE_TABLES = (
+    "grants",
+    "malformed_states",
+    "dispatch_waits",
+    "zombie_flags",
+    "janitor_actions",
+    "chained_dependents",
+)
+
+
+def test_pre_adr0056_cache_tables_are_dropped_and_recreated_empty(tmp_path):
+    """The ADR-0056 re-key: a pre-ADR-0056 cache.db opens with the six
+    coordination cache tables recreated EMPTY with the repo column — never a
+    backfill (a guessed repo would be the wrong-repo collision the re-key
+    prevents; the next dispatch pass rebuilds the rows from GitHub, which is
+    the ADR-0016 cache doctrine). drivers is a registry, so it keeps its
+    rows and ALTER-gains repo/stack."""
+    path = tmp_path / "cache.db"
+    db = sqlite3.connect(str(path))
+    db.executescript(_OLD_COORDINATION)
+    db.execute(
+        "INSERT INTO grants (issue, worker, node, login, granted_at)"
+        " VALUES (7, 'worker-a', 'box1', 'ozolith-worker-a', 100.0)"
+    )
+    db.execute(
+        "INSERT INTO malformed_states (issue, detail, first_seen, last_seen)"
+        " VALUES (9, 'failed + plan_ready', 100.0, 100.0)"
+    )
+    db.execute(
+        "INSERT INTO janitor_actions (issue, run_id, worker, reason, acted_at)"
+        " VALUES (5, 'r1', 'worker-a', 'escalated', 100.0)"
+    )
+    db.execute(
+        "INSERT INTO drivers (worker, node, login, role, registered_at, last_dispatch_at)"
+        " VALUES ('worker-a', 'box1', 'ozolith-worker-a', 'implementer', 100.0, 100.0)"
+    )
+    db.commit()
+    db.close()
+
+    store = Store(path, clock=lambda: 200.0)
+    for table in _SIX_CACHE_TABLES:
+        info = {r["name"]: r for r in store._db.execute(f"PRAGMA table_info({table})")}
+        assert "repo" in info, table
+        # janitor_actions.repo is the ONE nullable cache column — NULL marks
+        # a node-scoped act, never a '' sentinel; every other cache table's
+        # repo is NOT NULL (ADR-0056).
+        expect_notnull = 0 if table == "janitor_actions" else 1
+        assert info["repo"]["notnull"] == expect_notnull, table
+        count = store._db.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        assert count == 0, table  # recreated empty, never backfilled
+    # The registry survived with its rows, repo/stack defaulting to ''.
+    (driver,) = store.drivers()
+    assert driver["worker"] == "worker-a"
+    assert driver["repo"] == "" and driver["stack"] == ""
+    # The re-keyed accessors work against the recreated tables.
+    store.record_grant("acme/sandbox", 7, "worker-a", "box1", "ozolith-worker-a")
+    assert store.granted_issues("acme/sandbox") == {7}
+
+
+def test_migrated_rig_rebuilds_grants_from_github_on_the_next_pass(tmp_path):
+    """The drop is safe because the rebuild doctrine holds (ADR-0016): the
+    app opens a pre-ADR-0056 cache.db (tables recreated empty, old grant
+    gone) and the next dispatch pass re-derives the grant state from what
+    GitHub answers — the cache was never the truth."""
+    path = tmp_path / "data" / "cache" / "cache.db"
+    path.parent.mkdir(parents=True)
+    db = sqlite3.connect(str(path))
+    db.executescript(_OLD_COORDINATION)
+    db.execute(
+        "INSERT INTO grants (issue, worker, node, login, granted_at)"
+        " VALUES (7, 'worker-a', 'box1', 'ozolith-worker-a', 100.0)"
+    )
+    db.commit()
+    db.close()
+
+    control = make_rig(tmp_path)
+    assert control.store.granted_issues("acme/sandbox") == set()  # never backfilled
+    # GitHub still lists #7 as plan_ready and unassigned — the stale grant
+    # row is gone, so the pass grants it afresh, write-through and keyed.
+    control.github.add_issue(7, labels={"plan_ready"}, assignees=[])
+    assert control.dispatch().json()["issue"]["number"] == 7
+    assert control.store.granted_issues("acme/sandbox") == {7}
+
+
+def test_current_schema_store_reopens_without_dropping(tmp_path):
+    """The drop is a one-time migration: a store already carrying the repo
+    key keeps its coordination rows across a reopen (a restart must never
+    empty the caches)."""
+    path = tmp_path / "cache.db"
+    store = Store(path, clock=lambda: 100.0)
+    store.record_grant("acme/sandbox", 7, "worker-a", "box1", "ozolith-worker-a")
+    store.close()
+
+    reopened = Store(path, clock=lambda: 200.0)
+    assert reopened.granted_issues("acme/sandbox") == {7}

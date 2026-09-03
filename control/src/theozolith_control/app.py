@@ -39,7 +39,14 @@ from theozolith_control.crypto import SecretBox
 from theozolith_control.dispatch import Dispatcher
 from theozolith_control.secretstore import SecretStore
 from theozolith_control.settings import ControlSettings
-from theozolith_control.store import COMMAND_VERBS, EVENT_ERROR, EVENT_PROGRESS, Store
+from theozolith_control.store import (
+    COMMAND_VERBS,
+    EVENT_ERROR,
+    EVENT_PROGRESS,
+    EVENT_REVIEW,
+    EVENT_RUN,
+    Store,
+)
 
 # Ingestion size caps (ADR-0016): the transcript tail inside a progress
 # event, and any single event payload. Oversized tails are truncated (the
@@ -131,7 +138,7 @@ def create_app(
     box: SecretBox,
     *,
     config_loader=None,
-    github_client=None,
+    github_clients=None,
 ) -> FastAPI:
     load = config_loader or (lambda: load_config(settings.config_repo))
     app = FastAPI(title="TheOzolith Control Node", docs_url=None, redoc_url=None)
@@ -141,14 +148,23 @@ def create_app(
     app.state.store = store
     app.state.secret_store = secret_store
 
-    if github_client is None and settings.coordination_jobs_enabled:
+    # ``github_clients`` is a per-repo client factory (ADR-0056): every
+    # dispatch request names its repo, and all clients share the ONE control
+    # PAT and api_url (v1 doctrine: one GitHub host per Control Node).
+    # Memoized so a repo's rate-limit state lives in one client instance.
+    if github_clients is None and settings.coordination_jobs_enabled:
         from theozolith_worker.githubapi import GitHubClient
 
-        github_client = GitHubClient(
-            settings.repo or "", settings.github_token or "", settings.api_url
-        )
-    dispatcher = Dispatcher(store, github_client) if github_client is not None else None
-    app.state.github_client = github_client
+        memo: dict[str, Any] = {}
+
+        def _make_client(repo: str) -> Any:
+            if repo not in memo:
+                memo[repo] = GitHubClient(repo, settings.github_token or "", settings.api_url)
+            return memo[repo]
+
+        github_clients = _make_client
+    dispatcher = Dispatcher(store, github_clients) if github_clients is not None else None
+    app.state.github_client_factory = github_clients
 
     # Lint warnings are printed once per distinct config commit, not on every
     # heartbeat — the journal stays readable and a repo edit re-surfaces them.
@@ -338,7 +354,13 @@ def create_app(
         # An event declaring a node must come from that node's token —
         # events are facts about the past, and the past has an author.
         _node_auth(request, str(body.get("node", "")) or None)
-        _require(body, "type", str)
+        event_type = _require(body, "type", str)
+        if event_type in (EVENT_RUN, EVENT_REVIEW):
+            # Coordination events carry the repo they act in (ADR-0056):
+            # fail-closed, no compatibility fallback — a repo-less run or
+            # review event can never key a coordination cache row.
+            # Progress and error telemetry are unchanged.
+            _require(body, "repo", str)
         store.record_event(_capped_event(body))
         return {"ok": True}
 
@@ -366,31 +388,75 @@ def create_app(
             )
         worker = _require(body, "driver", str)
         login = _require(body, "login", str)
+        # The Claim Protocol is keyed by repository (ADR-0056): every request
+        # names the repo the Driver will check out and the Stack it runs as —
+        # fail-closed, no compatibility fallback for a repo-less request.
+        repo = _require(body, "repo", str)
+        stack = _require(body, "stack", str)
+        if not configrepo.valid_workspace(repo):
+            raise HTTPException(status_code=400, detail=f"'repo' must be owner/name, got {repo!r}")
         # The pin-eligibility gate (ADR-0015 revision) needs the recorded
         # pin. Fail-open on a broken Config Repo: an unreadable repo must
         # not silence dispatch — it is loudly visible everywhere else.
         # The same fail-open-on-broken-repo posture covers the config-
-        # distribution gate (ADR-0042): an unreadable repo must not silence
-        # dispatch — it is loudly visible everywhere else.
-        try:
-            config = _config()
-            pin = config.product_version
-            drivers_hash = config.drivers_hash
-        except HTTPException:
-            pin = ""
-            drivers_hash = ""
+        # distribution gate (ADR-0042) and the ADR-0056 Stack verification
+        # below. An ABSENT Config Repo (the ADR-0004 deletion-test boot) is
+        # the other fail-open case, guarded explicitly: load_config answers
+        # an EMPTY DeployConfig for a missing directory rather than raising,
+        # and an ingested Pinned Build with zero Stacks is NOT absent — it
+        # verifies (and refuses) like any other loaded build.
+        config: DeployConfig | None = None
+        if settings.config_repo.is_dir():
+            try:
+                config = _config()
+            except HTTPException:
+                config = None
+        pin = config.product_version if config is not None else ""
+        drivers_hash = config.drivers_hash if config is not None else ""
+        if config is not None:
+            # Pinned-Build verification (ADR-0056), before the role branch:
+            # the named Stack must exist, be placed on the authenticated
+            # node, and resolve to exactly the request's repo — else 403,
+            # never a fallback to the request's repo. A verified request
+            # with nothing eligible still gets the reason answer below.
+            named = next((s for s in config.stacks if s.name == stack), None)
+            if named is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"stack {stack!r} is not in the Pinned Build;"
+                        f" request names {repo!r} (ADR-0056)"
+                    ),
+                )
+            if named.node != node:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"stack {stack!r} is placed on node {named.node!r}, not"
+                        f" {node!r}; request names {repo!r} (ADR-0056)"
+                    ),
+                )
+            workspace = named.env.get("THEOZOLITH_REPO", "")
+            if workspace != repo:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"stack {stack!r} on node {named.node!r} resolves workspace"
+                        f" {workspace!r}; request names {repo!r} (ADR-0056)"
+                    ),
+                )
         # Off the event loop: the grant path does real GitHub round-trips
         # (with rate-limit sleeps) that must never stall heartbeats or the
         # terminal websockets. The dispatcher's own lock still serializes.
         if role == "implementer":
             return await asyncio.to_thread(
                 lambda: dispatcher.grant_work(
-                    worker, node, login, pin=pin, drivers_hash=drivers_hash
+                    repo, worker, node, login, stack=stack, pin=pin, drivers_hash=drivers_hash
                 )
             )
         return await asyncio.to_thread(
             lambda: dispatcher.review_targets(
-                worker, node, login, pin=pin, drivers_hash=drivers_hash
+                repo, worker, node, login, stack=stack, pin=pin, drivers_hash=drivers_hash
             )
         )
 
@@ -586,9 +652,11 @@ def create_app(
         command_id = store.queue_command(node, verb, target, force)
         if verb in ("recycle", "update") and store.release_quarantine(node):
             # Recycle/update is one of the two human quarantine releases
-            # (ADR-0016; the other is the explicit unquarantine).
+            # (ADR-0016; the other is the explicit unquarantine). Quarantine
+            # is node-scoped (ADR-0056): repo=None marks a node act — NULL,
+            # never a "" sentinel, on the one nullable cache column.
             store.record_janitor_action(
-                0, "", "", f"node {node}: quarantine released by {verb} command"
+                None, 0, "", "", f"node {node}: quarantine released by {verb} command"
             )
         return {"id": command_id}
 
@@ -618,7 +686,7 @@ def create_app(
             store.queue_command(node, "update", None, False)
             if store.release_quarantine(node):
                 store.record_janitor_action(
-                    0, "", "", f"node {node}: quarantine released by update fan-out"
+                    None, 0, "", "", f"node {node}: quarantine released by update fan-out"
                 )
         return {"version": version, "queued": nodes}
 
@@ -790,7 +858,9 @@ def create_app(
         _authorize(request, settings.admin_token, "admin")
         released = store.release_quarantine(node)
         if released:
-            store.record_janitor_action(0, "", "", f"node {node}: quarantine released by operator")
+            store.record_janitor_action(
+                None, 0, "", "", f"node {node}: quarantine released by operator"
+            )
         return {"released": released}
 
     @app.get("/api/v1/state")

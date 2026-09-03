@@ -77,6 +77,8 @@ class Worker:
         self.dispatch = dispatch or DispatchClient(
             config.control_node_url,
             config.control_token,
+            repo=config.repo,
+            stack=config.stack,
             ca=config.control_ca,
             log=log,
             on_error=lambda error_class, message: emit_error(

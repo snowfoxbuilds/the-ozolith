@@ -61,6 +61,10 @@ class WireStack:
     image: str = ""
     ports: tuple[str, ...] = ()
     volumes: tuple[str, ...] = ()
+    # tmpfs mounts for the single-image container form (grilling 2026-09-02):
+    # docker `--tmpfs` value syntax, beside volumes. A missing wire key degrades
+    # to today's behavior (old control / new daemon), so skew stays advisory.
+    tmpfs: tuple[str, ...] = ()
     compose_files: tuple[dict[str, str], ...] = ()  # [{name, content}]
 
     @classmethod
@@ -75,6 +79,7 @@ class WireStack:
             image=str(data.get("image", "")),
             ports=tuple(str(p) for p in (data.get("ports") or [])),
             volumes=tuple(str(v) for v in (data.get("volumes") or [])),
+            tmpfs=tuple(str(t) for t in (data.get("tmpfs") or [])),
             compose_files=tuple(
                 {"name": str(f.get("name", "")), "content": str(f.get("content", ""))}
                 for f in (data.get("compose_files") or [])

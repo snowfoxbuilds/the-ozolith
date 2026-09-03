@@ -48,11 +48,20 @@ def control_node():
 def test_request_work_returns_the_granted_issue(control_node):
     url, answers, seen = control_node
     answers.append((200, {"issue": {"number": 7, "title": "T", "body": "B", "labels": []}}))
-    granted = DispatchClient(url, "node-token").request_work("worker-a", "box1", "login-a")
+    client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="impl-a")
+    granted = client.request_work("worker-a", "box1", "login-a")
     assert granted is not None and granted["number"] == 7
-    # The request carries the driver's identity — registration included.
+    # The request carries the driver's identity — registration included —
+    # and names its repo and Stack (ADR-0056).
     assert seen == [
-        {"role": "implementer", "driver": "worker-a", "node": "box1", "login": "login-a"}
+        {
+            "role": "implementer",
+            "driver": "worker-a",
+            "node": "box1",
+            "login": "login-a",
+            "repo": "acme/sandbox",
+            "stack": "impl-a",
+        }
     ]
 
 
@@ -66,7 +75,7 @@ def test_no_grant_and_refusals_answer_none(control_node):
         ]
     )
     logs: list[str] = []
-    client = DispatchClient(url, "node-token", log=logs.append)
+    client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="impl-a", log=logs.append)
     assert client.request_work("w", "n", "l") is None
     assert client.request_work("w", "n", "l") is None
     assert client.request_work("w", "n", "l") is None
@@ -77,14 +86,18 @@ def test_no_grant_and_refusals_answer_none(control_node):
 def test_review_targets_and_pause(control_node):
     url, answers, seen = control_node
     answers.append((200, {"prs": [11, 13]}))
-    client = DispatchClient(url, "node-token")
+    client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="rev-a")
     assert client.review_targets("reviewer-1", "box1", "login-r") == [11, 13]
     assert seen[-1]["role"] == "reviewer"
+    # The reviewer side names its repo and Stack too (ADR-0056).
+    assert seen[-1]["repo"] == "acme/sandbox" and seen[-1]["stack"] == "rev-a"
 
 
 def test_unreachable_control_node_pauses_cleanly():
     logs: list[str] = []
-    client = DispatchClient("http://127.0.0.1:1", "t", timeout=0.2, log=logs.append)
+    client = DispatchClient(
+        "http://127.0.0.1:1", "t", repo="acme/sandbox", stack="impl-a", timeout=0.2, log=logs.append
+    )
     assert client.request_work("w", "n", "l") is None
     assert client.review_targets("w", "n", "l") is None
     assert any("unreachable" in line for line in logs)
@@ -114,18 +127,39 @@ def test_backoff_delay_doubles_to_the_cap_and_recovers():
 
 def test_unreachability_flag_tracks_the_last_pass(control_node):
     url, answers, _ = control_node
-    client = DispatchClient(url, "node-token")
+    client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="impl-a")
     answers.append((200, {"issue": None}))
     client.request_work("w", "n", "l")
     assert client.last_unreachable is False
 
-    dead = DispatchClient("http://127.0.0.1:1", "t", timeout=0.2)
+    dead = DispatchClient(
+        "http://127.0.0.1:1", "t", repo="acme/sandbox", stack="impl-a", timeout=0.2
+    )
     dead.request_work("w", "n", "l")
     assert dead.last_unreachable is True
 
     answers.append((503, {"detail": "no PAT"}))
     client.request_work("w", "n", "l")
     assert client.last_unreachable is False  # a refusal is not unreachability
+
+
+def test_repo_and_stack_refusals_log_without_backoff(control_node):
+    """ADR-0056: a 400 (repo-less request against a fail-closed endpoint) and
+    a 403 (Pinned-Build verification refusal) are dispatch refusals, never
+    unreachability — logged as `dispatch refused`, no backoff."""
+    url, answers, _ = control_node
+    answers.append((400, {"detail": "'repo' must be a non-empty str"}))
+    answers.append((403, {"detail": "stack 'impl-a' resolves workspace 'acme/other' (ADR-0056)"}))
+    logs: list[str] = []
+    client = DispatchClient(url, "node-token", repo="acme/sandbox", stack="impl-a", log=logs.append)
+
+    assert client.request_work("w", "n", "l") is None
+    assert client.last_unreachable is False
+    assert client.request_work("w", "n", "l") is None
+    assert client.last_unreachable is False
+    assert sum("dispatch refused" in line for line in logs) == 2
+    assert any("HTTP 400" in line for line in logs)
+    assert any("HTTP 403" in line for line in logs)
 
 
 # -- OZ-03: the node token stays off a plaintext non-loopback wire ---------------
@@ -137,7 +171,11 @@ def test_off_box_http_url_is_refused_without_dialing():
     driver pauses and surfaces control-url-refused."""
     errors: list[tuple[str, str]] = []
     client = DispatchClient(
-        "http://elsewhere.test", "node-token", on_error=lambda c, m: errors.append((c, m))
+        "http://elsewhere.test",
+        "node-token",
+        repo="acme/sandbox",
+        stack="impl-a",
+        on_error=lambda c, m: errors.append((c, m)),
     )
     assert client.request_work("w", "n", "l") is None
     assert client.last_unreachable is True
@@ -211,12 +249,23 @@ def test_dispatch_failures_fire_the_error_hook(control_node):
     answers.append((503, {"detail": "dispatch requires a control PAT"}))
     answers.append((200, {"issue": {"number": "not-an-int"}}))
     errors: list[tuple[str, str]] = []
-    client = DispatchClient(url, "node-token", on_error=lambda c, m: errors.append((c, m)))
+    client = DispatchClient(
+        url,
+        "node-token",
+        repo="acme/sandbox",
+        stack="impl-a",
+        on_error=lambda c, m: errors.append((c, m)),
+    )
 
     assert client.request_work("w", "n", "l") is None
     assert client.request_work("w", "n", "l") is None
     unreachable = DispatchClient(
-        "http://127.0.0.1:1", "t", timeout=0.2, on_error=lambda c, m: errors.append((c, m))
+        "http://127.0.0.1:1",
+        "t",
+        repo="acme/sandbox",
+        stack="impl-a",
+        timeout=0.2,
+        on_error=lambda c, m: errors.append((c, m)),
     )
     assert unreachable.request_work("w", "n", "l") is None
 

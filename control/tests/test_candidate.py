@@ -262,6 +262,36 @@ def test_export_codex_type_bakes_the_codex_view(tmp_path):
     assert candidate.verify_bundle(bundle) == summary
 
 
+def test_export_of_a_driverless_type_declaring_tmpfs_omits_it_from_the_manifest(tmp_path):
+    """tmpfs is node-side runtime state, never image identity (exactly parallel
+    to command/volumes, which also do not travel): a driverless type declaring
+    it exports fine — the shared parse accepts the field — and the bundle
+    manifest carries no ``tmpfs`` key, so verify's unknown-field refusal is
+    untouched and a verified build sees identical bytes (#109)."""
+    source = tmp_path / "config-src"
+    (source / "worker-types").mkdir(parents=True)
+    (source / "worker-types" / "deck.toml").write_text(
+        f'base = "{BASE_REF}"\nsetup = ["apt-get update"]\n'
+        'adapter = "claude"\ncommand = "sleep 30"\n'
+        'tmpfs = ["/tmp:size=8g", "/scratch"]\n'
+        'workspace = "acme/sandbox"\n'
+        '[secrets]\nGITHUB_TOKEN = "github-implementer"\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "bundle"
+    summary = candidate.export_candidate(
+        source, "deck", out, resolve_digest=resolve_a, now=lambda: NOW
+    )
+    manifest = json.loads((out / "candidate.json").read_text(encoding="utf-8"))
+    assert manifest["driver"] == ""  # driverless
+    assert "tmpfs" not in manifest  # runtime state, not image identity
+    # No bundle byte carries the field either — it never reached the context.
+    for path in out.rglob("*"):
+        if path.is_file():
+            assert b"tmpfs" not in path.read_bytes()
+    assert candidate.verify_bundle(out) == summary  # unknown-field refusal intact
+
+
 def test_export_without_knowledge_writes_no_tree(tmp_path):
     bundle, summary = export_gold(tmp_path, knowledge="")
     assert sorted(entry.name for entry in bundle.iterdir()) == ["Dockerfile", "candidate.json"]

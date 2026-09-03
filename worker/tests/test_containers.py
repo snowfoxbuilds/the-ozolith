@@ -11,6 +11,7 @@ from theozolith_worker.config import ConfigError, load_config
 from theozolith_worker.containers import (
     ContainerSpec,
     DockerEngine,
+    EngineError,
     container_labels,
     review_container_name,
     run_container_name,
@@ -165,3 +166,172 @@ def test_docker_launch_flags_and_secret_env_handling(tmp_path):
         assert name in argv
         assert all(value not in arg for arg in argv)
         assert entry["env"][name] == value
+
+
+# -- fail-closed aliveness observation (#109, grilling 2026-09-02) ----------------
+
+
+def scripted_docker(tmp_path: Path, plan: dict) -> Path:
+    """A docker stand-in that returns scripted ``(rc, stdout, stderr)`` per
+    subcommand. ``plan`` maps the docker subcommand (argv[0], e.g. ``inspect`` /
+    ``wait``) to a list of ``[rc, stdout, stderr]``; each call to that subcommand
+    pops the next response, holding on the last once the list is exhausted."""
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    count_path = tmp_path / "counts.json"
+    count_path.write_text("{}", encoding="utf-8")
+    binary = tmp_path / "docker"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"plan = json.load(open({str(plan_path)!r}))\n"
+        f"counts = json.load(open({str(count_path)!r}))\n"
+        "sub = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "responses = plan.get(sub, [[0, '', '']])\n"
+        "i = counts.get(sub, 0)\n"
+        "rc, out, err = responses[min(i, len(responses) - 1)]\n"
+        "counts[sub] = i + 1\n"
+        f"json.dump(counts, open({str(count_path)!r}, 'w'))\n"
+        "sys.stdout.write(out)\n"
+        "sys.stderr.write(err)\n"
+        "sys.exit(rc)\n"
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+    return binary
+
+
+def test_alive_retries_a_transient_inspect_blip_then_reports_the_truth(tmp_path):
+    """A non-definitive inspect failure (a transient dockerd 500) is NEVER read
+    as 'not alive': the aliveness path retries bounded and returns the true
+    aliveness once the blip clears — the whole point of #109 on the driver."""
+    binary = scripted_docker(
+        tmp_path,
+        {
+            "inspect": [
+                [1, "", "Error response from daemon: 500 Internal Server Error"],  # blip
+                [0, "true\n", ""],  # recovered: the container is running
+            ]
+        },
+    )
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    assert engine.alive("ozolith-run-r1") is True  # the blip did not read as an exit
+    assert len(slept) == 1  # retried once, with the injected (no-delay) sleep
+
+
+def test_alive_reads_no_such_object_as_absent_without_retrying(tmp_path):
+    """Docker's definitive no-such-object answer is evidence of absence (an
+    exited --rm container): reported not-alive at once, with no retry."""
+    binary = scripted_docker(
+        tmp_path, {"inspect": [[1, "", "Error: No such object: ozolith-run-r1"]]}
+    )
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    assert engine.alive("ozolith-run-r1") is False
+    assert slept == []  # a definitive answer never retries
+
+
+def test_alive_raises_after_exhausting_retries_on_an_unobservable_inspect(tmp_path):
+    """When every attempt fails non-definitively, aliveness is unobservable —
+    it RAISES EngineError rather than fabricate 'not alive'. The runner maps an
+    escaping EngineError to the ADR-0016 infra lane."""
+    binary = scripted_docker(
+        tmp_path, {"inspect": [[1, "", "Error response from daemon: 500 Internal"]]}
+    )
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    with pytest.raises(EngineError, match="unobservable"):
+        engine.alive("ozolith-run-r1")
+    assert len(slept) == 2  # 3 attempts -> 2 inter-attempt sleeps, no real delay
+
+
+def test_wait_reads_a_removed_container_as_exited(tmp_path):
+    """``docker wait`` failing on an already-removed --rm container resolves
+    through the aliveness path: definitively absent -> exit 0."""
+    binary = scripted_docker(
+        tmp_path,
+        {
+            "wait": [[1, "", "Error: No such container: ozolith-run-r1"]],
+            "inspect": [[1, "", "Error: No such object: ozolith-run-r1"]],
+        },
+    )
+    engine = DockerEngine(binary=str(binary), sleep=lambda _s: None)
+    assert engine.wait("ozolith-run-r1", 5.0) == 0
+
+
+def test_wait_raises_rather_than_fabricate_an_exit_on_an_unobservable_inspect(tmp_path):
+    """``docker wait`` failing while the container is UNOBSERVABLE must never be
+    read as a clean exit 0 — it raises, so a finished Output Proposal is never
+    discarded by a transient blip at wait time."""
+    binary = scripted_docker(
+        tmp_path,
+        {
+            "wait": [[1, "", "Error response from daemon: 500"]],
+            "inspect": [[1, "", "Error response from daemon: 500"]],
+        },
+    )
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=lambda _s: None)
+    with pytest.raises(EngineError):
+        engine.wait("ozolith-run-r1", 5.0)
+
+
+# -- exact inspect truth values: only `true`/`false` are trusted at a zero exit --
+# `{{.State.Running}}` prints exactly `true` or `false` when the container
+# exists. ONLY those two are definitive; a zero exit carrying anything else
+# (blank, a partial line, an error string on stdout) is a failed read that
+# proves nothing — retried like any other blip, NEVER read as absence.
+
+
+def test_alive_reads_exact_false_as_definitive_absence_without_retrying(tmp_path):
+    """A zero-exit inspect printing exactly ``false`` is docker's definitive
+    'exists but not running' answer — absence, reported at once with no retry."""
+    binary = scripted_docker(tmp_path, {"inspect": [[0, "false\n", ""]]})
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    assert engine.alive("ozolith-run-r1") is False
+    assert slept == []  # a definitive answer never retries
+
+
+@pytest.mark.parametrize("stdout", ["", "\n", "   \n", "Maybe\n", "error: broken pipe\n"])
+def test_alive_retries_then_raises_on_a_zero_exit_non_boolean(tmp_path, stdout):
+    """A zero exit whose stdout is neither ``true`` nor ``false`` — blank, a
+    partial line, an error string the CLI mistakenly wrote to stdout — is a
+    FAILED read, not an absence: it retries bounded and RAISES when persistent,
+    never fabricating 'not alive' from a value that means nothing."""
+    binary = scripted_docker(tmp_path, {"inspect": [[0, stdout, ""]]})
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    with pytest.raises(EngineError, match="unobservable"):
+        engine.alive("ozolith-run-r1")
+    assert len(slept) == 2  # 3 attempts -> 2 inter-attempt sleeps
+
+
+def test_alive_recovers_from_a_zero_exit_non_boolean_then_reports_alive(tmp_path):
+    """A zero-exit non-boolean value clears on retry: a blank/garbled read
+    followed by a real ``true`` reports alive — the recovery the bounded retry
+    exists for, on the exit-zero side rather than the non-zero side."""
+    binary = scripted_docker(
+        tmp_path,
+        {"inspect": [[0, "\n", ""], [0, "true\n", ""]]},  # blank, then recovered
+    )
+    slept: list[float] = []
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=slept.append)
+    assert engine.alive("ozolith-run-r1") is True
+    assert len(slept) == 1  # retried once
+
+
+def test_wait_does_not_read_a_zero_exit_non_boolean_inspect_as_exit_0(tmp_path):
+    """``docker wait`` failing, then the aliveness fallback inspect returning a
+    ZERO exit with a non-boolean value: wait() must not fabricate exit 0 from a
+    garbled read — the value is unobservable, so it retries and RAISES (a
+    finished Output Proposal is never discarded by a malformed inspect)."""
+    binary = scripted_docker(
+        tmp_path,
+        {
+            "wait": [[1, "", "Error response from daemon: 500"]],
+            "inspect": [[0, "garbled-not-a-bool\n", ""]],
+        },
+    )
+    engine = DockerEngine(binary=str(binary), alive_attempts=3, sleep=lambda _s: None)
+    with pytest.raises(EngineError):
+        engine.wait("ozolith-run-r1", 5.0)

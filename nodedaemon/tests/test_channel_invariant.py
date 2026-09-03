@@ -184,6 +184,101 @@ def test_channel_transcript_is_desired_state_and_references_only(tmp_path: Path,
     assert env["IMPLEMENTER_GITHUB_TOKEN_FILE"] == str(config.secrets_dir / "github-implementer")
 
 
+def test_failed_observation_beat_crosses_the_real_control_unchanged(tmp_path: Path, monkeypatch):
+    """The fail-closed observation doctrine (#109) crosses the channel with NO
+    control-side change: the REAL Control Node accepts (200) a heartbeat that
+    reports an unobservable container Stack ``unknown`` — the exact top-level
+    key set unchanged — and the ``docker-observation-failed`` events that ride
+    the existing ``/events`` path, proving the 'no control-side change' claim end
+    to end. The unknown state and the observation events are references and
+    size-capped text only; no value payload appears."""
+    settings = ControlSettings(
+        data_dir=tmp_path / "data",
+        config_repo=tmp_path / "configs",
+        admin_token="admin-token",
+        repo=None,
+        github_token=None,
+        api_url="",
+        secrets_channel_ok=True,
+    )
+    # A generic container Stack on this node: the daemon observes it every beat.
+    stack_toml = tmp_path / "configs" / "stacks" / "flightdeck.toml"
+    stack_toml.parent.mkdir(parents=True)
+    stack_toml.write_text(
+        'kind = "container"\nnode = "box1"\nimage = "ghcr.io/example/flightdeck:1"\n',
+        encoding="utf-8",
+    )
+    store = Store(settings.cache_db_path)
+    secret_store = SecretStore(settings.store_db_path)
+    box = SecretBox(generate_key())
+    node_token = secret_store.mint_node_token("box1")
+    web = TestClient(create_app(settings, store, secret_store, box))
+
+    transcript: list[tuple[str, str, int, bytes, bytes]] = []
+
+    def tapped_transport(method: str, url: str, headers: dict, body: bytes | None):
+        path = url.removeprefix("http://control.test")
+        response = web.request(method, path, content=body, headers=headers)
+        transcript.append((method, path, response.status_code, body or b"", response.content))
+        return response.status_code, response.content
+
+    popen = FakePopen()
+    monkeypatch.setattr(
+        "theozolith_nodedaemon.stacks.os.killpg",
+        lambda pid, sig: popen.registry[pid].__setattr__("returncode", -sig),
+    )
+    docker = FakeDocker()
+    # Both listings fail: the per-Stack container read and the run-container read.
+    docker.fail_stack_containers.add("flightdeck")
+    docker.fail_run_containers = True
+    config = DaemonConfig(
+        node="box1",
+        control_url="http://control.test",
+        node_token=node_token,
+        tls_ca=None,
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "run",
+        heartbeat_seconds=60,
+        stop_grace_seconds=0.2,
+        insecure_dev=True,
+        version="0.3.0",
+    )
+    daemon = NodeDaemon(
+        config,
+        docker=docker,  # type: ignore[arg-type]
+        client=ControlClient(
+            "http://control.test", node_token, insecure_dev=True, transport=tapped_transport
+        ),
+        supervisor=ProcessSupervisor(
+            popen=popen, log=lambda *_: None, launcher_dir=_launcher_dir(tmp_path)
+        ),
+        log=lambda *_: None,
+    )
+    daemon.once()  # pass 1: the desired container Stack arrives and is applied
+    daemon.once()  # pass 2: it is now observed — and every docker read fails
+
+    # Only known channel paths, and the real control accepted every exchange.
+    assert {e[1] for e in transcript} <= KNOWN_CHANNEL_PATHS
+    assert all(status == 200 for _m, _p, status, _rq, _rs in transcript)
+
+    heartbeats = [e for e in transcript if e[1] == "/api/v1/heartbeats"]
+    assert heartbeats
+    body = json.loads(heartbeats[-1][3])
+    # The exact top-level key set is UNCHANGED — the failure adds no key.
+    assert set(body) == HEARTBEAT_REQUEST_KEYS
+    # The unobservable Stack rode as `unknown`, with its evidence rows withheld.
+    (deck,) = [s for s in body["stacks"] if s["name"] == "flightdeck"]
+    assert deck["state"] == "unknown"
+    assert not [r for r in body["stack_containers"] if r.get("stack") == "flightdeck"]
+    assert body["run_containers"] == []  # key present, empty for this beat
+
+    # The observation events crossed the existing /events path and were accepted.
+    events = [json.loads(e[3]) for e in transcript if e[1] == "/api/v1/events"]
+    obs = [e for e in events if e.get("error_class") == "docker-observation-failed"]
+    assert any("flightdeck" in e["message"] for e in obs)  # the container listing
+    assert any("run-container listing failed" in e["message"] for e in obs)
+
+
 def test_registry_credential_value_only_crosses_on_the_pull(tmp_path: Path, monkeypatch):
     """The channel invariant extends to the ADR-0049 registry pull credential:
     the heartbeat carries the names-only ``registry_secrets`` reference, and

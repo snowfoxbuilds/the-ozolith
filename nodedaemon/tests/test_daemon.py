@@ -520,7 +520,7 @@ def test_venv_not_writable_boot_preflight_emits_one_event(rig: Rig, monkeypatch)
     running — reconcile never depends on updatability (ADR-0015)."""
     monkeypatch.setattr(rig.daemon, "_venv_writable", lambda: "/opt/theozolith/bin is not writable")
     rig.daemon._boot_preflight()
-    events = [e for e in rig.control.events if e["error_class"] == "VenvNotWritable"]
+    events = [e for e in rig.control.events if e.get("error_class") == "VenvNotWritable"]
     assert len(events) == 1
     assert "re-run install-nodedaemon.sh" in events[0]["message"]
 
@@ -851,8 +851,9 @@ def test_container_start_failure_emits_a_size_capped_error_event(rig: Rig, monke
     rig.control.heartbeat_answers.append(heartbeat_response([container_stack("web")]))
     rig.daemon.once()
 
-    (event,) = rig.control.events
-    assert event["type"] == "theozolith.error"
+    # The replacement is announced (theozolith.stack-replace, #109) just before
+    # the run; the run then fails, surfacing the error event — filter to it.
+    (event,) = [e for e in rig.control.events if e["type"] == "theozolith.error"]
     assert event["component"] == "node-daemon"
     assert event["error_class"] == "RuntimeError"
     assert "stack web: reconcile failed" in event["message"]
@@ -894,7 +895,7 @@ def test_error_emission_failure_is_swallowed(rig: Rig, monkeypatch):
     monkeypatch.setattr(rig.control, "_answer", refuse_events)
     rig.control.heartbeat_answers.append(heartbeat_response([container_stack("web")]))
     rig.daemon.once()  # must not raise
-    assert any("error event not delivered" in line for line in rig.logs)
+    assert any("event not delivered" in line for line in rig.logs)
 
 
 # -- degraded mode (ADR-0006) -----------------------------------------------------------
@@ -2882,7 +2883,7 @@ def test_one_stale_compose_down_failure_does_not_block_an_unrelated_start(rig: R
     assert rig.daemon._supervisor.alive("keep")  # unrelated Stack converged past the failure
     assert "gone" in rig.daemon._applied_compose  # retry state retained (not forgotten)
     assert "ozolith-gone" in rig.docker.compose_projects
-    assert any(e["error_class"] == "DockerError" for e in rig.control.events)
+    assert any(e.get("error_class") == "DockerError" for e in rig.control.events)
 
 
 def test_one_stale_process_stop_failure_does_not_block_reconciliation(rig: Rig, monkeypatch):
@@ -2906,7 +2907,7 @@ def test_one_stale_process_stop_failure_does_not_block_reconciliation(rig: Rig, 
     rig.daemon.once()
     assert rig.docker.stacks["ozolith-stack-keep"]["image"] == "ghcr.io/x/k:1"  # converged
     assert "gone" in rig.daemon._supervisor.names()  # not lost: retried next pass
-    assert any(e["error_class"] == "RuntimeError" for e in rig.control.events)
+    assert any(e.get("error_class") == "RuntimeError" for e in rig.control.events)
 
 
 def test_failed_stale_cleanup_is_retried_on_a_later_pass(rig: Rig):
@@ -4443,7 +4444,7 @@ def test_container_to_process_with_failed_removal_gates_the_spawn(rig: Rig, tmp_
     assert rig.popen.spawned == []
     assert "ozolith-stack-worker" in rig.docker.stacks
     assert _active_forms(rig, "worker") == {"single-image"}
-    assert any(e["error_class"] == "DockerError" for e in rig.control.events)
+    assert any(e.get("error_class") == "DockerError" for e in rig.control.events)
 
     # Removal recovers: the retry removes the container, then spawns exactly once.
     rig.docker.fail_remove.discard("ozolith-stack-worker")

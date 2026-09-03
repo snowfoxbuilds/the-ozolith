@@ -485,6 +485,12 @@ class WorkerTypeDef:
     # must start its own script instead, never hand it to the harness as argv)
     command: str = ""
     volumes: tuple[str, ...] = ()  # driverless only
+    # tmpfs mounts (grilling 2026-09-02): docker `--tmpfs` value syntax, beside
+    # volumes and driverless-only (driver-created Run containers are the worker
+    # component's business, not the daemon's). NOT image-identity-bearing — it
+    # is node-side runtime state, not image bytes, so it never enters
+    # instruction_hash or the candidate manifest (exactly parallel to volumes).
+    tmpfs: tuple[str, ...] = ()  # driverless only
 
     @property
     def is_driver(self) -> bool:
@@ -681,6 +687,11 @@ class StackDef:
     image: str = ""  # container kind, single-image form
     ports: tuple[str, ...] = ()
     volumes: tuple[str, ...] = ()
+    # tmpfs mounts (grilling 2026-09-02): docker `--tmpfs` value syntax, beside
+    # volumes and shape-lint validated at parse (so at both ingest and config
+    # load). Container kind, single-image form (the compose path ignores it,
+    # exactly as it ignores volumes). Travels the wire via as_wire.
+    tmpfs: tuple[str, ...] = ()
     compose: str = ""  # container kind, compose form (repo-relative path)
     overlays: tuple[str, ...] = ()
     # Web-terminal attach command as a structured argv array; ``{host}`` and
@@ -706,6 +717,7 @@ class StackDef:
             "image": self.image,
             "ports": list(self.ports),
             "volumes": list(self.volumes),
+            "tmpfs": list(self.tmpfs),
             "compose_files": compose_files,  # [{name, content}] base first
         }
 
@@ -806,6 +818,31 @@ def _str_list(data: dict, key: str, context: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _tmpfs_list(data: dict, key: str, context: str) -> tuple[str, ...]:
+    """The tmpfs mount list (grilling 2026-09-02): ``_str_list`` shape plus a
+    MINIMAL entry lint — each entry is ``<path>`` or ``<path>:<opts>``, the path
+    (everything before the first ``:``) absolute and the optional ``:`` options
+    suffix non-empty and whitespace-free. Nothing deeper: option contents, size
+    units, and mount flags are docker's to validate. This is deliberately NOT
+    volume-string sniffing, and existing ``volumes`` strings stay entirely
+    unvalidated (out of scope). Fires at parse, so at BOTH ingest and config
+    load — ingest reuses this parse, so one validator covers both sites."""
+    entries = _str_list(data, key, context)
+    for entry in entries:
+        path, sep, opts = entry.partition(":")
+        if not path.startswith("/"):
+            raise ConfigRepoError(
+                f"{context}: {key!r} entry {entry!r} — the mount path before"
+                " ':' must be absolute (start with '/')"
+            )
+        if sep and (not opts or any(ch.isspace() for ch in opts)):
+            raise ConfigRepoError(
+                f"{context}: {key!r} entry {entry!r} — the ':' options suffix"
+                " must be non-empty and contain no whitespace"
+            )
+    return entries
+
+
 def _parse_attach(data: dict, context: str) -> tuple[str, ...]:
     """The attach argv: a list of strings in which ``{host}``/``{container}``
     appear only as complete elements. The untrusted identifiers can then
@@ -858,12 +895,13 @@ def _check_jobs_dirs(stacks: tuple[StackDef, ...]) -> None:
             claims[(stack.node, path)] = stack.name
 
 
-def _valid_workspace(value: str) -> bool:
+def valid_workspace(value: str) -> bool:
     """The documented workspace shape: exactly two non-empty path components
     (``owner/name``). Deliberately NOT GitHub's full naming policy — only the
     two-component promise the schema makes. Rejects ``/repo``, ``owner/``,
     ``owner/repo/extra``, ``///``, and any empty or whitespace-only
-    component (ADR-0044 amendment)."""
+    component (ADR-0044 amendment). Public since ADR-0056: the dispatch
+    endpoint validates the request's ``repo`` with the same predicate."""
     parts = value.split("/")
     return len(parts) == 2 and all(part.strip() for part in parts)
 
@@ -929,6 +967,7 @@ _MOVED_TO_WORKER_TYPE = (
     "overlays",
     "ports",
     "volumes",
+    "tmpfs",
 )
 _WORKER_TYPE_STACK_KEYS = ("worker_type", "node", "state", "env", "attach", "workspace", "secrets")
 
@@ -976,7 +1015,7 @@ def _parse_worker_type_stack(name: str, data: dict[str, Any], context: str) -> S
     # Per-placement target-repo binding (ADR-0047): overrides the type's
     # workspace default at resolution.
     workspace = _require_str(data, "workspace", context, default="")
-    if workspace and not _valid_workspace(workspace):
+    if workspace and not valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"
@@ -1082,6 +1121,7 @@ def _parse_generic_stack(name: str, data: dict[str, Any], context: str) -> Stack
         image=_require_str(data, "image", context, default=""),
         ports=_str_list(data, "ports", context),
         volumes=_str_list(data, "volumes", context),
+        tmpfs=_tmpfs_list(data, "tmpfs", context),
         compose=_require_str(data, "compose", context, default=""),
         overlays=_str_list(data, "overlays", context),
         attach=_parse_attach(data, context),
@@ -1223,6 +1263,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
     workspace = _require_str(data, "workspace", context, default="")
     command = _require_str(data, "command", context, default="")
     volumes = _str_list(data, "volumes", context)
+    tmpfs = _tmpfs_list(data, "tmpfs", context)
     if driver:
         if driver.startswith(CUSTOM_DRIVER_PREFIX):
             custom_name = driver[len(CUSTOM_DRIVER_PREFIX) :]
@@ -1245,7 +1286,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                 f"{context}: driver must be 'builtin:<name>' or 'drivers/<name>'"
                 f" (ADR-0042), got {driver!r}"
             )
-        for field_name, present in (("command", command), ("volumes", volumes)):
+        for field_name, present in (("command", command), ("volumes", volumes), ("tmpfs", tmpfs)):
             if present:
                 raise ConfigRepoError(
                     f"{context}: {field_name!r} is a driverless (Flight Deck) field"
@@ -1331,7 +1372,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
             f" {adapter_name!r} cannot bake a model/effort — no"
             f" {adapter_name} Flight Deck exists (ADR-0052)"
         )
-    if workspace and not _valid_workspace(workspace):
+    if workspace and not valid_workspace(workspace):
         raise ConfigRepoError(
             f"{context}: 'workspace' must be owner/name — exactly two non-empty"
             f" path components — got {workspace!r}"
@@ -1363,6 +1404,7 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
         secrets=secrets,
         command=command,
         volumes=volumes,
+        tmpfs=tmpfs,
     )
 
 
@@ -1592,6 +1634,9 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
         command=wt.command,
         image=wt.tag,
         volumes=_resolve_volumes(wt.volumes, stack.name),
+        # tmpfs entries are container paths only — no `{stack}` placeholder
+        # substitution (that is volumes-only, for per-instance named volumes).
+        tmpfs=wt.tmpfs,
         attach=stack.attach,
     )
 
