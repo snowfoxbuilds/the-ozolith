@@ -69,7 +69,7 @@
 <details><summary class="muted">janitor actions ({{ flags.janitor_actions | length }} recent)</summary>
 <ul class="flags">
   {% for a in flags.janitor_actions %}
-  <li class="muted">{{ a.acted }} — {% if a.issue %}issue #{{ a.issue }}: {% endif %}{{ a.reason }}</li>
+  <li class="muted">{{ a.acted }} — {% if a.repo %}{{ a.repo }}#{{ a.issue }}: {% endif %}{{ a.reason }}</li>
   {% endfor %}
 </ul>
 </details>

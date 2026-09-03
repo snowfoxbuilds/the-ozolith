@@ -12,6 +12,7 @@ that name.)
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,15 @@ from theozolith_worker.githubapi import Issue, PullRequest, RepoMergeSettings
 
 ADMIN_TOKEN = "admin-token"
 ADMIN_PASSWORD = "rig-password"
+
+# A driver worker type for scaffold_stack (ADR-0044/0055): the Stack file
+# binds the workspace per placement, so one type serves every repo.
+SCAFFOLD_WORKER_TYPE_TOML = """\
+driver = "builtin:implementer"
+adapter = "claude"
+model = "claude-sonnet-5"
+base = "ghcr.io/x/run:1.0@sha256:{digest}"
+""".format(digest="0" * 64)
 # The init-persisted control IP (ADR-0031) — since ADR-0034 also the
 # browser origin, so the rig's TestClient dials it as the base URL and
 # sends the matching Origin by default (the armed BrowserGuard is the
@@ -124,16 +134,52 @@ class ControlRig:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
-    def dispatch(self, role: str = "implementer", worker: str = "worker-a", node: str = "box1"):
+    def scaffold_stack(
+        self, node: str = "box1", *, workspace: str = "acme/sandbox", name: str = ""
+    ) -> str:
+        """A Pinned Build binding ``workspace`` to a Stack on ``node`` — what
+        the ADR-0056 dispatch verification checks a request against. The
+        default name matches ``dispatch``'s default stack for the node, so a
+        test that writes any config file and still dispatches scaffolds the
+        binding its requests claim. Returns the Stack name."""
+        name = name or f"worker-{node}"
+        self.write_config("worker-types/claude-dev.toml", SCAFFOLD_WORKER_TYPE_TOML)
+        self.write_config(
+            f"stacks/{name}.toml",
+            f'worker_type = "claude-dev"\nnode = "{node}"\nworkspace = "{workspace}"\n',
+        )
+        return name
+
+    def dispatch(
+        self,
+        role: str = "implementer",
+        worker: str = "worker-a",
+        node: str = "box1",
+        repo: str = "acme/sandbox",
+        stack: str = "",
+    ):
         return self.node_post(
             "/api/v1/dispatch",
-            {"role": role, "driver": worker, "node": node, "login": f"ozolith-{worker}"},
+            {
+                "role": role,
+                "driver": worker,
+                "node": node,
+                "login": f"ozolith-{worker}",
+                # Every request names its repo and Stack (ADR-0056); the
+                # default stack pairs with scaffold_stack's default name.
+                "repo": repo,
+                "stack": stack or f"worker-{node}",
+            },
             node=node,
         )
 
 
 def make_rig(
-    tmp_path: Path, *, base_url: str = CONTROL_ORIGIN, **settings_overrides: Any
+    tmp_path: Path,
+    *,
+    base_url: str = CONTROL_ORIGIN,
+    github_clients: Callable[[str], Any] | None = None,
+    **settings_overrides: Any,
 ) -> ControlRig:
     settings = make_settings(tmp_path, **settings_overrides)
     clock = FakeClock()
@@ -145,12 +191,16 @@ def make_rig(
     secret_store = SecretStore(settings.store_db_path, clock=clock)
     box = SecretBox(generate_key())
     github = FakeGitHubLite()
+    # A per-repo client factory (ADR-0056); the rig's one fake answers for
+    # every repo by default — two-repo tests pass a dict-backed factory.
+    if github_clients is None and settings.coordination_jobs_enabled:
+        github_clients = lambda repo: github  # noqa: E731
     app = create_app(
         settings,
         store,
         secret_store,
         box,
-        github_client=github if settings.coordination_jobs_enabled else None,
+        github_clients=github_clients,
     )
     # The base URL is the derived browser origin by default: the __Host-
     # session cookie is Secure (ADR-0019) and the armed BrowserGuard
@@ -397,12 +447,14 @@ def run_event(
     run_id: str = "r1",
     attempt: int | None = 1,
     pr: int | None = None,
+    repo: str = "acme/sandbox",
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": "theozolith.run",
         "driver": worker,
         "node": node,
         "stack": "implementer",
+        "repo": repo,
         "issue": issue,
         "run_id": run_id,
         "phase": phase,
@@ -414,12 +466,15 @@ def run_event(
     return event
 
 
-def review_event(pr: int, issue: int, round_number: int, verdict: str) -> dict[str, Any]:
+def review_event(
+    pr: int, issue: int, round_number: int, verdict: str, *, repo: str = "acme/sandbox"
+) -> dict[str, Any]:
     return {
         "type": "theozolith.review",
         "reviewer": "reviewer-1",
         "node": "box1",
         "stack": "reviewer",
+        "repo": repo,
         "pr": pr,
         "issue": issue,
         "round": round_number,

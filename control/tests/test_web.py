@@ -311,9 +311,9 @@ def test_run_phases_and_links_appear_as_they_happen(control: ControlRig):
 
 def test_zombie_malformed_and_quarantine_flags_are_visible(control: ControlRig):
     login(control)
-    control.store.flag_zombie(5, "r1", "worker-a", "box1")
-    control.store.record_malformed(9, "carries failed + plan_ready")
-    control.store.record_chained_dependent(12, 3, 7, "closed unmerged", "a" * 40)
+    control.store.flag_zombie("acme/sandbox", 5, "r1", "worker-a", "box1")
+    control.store.record_malformed("acme/sandbox", 9, "carries failed + plan_ready")
+    control.store.record_chained_dependent("acme/sandbox", 12, 3, 7, "closed unmerged", "a" * 40)
     for run_id in ("r2", "r3"):
         control.node_post("/api/v1/events", run_event(6, "failed", run_id=run_id))
     page = control.client.get("/fragments/runs").text
@@ -321,6 +321,22 @@ def test_zombie_malformed_and_quarantine_flags_are_visible(control: ControlRig):
     assert "malformed" in page and "failed + plan_ready" in page
     assert "chained dependent" in page and "closed unmerged" in page
     assert "quarantined" in page and "consecutive failed Runs" in page
+
+
+def test_janitor_ledger_renders_repo_keyed_and_node_scoped_rows(control: ControlRig):
+    """The ledger fragment shows owner/name#N where a repo is present and
+    only the reason (which names the node) otherwise (ADR-0056): a NULL-repo
+    node act never renders a repo reference, and same-numbered issues in two
+    repos stay distinguishable."""
+    login(control)
+    control.store.record_janitor_action("acme/sandbox", 5, "r1", "worker-a", "zombie escalated")
+    control.store.record_janitor_action(
+        None, 0, "", "", "node box1: quarantine released by operator"
+    )
+    page = control.client.get("/fragments/runs").text
+    assert "acme/sandbox#5: zombie escalated" in page
+    assert "node box1: quarantine released by operator" in page
+    assert "#0" not in page  # the node act carries no repo reference
 
 
 # -- the activity fragment (acceptance 3) ----------------------------------------

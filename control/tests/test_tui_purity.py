@@ -191,6 +191,7 @@ def test_model_runs_align_with_the_real_events_documents(control: ControlRig):
                 "worker": "worker-a",
                 "node": "box1",
                 "stack": "worker",
+                "repo": "acme/sandbox",
                 "issue": issue,
                 "run_id": run_id,
                 "phase": phase,
