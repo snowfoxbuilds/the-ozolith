@@ -29,7 +29,9 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -91,6 +93,31 @@ class WireStack:
 # -- secrets: tmpfs materialization + VAR_FILE wiring ---------------------------
 
 
+def _clear_wrong_typed_target(target: Path) -> None:
+    """Remove ``target`` unless it is already a regular file, so the atomic
+    ``os.replace`` in :func:`materialize_secrets` can lay the secret leaf down.
+
+    ``os.replace`` overwrites a regular file atomically, but onto a DIRECTORY it
+    raises ``IsADirectoryError`` — permanently, on every reconcile pass. A boot
+    race leaves exactly that (#114): dockerd, restarting a Stack container before
+    the daemon has materialized secrets onto the freshly-wiped tmpfs, auto-
+    vivifies the missing bind source as a directory. A tmpfs secret writer must
+    never be defeated by a stray inode, so any non-regular target — a directory
+    (even a non-empty one), or any other type — is cleared here first. ``lstat``,
+    never ``stat``, so a symlink is removed as the link it is rather than
+    followed to overwrite or recurse into whatever it points at."""
+    try:
+        mode = os.lstat(target).st_mode
+    except FileNotFoundError:
+        return  # nothing there — the common case; os.replace creates it
+    if stat.S_ISREG(mode):
+        return  # a regular file — os.replace overwrites it atomically
+    if stat.S_ISDIR(mode):
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+
 def materialize_secrets(secrets_dir: Path, values: dict[str, str]) -> dict[str, Path]:
     """Write values under the runtime dir (tmpfs), atomically, behind the
     0700-directory/0444-leaf boundary.
@@ -120,6 +147,10 @@ def materialize_secrets(secrets_dir: Path, values: dict[str, str]) -> dict[str, 
             handle.write(value)
             handle.flush()
             os.fchmod(handle.fileno(), 0o444)
+        # Self-heal a wrong-typed target before the atomic replace: os.replace
+        # onto a directory (a boot race can leave one here — #114) raises EISDIR
+        # forever, so remove any non-regular target first.
+        _clear_wrong_typed_target(target)
         os.replace(tmp, target)
         paths[name] = target
     return paths

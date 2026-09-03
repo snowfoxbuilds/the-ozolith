@@ -1064,6 +1064,49 @@ def test_container_stack_secret_mounts_read_only_at_run_secrets(rig: Rig):
     assert host_path == str(rig.config.secrets_dir / "admin-token")
 
 
+def test_boot_race_directory_at_the_secret_leaf_recovers_on_reconcile(rig: Rig):
+    """The #114 boot race, recovered end to end: a stray DIRECTORY at the secret
+    leaf — what dockerd auto-vivifies when it restarts a Stack container before
+    the daemon materializes secrets on the freshly-wiped tmpfs — no longer wedges
+    the writer. The self-healing materialize repairs it, the leaf becomes a real
+    file, and the container Stack converges instead of re-logging EISDIR forever."""
+    rig.control.secrets["admin-token"] = "the-admin-value"
+    # Stand in for dockerd's auto-vivified bind source: the leaf as a directory.
+    rig.config.secrets_dir.mkdir(parents=True, exist_ok=True)
+    (rig.config.secrets_dir / "admin-token").mkdir()
+    stack = container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+
+    rig.daemon.once()
+
+    leaf = rig.config.secrets_dir / "admin-token"
+    assert leaf.is_file() and leaf.read_text() == "the-admin-value"
+    assert "ozolith-stack-flightdeck" in rig.docker.stacks  # converged, not wedged
+    assert not any("Is a directory" in line for line in rig.logs)  # no EISDIR deadlock
+
+
+def test_secret_materialization_oserror_degrades_instead_of_raising(rig: Rig, monkeypatch):
+    """A materialization OSError — a full or read-only tmpfs, or a target the
+    writer could not repair — degrades like any other deploy-blocker (#114):
+    _pull_stack_secrets returns False rather than letting the OSError bubble to
+    the generic reconcile wrapper as an opaque 'reconcile failed: [Errno …]'. The
+    fault surfaces as a targeted error event and the container is never started."""
+    rig.control.secrets["admin-token"] = "the-admin-value"
+
+    def boom(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(daemon, "materialize_secrets", boom)
+    stack = WireStack.from_wire(
+        container_stack("flightdeck", secrets={"THEOZOLITH_ADMIN_TOKEN": "admin-token"})
+    )
+
+    assert rig.daemon._pull_stack_secrets(stack) is False  # returns, never raises
+    assert any("secret materialization failed" in line for line in rig.logs)
+    (event,) = [e for e in rig.control.events if e["type"] == "theozolith.error"]
+    assert "materialization failed" in event["message"]
+
+
 # -- queue-behind recycle/update (NODE-SUBSTRATE, grilling 2026-07-17) -----------
 
 

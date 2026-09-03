@@ -2116,6 +2116,20 @@ class NodeDaemon:
                 type(exc).__name__, f"stack {stack.name}: cannot deploy, secrets unavailable: {exc}"
             )
             return False
+        except OSError as exc:
+            # Materialization itself faulted — a full or read-only tmpfs, or a
+            # wrong-typed target the writer could not repair. Degrade like any
+            # other deploy-blocker (report + False) so one wedged secret can
+            # never bubble to the generic reconcile wrapper and abort the whole
+            # stack's pass, re-logged forever (#114). The self-healing writer
+            # already repairs the boot-race directory; this is the backstop for
+            # every other materialization fault.
+            self._log(f"stack {stack.name}: cannot deploy, secret materialization failed ({exc})")
+            self._emit_error(
+                type(exc).__name__,
+                f"stack {stack.name}: cannot deploy, secret materialization failed: {exc}",
+            )
+            return False
 
     def _build_docker_config(self, images: dict[str, dict[str, Any]]) -> Path | None:
         """The DOCKER_CONFIG dir this pass's derived-image builds run under, or

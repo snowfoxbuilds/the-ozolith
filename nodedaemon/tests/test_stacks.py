@@ -151,6 +151,45 @@ def test_materialize_replaces_read_only_leaves_atomically(tmp_path: Path):
     assert [p.name for p in secrets_dir.iterdir()] == ["a"]
 
 
+def test_materialize_repairs_a_wrong_typed_target_from_the_boot_race(tmp_path: Path):
+    """A boot race (#114) can leave the secret leaf as a DIRECTORY: dockerd,
+    restarting a Stack container before the daemon materializes secrets on the
+    freshly-wiped tmpfs, auto-vivifies the missing bind source as one. os.replace
+    onto a directory raises IsADirectoryError forever, so the writer must self-
+    heal — remove any wrong-typed target — rather than stay permanently wedged.
+    A non-empty stray directory is cleared too (dockerd could have written into
+    it), and the leaf comes back a real 0444 file with the current value."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    stray = secrets_dir / "a"
+    stray.mkdir()  # dockerd's auto-vivified bind source
+    (stray / "leftover").write_text("junk")  # even non-empty, it must be cleared
+
+    paths = materialize_secrets(secrets_dir, {"a": "value-a"})
+
+    assert paths["a"].is_file()
+    assert paths["a"].read_text() == "value-a"
+    assert (paths["a"].stat().st_mode & 0o777) == 0o444
+    assert [p.name for p in secrets_dir.iterdir()] == ["a"]
+
+
+def test_materialize_repairs_a_symlink_target_without_following_it(tmp_path: Path):
+    """A wrong-typed target that is a symlink is removed as the link it is —
+    never followed to overwrite or recurse into whatever it points at. The
+    secret leaf must be a genuine regular file at the leaf path, not a link."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("do-not-touch")
+    (secrets_dir / "a").symlink_to(elsewhere)
+
+    paths = materialize_secrets(secrets_dir, {"a": "value-a"})
+
+    assert not paths["a"].is_symlink()
+    assert paths["a"].read_text() == "value-a"
+    assert elsewhere.read_text() == "do-not-touch"  # the link target is untouched
+
+
 def test_changed_env_recycles_even_with_the_same_command():
     """ADR-0044 amendment: convergence keys on the effective spec (command AND
     env), so a worker-type change that lands only in env still recycles."""

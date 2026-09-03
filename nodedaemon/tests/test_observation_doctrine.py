@@ -324,6 +324,23 @@ def test_dockerctl_run_stack_container_without_tmpfs_emits_none():
     assert "--tmpfs" not in run
 
 
+def test_dockerctl_run_stack_container_carries_no_restart_policy():
+    """Daemon-managed Stack containers carry NO Docker ``--restart`` policy: the
+    reconcile loop is the sole restarter, so dockerd never restarts a container
+    on host boot ahead of secret materialization on the wiped tmpfs (#114)."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None, env=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.run_stack_container("deck", "img:1", env_files={}, env={}, ports=[], volumes=[])
+    run = next(c for c in calls if c[1] == "run")
+    assert "--restart" not in run
+    assert "unless-stopped" not in run
+
+
 # -- fail-closed convergence: a failed read recreates nothing --------------------
 
 

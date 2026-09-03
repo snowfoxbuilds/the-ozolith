@@ -241,11 +241,20 @@ class DockerCtl:
         nothing is passed and the image's own ENTRYPOINT/CMD run unchanged."""
         name = f"{STACK_CONTAINER_PREFIX}{stack}"
         self.remove(name)
+        # No Docker restart policy on daemon-managed Stack containers. The
+        # daemon is the sole reconciler of Stack desired state (NODE-SUBSTRATE.md)
+        # and already recreates a stopped/exited/crashed container on its next
+        # pass — with freshly materialized secrets. A Docker `--restart` policy
+        # would instead let dockerd restart these containers on host boot BEFORE
+        # the daemon has materialized their secrets onto the freshly-wiped tmpfs
+        # (`/run/theozolith` is a systemd RuntimeDirectory, so empty every boot):
+        # the restarted container's missing bind source is then auto-vivified by
+        # dockerd as a DIRECTORY, which both fails the mount (dir->file mismatch)
+        # and wedges the secret writer (#114). Leaving restart to the reconcile
+        # loop keeps secret materialization strictly ahead of every start.
         args = [
             "run",
             "--detach",
-            "--restart",
-            "unless-stopped",
             "--name",
             name,
             "--label",
