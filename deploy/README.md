@@ -968,7 +968,8 @@ pin joined, compiled tree present — a dangling reference refuses the load;
 per-Stack overrides are rejected). Control injects the selection as
 `THEOZOLITH_KNOWLEDGE_TREE`, and `flightdeck-start` points the `~/.claude`
 knowledge directories at that compiled tree — **failing loud when the node has
-not converged it yet** (docker restart policy retries until it has; a deck
+not converged it yet** (the daemon's reconcile loop recreates the deck on a
+later pass — roughly the heartbeat cadence — retrying until it has; a deck
 never silently runs without its knowledge):
 
 ```
