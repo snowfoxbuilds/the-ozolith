@@ -201,6 +201,89 @@ def test_dockerctl_compose_ps_parses_valid_rows():
     assert [r["state"] for r in rows] == ["running", "exited"]  # lower-cased
 
 
+# -- required fields must be present strings (a missing/null field is malformed) --
+# The explicit per-field format guarantees every required field as a JSON string
+# on every row, so a MISSING or JSON-null field is not an optional value to
+# default — it is a failed observation. Defaulting it could still drive a
+# destructive reconcile: a null/absent State must never read as stopped, and a
+# null/absent Labels must never collapse to an empty label set (a missing-spec
+# replacement of a healthy Stack). The whole observation is rejected instead.
+
+_PS_ROW = {"Names": "ozolith-stack-a", "State": "running", "Status": "Up", "Labels": ""}
+_COMPOSE_ROW = {"Name": "ozolith-svc-1", "State": "running", "Status": "Up"}
+
+
+@pytest.mark.parametrize("field", ["Names", "State", "Status", "Labels"])
+def test_dockerctl_ps_raises_when_a_required_field_is_missing(field):
+    """Each required ``ps`` field, absent from an otherwise-valid row, is a
+    malformed observation — it raises rather than default the missing value."""
+    row = {k: v for k, v in _PS_ROW.items() if k != field}
+    with pytest.raises(DockerError, match="missing required field"):
+        _ctl_returning(json.dumps(row) + "\n").stack_containers("flightdeck")
+
+
+@pytest.mark.parametrize("field", ["Names", "State", "Status", "Labels"])
+def test_dockerctl_ps_raises_when_a_required_field_is_null(field):
+    """Each required ``ps`` field set to JSON ``null`` (Python ``None``) is a
+    malformed observation — a null State must never default to stopped, a null
+    Labels never to an empty label set."""
+    row = {**_PS_ROW, field: None}
+    with pytest.raises(DockerError, match="is null"):
+        _ctl_returning(json.dumps(row) + "\n").stack_containers("flightdeck")
+
+
+@pytest.mark.parametrize("field", ["Name", "State", "Status"])
+def test_dockerctl_compose_ps_raises_when_a_required_field_is_missing(field):
+    """``compose_ps`` requires the same present-string shape: an absent
+    Name/State/Status raises, so a malformed compose row never makes a running
+    project look stopped."""
+    row = {k: v for k, v in _COMPOSE_ROW.items() if k != field}
+    with pytest.raises(DockerError, match="missing required field"):
+        _ctl_returning(json.dumps(row) + "\n").compose_ps("ozolith-svc")
+
+
+@pytest.mark.parametrize("field", ["Name", "State", "Status"])
+def test_dockerctl_compose_ps_raises_when_a_required_field_is_null(field):
+    """A JSON-null Name/State/Status in a compose row is malformed — rejected,
+    never defaulted (a null State must not read as a stopped project)."""
+    row = {**_COMPOSE_ROW, field: None}
+    with pytest.raises(DockerError, match="is null"):
+        _ctl_returning(json.dumps(row) + "\n").compose_ps("ozolith-svc")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"Names": "ozolith-stack-b", "State": "running", "Status": "Up"},  # missing Labels
+        {"Names": "ozolith-stack-b", "State": None, "Status": "Up", "Labels": ""},  # null State
+    ],
+    ids=["missing-field", "null-field"],
+)
+def test_dockerctl_ps_rejects_a_multi_row_listing_when_a_later_row_is_incomplete(bad):
+    """A VALID first row followed by a row missing/nulling a required field fails
+    the WHOLE observation — a partial listing that silently drops the bad row
+    would under-count containers into a destructive 'they're gone'."""
+    listing = json.dumps(_PS_ROW) + "\n" + json.dumps(bad) + "\n"
+    with pytest.raises(DockerError):
+        _ctl_returning(listing).stack_containers("flightdeck")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"Name": "ozolith-svc-2", "Status": "Up"},  # missing State
+        {"Name": "ozolith-svc-2", "State": None, "Status": "Up"},  # null State
+    ],
+    ids=["missing-field", "null-field"],
+)
+def test_dockerctl_compose_ps_rejects_a_multi_row_listing_when_a_later_row_is_incomplete(bad):
+    """The compose equivalent: a later incomplete row rejects the whole listing,
+    so a running project is never made to look partly gone."""
+    listing = json.dumps(_COMPOSE_ROW) + "\n" + json.dumps(bad) + "\n"
+    with pytest.raises(DockerError):
+        _ctl_returning(listing).compose_ps("ozolith-svc")
+
+
 def test_dockerctl_run_stack_container_emits_tmpfs_per_entry():
     """Each tmpfs entry rides the run argv as ``--tmpfs <entry>`` in declared
     order, before the image (docker's own ``--tmpfs`` value syntax)."""

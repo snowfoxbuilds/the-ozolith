@@ -66,14 +66,22 @@ def _decode_ps_rows(stdout: str, verb: str) -> list[dict]:
 
 
 def _require_str_fields(row: dict, fields: tuple[str, ...], verb: str) -> None:
-    """A present field of the supported ``ps`` shape must be a string (the CLI's
-    ``{{json .Field}}`` always emits one). A wrong type is a malformed
-    observation, not a container to trust — it raises ``DockerError``. A missing
-    key stays tolerated (defaulted by the caller): an absent name never
-    fabricates absence, so it is not a fail-closed concern."""
+    """Every named field of the supported ``ps`` shape must be PRESENT and a
+    string. The explicit ``{{json .Field}}`` format guarantees each field as a
+    JSON string on every row, so a missing key, a JSON ``null``, or any other
+    type is malformed observation data — never an optional value to default.
+    Each case raises ``DockerError`` naming only the verb and field (no
+    unbounded row content). Defaulting instead would let a null ``State`` read
+    as stopped, or a null/absent ``Labels`` collapse to an empty label set that
+    provokes a missing-spec replacement — the whole observation is rejected here,
+    before any destructive consumer can act on a fabricated shape."""
     for key in fields:
-        value = row.get(key)
-        if value is not None and not isinstance(value, str):
+        if key not in row:
+            raise DockerError(f"docker {verb} row is missing required field {key!r}")
+        value = row[key]
+        if value is None:
+            raise DockerError(f"docker {verb} row field {key!r} is null (expected string)")
+        if not isinstance(value, str):
             raise DockerError(
                 f"docker {verb} row field {key!r} has unexpected type "
                 f"{type(value).__name__} (expected string)"
