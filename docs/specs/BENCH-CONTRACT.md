@@ -1,6 +1,6 @@
 Status: DRAFT
 
-Last updated: 2026-08-28
+Last updated: 2026-09-03
 
 # Bench Contract
 
@@ -20,7 +20,7 @@ Versioning promise (grilling 2026-08-28): visibility, not immutability. No part 
 
 Three compatibility keys own the entire contract; every public surface maps to exactly one of them (review 2026-08-28):
 
-- **`schema_version`** (currently 1, stamped in the job manifest) owns the Run Contract: job-dir layout, the Output Proposal schemas for both modes, the production prompt-renderer entry points, the PR-body-composition entry point, the gate entry points, proposal validation, and every other exposed Run behavior. The format-output CLI already asserts it on every invocation; bench records it per run.
+- **`schema_version`** (currently 2, stamped in the job manifest) owns the Run Contract: job-dir layout, the Output Proposal schemas for both modes, the production prompt-renderer entry points, the PR-body-composition entry point, the gate entry points, proposal validation, the GitHub Relay entry point with its policy and upstream modes (grilling 2026-09-03), and every other exposed Run behavior. The format-output CLI already asserts it on every invocation; bench records it per run.
 - **`bundle_format_version`** (currently 2, stamped in `candidate.json`) owns the Candidate Bundle: the `candidate.json` schema, the required-and-allowed set of build-context entries, export output, bundle-structure verification, and verified standalone-build behavior.
 - **`identity_spec_version`** (currently 2, stamped in `candidate.json`) owns candidate identity: the canonical serialization, the materialized-setup inputs, the conditional `knowledge_target` and `policy`/`policy_pin` keys, the tree-hash function (knowledge and policy pins share it), and the identity-triple computation.
 
@@ -68,31 +68,41 @@ Raw `docker build` on the bundle directory remains mechanically possible — the
 
 ### Run Contract — implementer mode
 
-A bench implementer run is a production Implementer Run with the driver replaced by the bench harness. The bench driver materializes the same job directory the production driver would — manifest (`mode: run`, stamped `schema_version`), `input/prompt.md`, `input/issue.json`, the Context Tree for a synthetic GitHub-style issue — launches the container with the in-image agent harness as PID 1, and applies the Output Proposal after process exit exactly as the production driver would (SilverquiLLM-bench#39: full-fidelity imitation).
+A bench implementer run is a production Implementer Run with the driver replaced by the bench harness. The bench driver materializes the same job directory the production driver would — manifest (`mode: run`, stamped `schema_version`), `input/prompt.md` carrying the synthetic GitHub-style issue body inline, `input/issue.json`, and the GitHub Relay socket (grilling 2026-09-03) — launches the container with the in-image agent harness as PID 1, and applies the Output Proposal after process exit exactly as the production driver would (SilverquiLLM-bench#39: full-fidelity imitation).
 
-- The scaffolding prompt defaults to the production renderer, called through the exposed entry point below — a deviating prompt template is a benchmark-mode variable, recorded on the mode, never on the candidate (grilling 2026-08-28). The task itself arrives as the synthetic issue body plus Context Tree, exactly as production workers receive work.
+- The scaffolding prompt defaults to the production renderer, called through the exposed entry point below — a deviating prompt template is a benchmark-mode variable, recorded on the mode, never on the candidate (grilling 2026-08-28). The task itself arrives as the synthetic issue body inline in the prompt, with `gh` through the relay for everything beyond it, exactly as production workers receive work (grilling 2026-09-03).
 - The first-party gate runs (grilling 2026-08-28): a bench run without test→docs→lint measures a different thing than what deploys. The bench driver replays the production gate-step sequence over the jobs channel (`input/jobs/` ↔ `output/jobs/`); consequence for benchmark authoring, not for this contract — task repos must be gate-runnable.
 - Output: the implementer Output Proposal (pr-title, pr-description, decisions, commit-message, and the rest of the mode's fields), validated by the same rules the production driver applies.
 
 ### Run Contract — review mode
 
-A bench review run is a production Review Run under the workspace-parity shape: sanitized PR-branch checkout with history, Context Tree parity (`input/issue/`, `input/pr/` including `base.md`, `changed-files.md`, `signals.md`), the judging agent running `git diff` itself.
+A bench review run is a production Review Run under the workspace-parity shape: sanitized PR-branch checkout with history, the driver-computed git facts (`input/pr/base.md`, `changed-files.md`, `signals.md`), the issue body and composed PR body inline in the prompt, the GitHub Relay for every conversation surface (grilling 2026-09-03), the judging agent running `git diff` itself.
 
-- Constructibility requirement (grilling 2026-08-28): a Review Run job directory must be fully constructible from a synthetic issue, a git branch, and an implementer-contract output — no live GitHub PR. The bench driver composes `input/pr/body.md` from an implementer proposal exactly as the production driver composes a PR body (Closes line, narrative, Decisions Section), computes `base.md`/`changed-files.md`/`signals.md` from git, and leaves conversation surfaces empty for a first-round review. This one shape serves both bench styles — fixtures with planted known deficiencies, and replay-review of an implementer bench run's output.
+- Constructibility requirement (grilling 2026-08-28): a Review Run job directory must be fully constructible from a synthetic issue, a git branch, and an implementer-contract output — no live GitHub PR. The bench driver composes the PR body from an implementer proposal exactly as the production driver does (Closes line, narrative, Decisions Section) and hands it to the review prompt renderer, computes `base.md`/`changed-files.md`/`signals.md` from git, and runs the relay against whatever upstream the mode declares — in no-upstream mode the conversation surfaces are simply absent, as on a first-round review (grilling 2026-09-03). This one shape serves both bench styles — fixtures with planted known deficiencies, and replay-review of an implementer bench run's output.
 - Round pinning (grilling 2026-08-28): bench review runs use `round: 1, round_budget: 3` — production first-round conditions. On the final round `revise` is forbidden at write time, which would distort a benchmarked reviewer's verdict distribution.
 - Output: the reviewer Output Proposal unchanged — verdict enum, evidence prose, deviation and risk grades, revised-plan/resume-commit on revise. No structured findings field is added for benchmarking (grilling 2026-08-28): the evaluation side reads prose regardless, and the production contract is measured as deployed. Note the vocabulary: mechanical signals are driver-computed *inputs* to the judge, never reviewer output.
 - Evaluation — whether the review found the known deficiencies, judged by another LLM over the proposal — is bench-side and out of this contract's scope (grilling 2026-08-28).
+
+### Run Contract — GitHub Relay
+
+Every Run — production and bench, both kinds — carries the GitHub Relay (grilling 2026-09-03): the driver-owned, per-Run Unix socket in the job dir through which the agent's `gh` reads GitHub with a credential the driver alone holds. The bench driver runs the product's relay through the exposed entry point below, never a copy, so policy is identical by construction: read-only (REST `GET`/`HEAD`, single-operation GraphQL `query`), fail-closed classification, the admin-read denylist, per-Run caps, agent-phase lifetime, and `gh-audit.jsonl`.
+
+- Two upstream modes, recorded per run as `gh_upstream`:
+  - **live** — a GitHub host plus a credential source (`_FILE` style, never argv; a read-only token the bench side owns). Full fidelity means the task's objects exist there: a scratch repository carrying the synthetic issue and, in review mode, the branch and PR — a bench-side provisioning obligation, like gate-runnable task repos.
+  - **none** — the relay answers every request with an explicit refusal ("This benchmark run has no GitHub upstream; the task is fully described in your prompt"). A permitted, recorded benchmark-mode variable: the run stays meaningful because the prompt carries the complete task statement, and the agent learns the situation on its first call.
+- No fixture upstream exists or is planned: high-level `gh` commands are GraphQL, and serving the task from files would mean emulating GitHub's schema.
 
 ### Exposed entry points
 
 Driver behaviors the bench harness must reproduce byte-comparably are exposed as stable entry points in the worker package's public API rather than copied (grilling 2026-08-28) — hand-rolled copies would drift silently as production templates evolve:
 
-- Prompt renderers for both run kinds: issue fields + round + flags in, `input/prompt.md` bytes out.
+- Prompt renderers for both run kinds: issue fields, composed PR body, round, ordered dependency numbers, and flags in, `input/prompt.md` bytes out.
 - PR-body composition: implementer proposal in, the PR body the production driver would publish out.
 - The gate-step sequence the production driver runs.
+- The GitHub Relay: socket lifecycle, policy, audit log, with an injectable upstream (live host + credential source, or none) (grilling 2026-09-03).
 - `theozolith candidate export` / `verify` / the build wrapper (Control-package CLI — the resolution machinery lives there; the monorepo is public and pip-installable).
 
-Every entry point maps to exactly one compatibility key (review 2026-08-28): the prompt renderers, PR-body composition, gate sequence, and proposal validation are `schema_version` surface; `candidate export`, the bundle it writes, verification of bundle structure, and the verified build wrapper are `bundle_format_version` surface; identity recomputation inside `verify` is `identity_spec_version` surface. The CLI syntax itself follows the product CLI policy (see Contract surface and versioning).
+Every entry point maps to exactly one compatibility key (review 2026-08-28): the prompt renderers, PR-body composition, gate sequence, GitHub Relay, and proposal validation are `schema_version` surface; `candidate export`, the bundle it writes, verification of bundle structure, and the verified build wrapper are `bundle_format_version` surface; identity recomputation inside `verify` is `identity_spec_version` surface. The CLI syntax itself follows the product CLI policy (see Contract surface and versioning).
 
 ### Conformance obligations
 
@@ -103,12 +113,13 @@ The implementation (the-ozolith#88) must land these test classes with the code �
 - **Build lifecycle**: invalid bundles never invoke Docker; the wrapper builds the same private snapshot it verified; mutating the caller's original directory after staging cannot affect the build; cleanup after success, failure, timeout, and interruption; repeat builds keep the deterministic identity and tag; re-export after a moved base tag resolves a new digest and identity; a damaged archived-and-restored bundle fails until replaced or re-exported.
 - **Credentials**: public resolution is anonymous; private resolution and pull work through `DOCKER_CONFIG`; missing or refused credentials fail clearly with the host named; no secret appears in argv, manifest, bundle, logs, errors, image layers, or evidence.
 - **Sources**: local directories accepted; URLs, plain files, absent paths, and unsafe trees rejected.
-- **Run Contract**: byte-stable prompt rendering for both modes; PR-body composition; gate ordering; proposal validation; synthetic round-one review construction; schema-version mismatch refusal.
+- **Run Contract**: byte-stable prompt rendering for both modes; PR-body composition; gate ordering; proposal validation; synthetic round-one review construction; schema-version mismatch refusal; relay policy fixtures — every wire shape the pinned `gh` emits classified allowed or refused, multi-operation and comment/string-evasion GraphQL documents refused, REST writes and denylisted admin reads refused with their messages, the no-upstream refusal, and `gh-audit.jsonl` shape (grilling 2026-09-03).
 
 ## Changelog
 
 Every breaking change to a contract surface lands an entry here naming the bumped key (see Contract surface and versioning).
 
+- **2026-09-03** — the GitHub Relay joins the Run Contract: `schema_version` 2 — the job dir carries the relay socket; the Context Tree (`input/issue/`, `input/pr/` GitHub-derived parts, `input/deps/`) leaves the job dir and the prompt renderers take the issue body, composed PR body, and ordered dependency numbers inline; the relay is an exposed entry point with `live` and `none` upstream modes. `bundle_format_version` and `identity_spec_version` unchanged (the new `GITHUB_READ_TOKEN` slot travels as a slot name like every other).
 - **2026-09-02** — Agent Policy trees join the bundle: `bundle_format_version` 2 — `candidate.json` gains the required `policy`/`policy_pin` keys and the layout allowlist gains `policy/`; `identity_spec_version` 2 — the canonical serialization gains the conditional `policy`/`policy_pin` keys (every pre-existing vector's expected values are byte-identical; a v1-stamped bundle is refused with the re-export message). `schema_version` unchanged.
 - **2026-08-28** — initial published contract: `schema_version` 1 (Run Contract), `bundle_format_version` 1 (Candidate Bundle and verified build), `identity_spec_version` 1 (candidate identity).
 
@@ -121,3 +132,4 @@ Every breaking change to a contract surface lands an entry here naming the bumpe
 | ADR-0052-codex-adapter-per-tool-knowledge | Per-tool knowledge compilation and the conditional `knowledge_target` identity key |
 | ADR-0054-candidate-bundle-bench-contract | The published bench contract: Candidate Bundle, identity spec, verified standalone build, and the Run Contract |
 | ADR-0055-flight-deck-live-surfaces | Agent Policy trees (and their pins) that join the bundle and candidate identity |
+| ADR-0057-github-relay | `gh` is the agent's GitHub read surface: a driver-owned per-Run relay socket in the job dir injects a dedicated read-only credential, admits only reads, and replaces the Context Tree; Run Contract `schema_version` 2 with live/none bench upstreams |
