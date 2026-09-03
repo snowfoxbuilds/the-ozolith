@@ -1107,6 +1107,23 @@ def test_secret_materialization_oserror_degrades_instead_of_raising(rig: Rig, mo
     assert "materialization failed" in event["message"]
 
 
+def test_invalid_secret_name_on_the_wire_degrades_the_stack(rig: Rig):
+    """Node-side defense in depth (#114): a stored secret name that is unsafe to
+    materialize but reaches the daemon anyway — control/daemon skew, or a control
+    that never applied the shared validator — is refused by the daemon's own
+    validate_stored_secret_name before any filesystem write. _pull_stack_secrets
+    degrades the one Stack (False + targeted error), never aborting the pass with a
+    ValueError, and nothing is written under (or above) the secrets dir."""
+    rig.control.secrets["../evil"] = "attacker"
+    stack = WireStack.from_wire(container_stack("flightdeck", secrets={"TOK": "../evil"}))
+
+    assert rig.daemon._pull_stack_secrets(stack) is False  # returns, never raises
+    assert any("invalid secret name" in line for line in rig.logs)
+    (event,) = [e for e in rig.control.events if e["type"] == "theozolith.error"]
+    assert "invalid secret name" in event["message"]
+    assert not (rig.config.secrets_dir.parent / "evil").exists()  # no traversal ran
+
+
 # -- queue-behind recycle/update (NODE-SUBSTRATE, grilling 2026-07-17) -----------
 
 
@@ -1883,6 +1900,93 @@ def test_changed_container_secret_mapping_recreates_it(rig: Rig):
     _run_container(rig, container_stack("flightdeck", secrets={"TOK": "b"}))
     assert rig.docker.stacks["ozolith-stack-flightdeck"]["env_files"]["TOK"].endswith("b")
     assert "ozolith-stack-flightdeck" in rig.docker.removed
+
+
+# -- legacy restart-policy migration (#114) --------------------------------------
+
+
+def test_legacy_restart_policy_is_migrated_in_place_without_recreate(rig: Rig):
+    """A container an older daemon created carries `unless-stopped`; the reconcile
+    loop converges it to `no` IN PLACE — docker update, never a recreate (#114) —
+    even on the healthy path where convergence would otherwise skip the container.
+    No removal, no restart, converged exactly once, and idempotent thereafter."""
+    stack = container_stack("flightdeck")
+    _run_container(rig, stack)  # create the container at the current spec
+    name = "ozolith-stack-flightdeck"
+    assert rig.docker.restart_policy_updates == []  # a freshly-run container is already `no`
+    rig.docker.stacks[name]["restart_policy"] = "unless-stopped"  # simulate an old-daemon container
+    rig.docker.removed.clear()
+
+    _run_container(rig, stack)  # a later pass: same healthy spec
+
+    assert rig.docker.restart_policy_updates == [name]  # converged once, in place
+    assert rig.docker.stacks[name]["restart_policy"] == "no"
+    assert name not in rig.docker.removed  # never recreated or restarted
+    assert name in rig.docker.stacks  # still the same container
+
+    _run_container(rig, stack)  # idempotent: an already-`no` container is not touched again
+    assert rig.docker.restart_policy_updates == [name]
+
+
+def test_restart_policy_migration_failure_is_isolated_and_retried(rig: Rig):
+    """A failed restart-policy update is reported, isolated, and retried next pass
+    (#114): the docker-update failure emits a theozolith.error but never tears the
+    container down or blocks the Stack from converging, and the next pass retries."""
+    stack = container_stack("flightdeck")
+    _run_container(rig, stack)
+    name = "ozolith-stack-flightdeck"
+    rig.docker.stacks[name]["restart_policy"] = "unless-stopped"
+    rig.docker.fail_set_restart_policy.add(name)  # docker update fails this pass
+    rig.docker.removed.clear()
+
+    _run_container(rig, stack)
+
+    assert any("restart-policy migration" in line for line in rig.logs)
+    assert any(e["type"] == "theozolith.error" for e in rig.control.events)
+    assert rig.docker.stacks[name]["restart_policy"] == "unless-stopped"  # update did not take
+    assert name not in rig.docker.removed  # the container was never torn down
+    assert name in rig.docker.stacks  # and the Stack still converged
+
+    rig.docker.fail_set_restart_policy.discard(name)  # the fault clears
+    _run_container(rig, stack)  # the next pass retries and converges the policy
+    assert rig.docker.stacks[name]["restart_policy"] == "no"
+
+
+def test_restart_policy_migration_covers_a_legacy_exited_container(rig: Rig):
+    """The migration listing is `--all` and docker update accepts any state, so a
+    legacy container that is exited or stuck in a restart loop — the boot-race
+    failure mode — has its policy converged before convergence recreates it (#114)."""
+    stack = container_stack("flightdeck", image="img:1")
+    name = "ozolith-stack-flightdeck"
+    rig.docker.images["img:1"] = {}  # so convergence does not defer on an unbuilt image
+    rig.docker.stacks[name] = {  # a desired but exited old-daemon container
+        "stack": "flightdeck",
+        "image": "img:1",
+        "state": "exited",
+        "restart_policy": "unless-stopped",
+        "theozolith.spec": "",
+    }
+    rig.control.heartbeat_answers.append(heartbeat_response([stack]))
+
+    rig.daemon.once()
+
+    assert name in rig.docker.restart_policy_updates  # the exited container was migrated
+    assert rig.docker.stacks[name]["restart_policy"] == "no"  # the recreated one carries no policy
+
+
+def test_restart_policy_migration_never_touches_compose_or_unlabeled_containers(rig: Rig):
+    """Only single-image Stack containers (the theozolith.stack label AND the
+    ozolith-stack- name prefix) are migrated (#114): a compose project's container
+    and any unrelated container — such as the Control Node's — are never updated."""
+    rig.docker.stacks["not-a-stack-container"] = {  # no ozolith-stack- prefix
+        "stack": "",
+        "image": "img:1",
+        "state": "running",
+        "restart_policy": "unless-stopped",
+    }
+    _run_container(rig, container_stack("flightdeck"))  # a normal single-image Stack (already `no`)
+
+    assert rig.docker.restart_policy_updates == []  # neither was migrated
 
 
 def test_preexisting_unlabeled_container_is_reconciled_once(rig: Rig):

@@ -72,6 +72,7 @@ from theozolith_nodedaemon.dockerctl import (
 from theozolith_nodedaemon.stacks import (
     DRIVER_LAUNCHER,
     ProcessSupervisor,
+    SecretNameError,
     WireStack,
     materialize_secrets,
     secret_env_files,
@@ -2006,6 +2007,19 @@ class NodeDaemon:
         except Exception as exc:
             self._log(f"removed-runtime sweep failed: {exc}")
             self._emit_error(type(exc).__name__, f"removed-runtime sweep failed: {exc}")
+        # Retire the legacy Docker restart policy off daemon-managed single-image
+        # Stack containers BEFORE converging the desired Stacks (#114). New
+        # containers already carry no `--restart` policy (run_stack_container),
+        # but one an older daemon created still holds `unless-stopped`, which lets
+        # dockerd restart it on host boot ahead of tmpfs secret materialization.
+        # Convergence is in place (docker update, never a recreate) so no
+        # container is disrupted; its own backstop keeps a migration failure from
+        # ever stopping the Stacks from converging.
+        try:
+            self._migrate_restart_policies()
+        except Exception as exc:
+            self._log(f"restart-policy migration sweep failed: {exc}")
+            self._emit_error(type(exc).__name__, f"restart-policy migration sweep failed: {exc}")
         for stack in desired:
             want_running = stack.state == "running" and stack.name not in self._drained
             try:
@@ -2093,6 +2107,64 @@ class NodeDaemon:
                     lambda name=name: self._compose_down(name),
                 )
 
+    def _migrate_restart_policies(self) -> None:
+        """Converge every daemon-managed single-image Stack container to Docker
+        restart policy ``no``, IN PLACE (#114).
+
+        A container an older daemon created carries ``--restart unless-stopped``,
+        which lets dockerd restart it on host boot BEFORE the daemon has
+        materialized its secrets onto the freshly-wiped ``/run`` tmpfs — the boot
+        race that wedges the secret writer. New containers already omit the policy
+        (``run_stack_container``); this retires it off the survivors without a
+        recreate or restart, so no live Flight Deck or worker Stack is disrupted.
+
+        Idempotent and self-retrying: each pass re-enumerates and re-checks, so a
+        container already at ``no`` is skipped silently and an update that fails
+        (a transient dockerd error) is retried next pass. Per-container isolation
+        (``_isolated``): one failure is logged and emitted as a
+        ``theozolith.error`` but never blocks the migration of the other
+        containers or the Stack reconciliation that follows. Containers that are
+        exited or in a restart loop are covered too — the listing is ``--all`` and
+        ``docker update`` accepts any container state."""
+        try:
+            rows = self._docker.stack_containers()
+        except DockerError as exc:
+            # A failed observation is never evidence of absence (observation
+            # doctrine): report it and let the next pass retry. Nothing here is
+            # destructive, so the reconcile pass continues.
+            self._emit_error(
+                type(exc).__name__,
+                f"restart-policy migration: container listing failed: {exc}",
+            )
+            return
+        for row in rows:
+            name = str(row.get("name", ""))
+            # Single-image Stack containers only: the theozolith.stack label (the
+            # _ps filter) and the ozolith-stack- name prefix both scope to
+            # run_stack_container's own containers — never a compose project's
+            # containers or the Control Node's systemd-run container.
+            if not name.startswith(STACK_CONTAINER_PREFIX):
+                continue
+            self._isolated(
+                f"stack container {name}: restart-policy migration",
+                lambda name=name: self._migrate_one_restart_policy(name),
+            )
+
+    def _migrate_one_restart_policy(self, name: str) -> None:
+        """Migrate one container's restart policy to ``no`` when it diverges.
+        A failed observation of the current policy is not treated as converged;
+        the next pass re-checks (observation doctrine). Only a policy that is
+        actually observed as non-``no`` is updated — a healthy already-converged
+        container is never touched, so there is no churn and no log spam."""
+        policy = self._docker.container_restart_policy(name)
+        if policy is None:
+            self._log(f"stack container {name}: restart policy unobservable; retrying next pass")
+            return
+        if policy in ("", "no"):
+            return  # already converged — no recreate, no update, no log
+        self._log(f"stack container {name}: migrating restart policy {policy!r} -> 'no' (#114)")
+        self._docker.set_restart_policy(name, "no")
+
     def _pull_stack_secrets(self, stack: WireStack) -> bool:
         """Materialize the Stack's secrets in tmpfs; False = cannot deploy.
 
@@ -2114,6 +2186,18 @@ class NodeDaemon:
             self._log(f"stack {stack.name}: cannot deploy, secrets unavailable ({exc})")
             self._emit_error(
                 type(exc).__name__, f"stack {stack.name}: cannot deploy, secrets unavailable: {exc}"
+            )
+            return False
+        except SecretNameError as exc:
+            # An unsafe stored secret name reached the node (control/daemon skew,
+            # or a control that never applied the shared validator). The node's
+            # own validate_stored_secret_name refused it before any filesystem
+            # write; degrade this one Stack (report + False) rather than let a
+            # ValueError bubble to the reconcile wrapper and abort the pass (#114).
+            self._log(f"stack {stack.name}: cannot deploy, invalid secret name ({exc})")
+            self._emit_error(
+                type(exc).__name__,
+                f"stack {stack.name}: cannot deploy, invalid secret name: {exc}",
             )
             return False
         except OSError as exc:

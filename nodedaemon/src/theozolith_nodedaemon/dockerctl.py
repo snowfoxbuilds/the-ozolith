@@ -286,6 +286,36 @@ class DockerCtl:
             args.extend(command[1:])
         self._run(args)
 
+    def container_restart_policy(self, name: str) -> str | None:
+        """The configured restart-policy name of a container — ``no``, ``always``,
+        ``unless-stopped``, or ``on-failure`` — or ``None`` when it cannot be
+        observed.
+
+        Reads ``HostConfig.RestartPolicy.Name`` via ``docker inspect``. A
+        container created with no ``--restart`` flag reports ``no`` (older Docker
+        can report an empty string; the caller treats both as already-converged).
+        A failed inspect returns ``None``: a failed observation is never evidence
+        that the policy is already ``no`` (observation doctrine), so the migration
+        caller retries on a later pass rather than treating an unreadable
+        container as converged (#114)."""
+        proc = self._run(
+            ["inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", name],
+            check=False,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            return None
+        return (proc.stdout or "").strip()
+
+    def set_restart_policy(self, name: str, policy: str = "no") -> None:
+        """Converge a container's restart policy IN PLACE, without recreating or
+        restarting it (``docker update --restart``). Used to retire the legacy
+        ``unless-stopped`` policy off daemon-managed single-image Stack containers
+        (#114) so dockerd never restarts them ahead of tmpfs secret
+        materialization on boot; the reconcile loop becomes the sole restarter.
+        Raises ``DockerError`` on failure so the caller can isolate and retry."""
+        self._run(["update", f"--restart={policy}", name], timeout=60)
+
     def compose(self, project: str, files: list[Path], verb: str) -> None:
         """Compose-form container Stack: base file + overlays, in order."""
         args = ["compose", "--project-name", project]

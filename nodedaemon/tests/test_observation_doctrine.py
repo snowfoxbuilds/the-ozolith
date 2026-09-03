@@ -341,6 +341,56 @@ def test_dockerctl_run_stack_container_carries_no_restart_policy():
     assert "unless-stopped" not in run
 
 
+def test_dockerctl_container_restart_policy_reads_the_inspect_format():
+    """The policy is read from HostConfig.RestartPolicy.Name via docker inspect."""
+
+    def runner(args, timeout=None, env=None):
+        assert args[:2] == ["docker", "inspect"]
+        assert "{{.HostConfig.RestartPolicy.Name}}" in args
+        return subprocess.CompletedProcess(args, 0, "unless-stopped\n", "")
+
+    ctl = DockerCtl(runner=runner)
+    assert ctl.container_restart_policy("ozolith-stack-deck") == "unless-stopped"
+
+
+def test_dockerctl_container_restart_policy_unobservable_reads_as_none():
+    """A failed inspect is never evidence the policy is already `no` (observation
+    doctrine): it reads as None so the migration retries a later pass (#114)."""
+
+    def runner(args, timeout=None, env=None):
+        return subprocess.CompletedProcess(args, 1, "", "No such container")
+
+    ctl = DockerCtl(runner=runner)
+    assert ctl.container_restart_policy("ghost") is None
+
+
+def test_dockerctl_set_restart_policy_updates_in_place():
+    """set_restart_policy runs `docker update --restart=no <name>` — an in-place
+    metadata change that never removes or restarts the container (#114)."""
+    calls: list[list[str]] = []
+
+    def runner(args, timeout=None, env=None):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ctl = DockerCtl(runner=runner)
+    ctl.set_restart_policy("ozolith-stack-deck")
+    (call,) = calls
+    assert call == ["docker", "update", "--restart=no", "ozolith-stack-deck"]
+
+
+def test_dockerctl_set_restart_policy_raises_on_failure():
+    """A failed docker update raises DockerError so the caller can isolate and
+    retry it on a later reconcile pass (#114)."""
+
+    def runner(args, timeout=None, env=None):
+        return subprocess.CompletedProcess(args, 1, "", "cannot update")
+
+    ctl = DockerCtl(runner=runner)
+    with pytest.raises(DockerError):
+        ctl.set_restart_policy("ozolith-stack-deck")
+
+
 # -- fail-closed convergence: a failed read recreates nothing --------------------
 
 
