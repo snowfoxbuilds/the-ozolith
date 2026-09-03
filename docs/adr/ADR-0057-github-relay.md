@@ -1381,9 +1381,9 @@ recorded as an accepted residual risk rather than claimed away.
       fourth redirect answer refused at the hop limit producing four
       entries, exactly three redirect-intent records, and no fourth
       redirected upstream request, and a four-entry completion record with
-      a 256-byte host in every entry under the cap by construction; no
-      `Location` path or query byte in any record; the preflight writing no
-      per-Run record; audit-path tampering — attempted unlink,
+      a 253-byte literal host in every entry under the cap by construction;
+      no `Location` path or query byte in any record; the preflight writing
+      no per-Run record; audit-path tampering — attempted unlink,
       replacement, truncation, symlink substitution, a forged pre-existing
       log at the sink path, concurrent writers, and a crash during final
       publication — each leaving the published record intact or the failure
@@ -1433,17 +1433,17 @@ recorded as an accepted residual risk rather than claimed away.
       and nothing longer; a missing `Location`, a duplicated one, an
       unparseable one, and a scheme-relative one each recorded under the
       matching classification; a host of 253 bytes recorded literally, of
-      254 bytes as `oversized` with length and digest, and hosts carrying
-      user-info, percent-encoding, a control or non-ASCII byte, a `"`, or
-      a `\` each recorded as `invalid` with length and digest and no
-      escaped byte in the record; every entry's port, user-info, path,
-      query, and fragment absent; a four-entry completion at every
-      field's maximal width — four 253-byte literal hosts, the widest
-      enum values, 20-digit integers — serialized under the cap with its
-      byte count asserted, and the digest-host, invalid-form,
-      digest-form, and terminal maximal shapes likewise; and every
-      mandatory completion field present, with no whole-record truncation
-      and no missing completion for any hostile `Location`;
+      254 bytes as `oversized` with length and digest and no cut literal,
+      and hosts carrying user-info, percent-encoding, a control or
+      non-ASCII byte, a `"`, or a `\` each recorded as `invalid` with
+      length and digest and no escaped byte in the record; every entry's
+      port, user-info, path, query, and fragment absent; a four-entry
+      completion at every field's maximal width — four 253-byte literal
+      hosts, the widest enum values, 20-digit integers — serialized under
+      the cap with its byte count asserted, and the digest-host,
+      invalid-form, digest-form, and terminal maximal shapes likewise; and
+      every mandatory completion field present, with no whole-record
+      truncation and no missing completion for any hostile `Location`;
     - one terminal, one shutdown — audit-budget exhaustion with concurrent
       requests holding reservations, each finishing with its hops and
       completion written and every later request refused with the stable
@@ -1968,4 +1968,5 @@ recorded as an accepted residual risk rather than claimed away.
   counters, and four-entry redirect accounting, and its sixth review made
   the refusal schemas total over malformed input, bounded the
   refused-redirect metadata, and stated the audit's evidence claim
-  exactly.
+  exactly, and its seventh review aligned the write-ahead fixture's host
+  width with the 253-byte literal of the completion schema.
