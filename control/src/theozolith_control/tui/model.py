@@ -216,6 +216,7 @@ def command_rows(state: dict[str, Any]) -> list[CommandRow]:
 
 @dataclass(frozen=True)
 class RunRow:
+    repo: str  # the Bound Workspace this Run acts in (ADR-0056)
     issue: int
     driver: str  # the worker_id that emitted the Run event (ADR-0020 field)
     node: str
@@ -260,6 +261,8 @@ class RunIndex:
     telemetry: a missing record renders as unavailable, never as a missing
     Run."""
 
+    # Keyed by (repo, issue) (ADR-0056): two Bound Workspaces can share an
+    # issue number, and a single-issue key would shadow one Run with the other.
     latest_run_by_issue: dict[Any, dict[str, Any]] = field(default_factory=dict)
     latest_progress_by_run: dict[str, dict[str, Any]] = field(default_factory=dict)
     max_run_id: int | None = None
@@ -312,11 +315,11 @@ class RunIndex:
             for event in page.get("events") or []:
                 if isinstance(event.get("id"), int):
                     max_id = event["id"] if max_id is None else max(max_id, event["id"])
-                issue = (event.get("payload") or {}).get("issue")
-                # Newest-first pages: the first occurrence per issue IS the
-                # latest.
-                if issue is not None and issue not in latest:
-                    latest[issue] = event
+                key = _run_key(event)
+                # Newest-first pages: the first occurrence per (repo, issue)
+                # IS the latest. A repo-less legacy event is skipped.
+                if key is not None and key not in latest:
+                    latest[key] = event
             cursor = page.get("next_cursor")
             if cursor is None:
                 truncated = False
@@ -328,11 +331,12 @@ class RunIndex:
         self.truncated = truncated
 
     def _apply_runs(self, fresh: list[dict[str, Any]]) -> None:
-        # Oldest-first application: the newest event per issue lands last.
+        # Oldest-first application: the newest event per (repo, issue) lands
+        # last. A repo-less legacy event is skipped (metrics history only).
         for event in reversed(fresh):
-            issue = (event.get("payload") or {}).get("issue")
-            if issue is not None:
-                self.latest_run_by_issue[issue] = event
+            key = _run_key(event)
+            if key is not None:
+                self.latest_run_by_issue[key] = event
             if isinstance(event.get("id"), int):
                 self.max_run_id = max(self.max_run_id or 0, event["id"])
 
@@ -401,18 +405,32 @@ def runs_notice(truncated: bool) -> str:
     )
 
 
-def run_rows(index: RunIndex, repo: str | None) -> list[RunRow]:
-    """Rows from the complete index: latest run event per issue joined with
-    the latest progress telemetry per run_id (``store.run_states()``'s
-    shape). A Run whose progress was evicted keeps its row — the durable
-    run event is the row's existence; telemetry is advisory."""
+def _run_key(event: dict[str, Any]) -> tuple[str, int] | None:
+    """The (repo, issue) key for a run event, or None to skip it (ADR-0056):
+    a repo-less legacy event stays metrics history, never a row — the
+    client-side mirror of the store's live-claim legacy fence."""
+    payload = event.get("payload") or {}
+    repo = payload.get("repo")
+    issue = payload.get("issue")
+    if not repo or not isinstance(repo, str) or issue is None:
+        return None
+    return (repo, int(issue))
+
+
+def run_rows(index: RunIndex) -> list[RunRow]:
+    """Rows from the complete index: latest run event per (repo, issue) joined
+    with the latest progress telemetry per run_id (``store.run_states()``'s
+    shape). Every link is built from the row's OWN repo (ADR-0056), so two
+    Bound Workspaces sharing an issue number render distinct rows. A Run whose
+    progress was evicted keeps its row — the durable run event is the row's
+    existence; telemetry is advisory."""
     latest_runs = index.latest_run_by_issue
     latest_progress = index.latest_progress_by_run
-    base = f"https://github.com/{repo}" if repo else ""
     rows = []
-    for issue in sorted(latest_runs):
-        event = latest_runs[issue]
+    for repo, issue in sorted(latest_runs):
+        event = latest_runs[(repo, issue)]
         payload = event.get("payload") or {}
+        base = f"https://github.com/{repo}"
         run_id = str(payload.get("run_id") or "")
         progress = (latest_progress.get(run_id) or {}).get("payload") or {}
         phase = str(payload.get("phase") or "")
@@ -426,6 +444,7 @@ def run_rows(index: RunIndex, repo: str | None) -> list[RunRow]:
         evidence_path = f"runs/issue-{issue}/{run_id}" if run_id else ""
         rows.append(
             RunRow(
+                repo=repo,
                 issue=int(issue),
                 driver=str(payload.get("driver") or ""),
                 node=str(payload.get("node") or ""),
@@ -455,6 +474,17 @@ def run_rows(index: RunIndex, repo: str | None) -> list[RunRow]:
             )
         )
     return rows
+
+
+def pause_notice(state: dict[str, Any]) -> str:
+    """The dispatch-pause lines for the Runs panel (ADR-0056): one
+    ``dispatch paused: owner/name — <reason>`` per recorded per-repo pause
+    row, empty when none. Pure over ``state['dispatch_pauses']``."""
+    lines = [
+        f"dispatch paused: {row.get('repo')} — {row.get('reason') or 'unspecified'}"
+        for row in state.get("dispatch_pauses") or []
+    ]
+    return "\n".join(lines)
 
 
 def timeout_budget_seconds(state: dict[str, Any], stack: str) -> float:

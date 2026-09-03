@@ -12,6 +12,8 @@ import json
 import time
 from typing import Any
 
+from theozolith_worker.evidence import issue_evidence_url
+
 from theozolith_control.app import ERROR_CONTEXT_LIMIT, ERROR_MESSAGE_LIMIT
 from theozolith_control.configrepo import DeployConfig
 from theozolith_control.store import EVENT_ERROR, EVENT_PROGRESS, EVENT_REVIEW, EVENT_RUN, Store
@@ -167,12 +169,18 @@ def fleet_view(store: Store, config: DeployConfig, *, now: float | None = None) 
     }
 
 
-def runs_view(store: Store, repo: str | None, *, now: float | None = None) -> list[dict[str, Any]]:
+def runs_view(store: Store, *, now: float | None = None) -> list[dict[str, Any]]:
+    """The dashboard Runs rows, one per (repo, issue) (ADR-0056): every link
+    is built from the row's OWN repo, so two Bound Workspaces sharing an issue
+    number render distinct, correctly linked rows. A repo-less legacy row
+    (pre-ADR-0056 event kept as metrics history) keeps its row with the
+    reference but no links."""
     now = time.time() if now is None else now
-    base = f"https://github.com/{repo}" if repo else None
     rows = []
     for run in store.run_states():
         progress = run.get("progress") or {}
+        repo = run.get("repo")
+        base = f"https://github.com/{repo}" if repo else None
         rows.append(
             {
                 **run,
@@ -180,6 +188,7 @@ def runs_view(store: Store, repo: str | None, *, now: float | None = None) -> li
                 "last_event": ago(now - run["last_event_at"]),
                 "issue_url": f"{base}/issues/{run['issue']}" if base else None,
                 "pr_url": f"{base}/pull/{run['pr']}" if base and run["pr"] else None,
+                "evidence_url": issue_evidence_url(repo, run["issue"]) if repo else None,
                 "progress": progress,
                 "progress_elapsed": (
                     elapsed(progress["elapsed_seconds"])

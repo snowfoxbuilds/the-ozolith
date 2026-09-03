@@ -9,12 +9,17 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   and build status every 60s; responses carry infrastructure commands (drain, recycle,
   update, rebuild — recycle/update queue behind an in-flight Run unless `--force`) and
   the node's desired state from the Config Repo (ADR-0006).
-- **Claim dispatch** (ADR-0017) — the single writer of claim creation: Implementers request
-  work, the Control Node claims the issue on GitHub itself (assign + `in_progress`,
-  write-through) and returns it; the Reviewer side is discovery-only. Gates: node
-  quarantine (2 consecutive failed Runs, human-only release), pending lifecycle
-  commands, and the `failed` label (refused and surfaced as a malformed state, never
-  laundered). Requires the control PAT; without it the pipeline pauses.
+- **Claim dispatch** (ADR-0017/ADR-0056) — the single writer of claim creation, keyed by
+  repository across every Bound Workspace of the deployment: each request names the
+  `repo` it will check out and the `stack` it runs as, verified against the Pinned Build
+  (the named Stack exists, is placed on the authenticated node, and resolves exactly that
+  workspace — else 403). Implementers request work, the Control Node claims the issue on
+  GitHub itself (assign + `in_progress`, write-through) and returns it; the Reviewer side
+  is discovery-only. Gates: node quarantine (2 consecutive failed Runs, human-only
+  release), pending lifecycle commands, and the `failed` label (refused and surfaced as a
+  malformed state, never laundered). Requires the control PAT; without it the pipeline
+  pauses. The coordinated set is the Pinned Build's driver-bearing Stacks, not a setting —
+  the one control PAT (v1: one GitHub host + one PAT) must reach every Bound Workspace.
 - **Typed event API** — namespaced events; `theozolith.run`, `theozolith.review`,
   `theozolith.run.progress`, and `theozolith.error` are the known pipeline types;
   unknown types are accepted, stored, and rendered generically on the dashboard
@@ -22,11 +27,14 @@ built-in Stack (a container Stack; `control/docker/Dockerfile`, compose in
   truncated, never refused); progress and error events evict oldest-first under a
   ~10GB budget (the database is a cache, never the archive — ADR-0016). The dashboard's
   errors panel filters `theozolith.error` summaries by node and component.
-- **Zombie-claim janitor** (ADR-0016) — two-phase, evidence-first: silence past the
-  grace period flags the dashboard only; once the Run's evidence bundle lands the claim
-  is released and escalated `failed` + `needs_human` with the evidence link. Also
+- **Zombie-claim janitor** (ADR-0016/ADR-0056) — two-phase, evidence-first: silence past
+  the grace period flags the dashboard only; once the Run's evidence bundle lands the
+  claim is released and escalated `failed` + `needs_human` with the evidence link. Also
   releases never-activated dispatch grants (no claimed event within the activation
-  window).
+  window). Every pass sweeps each Bound Workspace with its own per-repo client and
+  per-repo isolation — one repo's GitHub trouble never starves the others — and logs any
+  live claim whose repo the Pinned Build no longer binds (coverage withdrawn, no GitHub
+  write).
 - **Secret store** — values entered once via `theozolith secret set` or the
   dashboard's web form (both write through the same store), encrypted at rest (Fernet,
   file-held master key), pull-only and node-scoped, TLS mandatory, never displayed.

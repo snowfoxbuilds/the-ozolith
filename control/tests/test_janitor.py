@@ -5,7 +5,8 @@ plus the release of never-activated dispatch grants (ADR-0017)."""
 from __future__ import annotations
 
 from controlrig import ControlRig, FakeGitHubLite, run_event
-from theozolith_control import janitor
+from theozolith_control import cli, configrepo, janitor
+from theozolith_worker.bootstrap.vocabulary import FAILED
 
 GRACE = 600.0
 
@@ -499,3 +500,168 @@ def test_an_interrupted_recording_heals_without_another_write(control, github):
     assert drift_sweep(control, github) == [9]
     assert len(github.comments[9]) == 2
     assert github.writes[-1] == ("add_labels", 9, BLOCKED, NEEDS_HUMAN)
+
+
+# -- the per-repo sweep fan-out (ADR-0056) ---------------------------------------
+
+ESCALATE = ("add_labels", 5, FAILED, NEEDS_HUMAN)
+
+
+def _driver_stack(repo: str) -> configrepo.StackDef:
+    """A resolved driver-bearing Stack bound to ``repo`` — what
+    ``bound_repos()`` reads (its injected THEOZOLITH_REPO)."""
+    return configrepo.StackDef(
+        name=repo.replace("/", "-"),
+        kind="process",
+        node="box1",
+        worker_type="claude-dev",
+        env={"THEOZOLITH_REPO": repo},
+    )
+
+
+def _config_binding(*repos: str) -> configrepo.DeployConfig:
+    return configrepo.DeployConfig(
+        commit="c", stacks=tuple(_driver_stack(r) for r in repos), worker_types={}
+    )
+
+
+def _ready_zombie(control: ControlRig, repo: str, fake: FakeGitHubLite) -> None:
+    """A silent claim with landed evidence in ``repo`` — ready to escalate the
+    moment its repo is swept. (The sweep loop uses real time, so a claim
+    recorded at the fake clock reads as long-silent; no advance needed.)"""
+    fake.add_issue(5, labels={"in_progress"}, assignees=["ozolith-worker-a"])
+    fake.evidence.add("runs/issue-5/r1/swept.json")
+    control.node_post("/api/v1/events", run_event(5, "claimed", attempt=None, repo=repo))
+
+
+def test_sweep_pass_escalates_every_bound_repo_with_its_own_client(control):
+    """cli._sweep_pass fans out over every Bound Workspace with one client
+    each; same-numbered zombie claims in two repos each escalate through their
+    own client alone (ADR-0056)."""
+    one, two = FakeGitHubLite("acme/one"), FakeGitHubLite("acme/two")
+    fakes = {"acme/one": one, "acme/two": two}
+    for repo, fake in fakes.items():
+        _ready_zombie(control, repo, fake)
+
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/one", "acme/two"),
+        client_for=lambda repo: fakes[repo],
+    )
+    assert ESCALATE in one.writes and ESCALATE in two.writes  # each via its own client
+
+
+def test_sweep_pass_isolates_a_failing_repo_from_the_others(control):
+    """A GitHub failure on one repo is contained and the other repos' sweeps
+    complete — two clients, one raising (ADR-0056)."""
+    good, bad = FakeGitHubLite("acme/good"), FakeGitHubLite("acme/bad")
+    _ready_zombie(control, "acme/good", good)
+    _ready_zombie(control, "acme/bad", bad)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("GitHub is down")
+
+    bad.get_issue = boom  # the bad repo's reads all fail
+
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/good", "acme/bad"),
+        client_for=lambda repo: {"acme/good": good, "acme/bad": bad}[repo],
+    )
+    assert ESCALATE in good.writes  # the healthy repo completed
+    assert bad.writes == []  # the failing repo wrote nothing
+
+
+def test_sweep_pass_survives_a_repos_client_construction_failure(control):
+    """Client construction is inside the per-repo isolation (ADR-0056): a repo
+    whose client cannot be built is logged and the pass continues."""
+    good = FakeGitHubLite("acme/good")
+    _ready_zombie(control, "acme/good", good)
+
+    def client_for(repo: str):
+        if repo == "acme/bad":
+            raise RuntimeError("cannot reach GitHub for acme/bad")
+        return good
+
+    # bound_repos sorts: acme/bad is attempted first and fails, acme/good still runs.
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/bad", "acme/good"),
+        client_for=client_for,
+    )
+    assert ESCALATE in good.writes
+
+
+def test_sweep_pass_rereads_the_bound_set_each_pass(control):
+    """An injected load returning a different bound set between two passes
+    changes what is swept — no restart (ADR-0056)."""
+    one, two = FakeGitHubLite("acme/one"), FakeGitHubLite("acme/two")
+    fakes = {"acme/one": one, "acme/two": two}
+    for repo, fake in fakes.items():
+        _ready_zombie(control, repo, fake)
+
+    # First pass binds only acme/one.
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/one"),
+        client_for=lambda repo: fakes[repo],
+    )
+    assert ESCALATE in one.writes
+    assert two.writes == []  # acme/two not bound this pass
+
+    # Second pass binds both: acme/two is now swept, with no restart.
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/one", "acme/two"),
+        client_for=lambda repo: fakes[repo],
+    )
+    assert ESCALATE in two.writes
+
+
+def test_sweep_pass_logs_unbound_claims_and_links_without_writing(control, capsys):
+    """A live claim or chained-dependent link whose repo the Pinned Build no
+    longer binds is logged every pass — no GitHub write, no flag row
+    (ADR-0056)."""
+    bound = FakeGitHubLite("acme/bound")
+    control.node_post("/api/v1/events", run_event(9, "claimed", repo="acme/unbound"))
+    control.store.record_chained_dependent("acme/unbound", 12, 3, 7, "closed unmerged", "a" * 40)
+
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=False,
+        load=lambda: _config_binding("acme/bound"),
+        client_for=lambda repo: bound,
+    )
+    out = capsys.readouterr().out
+    assert "live claim acme/unbound#9 is in an unbound repo" in out
+    assert "chained dependent acme/unbound#12 is in an unbound repo" in out
+    assert bound.writes == []  # no GitHub write for withdrawn coverage
+
+
+def test_sweep_pass_unreadable_config_sweeps_nothing_but_still_evicts(control, capsys):
+    """serve's pass degrades on an unreadable Pinned Build: it logs, sweeps no
+    repos, and still runs the repo-agnostic eviction (ADR-0056)."""
+
+    def load():
+        raise configrepo.ConfigRepoError("broken pins.toml")
+
+    cli._sweep_pass(
+        control.settings,
+        control.store,
+        evict=True,
+        load=load,
+        client_for=lambda repo: FakeGitHubLite(repo),
+    )
+    out = capsys.readouterr().out
+    assert "config unreadable" in out and "sweeping no repos this pass" in out

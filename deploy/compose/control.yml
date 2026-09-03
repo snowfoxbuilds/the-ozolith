@@ -51,9 +51,12 @@ services:
       # The partitioned data dir inside the container; the volume below
       # makes ~/.theozolith on the host the real home.
       THEOZOLITH_DATA_DIR: /data
-      # Optional pipeline identity (ADR-0017); without it the Control Node
-      # is a pure substrate observer and dispatch answers 503.
-      THEOZOLITH_REPO: ${THEOZOLITH_REPO:-}
+      # The control PAT alone enables coordination (ADR-0017/ADR-0056):
+      # without it the Control Node is a pure substrate observer and dispatch
+      # answers 503. The coordinated set is the Pinned Build's Bound
+      # Workspaces (the driver-bearing Stacks), not an env var — this one PAT
+      # must reach every Bound Workspace (v1: one GitHub host + one PAT). The
+      # old pipeline-repo setting is retired: a set value fails settings load.
       CONTROL_GITHUB_TOKEN: ${CONTROL_GITHUB_TOKEN:-}
     volumes:
       - ${THEOZOLITH_HOME:-~/.theozolith}:/data

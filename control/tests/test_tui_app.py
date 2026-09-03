@@ -79,7 +79,7 @@ async def test_panels_render_from_the_api_documents():
         assert "queued behind run r7" in command_rows[0][5]
         assert rows(app, "#stacks")[0][:5] == ["box1", "deck", "container", "running", "running"]
         run_rows = rows(app, "#runs-table")
-        assert run_rows[0][0] == "#7" and run_rows[0][1] == "gate"
+        assert run_rows[0][0] == "acme/sandbox#7" and run_rows[0][1] == "gate"
         settings = dict((r[0], r[1]) for r in rows(app, "#settings-table"))
         assert settings["control_ip"] == "203.0.113.5"
         assert settings["heartbeat_seconds"] == "60.0"
@@ -210,7 +210,10 @@ async def test_runs_panel_keeps_issues_beyond_the_first_event_page():
     async with app.run_test(size=(120, 50)):
         await app.refresh_now()
         run_rows = rows(app, "#runs-table")
-        assert [r[0] for r in run_rows] == ["#3", "#7"]  # the older issue survives
+        assert [r[0] for r in run_rows] == [
+            "acme/sandbox#3",
+            "acme/sandbox#7",
+        ]  # the older issue survives
         assert app.query_one("#runs-notice", Static).display is False  # complete: no notice
 
 
@@ -228,7 +231,10 @@ async def test_progress_eviction_degrades_telemetry_without_removing_the_run():
     async with app.run_test(size=(120, 50)):
         await app.refresh_now()
         run_rows = rows(app, "#runs-table")
-        assert [r[0] for r in run_rows] == ["#3", "#5"]  # both Runs still listed
+        assert [r[0] for r in run_rows] == [
+            "acme/sandbox#3",
+            "acme/sandbox#5",
+        ]  # both Runs still listed
         # The live Run's detail renders missing telemetry as unavailable —
         # honestly, without dropping the row.
         detail = str(app.query_one("#run-detail", Static).content)

@@ -598,6 +598,11 @@ def test_control_compose_mounts_the_partitioned_home():
     assert "run --rm control init" in compose  # the unified first run (ADR-0023)
     assert "8443" in compose
     assert "6965:6965" in compose  # the bootstrap listener rides its own port
+    # THEOZOLITH_REPO is retired as a Control Node setting (ADR-0056): the
+    # control PAT alone enables coordination, keyed by the Pinned Build's
+    # Bound Workspaces — the compose file must never pass it.
+    assert "THEOZOLITH_REPO" not in compose
+    assert "CONTROL_GITHUB_TOKEN" in compose
 
 
 def test_ci_builds_the_control_image():

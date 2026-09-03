@@ -339,6 +339,24 @@ def test_janitor_ledger_renders_repo_keyed_and_node_scoped_rows(control: Control
     assert "#0" not in page  # the node act carries no repo reference
 
 
+def test_two_bound_workspaces_render_distinct_linked_rows(control: ControlRig):
+    """Two Bound Workspaces sharing an issue number render two Runs rows, each
+    with its own owner/name#N issue link, per-row PR link, and per-row
+    evidence link on the run id (ADR-0056)."""
+    login(control)
+    control.node_post(
+        "/api/v1/events", run_event(7, "pr-open", run_id="rA", pr=11, repo="acme/app")
+    )
+    control.node_post("/api/v1/events", run_event(7, "claimed", run_id="rB", repo="acme/infra"))
+    page = control.client.get("/fragments/runs").text
+    assert "acme/app#7" in page and "acme/infra#7" in page
+    assert "github.com/acme/app/issues/7" in page
+    assert "github.com/acme/infra/issues/7" in page
+    assert "github.com/acme/app/pull/11" in page  # per-row PR link
+    # The run id links to that row's own repo evidence directory.
+    assert "github.com/acme/app/tree/theozolith/evidence/runs/issue-7" in page
+
+
 # -- the activity fragment (acceptance 3) ----------------------------------------
 
 

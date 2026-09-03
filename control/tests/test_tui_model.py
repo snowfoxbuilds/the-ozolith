@@ -176,7 +176,7 @@ def test_run_rows_latest_per_issue_joined_with_latest_progress():
             )
         },
     )
-    rows = model.run_rows(index, "acme/sandbox")
+    rows = model.run_rows(index)
     by_issue = {r.issue: r for r in rows}
     live = by_issue[7]
     assert live.phase == "gate" and not live.terminal
@@ -199,18 +199,27 @@ def test_run_rows_carry_the_canonical_failure_class_from_the_event():
     index = make_index(
         {None: page([run_event(10, 5, "failed", run_id="r9", failure_class="timeout")])}
     )
-    (row,) = model.run_rows(index, None)
+    (row,) = model.run_rows(index)
     assert row.failure_class == "timeout"
 
 
-def test_run_rows_without_a_repo_omit_links_but_keep_the_reference():
-    index = make_index({None: page([run_event(10, 5, "failed", run_id="r9")])})
-    rows = model.run_rows(index, None)
-    assert rows[0].pr_url == "" and rows[0].evidence_url == ""
-    assert rows[0].evidence_ref == "theozolith/evidence: runs/issue-5/r9"
-    # A legacy failed event predating the channel amendment: the field is
-    # empty and the app renders the explicit legacy message (ADR-0040).
-    assert rows[0].failure_class == ""
+def test_repo_less_legacy_events_are_skipped_never_rows():
+    """A pre-ADR-0056 run event carries no repo: it stays metrics history and
+    never becomes a Runs row (the client-side legacy fence). A repo-bearing
+    event beside it is unaffected."""
+    index = make_index(
+        {
+            None: page(
+                [
+                    run_event(20, 6, "gate", run_id="r6"),
+                    run_event(10, 5, "failed", run_id="r9", repo=None),
+                ]
+            )
+        }
+    )
+    rows = model.run_rows(index)
+    assert {r.issue for r in rows} == {6}  # issue 5's repo-less event is gone
+    assert rows[0].repo == "acme/sandbox"
 
 
 def test_run_index_bootstrap_is_complete_across_page_boundaries():
@@ -237,7 +246,7 @@ def test_run_index_bootstrap_is_complete_across_page_boundaries():
             ),
         }
     )
-    rows = {r.issue: r for r in model.run_rows(index, None)}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert set(rows) == {3, 7, 9}  # the older active issue survives the boundary
     assert rows[3].phase == "claimed" and not rows[3].terminal
     assert rows[7].phase == "gate" and rows[7].run_id == "r7b"  # latest event wins
@@ -267,7 +276,7 @@ def test_run_index_advances_incrementally_without_rescanning_history():
     calls.clear()
     index.refresh(fetch_runs, pager({}))
     assert calls == [None]
-    (row,) = model.run_rows(index, None)
+    (row,) = model.run_rows(index)
     assert row.phase == "gate" and index.max_run_id == 40
 
 
@@ -285,7 +294,7 @@ def test_run_index_gap_closed_within_the_bound_stays_complete():
         )
     backlog["2"] = page([run_event(1, 3, "claimed", run_id="r3")])
     index.refresh(pager(backlog), pager({}))
-    rows = {r.issue: r for r in model.run_rows(index, None)}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert set(rows) == {3, 7}
     assert rows[7].phase == "gate" and not index.truncated
 
@@ -306,7 +315,7 @@ def test_run_index_unclosable_gap_rebootstraps_and_discloses():
             [run_event(event_id, 7, "claimed", run_id="r7")], next_cursor=str(event_id)
         )
     index.refresh(pager(flood), pager({}))
-    rows = {r.issue: r for r in model.run_rows(index, None)}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert rows[7].phase == "gate"  # the newest window is correct
     assert index.truncated  # and the missing tail is disclosed
     assert model.runs_notice(index.truncated) != ""
@@ -345,7 +354,7 @@ def test_run_index_progress_eviction_never_removes_the_run():
         },
         {None: page([], evicted=True)},  # every progress record evicted
     )
-    rows = {r.issue: r for r in model.run_rows(index, None)}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert set(rows) == {5, 7}
     assert rows[7].elapsed_seconds is None and rows[7].tool_calls is None
     assert rows[5].terminal and rows[5].failure_class == "infra"
@@ -372,7 +381,7 @@ def test_run_index_progress_paginates_until_live_runs_are_covered():
             "95": page([progress_event(70, "r3", tool_calls=9)]),
         },
     )
-    rows = {r.issue: r for r in model.run_rows(index, None)}
+    rows = {r.issue: r for r in model.run_rows(index)}
     assert rows[7].tool_calls == 50
     assert rows[3].tool_calls == 9  # found beyond the first page
 

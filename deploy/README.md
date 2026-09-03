@@ -46,6 +46,16 @@ Stacks and worker types on top, never below.
    listener's `/control-url`, the certificate SAN, and the browser origin carry —
    mint surfaces never re-detect it.
 
+   Coordination (claim dispatch + the janitor) turns on when the Control Node has
+   the control PAT — `CONTROL_GITHUB_TOKEN` in `control.yml`'s `environment`;
+   without it the Control Node is a pure substrate observer and dispatch answers
+   503. The coordinated set is the Pinned Build's **Bound Workspaces** — the
+   driver-bearing Stacks — not an env var, so this one PAT must reach every Bound
+   Workspace (v1 doctrine: one GitHub host + one PAT per Control Node; ADR-0056).
+   `THEOZOLITH_REPO` is no longer a Control Node setting: a set value fails
+   settings load loudly (the Driver's own `THEOZOLITH_REPO`, injected into worker
+   Stacks, is unchanged).
+
    `init` (ADR-0023/0034/0036) composes the machine surface: master key → admin
    bearer token → control address (`https://<control-ip>`; `--port` to vary) →
    per-deployment CA + server cert with IP SANs (the persisted IP and loopback)

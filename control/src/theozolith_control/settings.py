@@ -53,7 +53,6 @@ class ControlSettings:
     # ingest`. The field keeps its historical name.
     config_repo: Path
     admin_token: str  # the machine credential: CLI + API ("" until init)
-    repo: str | None  # target repo (owner/name) for dispatch + janitor
     github_token: str | None  # the control PAT (claim writes, janitor)
     api_url: str = "https://api.github.com"
     # Tier-2 tunables (control.toml [settings]; ADR-0023). Defaults here
@@ -168,8 +167,10 @@ class ControlSettings:
 
     @property
     def coordination_jobs_enabled(self) -> bool:
-        """Dispatch + janitor need a GitHub identity and a target repo."""
-        return bool(self.repo and self.github_token)
+        """Dispatch + janitor need only the control PAT (ADR-0056): the
+        coordinated set is the Pinned Build's Bound Workspaces, not a
+        setting. Presence of the one GitHub identity is the enablement bit."""
+        return bool(self.github_token)
 
 
 _SETTING_FIELDS = {f.name for f in fields(ControlSettings)}
@@ -185,9 +186,20 @@ def _read_secret_file(path: Path) -> str:
 def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
     environ = os.environ if environ is None else environ
 
-    repo = env_value(environ, "THEOZOLITH_REPO")
-    if repo and "/" not in repo:
-        raise ConfigError(f"THEOZOLITH_REPO must be owner/name, got {repo!r}")
+    # THEOZOLITH_REPO is retired as a Control Node setting (ADR-0056): a
+    # lingering export must fail loud, never silently steer coordination.
+    # Coordination is keyed by the Pinned Build's Bound Workspaces now — the
+    # driver-bearing Stacks define what this Control Node coordinates. The
+    # guard runs before anything else reads the environment, and honors the
+    # _FILE spelling (env_value treats "" as unset, so an empty export loads
+    # clean); every control entry point routes through load_settings, so it
+    # fires everywhere and cli.main turns the ConfigError into exit 2.
+    if env_value(environ, "THEOZOLITH_REPO"):
+        raise ConfigError(
+            "THEOZOLITH_REPO is retired as a Control Node setting (ADR-0056, issue #96):"
+            " workspaces are bound via Stacks — the Pinned Build's driver-bearing"
+            " Stacks define what this Control Node coordinates. Fix: unset THEOZOLITH_REPO."
+        )
 
     default_dir = DEFAULT_ROOT_DATA_DIR if os.geteuid() == 0 else DEFAULT_DATA_DIR
     data_dir = Path(
@@ -221,7 +233,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ControlSettings:
         # env var stays as the container/dev override.
         admin_token=env_value(environ, "THEOZOLITH_ADMIN_TOKEN")
         or _read_secret_file(data_dir / "secrets" / ADMIN_TOKEN_FILE),
-        repo=repo,
         github_token=env_value(environ, "CONTROL_GITHUB_TOKEN")
         or env_value(environ, "GITHUB_TOKEN"),
         api_url=env_value(environ, "THEOZOLITH_API_URL", "https://api.github.com") or "",

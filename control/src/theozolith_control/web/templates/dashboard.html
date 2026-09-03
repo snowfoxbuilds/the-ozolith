@@ -1,8 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Fleet · TheOzolith{% endblock %}
 {% block content %}
-{% if repo %}<p class="muted">pipeline repo:
-  <a href="https://github.com/{{ repo }}">{{ repo }}</a></p>{% endif %}
+{% if repos %}<p class="muted">coordinating:
+  {% for r in repos %}<a href="https://github.com/{{ r }}">{{ r }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+{% else %}<p class="muted">no Bound Workspaces</p>{% endif %}
 <section id="runs" hx-get="/fragments/runs" hx-trigger="load, every {{ poll_seconds }}s"
          aria-label="Workers and Runs"><p class="muted">loading runs…</p></section>
 <section id="fleet" hx-get="/fragments/fleet" hx-trigger="load, every {{ poll_seconds }}s"

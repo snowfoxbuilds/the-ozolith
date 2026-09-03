@@ -251,6 +251,7 @@ def test_dispatch_refuses_failed_plus_plan_ready_and_flags_it(control: ControlRi
     assert control.github.writes == []  # never laundered
     flags = control.admin("GET", "/api/v1/flags").json()
     assert flags["malformed_states"][0]["issue"] == 7
+    assert "dispatch_pauses" in flags  # the per-repo pause lane rides /flags (ADR-0056)
     # The human fixed the labels: the flag clears on the next pass.
     control.github.issues[7]["labels"] = {"plan_ready"}
     assert control.dispatch().json()["issue"]["number"] == 7
@@ -713,10 +714,14 @@ def test_dispatch_reviewer_side_is_discovery_only(control: ControlRig):
 
 
 def test_dispatch_without_a_control_pat_answers_503(tmp_path):
-    """ADR-0017: no second claim path — an unconfigured Control Node pauses
-    the pipeline rather than falling back."""
+    """ADR-0017/ADR-0056: no second claim path — an unconfigured Control Node
+    pauses the pipeline rather than falling back. 503 fires ONLY on a missing
+    PAT, and the detail names CONTROL_GITHUB_TOKEN only (no repo)."""
     rig = make_rig(tmp_path, github_token=None)
-    assert rig.dispatch().status_code == 503
+    answer = rig.dispatch()
+    assert answer.status_code == 503
+    detail = answer.json()["detail"]
+    assert "CONTROL_GITHUB_TOKEN" in detail and "THEOZOLITH_REPO" not in detail
 
 
 def test_dispatch_requires_the_node_token(control: ControlRig):
@@ -1135,9 +1140,9 @@ DECK_MODE = "quiet"
 
 
 def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig):
-    """The M9 Operator TUI read model (ADR-0040): desired_stacks entries
-    carry the Stack's attach argv and non-secret env declarations, and the
-    document carries the coordination repo and the read-only control_toml
+    """The M9 Operator TUI read model (ADR-0040/ADR-0056): desired_stacks
+    entries carry the Stack's attach argv and non-secret env declarations, and
+    the document carries the Bound Workspaces and the read-only control_toml
     view — a pure API consumer needs no Config Repo access for any panel.
     The node channel is untouched: attach never rides a heartbeat."""
     control.write_config("stacks/deck.toml", ATTACH_STACK_TOML % ("0" * 64))
@@ -1166,7 +1171,12 @@ def test_state_carries_attach_env_repo_and_the_settings_view(control: ControlRig
     assert worker_env["THEOZOLITH_ADAPTER"] == "claude"
     assert worker_env["THEOZOLITH_RUN_IMAGE"].startswith("theozolith/claude-dev:")
 
-    assert state["repo"] == "acme/sandbox"
+    # The Bound Workspaces the Pinned Build coordinates (ADR-0056): the sorted
+    # driver-bearing Stacks' repos, with the singular "repo" target retired and
+    # the per-repo dispatch-pause list carried beside it.
+    assert state["repos"] == ["acme/sandbox"]
+    assert "repo" not in state
+    assert state["dispatch_pauses"] == []
     toml_view = state["control_toml"]
     assert toml_view["control_ip"] == "203.0.113.5"
     assert toml_view["control_port"] == 443

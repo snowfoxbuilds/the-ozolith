@@ -569,6 +569,46 @@ def test_stack_env_repo_still_wins_over_stack_workspace(tmp_path):
     assert stack.env["THEOZOLITH_REPO"] == "acme/expert"
 
 
+# -- Bound Workspaces (ADR-0056) -------------------------------------------------
+
+
+def test_bound_repos_lists_driver_bearing_stacks_sorted_and_deduped(tmp_path):
+    """The Bound Workspaces are the sorted, de-duplicated repos of resolved
+    driver-bearing (process-kind) Stacks — a stopped worker's repo included
+    (its zombie claims still need the janitor), a Flight Deck's and a generic
+    Stack's excluded."""
+    driver_type(tmp_path)  # workspace default acme/sandbox
+    thin_stack(tmp_path, "impl-sandbox", "claude-dev")  # running -> acme/sandbox
+    thin_stack(tmp_path, "impl-sandbox-2", "claude-dev")  # same repo, one entry
+    thin_stack(tmp_path, "impl-zeta", "claude-dev", workspace='"acme/zeta"', state='"stopped"')
+    # A driverless Flight Deck bound to a repo — container kind, never bound.
+    write(tmp_path, "worker-types/flightdeck.toml", f'base = "{BASE}"\n')
+    thin_stack(tmp_path, "deck", "flightdeck", workspace='"acme/deck"')
+    # A generic (worker_type-less) process Stack — never a Bound Workspace.
+    write(
+        tmp_path, "stacks/generic.toml", 'kind = "process"\nnode = "box1"\ncommand = "run-thing"\n'
+    )
+    assert load_config(tmp_path).bound_repos() == ["acme/sandbox", "acme/zeta"]
+
+
+def test_bound_repos_reports_the_env_override(tmp_path):
+    """The env value is what the Driver checks out, so an [env] override is
+    the bound repo — not the typed workspace it overrode (ADR-0056)."""
+    driver_type(tmp_path)
+    write(
+        tmp_path,
+        "stacks/implementer.toml",
+        'worker_type = "claude-dev"\nnode = "box1"\nworkspace = "acme/other"\n'
+        '[env]\nTHEOZOLITH_REPO = "acme/expert"\n',
+    )
+    assert load_config(tmp_path).bound_repos() == ["acme/expert"]
+
+
+def test_bound_repos_empty_with_no_driver_stacks(tmp_path):
+    driver_type(tmp_path)  # a dormant type, no Stack instantiating it
+    assert load_config(tmp_path).bound_repos() == []
+
+
 # -- CRITICAL: derived-image identity (ADR-0044 as amended by ADR-0045) ----------
 
 GOLDEN_BASE = "ghcr.io/snowfoxbuilds/theozolith-run-claude:0.3.0@sha256:" + "a" * 64

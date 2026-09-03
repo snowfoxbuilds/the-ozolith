@@ -238,6 +238,44 @@ def test_incomplete_error_history_never_reads_healthy(tmp_path):
     assert doc["errors"]["evicted"] is True  # the raw document rides along
 
 
+# -- coordination surfaces (ADR-0056) --------------------------------------------
+
+
+def test_coordinating_line_lists_the_bound_workspaces(tmp_path):
+    code, lines = _run(tmp_path, state_doc(repos=["acme/app", "acme/infra"]))
+    assert code == 0
+    assert "coordinating: acme/app, acme/infra" in "\n".join(lines)
+
+
+def test_no_bound_workspaces_reads_explicitly(tmp_path):
+    code, lines = _run(tmp_path, state_doc())  # no repos key
+    assert code == 0
+    assert "coordinating: (no Bound Workspaces)" in "\n".join(lines)
+
+
+def test_dispatch_pause_degrades_with_its_repo_and_reason(tmp_path):
+    """A per-repo dispatch pause degrades the verdict and prints a paused
+    table (ADR-0056), below node-health and above advisory telemetry."""
+    state = state_doc(
+        repos=["acme/app"],
+        dispatch_pauses=[
+            {
+                "repo": "acme/app",
+                "reason": "GitHub 502",
+                "first_seen": NOW - 30,
+                "last_seen": NOW - 5,
+            }
+        ],
+    )
+    reasons = statuscli.evaluate(state, no_errors())
+    assert reasons == ["dispatch paused for acme/app: GitHub 502"]
+    code, lines = _run(tmp_path, state)
+    assert code == 1
+    joined = "\n".join(lines)
+    assert lines[0] == "degraded: dispatch paused for acme/app: GitHub 502"
+    assert "REPO" in joined and "GitHub 502" in joined  # the paused table renders
+
+
 # -- exit 2: the read failed (acceptance 8) --------------------------------------
 
 

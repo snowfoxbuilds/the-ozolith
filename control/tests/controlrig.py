@@ -62,7 +62,6 @@ def make_settings(tmp_path: Path, **overrides: Any) -> ControlSettings:
         data_dir=tmp_path / "data",
         config_repo=tmp_path / "configs",
         admin_token=ADMIN_TOKEN,
-        repo="acme/sandbox",
         github_token="gh-token",
         api_url="https://api.github.invalid",
         # The init-persisted control IP (ADR-0031): what every mint surface
@@ -234,8 +233,8 @@ class FakeGitHubLite:
     sort=created&direction=asc), which the dispatcher relies on to drain
     plans in creation order."""
 
-    def __init__(self):
-        self.repo = "acme/sandbox"
+    def __init__(self, repo: str = "acme/sandbox"):
+        self.repo = repo
         self.issues: dict[int, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, list[str]] = {}

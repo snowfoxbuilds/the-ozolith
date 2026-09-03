@@ -370,8 +370,8 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "claim dispatch requires THEOZOLITH_REPO and CONTROL_GITHUB_TOKEN"
-                    " on the Control Node (ADR-0017)"
+                    "claim dispatch requires CONTROL_GITHUB_TOKEN on the Control"
+                    " Node (ADR-0017/ADR-0056)"
                 ),
             )
         body = await _json_body(request)
@@ -863,7 +863,15 @@ def create_app(
     @app.get("/api/v1/state")
     async def state(request: Request) -> dict[str, Any]:
         _authorize(request, settings.admin_token, "admin")
-        config = _config()
+        # Fail-open on a broken Pinned Build (the dispatch pattern): a
+        # config-derived key degrades to its empty value rather than 500-ing
+        # the whole document and blinding `theozolith status` and the TUI.
+        # The settled fail-open-to-[] for `repos` is only real if the read
+        # model keeps answering (ADR-0056).
+        try:
+            config: DeployConfig | None = _config()
+        except HTTPException:
+            config = None
         return {
             **store.fleet_state(),
             "provisioned_nodes": secret_store.provisioned_nodes(),
@@ -873,10 +881,10 @@ def create_app(
             # math), the product pin, and desired Stack state — so a pure
             # API consumer needs no Config Repo or cache.db access.
             "now": store.now(),
-            "product_pin": config.product_version or None,
+            "product_pin": config.product_version or None if config else None,
             # The recorded config-distribution hash (ADR-0042), null when no
             # drivers/ — the off-hash convergence input for the read models.
-            "config_drivers_hash": config.drivers_hash or None,
+            "config_drivers_hash": config.drivers_hash or None if config else None,
             # M9 (ADR-0040): entries carry the Stack's attach argv and its
             # non-secret env declarations too — the Operator TUI resolves
             # attach commands and the Run timeout budget client-side. This
@@ -891,12 +899,17 @@ def create_app(
                     "env": dict(s.env),
                     "attach": list(s.attach),
                 }
-                for s in config.stacks
+                for s in (config.stacks if config else ())
             ],
-            # The coordination target (owner/name, null when dispatch is
-            # off): the TUI builds issue/PR/evidence links from it exactly
-            # as the dashboard does server-side (ADR-0040).
-            "repo": settings.repo or None,
+            # The Bound Workspaces (ADR-0056): the sorted repos the Pinned
+            # Build's driver-bearing Stacks coordinate — [] when the build is
+            # unreadable or names no such Stack. Every operator surface builds
+            # issue/PR/evidence links from the per-row repo now, so the old
+            # singular "repo" target is gone (no compatibility window).
+            "repos": config.bound_repos() if config else [],
+            # Per-repo dispatch pauses (ADR-0056): a self-clearing row recorded
+            # when a repo's GitHub reads fail — surfaced, never a 500.
+            "dispatch_pauses": store.dispatch_pauses(),
             # The read-only settings view (ADR-0040): the address fields and
             # the EFFECTIVE tier-2 values this serve is running with
             # (control.toml overlaid with env overrides — what is live, not
@@ -964,6 +977,10 @@ def create_app(
             # a human call the janitor surfaces without any GitHub write;
             # cache rows re-verified every base-drift pass.
             "chained_dependents": store.chained_dependents(),
+            # Per-repo dispatch pauses (ADR-0056): a repo whose GitHub reads
+            # failed is paused with a self-clearing row — surfaced here so
+            # `theozolith flags` carries it beside the other advisory lanes.
+            "dispatch_pauses": store.dispatch_pauses(),
             "quarantines": store.quarantines(),
             # Advisory config-distribution stamp skew (ADR-0042): a node's
             # applied distribution was built against a product version other

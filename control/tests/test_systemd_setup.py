@@ -340,7 +340,6 @@ def test_ownership_repair_never_touches_a_nondefault_path(tmp_path, monkeypatch)
         data_dir=elsewhere,
         config_repo=elsewhere / "configs",
         admin_token="",
-        repo=None,
         github_token=None,
     )
     cli._repair_partition_ownership(settings)

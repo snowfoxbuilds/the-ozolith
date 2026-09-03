@@ -406,3 +406,29 @@ def test_recover_without_browser_enablement_owes_no_password(home, capsys):
     controltoml.write_browser_origin(home / "configs", "https://127.0.0.1")
     assert cli_main(["recover"]) == 1  # enabled but hash missing -> named
     assert "origin-init --force" in capsys.readouterr().out
+
+
+# -- the retired Control Node repo setting (ADR-0056) ------------------------------
+
+
+def test_control_node_repo_setting_is_retired(tmp_path):
+    """ADR-0056: THEOZOLITH_REPO is retired as a Control Node setting — a
+    lingering export (and its _FILE spelling) fails settings load loudly, so
+    it can never silently steer coordination; unset/empty loads clean, and a
+    PAT alone (no repo) enables coordination now."""
+    from theozolith_worker.config import ConfigError
+
+    base = {"THEOZOLITH_DATA_DIR": str(tmp_path)}
+    # Unset and empty both load clean (env_value treats "" as unset).
+    assert load_settings(base).coordination_jobs_enabled is False
+    assert load_settings({**base, "THEOZOLITH_REPO": ""}).github_token is None
+    # The PAT alone is the enablement bit — no target repo setting exists.
+    assert load_settings({**base, "CONTROL_GITHUB_TOKEN": "gh"}).coordination_jobs_enabled is True
+
+    with pytest.raises(ConfigError, match="retired"):
+        load_settings({**base, "THEOZOLITH_REPO": "owner/name"})
+    # The _FILE spelling trips the same guard (env_value honors it).
+    repo_file = tmp_path / "repo"
+    repo_file.write_text("owner/name")
+    with pytest.raises(ConfigError, match="retired"):
+        load_settings({**base, "THEOZOLITH_REPO_FILE": str(repo_file)})
