@@ -282,8 +282,9 @@ from an Ozolith-owned completion marker
   needed (the remove-the-mapping hardening keeps working);
 - **marker absent** → require a readable `TS_AUTHKEY_FILE` and run the fresh
   enrollment path — *even over a non-empty `tailscaled.state`* left by a prior
-  failed attempt, so Docker's restart policy (or a corrected key) retries
-  enrollment instead of dead-ending on keyless reuse. The state file itself is
+  failed attempt, so the daemon's reconcile loop recreating the deck on a
+  later pass (or a corrected key) retries enrollment instead of dead-ending
+  on keyless reuse. The state file itself is
   never deleted or rewritten automatically.
 
 The marker is promoted **atomically** (temp file + same-volume rename), and
@@ -385,10 +386,13 @@ the verified path.
 
 `flightdeck-start` (baked by the worker type's setup) is deliberately
 fail-fast — a Flight Deck that cannot bring up its tailnet access exits
-non-zero immediately, and Docker's restart policy owns any retry. (Knowledge
-never blocks a start: the read-only mount's symlinks may dangle until the
-node converges a distribution, ADR-0048.) There is no in-container retry loop
-and no "running but unreachable" state:
+non-zero immediately, and the daemon's reconcile loop owns any retry,
+recreating the deck on a later pass (roughly the heartbeat cadence).
+Daemon-managed Stack containers carry no Docker `--restart` policy, so the
+reconcile loop is the sole restarter (#114). (Knowledge never blocks a start:
+the read-only mount's symlinks may dangle until the node converges a
+distribution, ADR-0048.) There is no in-container retry loop and no "running
+but unreachable" state:
 
 - enrollment vs. reuse is decided from the completion marker (see above)
   **before** `tailscaled` launches — the two branches cannot be misrouted by a

@@ -68,6 +68,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# The one shared stored-secret-name validator lives in the Node Daemon, which
+# owns the tmpfs leaf semantics a name must be safe for (stdlib-only; the
+# ADR-0054 precedent of control importing the daemon's own code so the two can
+# never drift). Applied here at config load, and at the admin write surfaces,
+# so a name unsafe to materialize can never be stored or bound (#114).
+from theozolith_nodedaemon.stacks import SecretNameError, validate_stored_secret_name
+
 # The adapter capability registry (ADR-0045): control validates worker-type
 # model/effort values against the SAME code the derived image runs at build
 # time (theozolith-worker is a runtime dependency, ADR-0015 amendment), so an
@@ -189,11 +196,27 @@ def registry_host(ref: str) -> str:
 
 def validate_registry_secret(name: str, value: str) -> None:
     """Shape-check a secret at the WRITE surface (PUT /api/v1/secrets and the
-    web form, ADR-0049). Only ``registry:``-prefixed names are constrained —
-    a managed registry pull credential must name a plausible host and carry a
-    ``<user>:<token>`` value, or ingest and the node cannot use it. Every
-    other name stays shape-blind (secret values are opaque). Raises
-    ``ConfigRepoError`` with an actionable message on a malformed credential."""
+    web form). Two checks, in order:
+
+    1. EVERY stored name must be a materializable stored secret name
+       (``validate_stored_secret_name``, #114): the name a value is filed under
+       is also the leaf filename the node writes it to, so a traversing, empty,
+       or otherwise unsafe name is refused before it can be stored. This is the
+       same shared validator applied at config-load binding sites and, as
+       defense in depth, in the daemon's ``materialize_secrets``.
+    2. ``registry:``-prefixed names are additionally constrained (ADR-0049) — a
+       managed registry pull credential must name a plausible host and carry a
+       ``<user>:<token>`` value, or ingest and the node cannot use it. A colon
+       is a legal leaf character, so ``registry:<host>`` passes check 1.
+
+    Every non-registry name stays value-shape-blind (secret values are opaque).
+    Raises ``ConfigRepoError`` with an actionable message on any violation."""
+    try:
+        validate_stored_secret_name(name)
+    except SecretNameError as exc:
+        raise ConfigRepoError(
+            f"secret name {name!r} is not a valid stored secret name: {exc}"
+        ) from exc
     if not name.startswith(REGISTRY_SECRET_PREFIX):
         return
     host = name[len(REGISTRY_SECRET_PREFIX) :]
@@ -966,8 +989,15 @@ def _guard_secret_bindings(secrets: dict[str, str], context: str) -> None:
     """A [secrets] binding VALUE (the stored secret name) may not name a
     managed registry pull credential (ADR-0049): ``registry:<host>`` is
     infrastructure delivered to container *builds*, never routed into workload
-    env by a config edit. Guarded at both declaration sites (worker-type
-    default bindings and per-Stack rebindings)."""
+    env by a config edit. And every non-empty binding value must be a
+    materializable stored secret name (``validate_stored_secret_name``, #114):
+    the value becomes a leaf filename on the node, so a traversing or unsafe
+    name is refused here at config load rather than reaching the daemon.
+    Guarded at both declaration sites (worker-type default bindings and
+    per-Stack rebindings). An empty value is a slot sentinel — a required-slot
+    declaration or an unbind (ADR-0047) — resolved and dropped by
+    ``_merge_secret_bindings`` before any name reaches the store, so it is left
+    untouched here."""
     for slot, stored_name in secrets.items():
         if stored_name.startswith(REGISTRY_SECRET_PREFIX):
             raise ConfigRepoError(
@@ -976,6 +1006,14 @@ def _guard_secret_bindings(secrets: dict[str, str], context: str) -> None:
                 " (ADR-0049), never a workload secret; it cannot be routed into"
                 " a Stack's environment"
             )
+        if stored_name:
+            try:
+                validate_stored_secret_name(stored_name)
+            except SecretNameError as exc:
+                raise ConfigRepoError(
+                    f"{context}: [secrets] {slot} binds an invalid stored secret"
+                    f" name {stored_name!r}: {exc}"
+                ) from exc
 
 
 # Fields that a fat pre-ADR-0044 Stack carried but that now live in the worker

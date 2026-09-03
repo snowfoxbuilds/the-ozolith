@@ -93,6 +93,19 @@ class FakeDocker:
         # `compose_ps` for one of these reports a non-running row, so the daemon's
         # liveness check treats it as down and brings it up again.
         self.compose_stopped: set[str] = set()
+        # Restart-policy migration (#114): every set_restart_policy target, in
+        # order, so a test asserts a legacy container was converged to `no`
+        # exactly once and an already-converged one is never touched. A container
+        # in fail_set_restart_policy raises DockerError on update (isolation +
+        # retry test). The two non-converged inspect outcomes are modeled
+        # distinctly (observation doctrine): a name in fail_restart_policy_inspect
+        # RAISES DockerError (a genuine failed observation → isolated + emitted +
+        # retried), while one in vanished_before_inspect reads as None (a benign
+        # disappearance between listing and inspect → skipped, no error).
+        self.restart_policy_updates: list[str] = []
+        self.fail_set_restart_policy: set[str] = set()
+        self.fail_restart_policy_inspect: set[str] = set()
+        self.vanished_before_inspect: set[str] = set()
 
     def add_run_container(self, name: str, run_id: str, owner: str) -> None:
         self.containers[name] = {
@@ -144,7 +157,40 @@ class FakeDocker:
             # Mirrors the real LABEL_STACK_SPEC label; stack_containers surfaces
             # it as a row key, exactly as DockerCtl._ps flattens labels.
             "theozolith.spec": spec,
+            # New containers carry NO Docker restart policy (#114): the real
+            # `docker run` omits `--restart`, so dockerd defaults the policy to
+            # `no`. The migration sweep therefore skips a freshly-run container.
+            "restart_policy": "no",
         }
+
+    def container_restart_policy(self, name: str) -> str | None:
+        # Mirrors DockerCtl.container_restart_policy (#114), keeping the two
+        # non-zero inspect outcomes distinct. A fault-injected name RAISES
+        # DockerError (a genuine failed observation), exactly as a generic non-zero
+        # `docker inspect` does. A name that vanished between listing and inspect —
+        # modeled by vanished_before_inspect, or simply absent from stacks — reads
+        # as None (the definitive `no such container` race). Otherwise the stored
+        # policy, defaulting to `no` for a container seeded without one, exactly as
+        # a real `docker run` without `--restart` reports.
+        if name in self.fail_restart_policy_inspect:
+            raise DockerError(f"restart-policy inspect failed for {name}")
+        if name in self.vanished_before_inspect:
+            return None
+        data = self.stacks.get(name)
+        if data is None:
+            return None
+        return str(data.get("restart_policy", "no"))
+
+    def set_restart_policy(self, name: str, policy: str = "no") -> None:
+        # Mirrors DockerCtl.set_restart_policy (#114): an in-place `docker update`
+        # that never removes or restarts the container. Records the call so a test
+        # can assert the migration ran (and ran only when needed); raises for a
+        # fault-injected name so the isolation/retry path is exercised.
+        if name in self.fail_set_restart_policy:
+            raise DockerError(f"restart-policy update failed for {name}")
+        self.restart_policy_updates.append(name)
+        if name in self.stacks:
+            self.stacks[name]["restart_policy"] = policy
 
     def compose(self, project: str, files: list[Path], verb: str) -> None:
         self.compose_calls.append((project, [str(f) for f in files], verb))

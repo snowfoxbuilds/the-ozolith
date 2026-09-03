@@ -2288,6 +2288,66 @@ def test_validate_registry_secret_shape(name, value, ok):
             validate_registry_secret(name, value)
 
 
+@pytest.mark.parametrize(
+    "bad", ["", ".", "..", "../evil", "a/b", "/abs", ".a.tmp", ".token.tmp", "with\x00nul"]
+)
+def test_validate_registry_secret_rejects_unsafe_stored_names(bad):
+    """The WRITE surface (PUT /api/v1/secrets and the web form) refuses a stored
+    name unsafe to materialize as a tmpfs leaf (#114) before it can be stored —
+    the same shared validator applied at config load and in the daemon. The
+    reservation is narrow: '.'/'..', separators, NUL, and the writer's
+    '.<name>.tmp' temporary namespace."""
+    from theozolith_control.configrepo import validate_registry_secret
+
+    with pytest.raises(ConfigRepoError):
+        validate_registry_secret(bad, "some-value")
+
+
+@pytest.mark.parametrize("ok", [".env", ".hidden", "backup.tmp", "github-implementer"])
+def test_validate_registry_secret_accepts_ordinary_dot_names(ok):
+    """Ordinary dot-prefixed leaves ('.env', '.hidden') are legitimate secret
+    names, not traversals — only the '.<name>.tmp' temp namespace is reserved — so
+    the write surface accepts them (#114)."""
+    from theozolith_control.configrepo import validate_registry_secret
+
+    validate_registry_secret(ok, "some-value")  # no raise
+
+
+@pytest.mark.parametrize("site", ["worker-type", "stack", "generic-process", "generic-container"])
+def test_invalid_stored_secret_name_binding_is_rejected(tmp_path, site):
+    """A [secrets] binding VALUE unsafe to materialize is refused at config load,
+    fail-loud at every declaration site (#114): worker-type defaults, thin-Stack
+    rebindings, and plain (workerless) process/container Stacks — so a traversing
+    name can never reach the Fernet store or the node."""
+    bad = "../evil"
+    if site == "worker-type":
+        driver_type(tmp_path, secrets={"GITHUB_TOKEN": bad})
+        thin_stack(tmp_path, "implementer", "claude-dev")
+    elif site == "stack":
+        driver_type(tmp_path)
+        write(
+            tmp_path,
+            "stacks/implementer.toml",
+            f'worker_type = "claude-dev"\nnode = "box1"\n[secrets]\nGITHUB_TOKEN = "{bad}"\n',
+        )
+    elif site == "generic-process":
+        write(
+            tmp_path,
+            "stacks/job.toml",
+            'kind = "process"\nnode = "box9"\nstate = "running"\n'
+            f'command = "python3 -m job"\n[secrets]\nTOK = "{bad}"\n',
+        )
+    else:  # generic-container
+        write(
+            tmp_path,
+            "stacks/web.toml",
+            'kind = "container"\nnode = "box9"\nstate = "running"\n'
+            f'image = "ghcr.io/acme/web:1"\n[secrets]\nTOK = "{bad}"\n',
+        )
+    with pytest.raises(ConfigRepoError, match="invalid stored secret name"):
+        load_config(tmp_path)
+
+
 # -- the codex adapter through config load (ADR-0052) ----------------------------
 
 

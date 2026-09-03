@@ -205,9 +205,10 @@ resolves the entry, and the next `claude` launch picks up the new content.
    never recreates: it is picked up on the next `claude` launch in any tmux
    window, while a running session keeps what it loaded. A deck whose node
    has not yet converged a declared artifact fails its container start
-   loudly and lets the restart policy retry, and the point-5 check guards
-   every later launch the same way — non-convergence is never a silent
-   fallback.
+   loudly and the daemon's reconcile loop recreates it on a later pass,
+   retrying the start (amended 2026-09-03, #118), and the point-5 check
+   guards every later launch the same way — non-convergence is never a
+   silent fallback.
 7. **Scope.** The CLI Pin is driverless-only in v1 and refused with a driver
    (the mirror of `effort` being refused on decks until a consumer exists);
    driver types keep the base image's CLI as identity bytes. Both fields are
@@ -336,7 +337,20 @@ behavior. The implementing PRs must demonstrate at minimum:
   future key becomes a silent execution or identity surface; hence the
   allowlist.
 
+## Amendments
+
+- **2026-09-03 (#118)**: the reconcile loop, not a Docker restart policy,
+  retries a failed deck start (Decision 6). Daemon-managed single-image Stack
+  containers carry no Docker `--restart` policy — the Node Daemon's reconcile
+  loop is the sole restarter, so a deck that fails its fail-closed launch is
+  recreated on a later pass (roughly the heartbeat cadence). This closes the
+  boot-time race (#114) where dockerd, restarting an `unless-stopped`
+  container before the daemon materialized secrets onto the freshly-wiped
+  `/run` tmpfs, auto-vivified the missing bind source as a directory and
+  wedged both the mount and the secret writer. See NODE-SUBSTRATE.md.
+
 ## Relevant PRs
 
 - #95 — grilling session (2026-09-02) that settled this decision.
 - #97 — post-merge review that hardened the first draft: the safe-key allowlist closing the identity denylist gap, the pin-as-requirement fix, separating integrity from safe extraction, closing the interior-of-an-admitted-key hole, and the per-platform integrity map.
+- #118 — the reconcile loop is the sole restarter of Stack containers, retiring the Docker restart policy that raced tmpfs secret materialization on boot (#114).

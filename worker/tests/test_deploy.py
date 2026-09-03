@@ -1474,8 +1474,9 @@ def test_flightdeck_start_unavailable_tree_fails_before_the_daemon(tmp_path, exa
     """ADR-0048 amendment: the selected knowledge tree is a HARD prerequisite
     — when the node has not converged a distribution carrying it (or the tree
     was retired), the deck fails loud BEFORE tailscaled ever launches, and
-    docker restart policy owns the retry. Silently starting without skills is
-    exactly what this replaces."""
+    the daemon's reconcile loop owns the retry — recreating the deck on a later
+    pass (~heartbeat cadence). Silently starting without skills is exactly what
+    this replaces."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
@@ -1594,8 +1595,9 @@ def test_flightdeck_start_links_managed_settings_into_the_policy_tree(tmp_path, 
 
 def test_flightdeck_start_unconverged_policy_tree_fails_before_the_daemon(tmp_path, example_config):
     """ADR-0055 §6: a SELECTED policy tree the node has not converged fails
-    the start loudly BEFORE tailscaled launches — docker restart policy owns
-    the retry; a deck never runs under silently missing policy."""
+    the start loudly BEFORE tailscaled launches — the daemon's reconcile loop
+    owns the retry, recreating the deck on a later pass (~heartbeat cadence);
+    a deck never runs under silently missing policy."""
     sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
     shutil.rmtree(sandbox / "policy" / "claude-defaults")  # not converged yet
     proc = _run_start(
@@ -2170,7 +2172,8 @@ def test_flightdeck_start_enrollment_failure_is_permanent_not_retried(tmp_path, 
     """Issue #31 lifecycle point 4: a failing `tailscale up` (invalid/expired
     key, rejected flags) gets exactly ONE attempt and fails the container
     promptly — the removed draft's invisible `until ... sleep 5` loop must
-    never come back. Docker's restart policy owns any retry."""
+    never come back. The daemon's reconcile loop owns any retry, recreating the
+    deck on a later pass (~heartbeat cadence)."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
@@ -2450,10 +2453,11 @@ def test_flightdeck_start_workspace_debris_is_refused_not_deleted(tmp_path, exam
 
 
 def test_flightdeck_start_failed_auth_or_clone_fails_the_container(tmp_path, example_config):
-    """gh failures are container failures (docker restart policy owns the
-    retry): a rejected token stops the start at auth, a failed clone stops
-    it at the clone — both BEFORE tailscaled launches, so a deck never runs
-    half-authenticated or half-materialized."""
+    """gh failures are container failures (the daemon's reconcile loop owns the
+    retry, recreating the deck on a later pass ~heartbeat cadence): a rejected
+    token stops the start at auth, a failed clone stops it at the clone — both
+    BEFORE tailscaled launches, so a deck never runs half-authenticated or
+    half-materialized."""
     sandbox = tmp_path / "sandbox"
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
@@ -2766,8 +2770,9 @@ def test_deck_shim_running_session_survives_a_bump(tmp_path, example_config):
 def test_flightdeck_start_unconverged_cli_pin_fails_before_the_daemon(tmp_path, example_config):
     """ADR-0055 §6: a pinned deck whose node has not converged the CLI export
     refuses the container start loudly — before tailscaled, before tmux —
-    and docker restart policy owns the retry; neither the previous export
-    nor the image CLI ever runs."""
+    and the daemon's reconcile loop owns the retry, recreating the deck on a
+    later pass (~heartbeat cadence); neither the previous export nor the image
+    CLI ever runs."""
     sandbox, bin_dir, script, daemon_calls, key_file = _policy_run(tmp_path, example_config)
     proc = _run_start(
         script,
