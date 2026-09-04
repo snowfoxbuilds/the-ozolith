@@ -474,7 +474,11 @@ class AuditSink:
     reopened. The terminal record's room is reserved at construction and
     never released. State: ``ok`` → ``budget-exhausted`` when a reservation
     would cross the file cap, ``unavailable`` after any failed write (no
-    further write of any kind)."""
+    further write of any kind). Both states are latched: only an ``ok`` sink
+    hands out a reservation, so room a release returns to the pool after
+    exhaustion is never lent again — the reservations already held finish,
+    the terminal record has its own room, and nothing else is authorized
+    (ADR-0057 item 8)."""
 
     def __init__(
         self,
@@ -515,6 +519,8 @@ class AuditSink:
         return self._seq
 
     def reserve(self, kind: str) -> Reservation | None:
+        if self.state != STATE_OK:
+            return None
         size = RESERVATION_RECORDS[kind] * self.budgets.record_cap
         if self._committed + size > self.budgets.file_cap:
             self.state = STATE_BUDGET_EXHAUSTED

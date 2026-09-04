@@ -322,6 +322,21 @@ def _parse_header_line(line: bytes) -> tuple[str, str] | None:
     return name.decode("ascii"), value.strip(b" \t").decode("ascii")
 
 
+def _content_length(value: str, limit: int) -> int | None:
+    """The declared length when ``value`` is decimal digits (leading zeros
+    included) naming at most ``limit`` bytes; ``None`` otherwise. The digit
+    count is compared before any conversion, so a value as wide as the header
+    field never reaches ``int`` — its string-to-integer limit would otherwise
+    turn a hostile header into an exception instead of a refusal."""
+    if _DIGITS.fullmatch(value) is None:
+        return None
+    significant = value.lstrip("0")
+    if len(significant) > len(str(limit)):
+        return None
+    length = int(significant) if significant else 0
+    return length if length <= limit else None
+
+
 def _read_chunked(reader: Reader, budgets: Budgets) -> bytes | Reason:
     parts: list[bytes] = []
     total = 0
@@ -446,11 +461,10 @@ def read_request(
         return refuse(Reason.FRAMING)
     body_length = 0
     if content_lengths:
-        if _DIGITS.fullmatch(content_lengths[0]) is None:
+        declared = _content_length(content_lengths[0], budgets.request_body_limit)
+        if declared is None:
             return refuse(Reason.FRAMING)
-        body_length = int(content_lengths[0])
-        if body_length > budgets.request_body_limit:
-            return refuse(Reason.FRAMING)
+        body_length = declared
     chunked = False
     if transfer_encodings:
         if transfer_encodings[0].lower() != "chunked":

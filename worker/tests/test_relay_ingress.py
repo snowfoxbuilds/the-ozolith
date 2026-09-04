@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -513,6 +514,41 @@ def test_body_framing_matrix():
     assert refusal_triple(
         parse(request(post, b"Transfer-Encoding: chunked", body=two_chunks_over))
     ) == (None, "framing", 400)
+
+
+def test_content_length_is_total_over_every_value_the_header_limits_admit():
+    post = b"POST /graphql HTTP/1.1"
+    limit = DEFAULT_BUDGETS.request_body_limit
+    tail = b"GET /user/keys HTTP/1.1\r\n\r\n"
+    # The widest value that fits the header field is far past the
+    # interpreter's string-to-integer digit limit; it must refuse, not raise.
+    widest = DEFAULT_BUDGETS.header_field - len(b"Content-Length: ")
+    assert widest > sys.get_int_max_str_digits()
+    for digits in (b"9" * 5000, b"9" * widest, b"1" + b"0" * len(str(limit))):
+        data = reader(request(post, b"Content-Length: " + digits, body=b"{}" + tail))
+        result = read_request(data, DEFAULT_BUDGETS)
+        assert refusal_triple(result) == (None, "framing", 400), len(digits)
+        assert isinstance(result.target, CanonicalTarget) and result.target.path == "/graphql"
+        assert data.read() == b"{}" + tail, len(digits)
+    # Leading zeros keep the numeric value, however many there are.
+    zeros = b"0" * 5000
+    assert parse(request(post, b"Content-Length: " + zeros + b"2", body=b"{}")).body == b"{}"
+    assert parse(request(post, b"Content-Length: " + zeros)).body == b""
+    assert parse(request(post, b"Content-Length: " + zeros + b"0")).body == b""
+    at = parse(request(post, b"Content-Length: " + zeros + b"%d" % limit, body=b"x" * limit))
+    assert isinstance(at, ParsedRequest) and len(at.body) == limit
+    padded_over = zeros + b"%d" % (limit + 1)
+    assert refusal_triple(parse(request(post, b"Content-Length: " + padded_over, body=b"x"))) == (
+        None,
+        "framing",
+        400,
+    )
+    # A leading-zero declaration on GET is still a body on GET.
+    assert refusal_triple(
+        parse(request(b"GET /user HTTP/1.1", b"Content-Length: " + zeros + b"2", body=b"{}"))
+    ) == (None, "body", 400)
+    get_zeros = parse(request(b"GET /user HTTP/1.1", b"Content-Length: " + zeros))
+    assert isinstance(get_zeros, ParsedRequest)
 
 
 # ------------------------------------------------- upstream reconstruction

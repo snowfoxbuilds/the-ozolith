@@ -813,6 +813,45 @@ def test_terminal_room_is_reserved_at_construction_and_reservations_latch_budget
         sink.write_terminal(TerminalRecord(TS, "agent-exit", False, False, True, 1, 0, 0, 1, 1))
 
 
+def test_budget_exhaustion_never_recovers_when_a_held_reservation_is_released():
+    # Terminal room plus one authorized reservation is exactly the cap.
+    fake = FakeFd()
+    sink = fake.sink(Budgets(record_cap=4096, file_cap=4096 * 6))
+    held = sink.reserve("authorized")
+    assert held is not None
+    assert sink.reserve("refusal") is None and sink.state == "budget-exhausted"
+    target = Target.full(MethodClass.GET, target_of("/user"), None)
+    sink.write_intent(authorized(1, target), held)
+    sink.write_completion(CompletionRecord(1, TS, Outcome.DELIVERED, 200, 1, 1, ()), held)
+    sink.release(held)
+    # The release returned the unused room, but the state is a latch: no
+    # refusal or authorized reservation is handed out again, ever.
+    committed = sink.bytes_committed
+    assert committed == 4096 + held.used < 4096 * 6
+    for _ in range(3):
+        assert sink.reserve("refusal") is None
+        assert sink.reserve("authorized") is None
+        assert sink.state == "budget-exhausted"
+        assert sink.bytes_committed == committed
+    # The terminal record still has the room reserved for it at construction.
+    sink.write_terminal(TerminalRecord(TS, "agent-exit", False, False, True, 1, 0, 0, 1, 1))
+    assert len(fake.writes) == 3 and sink.state == "budget-exhausted"
+
+
+def test_unavailable_takes_precedence_over_budget_exhaustion():
+    fake = FakeFd(fail_sync=True)
+    sink = fake.sink(Budgets(record_cap=4096, file_cap=4096 * 6))
+    held = sink.reserve("authorized")
+    target = Target.full(MethodClass.GET, target_of("/user"), None)
+    with pytest.raises(AuditUnavailable):
+        sink.write_intent(authorized(1, target), held)
+    assert sink.state == "unavailable"
+    # A reservation that would have crossed the cap never relabels the state.
+    assert sink.reserve("refusal") is None and sink.state == "unavailable"
+    sink.release(held)
+    assert sink.reserve("refusal") is None and sink.state == "unavailable"
+
+
 def test_unused_reservation_bytes_are_released_only_after_the_last_record():
     budgets = Budgets(record_cap=1000, file_cap=100_000)
     fake = FakeFd()

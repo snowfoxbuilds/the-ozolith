@@ -122,9 +122,23 @@ def test_variables_come_from_the_json_body_independent_of_the_query_text():
     assert by_name["ratio"] == GraphQLVariable("ratio", "number", b"0.5")
     assert canonical_json({"z": "é"}) == b'{"z":"\\u00e9"}'  # ASCII-only by construction
     absent = classify_graphql(b'{"query": "{ viewer { id } }"}')
-    assert absent.variables == ()
-    null = classify_graphql(b'{"query": "{ viewer { id } }", "variables": null}')
-    assert null.variables == () and null.refusal is None
+    assert absent.parsed and absent.variables == () and absent.refusal is None
+    empty = classify_graphql(b'{"query": "{ viewer { id } }", "variables": {}}')
+    assert empty.parsed and empty.variables == () and empty.refusal is None
+
+
+def test_a_present_variables_member_must_be_an_object():
+    # Omission is an empty set; presence with any non-object value — null
+    # included — refuses the body before the document is ever lexed.
+    for value in (b"null", b"[1]", b"[]", b'"x"', b"1", b"0", b"true", b"false"):
+        result = classify_graphql(b'{"query": "{ viewer { id } }", "variables": ' + value + b"}")
+        assert result.parsed is False, value
+        assert result.refusal is Reason.GRAPHQL_UNPARSEABLE, value
+        assert (result.operation_type, result.operation_name, result.variables) == (
+            None,
+            None,
+            (),
+        ), value
 
 
 def test_lexer_precision_on_names_and_literals():

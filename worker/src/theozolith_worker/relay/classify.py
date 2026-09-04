@@ -231,13 +231,14 @@ def classify_graphql(body: bytes) -> GraphQLClassification:
     data = _load_json_object(body)
     if data is None or not isinstance(data.get("query"), str):
         return _UNPARSEABLE
-    raw_variables = data.get("variables")
-    if raw_variables is None:
+    # An absent member is an empty variable set; a present one must be an
+    # object — ``null`` included, every other JSON value refuses the body.
+    if "variables" not in data:
         variables: tuple[GraphQLVariable, ...] = ()
-    elif isinstance(raw_variables, dict):
+    elif isinstance(data["variables"], dict):
         variables = tuple(
             GraphQLVariable(name, _json_type(value), canonical_json(value))
-            for name, value in raw_variables.items()
+            for name, value in data["variables"].items()
         )
     else:
         return _UNPARSEABLE

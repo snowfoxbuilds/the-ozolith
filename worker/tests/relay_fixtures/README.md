@@ -84,7 +84,8 @@ allowlist is exercised against what `gh` really sends.
   and the variable names in body order. `gh-*` files are captures; `adv-*`
   files are hand-authored adversarial documents (multi-operation, keywords
   hidden in comments and string literals, anonymous queries, mutations,
-  subscriptions, empty and garbage bodies, duplicate keys, bad encodings).
+  subscriptions, empty and garbage bodies, duplicate keys, bad encodings, a
+  present `variables` member that is not an object — `null` included).
 - `rest/<name>.http` — a complete captured request. `<name>.expected.json`
   gives the method and the byte-exact canonical upstream request-target the
   relay reconstructs.
