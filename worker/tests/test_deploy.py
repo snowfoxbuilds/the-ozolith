@@ -91,6 +91,42 @@ def test_systemd_units_exist_for_both_drivers():
         assert "M3" in unit  # explicitly a convenience until daemon supervision
 
 
+CODEX_DOCKERFILE = REPO_ROOT / "worker" / "docker" / "Dockerfile.codex"
+RELAY_FIXTURES_README = REPO_ROOT / "worker" / "tests" / "relay_fixtures" / "README.md"
+
+
+def fixture_corpus_gh_version() -> str:
+    """The exact `gh` release the relay fixture corpus was captured from."""
+    match = re.search(r"`GH_VERSION`: `(\d+\.\d+\.\d+)`", RELAY_FIXTURES_README.read_text())
+    assert match is not None, "relay_fixtures/README.md must name its GH_VERSION"
+    return match.group(1)
+
+
+def assert_gh_pin(dockerfile: str) -> str:
+    """ADR-0057: `gh` is pinned to one exact release by version AND
+    release-tarball sha256, verified before extraction (fail-closed, the
+    tailscale/gitleaks precedent), installed onto PATH, amd64-only in V1,
+    and equal to the version the fixture corpus was captured from — the
+    relay and the client it is tested against ship together."""
+    version = re.search(r"^ARG GH_VERSION=(\d+\.\d+\.\d+)$", dockerfile, re.M)
+    assert version is not None, "the gh install must declare an exact ARG GH_VERSION default"
+    assert re.search(r"^ARG GH_SHA256=[0-9a-f]{64}$", dockerfile, re.M), (
+        "a lowercase sha256 default"
+    )
+    assert (
+        "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+        in dockerfile
+    )
+    verify = dockerfile.index('echo "${GH_SHA256}  gh.tgz" | sha256sum -c -')
+    extract = dockerfile.index("tar -xzf gh.tgz")
+    assert verify < extract, "the checksum must be verified before the tarball is extracted"
+    assert "ARG TARGETARCH" in dockerfile
+    assert 'if [ "$arch" != "amd64" ]' in dockerfile and "exit 1" in dockerfile
+    assert "/usr/local/bin/gh" in dockerfile
+    assert version.group(1) == fixture_corpus_gh_version()
+    return version.group(1)
+
+
 def test_run_image_contract():
     dockerfile = DOCKERFILE.read_text()
     # PID 1 is the harness; the actors never run in this image.
@@ -104,6 +140,13 @@ def test_run_image_contract():
     assert "OZOLITH_UID" in dockerfile  # job-dir ownership knob
     # Knowledge Source is baked at BUILD time (never at container start).
     assert "theozolith-knowledge bake" in dockerfile
+    assert_gh_pin(dockerfile)
+
+
+def test_run_images_pin_the_same_gh_version():
+    """One relay, one client: both run images install the exact `gh`
+    release the fixture corpus was captured from (ADR-0057 item 6)."""
+    assert assert_gh_pin(DOCKERFILE.read_text()) == assert_gh_pin(CODEX_DOCKERFILE.read_text())
 
 
 def test_codex_run_image_contract():
@@ -115,7 +158,7 @@ def test_codex_run_image_contract():
     per-tool tree at the node)."""
     from theozolith_worker.adapters import CodexAdapter
 
-    dockerfile = (REPO_ROOT / "worker" / "docker" / "Dockerfile.codex").read_text()
+    dockerfile = CODEX_DOCKERFILE.read_text()
     assert 'ENTRYPOINT ["theozolith-harness"]' in dockerfile
     assert "tmux" not in dockerfile
     assert "USER ozolith" in dockerfile
@@ -125,6 +168,7 @@ def test_codex_run_image_contract():
     floor = ".".join(str(part) for part in CodexAdapter.MIN_ENFORCING_CLI)
     assert pinned.group(1) == floor  # bump both together, re-running spike #76
     assert "theozolith-knowledge bake" not in dockerfile
+    assert_gh_pin(dockerfile)
 
 
 def test_ci_builds_the_run_container_images():
