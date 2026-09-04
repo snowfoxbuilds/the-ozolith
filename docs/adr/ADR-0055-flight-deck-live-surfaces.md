@@ -176,21 +176,54 @@ resolves the entry, and the next agent-CLI launch picks up the new content (amen
    equal for every tool, the way the tuple-key spelling is already held.
    Per tool the contract fixes: the wrapper package; the supported
    platform-package map (tuple → package and tarball-version rule); the
-   expected archive prefix per tuple; the exact executable member; the
-   published executable name; the closed set of members permitted to
-   carry executable bits; and the layout markers that must be present.
-   The rows, verified against the real tarballs at the adapters' floors
-   (claude-code 2.1.260 and codex 0.150.0, 2026-09-04):
+   **archive root** (npm's fixed `package/`, the directory every member
+   must sit under) and, beneath it, the **payload prefix** per tuple —
+   the directory the tool's own layout starts at, which for a vendored
+   tool is not the root; the **allowed-member set**, closed: every member
+   of the real archive at its exact root-relative path, each tagged
+   executable or non-executable, root members outside the payload prefix
+   included; the exact executable member; the published name; the
+   **published set**, also closed — the allowed members under the payload
+   prefix, rehomed at their prefix-relative paths, plus the product-created
+   link when the layout is vendored; and the **layout marker** with its
+   closed schema. No executable member outside the row's executable-tagged
+   members is ever accepted, and no member outside the allowed set is ever
+   accepted, executable or not. The rows, verified against the real
+   tarballs at the adapters' floors (claude-code 2.1.260 and codex
+   0.150.0, both Linux architectures, 2026-09-04):
 
    | | claude | codex |
    | --- | --- | --- |
    | Wrapper | `@anthropic-ai/claude-code` | `@openai/codex` (its `bin/codex.js` is a node launcher the deck never runs) |
    | Platform tarball | `@anthropic-ai/claude-code-linux-{x64,arm64}[-musl]` at `<version>` | `@openai/codex` at `<version>-linux-{x64,arm64}`; the glibc and musl tuples of one architecture share it |
-   | Prefix | `package/` | `package/vendor/<triple>/`, triple `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` |
+   | Archive root | `package/` | `package/` |
+   | Payload prefix | the root itself | `package/vendor/<triple>/`, triple `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` |
+   | Allowed members (closed) | four: `claude` (executable), `package.json`, `LICENSE.md`, `README.md` | eight: at the root `package.json` and `README.md` (non-executable, outside the payload prefix); under the payload prefix `codex-package.json` (non-executable) and the five executables `bin/codex`, `bin/codex-code-mode-host`, `codex-path/rg`, `codex-resources/bwrap`, `codex-resources/zsh/bin/zsh` — the helpers the binary resolves relative to its own canonical path |
    | Executable member | `package/claude` | `<prefix>bin/codex` |
    | Published name | `claude` | `codex` |
-   | Permitted executables | exactly the executable member | `bin/codex`, `bin/codex-code-mode-host`, `codex-path/rg`, `codex-resources/bwrap`, `codex-resources/zsh/bin/zsh`, all under the prefix — the helpers the binary resolves relative to its own canonical path |
-   | Required markers | `package/package.json` | `package/package.json` and `<prefix>codex-package.json`, the marker the binary locates its helpers by |
+   | Published set (closed) | the four members | the six payload members at their prefix-relative paths plus the product-created link `codex` → `bin/codex`; the root `package.json` and `README.md` are validated and discarded |
+   | Layout marker | `package/package.json`: `name` equals the tuple's platform package and `version` the pinned version | `<prefix>codex-package.json` under the closed schema below; `package/package.json` additionally carries `name` `@openai/codex` and `version` `<pinned>-<platform>` |
+
+   The codex layout marker is the file the binary locates its helpers by,
+   so it is validated under a **closed schema** with every field bound to
+   a product-expected value derived from the contract row and the pinned
+   coordinate — never from the archive: exactly the seven members
+   `layoutVersion` (integer, exactly the row's `1`), `version` (string,
+   exactly the resolved base version — `0.150.0`, without the platform
+   suffix), `target` (string, exactly the selected tuple's triple),
+   `variant` (string, exactly `codex`), `entrypoint` (string, exactly the
+   executable member's prefix-relative path `bin/codex`), `resourcesDir`
+   (exactly `codex-resources`) and `pathDir` (exactly `codex-path`). A
+   missing member, an extra member, a wrong type, a wrong value, an
+   empty, absolute, `..`-bearing, backslash- or NUL-bearing path value, an
+   `entrypoint` outside the executable-tagged set, and a value consistent
+   with the other tuple (its triple, or a base version other than the
+   pinned one) each refuse before anything is extracted. The daemon
+   publishes a product-rendered marker holding exactly those bound values,
+   never the archive's bytes, so the published layout is product-owned end
+   to end; the archive's copy is evidence that the tarball is the one the
+   contract describes, nothing more. The claude marker is bound the same
+   way for the two fields the contract names.
 
    A tool absent from the contract fails closed with a typed, redacted
    class before any download, its records untouched; a malformed contract
@@ -206,20 +239,24 @@ resolves the entry, and the next agent-CLI launch picks up the new content (amen
    validates every member before any extraction — absolute paths, `..`
    traversal, symlinks, hardlinks, devices, sockets, FIFOs, and unexpected
    entry types refuse; duplicate or conflicting paths refuse; entry-count
-   and expanded-size caps apply; every member must sit under the tool's
-   prefix root, every required marker and the executable member must be
-   present as regular files, and any executable-mode member outside the
-   contract's permitted set refuses — a claude tarball offered to the
-   codex contract, or the reverse, refuses on both counts; (e) extracts
-   only into staging, never following links, to paths computed from the
-   validated names; (f) requires the executable member and every
-   permitted executable to be a regular file and normalizes ownership
-   (the service account) and modes itself — permitted executables 0755,
-   everything else 0644; archive metadata is never trusted; (g)
-   assembles the publish directory from the contract's published set —
-   the permitted executables and required markers at their
-   prefix-relative paths, nothing else from the archive — and, when the
-   executable member is not at the prefix root, adds a product-created
+   and expanded-size caps apply; every member must sit under the archive
+   root and be named in the row's allowed-member set as a regular file, no
+   allowed member may be absent, and a member's executable bit must agree
+   with its tag in both directions — an executable-mode member the row
+   tags non-executable refuses exactly as an unlisted member does — then
+   the layout marker is read from the archive stream, size-capped, and
+   held to the closed schema; a claude tarball offered to the codex
+   contract, or the reverse, refuses on every one of these counts; (e)
+   extracts only into staging, never following links, to paths computed
+   from the validated names; (f) requires the executable member and every
+   executable-tagged member to be a regular file and normalizes ownership
+   (the service account) and modes itself — executable-tagged members
+   0755, everything else 0644, directories 0755; archive metadata is
+   never trusted; (g) assembles the publish directory from the row's
+   published set — the allowed members under the payload prefix at their
+   prefix-relative paths, the product-rendered marker in place of the
+   archive's, nothing else from the archive — and, when the executable
+   member is not at the payload prefix root, adds a product-created
    relative link `<published name>` → executable member inside the
    directory (codex: `codex` → `bin/codex`; the binary canonicalizes its
    own path before looking for its helpers, so the link is transparent
@@ -238,9 +275,13 @@ resolves the entry, and the next agent-CLI launch picks up the new content (amen
    integrity — and a daemon that carries the contract refuses an unknown
    tool before download; either way nothing publishes and no verified
    entry is touched. A claude pin's wire shape is unchanged, so an older
-   Control's claude pins converge on a newer daemon exactly as before.
-   This is the ADR-0042 staged-verify-then-exchange doctrine applied to
-   a registry artifact.
+   Control's claude pins converge on a newer daemon exactly as before. The
+   allowed-member set and the marker schema advance only with the
+   adapter's validated-CLI review (the one that moves `MIN_ENFORCING_CLI`),
+   so a pinned CLI whose archive gains, loses, or renames a member fails
+   closed until that review records the new row — the deliberate price of
+   a closed contract. This is the ADR-0042 staged-verify-then-exchange
+   doctrine applied to a registry artifact.
 5. **The pin is an execution requirement: desired-first publication,
    converge-strict launch, no fallback.** Per worker type the export parent
    carries two published facts: a **desired record** — the exact resolved
@@ -343,23 +384,38 @@ behavior. The implementing PRs must demonstrate at minimum:
   normalized ownership and modes; concurrent reconciliation exposes no
   partial state; pruning cannot delete a desired or exported version.
 - **CLI archive contract** (amended 2026-09-04, #132): success fixtures
-  for both real archive shapes — the four-member claude layout and the
-  eight-member vendored codex layout, per Linux tuple — install, publish
-  exactly the contract's published set with normalized modes, and expose
-  the published executable at `<version>/<name>` (for codex through the
-  daemon-created link, resolving inside the version directory); negative
-  tests refuse, each without publishing and with previously verified
-  versions untouched: cross-tool archive substitution in both directions,
-  a wrong executable path or name, an unexpected executable payload (an
-  extra executable beside the permitted set, or a permitted name under
-  another triple's prefix), a missing layout marker, a malformed contract
-  row, and an unknown tool on the wire; mixed-version wire behavior is
-  exercised — an older daemon receiving a codex pin fails at the integrity
-  gate and publishes nothing, and a newer daemon converges an older
-  Control's claude pins unchanged; the adapter-side and daemon-side halves
-  of the contract are held equal by a test for every registered adapter
-  that declares a CLI table; the codex launch shim passes the pin check
-  and execs the published link exactly as the claude shim execs its
+  for both real archive shapes — the four-member claude layout per Linux
+  tuple and the eight-member vendored codex layout for **both** the x64
+  and the arm64 tarball, each fixture replicating the real member listing
+  exactly (paths, types, modes, both root members, the marker and the
+  `package.json` contents) — install, publish exactly the row's published
+  set with normalized modes and the product-rendered marker, publish
+  nothing from outside the payload prefix, and expose the published
+  executable at `<version>/<name>` (for codex through the daemon-created
+  link, resolving inside the version directory); the recorded rows are
+  re-verified against the real registry tarballs whenever a floor moves.
+  Negative tests refuse, each without publishing and with previously
+  verified versions untouched: cross-tool archive substitution in both
+  directions; a wrong executable path or name; a member outside the
+  allowed set (executable or not, at the root or under the prefix); an
+  allowed member missing; an executable bit on a non-executable-tagged
+  member and a permitted executable name under the other triple's prefix;
+  a link, device, duplicate, traversal, absolute, oversized, or
+  over-count member; a malformed contract row; an unknown tool on the
+  wire. Marker mutation tests cover every rejected field of the codex
+  schema — each of the seven members missing, an extra member, a wrong
+  type, a wrong value, `layoutVersion` other than the row's, `version`
+  carrying the platform suffix or another base version, `target` naming
+  the other triple, `variant` other than `codex`, `entrypoint` absolute,
+  traversal-bearing, or outside the executable-tagged set, and
+  `resourcesDir`/`pathDir` absolute, traversal-bearing, or renamed — and
+  the two bound claude `package.json` fields. Mixed-version wire behavior
+  is exercised — an older daemon receiving a codex pin fails at the
+  integrity gate and publishes nothing, and a newer daemon converges an
+  older Control's claude pins unchanged; the adapter-side and daemon-side
+  halves of the contract are held equal by a test for every registered
+  adapter that declares a CLI table; the codex launch shim passes the pin
+  check and execs the published link exactly as the claude shim execs its
   binary.
 - **Lifecycle**: adopting or dropping the CLI Pin recreates once; a
   version change does not recreate; an existing session survives a pin
@@ -391,7 +447,10 @@ behavior. The implementing PRs must demonstrate at minimum:
   means new launches fail until the fetch succeeds — the deliberate price
   of pin-as-requirement (running sessions ride through). A new vendor
   settings key is unusable in policy until deliberately classified into
-  the allowlist.
+  the allowlist. Likewise a CLI version whose archive membership or
+  layout marker differs from the contract row fails closed until the
+  adapter's validated-CLI review records the new row — pinning ahead of
+  the floor is bounded by the closed contract, not just by the floor lint.
 - **Neutral**: the deck image still ships the base image's CLI, inert when
   a pin is declared; the config distribution hash keeps its protocol name
   while covering a third tree; the Candidate Bundle exporter and verifier
@@ -452,7 +511,7 @@ behavior. The implementing PRs must demonstrate at minimum:
   container before the daemon materialized secrets onto the freshly-wiped
   `/run` tmpfs, auto-vivified the missing bind source as a directory and
   wedged both the mount and the secret writer. See NODE-SUBSTRATE.md.
-- **2026-09-04 (#132)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout. The CLI archive contract becomes explicit per tool (Decisions 3–5 and 8): a closed product-owned table in Node Daemon code, mirrored by adapter constants under a contract test, with the rows verified against the real claude 2.1.260 and codex 0.150.0 tarballs; the registry supplies bytes and integrity only, the published-executable link for a vendored layout is daemon-created and never archive-supplied, and an unknown tool or a mixed-version wire fails closed without touching verified entries.
+- **2026-09-04 (#132)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout. The CLI archive contract becomes explicit per tool (Decisions 3–5 and 8): a closed product-owned table in Node Daemon code, mirrored by adapter constants under a contract test, with the rows verified against the real claude 2.1.260 and codex 0.150.0 tarballs; the registry supplies bytes and integrity only, the published-executable link for a vendored layout is daemon-created and never archive-supplied, and an unknown tool or a mixed-version wire fails closed without touching verified entries. Re-amended in the same PR after review: the contract distinguishes the archive root from the tool payload prefix, enumerates the real codex members outside the prefix (`package/package.json`, `package/README.md`), closes the allowed-member and published-member sets (no unlisted member, executable or not, and no executable bit outside the five payload executables), binds `codex-package.json` to a closed seven-field schema whose values derive from the row and the pinned coordinate and publishes a product-rendered marker, and requires fixtures for both the x64 and the arm64 eight-member tarball plus mutation tests for every rejected marker field.
 
 ## Relevant PRs
 
