@@ -1,0 +1,1 @@
+{"query": "mutation query { addStar(input: {starrableId: \"x\"}) { clientMutationId } }"}

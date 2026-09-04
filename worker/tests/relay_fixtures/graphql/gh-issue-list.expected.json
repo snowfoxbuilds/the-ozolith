@@ -1,0 +1,12 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "IssueList",
+  "refusal": null,
+  "variables": [
+    "limit",
+    "owner",
+    "repo",
+    "states"
+  ]
+}

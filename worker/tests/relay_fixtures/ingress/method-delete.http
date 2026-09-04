@@ -1,0 +1,2 @@
+DELETE /user HTTP/1.1
+

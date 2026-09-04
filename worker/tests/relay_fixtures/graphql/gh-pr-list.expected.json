@@ -1,0 +1,12 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "PullRequestList",
+  "refusal": null,
+  "variables": [
+    "limit",
+    "owner",
+    "repo",
+    "state"
+  ]
+}

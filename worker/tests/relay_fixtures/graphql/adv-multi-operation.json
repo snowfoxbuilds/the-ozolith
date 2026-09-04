@@ -1,0 +1,1 @@
+{"query": "query A { viewer { login } } query B { viewer { id } }"}

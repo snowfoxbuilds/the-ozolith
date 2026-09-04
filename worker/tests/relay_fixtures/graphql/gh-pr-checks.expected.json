@@ -1,0 +1,9 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "PullRequestStatusChecks",
+  "refusal": null,
+  "variables": [
+    "id"
+  ]
+}

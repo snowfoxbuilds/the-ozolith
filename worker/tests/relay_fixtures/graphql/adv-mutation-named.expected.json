@@ -1,0 +1,9 @@
+{
+  "parsed": true,
+  "operation_type": "mutation",
+  "operation_name": "Star",
+  "refusal": "graphql-non-query",
+  "variables": [
+    "id"
+  ]
+}

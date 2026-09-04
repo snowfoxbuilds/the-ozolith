@@ -1,0 +1,1 @@
+{"query": "query Q($a: Boolean = false) @cached(ttl: 60) { viewer { login @include(if: $a) } }"}

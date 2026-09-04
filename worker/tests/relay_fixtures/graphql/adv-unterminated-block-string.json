@@ -1,0 +1,1 @@
+{"query": "query { search(query: \"\"\"x, type: ISSUE) { issueCount } }"}

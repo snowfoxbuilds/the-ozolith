@@ -1,0 +1,1 @@
+{"query": "fragment F on Issue { id }"}

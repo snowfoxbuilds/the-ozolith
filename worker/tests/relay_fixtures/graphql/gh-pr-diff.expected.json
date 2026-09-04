@@ -1,0 +1,11 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "PullRequestByNumber",
+  "refusal": null,
+  "variables": [
+    "owner",
+    "pr_number",
+    "repo"
+  ]
+}

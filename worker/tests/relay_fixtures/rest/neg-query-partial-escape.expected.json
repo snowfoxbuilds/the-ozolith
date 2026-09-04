@@ -1,0 +1,7 @@
+{
+  "refusal": {
+    "stage": "query",
+    "reason": "query",
+    "status": 400
+  }
+}

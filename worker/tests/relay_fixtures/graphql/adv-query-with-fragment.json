@@ -1,0 +1,1 @@
+{"query": "fragment F on User { login } query Q { viewer { ...F } }"}

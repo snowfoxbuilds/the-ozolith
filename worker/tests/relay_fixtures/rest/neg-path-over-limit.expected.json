@@ -1,0 +1,7 @@
+{
+  "refusal": {
+    "stage": "path",
+    "reason": "path",
+    "status": 400
+  }
+}

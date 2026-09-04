@@ -1,0 +1,5 @@
+POST /graphql HTTP/1.1
+Trailer: X
+Content-Length: 2
+
+{}

@@ -1,0 +1,1 @@
+{"query":"query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }","variables":{"name":"REPO","owner":"OWNER"}}

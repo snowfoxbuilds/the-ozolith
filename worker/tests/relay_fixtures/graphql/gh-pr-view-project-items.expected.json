@@ -1,0 +1,12 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "PullRequestProjectItems",
+  "refusal": null,
+  "variables": [
+    "endCursor",
+    "name",
+    "number",
+    "owner"
+  ]
+}

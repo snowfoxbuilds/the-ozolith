@@ -1,0 +1,10 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "RepositoryInfo",
+  "refusal": null,
+  "variables": [
+    "name",
+    "owner"
+  ]
+}
