@@ -20,7 +20,7 @@ CONTROL_DOCKERFILE = REPO_ROOT / "control" / "docker" / "Dockerfile"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
-CLI_PIN_VERSION = "2.1.257"  # what the example's `cli` declares (flightdeck.toml)
+CLI_PIN_VERSION = "2.1.260"  # what the example's `cli` declares (flightdeck.toml)
 
 
 def fake_resolve_cli(declared: str) -> dict:
@@ -2683,12 +2683,12 @@ def test_deck_shim_refuses_every_preconvergence_state_with_no_fallback(tmp_path,
     assert proc.returncode == 1
     assert "no desired CLI record" in proc.stderr
 
-    _cli_records(store, desired="2.1.257")  # desired, not yet installed
+    _cli_records(store, desired="2.1.260")  # desired, not yet installed
     proc = _run_shim(shim, PATH=path_with_decoy)
     assert proc.returncode == 1
-    assert "not converged" in proc.stderr and "desired 2.1.257" in proc.stderr
+    assert "not converged" in proc.stderr and "desired 2.1.260" in proc.stderr
 
-    _cli_records(store, desired="2.1.257", entry="2.1.250")  # stale entry
+    _cli_records(store, desired="2.1.260", entry="2.1.250")  # stale entry
     proc = _run_shim(shim, PATH=path_with_decoy)
     assert proc.returncode == 1
     assert "never the previous export, never the image CLI" in proc.stderr
@@ -2704,8 +2704,8 @@ def test_deck_shim_execs_exactly_the_desired_version_with_argv(tmp_path, example
     sandbox.mkdir()
     store = sandbox / "cli"
     shim = _generate_deck_shim(tmp_path, example_config, sandbox)
-    record = _cli_version_binary(store, "2.1.257")
-    _cli_records(store, desired="2.1.257", entry="2.1.257")
+    record = _cli_version_binary(store, "2.1.260")
+    _cli_records(store, desired="2.1.260", entry="2.1.260")
 
     proc = _run_shim(shim, "--model", "claude-fable-5", "two words")
     assert proc.returncode == 0, proc.stderr
@@ -2740,10 +2740,10 @@ def test_deck_shim_running_session_survives_a_bump(tmp_path, example_config):
     pid_file = store / "running.pid"
     _cli_version_binary(
         store,
-        "2.1.257",
+        "2.1.260",
         body=f'#!/bin/sh\necho $$ > "{pid_file}"\nexec /bin/sleep 60\n',
     )
-    _cli_records(store, desired="2.1.257", entry="2.1.257")
+    _cli_records(store, desired="2.1.260", entry="2.1.260")
     env = {**os.environ, "THEOZOLITH_WORKER_TYPE": "flightdeck"}
     session = subprocess.Popen([str(shim)], env=env)
     try:
@@ -2785,7 +2785,7 @@ def test_flightdeck_start_unconverged_cli_pin_fails_before_the_daemon(tmp_path, 
     assert "no desired CLI record" in proc.stderr
     assert not daemon_calls.exists()
 
-    _cli_records(sandbox / "cli", desired="2.1.257", entry="2.1.250")
+    _cli_records(sandbox / "cli", desired="2.1.260", entry="2.1.250")
     _cli_version_binary(sandbox / "cli", "2.1.250")
     proc = _run_start(
         script,
@@ -2811,8 +2811,8 @@ def test_flightdeck_start_pinned_deck_exports_the_launch_path_to_the_session(
     bin_dir = sandbox / "bin"
     bin_dir.mkdir(parents=True)
     script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
-    _cli_version_binary(sandbox / "cli", "2.1.257")
-    _cli_records(sandbox / "cli", desired="2.1.257", entry="2.1.257")
+    _cli_version_binary(sandbox / "cli", "2.1.260")
+    _cli_records(sandbox / "cli", desired="2.1.260", entry="2.1.260")
     key_file = sandbox / "authkey"
     key_file.write_text("tskey-auth-x\n")
     _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")

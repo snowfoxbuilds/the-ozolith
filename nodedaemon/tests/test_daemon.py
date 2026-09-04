@@ -6402,7 +6402,7 @@ from theozolith_nodedaemon import cliinstall  # noqa: E402
 _CLI_SRI = "sha512-" + "A" * 96
 
 
-def cli_recipe(version: str = "2.1.257", name: str = "flightdeck", **overrides) -> dict:
+def cli_recipe(version: str = "2.1.260", name: str = "flightdeck", **overrides) -> dict:
     recipe = image_recipe(
         name=name,
         cli_tool="claude",
@@ -6479,11 +6479,11 @@ def test_cli_desired_record_lands_before_install_and_entry_only_after(rig: Rig, 
     exactly that version installed; the failure logs, emits a typed
     theozolith.error, and rides the heartbeat rows until a later pass
     succeeds (ADR-0055 point 5)."""
-    installer.fail_versions.add("2.1.257")
+    installer.fail_versions.add("2.1.260")
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
     by_type = rig.config.cli_dir / "claude" / "by-type"
-    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.260\n"
     assert not (by_type / "flightdeck.current").exists()  # never before the install
     assert any("injected download failure" in line for line in rig.logs)
     event = _find_error(rig, "injected download failure")
@@ -6497,28 +6497,28 @@ def test_cli_desired_record_lands_before_install_and_entry_only_after(rig: Rig, 
     assert row == {
         "worker_type": "flightdeck",
         "tool": "claude",
-        "desired": "2.1.257",
+        "desired": "2.1.260",
         "applied": "",
         "converged": False,
         "error_class": "CliDownloadFailed",
-        "error": "claude 2.1.257: injected download failure",
+        "error": "claude 2.1.260: injected download failure",
     }
     # ...and this pass's retry succeeded: entry re-pointed, failure cleared.
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
     assert row["error_class"] == "" and row["error"] == ""
 
 
 def test_cli_version_bump_rewrites_desired_immediately_repoints_late_and_prunes(
     rig: Rig, installer
 ):
-    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.257")]))
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.260")]))
     rig.daemon.once()
     by_type = rig.config.cli_dir / "claude" / "by-type"
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
 
     installer.fail_versions.add("2.1.258")
     rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.258")]))
@@ -6527,15 +6527,15 @@ def test_cli_version_bump_rewrites_desired_immediately_repoints_late_and_prunes(
     # launch gate refuses via entry != desired — never a silent fallback) and
     # the old version dir is retained while still entry-referenced.
     assert (by_type / "flightdeck.desired").read_text() == "2.1.258\n"
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
-    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
+    assert (rig.config.cli_dir / "claude" / "2.1.260" / "claude").is_file()
 
     installer.fail_versions.clear()
     rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.258")]))
     rig.daemon.once()
     assert os.readlink(by_type / "flightdeck.current") == "../2.1.258"
-    # Prune: nothing references 2.1.257 any more.
-    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+    # Prune: nothing references 2.1.260 any more.
+    assert not (rig.config.cli_dir / "claude" / "2.1.260").exists()
     assert (rig.config.cli_dir / "claude" / "2.1.258" / "claude").is_file()
 
 
@@ -6552,7 +6552,7 @@ def test_cli_records_retire_when_the_pin_is_dropped(rig: Rig, installer):
     rig.daemon.once()
     assert not (by_type / "flightdeck.desired").exists()
     assert not (by_type / "flightdeck.current").exists()
-    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+    assert not (rig.config.cli_dir / "claude" / "2.1.260").exists()
     # The NEXT beat — built from the applied pin-less config — reports no rows.
     rig.control.heartbeat_answers.append(cli_response([image_recipe(name="flightdeck")]))
     rig.daemon.once()
@@ -6566,11 +6566,11 @@ def test_cli_prune_never_touches_referenced_versions_and_failure_degrades(
     injected prune failure logs + emits and leaves records, entries, and the
     version dir intact (degrade to retained disk, never a corrupted
     export)."""
-    recipes = [cli_recipe("2.1.257", name="deck-a"), cli_recipe("2.1.258", name="deck-b")]
+    recipes = [cli_recipe("2.1.260", name="deck-a"), cli_recipe("2.1.258", name="deck-b")]
     rig.control.heartbeat_answers.append(cli_response(recipes))
     rig.daemon.once()
     by_type = rig.config.cli_dir / "claude" / "by-type"
-    assert os.readlink(by_type / "deck-a.current") == "../2.1.257"
+    assert os.readlink(by_type / "deck-a.current") == "../2.1.260"
     assert os.readlink(by_type / "deck-b.current") == "../2.1.258"
 
     doomed = rig.config.cli_dir / "claude" / "2.1.258"
@@ -6589,8 +6589,8 @@ def test_cli_prune_never_touches_referenced_versions_and_failure_degrades(
     # surfaced.
     assert not (by_type / "deck-b.desired").exists()
     assert doomed.is_dir()
-    assert os.readlink(by_type / "deck-a.current") == "../2.1.257"
-    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+    assert os.readlink(by_type / "deck-a.current") == "../2.1.260"
+    assert (rig.config.cli_dir / "claude" / "2.1.260" / "claude").is_file()
     assert _find_error(rig, "cli prune under claude failed") is not None
     monkeypatch.setattr(daemon.os, "replace", real_replace)
 
@@ -6611,9 +6611,9 @@ def test_cli_wiped_store_reconstructs_from_the_cached_wire(rig: Rig, installer):
 
     rig.daemon.once()  # no scripted answer -> unreachable -> cached config
     by_type = rig.config.cli_dir / "claude" / "by-type"
-    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
-    assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
+    assert (rig.config.cli_dir / "claude" / "2.1.260" / "claude").is_file()
 
 
 def test_cli_malformed_wire_is_skipped_and_records_stay(rig: Rig, installer):
@@ -6640,10 +6640,10 @@ def test_cli_malformed_wire_is_skipped_and_records_stay(rig: Rig, installer):
     ):
         rig.control.heartbeat_answers.append(cli_response([mangled]))
         rig.daemon.once()
-        assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
-        assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+        assert (by_type / "flightdeck.desired").read_text() == "2.1.260\n"
+        assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
         # ...and the referenced version dir survives the pass's prune.
-        assert (rig.config.cli_dir / "claude" / "2.1.257" / "claude").is_file()
+        assert (rig.config.cli_dir / "claude" / "2.1.260" / "claude").is_file()
     event = _find_error(rig, "malformed on the wire")
     assert event is not None and event["error_class"] == "CliWireMalformed"
     # Malformed rows are skipped from the telemetry (no truthful desired
@@ -6660,7 +6660,7 @@ def test_cli_version_change_never_recreates_the_deck_container(rig: Rig, install
     injected env, which IS part of the stack spec)."""
     stack = container_stack(name="deck", image=cli_recipe()["tag"])
     stack["env"] = {"THEOZOLITH_WORKER_TYPE": "flightdeck"}
-    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.257")], stacks=[stack]))
+    rig.control.heartbeat_answers.append(cli_response([cli_recipe("2.1.260")], stacks=[stack]))
     rig.daemon.once()
     assert "ozolith-stack-deck" in rig.docker.stacks
     removed_before = list(rig.docker.removed)
@@ -6698,7 +6698,7 @@ def test_cli_export_modes_are_explicit_under_a_restrictive_umask(
     rig.daemon.once()
     cli_root = rig.config.cli_dir
     by_type = cli_root / "claude" / "by-type"
-    version_dir = cli_root / "claude" / "2.1.257"
+    version_dir = cli_root / "claude" / "2.1.260"
     for directory in (cli_root, cli_root / "claude", by_type, version_dir):
         assert _mode(directory) == 0o755, directory
     assert _mode(by_type / "flightdeck.desired") == 0o644
@@ -6706,7 +6706,7 @@ def test_cli_export_modes_are_explicit_under_a_restrictive_umask(
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
 
 
 def test_cli_preexisting_restrictive_modes_are_repaired_in_place(
@@ -6720,7 +6720,7 @@ def test_cli_preexisting_restrictive_modes_are_repaired_in_place(
     rig.daemon.once()
     cli_root = rig.config.cli_dir
     by_type = cli_root / "claude" / "by-type"
-    version_dir = cli_root / "claude" / "2.1.257"
+    version_dir = cli_root / "claude" / "2.1.260"
     os.chmod(by_type / "flightdeck.desired", 0o600)
     os.chmod(version_dir / "claude", 0o700)
     for directory in (version_dir, by_type, cli_root / "claude", cli_root):
@@ -6743,7 +6743,7 @@ def test_cli_unreadable_export_never_reports_applied_or_converged(rig: Rig, inst
     repair path heals it."""
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
-    version_dir = rig.config.cli_dir / "claude" / "2.1.257"
+    version_dir = rig.config.cli_dir / "claude" / "2.1.260"
     installer.repair = False  # freeze the broken modes: no fast-path repair
     os.chmod(version_dir, 0o700)
     for _ in range(2):  # converge, then beat from the frozen state
@@ -6757,7 +6757,7 @@ def test_cli_unreadable_export_never_reports_applied_or_converged(rig: Rig, inst
         rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
         rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
 
     # The desired record itself is the same class of evidence: owner-only
     # 0600 (directories and binary left fully valid) fails the deck gate's
@@ -6774,7 +6774,7 @@ def test_cli_unreadable_export_never_reports_applied_or_converged(rig: Rig, inst
     rig.daemon.once()
     assert _mode(desired_record) == 0o644  # the ordinary pass repaired it
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
 
 
 def test_cli_desired_record_is_launch_evidence(rig: Rig, installer, tmp_path):
@@ -6793,14 +6793,14 @@ def test_cli_desired_record_is_launch_evidence(rig: Rig, installer, tmp_path):
     def applied() -> str:
         return rig.daemon._cli_applied_version(cli_root, "claude", "flightdeck")
 
-    assert applied() == "2.1.257"  # the healthy baseline
+    assert applied() == "2.1.260"  # the healthy baseline
 
     # Owner-readable only: the arbitrary non-root deck UID fails the gate's
     # [ -r ] even though every directory and the binary stay fully valid.
     os.chmod(desired_record, 0o600)
     assert applied() == ""
     os.chmod(desired_record, 0o644)
-    assert applied() == "2.1.257"
+    assert applied() == "2.1.260"
 
     # Missing: the gate fails loud with no desired record.
     payload = desired_record.read_bytes()
@@ -6833,14 +6833,14 @@ def test_cli_desired_record_is_launch_evidence(rig: Rig, installer, tmp_path):
     # A symlinked version DIRECTORY — even pointing at the real, valid
     # content — is no evidence: inside the read-only mount it can resolve
     # elsewhere or dangle.
-    version_dir = cli_root / "claude" / "2.1.257"
+    version_dir = cli_root / "claude" / "2.1.260"
     moved = tmp_path / "moved-version-dir"
     os.replace(version_dir, moved)
     version_dir.symlink_to(moved)
     assert applied() == ""
     version_dir.unlink()
     os.replace(moved, version_dir)
-    assert applied() == "2.1.257"  # every restoration re-closes the chain
+    assert applied() == "2.1.260"  # every restoration re-closes the chain
 
 
 def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
@@ -6859,7 +6859,7 @@ def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
     def applied() -> str:
         return rig.daemon._cli_applied_version(cli_root, "claude", "flightdeck")
 
-    assert applied() == "2.1.257"  # the healthy baseline
+    assert applied() == "2.1.260"  # the healthy baseline
 
     # The whole TOOL directory a symlink — to the fully valid real tree.
     hijacked = tmp_path / "external-tree"
@@ -6868,7 +6868,7 @@ def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
     assert applied() == ""
     tool_root.unlink()
     os.replace(hijacked, tool_root)
-    assert applied() == "2.1.257"
+    assert applied() == "2.1.260"
 
     # by-type a symlink — to the fully valid real desired/current records.
     by_type = tool_root / "by-type"
@@ -6877,7 +6877,7 @@ def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
     assert applied() == ""
     by_type.unlink()
     os.replace(hijacked, by_type)
-    assert applied() == "2.1.257"  # every restoration re-closes the chain
+    assert applied() == "2.1.260"  # every restoration re-closes the chain
 
 
 def test_cli_symlinked_tool_dir_is_repaired_without_touching_the_target(
@@ -6907,19 +6907,19 @@ def test_cli_symlinked_tool_dir_is_repaired_without_touching_the_target(
     assert tool_root.is_dir() and not tool_root.is_symlink()
     assert _mode(tool_root) == 0o755
     by_type = tool_root / "by-type"
-    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
-    assert installer.calls == [*downloads, ("claude", "2.1.257")]
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
+    assert installer.calls == [*downloads, ("claude", "2.1.260")]
 
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
     # The external target was never traversed, chmod'd, or deleted through:
     # its records, entry, and binary are exactly the pre-hijack state.
-    assert (hijacked / "by-type" / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(hijacked / "by-type" / "flightdeck.current") == "../2.1.257"
-    assert (hijacked / "2.1.257" / "claude").read_bytes() == b"binary 2.1.257\n"
+    assert (hijacked / "by-type" / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(hijacked / "by-type" / "flightdeck.current") == "../2.1.260"
+    assert (hijacked / "2.1.260" / "claude").read_bytes() == b"binary 2.1.260\n"
 
 
 def test_cli_symlinked_by_type_is_repaired_without_touching_the_records(
@@ -6942,16 +6942,16 @@ def test_cli_symlinked_by_type_is_repaired_without_touching_the_records(
     row = _cli_rows(rig)[0]
     assert row["applied"] == "" and row["converged"] is False
     assert by_type.is_dir() and not by_type.is_symlink()
-    assert (by_type / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(by_type / "flightdeck.current") == "../2.1.257"
+    assert (by_type / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(by_type / "flightdeck.current") == "../2.1.260"
     assert installer.calls == downloads  # the version dir was intact: no download
 
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
-    assert (hijacked / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.257"
+    assert row["applied"] == "2.1.260" and row["converged"] is True
+    assert (hijacked / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.260"
 
 
 def test_cli_retire_never_walks_a_symlinked_by_type(rig: Rig, installer, tmp_path):
@@ -6972,9 +6972,9 @@ def test_cli_retire_never_walks_a_symlinked_by_type(rig: Rig, installer, tmp_pat
     rig.control.heartbeat_answers.append(cli_response([image_recipe(name="flightdeck")]))
     rig.daemon.once()
     assert not by_type.is_symlink() and not by_type.exists()
-    assert (hijacked / "flightdeck.desired").read_text() == "2.1.257\n"
-    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.257"
-    assert not (rig.config.cli_dir / "claude" / "2.1.257").exists()
+    assert (hijacked / "flightdeck.desired").read_text() == "2.1.260\n"
+    assert os.readlink(hijacked / "flightdeck.current") == "../2.1.260"
+    assert not (rig.config.cli_dir / "claude" / "2.1.260").exists()
 
 
 def test_cli_intermediate_repair_failure_is_contained_and_retried(
@@ -7012,16 +7012,16 @@ def test_cli_intermediate_repair_failure_is_contained_and_retried(
         rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
         rig.daemon.once()
     row = _cli_rows(rig)[0]
-    assert row["applied"] == "2.1.257" and row["converged"] is True
+    assert row["applied"] == "2.1.260" and row["converged"] is True
     assert row["error_class"] == "" and row["error"] == ""
 
 
 def test_cli_installer_failure_class_rides_the_event_and_heartbeat(rig: Rig, installer):
     """Every typed installer failure — a publish-side one included — surfaces
     its STABLE class in the theozolith.error event and the heartbeat row."""
-    installer.fail_versions.add("2.1.257")
+    installer.fail_versions.add("2.1.260")
     installer.failure = cliinstall.CliPublishFailed(
-        "claude 2.1.257: publish rename failed: injected"
+        "claude 2.1.260: publish rename failed: injected"
     )
     rig.control.heartbeat_answers.append(cli_response([cli_recipe()]))
     rig.daemon.once()

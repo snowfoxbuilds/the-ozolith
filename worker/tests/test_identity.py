@@ -51,7 +51,7 @@ from theozolith_worker.identity import (
 
 MANAGED = "etc/claude-code/managed-settings.json"
 DROPINS = "etc/claude-code/managed-settings.d"
-MIN_CLI = (2, 1, 232)
+MIN_CLI = (2, 1, 260)
 
 
 def _write(root: Path, relpath: str, data) -> Path:
@@ -454,7 +454,7 @@ class ScriptedRunner:
 
     def __init__(
         self,
-        version="2.1.232 (Claude Code)",
+        version="2.1.260 (Claude Code)",
         probe_stdout="",
         probe_rc=0,
         on_probe=None,
@@ -502,7 +502,7 @@ def test_preflight_passes_and_asks_for_no_model(tmp_path):
     )
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5", "low"), runner)
     assert report.ok, report.detail
-    assert report.cli_version.startswith("2.1.232")
+    assert report.cli_version.startswith("2.1.260")
     assert report.probe_model == "claude-sonnet-5"
     assert report.probe_effort == "low"
     assert capture.is_file()
@@ -546,7 +546,7 @@ def test_preflight_fails_on_a_pre_enforcement_cli(tmp_path):
     runner = ScriptedRunner(version="2.1.222 (Claude Code)")
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), runner)
     assert not report.ok and report.category == CATEGORY_CLI_TOO_OLD
-    assert "2.1.232" in report.detail
+    assert "2.1.260" in report.detail
 
 
 def test_preflight_probe_substitution_fails(tmp_path):
@@ -623,7 +623,7 @@ def test_preflight_timeout_fails_closed(tmp_path):
 
     def hanging(argv, **kwargs):
         if "--version" in argv:
-            return subprocess.CompletedProcess(argv, 0, stdout="2.1.232", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="2.1.260", stderr="")
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
 
     report = _preflight(tmp_path, BakedIdentity("claude-sonnet-5"), hanging)

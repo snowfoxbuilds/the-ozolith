@@ -1972,7 +1972,7 @@ def test_heartbeat_cli_rows_are_stored_replaced_per_beat_and_served(control: Con
     row = {
         "worker_type": "flightdeck",
         "tool": "claude",
-        "desired": "2.1.257",
+        "desired": "2.1.260",
         "applied": "",
         "converged": False,
         "error_class": "CliIntegrityMismatch",
@@ -1983,16 +1983,16 @@ def test_heartbeat_cli_rows_are_stored_replaced_per_beat_and_served(control: Con
     stored = state["cli_status"]
     assert len(stored) == 1 and stored[0]["node"] == "box1"
     assert stored[0]["worker_type"] == "flightdeck"
-    assert stored[0]["desired"] == "2.1.257" and stored[0]["applied"] == ""
+    assert stored[0]["desired"] == "2.1.260" and stored[0]["applied"] == ""
     assert stored[0]["converged"] == 0
     assert stored[0]["error_class"] == "CliIntegrityMismatch"
 
     # Replaced whole on the next beat; a nameless row never lands.
-    converged = {**row, "applied": "2.1.257", "converged": True, "error_class": "", "error": ""}
+    converged = {**row, "applied": "2.1.260", "converged": True, "error_class": "", "error": ""}
     control.heartbeat(cli=[converged, {"tool": "claude"}])
     stored = control.admin("GET", "/api/v1/state").json()["cli_status"]
     assert len(stored) == 1
-    assert stored[0]["applied"] == "2.1.257" and stored[0]["converged"] == 1
+    assert stored[0]["applied"] == "2.1.260" and stored[0]["converged"] == 1
     assert stored[0]["error_class"] == ""
 
     # A beat with no rows clears the node's slice (a dropped pin).

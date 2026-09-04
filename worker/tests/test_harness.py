@@ -873,7 +873,7 @@ def test_dryrun_mode_needs_no_task_or_workdir(tmp_path, monkeypatch):
             ok=True,
             expected_model=PIN,
             expected_effort="low",
-            cli_version="2.1.232",
+            cli_version="2.1.260",
             probe_model=PIN,
             probe_effort="low",
         )
@@ -901,7 +901,7 @@ def test_dryrun_mode_fails_loud_with_the_category(tmp_path, monkeypatch):
             expected_effort="",
             category="substituted",
             detail="the identity probe ran on 'claude-opus-5'",
-            cli_version="2.1.232",
+            cli_version="2.1.260",
         )
 
     monkeypatch.setattr(ClaudeAdapter, "preflight", failing_preflight)

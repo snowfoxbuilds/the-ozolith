@@ -127,18 +127,18 @@ def test_old_db_gains_the_cli_status_table(tmp_path):
             {
                 "worker_type": "flightdeck",
                 "tool": "claude",
-                "desired": "2.1.257",
+                "desired": "2.1.260",
                 "applied": "2.1.250",
                 "converged": False,
                 "error_class": "CliDownloadFailed",
-                "error": "claude 2.1.257: download failed after 0 bytes",
+                "error": "claude 2.1.260: download failed after 0 bytes",
             }
         ],
     )
     rows = store.fleet_state()["cli_status"]
     assert len(rows) == 1 and rows[0]["node"] == "box1"
-    assert rows[0]["desired"] == "2.1.257" and rows[0]["converged"] == 0
-    assert rows[0]["error_message"].startswith("claude 2.1.257")
+    assert rows[0]["desired"] == "2.1.260" and rows[0]["converged"] == 0
+    assert rows[0]["error_message"].startswith("claude 2.1.260")
     store.record_cli_status("box1", [])
     assert store.fleet_state()["cli_status"] == []
 

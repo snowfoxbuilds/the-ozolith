@@ -650,18 +650,20 @@ def test_claude_adapter_verify_enforceable_gates_on_the_cli_version(monkeypatch)
     failed build (ADR-0045)."""
     adapter = ClaudeAdapter()
 
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.240 (Claude Code)")
-    assert adapter.verify_enforceable() == "2.1.240 (Claude Code)"
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.261 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.261 (Claude Code)"
 
-    # The floor is 2.1.232 exactly: the managed-over-project model-default
-    # precedence, the per-key managed env merge (2.1.223), the Stop-hook
-    # applied-effort payload, the ConfigChange hook, and the dry-run probe's
-    # isolation flags were all verified live there.
-    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 232)
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
-    assert adapter.verify_enforceable() == "2.1.232 (Claude Code)"
+    # The floor is 2.1.260: an operator minimum-version requirement (issue
+    # #128). The behaviors the identity machinery relies on — the
+    # managed-over-project model-default precedence, the per-key managed env
+    # merge (2.1.223), the Stop-hook applied-effort payload, the ConfigChange
+    # hook, and the dry-run probe's isolation flags — were verified live on
+    # 2.1.232 (the behavior baseline).
+    assert ClaudeAdapter.MIN_ENFORCING_CLI == (2, 1, 260)
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.260 (Claude Code)")
+    assert adapter.verify_enforceable() == "2.1.260 (Claude Code)"
 
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.231 (Claude Code)")
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.259 (Claude Code)")
     with pytest.raises(AgentAdapterError, match="predates the identity behavior"):
         adapter.verify_enforceable()
 

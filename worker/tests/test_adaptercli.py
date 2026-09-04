@@ -23,7 +23,7 @@ def enforcing_cli(monkeypatch):
     """Stub the in-image CLI version probe: unit tests run where no claude
     binary exists; the real probe is exercised by its own contract tests and
     by the live-enforcement suite."""
-    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.232 (Claude Code)")
+    monkeypatch.setattr(ClaudeAdapter, "_cli_version", lambda self: "2.1.260 (Claude Code)")
 
 
 def test_console_script_registered():

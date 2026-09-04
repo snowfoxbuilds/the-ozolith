@@ -77,7 +77,7 @@ def write_pins(
     write(tmp_path, "pins.toml", "\n".join(lines) + "\n")
 
 
-def cli_pin(version: str = "2.1.257", tuples: tuple[str, ...] | None = None) -> dict:
+def cli_pin(version: str = "2.1.260", tuples: tuple[str, ...] | None = None) -> dict:
     """An ingest-shaped CLI pin record (ADR-0055)."""
     tuples = tuples or ("linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl")
     return {
@@ -1030,16 +1030,16 @@ def test_refuse_ui_write_covers_policy(tmp_path):
 
 
 def test_cli_pin_field_parses_and_joins_the_ingest_pin(tmp_path):
-    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
-    deck_type(tmp_path, cli='"2.1.257"')
+    write_pins(tmp_path, cli={"claude/2.1.260": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.260"')
     wt = load_config(tmp_path).worker_types["flightdeck"]
-    assert wt.cli == "2.1.257"
-    assert wt.cli_version == "2.1.257"
+    assert wt.cli == "2.1.260"
+    assert wt.cli_version == "2.1.260"
     assert set(wt.cli_platforms) == {"linux-x64-glibc", "linux-arm64-glibc", "linux-x64-musl"}
     assert wt.cli_platforms["linux-x64-glibc"]["integrity"].startswith("sha512-")
     recipe = wt.recipe_wire()
     assert recipe["cli_tool"] == "claude"
-    assert recipe["cli_version"] == "2.1.257"
+    assert recipe["cli_version"] == "2.1.260"
     assert recipe["cli_platforms"] == wt.cli_platforms
 
 
@@ -1047,7 +1047,7 @@ def test_cli_with_a_driver_is_refused(tmp_path):
     """Driverless-only in v1 (ADR-0055 §7): a driver type keeps the base
     image's CLI as identity bytes — and the refusal fires with its precise
     message even though ingest resolved no pin for the definition."""
-    driver_type(tmp_path, cli='"2.1.257"')
+    driver_type(tmp_path, cli='"2.1.260"')
     with pytest.raises(ConfigRepoError, match="driverless-only in v1"):
         load_config(tmp_path)
 
@@ -1059,13 +1059,13 @@ def test_cli_on_a_codex_adapter_is_refused(tmp_path):
 
 
 def test_cli_without_an_ingest_pin_is_refused(tmp_path):
-    deck_type(tmp_path, cli='"2.1.257"')
+    deck_type(tmp_path, cli='"2.1.260"')
     with pytest.raises(ConfigRepoError, match="re-run `theozolith config ingest`"):
         load_config(tmp_path)
 
 
 def test_cli_declared_shape_is_validated(tmp_path):
-    for bad in ("2.1.257 beta", "a/b", ".hidden", ""):
+    for bad in ("2.1.260 beta", "a/b", ".hidden", ""):
         deck_type(tmp_path, cli=f'"{bad}"' if bad else None)
         if not bad:
             load_config(tmp_path)  # absent field: a pinless deck is legal
@@ -1075,7 +1075,7 @@ def test_cli_declared_shape_is_validated(tmp_path):
 
 
 def test_cli_resolved_fields_cannot_be_authored(tmp_path):
-    deck_type(tmp_path, cli_version='"2.1.257"')
+    deck_type(tmp_path, cli_version='"2.1.260"')
     with pytest.raises(ConfigRepoError, match="ingest-resolved, never authored"):
         load_config(tmp_path)
 
@@ -1095,8 +1095,8 @@ def test_cli_is_never_identity_bearing(tmp_path):
     and tag are byte-identical to the same type without cli — declared,
     fleet-visible, never identity — and the wire recipes differ ONLY in the
     three cli keys."""
-    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
-    deck_type(tmp_path, cli='"2.1.257"')
+    write_pins(tmp_path, cli={"claude/2.1.260": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.260"')
     deck_type(tmp_path, name="twin")
     config = load_config(tmp_path)
     pinned, twin = config.worker_types["flightdeck"], config.worker_types["twin"]
@@ -1125,23 +1125,23 @@ def test_cli_lifecycle_rides_the_injected_env(tmp_path):
     bare = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
     assert "THEOZOLITH_WORKER_TYPE" not in bare.env
 
-    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.257")})
+    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.260")})
     deck_type(tmp_path, cli='"pinned"')
     adopted = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
     assert adopted.env["THEOZOLITH_WORKER_TYPE"] == "flightdeck"
     assert adopted.image == bare.image  # never identity-bearing
 
-    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.258")})
+    write_pins(tmp_path, cli={"claude/pinned": cli_pin("2.1.261")})
     bumped = next(s for s in load_config(tmp_path).stacks if s.name == "deck")
     for field in ("env", "image", "command", "volumes", "ports", "secrets"):
         assert getattr(bumped, field) == getattr(adopted, field)
     wt = load_config(tmp_path).worker_types["flightdeck"]
-    assert wt.cli_version == "2.1.258"  # the wire recipe moved; the spec did not
+    assert wt.cli_version == "2.1.261"  # the wire recipe moved; the spec did not
 
 
 def test_stack_env_worker_type_override_is_rejected(tmp_path):
-    write_pins(tmp_path, cli={"claude/2.1.257": cli_pin()})
-    deck_type(tmp_path, cli='"2.1.257"')
+    write_pins(tmp_path, cli={"claude/2.1.260": cli_pin()})
+    deck_type(tmp_path, cli='"2.1.260"')
     write(
         tmp_path,
         "stacks/deck.toml",

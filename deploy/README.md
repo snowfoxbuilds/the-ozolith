@@ -695,12 +695,13 @@ remove or relocate it, or drop the worker type's model/effort. Unrelated
 managed keys survive untouched. A malformed managed document also fails the
 build: unknowable policy is not policy.
 
-The minimum in-image CLI is **Claude Code 2.1.232**: the
-managed-over-checkout model-default precedence, the per-key managed `env`
-merge (2.1.223), the Stop-hook applied-effort payload, and the ConfigChange
-hook were all verified live there. The materialize step probes
-`claude --version` in-image and fails the build below that floor; the setup
-dry-run enforces the same floor at runtime.
+The minimum in-image CLI is **Claude Code 2.1.260** (an operator
+minimum-version requirement; issue #128). The behaviors the identity
+machinery relies on — the managed-over-checkout model-default precedence, the
+per-key managed `env` merge (2.1.223), the Stop-hook applied-effort payload,
+and the ConfigChange hook — were verified live on 2.1.232. The materialize
+step probes `claude --version` in-image and fails the build below the floor;
+the setup dry-run enforces the same floor at runtime.
 
 **One setup dry-run per driver boot — never a per-Run probe.** Before a
 driver takes any work it commissions one `identity-dryrun` container: the

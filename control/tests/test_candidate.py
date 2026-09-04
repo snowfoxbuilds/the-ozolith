@@ -496,7 +496,7 @@ def test_export_refuses_a_cli_declaring_type_and_the_manifest_never_gained_cli(t
     source = make_source(tmp_path, driver="", model="", knowledge="", name="deck")
     path = source / "worker-types" / "deck.toml"
     # Prepended: an append would land inside the trailing [secrets] table.
-    path.write_text('cli = "2.1.257"\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
+    path.write_text('cli = "2.1.260"\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(CandidateError, match="live surface, never Candidate Bundle identity"):
         candidate.export_candidate(source, "deck", tmp_path / "out", resolve_digest=resolve_a)
     assert not any(key.startswith("cli") for key in candidate._MANIFEST_KEYS)
