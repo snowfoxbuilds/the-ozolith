@@ -531,7 +531,7 @@ def _cli_row(**over: Any) -> dict[str, Any]:
         "node": "box1",
         "worker_type": "flightdeck",
         "tool": "claude",
-        "desired": "2.1.257",
+        "desired": "2.1.260",
         "applied": "2.1.250",
         "converged": 0,
         "error_class": "",
@@ -548,7 +548,7 @@ def test_nonconverged_cli_pin_degrades_with_the_specified_wording(tmp_path):
     assert code == 1
     assert lines[0] == (
         "degraded: worker type flightdeck on box1 cli pin not converged:"
-        " desired 2.1.257, applied 2.1.250 (last failure: CliIntegrityMismatch)"
+        " desired 2.1.260, applied 2.1.250 (last failure: CliIntegrityMismatch)"
     )
     # No applied version and no recorded failure both render honestly.
     state = state_doc(cli_status=[_cli_row(applied="")])
@@ -557,7 +557,7 @@ def test_nonconverged_cli_pin_degrades_with_the_specified_wording(tmp_path):
 
 
 def test_converged_cli_pin_is_healthy_and_renders_the_table(tmp_path):
-    state = state_doc(cli_status=[_cli_row(applied="2.1.257", converged=1)])
+    state = state_doc(cli_status=[_cli_row(applied="2.1.260", converged=1)])
     code, lines = _run(tmp_path, state)
     assert code == 0
     joined = "\n".join(lines)
@@ -565,7 +565,7 @@ def test_converged_cli_pin_is_healthy_and_renders_the_table(tmp_path):
     header = next(line for line in lines if "WORKER-TYPE" in line)
     assert "NODE" in header and "DESIRED" in header and "LAST FAILURE" in header
     row = next(line for line in lines if "flightdeck" in line)
-    assert "2.1.257" in row and " ok" in row
+    assert "2.1.260" in row and " ok" in row
     # No rows -> no table (the section only prints when it has content).
     _code, lines = _run(tmp_path, state_doc())
     assert "cli pins:" not in "\n".join(lines)

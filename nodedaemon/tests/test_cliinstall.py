@@ -33,7 +33,7 @@ from theozolith_nodedaemon.cliinstall import (
 KEY = "linux-x64-glibc"
 SIBLING = "linux-arm64-glibc"
 PACKAGE = "@anthropic-ai/claude-code-linux-x64"
-VERSION = "2.1.257"
+VERSION = "2.1.260"
 BINARY = b"#!/bin/sh\necho claude\n"
 
 

@@ -382,18 +382,20 @@ class ClaudeAdapter:
     # CLAUDE_CODE_EFFORT_LEVEL overrides /effort, --effort, the process
     # environment, and any settings-file effortLevel (verified live).
     MANAGED_SETTINGS = identity_mod.MANAGED_SETTINGS_FILE
-    # The oldest Claude Code whose exact behavior this adapter relies on:
-    # the managed-over-project settings precedence for the model default,
-    # the per-key managed ``env`` merge (2.1.223 — without it a
-    # server-delivered org env block displaces the baked effort pin), the
-    # Stop-hook payload carrying the applied (post-clamp) effort, the
-    # ConfigChange hook, hooks riding ``--settings``, and the dry-run
-    # probe's isolation flags (``--tools ""``, ``--permission-mode
-    # dontAsk``, ``--setting-sources ""``) — the whole set verified live on
-    # 2.1.232, which is therefore the floor: an older CLI would either fail
-    # every Run with a confusing error (unknown flag) or silently void an
-    # observation channel, and the floor turns both into cli-too-old.
-    MIN_ENFORCING_CLI = (2, 1, 232)
+    # The behaviors this adapter relies on: the managed-over-project settings
+    # precedence for the model default, the per-key managed ``env`` merge
+    # (2.1.223 — without it a server-delivered org env block displaces the
+    # baked effort pin), the Stop-hook payload carrying the applied
+    # (post-clamp) effort, the ConfigChange hook, hooks riding ``--settings``,
+    # and the dry-run probe's isolation flags (``--tools ""``,
+    # ``--permission-mode dontAsk``, ``--setting-sources ""``) — the whole set
+    # verified live on 2.1.232 (the behavior baseline). The floor below is set
+    # higher, to 2.1.260, as an operator minimum-version requirement (issue
+    # #128); a classification review should re-confirm the behavior set against
+    # 2.1.260 before relying on it. An older CLI would either fail every Run
+    # with a confusing error (unknown flag) or silently void an observation
+    # channel, and the floor turns both into cli-too-old.
+    MIN_ENFORCING_CLI = (2, 1, 260)
     # The Agent Policy validator this adapter owns (ADR-0055): the safe-key
     # allowlist in ``theozolith_worker.policy`` admits verbatim managed-
     # settings drop-ins, and it advances ONLY through the same deliberate

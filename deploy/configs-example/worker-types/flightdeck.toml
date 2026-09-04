@@ -127,7 +127,7 @@ policy = "policy/claude-defaults"
 # is container spec). Matches the run image's own pinned CLI. KNOWN
 # LIMITATION: nothing checks model<->CLI-version compatibility — pin a CLI
 # that knows the `model` below, or a launch fails where a build used to.
-cli = "2.1.257"
+cli = "2.1.260"
 
 # The deck's DEFAULT model (ADR-0045 §4). Control appends an interactive-scope
 # materialize step for this field: the build validates the ID and writes it to

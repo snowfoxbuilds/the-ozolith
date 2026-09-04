@@ -1423,8 +1423,8 @@ class FakeNpm:
 def test_cli_pin_exact_version_resolves_every_supported_tuple(monkeypatch):
     npm = FakeNpm()
     monkeypatch.setattr(ingest_mod, "_urlopen", npm)
-    pin = resolve_cli_pin("2.1.257")
-    assert pin["version"] == "2.1.257"
+    pin = resolve_cli_pin("2.1.260")
+    assert pin["version"] == "2.1.260"
     assert pin["platforms"] == {
         key: {"package": package, "integrity": _SRI}
         for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
@@ -1437,11 +1437,11 @@ def test_cli_pin_exact_version_resolves_every_supported_tuple(monkeypatch):
 
 def test_cli_pin_dist_tag_resolves_and_reresolves(monkeypatch):
     """A dist-tag re-resolves on every resolution, like a moving base tag."""
-    npm = FakeNpm(tags={"latest": "2.1.258"})
+    npm = FakeNpm(tags={"latest": "2.1.260"})
     monkeypatch.setattr(ingest_mod, "_urlopen", npm)
-    assert resolve_cli_pin("latest")["version"] == "2.1.258"
-    npm.tags["latest"] = "2.1.259"
-    assert resolve_cli_pin("latest")["version"] == "2.1.259"
+    assert resolve_cli_pin("latest")["version"] == "2.1.260"
+    npm.tags["latest"] = "2.1.261"
+    assert resolve_cli_pin("latest")["version"] == "2.1.261"
 
 
 def test_cli_pin_unsuppliable_tuple_fails_naming_it(monkeypatch):
@@ -1457,7 +1457,7 @@ def test_cli_pin_unsuppliable_tuple_fails_naming_it(monkeypatch):
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(ingest_mod, "_urlopen", npm)
             with pytest.raises(IngestError, match=r"linux-arm64-musl"):
-                resolve_cli_pin("2.1.257")
+                resolve_cli_pin("2.1.260")
 
 
 def test_cli_pin_below_the_floor_fails(monkeypatch):
@@ -1469,7 +1469,7 @@ def test_cli_pin_below_the_floor_fails(monkeypatch):
 def test_cli_pin_malformed_registry_answers_fail_actionably(monkeypatch):
     monkeypatch.setattr(ingest_mod, "_urlopen", FakeNpm(raw=b"not json"))
     with pytest.raises(IngestError, match="malformed response"):
-        resolve_cli_pin("2.1.257")
+        resolve_cli_pin("2.1.260")
     monkeypatch.setattr(ingest_mod, "_urlopen", FakeNpm(tags={"latest": "not-semver"}))
     with pytest.raises(IngestError, match="not an exact"):
         resolve_cli_pin("latest")
@@ -1507,10 +1507,10 @@ def test_ingest_writes_the_cli_pins_and_the_result_loads(tmp_path):
     src = _deck_source(tmp_path)
     pinned = pinned_dir(tmp_path)
     report = ingest(
-        str(src), pinned, resolve_cli=_fake_cli_resolver(["2.1.257"]), log=lambda *_: None
+        str(src), pinned, resolve_cli=_fake_cli_resolver(["2.1.260"]), log=lambda *_: None
     )
-    assert report.cli_pins["claude/latest"]["version"] == "2.1.257"
-    assert "cli claude/latest resolved 2.1.257 (4 platform(s))" in report.summary()
+    assert report.cli_pins["claude/latest"]["version"] == "2.1.260"
+    assert "cli claude/latest resolved 2.1.260 (4 platform(s))" in report.summary()
     pins_text = (pinned / "pins.toml").read_text()
     entries = "".join(
         f'"{key}" = {{ package = "{ClaudeAdapter.CLI_PLATFORM_PACKAGES[key]}",'
@@ -1518,26 +1518,26 @@ def test_ingest_writes_the_cli_pins_and_the_result_loads(tmp_path):
         for key in sorted(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
     )
     golden = (
-        '[cli."claude/latest"]\nversion = "2.1.257"\n\n[cli."claude/latest".platforms]\n' + entries
+        '[cli."claude/latest"]\nversion = "2.1.260"\n\n[cli."claude/latest".platforms]\n' + entries
     )
     assert golden in pins_text
     wt = configrepo.load_config(pinned).worker_types["deck"]
-    assert wt.cli == "latest" and wt.cli_version == "2.1.257"
+    assert wt.cli == "latest" and wt.cli_version == "2.1.260"
     assert set(wt.cli_platforms) == set(ClaudeAdapter.CLI_PLATFORM_PACKAGES)
     recipe = wt.recipe_wire()
-    assert recipe["cli_tool"] == "claude" and recipe["cli_version"] == "2.1.257"
+    assert recipe["cli_tool"] == "claude" and recipe["cli_version"] == "2.1.260"
 
 
 def test_reingest_with_a_moved_dist_tag_reresolves(tmp_path):
     src = _deck_source(tmp_path)
     pinned = pinned_dir(tmp_path)
-    cell = ["2.1.257"]
+    cell = ["2.1.260"]
     ingest(str(src), pinned, resolve_cli=_fake_cli_resolver(cell), log=lambda *_: None)
-    cell[0] = "2.1.258"
+    cell[0] = "2.1.261"
     report = ingest(str(src), pinned, resolve_cli=_fake_cli_resolver(cell), log=lambda *_: None)
     assert report.changed  # the moved pin alone recommits the pinned build
-    assert 'version = "2.1.258"' in (pinned / "pins.toml").read_text()
-    assert configrepo.load_config(pinned).worker_types["deck"].cli_version == "2.1.258"
+    assert 'version = "2.1.261"' in (pinned / "pins.toml").read_text()
+    assert configrepo.load_config(pinned).worker_types["deck"].cli_version == "2.1.261"
 
 
 def test_cli_on_a_driver_type_is_skipped_at_resolution_and_refused_by_the_lint(tmp_path):
@@ -1549,7 +1549,7 @@ def test_cli_on_a_driver_type_is_skipped_at_resolution_and_refused_by_the_lint(t
         src,
         "worker-types/claude-dev.toml",
         f'driver = "builtin:implementer"\nadapter = "claude"\nmodel = "claude-sonnet-5"\n'
-        f'workspace = "acme/sandbox"\nbase = "{BASE}"\ncli = "2.1.257"\n'
+        f'workspace = "acme/sandbox"\nbase = "{BASE}"\ncli = "2.1.260"\n'
         'knowledge = "knowledge/dev"\n',
     )
     _commit_all(src, "driver with cli")
