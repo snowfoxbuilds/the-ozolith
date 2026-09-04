@@ -64,8 +64,10 @@ prompts; codex has no workflows target) each get their own content-hash pin
 edit), so one tree serves both adapters and an edit re-tags exactly the
 types whose view changed. Driver workers bake their adapter's view into
 their derived images. The Flight Deck's own `knowledge` field selects which
-node-applied tree its read-only mount serves (always the claude view) — the
-deck fails loud until the node has converged that tree, content edits reach
+node-applied tree its read-only mount serves — the node exports every
+compiled view and the deck's selector names its adapter's (`<tree>/claude`
+here; a codex deck selects `<tree>/codex`, #127) — the deck fails loud until
+the node has converged that tree, content edits reach
 it on agent-CLI restart, and changing the selected tree recreates the deck.
 
 After updating the product across the ADR-0052 layout change, re-run

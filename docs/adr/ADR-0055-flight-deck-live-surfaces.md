@@ -38,6 +38,14 @@ platform package per (OS, architecture, libc) tuple — each with its own
 tarball and integrity — so a single recorded integrity cannot
 authenticate every package a heterogeneous fleet selects.
 
+The second adapter's CLI ships differently — at codex-cli 0.150.0 the
+platform tarballs are versions of the wrapper package itself
+(`@openai/codex@<version>-linux-{x64,arm64}`, static musl binaries), each
+carrying five executables under a per-triple `vendor/` prefix plus the
+layout marker the binary resolves its helpers by — so the archive
+contract of Decisions 3–5, previously implicit in one claude-shaped
+validator, is explicit per tool (amended 2026-09-04, #132).
+
 This decision amends ADR-0044 (the customization tuple gains `policy` and
 `cli`; on a driverless type both are declared but not identity-bearing),
 ADR-0045 (policy trees are validated at ingest and config load by a safe-key
@@ -55,7 +63,7 @@ Two new worker-type-definition fields become **declared, fleet-visible, and
 deliberately not identity-bearing on a driverless type**: the **Agent Policy**
 reference and the **CLI Pin**. Both generalize the knowledge precedent; the
 Node Daemon exports, the deck mounts a stable parent, a stable env selector
-resolves the entry, and the next `claude` launch picks up the new content.
+resolves the entry, and the next agent-CLI launch picks up the new content (amended 2026-09-04: the deck's CLI is whichever registered adapter the definition names).
 
 1. **Agent Policy is a Config Repo tree, referenced by name, delivered on the
    HITL/HOTL line.** The Config Repo gains `policy/<name>/` — verbatim
@@ -127,52 +135,153 @@ resolves the entry, and the next `claude` launch picks up the new content.
    doctrine applied to the agent CLI.** `cli = "<exact version | npm dist-
    tag>"` on the definition; ingest resolves it against the npm registry
    to an exact version plus the **complete supported-platform integrity
-   map**. The CLI ships one platform npm package per (OS, architecture,
-   libc) tuple — Linux x64, Linux ARM64, and musl variants among them —
-   each with its own tarball and registry-published integrity, so a
-   single recorded integrity cannot authenticate every package a
+   map**. A CLI ships one platform tarball per (OS, architecture, libc)
+   tuple it serves — each with its own registry-published integrity, so
+   a single recorded integrity cannot authenticate every tarball a
    heterogeneous fleet selects. The supported-tuple set is product-owned
-   (the platforms the Node Daemon itself supports); ingest resolves
-   every tuple in that set and records, in `pins.toml` under `[cli]`
-   keyed `<tool>/<declared>`, the exact version plus one
-   `{package, integrity}` entry per tuple — a supported tuple whose
-   package or integrity the registry cannot supply fails the ingest.
-   Nodes select only from the pinned map (point 4a): every
+   (the platforms the Node Daemon itself supports); which registry
+   coordinate serves each tuple is the adapter's declaration under the
+   **CLI archive contract** (point 4): the wrapper package the declared
+   version or dist-tag resolves against, and per tuple the platform
+   package plus the tarball-version rule — claude's platform packages
+   are distinct packages at the same version, while codex publishes its
+   platform tarballs as versions of the wrapper package itself,
+   `<version>-<platform>`, and one static musl tarball serves both libc
+   tuples of an architecture (amended 2026-09-04, #132). Ingest resolves
+   every tuple in the set from that declaration and records, in
+   `pins.toml` under `[cli]` keyed `<tool>/<declared>`, the exact version
+   plus one `{package, integrity}` entry per tuple — a supported tuple
+   whose tarball or integrity the registry cannot supply fails the
+   ingest. Nodes select only from the pinned map (point 4a): every
    network-derived trust decision lives in the durable pinned build,
-   never in registry metadata fetched node-side at download time. A
-   dist-tag re-resolves on
-   every ingest, exactly as a moving base tag does. Ingest and load refuse a
+   never in registry metadata fetched node-side at download time, and
+   the registry supplies nothing but bytes and their integrity — never a
+   path, a mode, or an executable name. A dist-tag re-resolves on every
+   ingest, exactly as a moving base tag does. Ingest and load refuse a
    resolved version below the adapter's `MIN_ENFORCING_CLI` floor — the
    product-wide statement of which CLIs it has validated. Absent field means
    today's behavior: the image's CLI, no mount.
-4. **The Node Daemon installs the binary through a fail-closed lifecycle.**
-   The registry-published integrity authenticates bytes; it says nothing
-   about whether an archive is safe to unpack, so verification and
-   extraction are separate, ordered gates. At reconcile the node: (a)
-   resolves its platform tuple deterministically — OS, architecture, and
-   libc — and selects that tuple's `{package, integrity}` entry from the
-   ingest-pinned map; a tuple absent from the map fails before any
-   download; (b) downloads the tarball with a bounded size
-   and timeout into a private staging directory on the state filesystem;
-   (c) verifies the complete tarball against the selected entry's
-   ingest-pinned integrity before extracting anything; (d) parses and validates the archive before
-   extraction — absolute paths, `..` traversal, symlinks, hardlinks,
-   devices, sockets, FIFOs, and unexpected entry types refuse; duplicate or
-   conflicting paths refuse; entry-count and expanded-size caps apply; the
-   layout must be exactly the expected package shape with the CLI binary at
-   its expected path, and any unexpected executable payload refuses; (e)
-   extracts only into staging, never following links; (f) requires the
-   resulting binary to be a regular file and normalizes ownership (the
-   service account) and modes itself — archive metadata is never trusted;
-   (g) atomically publishes the completed
+4. **The Node Daemon installs the CLI through a fail-closed lifecycle
+   held to a product-owned CLI archive contract.** The registry-published
+   integrity authenticates bytes; it says nothing about whether an archive
+   is safe to unpack, so verification and extraction are separate, ordered
+   gates — and what an archive is *allowed to contain* is a product
+   decision, never read from the archive or the registry (amended
+   2026-09-04, #132). The **CLI archive contract** is a closed table in
+   Node Daemon product code keyed by tool slug (`cliinstall`, one row per
+   registered adapter). The daemon is stdlib-only (ADR-0010) and cannot
+   import the adapters, so the resolution half of the same table —
+   wrapper, per-tuple package, tarball-version rule — is declared as
+   adapter constants, and a dev-only contract test holds the two halves
+   equal for every tool, the way the tuple-key spelling is already held.
+   Per tool the contract fixes: the wrapper package; the supported
+   platform-package map (tuple → package and tarball-version rule); the
+   **archive root** (npm's fixed `package/`, the directory every member
+   must sit under) and, beneath it, the **payload prefix** per tuple —
+   the directory the tool's own layout starts at, which for a vendored
+   tool is not the root; the **allowed-member set**, closed: every member
+   of the real archive at its exact root-relative path, each tagged
+   executable or non-executable, root members outside the payload prefix
+   included; the exact executable member; the published name; the
+   **published set**, also closed — the allowed members under the payload
+   prefix, rehomed at their prefix-relative paths, plus the product-created
+   link when the layout is vendored; and the **layout marker** with its
+   closed schema. No executable member outside the row's executable-tagged
+   members is ever accepted, and no member outside the allowed set is ever
+   accepted, executable or not. The rows, verified against the real
+   tarballs at the adapters' floors (claude-code 2.1.260 and codex
+   0.150.0, both Linux architectures, 2026-09-04):
+
+   | | claude | codex |
+   | --- | --- | --- |
+   | Wrapper | `@anthropic-ai/claude-code` | `@openai/codex` (its `bin/codex.js` is a node launcher the deck never runs) |
+   | Platform tarball | `@anthropic-ai/claude-code-linux-{x64,arm64}[-musl]` at `<version>` | `@openai/codex` at `<version>-linux-{x64,arm64}`; the glibc and musl tuples of one architecture share it |
+   | Archive root | `package/` | `package/` |
+   | Payload prefix | the root itself | `package/vendor/<triple>/`, triple `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` |
+   | Allowed members (closed) | four: `claude` (executable), `package.json`, `LICENSE.md`, `README.md` | eight: at the root `package.json` and `README.md` (non-executable, outside the payload prefix); under the payload prefix `codex-package.json` (non-executable) and the five executables `bin/codex`, `bin/codex-code-mode-host`, `codex-path/rg`, `codex-resources/bwrap`, `codex-resources/zsh/bin/zsh` — the helpers the binary resolves relative to its own canonical path |
+   | Executable member | `package/claude` | `<prefix>bin/codex` |
+   | Published name | `claude` | `codex` |
+   | Published set (closed) | the four members | the six payload members at their prefix-relative paths plus the product-created link `codex` → `bin/codex`; the root `package.json` and `README.md` are validated and discarded |
+   | Layout marker | `package/package.json`: `name` equals the tuple's platform package and `version` the pinned version | `<prefix>codex-package.json` under the closed schema below; `package/package.json` additionally carries `name` `@openai/codex` and `version` `<pinned>-<platform>` |
+
+   The codex layout marker is the file the binary locates its helpers by,
+   so it is validated under a **closed schema** with every field bound to
+   a product-expected value derived from the contract row and the pinned
+   coordinate — never from the archive: exactly the seven members
+   `layoutVersion` (integer, exactly the row's `1`), `version` (string,
+   exactly the resolved base version — `0.150.0`, without the platform
+   suffix), `target` (string, exactly the selected tuple's triple),
+   `variant` (string, exactly `codex`), `entrypoint` (string, exactly the
+   executable member's prefix-relative path `bin/codex`), `resourcesDir`
+   (exactly `codex-resources`) and `pathDir` (exactly `codex-path`). A
+   missing member, an extra member, a wrong type, a wrong value, an
+   empty, absolute, `..`-bearing, backslash- or NUL-bearing path value, an
+   `entrypoint` outside the executable-tagged set, and a value consistent
+   with the other tuple (its triple, or a base version other than the
+   pinned one) each refuse before anything is extracted. The daemon
+   publishes a product-rendered marker holding exactly those bound values,
+   never the archive's bytes, so the published layout is product-owned end
+   to end; the archive's copy is evidence that the tarball is the one the
+   contract describes, nothing more. The claude marker is bound the same
+   way for the two fields the contract names.
+
+   A tool absent from the contract fails closed with a typed, redacted
+   class before any download, its records untouched; a malformed contract
+   row is a product bug that fails the same way. At reconcile the node:
+   (a) resolves its platform tuple deterministically — OS, architecture,
+   and libc — and selects that tuple's `{package, integrity}` entry from
+   the ingest-pinned map; a tuple absent from the map fails before any
+   download; (b) downloads the tarball — at the coordinate the contract
+   derives from the pinned package and version — with a bounded size and
+   timeout into a private staging directory on the state filesystem; (c)
+   verifies the complete tarball against the selected entry's
+   ingest-pinned integrity before extracting anything; (d) parses and
+   validates every member before any extraction — absolute paths, `..`
+   traversal, symlinks, hardlinks, devices, sockets, FIFOs, and unexpected
+   entry types refuse; duplicate or conflicting paths refuse; entry-count
+   and expanded-size caps apply; every member must sit under the archive
+   root and be named in the row's allowed-member set as a regular file, no
+   allowed member may be absent, and a member's executable bit must agree
+   with its tag in both directions — an executable-mode member the row
+   tags non-executable refuses exactly as an unlisted member does — then
+   the layout marker is read from the archive stream, size-capped, and
+   held to the closed schema; a claude tarball offered to the codex
+   contract, or the reverse, refuses on every one of these counts; (e)
+   extracts only into staging, never following links, to paths computed
+   from the validated names; (f) requires the executable member and every
+   executable-tagged member to be a regular file and normalizes ownership
+   (the service account) and modes itself — executable-tagged members
+   0755, everything else 0644, directories 0755; archive metadata is
+   never trusted; (g) assembles the publish directory from the row's
+   published set — the allowed members under the payload prefix at their
+   prefix-relative paths, the product-rendered marker in place of the
+   archive's, nothing else from the archive — and, when the executable
+   member is not at the payload prefix root, adds a product-created
+   relative link `<published name>` → executable member inside the
+   directory (codex: `codex` → `bin/codex`; the binary canonicalizes its
+   own path before looking for its helpers, so the link is transparent
+   and the vendored layout stays intact beside it; claude publishes
+   `claude` itself), then atomically publishes the completed
    `<state-dir>/cli/<tool>/<version>/` directory (same-filesystem rename)
    and only then the worker-type export. A partially downloaded or
    extracted version is never visible at any published path, concurrent
    reconciles included. On failure or interruption: staging is cleaned,
    previously verified versions are retained for recovery, the desired pin
-   stays non-converged, a redacted `theozolith.error` event reports it, and
-   the next reconcile retries. This is the ADR-0042
-   staged-verify-then-exchange doctrine applied to a registry artifact.
+   stays non-converged, a redacted `theozolith.error` event reports it,
+   and the next reconcile retries. Control/daemon skew is fail-closed and
+   non-destructive by construction: a codex pin reaching a daemon that
+   predates the contract fails at the integrity gate — it can only derive
+   the claude-shaped coordinate, whose bytes do not match the pinned
+   integrity — and a daemon that carries the contract refuses an unknown
+   tool before download; either way nothing publishes and no verified
+   entry is touched. A claude pin's wire shape is unchanged, so an older
+   Control's claude pins converge on a newer daemon exactly as before. The
+   allowed-member set and the marker schema advance only with the
+   adapter's validated-CLI review (the one that moves `MIN_ENFORCING_CLI`),
+   so a pinned CLI whose archive gains, loses, or renames a member fails
+   closed until that review records the new row — the deliberate price of
+   a closed contract. This is the ADR-0042 staged-verify-then-exchange
+   doctrine applied to a registry artifact.
 5. **The pin is an execution requirement: desired-first publication,
    converge-strict launch, no fallback.** Per worker type the export parent
    carries two published facts: a **desired record** — the exact resolved
@@ -181,14 +290,21 @@ resolves the entry, and the next `claude` launch picks up the new content.
    after that exact version has completed point 4. The deck bind-mounts the
    export parent read-only, control injects the un-overridable
    `THEOZOLITH_WORKER_TYPE`, and the start script wires the check into the
-   launch path itself (the example installs a `claude` shim first on PATH):
+   launch path itself: the example installs a shim named for the tool's
+   published executable — `claude` or `codex` — first on PATH, which
+   reads `<state-dir>/cli/<tool>/by-type/<worker type>.desired`, compares
+   it with the `.current` entry, and execs the version-addressed
+   `<state-dir>/cli/<tool>/<desired>/<published name>` with the caller's
+   argv (for codex the deck's launch also passes the well-known model
+   file's value as `--model`, ADR-0052 §4; amended 2026-09-04, #132):
    **every** launch — container start or a new tmux window on a deck that
    has been up for weeks — verifies that the entry exists and identifies
    exactly the desired version before exec'ing it, and fails loudly
    otherwise. A missing entry, a stale entry, and the image's own CLI are
    all non-answers: a new launch never runs the previous export and never
-   falls back to the image binary (`DISABLE_AUTOUPDATER=1` closes the
-   self-update path). Running sessions are undisturbed — they hold their
+   falls back to the image binary (`DISABLE_AUTOUPDATER=1` closes claude's
+   self-update path; `check_for_update_on_startup = false`, seeded into
+   the codex state volume's `config.toml`, closes codex's update prompt). Running sessions are undisturbed — they hold their
    binary's inode and the policy they loaded. A fetch failure therefore has
    one meaning: cached versions remain on disk for recovery and for the
    sessions running them, but the desired pin is non-converged and new
@@ -202,8 +318,8 @@ resolves the entry, and the next `claude` launch picks up the new content.
 6. **Recreate and failure semantics.** Adopting or dropping either field,
    or changing the selected policy tree, changes env or volumes and
    recreates the deck once. A policy content edit or a CLI version bump
-   never recreates: it is picked up on the next `claude` launch in any tmux
-   window, while a running session keeps what it loaded. A deck whose node
+   never recreates: it is picked up on the next agent-CLI launch in any
+   tmux window, while a running session keeps what it loaded. A deck whose node
    has not yet converged a declared artifact fails its container start
    loudly and the daemon's reconcile loop recreates it on a later pass,
    retrying the start (amended 2026-09-03, #118), and the point-5 check
@@ -211,10 +327,18 @@ resolves the entry, and the next `claude` launch picks up the new content.
    silent fallback.
 7. **Scope.** The CLI Pin is driverless-only in v1 and refused with a driver
    (the mirror of `effort` being refused on decks until a consumer exists);
-   driver types keep the base image's CLI as identity bytes. Both fields are
-   refused on a codex-adapter type until a consumer exists: codex has no
-   managed-settings tier, its config file is theozolith-owned and baked, and
-   codex decks are already refused (ADR-0052). Telemetry: per worker type
+   driver types keep the base image's CLI as identity bytes. Agent Policy is
+   refused on a codex-adapter type until a codex consumer and its own
+   classification review exist: codex's admin tier is a single system
+   `config.toml` below user config plus a constraint-typed
+   `requirements.toml`, not a drop-in directory, so a codex policy tree
+   would be a different shape under a different allowlist (amended
+   2026-09-04). The CLI Pin is open to a
+   driverless codex type (amended 2026-09-04): the codex adapter declares
+   the resolution half of the CLI archive contract and the Node Daemon
+   holds the tarball to the codex row of point 4, and the pin resolves,
+   installs, exports, and launches pin-strict exactly as the claude pin
+   does — the deck is the consumer this clause was waiting for. Telemetry: per worker type
    the heartbeat carries the desired CLI version, the applied (exported)
    version, the convergence state, and the last install failure as a
    redacted class + message — names, versions, and error classes only,
@@ -223,9 +347,10 @@ resolves the entry, and the next `claude` launch picks up the new content.
    dispatch targets) and is not a permitted execution state either: an
    unconverged pin is enforced at launch (point 5) and reported here.
 8. **Ownership.** The product owns validation (the safe-key allowlist and
-   tree lint), resolution (ingest), the install lifecycle and export
-   contract (Node Daemon: staging, verification, atomic publication,
-   desired records, pruning), and telemetry. The in-container wiring — the
+   tree lint), resolution (ingest), the CLI archive contract and the
+   install lifecycle and export contract (Node Daemon: the per-tool
+   contract rows, staging, verification, atomic publication, desired
+   records, pruning), and telemetry. The in-container wiring — the
    managed-settings symlink via the deck's passwordless sudo, the launch
    shim with the pin check, PATH precedence, the autoupdater switch —
    stays operator-authored in the example start script; the strict-launch
@@ -258,6 +383,40 @@ behavior. The implementing PRs must demonstrate at minimum:
   all fail without publishing anything; success publishes atomically with
   normalized ownership and modes; concurrent reconciliation exposes no
   partial state; pruning cannot delete a desired or exported version.
+- **CLI archive contract** (amended 2026-09-04, #132): success fixtures
+  for both real archive shapes — the four-member claude layout per Linux
+  tuple and the eight-member vendored codex layout for **both** the x64
+  and the arm64 tarball, each fixture replicating the real member listing
+  exactly (paths, types, modes, both root members, the marker and the
+  `package.json` contents) — install, publish exactly the row's published
+  set with normalized modes and the product-rendered marker, publish
+  nothing from outside the payload prefix, and expose the published
+  executable at `<version>/<name>` (for codex through the daemon-created
+  link, resolving inside the version directory); the recorded rows are
+  re-verified against the real registry tarballs whenever a floor moves.
+  Negative tests refuse, each without publishing and with previously
+  verified versions untouched: cross-tool archive substitution in both
+  directions; a wrong executable path or name; a member outside the
+  allowed set (executable or not, at the root or under the prefix); an
+  allowed member missing; an executable bit on a non-executable-tagged
+  member and a permitted executable name under the other triple's prefix;
+  a link, device, duplicate, traversal, absolute, oversized, or
+  over-count member; a malformed contract row; an unknown tool on the
+  wire. Marker mutation tests cover every rejected field of the codex
+  schema — each of the seven members missing, an extra member, a wrong
+  type, a wrong value, `layoutVersion` other than the row's, `version`
+  carrying the platform suffix or another base version, `target` naming
+  the other triple, `variant` other than `codex`, `entrypoint` absolute,
+  traversal-bearing, or outside the executable-tagged set, and
+  `resourcesDir`/`pathDir` absolute, traversal-bearing, or renamed — and
+  the two bound claude `package.json` fields. Mixed-version wire behavior
+  is exercised — an older daemon receiving a codex pin fails at the
+  integrity gate and publishes nothing, and a newer daemon converges an
+  older Control's claude pins unchanged; the adapter-side and daemon-side
+  halves of the contract are held equal by a test for every registered
+  adapter that declares a CLI table; the codex launch shim passes the pin
+  check and execs the published link exactly as the claude shim execs its
+  binary.
 - **Lifecycle**: adopting or dropping the CLI Pin recreates once; a
   version change does not recreate; an existing session survives a pin
   change; a pre-convergence launch fails loudly; a post-convergence launch
@@ -277,7 +436,8 @@ behavior. The implementing PRs must demonstrate at minimum:
   untouched — policy trees are declarative by construction: they cannot
   select a model, register a hook, or name anything executable or fetched.
 - **Negative**: two more resolvers (npm registry at ingest, tarball fetch on
-  nodes) and a ~215 MB binary per pinned version on each node's state dir; a
+  nodes) and, per pinned version on each node's state dir, a ~215 MB claude
+  binary or ~330 MB of vendored codex executables; a
   deck's *actual* CLI can now postdate or predate the base image's, so a
   model ID the pinned CLI does not know fails at launch rather than at build
   (the floor lint bounds this; the operator pins a CLI that knows the
@@ -287,7 +447,10 @@ behavior. The implementing PRs must demonstrate at minimum:
   means new launches fail until the fetch succeeds — the deliberate price
   of pin-as-requirement (running sessions ride through). A new vendor
   settings key is unusable in policy until deliberately classified into
-  the allowlist.
+  the allowlist. Likewise a CLI version whose archive membership or
+  layout marker differs from the contract row fails closed until the
+  adapter's validated-CLI review records the new row — pinning ahead of
+  the floor is bounded by the closed contract, not just by the floor lint.
 - **Neutral**: the deck image still ships the base image's CLI, inert when
   a pin is declared; the config distribution hash keeps its protocol name
   while covering a third tree; the Candidate Bundle exporter and verifier
@@ -348,9 +511,11 @@ behavior. The implementing PRs must demonstrate at minimum:
   container before the daemon materialized secrets onto the freshly-wiped
   `/run` tmpfs, auto-vivified the missing bind source as a directory and
   wedged both the mount and the secret writer. See NODE-SUBSTRATE.md.
+- **2026-09-04 (#132)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout. The CLI archive contract becomes explicit per tool (Decisions 3–5 and 8): a closed product-owned table in Node Daemon code, mirrored by adapter constants under a contract test, with the rows verified against the real claude 2.1.260 and codex 0.150.0 tarballs; the registry supplies bytes and integrity only, the published-executable link for a vendored layout is daemon-created and never archive-supplied, and an unknown tool or a mixed-version wire fails closed without touching verified entries. Re-amended in the same PR after review: the contract distinguishes the archive root from the tool payload prefix, enumerates the real codex members outside the prefix (`package/package.json`, `package/README.md`), closes the allowed-member and published-member sets (no unlisted member, executable or not, and no executable bit outside the five payload executables), binds `codex-package.json` to a closed seven-field schema whose values derive from the row and the pinned coordinate and publishes a product-rendered marker, and requires fixtures for both the x64 and the arm64 eight-member tarball plus mutation tests for every rejected marker field.
 
 ## Relevant PRs
 
 - #95 — grilling session (2026-09-02) that settled this decision.
 - #97 — post-merge review that hardened the first draft: the safe-key allowlist closing the identity denylist gap, the pin-as-requirement fix, separating integrity from safe extraction, closing the interior-of-an-admitted-key hole, and the per-platform integrity map.
 - #118 — the reconcile loop is the sole restarter of Stack containers, retiring the Docker restart policy that raced tmpfs secret materialization on boot (#114).
+- #132 — the #127 grilling (2026-09-04) narrowing the codex refusal to Agent Policy and opening the CLI Pin to codex decks.

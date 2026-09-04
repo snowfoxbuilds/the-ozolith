@@ -279,6 +279,7 @@ Stated plainly, per the operator ruling:
     plus hash-verified distribution. `DISABLE_AUTOUPDATER` is not a
     steering key and rides the deck session env when a CLI Pin is
     declared.
+- **2026-09-04 (#132)**: the codex adapter gains the interactive scope under this ADR's existing contract — only the well-known model file is written, `effort` stays refused on every driverless type, and the deck's model is a default passed as the CLI's model flag; no codex-specific identity machinery runs on a deck. See ADR-0052.
 
 ## Relevant PRs
 
@@ -289,3 +290,4 @@ Stated plainly, per the operator ruling:
   for identity failures.
 - #95 — the ADR-0055 amendment moving operator managed-settings policy
   to an allowlist-validated Config Repo tree.
+- #132 — the #127 grilling (2026-09-04) adding the codex adapter's interactive scope.
