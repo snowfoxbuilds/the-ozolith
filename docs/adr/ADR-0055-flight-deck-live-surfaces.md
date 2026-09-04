@@ -356,10 +356,11 @@ behavior. The implementing PRs must demonstrate at minimum:
   container before the daemon materialized secrets onto the freshly-wiped
   `/run` tmpfs, auto-vivified the missing bind source as a directory and
   wedged both the mount and the secret writer. See NODE-SUBSTRATE.md.
-- **2026-09-04 (#127 grilling)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout.
+- **2026-09-04 (#132)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout.
 
 ## Relevant PRs
 
 - #95 — grilling session (2026-09-02) that settled this decision.
 - #97 — post-merge review that hardened the first draft: the safe-key allowlist closing the identity denylist gap, the pin-as-requirement fix, separating integrity from safe extraction, closing the interior-of-an-admitted-key hole, and the per-platform integrity map.
 - #118 — the reconcile loop is the sole restarter of Stack containers, retiring the Docker restart policy that raced tmpfs secret materialization on boot (#114).
+- #132 — the #127 grilling (2026-09-04) narrowing the codex refusal to Agent Policy and opening the CLI Pin to codex decks.
