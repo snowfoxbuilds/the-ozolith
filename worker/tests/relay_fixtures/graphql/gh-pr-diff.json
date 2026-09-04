@@ -1,0 +1,1 @@
+{"query":"\n\tquery PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {\n\t\trepository(owner: $owner, name: $repo) {\n\t\t\tpullRequest(number: $pr_number) {number,id}\n\t\t}\n\t}","variables":{"owner":"OWNER","pr_number":1,"repo":"REPO"}}

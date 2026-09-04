@@ -1,0 +1,1 @@
+{"query": "query { search(query: \"mutation { x }\", type: ISSUE, first: 1) { issueCount } }"}

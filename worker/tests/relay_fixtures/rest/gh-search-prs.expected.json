@@ -1,0 +1,4 @@
+{
+  "method": "GET",
+  "upstream_target": "/search/issues?page=1&per_page=30&q=%28%20%22multi%20word%20term%22%20%29%20author%3Aoctocat%20is%3Apublic%20label%3A%22help%20wanted%22%20repo%3AOWNER%2FREPO%20state%3Aopen%20type%3Apr"
+}

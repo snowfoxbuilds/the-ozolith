@@ -1,0 +1,7 @@
+{
+  "parsed": true,
+  "operation_type": "mutation",
+  "operation_name": null,
+  "refusal": "graphql-non-query",
+  "variables": []
+}

@@ -1,0 +1,11 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": "IssueByNumber",
+  "refusal": null,
+  "variables": [
+    "number",
+    "owner",
+    "repo"
+  ]
+}

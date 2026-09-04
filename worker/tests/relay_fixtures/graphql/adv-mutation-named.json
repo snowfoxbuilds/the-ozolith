@@ -1,0 +1,1 @@
+{"query": "mutation Star($id: ID!) { addStar(input: {starrableId: $id}) { clientMutationId } }", "variables": {"id": "x"}}

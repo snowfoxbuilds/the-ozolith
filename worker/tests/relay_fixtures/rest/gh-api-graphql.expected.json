@@ -1,0 +1,4 @@
+{
+  "method": "POST",
+  "upstream_target": "/graphql"
+}
