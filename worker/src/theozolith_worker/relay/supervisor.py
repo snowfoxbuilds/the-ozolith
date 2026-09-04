@@ -164,13 +164,23 @@ class RelayRun:
             os.close(sink_fd)
             raise RelayStartError(f"an entry already exists at the relay socket path {SOCKET_NAME}")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound = False
         try:
             listener.bind(str(socket_path))
+            bound = True
             os.chmod(socket_path, 0o666)
             listener.listen(64)
         except OSError as exc:
             listener.close()
             os.close(sink_fd)
+            # Undo only what this invocation created. A ``chmod`` or ``listen``
+            # that fails leaves behind the socket this ``bind`` just made, so
+            # unlink it. A ``bind`` that fails made nothing — and if it lost a
+            # race to an entry that appeared after the precheck, that entry is
+            # foreign and is left exactly as the pre-existing case is (item 10).
+            if bound:
+                with contextlib.suppress(OSError):
+                    os.unlink(socket_path)
             raise RelayStartError(f"relay socket: {exc.strerror}") from exc
 
         live = isinstance(upstream, Live)

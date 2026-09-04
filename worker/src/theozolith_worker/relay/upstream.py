@@ -9,11 +9,11 @@ read within the per-request limit, into memory or an unlinked spool file,
 and every redirect answer is a fresh policy decision against the origin pin
 made before the hop's request exists.
 
-One absolute deadline per send covers the connect, the request, the
-response head, every body read, and every followed hop; every byte the
-gate reads is counted against the aggregate whether the send ends
+One absolute deadline per send covers name resolution, the connect, the
+request, the response head, every body read, and every followed hop; every
+byte the gate reads is counted against the aggregate whether the send ends
 delivered, refused, timed out, truncated, or aborted; and ``abort`` reaches
-a connect in progress as well as a read.
+a name lookup and a connect in progress as well as a read.
 """
 
 from __future__ import annotations
@@ -141,11 +141,14 @@ class AggregateBudget:
 
     def settle_response(self, reserved: int, consumed: int) -> None:
         """Keep what was actually read and return the rest of the
-        reservation. ``consumed`` can exceed ``reserved`` by the one byte
-        the gate reads to see a per-request overflow; that byte was
-        received, so it is charged too."""
+        reservation. The reservation already covers the one byte the gate
+        reads past the per-request limit to see an overflow, so ``consumed``
+        never exceeds ``reserved``; the clamp makes that an invariant the
+        aggregate keeps whatever a caller does — remaining never rises above
+        what was reserved here nor falls below zero."""
         with self._lock:
-            self._response_remaining += reserved - consumed
+            charged = min(max(consumed, 0), reserved)
+            self._response_remaining += reserved - charged
 
 
 class SpoolHandle:
@@ -262,6 +265,17 @@ def hop_request(method: str, request_target: str) -> UpstreamRequest:
     return UpstreamRequest(method, request_target, _HOP_HEADERS, b"")
 
 
+def response_reservation(budgets: Budgets) -> int:
+    """What a send reserves against the aggregate before it reads a byte:
+    the per-request response limit plus the one byte the gate reads past it
+    to detect an overflow. Reserving the whole of what a single response can
+    receive is what keeps the aggregate strictly bounded — every admitted
+    send holds room for its worst case, so settling can never drive the
+    remaining capacity negative, and the server's admission peek uses the
+    same figure so it never authorizes a request the gate would then refuse."""
+    return budgets.response_body_limit + 1
+
+
 def discard_spool(spool_dir: Path) -> None:
     """Delete whatever the spool directory holds; a crash between a spool
     file's creation and its unlink is the only way it holds anything."""
@@ -318,12 +332,14 @@ class UpstreamClient:
     follows a redirect only per hop through ``authorize_hop``.
 
     The client opens every socket itself so that the send's deadline and
-    ``abort`` govern the connect too: a non-blocking connect awaited on a
-    selector together with the wake pipe ``abort`` writes to, then the TLS
-    handshake on the wrapped socket, both armed with what remains of the
-    deadline. The socket is kept here for the life of the exchange because
-    ``http.client`` forgets it once a ``Connection: close`` response owns
-    it, and every later read must still be armed and abortable."""
+    ``abort`` govern name resolution and the connect too: the blocking
+    lookup runs in a throwaway thread waited on alongside the wake pipe, then
+    a non-blocking connect awaited on a selector together with that same wake
+    pipe ``abort`` writes to, then the TLS handshake on the wrapped socket,
+    all armed with what remains of the deadline. The socket is kept here for
+    the life of the exchange because ``http.client`` forgets it once a
+    ``Connection: close`` response owns it, and every later read must still
+    be armed and abortable."""
 
     def __init__(
         self,
@@ -336,6 +352,7 @@ class UpstreamClient:
         spool_threshold: int = MEMORY_SPOOL_THRESHOLD,
         _spool_write=os.write,
         _socket=socket.socket,
+        _getaddrinfo=socket.getaddrinfo,
     ):
         self._credential = credential
         self._budgets = budgets
@@ -345,6 +362,7 @@ class UpstreamClient:
         self._spool_threshold = spool_threshold
         self._spool_write = _spool_write
         self._socket = _socket
+        self._getaddrinfo = _getaddrinfo
         self._lock = threading.Lock()
         self._tls: ssl.SSLContext | None = None
         self._in_flight: dict[http.client.HTTPConnection, socket.socket | None] = {}
@@ -429,12 +447,54 @@ class UpstreamClient:
         if sock not in ready:
             raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
 
+    def _resolve(self, host: str, port: int, deadline: float) -> list:
+        """Name resolution under the send's one deadline and abort. The
+        blocking ``getaddrinfo`` cannot be interrupted, so it runs in a
+        throwaway thread and this waits on the abort pipe and the thread's
+        completion together, bounded by what is left of the deadline. An
+        abort returns ``aborted`` at once and the deadline a timeout, each
+        without waiting for the lookup; a result that lands after either is
+        left in the daemon thread and never read, so it opens no socket. The
+        same ``deadline`` then governs every address the lookup returns."""
+        done_r, done_w = os.pipe()
+        holder: dict[str, object] = {}
+
+        def resolve() -> None:
+            try:
+                holder["addrinfos"] = self._getaddrinfo(
+                    host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+                )
+            except BaseException as exc:  # re-raised on the caller's thread
+                holder["error"] = exc
+            finally:
+                with contextlib.suppress(OSError):
+                    os.write(done_w, b"x")
+                os.close(done_w)
+
+        threading.Thread(target=resolve, daemon=True, name="relay-resolve").start()
+        try:
+            remaining = self._remaining(deadline)
+            with selectors.DefaultSelector() as selector:
+                selector.register(self._wake_r, selectors.EVENT_READ)
+                selector.register(done_r, selectors.EVENT_READ)
+                ready = {key.fileobj for key, _ in selector.select(remaining)}
+        finally:
+            os.close(done_r)
+        if self._wake_r in ready or self._aborted:
+            raise _Refused(Outcome.ABORTED, Reason.ABORTED)
+        if done_r not in ready:
+            raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        error = holder.get("error")
+        if error is not None:
+            raise error
+        return holder["addrinfos"]
+
     def _open_socket(
         self, connection: http.client.HTTPConnection, deadline: float
     ) -> socket.socket:
         failure: OSError | None = None
-        for family, kind, proto, _, address in socket.getaddrinfo(
-            connection.host, connection.port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        for family, kind, proto, _, address in self._resolve(
+            connection.host, connection.port, deadline
         ):
             sock = self._socket(family, kind, proto)
             try:
@@ -526,8 +586,8 @@ class UpstreamClient:
         if self._credential is None:
             raise RuntimeError("UpstreamClient.send needs a credential")
         request_bytes = request_size(request)
-        limit = self._budgets.response_body_limit
-        if not aggregate.reserve_response(limit):
+        reservation = response_reservation(self._budgets)
+        if not aggregate.reserve_response(reservation):
             return UpstreamResult(
                 Outcome.REFUSED_GATE, None, (), None, request_bytes, 0, (), Reason.GATE_AGGREGATE
             )
@@ -543,7 +603,7 @@ class UpstreamClient:
         try:
             return chain.run(request_bytes)
         finally:
-            aggregate.settle_response(limit, chain.received)
+            aggregate.settle_response(reservation, chain.received)
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:

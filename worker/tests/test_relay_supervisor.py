@@ -7,6 +7,7 @@ and the cleanup that never touches the sink."""
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import socket
@@ -528,6 +529,60 @@ def test_an_interruption_during_delivery_cleans_up_and_re_raises(dirs, monkeypat
     with pytest.raises(KeyboardInterrupt):
         start_failing(dirs, Live(credential=CREDENTIAL))
     assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+# -- socket bring-up failures ------------------------------------------------
+
+
+def test_a_chmod_failure_after_bind_unlinks_this_run_s_socket(dirs, monkeypatch):
+    """``bind`` created the socket, then ``chmod`` fails: the socket this run
+    made is its to remove, so start fails loud and leaves nothing behind."""
+    job, _ = dirs
+    real_chmod = supervisor.os.chmod
+
+    def failing_chmod(path, mode, *args, **kwargs):
+        if Path(path) == job / SOCKET_NAME:
+            raise OSError(errno.EPERM, "chmod refused")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(supervisor.os, "chmod", failing_chmod)
+    fds = open_fds()
+    with pytest.raises(RelayStartError):
+        start_failing(dirs, NoUpstream())
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+def test_a_listen_failure_after_bind_unlinks_this_run_s_socket(dirs, monkeypatch):
+    """``bind`` created the socket, then ``listen`` fails: same cleanup — the
+    descriptor is closed and the run's own socket unlinked."""
+
+    class ListenFails(socket.socket):
+        def listen(self, backlog=0):
+            raise OSError(errno.EADDRINUSE, "listen refused")
+
+    monkeypatch.setattr(supervisor.socket, "socket", lambda family, kind: ListenFails(family, kind))
+    fds = open_fds()
+    with pytest.raises(RelayStartError):
+        start_failing(dirs, NoUpstream())
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+def test_a_bind_race_never_unlinks_the_entry_it_lost_to(dirs, monkeypatch):
+    """An entry that appears after the precheck makes ``bind`` fail; that
+    entry is foreign — this run never created it — so it is left untouched,
+    exactly as a pre-existing entry is."""
+    job, _ = dirs
+    foreign = job / SOCKET_NAME
+    foreign.write_text("foreign")
+    monkeypatch.setattr(supervisor.os.path, "lexists", lambda path: False)
+    fds = open_fds()
+    with pytest.raises(RelayStartError):
+        start_failing(dirs, NoUpstream())
+    assert foreign.read_text() == "foreign"  # the entry we lost to is preserved
+    assert not child_pids("r1")
     assert open_fds() == fds
 
 

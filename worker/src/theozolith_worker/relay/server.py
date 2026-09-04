@@ -59,6 +59,7 @@ from theozolith_worker.relay.upstream import (
     UpstreamResult,
     discard_spool,
     request_size,
+    response_reservation,
 )
 
 REASON_AGENT_EXIT = "agent-exit"
@@ -575,7 +576,7 @@ class _Relay:
                 )
                 if not self.aggregate.charge_request(request_size(upstream_request)):
                     decision, reason = Decision.REFUSED, Reason.BUDGET_REQUEST_BYTES
-                elif self.aggregate.response_remaining < budgets.response_body_limit:
+                elif self.aggregate.response_remaining < response_reservation(budgets):
                     decision, reason = Decision.REFUSED, Reason.BUDGET_RESPONSE_BYTES
             early = self._reserve_and_record(seq, decision, reason, target)
         if isinstance(early, Reason):

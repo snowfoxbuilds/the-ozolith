@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import http.client
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -762,6 +763,58 @@ def test_the_aggregate_decreases_by_actual_bytes_when_a_read_is_aborted(spool_di
     assert list(spool_dir.iterdir()) == []
 
 
+def test_over_limit_responses_at_the_aggregate_boundary_never_go_negative(spool_dir, upstream):
+    """The reservation covers the overflow-detection byte, so responses that
+    each run one byte past the per-request limit cannot, together, drive the
+    aggregate below zero. Four sends race for an aggregate that holds exactly
+    two reservations: two read their overflow byte and refuse, two are turned
+    away before reading a byte, the accounted total never exceeds the
+    aggregate, and the remaining capacity never goes negative."""
+    reservation = LIMIT + 1
+    budgets = Budgets(
+        response_body_limit=LIMIT,
+        aggregate_response_bytes=2 * reservation,
+        upstream_timeout=5.0,
+    )
+    upstream.route(
+        "/over", Response(200, [], b"z" * reservation, stall_after=LIMIT // 2, stall_seconds=0.4)
+    )
+    client = upstream.client(budgets, spool_dir)
+    aggregate = AggregateBudget(budgets)
+    barrier = threading.Barrier(4)
+    results: list[UpstreamResult] = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        result = send(client, "/over", budgets=budgets, aggregate=aggregate)
+        with lock:
+            results.append(result)
+        _consume(result)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert all(r.outcome is Outcome.REFUSED_GATE for r in results)
+    reasons = sorted(r.reason.value for r in results)
+    assert reasons == [
+        "gate-aggregate",
+        "gate-aggregate",
+        "gate-response-bytes",
+        "gate-response-bytes",
+    ]
+    over = [r for r in results if r.reason is Reason.GATE_RESPONSE_BYTES]
+    assert all(r.response_bytes == reservation for r in over)
+    accounted = sum(r.response_bytes for r in results)
+    assert accounted == 2 * reservation == budgets.aggregate_response_bytes
+    assert aggregate.response_remaining == 0
+    assert aggregate.response_remaining >= 0
+    assert len(upstream.requests) == 2
+
+
 # -- the single absolute deadline --------------------------------------------
 
 
@@ -840,6 +893,114 @@ def test_abort_during_a_detached_close_delimited_body_read(spool_dir, upstream):
     thread.join(5)
     assert not thread.is_alive()
     assert results[0].outcome is Outcome.ABORTED
+
+
+# -- name resolution under the deadline --------------------------------------
+
+
+def _recording_socket():
+    """A ``socket`` factory that remembers every call so a test can prove no
+    socket was opened."""
+    calls: list[tuple] = []
+
+    def factory(*args):
+        calls.append(args)
+        return socket.socket(*args)
+
+    return calls, factory
+
+
+def _dns_client(spool_dir, budgets, getaddrinfo, socket_factory):
+    # The factory's host/port reach ``getaddrinfo``; the port is closed so a
+    # completed lookup could only fail, never deliver — but these tests end
+    # before the lookup returns.
+    return UpstreamClient(
+        CREDENTIAL,
+        budgets,
+        spool_dir,
+        connection_factory=lambda host, port, timeout: http.client.HTTPConnection(
+            "127.0.0.1", 9, timeout=timeout
+        ),
+        _getaddrinfo=getaddrinfo,
+        _socket=socket_factory,
+    )
+
+
+def test_a_stalled_resolver_times_out_near_the_deadline_and_opens_no_socket(spool_dir):
+    """A resolver that never answers does not hold the send past its
+    deadline; the send times out near it, and the result that finally
+    arrives is discarded — no socket is ever opened for it."""
+    release = threading.Event()
+
+    def blocking(host, port, family, kind):
+        release.wait()
+        return socket.getaddrinfo("127.0.0.1", 9, family, kind)
+
+    calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.4)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    started = time.monotonic()
+    result = send(client, "/zen", budgets=budgets)
+    elapsed = time.monotonic() - started
+    assert (result.outcome, result.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+    assert 0.4 <= elapsed < 1.0
+    assert calls == []
+    release.set()  # let the daemon lookup finish; its late result is ignored
+    time.sleep(0.2)
+    assert calls == []
+    client.close()
+
+
+def test_abort_during_resolution_returns_aborted_promptly_and_opens_no_socket(spool_dir):
+    """Agent exit during a name lookup returns ``aborted`` at once rather
+    than waiting the full upstream timeout, and opens no socket."""
+    release = threading.Event()
+
+    def blocking(host, port, family, kind):
+        release.wait()
+        return socket.getaddrinfo("127.0.0.1", 9, family, kind)
+
+    calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=30.0)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    results: list[UpstreamResult] = []
+    thread = threading.Thread(target=lambda: results.append(send(client, "/zen", budgets=budgets)))
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.3)
+    client.abort()
+    thread.join(5)
+    elapsed = time.monotonic() - started
+    assert not thread.is_alive()
+    assert (results[0].outcome, results[0].reason) == (Outcome.ABORTED, Reason.ABORTED)
+    assert elapsed < 5
+    assert calls == []
+    release.set()
+    client.close()
+
+
+def test_one_deadline_spans_every_resolved_address(spool_dir):
+    """The single send deadline is kept across the addresses a lookup
+    returns, not reset for each: the first address is refused fast and the
+    second is a blackhole, so the send tries both and still times out within
+    one deadline window rather than one window per address."""
+
+    def two_addresses(host, port, family, kind):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80)),
+        ]
+
+    calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.6)
+    client = _dns_client(spool_dir, budgets, two_addresses, socket_factory)
+    started = time.monotonic()
+    result = send(client, "/zen", budgets=budgets)
+    elapsed = time.monotonic() - started
+    assert (result.outcome, result.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+    assert 0.6 <= elapsed < 1.2  # one deadline for both addresses, not two
+    assert len(calls) == 2  # both candidate addresses were attempted
+    client.close()
 
 
 # -- per-hop request-byte budgets --------------------------------------------
