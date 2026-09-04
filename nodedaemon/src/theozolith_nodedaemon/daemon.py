@@ -1878,11 +1878,17 @@ class NodeDaemon:
         trailing newlines stripped, the shim's exact ``$(cat)`` parse — names
         the entry symlink's target version (the gate refuses on any mismatch,
         so mid-upgrade skew is no applied version, not the old one), and the
-        binary a regular world-r+x file. The tree mounts into containers
-        running an arbitrary non-root UID — anything less and status would
-        report a convergence launches cannot see. '' when absent, broken,
-        unreadable, malformed, or mismatched; every filesystem error is
-        evidence of absence, never an escape into the heartbeat."""
+        published executable — ``<version>/<published name>`` by the tool's
+        contract row — a regular world-r+x file, or for a vendored row a
+        RELATIVE symlink reading exactly the row's executable member (never
+        absolute, ``..``-bearing, archive-supplied to another target, or a
+        regular file) whose target is that file beneath real directories.
+        The tree mounts into containers running an arbitrary non-root UID —
+        anything less and status would report a convergence launches cannot
+        see. '' when absent, broken, unreadable, malformed, mismatched, or
+        for a tool outside the contract (its install already failed typed);
+        every filesystem error is evidence of absence, never an escape into
+        the heartbeat."""
 
         def lmode(path: Path) -> int:
             # The entry's OWN mode — lstat never follows a symlink (a link is
@@ -1924,10 +1930,32 @@ class NodeDaemon:
         version_dir = tool_root / version
         if not stat.S_ISDIR(lmode(version_dir)):
             return ""
-        binary = version_dir / cliinstall.CLI_BINARY_NAME
+        row = cliinstall.CLI_ARCHIVE_CONTRACT.get(tool)
+        if row is None:
+            return ""
+        published = version_dir / row.published_name
+        directories = [cli_root, tool_root, by_type, version_dir]
+        if row.vendored:
+            if not stat.S_ISLNK(lmode(published)):
+                return ""
+            try:
+                target = os.readlink(published)
+            except OSError:
+                return ""
+            if target != row.executable_member:
+                return ""
+            binary = version_dir
+            for part in row.executable_member.split("/")[:-1]:
+                binary = binary / part
+                if not stat.S_ISDIR(lmode(binary)):
+                    return ""
+                directories.append(binary)
+            binary = binary / row.executable_member.rsplit("/", 1)[-1]
+        else:
+            binary = published
         if not stat.S_ISREG(lmode(binary)):
             return ""
-        for directory in (cli_root, tool_root, by_type, version_dir):
+        for directory in directories:
             if not grants(directory, 0o001):
                 return ""
         if not grants(binary, 0o005):

@@ -6880,6 +6880,97 @@ def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
     assert applied() == "2.1.260"  # every restoration re-closes the chain
 
 
+def _publish_codex_layout(cli_root: Path, name: str, version: str) -> Path:
+    """The contract's published codex set as the real installer lays it out:
+    the desired record and entry for worker type ``name``, the vendored
+    payload at its prefix-relative paths, and the daemon-created relative
+    link ``codex`` -> ``bin/codex``."""
+    tool_root = cli_root / "codex"
+    by_type = tool_root / "by-type"
+    version_dir = tool_root / version
+    for directory in (
+        tool_root,
+        by_type,
+        version_dir,
+        version_dir / "bin",
+        version_dir / "codex-path",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o755)
+    (by_type / f"{name}.desired").write_text(version + "\n")
+    (by_type / f"{name}.desired").chmod(0o644)
+    (by_type / f"{name}.current").symlink_to(f"../{version}")
+    for rel in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+        (version_dir / rel).write_text(f"binary {version}\n")
+        (version_dir / rel).chmod(0o755)
+    (version_dir / "codex-package.json").write_text("{}\n")
+    (version_dir / "codex").symlink_to("bin/codex")
+    return version_dir
+
+
+def test_cli_applied_evidence_walks_the_vendored_codex_link(rig: Rig, tmp_path):
+    """For a vendored row the published executable is the daemon-created
+    RELATIVE link ``<version>/codex`` -> ``bin/codex``: applied evidence
+    requires exactly that link (never absolute, ``..``-bearing, pointing at
+    another target as an archive-supplied link would, or a regular file in
+    its place), a real world-traversable ``bin`` directory, and a regular
+    world-r+x ``bin/codex`` behind it. An unknown tool has no evidence at all
+    (its install already failed typed)."""
+    cli_root = rig.config.cli_dir
+    version_dir = _publish_codex_layout(cli_root, "codexdeck", "0.153.3")
+    link = version_dir / "codex"
+    binary = version_dir / "bin" / "codex"
+
+    def applied() -> str:
+        return rig.daemon._cli_applied_version(cli_root, "codex", "codexdeck")
+
+    assert applied() == "0.153.3"  # the healthy baseline
+
+    def relink(target) -> None:
+        link.unlink()
+        link.symlink_to(target)
+
+    for wrong in (binary, "../0.153.3/bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+        relink(wrong)
+        assert applied() == "", wrong
+    relink("bin/codex")
+    assert applied() == "0.153.3"
+
+    # A regular file where the link belongs — even a valid-looking binary.
+    link.unlink()
+    link.write_text("binary 0.153.3\n")
+    link.chmod(0o755)
+    assert applied() == ""
+    link.unlink()
+    link.symlink_to("bin/codex")
+    assert applied() == "0.153.3"
+
+    # The target must be a regular world-r+x file; the interior directory a
+    # real world-traversable one (a symlinked bin resolves elsewhere inside
+    # the read-only mount).
+    os.chmod(binary, 0o750)
+    assert applied() == ""
+    os.chmod(binary, 0o755)
+    binary.unlink()
+    assert applied() == ""
+    binary.write_text("binary 0.153.3\n")
+    binary.chmod(0o755)
+    os.chmod(version_dir / "bin", 0o750)
+    assert applied() == ""
+    os.chmod(version_dir / "bin", 0o755)
+    moved = tmp_path / "moved-bin"
+    os.replace(version_dir / "bin", moved)
+    (version_dir / "bin").symlink_to(moved)
+    assert applied() == ""
+    (version_dir / "bin").unlink()
+    os.replace(moved, version_dir / "bin")
+    assert applied() == "0.153.3"  # every restoration re-closes the chain
+
+    # A tool outside the contract: no row, no evidence.
+    os.replace(cli_root / "codex", cli_root / "pi")
+    assert rig.daemon._cli_applied_version(cli_root, "pi", "codexdeck") == ""
+
+
 def test_cli_symlinked_tool_dir_is_repaired_without_touching_the_target(
     rig: Rig, installer, tmp_path
 ):
