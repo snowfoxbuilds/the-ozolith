@@ -4,10 +4,11 @@ items 8 and 10).
 The supervisor owns everything the child must never create for itself: the
 per-Run relay directory and the exclusively created audit sink, the socket
 bound at the job-dir root, and the pipe the credential crosses once. The
-child is spawned with those as inherited descriptors and nothing secret in
-argv or its environment, watched through its report lines, and at the end of
-the agent phase signalled, waited for, and classified from its exit report
-and status together with what the supervisor itself observed.
+child is spawned with those as inherited descriptors, an explicit environment
+holding only what its interpreter needs to start and find the package, and
+nothing secret in argv; it is watched through its report lines, and at the
+end of the agent phase signalled, waited for, and classified from its exit
+report and status together with what the supervisor itself observed.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -35,10 +36,25 @@ CONTAINER_SOCKET_PATH = "/job/gh.sock"
 READY_TIMEOUT_SECONDS = 10.0
 _POLL_SECONDS = 0.05
 
+# The child's whole environment: what its interpreter needs to start and
+# find the package, nothing else. No driver token source, provider key,
+# ``_FILE`` path, or operator variable crosses. PATH resolves a non-absolute
+# interpreter (Popen looks the executable up through the environment it is
+# given); PYTHONPATH and PYTHONHOME are how the parent's own interpreter
+# finds the package in a source-tree run; the locale variables make the
+# child decode argv — the spool path, the run id — as the parent encoded it.
+INHERITED_ENVIRONMENT = ("PATH", "PYTHONPATH", "PYTHONHOME", "LANG", "LC_ALL", "LC_CTYPE")
+
 TERMINATION_CLEAN = "clean"
 TERMINATION_EXHAUSTED = "exhausted"
 TERMINATION_KILLED = "killed"
 TERMINATION_CRASHED = "crashed"
+
+
+def child_environment(parent: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """The relay child's environment: the allowlisted names present in
+    ``parent``, copied unchanged — never a synthesized value."""
+    return {name: parent[name] for name in INHERITED_ENVIRONMENT if name in parent}
 
 
 class RelayStartError(RuntimeError):
@@ -187,6 +203,7 @@ class RelayRun:
                 stderr=subprocess.PIPE,
                 close_fds=True,
                 start_new_session=True,
+                env=child_environment(),
             )
         except OSError as exc:
             listener.close()
@@ -218,16 +235,28 @@ class RelayRun:
             reports=reports,
             readers=readers,
         )
-        if live:
-            assert isinstance(upstream, Live)
-            try:
-                _deliver_credential(cred_w, upstream)
-            except OSError:
-                run._abandon()
-                raise RelayStartError("relay child exited before taking its credential") from None
-        if not run._await_ready():
+        # From here on the child exists: whatever fails, it is killed and
+        # reaped, the readers joined, the socket and spool cleared.
+        try:
+            if live:
+                assert isinstance(upstream, Live)
+                try:
+                    _deliver_credential(cred_w, upstream)
+                finally:
+                    os.close(cred_w)
+            if not run._await_ready():
+                raise RelayStartError("relay child did not report ready")
+        except RelayStartError:
             run._abandon()
-            raise RelayStartError("relay child did not report ready")
+            raise
+        except (OSError, UnicodeError, ValueError):
+            # ``from None`` on purpose: a FileNotFoundError carries the path
+            # and a UnicodeDecodeError the bytes; neither may ride the chain.
+            run._abandon()
+            raise RelayStartError("relay credential could not be delivered") from None
+        except BaseException:
+            run._abandon()
+            raise
         return run
 
     def _await_ready(self) -> bool:
@@ -242,10 +271,11 @@ class RelayRun:
         return False
 
     def _abandon(self) -> None:
-        """A failed start: kill the child, drain, clean up, never classify."""
+        """A failed start: kill the child if it still runs, reap it, join
+        the readers, clean up — never classify."""
         if self._popen.poll() is None:
             _signal(self._popen.pid, signal.SIGKILL)
-            self._popen.wait()
+        self._popen.wait()
         self._join_readers()
         self._cleanup()
 
@@ -345,20 +375,18 @@ class RelayRun:
 
 
 def _deliver_credential(cred_w: int, upstream: Live) -> None:
-    """The credential crosses the pipe once and is closed behind it: never
-    argv, never the environment, never a file the supervisor writes."""
-    try:
-        if upstream.credential is not None:
-            credential = upstream.credential
-        else:
-            assert upstream.credential_file is not None
-            credential = upstream.credential_file.read_text(encoding="utf-8").strip()
-        data = credential.encode("utf-8")
-        while data:
-            written = os.write(cred_w, data)
-            data = data[written:]
-    finally:
-        os.close(cred_w)
+    """The credential crosses the pipe once: never argv, never the child's
+    environment, never a file the supervisor writes. The caller closes the
+    write end behind it, on every path, so the child reads end-of-file."""
+    if upstream.credential is not None:
+        credential = upstream.credential
+    else:
+        assert upstream.credential_file is not None
+        credential = upstream.credential_file.read_text(encoding="utf-8").strip()
+    data = credential.encode("utf-8")
+    while data:
+        written = os.write(cred_w, data)
+        data = data[written:]
 
 
 def _signal(pid: int, sig: int) -> None:

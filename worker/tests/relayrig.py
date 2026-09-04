@@ -31,8 +31,9 @@ CREDENTIAL = "ghp_relay-test-credential-0123456789"
 @dataclass
 class Response:
     """One scripted upstream answer. ``raw`` is sent verbatim in place of
-    everything else; ``stall_after``/``close_after`` cut the body short by
-    sleeping or closing once that many body bytes are out."""
+    everything else; ``head_delay`` holds the head back that long;
+    ``stall_after``/``close_after`` cut the body short by sleeping or
+    closing once that many body bytes are out."""
 
     status: int = 200
     headers: list[tuple[str, str]] = field(default_factory=list)
@@ -43,6 +44,7 @@ class Response:
     stall_seconds: float = 0.0
     close_after: int | None = None
     raw: bytes | None = None
+    head_delay: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class FakeUpstream:
         self._lock = threading.Lock()
         self.routes: dict[str, Route] = {}
         self.requests: list[Seen] = []
+        self._created: list[UpstreamClient] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -104,6 +107,8 @@ class FakeUpstream:
     @staticmethod
     def _write(handler: BaseHTTPRequestHandler, seen: Seen, response: Response) -> None:
         out = handler.wfile
+        if response.head_delay:
+            time.sleep(response.head_delay)
         if response.raw is not None:
             out.write(response.raw)
             out.flush()
@@ -150,6 +155,8 @@ class FakeUpstream:
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+        for client in self._created:
+            client.close()
 
     @property
     def port(self) -> int:
@@ -174,9 +181,11 @@ class FakeUpstream:
         credential: str | None = CREDENTIAL,
         **kwargs,
     ) -> UpstreamClient:
-        return UpstreamClient(
+        client = UpstreamClient(
             credential, budgets, spool_dir, connection_factory=self.factory, **kwargs
         )
+        self._created.append(client)
+        return client
 
     def clients(self, budgets: Budgets, **kwargs) -> Callable[[Path], UpstreamClient]:
         """The ``ServerRig`` upstream argument: a client per spool dir."""
@@ -342,10 +351,22 @@ class ServerRig:
         return self.sink_path.read_bytes()
 
     def connect(self, timeout: float = 10.0) -> socket.socket:
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(timeout)
-        conn.connect(str(self.socket_path))
-        return conn
+        """A connection to the relay. A full listen backlog answers a
+        timed connect with EAGAIN on Linux instead of waiting, so the
+        connect is retried with a short pause until ``timeout`` is spent:
+        the acceptor's pace never decides a test."""
+        deadline = time.monotonic() + timeout
+        while True:
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(timeout)
+            try:
+                conn.connect(str(self.socket_path))
+                return conn
+            except BlockingIOError:
+                conn.close()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
 
     def call(self, raw: bytes, timeout: float = 10.0, *, half_close: bool = True) -> bytes:
         """Send ``raw``, signal end-of-input unless told not to, and read

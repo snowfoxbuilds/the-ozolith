@@ -7,6 +7,7 @@ and the per-hop redirect policy — every check against a local
 from __future__ import annotations
 
 import errno
+import http.client
 import os
 import threading
 import time
@@ -39,6 +40,7 @@ from theozolith_worker.relay.upstream import (
     SpoolHandle,
     UpstreamClient,
     UpstreamResult,
+    hop_request,
     request_size,
 )
 
@@ -189,7 +191,7 @@ def test_gate_delivers_exactly_at_the_limit_and_refuses_one_byte_over(spool_dir:
     assert (over.outcome, over.reason) == (Outcome.REFUSED_GATE, Reason.GATE_RESPONSE_BYTES)
     assert over.body is None
     assert over.status == 200
-    assert over.response_bytes <= LIMIT
+    assert over.response_bytes == LIMIT + 1  # the one overflow byte was read, so it is counted
     assert list(spool_dir.iterdir()) == []
 
 
@@ -669,3 +671,297 @@ def test_abort_mid_read_yields_aborted_and_later_sends_never_connect(spool_dir, 
     assert (later.outcome, later.reason) == (Outcome.ABORTED, Reason.ABORTED)
     assert len(upstream.requests) == 1
     assert client.aborted
+
+
+# -- aggregate response accounting on every path -----------------------------
+
+
+def _consume(result: UpstreamResult) -> None:
+    if isinstance(result.body, SpoolHandle):
+        result.body.close()
+
+
+def test_the_aggregate_decreases_by_actual_response_bytes_on_every_path(spool_dir, upstream):
+    """Every send settles the aggregate to the bytes the gate actually read,
+    never the reservation and never zero — delivered, exactly at the cap,
+    one over (the overflow byte counted too), truncated, timed out, and
+    spool-write-failed. Repeated over-limit responses each charge only their
+    own bytes."""
+    budgets = Budgets(
+        response_body_limit=LIMIT, aggregate_response_bytes=10 * LIMIT, upstream_timeout=0.5
+    )
+    upstream.route("/ok", Response(200, [], b"a" * 10))
+    upstream.route("/cap", Response(200, [], b"b" * LIMIT))
+    upstream.route("/over", Response(200, [], b"c" * (LIMIT + 1)))
+    upstream.route("/cut", Response(200, [], b"d" * 1000, close_after=200))
+    upstream.route("/stall", Response(200, [], b"e" * 1000, stall_after=100, stall_seconds=1.5))
+
+    def spool_write(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    aggregate = AggregateBudget(budgets)
+    expected = {
+        "/ok": (Outcome.DELIVERED, 10),
+        "/cap": (Outcome.DELIVERED, LIMIT),
+        "/over": (Outcome.REFUSED_GATE, LIMIT + 1),
+        "/over ": (Outcome.REFUSED_GATE, LIMIT + 1),  # repeated over-limit
+        "/cut": (Outcome.UPSTREAM_ERROR, 200),
+        "/stall": (Outcome.TIMEOUT, 100),
+    }
+    spent = 0
+    start = aggregate.response_remaining
+    for target, (outcome, received) in expected.items():
+        client = upstream.client(budgets, spool_dir, spool_threshold=16, _spool_write=os.write)
+        result = send(client, target.strip(), budgets=budgets, aggregate=aggregate)
+        assert result.outcome is outcome, target
+        assert result.response_bytes == received, target
+        spent += received
+        assert aggregate.response_remaining == start - spent, target
+        assert list(spool_dir.iterdir()) == [], target
+        _consume(result)
+
+    # A spool-write failure still charges the bytes that reached the gate.
+    upstream.route("/spool", Response(200, [], b"f" * 100_000))
+    big = Budgets(
+        response_body_limit=1024 * 1024,
+        aggregate_response_bytes=8 * 1024 * 1024,
+        upstream_timeout=5.0,
+    )
+    ag2 = AggregateBudget(big)
+    client = upstream.client(big, spool_dir, spool_threshold=64, _spool_write=spool_write)
+    result = send(client, "/spool", budgets=big, aggregate=ag2)
+    assert result.outcome is Outcome.UPSTREAM_ERROR
+    assert result.response_bytes > 0
+    assert ag2.response_remaining == big.aggregate_response_bytes - result.response_bytes
+    assert list(spool_dir.iterdir()) == []
+
+
+def test_the_aggregate_decreases_by_actual_bytes_when_a_read_is_aborted(spool_dir, upstream):
+    budgets = Budgets(
+        response_body_limit=LIMIT, aggregate_response_bytes=10 * LIMIT, upstream_timeout=30.0
+    )
+    upstream.route("/slow", Response(200, [], b"g" * 800, stall_after=200, stall_seconds=3.0))
+    aggregate = AggregateBudget(budgets)
+    client = upstream.client(budgets, spool_dir)
+    results: list[UpstreamResult] = []
+    thread = threading.Thread(
+        target=lambda: results.append(send(client, "/slow", budgets=budgets, aggregate=aggregate))
+    )
+    thread.start()
+    deadline = time.monotonic() + 3
+    while not upstream.requests and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    client.abort()
+    thread.join(5)
+    assert not thread.is_alive()
+    result = results[0]
+    assert (result.outcome, result.reason) == (Outcome.ABORTED, Reason.ABORTED)
+    assert result.response_bytes >= 200
+    assert aggregate.response_remaining == budgets.aggregate_response_bytes - result.response_bytes
+    assert list(spool_dir.iterdir()) == []
+
+
+# -- the single absolute deadline --------------------------------------------
+
+
+def test_a_head_then_body_delay_each_under_the_timeout_but_over_the_total(spool_dir, upstream):
+    """One absolute deadline spans the whole exchange: a head delay and a
+    body stall each shorter than the timeout, but longer than it together,
+    time the send out — a per-phase timeout would let both through."""
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.6)
+    upstream.route(
+        "/split",
+        Response(200, [], b"h" * 400, head_delay=0.4, stall_after=100, stall_seconds=0.5),
+    )
+    client = upstream.client(budgets, spool_dir, spool_threshold=16)
+    started = time.monotonic()
+    result = send(client, "/split", budgets=budgets)
+    elapsed = time.monotonic() - started
+    assert (result.outcome, result.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+    assert result.body is None
+    assert 0.6 <= elapsed < 1.4
+    assert list(spool_dir.iterdir()) == []
+
+
+# -- abort during connect ----------------------------------------------------
+
+
+def test_abort_during_connect_yields_aborted_without_waiting_for_the_timeout(spool_dir):
+    """A connect to an unreachable origin is interrupted by abort at once,
+    not left to the upstream timeout — the wake reaches the pending
+    connect, not only an established read."""
+
+    def blackhole(host, port, timeout):
+        # 192.0.2.0/24 is TEST-NET-1 (RFC 5737): routable nowhere, so the
+        # non-blocking connect stays in progress until it is woken.
+        return http.client.HTTPConnection("192.0.2.1", 80, timeout=timeout)
+
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=30.0)
+    client = UpstreamClient(CREDENTIAL, budgets, spool_dir, connection_factory=blackhole)
+    results: list[UpstreamResult] = []
+    thread = threading.Thread(target=lambda: results.append(send(client, "/zen", budgets=budgets)))
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.3)
+    client.abort()
+    thread.join(5)
+    assert not thread.is_alive()
+    elapsed = time.monotonic() - started
+    assert (results[0].outcome, results[0].reason) == (Outcome.ABORTED, Reason.ABORTED)
+    assert elapsed < 5
+    assert send(client, "/zen", budgets=budgets).outcome is Outcome.ABORTED
+    client.close()
+
+
+def test_abort_during_a_detached_close_delimited_body_read(spool_dir, upstream):
+    """A ``Connection: close`` response hands http.client's socket to the
+    response object, clearing ``HTTPConnection.sock``; abort still reaches
+    the read because the client kept the socket itself."""
+    # The fake always sends ``Connection: close``, so http.client detaches
+    # the socket into the response object and clears ``HTTPConnection.sock``;
+    # the body then stalls, and abort must still reach the detached read.
+    upstream.route(
+        "/detached",
+        Response(200, [], b"z" * 800, stall_after=200, stall_seconds=3.0),
+    )
+    budgets = Budgets(response_body_limit=1024 * 1024, upstream_timeout=30.0)
+    client = upstream.client(budgets, spool_dir)
+    results: list[UpstreamResult] = []
+    thread = threading.Thread(
+        target=lambda: results.append(send(client, "/detached", budgets=budgets))
+    )
+    thread.start()
+    deadline = time.monotonic() + 3
+    while not upstream.requests and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    client.abort()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert results[0].outcome is Outcome.ABORTED
+
+
+# -- per-hop request-byte budgets --------------------------------------------
+
+
+def _hop_size(target: str) -> int:
+    return request_size(hop_request("GET", target))
+
+
+def test_a_redirect_with_no_request_byte_budget_is_refused_before_the_hop(spool_dir, upstream):
+    upstream.route("/start", Response(302, [("Location", to("/zen"))]))
+    upstream.route("/zen", Response(200, [], b"unreached"))
+    budgets = Budgets(response_body_limit=LIMIT, aggregate_request_bytes=0, upstream_timeout=5.0)
+    aggregate = AggregateBudget(budgets)
+    result = send(
+        upstream.client(budgets, spool_dir), "/start", budgets=budgets, aggregate=aggregate
+    )
+    assert (result.outcome, result.reason, result.status) == (
+        Outcome.REFUSED_REDIRECT,
+        Reason.REDIRECT_BUDGET,
+        302,
+    )
+    assert result.body is None
+    entry = result.redirects[0]
+    assert (entry.hop, entry.decision, entry.reason) == (
+        1,
+        RedirectDecision.REFUSED,
+        Reason.REDIRECT_BUDGET,
+    )
+    assert upstream.targets() == ["/start"]
+    assert aggregate.request_remaining == 0
+
+
+def test_a_redirect_with_exactly_the_hop_budget_is_followed(spool_dir, upstream):
+    upstream.route("/start", Response(302, [("Location", to("/zen"))]))
+    upstream.route("/zen", Response(200, [], b"ok"))
+    hop = _hop_size("/zen")
+    budgets = Budgets(response_body_limit=LIMIT, aggregate_request_bytes=hop, upstream_timeout=5.0)
+    aggregate = AggregateBudget(budgets)
+    result = send(
+        upstream.client(budgets, spool_dir), "/start", budgets=budgets, aggregate=aggregate
+    )
+    assert result.outcome is Outcome.DELIVERED
+    assert aggregate.request_remaining == 0
+    assert len(result.redirects) == 1 and result.redirects[0].decision is RedirectDecision.FOLLOWED
+    _consume(result)
+
+
+def test_every_followed_hop_is_charged_exactly_once(spool_dir, upstream):
+    chain(upstream, 3, Response(200, [], b"done"))
+    hops = _hop_size("/c1") + _hop_size("/c2") + _hop_size("/c3")
+    budgets = Budgets(response_body_limit=LIMIT, aggregate_request_bytes=hops, upstream_timeout=5.0)
+    aggregate = AggregateBudget(budgets)
+    result = send(upstream.client(budgets, spool_dir), "/c0", budgets=budgets, aggregate=aggregate)
+    assert result.outcome is Outcome.DELIVERED
+    assert len(result.redirects) == 3
+    assert aggregate.request_remaining == 0
+    _consume(result)
+
+
+def test_a_hop_refused_by_the_audit_step_refunds_its_request_charge(spool_dir, upstream):
+    chain(upstream, 3, Response(200, [], b"unreached"))
+
+    def authorize(hop, target):
+        return Reason.AUDIT_UNREPRESENTABLE if hop == 2 else None
+
+    budgets = Budgets(
+        response_body_limit=LIMIT,
+        aggregate_request_bytes=_hop_size("/c1") + _hop_size("/c2") + _hop_size("/c3"),
+        upstream_timeout=5.0,
+    )
+    aggregate = AggregateBudget(budgets)
+    result = send(
+        upstream.client(budgets, spool_dir),
+        "/c0",
+        budgets=budgets,
+        aggregate=aggregate,
+        authorize_hop=authorize,
+    )
+    assert (result.outcome, result.reason) == (
+        Outcome.REFUSED_REDIRECT,
+        Reason.AUDIT_UNREPRESENTABLE,
+    )
+    # hop 1 charged and followed; hop 2 charged then refunded when refused.
+    assert aggregate.request_remaining == budgets.aggregate_request_bytes - _hop_size("/c1")
+
+
+def test_concurrent_redirect_chains_charge_their_hops_atomically(spool_dir, upstream):
+    """Conservation under contention: whatever the interleaving, the bytes
+    charged (one per followed hop) plus what remains equal the budget, so no
+    hop is charged twice and none is lost."""
+    chain(upstream, 3, Response(200, [], b"x" * 10, stall_after=5, stall_seconds=0.3))
+    per_hop = _hop_size("/c1")
+    assert per_hop == _hop_size("/c2") == _hop_size("/c3")
+    budget = 7 * per_hop  # four 3-hop chains want twelve; only seven fit
+    budgets = Budgets(
+        response_body_limit=LIMIT, aggregate_request_bytes=budget, upstream_timeout=5.0
+    )
+    aggregate = AggregateBudget(budgets)
+    client = upstream.client(budgets, spool_dir)
+    results: list[UpstreamResult] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(4)
+
+    def worker():
+        barrier.wait()
+        result = send(client, "/c0", budgets=budgets, aggregate=aggregate)
+        with lock:
+            results.append(result)
+        _consume(result)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    followed = sum(
+        1
+        for result in results
+        for entry in result.redirects
+        if entry.decision is RedirectDecision.FOLLOWED
+    )
+    assert aggregate.request_remaining >= 0
+    assert followed * per_hop + aggregate.request_remaining == budget
+    assert aggregate.request_remaining < per_hop

@@ -402,8 +402,12 @@ def test_gate_and_redirect_refusals_answer_502_after_their_completion(rigs, upst
 
 
 def test_every_accepted_connection_costs_one_unit_at_accept(rigs, upstream):
+    """Each accepted connection spends one unit whatever it carries — no
+    request line, an incomplete one, an idle head, or a served request. The
+    slot count is generous so no connection here is busy-refused; the
+    busy-refusal partition is pinned by its own deterministic test."""
     budgets = Budgets(
-        connection_budget=12, open_connections=2, head_read_seconds=0.4, body_read_seconds=0.4
+        connection_budget=12, open_connections=4, head_read_seconds=0.4, body_read_seconds=0.4
     )
     rig = rigs(**live(upstream, budgets))
     empty = rig.connect()
@@ -414,19 +418,11 @@ def test_every_accepted_connection_costs_one_unit_at_accept(rigs, upstream):
     idle = rig.connect()
     assert read_all(idle) == b""  # closed by the relay at the head limit
     idle.close()
-    holders = [rig.connect() for _ in range(2)]
-    busy = rig.connect()
-    reply = parse_reply(read_all(busy))
-    assert (reply.status, reply.reason) == (429, "budget-concurrency")
-    busy.close()
-    for holder in holders:
-        holder.close()
-    time.sleep(0.1)
     assert rig.request(get("/zen")).status == 200
     rig.stop()
     record = terminal(rig)
     assert record["reason"] == "agent-exit"
-    assert (record["accepted"], record["busy_refused"], record["no_request"]) == (7, 1, 5)
+    assert (record["accepted"], record["busy_refused"], record["no_request"]) == (4, 0, 3)
     assert (record["requests_seen"], record["requests_charged"]) == (1, 1)
     assert record["connection_budget_exhausted"] is False
     assert (
@@ -461,8 +457,14 @@ def test_the_accept_that_spends_the_last_unit_is_served_then_the_socket_is_gone(
 
 def test_request_lines_past_the_request_budget_are_seen_charged_and_refused(rigs, upstream):
     """2,001 parsed request lines within 4,000 accepted connections: the
-    2,001st is refused with the stable message and recorded, the counters
-    stay exact and separate, and exhaustion ends acceptance."""
+    2,001st is refused with the stable message and recorded, and exhaustion
+    ends acceptance at exactly the connection budget. The request counters
+    are exact; the 1,999 request-less connections partition into ``no_request``
+    and ``busy_refused`` — a request-less connection accepted while every
+    open-connection slot is busy is legitimately busy-refused rather than read
+    empty, and which it is depends on host scheduling — so this asserts their
+    sum and the whole partition, and a separate test pins busy refusal
+    deterministically."""
     budgets = Budgets(head_read_seconds=1.0)
     rig = rigs(
         **live(upstream, budgets),
@@ -486,7 +488,12 @@ def test_request_lines_past_the_request_budget_are_seen_charged_and_refused(rigs
     assert record["accepted"] == budgets.connection_budget == 4000
     assert record["requests_seen"] == budgets.request_budget + 1 == 2001
     assert record["requests_charged"] == budgets.request_budget == 2000
-    assert record["no_request"] == 1999
+    request_less = budgets.connection_budget - budgets.request_budget - 1
+    assert record["no_request"] + record["busy_refused"] == request_less == 1999
+    assert (
+        record["accepted"]
+        == record["requests_seen"] + record["no_request"] + record["busy_refused"]
+    )
     assert record["request_budget_exhausted"] is True
     assert record["connection_budget_exhausted"] is True
     assert record["audit_budget_exhausted"] is False
@@ -969,3 +976,76 @@ def test_the_reader_contract_matches_the_parser(rigs):
     rig = rigs(**none())
     assert rig.request(get("/zen")).reason == "no-upstream"
     rig.stop()
+
+
+# -- agent exit against the acceptor (item 5) ------------------------------
+
+
+def test_agent_exit_wakes_a_blocked_acceptor_without_waiting_for_the_poll(
+    rigs, upstream, monkeypatch
+):
+    """With the poll interval stretched far past the test, only the wake
+    mechanism can end acceptance promptly — a poll-only acceptor would sit
+    in select for the whole interval."""
+    monkeypatch.setattr("theozolith_worker.relay.server.ACCEPT_POLL_SECONDS", 30.0)
+    rig = rigs(**live(upstream))
+    started = time.monotonic()
+    assert rig.stop() == 0
+    assert time.monotonic() - started < 5  # the 30 s poll never elapsed
+    assert exit_event(rig)["reason"] == "agent-exit"
+    record = terminal(rig)
+    assert (record["accepted"], record["requests_seen"], record["no_request"]) == (0, 0, 0)
+
+
+def test_agent_exit_winning_a_simultaneously_ready_listener_serves_nothing(rigs, upstream):
+    """The listener is ready and agent exit arrives at the same instant: the
+    exit wins, the pending connection is never accepted or served, and the
+    listener is closed and unlinked."""
+    box: list[ServerRig] = []
+
+    def listener_ready() -> None:
+        if box:
+            box[0].agent_exit.set()
+
+    rig = rigs(**live(upstream), hooks=SimpleNamespace(listener_ready=listener_ready))
+    box.append(rig)
+    conn = rig.connect()
+    conn.sendall(get("/zen"))
+    assert read_all(conn) == b""  # reset unread, credentialed work never begins
+    conn.close()
+    assert rig.join() == 0
+    assert exit_event(rig)["reason"] == "agent-exit"
+    record = terminal(rig)
+    assert (record["accepted"], record["requests_seen"], record["no_request"]) == (0, 0, 0)
+    assert upstream.targets() == []
+    assert rig.records().counts_by_kind.get("intent", 0) == 0
+    assert not rig.socket_path.exists()
+
+
+def test_connection_budget_exhaustion_refuses_the_over_cap_connection_deterministically(
+    rigs, upstream
+):
+    """A one-slot relay with a two-connection budget: the first connection is
+    held mid-upstream while the second is accepted and busy-refused, spending
+    the last unit; the held one is served, then acceptance is over."""
+    gate = threading.Event()
+    hooks = SimpleNamespace(during_upstream=lambda seq: gate.wait(10))
+    budgets = Budgets(connection_budget=2, open_connections=1, upstream_timeout=5.0)
+    rig = rigs(**live(upstream, budgets), hooks=hooks)
+    first: dict[str, bytes] = {}
+    held = threading.Thread(target=lambda: first.__setitem__("r", rig.call(get("/zen"))))
+    held.start()
+    deadline = time.monotonic() + 5
+    while not upstream.requests and time.monotonic() < deadline:
+        time.sleep(0.01)
+    busy = parse_reply(read_all(rig.connect()))
+    assert (busy.status, busy.reason) == (429, "budget-concurrency")
+    gate.set()
+    held.join(20)
+    assert parse_reply(first["r"]).status == 200
+    assert rig.join() == 0
+    record = terminal(rig)
+    assert record["reason"] == "connection-budget-exhausted"
+    assert (record["accepted"], record["busy_refused"], record["requests_seen"]) == (2, 1, 1)
+    assert record["connection_budget_exhausted"] is True
+    assert not rig.socket_path.exists()

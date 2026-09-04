@@ -8,7 +8,9 @@ finite connection budget charged at accept. Per request the order is fixed —
 parse, classify, reserve budgets and audit capacity, append and sync the
 intent record — and only after that write returns does anything reach the
 credential-holding upstream client. Acceptance ends exactly once, on agent
-exit or connection-budget exhaustion, and one shutdown sequence follows.
+exit or connection-budget exhaustion — the first of the two to claim it
+under the state lock, agent exit waking the acceptor through a pipe rather
+than a poll — and one shutdown sequence follows.
 """
 
 from __future__ import annotations
@@ -296,6 +298,8 @@ class Hooks(Protocol):
 
     def after_upstream_complete(self, seq: int) -> None: ...
 
+    def listener_ready(self) -> None: ...
+
 
 def _refusal_target(refusal: IngressRefusal) -> Target:
     if refusal.target is None:
@@ -353,8 +357,13 @@ class _Relay:
         self.queue: list[socket.socket] = []
         self.outstanding = 0
         self.stopping = False
+        # Set the instant agent exit claims acceptance, read without the lock
+        # by a worker about to serve a connection it popped just then.
+        self.exiting = threading.Event()
         self.acceptance_over = threading.Event()
+        # The arbitration variable: the first claim under state_lock wins.
         self.accept_reason: str | None = None
+        self._wake_r, self._wake_w = os.pipe()
         self.report_lock = threading.Lock()
 
     # -- reporting -------------------------------------------------------
@@ -378,38 +387,83 @@ class _Relay:
 
     # -- acceptance ------------------------------------------------------
 
+    def _claim_locked(self, reason: str) -> None:
+        """Under state_lock: end acceptance for ``reason`` unless the other
+        reason already did. An agent-exit claim also stops every worker
+        from starting on a connection it has not read yet."""
+        if self.accept_reason is None:
+            self.accept_reason = reason
+            if reason == REASON_AGENT_EXIT:
+                self.exiting.set()
+
+    def _watch_agent_exit(self) -> None:
+        """Claim agent exit the moment the event is set — before the
+        acceptor could accept another connection — abort every upstream
+        exchange, then wake the acceptor out of its select."""
+        self.agent_exit.wait()
+        with self.state_lock:
+            self._claim_locked(REASON_AGENT_EXIT)
+        if self.upstream is not None:
+            self.upstream.abort()
+        os.write(self._wake_w, b"x")
+
     def _accept_loop(self) -> None:
         listener = self.listener
         listener.setblocking(False)
         selector = selectors.DefaultSelector()
         selector.register(listener, selectors.EVENT_READ)
-        reason: str | None = None
-        while reason is None:
-            if self.agent_exit.is_set():
-                reason = REASON_AGENT_EXIT
+        selector.register(self._wake_r, selectors.EVENT_READ)
+        while True:
+            ready = selector.select(timeout=ACCEPT_POLL_SECONDS)  # the poll is a backstop
+            listener_ready = any(key.fileobj is listener for key, _ in ready)
+            if listener_ready:
+                self._hook("listener_ready")
+            reason = self._accept_one(listener, listener_ready)
+            if reason is not None:
                 break
-            if not selector.select(timeout=ACCEPT_POLL_SECONDS):
-                continue
-            try:
-                conn, _ = listener.accept()
-            except OSError:
-                continue
-            with self.state_lock:
-                self.accepted += 1
-                exhausted = self.accepted >= self.budgets.connection_budget
-            if self.open_slots.acquire(blocking=False):
-                with self.work:
-                    self.queue.append(conn)
-                    self.outstanding += 1
-                    self.work.notify()
-            else:
-                self._refuse_busy(conn)
-            if exhausted:
-                with self.state_lock:
-                    self.connection_budget_exhausted = True
-                reason = REASON_CONNECTION_BUDGET
         selector.close()
         self._end_acceptance(reason)
+
+    def _accept_one(self, listener: socket.socket, listener_ready: bool) -> str | None:
+        """One arbitration step: agent exit, once set, wins before any
+        accept; otherwise a ready listener's connection is accepted and
+        charged, and the one that spends the last unit claims exhaustion —
+        it was accepted, so it is served. The accept itself is outside the
+        state lock so a worker is never blocked from freeing its slot while
+        the acceptor holds it."""
+        with self.state_lock:
+            if self.agent_exit.is_set():
+                self._claim_locked(REASON_AGENT_EXIT)
+            reason = self.accept_reason
+        if reason is not None:
+            return reason
+        if not listener_ready:
+            return None
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return None
+        with self.state_lock:
+            if self.accept_reason == REASON_AGENT_EXIT:
+                # Agent exit claimed acceptance between the check and the
+                # accept: this connection is abandoned unread, never counted
+                # or served, like one still in the backlog at listener close.
+                with contextlib.suppress(OSError):
+                    conn.close()
+                return self.accept_reason
+            self.accepted += 1
+            if self.accepted >= self.budgets.connection_budget:
+                self.connection_budget_exhausted = True
+                self._claim_locked(REASON_CONNECTION_BUDGET)
+            reason = self.accept_reason
+        if self.open_slots.acquire(blocking=False):
+            with self.work:
+                self.queue.append(conn)
+                self.outstanding += 1
+                self.work.notify()
+        else:
+            self._refuse_busy(conn)
+        return reason
 
     def _refuse_busy(self, conn: socket.socket) -> None:
         try:
@@ -434,7 +488,7 @@ class _Relay:
         if isinstance(path, str) and path:
             with contextlib.suppress(OSError):
                 os.unlink(path)
-        self.accept_reason = reason
+        assert self.accept_reason == reason
         self.acceptance_over.set()
 
     # -- workers ---------------------------------------------------------
@@ -468,6 +522,12 @@ class _Relay:
             self.work.notify_all()
 
     def _handle(self, conn: socket.socket) -> None:
+        if self.exiting.is_set():
+            # Popped after agent exit claimed acceptance: closed unread, as
+            # if it had still been in the queue.
+            with self.state_lock:
+                self.no_request += 1
+            return
         reader = _HeadBodyReader(conn, self.budgets)
         seen = read_request(reader, self.budgets)
         if isinstance(seen, NoRequestLine):
@@ -555,30 +615,32 @@ class _Relay:
             aggregate=self.aggregate,
             observe=observe,
         )
-        self._hook("after_upstream_complete", seq)
-        completion = CompletionRecord(
-            seq,
-            self.sink.now(),
-            result.outcome,
-            result.status,
-            result.request_bytes,
-            result.response_bytes,
-            result.redirects,
-        )
-        with self.state_lock:
-            try:
-                self.sink.write_completion(completion, reservation)
-                completed = True
-            except AuditUnavailable as exc:
-                self._report_audit_failure(exc)
-                completed = False
-            finally:
-                self.sink.release(reservation)
-        if not completed:
+        try:
+            self._hook("after_upstream_complete", seq)
+            completion = CompletionRecord(
+                seq,
+                self.sink.now(),
+                result.outcome,
+                result.status,
+                result.request_bytes,
+                result.response_bytes,
+                result.redirects,
+            )
+            with self.state_lock:
+                try:
+                    self.sink.write_completion(completion, reservation)
+                    completed = True
+                except AuditUnavailable as exc:
+                    self._report_audit_failure(exc)
+                    completed = False
+                finally:
+                    self.sink.release(reservation)
+            if not completed:
+                self._answer(conn, 503, Reason.AUDIT_UNAVAILABLE)
+                return
+            self._deliver(conn, method, result)
+        finally:
             _discard(result.body)
-            self._answer(conn, 503, Reason.AUDIT_UNAVAILABLE)
-            return
-        self._deliver(conn, method, result)
 
     def _reserve_and_record(
         self, seq: int, decision: Decision, reason: Reason | None, target: Target
@@ -737,6 +799,10 @@ class _Relay:
 
     def run(self) -> int:
         self._install_sigterm()
+        watcher = threading.Thread(
+            target=self._watch_agent_exit, daemon=True, name="relay-agent-exit"
+        )
+        watcher.start()
         workers = [
             threading.Thread(target=self._worker, daemon=True, name=f"relay-worker-{index}")
             for index in range(self.budgets.concurrency)
@@ -756,7 +822,15 @@ class _Relay:
         self._write_terminal(reason)
         if self.upstream is not None:
             discard_spool(self.upstream.spool_dir)
+            self.upstream.close()
         self._report({"event": "exit", "reason": reason, "audit": self.sink.state})
+        # The run is over whichever way acceptance ended; the watcher is
+        # released before its pipe goes, so its wake byte never lands on a
+        # reused descriptor.
+        self.agent_exit.set()
+        watcher.join()
+        os.close(self._wake_r)
+        os.close(self._wake_w)
         return 0
 
 

@@ -12,19 +12,22 @@ import signal
 import socket
 import stat
 import time
+import traceback
 from pathlib import Path
 
 import pytest
-from theozolith_worker.relay import audit
+from theozolith_worker.relay import audit, supervisor
 from theozolith_worker.relay.__main__ import parse_args
 from theozolith_worker.relay.audit import SINK_NAME, SPOOL_DIR, parse_records
 from theozolith_worker.relay.reasons import Budgets
 from theozolith_worker.relay.supervisor import (
     CONTAINER_SOCKET_PATH,
+    INHERITED_ENVIRONMENT,
     SOCKET_NAME,
     RelayExit,
     RelayRun,
     RelayStartError,
+    child_environment,
 )
 from theozolith_worker.relay.upstream import Live, NoUpstream
 
@@ -373,6 +376,159 @@ def test_stderr_of_the_child_reaches_log(relays, dirs):
     # Nothing is logged in a healthy run; the stderr pump simply ends.
     run.stop()
     assert all(isinstance(line, str) for line in logs)
+
+
+# -- the child's environment -------------------------------------------------
+
+PLANTED = {
+    "GH_TOKEN": "ghp_planted-driver-token-0000",
+    "GITHUB_TOKEN": "ghp_planted-github-token-1111",
+    "THEOZOLITH_RELAY_TOKEN_FILE": "/run/secrets/planted-relay-token",
+    "ANTHROPIC_API_KEY": "sk-ant-planted-provider-key-2222",
+    "OPENAI_API_KEY_FILE": "/run/secrets/planted-openai-key",
+    "AWS_SECRET_ACCESS_KEY": "planted-aws-not-a-real-secret-3333",
+    "HOME": "/home/planted-operator",
+    "TMPDIR": "/var/tmp/planted-operator",
+}
+
+
+def test_child_environment_keeps_only_the_interpreter_allowlist():
+    parent = {"PATH": "/usr/bin:/bin", "PYTHONPATH": "/src", "LANG": "en_US.UTF-8", **PLANTED}
+    assert child_environment(parent) == {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": "/src",
+        "LANG": "en_US.UTF-8",
+    }
+    assert child_environment({}) == {}
+    assert set(child_environment()) <= set(INHERITED_ENVIRONMENT)
+
+
+def test_child_environ_holds_no_planted_secret_or_secret_path(relays, dirs, monkeypatch):
+    if not Path("/proc/self/environ").exists():
+        pytest.skip("/proc is unavailable")
+    for name, value in PLANTED.items():
+        monkeypatch.setenv(name, value)
+    run = start(relays, dirs, upstream=Live(credential=CREDENTIAL))
+    environ = proc_bytes(run.pid, "environ")
+    names = [entry.split(b"=", 1)[0].decode() for entry in environ.split(b"\0") if entry]
+    assert names and set(names) <= set(INHERITED_ENVIRONMENT), names
+    for name, value in PLANTED.items():
+        assert name.encode() not in environ
+        assert value.encode() not in environ
+    assert CREDENTIAL.encode() not in environ
+    # The allowlist is enough to launch the interpreter and import the package.
+    assert b'"reason":"admin-read"' in call(run.socket_path, ADMIN_READ)
+    assert run.stop().termination == "clean"
+
+
+# -- start: failure after the spawn --------------------------------------------
+
+
+def child_pids(run_id: str) -> list[int]:
+    """Every live process whose argv names this run id."""
+    needle = f"--run-id\0{run_id}\0".encode()
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle in cmdline:
+            found.append(int(entry.name))
+    return found
+
+
+def open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def start_failing(dirs, upstream, run_id: str = "r1") -> None:
+    job, jobs = dirs
+    RelayRun.start(
+        job=job,
+        jobs_dir=jobs,
+        run_id=run_id,
+        upstream=upstream,
+        log=lambda line: None,
+        budgets=SMALL,
+    )
+
+
+def assert_nothing_remains(dirs, run_id: str = "r1") -> None:
+    """No child, no socket, an empty spool, the sink untouched."""
+    job, jobs = dirs
+    wait_for(lambda: not child_pids(run_id))
+    assert not os.path.lexists(job / SOCKET_NAME)
+    relay_dir = jobs / audit.RELAY_PARENT / run_id
+    assert list((relay_dir / SPOOL_DIR).iterdir()) == []
+    assert (relay_dir / SINK_NAME).exists()
+
+
+def rendered_chain(exc: BaseException | None) -> str:
+    """The exception and what a printer follows it with — its cause, or its
+    context unless suppressed — as messages; the frames are the test's own."""
+    out: list[str] = []
+    while exc is not None:
+        out += traceback.format_exception_only(exc)
+        if exc.__cause__ is not None:
+            exc = exc.__cause__
+        else:
+            exc = None if exc.__suppress_context__ else exc.__context__
+    return "".join(out)
+
+
+def assert_redacted(info: pytest.ExceptionInfo, *secrets: str) -> None:
+    rendered = rendered_chain(info.value)
+    assert rendered == f"{RelayStartError.__module__}.RelayStartError: {info.value}\n"
+    for secret in secrets:
+        assert secret not in rendered, secret
+
+
+def test_an_invalid_utf8_credential_file_fails_redacted_and_leaves_nothing(dirs, tmp_path):
+    token = tmp_path / "secret-token-path"
+    token.write_bytes(b"\xff\xfe not utf-8")
+    fds = open_fds()
+    with pytest.raises(RelayStartError) as info:
+        start_failing(dirs, Live(credential_file=token))
+    assert str(info.value) == "relay credential could not be delivered"
+    assert_redacted(info, str(token), "xff", "not utf-8")
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+def test_an_unencodable_credential_fails_redacted_and_leaves_nothing(dirs):
+    fds = open_fds()
+    with pytest.raises(RelayStartError) as info:
+        start_failing(dirs, Live(credential="\udcff"))
+    assert str(info.value) == "relay credential could not be delivered"
+    assert_redacted(info, "udcff", "surrogate")
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+def test_a_missing_credential_file_fails_without_naming_the_path(dirs, tmp_path):
+    token = tmp_path / "absent-secret-path"
+    fds = open_fds()
+    with pytest.raises(RelayStartError) as info:
+        start_failing(dirs, Live(credential_file=token))
+    assert str(info.value) == "relay credential could not be delivered"
+    assert_redacted(info, str(token), "absent-secret-path")
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
+
+
+def test_an_interruption_during_delivery_cleans_up_and_re_raises(dirs, monkeypatch):
+    def interrupt(cred_w: int, upstream: Live) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(supervisor, "_deliver_credential", interrupt)
+    fds = open_fds()
+    with pytest.raises(KeyboardInterrupt):
+        start_failing(dirs, Live(credential=CREDENTIAL))
+    assert_nothing_remains(dirs)
+    assert open_fds() == fds
 
 
 # -- the child entry's argv ---------------------------------------------------

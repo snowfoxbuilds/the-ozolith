@@ -8,14 +8,23 @@ durable. No upstream byte is returned until the whole response has been
 read within the per-request limit, into memory or an unlinked spool file,
 and every redirect answer is a fresh policy decision against the origin pin
 made before the hop's request exists.
+
+One absolute deadline per send covers the connect, the request, the
+response head, every body read, and every followed hop; every byte the
+gate reads is counted against the aggregate whether the send ends
+delivered, refused, timed out, truncated, or aborted; and ``abort`` reaches
+a connect in progress as well as a read.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import os
+import selectors
 import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -91,7 +100,10 @@ Upstream = Live | NoUpstream
 
 class AggregateBudget:
     """The per-Run aggregate byte budgets, atomic under their own lock so
-    concurrent requests near a limit cannot overshoot it."""
+    concurrent requests near a limit cannot overshoot it. Response bytes
+    are reserved per send at the per-request limit and settled to the
+    actual count read; request bytes are charged per request sent, the
+    original by the server and every followed hop by the chain."""
 
     def __init__(self, budgets: Budgets):
         self._lock = threading.Lock()
@@ -115,6 +127,11 @@ class AggregateBudget:
             self._request_remaining -= n
             return True
 
+    def refund_request(self, n: int) -> None:
+        """A charged hop whose request never came to exist."""
+        with self._lock:
+            self._request_remaining += n
+
     def reserve_response(self, n: int) -> bool:
         with self._lock:
             if n > self._response_remaining:
@@ -122,9 +139,13 @@ class AggregateBudget:
             self._response_remaining -= n
             return True
 
-    def release_response(self, n: int) -> None:
+    def settle_response(self, reserved: int, consumed: int) -> None:
+        """Keep what was actually read and return the rest of the
+        reservation. ``consumed`` can exceed ``reserved`` by the one byte
+        the gate reads to see a per-request overflow; that byte was
+        received, so it is charged too."""
         with self._lock:
-            self._response_remaining += n
+            self._response_remaining += reserved - consumed
 
 
 class SpoolHandle:
@@ -156,6 +177,10 @@ class SpoolHandle:
 
 @dataclass(frozen=True)
 class UpstreamResult:
+    """``request_bytes`` is every request this send charged — the original
+    and each followed hop; ``response_bytes`` is every body byte the gate
+    read, the same count the aggregate keeps, whatever the outcome."""
+
     outcome: Outcome
     status: int | None
     headers: tuple[tuple[str, str], ...]
@@ -177,7 +202,7 @@ class _Refused(Exception):
 
 class _Body:
     """The gate's accumulator: memory up to the spool threshold, then an
-    unlinked spool file under the spool directory, counting actual bytes."""
+    unlinked spool file under the spool directory."""
 
     def __init__(self, spool_dir: Path, threshold: int, spool_write):
         self._spool_dir = spool_dir
@@ -228,6 +253,13 @@ def request_size(request: UpstreamRequest) -> int:
     line = f"{request.method} {request.request_target} HTTP/1.1\r\n"
     headers = "".join(f"{name}: {value}\r\n" for name, value in request.headers)
     return len(line.encode("ascii")) + len(headers.encode("latin-1")) + 2 + len(request.body)
+
+
+def hop_request(method: str, request_target: str) -> UpstreamRequest:
+    """The request a followed hop sends — the method preserved, the relay's
+    fixed headers, no body — built as one value so the bytes charged for
+    the hop are the bytes put on the wire."""
+    return UpstreamRequest(method, request_target, _HOP_HEADERS, b"")
 
 
 def discard_spool(spool_dir: Path) -> None:
@@ -283,7 +315,15 @@ def _pinned_origin(parts: uri.UriParts) -> bool:
 class UpstreamClient:
     """Sends validated requests to the pinned origin with the credential
     attached, gates every response before a byte of it is handed back, and
-    follows a redirect only per hop through ``authorize_hop``."""
+    follows a redirect only per hop through ``authorize_hop``.
+
+    The client opens every socket itself so that the send's deadline and
+    ``abort`` govern the connect too: a non-blocking connect awaited on a
+    selector together with the wake pipe ``abort`` writes to, then the TLS
+    handshake on the wrapped socket, both armed with what remains of the
+    deadline. The socket is kept here for the life of the exchange because
+    ``http.client`` forgets it once a ``Connection: close`` response owns
+    it, and every later read must still be armed and abortable."""
 
     def __init__(
         self,
@@ -295,6 +335,7 @@ class UpstreamClient:
         clock: Callable[[], float] = time.monotonic,
         spool_threshold: int = MEMORY_SPOOL_THRESHOLD,
         _spool_write=os.write,
+        _socket=socket.socket,
     ):
         self._credential = credential
         self._budgets = budgets
@@ -303,46 +344,72 @@ class UpstreamClient:
         self._clock = clock
         self._spool_threshold = spool_threshold
         self._spool_write = _spool_write
+        self._socket = _socket
         self._lock = threading.Lock()
-        # Each in-flight connection's socket, held here because getresponse()
-        # forgets it once the response owns it — and abort() must reach it.
+        self._tls: ssl.SSLContext | None = None
         self._in_flight: dict[http.client.HTTPConnection, socket.socket | None] = {}
         self._aborted = False
+        self._wake_r, self._wake_w = os.pipe()
+        self._closed = False
 
-    @staticmethod
-    def _default_factory(host: str, port: int, timeout: float) -> http.client.HTTPConnection:
-        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    def _default_factory(self, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=self._tls_context())
+
+    def _tls_context(self) -> ssl.SSLContext:
+        with self._lock:
+            if self._tls is None:
+                self._tls = ssl.create_default_context()
+            return self._tls
 
     @property
     def aborted(self) -> bool:
         return self._aborted
 
     def abort(self) -> None:
-        """Agent exit: every in-flight upstream connection is shut down so
-        its worker's read returns, and every send from now on — in flight
-        or not yet started — ends ``aborted`` without touching the wire."""
+        """Agent exit: every send from now on — in flight or not yet
+        started — ends ``aborted`` without touching the wire. A connect in
+        progress wakes through the pipe; a blocked handshake or read wakes
+        because its socket is shut down."""
         with self._lock:
+            if self._aborted:
+                return
             self._aborted = True
             sockets = list(self._in_flight.values())
+            wake = not self._closed
+        if wake:
+            os.write(self._wake_w, b"x")
         for sock in sockets:
             _shutdown_socket(sock)
 
-    def _open(self, deadline: float) -> http.client.HTTPConnection:
+    def close(self) -> None:
+        """Release the wake pipe once no send can start again."""
         with self._lock:
-            if self._aborted:
-                raise _Refused(Outcome.ABORTED, Reason.ABORTED)
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
-            connection = self._factory(HOST, PORT, remaining)
-            self._in_flight[connection] = None
-        return connection
+            if self._closed:
+                return
+            self._closed = True
+        os.close(self._wake_r)
+        os.close(self._wake_w)
 
-    def _connected(self, connection: http.client.HTTPConnection) -> None:
+    def _remaining(self, deadline: float) -> float:
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        return remaining
+
+    def _arm(self, sock: socket.socket, deadline: float) -> None:
+        """The absolute deadline governs the next socket operation."""
+        sock.settimeout(max(self._remaining(deadline), _MIN_SOCKET_TIMEOUT))
+
+    def _track(self, connection: http.client.HTTPConnection, sock: socket.socket | None) -> None:
         with self._lock:
             if self._aborted:
                 raise _Refused(Outcome.ABORTED, Reason.ABORTED)
-            self._in_flight[connection] = connection.sock
+            self._in_flight[connection] = sock
+
+    def _open(self, deadline: float) -> http.client.HTTPConnection:
+        connection = self._factory(HOST, PORT, self._remaining(deadline))
+        self._track(connection, None)
+        return connection
 
     def _close(self, connection: http.client.HTTPConnection) -> None:
         with self._lock:
@@ -351,14 +418,72 @@ class UpstreamClient:
         if sock is not None:
             sock.close()
 
-    def _arm(self, connection: http.client.HTTPConnection, deadline: float) -> None:
-        """The wall-clock deadline governs every socket operation."""
-        remaining = deadline - self._clock()
-        if remaining <= 0:
+    def _await_connect(self, sock: socket.socket, deadline: float) -> None:
+        remaining = self._remaining(deadline)
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._wake_r, selectors.EVENT_READ)
+            selector.register(sock, selectors.EVENT_WRITE)
+            ready = {key.fileobj for key, _ in selector.select(remaining)}
+        if self._wake_r in ready or self._aborted:
+            raise _Refused(Outcome.ABORTED, Reason.ABORTED)
+        if sock not in ready:
             raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
-        connection.timeout = remaining
-        if connection.sock is not None:
-            connection.sock.settimeout(max(remaining, _MIN_SOCKET_TIMEOUT))
+
+    def _open_socket(
+        self, connection: http.client.HTTPConnection, deadline: float
+    ) -> socket.socket:
+        failure: OSError | None = None
+        for family, kind, proto, _, address in socket.getaddrinfo(
+            connection.host, connection.port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        ):
+            sock = self._socket(family, kind, proto)
+            try:
+                self._track(connection, sock)
+                sock.setblocking(False)
+                err = sock.connect_ex(address)
+                if err == errno.EINPROGRESS:
+                    self._await_connect(sock, deadline)
+                    err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err:
+                    raise OSError(err, os.strerror(err))
+                sock.setblocking(True)
+                return sock
+            except OSError as exc:
+                sock.close()
+                failure = exc
+            except BaseException:
+                sock.close()
+                raise
+        if failure is None:
+            failure = OSError(errno.EHOSTUNREACH, "no address for the origin")
+        raise failure
+
+    def _secure(
+        self, connection: http.client.HTTPConnection, sock: socket.socket, deadline: float
+    ) -> socket.socket:
+        tls = self._tls_context().wrap_socket(
+            sock, server_hostname=connection.host, do_handshake_on_connect=False
+        )
+        try:
+            self._track(connection, tls)
+            self._arm(tls, deadline)
+            tls.do_handshake()
+        except BaseException:
+            tls.close()
+            raise
+        return tls
+
+    def _connect(self, connection: http.client.HTTPConnection, deadline: float) -> socket.socket:
+        sock = self._open_socket(connection, deadline)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            sock.close()
+            raise
+        if isinstance(connection, http.client.HTTPSConnection):
+            sock = self._secure(connection, sock, deadline)
+        connection.sock = sock
+        return sock
 
     def _put(
         self,
@@ -368,49 +493,17 @@ class UpstreamClient:
         headers: tuple[tuple[str, str], ...],
         body: bytes,
         deadline: float,
-    ) -> http.client.HTTPResponse:
+    ) -> tuple[http.client.HTTPResponse, socket.socket]:
         assert self._credential is not None
-        self._arm(connection, deadline)
-        connection.connect()
-        self._connected(connection)
-        self._arm(connection, deadline)
+        sock = self._connect(connection, deadline)
+        self._arm(sock, deadline)
         connection.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
         for name, value in headers:
             connection.putheader(name, value)
         connection.putheader("Authorization", f"Bearer {self._credential}")
         connection.endheaders(body if body else None)
-        self._arm(connection, deadline)
-        return connection.getresponse()
-
-    def _gate(
-        self,
-        connection: http.client.HTTPConnection,
-        response: http.client.HTTPResponse,
-        deadline: float,
-        already_read: int,
-    ) -> _Body:
-        """Read the whole body counting actual bytes; one byte past the
-        per-request limit (cumulative over the chain) refuses."""
-        limit = self._budgets.response_body_limit
-        body = _Body(self.spool_dir, self._spool_threshold, self._spool_write)
-        try:
-            while True:
-                remaining = limit - already_read - body.size
-                self._arm(connection, deadline)
-                chunk = response.read(min(_READ_CHUNK, remaining + 1))
-                if not chunk:
-                    # http.client hands back an empty read, not IncompleteRead,
-                    # when a Content-Length body ends early; a short body is
-                    # never delivered as a whole one.
-                    if response.length:
-                        raise http.client.IncompleteRead(b"")
-                    return body
-                if len(chunk) > remaining:
-                    raise _Refused(Outcome.REFUSED_GATE, Reason.GATE_RESPONSE_BYTES)
-                body.append(chunk)
-        except BaseException:
-            body.discard()
-            raise
+        self._arm(sock, deadline)
+        return connection.getresponse(), sock
 
     def send(
         self,
@@ -425,14 +518,16 @@ class UpstreamClient:
         """One credentialed exchange, redirects included. ``authorize_hop``
         is the server's write-ahead step for a candidate hop: ``None``
         authorizes it, a ``Reason`` refuses it and is recorded as that hop's
-        entry. The request bytes are already charged by the caller; the
-        response allowance is reserved here, atomically, before any
-        connection is opened, and the unused remainder returned after."""
+        entry. The original request's bytes are already charged by the
+        caller; each followed hop's are charged here before its record is
+        written. The response allowance is reserved here, atomically, before
+        any connection is opened, and settled to the bytes actually read
+        once the send is over, however it ended."""
         if self._credential is None:
             raise RuntimeError("UpstreamClient.send needs a credential")
-        budgets = self._budgets
         request_bytes = request_size(request)
-        if not aggregate.reserve_response(budgets.response_body_limit):
+        limit = self._budgets.response_body_limit
+        if not aggregate.reserve_response(limit):
             return UpstreamResult(
                 Outcome.REFUSED_GATE, None, (), None, request_bytes, 0, (), Reason.GATE_AGGREGATE
             )
@@ -442,23 +537,27 @@ class UpstreamClient:
             method_class=method_class,
             canonical_target=canonical_target,
             authorize_hop=authorize_hop,
+            aggregate=aggregate,
             observe=observe,
         )
         try:
             return chain.run(request_bytes)
         finally:
-            aggregate.release_response(budgets.response_body_limit - chain.response_bytes)
+            aggregate.settle_response(limit, chain.received)
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:
+    """The one wake-up a blocked recv or handshake honors. The base method
+    is called on purpose: ``SSLSocket.shutdown`` would also drop the SSL
+    object under the thread still reading through it."""
     if sock is not None:
         with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)  # the only wake-up a blocked recv honors
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
 
 
 class _Chain:
-    """One send's state: the current hop, the bytes so far, and the
-    redirect entries the completion record will carry."""
+    """One send's state: the current hop, the bytes charged and read so
+    far, and the redirect entries the completion record will carry."""
 
     def __init__(
         self,
@@ -468,6 +567,7 @@ class _Chain:
         method_class: MethodClass,
         canonical_target: CanonicalTarget,
         authorize_hop: Callable[[int, CanonicalTarget], Reason | None],
+        aggregate: AggregateBudget,
         observe: Observer | None,
     ):
         self._client = client
@@ -476,88 +576,127 @@ class _Chain:
         self._method_class = method_class
         self._graphql = method_class is MethodClass.POST and canonical_target.path == GRAPHQL_PATH
         self._authorize_hop = authorize_hop
+        self._aggregate = aggregate
         self._observe = observe or (lambda point, hop: None)
         self._visited = {_target_key(canonical_target)}
-        self.response_bytes = 0
+        self.received = 0
+        self.request_bytes = 0
         self.entries: list[RedirectEntry] = []
         self._hop = 0
         self._status: int | None = None
 
     def run(self, request_bytes: int) -> UpstreamResult:
-        client = self._client
-        deadline = client._clock() + self._budgets.upstream_timeout
-        method = self._request.method
-        target = self._request.request_target
-        headers = self._request.headers
-        body = self._request.body
+        self.request_bytes = request_bytes
+        deadline = self._client._clock() + self._budgets.upstream_timeout
+        current = self._request
         try:
             while True:
-                status, response_headers, gated = self._exchange(
-                    method, target, headers, body, deadline
-                )
+                status, response_headers, gated = self._exchange(current, deadline)
                 if not _is_redirect(status):
                     return UpstreamResult(
                         Outcome.DELIVERED,
                         status,
                         filter_response_headers(response_headers),
                         gated,
-                        request_bytes,
-                        self.response_bytes,
+                        self.request_bytes,
+                        self.received,
                         tuple(self.entries),
                         None,
                     )
                 if isinstance(gated, SpoolHandle):
                     gated.close()
                 locations = [v for name, v in response_headers if name.lower() == "location"]
-                target = self._decide(status, locations, target)
-                headers = _HOP_HEADERS
-                body = b""
+                current = self._decide(status, locations, current.request_target)
         except _Refused as refused:
             return UpstreamResult(
                 refused.outcome,
                 self._status,
                 (),
                 None,
-                request_bytes,
-                self.response_bytes,
+                self.request_bytes,
+                self.received,
                 tuple(self.entries),
                 refused.reason,
             )
 
     def _exchange(
-        self,
-        method: str,
-        target: str,
-        headers: tuple[tuple[str, str], ...],
-        body: bytes,
-        deadline: float,
+        self, request: UpstreamRequest, deadline: float
     ) -> tuple[int, list[tuple[str, str]], bytes | SpoolHandle]:
         client = self._client
         connection = client._open(deadline)
         try:
             if self._hop:
                 self._observe("before_redirect_send", self._hop)
-            response = client._put(connection, method, target, headers, body, deadline)
+            response, sock = client._put(
+                connection,
+                request.method,
+                request.request_target,
+                request.headers,
+                request.body,
+                deadline,
+            )
             self._status = response.status
             self._observe("after_redirect_send" if self._hop else "during_upstream", self._hop)
             response_headers = list(response.getheaders())
             encoding = response.getheader("Content-Encoding")
             if encoding is not None and encoding.strip().lower() != "identity":
                 raise _Refused(Outcome.REFUSED_GATE, Reason.CONTENT_ENCODING)
-            gated = client._gate(connection, response, deadline, self.response_bytes)
-            self.response_bytes += gated.size
+            gated = self._gate(response, sock, deadline)
             return response.status, response_headers, gated.finish()
         except _Refused:
             raise
-        except (OSError, http.client.HTTPException) as exc:
+        except Exception as exc:
+            # Aborted wins over every other reading of a failure: the shut
+            # down socket surfaces as EOF, a reset, or an SSL error, none of
+            # which is the origin's doing.
             if client.aborted:
                 raise _Refused(Outcome.ABORTED, Reason.ABORTED) from exc
-            timed_out = isinstance(exc, TimeoutError) or client._clock() >= deadline
-            if timed_out:
+            if not isinstance(exc, OSError | http.client.HTTPException):
+                raise
+            if isinstance(exc, TimeoutError) or client._clock() >= deadline:
                 raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT) from exc
             raise _Refused(Outcome.UPSTREAM_ERROR, Reason.UPSTREAM_ERROR) from exc
         finally:
             client._close(connection)
+
+    def _gate(
+        self, response: http.client.HTTPResponse, sock: socket.socket, deadline: float
+    ) -> _Body:
+        """Read the whole body, counting every byte handed up before
+        anything is decided about it: one byte past the per-request limit
+        (cumulative over the chain) refuses, and that byte is counted too.
+        ``read1`` makes one receive per call, so a timeout never loses
+        bytes already received to the count."""
+        client = self._client
+        limit = self._budgets.response_body_limit
+        body = _Body(client.spool_dir, client._spool_threshold, client._spool_write)
+        try:
+            while True:
+                remaining = limit - self.received
+                if response.isclosed():
+                    # A Content-Length body read to its end released the
+                    # socket already; there is nothing left to arm.
+                    chunk = b""
+                else:
+                    client._arm(sock, deadline)
+                    chunk = response.read1(min(_READ_CHUNK, remaining + 1))
+                if not chunk:
+                    if response.length:
+                        # http.client hands back an empty read, not
+                        # IncompleteRead, when a Content-Length body ends
+                        # early; a short body is never delivered as a whole.
+                        raise http.client.IncompleteRead(b"")
+                    if client.aborted:
+                        # A close-delimited body's EOF may be the abort's.
+                        raise _Refused(Outcome.ABORTED, Reason.ABORTED)
+                    return body
+                self.received += len(chunk)
+                if len(chunk) > remaining:
+                    raise _Refused(Outcome.REFUSED_GATE, Reason.GATE_RESPONSE_BYTES)
+                body.append(chunk)
+        except BaseException:
+            body.discard()
+            raise
 
     def _refuse(self, status: int, reason: Reason, locations: list[str]) -> _Refused:
         self.entries.append(
@@ -565,10 +704,10 @@ class _Chain:
         )
         return _Refused(Outcome.REFUSED_REDIRECT, reason)
 
-    def _decide(self, status: int, locations: list[str], base_target: str) -> str:
+    def _decide(self, status: int, locations: list[str], base_target: str) -> UpstreamRequest:
         """Item 5 per hop: every check re-run against the resolved
-        ``Location``; the returned canonical request-target is the next
-        hop's, sent only after ``authorize_hop`` made its record durable."""
+        ``Location``; the returned request is the next hop's, its bytes
+        charged and its record durable before it is sent."""
         self._hop += 1
         if self._graphql:
             raise self._refuse(status, Reason.REDIRECT_GRAPHQL, locations)
@@ -599,14 +738,23 @@ class _Chain:
         key = _target_key(canonical)
         if key in self._visited:
             raise self._refuse(status, Reason.REDIRECT_LOOP, locations)
+        # The hop's exact bytes are charged before its record is written and
+        # before any connection for it exists; a hop the audit step then
+        # refuses never comes to exist, so its charge goes back.
+        following = hop_request(self._request.method, key)
+        hop_bytes = request_size(following)
+        if not self._aggregate.charge_request(hop_bytes):
+            raise self._refuse(status, Reason.REDIRECT_BUDGET, locations)
         refusal = self._authorize_hop(self._hop, canonical)
         if refusal is not None:
+            self._aggregate.refund_request(hop_bytes)
             raise self._refuse(status, refusal, locations)
+        self.request_bytes += hop_bytes
         self._visited.add(key)
         self.entries.append(
             _redirect_entry(self._hop, status, RedirectDecision.FOLLOWED, None, locations)
         )
-        return key
+        return following
 
 
 def _target_key(target: CanonicalTarget) -> str:
