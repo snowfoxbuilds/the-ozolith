@@ -1,0 +1,3 @@
+# The corpus is byte-exact wire data (CRLF request lines, raw control and
+# non-ASCII bytes): never normalize line endings on checkout or commit.
+* -text

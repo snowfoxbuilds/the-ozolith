@@ -1,0 +1,4 @@
+{
+  "method": "GET",
+  "upstream_target": "/search/issues?q=a%20b"
+}

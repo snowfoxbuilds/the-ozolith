@@ -1,0 +1,1 @@
+{"query":"query RepositoryInfo($owner: String!, $name: String!) {\n\t\trepository(owner: $owner, name: $name) {name,owner{id,login},description}\n\t}","variables":{"name":"REPO","owner":"OWNER"}}

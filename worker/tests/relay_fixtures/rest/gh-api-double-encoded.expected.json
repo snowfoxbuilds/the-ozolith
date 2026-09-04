@@ -1,0 +1,4 @@
+{
+  "method": "GET",
+  "upstream_target": "/repos/OWNER/REPO/issues?q=%2541"
+}

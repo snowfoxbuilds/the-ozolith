@@ -1,0 +1,1 @@
+{"query": "query { viewer { login } }\n# a comment line\nmutation { addStar(input: {starrableId: \"x\"}) { clientMutationId } }"}

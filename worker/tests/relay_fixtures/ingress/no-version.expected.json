@@ -1,0 +1,5 @@
+{
+  "stage": "request-line",
+  "reason": "request-line",
+  "status": 400
+}

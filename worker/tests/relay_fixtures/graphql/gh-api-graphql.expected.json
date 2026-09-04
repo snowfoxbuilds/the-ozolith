@@ -1,0 +1,10 @@
+{
+  "parsed": true,
+  "operation_type": "query",
+  "operation_name": null,
+  "refusal": null,
+  "variables": [
+    "name",
+    "owner"
+  ]
+}

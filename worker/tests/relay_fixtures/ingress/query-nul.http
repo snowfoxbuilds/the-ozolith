@@ -1,0 +1,2 @@
+GET /search/issues?q=%00 HTTP/1.1
+

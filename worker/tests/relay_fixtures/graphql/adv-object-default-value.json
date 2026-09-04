@@ -1,0 +1,1 @@
+{"query": "query Q($f: Input = {a: 1, b: \"}\"}) { viewer { login } }"}
