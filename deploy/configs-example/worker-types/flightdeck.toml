@@ -42,12 +42,15 @@
 # worker-visible. Knowledge (skills/subagents/workflows) is authored in the
 # Config Repo `knowledge/` tree, compiled at ingest, and read-only
 # bind-mounted from the node's applied pinned tree (the stable
-# /var/lib/theozolith/knowledge export the daemon maintains) — no writable
-# clone, no promote workflow. The `knowledge` field below SELECTS which tree
-# this deck reads: control injects it as THEOZOLITH_KNOWLEDGE_TREE and
-# flightdeck-start symlinks the ~/.claude knowledge dirs into that tree,
-# failing loud if the node has not converged it yet. An edit reaches every
-# deck on every node via ordinary config distribution, picked up on agent-CLI
+# /var/lib/theozolith/knowledge export the daemon maintains, one per-tool
+# VIEW per tree: <tree>/claude, <tree>/codex) — no writable clone, no
+# promote workflow. The `knowledge` field below SELECTS which tree this
+# deck reads: control injects the adapter's view path (`<tree>/claude`) as
+# THEOZOLITH_KNOWLEDGE_TREE and flightdeck-start symlinks the ~/.claude
+# knowledge dirs into that view, failing loud unless the view's marker
+# (CLAUDE.md) is present — not yet converged, retired, or a selector that
+# points above the per-tool views (ADR-0052 §3). An edit reaches every deck
+# on every node via ordinary config distribution, picked up on agent-CLI
 # restart; switching the SELECTED tree changes the container spec and
 # recreates the deck. The symlink carve-out is Flight-Deck-only.
 #
@@ -95,11 +98,13 @@ base = "ghcr.io/snowfoxbuilds/theozolith-run-claude:main"
 # must live OUTSIDE every volume mountpoint: the model rides the root-owned
 # well-known file /etc/theozolith/model (ADR-0045 §4).
 
-# The knowledge SELECTION (ADR-0048): the compiled Config Repo tree this
-# deck's ~/.claude symlinks resolve into, delivered to flightdeck-start as
-# THEOZOLITH_KNOWLEDGE_TREE (per-Stack [env] override rejected). Ingest must
-# have compiled and pinned the tree, and load fails loud on a dangling
-# reference — same validation as the driver types.
+# The knowledge SELECTION (ADR-0048): the Config Repo tree whose compiled
+# claude VIEW this deck's ~/.claude symlinks resolve into. Control derives
+# the view path `<tree>/claude` from this type's adapter and delivers it to
+# flightdeck-start as THEOZOLITH_KNOWLEDGE_TREE (ADR-0052 §3; per-Stack
+# [env] override rejected). Ingest must have compiled and pinned the tree,
+# and load fails loud on a dangling reference — same validation as the
+# driver types.
 knowledge = "knowledge/claude-dev"
 
 # The Agent Policy SELECTION (ADR-0055): the validated managed-settings
@@ -309,13 +314,15 @@ fi''',
 
     # (7) Write /usr/local/bin/flightdeck-start (chmod +x). This is CONFIG
     #     content baked by setup — never product source — which is how the
-    #     no-tailscale-in-product constraint is honored. The knowledge tree
-    #     name is NOT a literal here (ADR-0048 amendment): the script reads
-    #     $THEOZOLITH_KNOWLEDGE_TREE, injected control-side from the
-    #     worker-type `knowledge` field above, and FAILS LOUD when the
-    #     selected tree has not converged onto this node — the Node Daemon's
+    #     no-tailscale-in-product constraint is honored. The knowledge view
+    #     path is NOT a literal here (ADR-0048 amendment): the script reads
+    #     $THEOZOLITH_KNOWLEDGE_TREE — the `<tree>/claude` view path control
+    #     derives from the worker-type `knowledge` field above — and FAILS
+    #     LOUD unless the view marker (CLAUDE.md) is at the selected root: not
+    #     converged, retired, or a selector pointing above the per-tool views
+    #     (a mixed Control/daemon pairing, ADR-0052 §3). The Node Daemon's
     #     reconcile loop then recreates the failed container on a later pass
-    #     (roughly the heartbeat cadence) until it has. Runtime values
+    #     (roughly the heartbeat cadence) until it converges. Runtime values
     #     ($FLIGHTDECK_TS_HOSTNAME, $TS_AUTHKEY_FILE, $!) stay UNEXPANDED at
     #     build — every script line is a single-quoted printf argument — and
     #     expand only at container start.
@@ -365,15 +372,18 @@ fi''',
 '#!/bin/sh' \
 'set -eu' \
 '# ADR-0048: knowledge is the node-applied pinned tree, mounted read-only at' \
-'# /var/lib/theozolith/knowledge. The worker-type knowledge field selects the' \
-'# tree, control-injected as THEOZOLITH_KNOWLEDGE_TREE. FAIL LOUD when it is' \
-'# not available: a deck must never run with silently missing knowledge, and' \
-'# the daemon reconcile loop recreates the deck on a later pass (~heartbeat' \
-'# cadence), retrying until the node converges the distribution.' \
+'# /var/lib/theozolith/knowledge as one VIEW per tool (<tree>/claude,' \
+'# <tree>/codex). The worker-type knowledge field selects the tree; control' \
+'# injects the claude view path as THEOZOLITH_KNOWLEDGE_TREE (ADR-0052). FAIL' \
+'# LOUD unless the view marker CLAUDE.md is a regular file at that root: a' \
+'# bare directory test cannot tell a converged view from the views PARENT' \
+'# (an old-control selector), and linking into the parent would silently' \
+'# give the deck no knowledge. The daemon reconcile loop recreates the deck' \
+'# on a later pass (~heartbeat cadence), retrying until the node converges.' \
 ': "${THEOZOLITH_KNOWLEDGE_TREE:?flightdeck-start: THEOZOLITH_KNOWLEDGE_TREE is missing - the worker type must declare knowledge (ADR-0048)}"' \
 'KNOWLEDGE_TREE_DIR="/var/lib/theozolith/knowledge/${THEOZOLITH_KNOWLEDGE_TREE}"' \
-'if [ ! -d "$KNOWLEDGE_TREE_DIR" ]; then' \
-'  echo "flightdeck-start: knowledge tree $KNOWLEDGE_TREE_DIR is not available on this node (config distribution not converged, or the tree was retired) - failing loud (ADR-0048)" >&2' \
+'if [ ! -f "$KNOWLEDGE_TREE_DIR/CLAUDE.md" ]; then' \
+'  echo "flightdeck-start: knowledge view $KNOWLEDGE_TREE_DIR is not available on this node (CLAUDE.md missing - config distribution not converged, the tree was retired, or THEOZOLITH_KNOWLEDGE_TREE=$THEOZOLITH_KNOWLEDGE_TREE points above the per-tool views) - failing loud (ADR-0048/ADR-0052)" >&2' \
 '  exit 1' \
 'fi' \
 '# Symlink the ~/.claude knowledge dirs into the COMPILED tree (skills/,' \

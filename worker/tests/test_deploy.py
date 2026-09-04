@@ -755,14 +755,15 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
     wt = config.worker_types["flightdeck"]
     # The deck SELECTS its tree via the worker-type knowledge field (ADR-0048
     # amendment): validated like a driver's (pin joined at load), delivered
-    # as control-injected env — and NEVER baked: the wire recipe carries
-    # empty knowledge fields (the state volume shadows ~/.claude), so a
-    # content edit moves the pin without touching the image identity.
+    # as control-injected env naming the adapter's VIEW path (ADR-0052 §3)
+    # — and NEVER baked: the wire recipe carries empty knowledge fields (the
+    # state volume shadows ~/.claude), so a content edit moves the pin
+    # without touching the image identity.
     assert wt.knowledge == "knowledge/claude-dev"
     assert wt.knowledge_pin == config.worker_types["claude-dev"].knowledge_pin
     recipe = wt.recipe_wire()
     assert recipe["knowledge"] == "" and recipe["knowledge_pin"] == ""
-    assert flightdeck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "claude-dev"
+    assert flightdeck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "claude-dev/claude"
     script = "\n".join(wt.setup)
 
     # The writable clone is RETIRED (ADR-0048): no clone-init, no knowledge
@@ -780,11 +781,15 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
             assert "cli.github.com" in line or "users.noreply.github.com" in line, line
     assert "ln -sfnT" not in script and "ln -sfn" not in script
     assert "knowledge/claude-dev" not in script  # the selection is env, not a literal
+    assert "claude-dev/claude" not in script
     assert '"${THEOZOLITH_KNOWLEDGE_TREE:?' in script
     assert 'KNOWLEDGE_TREE_DIR="/var/lib/theozolith/knowledge/${THEOZOLITH_KNOWLEDGE_TREE}"' in (
         script
     )
-    assert 'if [ ! -d "$KNOWLEDGE_TREE_DIR" ]; then' in script
+    # The view MARKER gate, never a bare directory test: the views' parent
+    # is a directory too (ADR-0052 §3).
+    assert 'if [ ! -f "$KNOWLEDGE_TREE_DIR/CLAUDE.md" ]; then' in script
+    assert 'if [ ! -d "$KNOWLEDGE_TREE_DIR" ]' not in script
     assert "link_knowledge" in script and 'ln -s "$1" "$2"' in script
     assert "for entry in skills agents workflows CLAUDE.md; do" in script
     assert '"/home/ozolith/.claude/$entry"' in script
@@ -1142,10 +1147,12 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     (sandbox / "home" / ".claude").mkdir(parents=True)  # the state-volume mountpoint
     (sandbox / "tsstate").mkdir()  # the tailscale-state volume mountpoint
     (sandbox / "workspace").mkdir()  # the workspace volume mountpoint
-    # The applied knowledge tree the deck's selection resolves to (ADR-0048):
-    # present by default so the fail-loud gate passes; the unavailable-tree
-    # test removes it.
-    (sandbox / "knowledge" / "claude-dev").mkdir(parents=True)
+    # The applied knowledge tree in the node's per-tool export layout
+    # (ADR-0052 §3): the claude VIEW the deck's selection resolves to, with
+    # its marker and the entries the link step expects, beside the codex
+    # view — present by default so the fail-loud gate passes; the
+    # unavailable-tree and mixed-version pairing tests reshape it.
+    _lay_out_per_tool_export(sandbox / "knowledge" / "claude-dev")
     # The applied Agent Policy tree (ADR-0055), same posture.
     (sandbox / "policy" / "claude-defaults").mkdir(parents=True)
     (sandbox / "policy" / "claude-defaults" / "attribution.json").write_text(POLICY_DOC)
@@ -1155,6 +1162,28 @@ def _sandboxed_script(script: Path, sandbox: Path) -> Path:
     sudo.write_text('#!/bin/sh\nexec "$@"\n')
     sudo.chmod(0o755)
     return rewritten
+
+
+def _lay_out_per_tool_export(tree: Path) -> None:
+    """One exported tree as the new daemon lays it out: <tree>/claude/ with
+    CLAUDE.md (the claude view marker) plus skills/agents/workflows, and
+    <tree>/codex/ with AGENTS.md (the codex view marker)."""
+    claude_view = tree / "claude"
+    claude_view.mkdir(parents=True)
+    (claude_view / "CLAUDE.md").write_text("# claude view\n")
+    for entry in ("skills", "agents", "workflows"):
+        (claude_view / entry).mkdir()
+    (tree / "codex").mkdir()
+    (tree / "codex" / "AGENTS.md").write_text("# codex view\n")
+
+
+def _lay_out_flattened_export(tree: Path) -> None:
+    """One exported tree as a PRE-transition daemon laid it out: the claude
+    compile flattened at the tree root, no per-tool views."""
+    tree.mkdir(parents=True)
+    (tree / "CLAUDE.md").write_text("# flattened claude compile\n")
+    for entry in ("skills", "agents", "workflows"):
+        (tree / entry).mkdir()
 
 
 def _stub(bin_dir: Path, name: str, exit_code: int) -> Path:
@@ -1304,13 +1333,14 @@ def _run_start(
 ) -> subprocess.CompletedProcess:
     """The container-start env: the knowledge and policy selections ride as
     the control-injected THEOZOLITH_KNOWLEDGE_TREE / THEOZOLITH_POLICY_TREE
-    (ADR-0048/0055) — defaulted here so every lifecycle test starts like a
-    resolved deck Stack; pass ``None`` to UNSET a variable (the
+    (ADR-0048/0055) — the knowledge selector being the claude VIEW path
+    ``<tree>/claude`` (ADR-0052 §3) — defaulted here so every lifecycle test
+    starts like a resolved deck Stack; pass ``None`` to UNSET a variable (the
     missing-selection and policy-less-deck tests)."""
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "THEOZOLITH_KNOWLEDGE_TREE": "claude-dev",
+        "THEOZOLITH_KNOWLEDGE_TREE": "claude-dev/claude",
         "THEOZOLITH_POLICY_TREE": "claude-defaults",
     }
     env.pop("TS_AUTHKEY_FILE", None)
@@ -1498,6 +1528,85 @@ def test_flightdeck_start_unavailable_tree_fails_before_the_daemon(tmp_path, exa
     assert not (sandbox / "home" / ".claude" / "skills").exists()
 
 
+def _start_against_export(tmp_path, example_config, lay_out, selector: str):
+    """Drive one Control/daemon pairing of the export transition (ADR-0052
+    §3): ``lay_out`` shapes the mounted export as that daemon would, and
+    ``selector`` is what that Control injects."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_script(_generate_flightdeck_start(tmp_path, example_config), sandbox)
+    shutil.rmtree(sandbox / "knowledge" / "claude-dev")
+    lay_out(sandbox / "knowledge" / "claude-dev")
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    proc = _run_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_KNOWLEDGE_TREE=selector,
+    )
+    return proc, sandbox, daemon_calls
+
+
+def test_flightdeck_start_refuses_a_flattened_export_under_a_view_selector(
+    tmp_path, example_config
+):
+    """New Control, OLD daemon (ADR-0052 §3): the selector names the claude
+    view ``claude-dev/claude``, but the old daemon's export is the flattened
+    claude compile at the tree root — the view path does not exist. The deck
+    fails closed before tailscaled launches, naming the selector, and never
+    reads the flattened tree in its place."""
+    proc, sandbox, daemon_calls = _start_against_export(
+        tmp_path, example_config, _lay_out_flattened_export, "claude-dev/claude"
+    )
+    assert proc.returncode == 1
+    assert "knowledge view" in proc.stderr and "not available on this node" in proc.stderr
+    assert "THEOZOLITH_KNOWLEDGE_TREE=claude-dev/claude" in proc.stderr
+    assert not daemon_calls.exists()
+    assert not (sandbox / "home" / ".claude" / "skills").exists()
+    assert not (sandbox / "home" / ".claude" / "CLAUDE.md").exists()
+
+
+def test_flightdeck_start_refuses_the_views_parent_under_a_bare_selector(tmp_path, example_config):
+    """OLD Control, new daemon (ADR-0052 §3): the selector is the bare tree
+    name ``claude-dev``, which under the per-tool export is the PARENT of the
+    views — a directory that exists but holds no CLAUDE.md. A bare directory
+    test would link ~/.claude into it and silently give the deck no
+    knowledge; the view-marker gate refuses before tailscaled launches."""
+    proc, sandbox, daemon_calls = _start_against_export(
+        tmp_path, example_config, _lay_out_per_tool_export, "claude-dev"
+    )
+    assert (sandbox / "knowledge" / "claude-dev").is_dir()  # the parent IS there
+    assert proc.returncode == 1
+    assert "CLAUDE.md missing" in proc.stderr and "points above the per-tool views" in proc.stderr
+    assert "THEOZOLITH_KNOWLEDGE_TREE=claude-dev" in proc.stderr
+    assert not daemon_calls.exists()
+    assert not (sandbox / "home" / ".claude" / "skills").exists()
+    assert not (sandbox / "home" / ".claude" / "CLAUDE.md").exists()
+
+
+def test_flightdeck_start_converged_per_tool_export_links_the_claude_view(tmp_path, example_config):
+    """New Control, new daemon: the selector names the claude view and the
+    per-tool export carries CLAUDE.md at the claude view root and AGENTS.md
+    at the codex view root — the claude deck links ~/.claude into its view
+    and reaches the tailnet lifecycle (the deliberately dying stub daemon
+    then fails the container, after the links landed)."""
+    proc, sandbox, daemon_calls = _start_against_export(
+        tmp_path, example_config, _lay_out_per_tool_export, "claude-dev/claude"
+    )
+    assert daemon_calls.exists()  # past the knowledge gate
+    view = sandbox / "knowledge" / "claude-dev" / "claude"
+    home = sandbox / "home" / ".claude"
+    for entry in ("skills", "agents", "workflows", "CLAUDE.md"):
+        assert os.readlink(home / entry) == str(view / entry), entry
+    assert (home / "CLAUDE.md").read_text() == "# claude view\n"
+    assert (sandbox / "knowledge" / "claude-dev" / "codex" / "AGENTS.md").is_file()
+    assert "not available on this node" not in proc.stderr
+
+
 def test_flightdeck_start_missing_selection_fails_before_the_daemon(tmp_path, example_config):
     """Without the control-injected THEOZOLITH_KNOWLEDGE_TREE (a deck run
     outside a resolved worker-type Stack), the script refuses to guess."""
@@ -1544,10 +1653,9 @@ def test_flightdeck_start_replaces_stale_links_but_refuses_a_real_directory(
     # Both stale entries were relinked into the selected tree before the
     # (deliberately dying) stub daemon failed the container.
     assert daemon_calls.exists()
-    assert os.readlink(claude / "skills") == str(sandbox / "knowledge" / "claude-dev" / "skills")
-    assert os.readlink(claude / "CLAUDE.md") == str(
-        sandbox / "knowledge" / "claude-dev" / "CLAUDE.md"
-    )
+    view = sandbox / "knowledge" / "claude-dev" / "claude"
+    assert os.readlink(claude / "skills") == str(view / "skills")
+    assert os.readlink(claude / "CLAUDE.md") == str(view / "CLAUDE.md")
 
     (claude / "agents").unlink()
     (claude / "agents").mkdir()  # a real directory must never be deleted
@@ -1749,14 +1857,19 @@ def test_flightdeck_start_fresh_enrollment_consumes_the_key_by_path_only(tmp_pat
     )
     assert proc.returncode == 0, proc.stderr
     home = sandbox / "home"
-    # The symlinks target the COMPILED trees on the read-only mount (ADR-0048).
+    # The symlinks target the claude VIEW of the compiled tree on the
+    # read-only mount (ADR-0048/0052) — the converged new-Control/new-daemon
+    # case: the claude view resolves for this deck while the codex view sits
+    # beside it, unlinked.
     for link, target in (
-        (".claude/skills", "claude-dev/skills"),
-        (".claude/agents", "claude-dev/agents"),
-        (".claude/workflows", "claude-dev/workflows"),
-        (".claude/CLAUDE.md", "claude-dev/CLAUDE.md"),
+        (".claude/skills", "claude-dev/claude/skills"),
+        (".claude/agents", "claude-dev/claude/agents"),
+        (".claude/workflows", "claude-dev/claude/workflows"),
+        (".claude/CLAUDE.md", "claude-dev/claude/CLAUDE.md"),
     ):
         assert os.readlink(home / link) == str(sandbox / "knowledge" / target), link
+    assert (home / ".claude" / "CLAUDE.md").read_text() == "# claude view\n"
+    assert (sandbox / "knowledge" / "claude-dev" / "codex" / "AGENTS.md").is_file()
     up_lines = [c for c in ts_calls.read_text().splitlines() if " up " in c]
     assert len(up_lines) == 1
     assert "--ssh" in up_lines[0]

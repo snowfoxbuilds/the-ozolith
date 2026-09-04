@@ -1660,13 +1660,16 @@ def _resolve_worker_stack(stack: StackDef, wt: WorkerTypeDef, repo_dir: Path | N
     if workspace:
         env["THEOZOLITH_REPO"] = workspace
     if wt.knowledge:
-        # The deck's knowledge SELECTION (ADR-0048 amendment): flightdeck-start
-        # symlinks ~/.claude into exactly this tree under the read-only mount
-        # and fails loud when it is absent. Identity-bearing per type — the
-        # [env] guard above keeps it un-overridable per Stack — and part of
-        # the container spec, so changing the selected tree recreates the
-        # deck while content edits redistribute live.
-        env["THEOZOLITH_KNOWLEDGE_TREE"] = wt.knowledge_tree
+        # The deck's knowledge SELECTION (ADR-0048 amendment) as the VIEW
+        # PATH `<tree>/<adapter>` (ADR-0052 §3): the node exports every
+        # per-tool compile of the tree and the deck's start script links the
+        # agent home into exactly this view under the read-only mount,
+        # failing loud when the view's marker is absent. Identity-bearing
+        # per type — the [env] guard above keeps it un-overridable per Stack
+        # — and part of the container spec, so changing the selected tree
+        # (or the adapter) recreates the deck while content edits
+        # redistribute live.
+        env["THEOZOLITH_KNOWLEDGE_TREE"] = f"{wt.knowledge_tree}/{wt.adapter}"
     if wt.policy:
         # The deck's Agent Policy SELECTION (ADR-0055): the start script
         # links the managed drop-in dir to exactly this tree under the

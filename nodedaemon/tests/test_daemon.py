@@ -5965,15 +5965,15 @@ def test_knowledge_export_is_maintained_updated_and_retired(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], a_hash))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
-    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
     parent_inode = export.stat().st_ino
 
     b_hash, b_data = _knowledge_dist("# v2\n")
     rig.control.config_artifacts[b_hash] = b_data
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v2\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v2\n"
     assert export.stat().st_ino == parent_inode  # the mount anchor never moved
 
     c_hash, c_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
@@ -6000,8 +6000,8 @@ def test_knowledge_only_to_empty_distribution_retires_the_export(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").is_file()
-    assert (export / "other" / "CLAUDE.md").is_file()
+    assert (export / "dev" / "claude" / "CLAUDE.md").is_file()
+    assert (export / "other" / "claude" / "CLAUDE.md").is_file()
     parent_inode = export.stat().st_ino
 
     rig.control.heartbeat_answers.append(dist_response([], ""))
@@ -6032,7 +6032,7 @@ def test_knowledge_export_survives_a_failed_convergence(rig: Rig):
     b_hash, _ = _knowledge_dist("# v2\n")  # desired but never served (409)
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
 
 
 def test_knowledge_export_repairs_local_drift(rig: Rig):
@@ -6043,12 +6043,12 @@ def test_knowledge_export_repairs_local_drift(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    (export / "dev" / "CLAUDE.md").write_text("# vandalized\n")
+    (export / "dev" / "claude" / "CLAUDE.md").write_text("# vandalized\n")
     (export / "stale-extra").mkdir()
 
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
     assert not (export / "stale-extra").exists()  # not in the applied tree
 
 
@@ -6084,11 +6084,11 @@ def test_knowledge_recipe_defers_then_builds_once_converged(rig: Rig):
     assert recipe["tag"] in rig.docker.images
 
 
-def test_knowledge_export_serves_the_claude_view_of_a_per_tool_dist(rig: Rig):
-    """ADR-0052: per-tool dists keep each compile under <name>/<tool>/; the
-    deck-facing export flattens to the CLAUDE view (decks are claude-only),
-    so the deck's mount contract — CLAUDE.md at the tree root — never
-    changes across the layout migration."""
+def test_knowledge_export_mirrors_the_per_tool_layout_of_a_dist(rig: Rig):
+    """ADR-0052 §3: per-tool dists keep each compile under <name>/<tool>/ and
+    the deck-facing export mirrors that layout unflattened — every view
+    present, none chosen by the daemon; the deck's selector names one
+    (CLAUDE.md at the claude view root, AGENTS.md at the codex view root)."""
     digest, data = make_config_dist(
         {
             "knowledge/dev/claude/CLAUDE.md": "# claude view\n",
@@ -6100,33 +6100,68 @@ def test_knowledge_export_serves_the_claude_view_of_a_per_tool_dist(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# claude view\n"
-    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
-    assert not (export / "dev" / "claude").exists()  # flattened, not nested
-    assert not (export / "dev" / "codex").exists()  # the codex view never exports
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# claude view\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
+    assert (export / "dev" / "codex" / "AGENTS.md").read_text() == "# codex view\n"
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude", "codex"]
+    assert not (export / "dev" / "CLAUDE.md").exists()  # nested, never flattened
+
+    # A second pass over the same dist is a no-op exchange (the tree hash
+    # matches): the mounted child keeps its inode.
+    child_inode = (export / "dev").stat().st_ino
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (export / "dev").stat().st_ino == child_inode
+    assert sum("knowledge export 'dev' updated" in line for line in rig.logs) == 1
 
 
-def test_knowledge_export_keeps_the_legacy_bare_layout_working(rig: Rig):
-    """A pre-ADR-0052 dist (claude compile bare under the tree root) exports
-    exactly as before — the compat window until the operator's next ingest."""
+def test_knowledge_export_wraps_the_legacy_bare_layout_as_the_claude_view(rig: Rig):
+    """A pre-ADR-0052 dist (claude compile bare under the tree root — the
+    only legacy shape that can exist) exports under <name>/claude/, so the
+    deck's view selector resolves it exactly like a per-tool dist — the
+    compat window until the operator's next ingest migrates the layout. The
+    wrap is compared as a whole, so an up-to-date export skips the exchange
+    on later passes."""
     digest, data = _knowledge_dist("# legacy\n")
     rig.control.config_artifacts[digest] = data
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude"]
+    assert not (export / "dev" / "CLAUDE.md").exists()
+    assert not list(export.glob(".*"))  # the staged wrap left no leftovers
+
+    child_inode = (export / "dev").stat().st_ino
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (export / "dev").stat().st_ino == child_inode
+    assert sum("knowledge export 'dev' updated" in line for line in rig.logs) == 1
+    assert not list(export.glob(".*"))
 
 
 def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
-    """The layout migration is one ordinary export update: same child name,
-    new content, parent inode (the deck bind anchor) untouched."""
+    """The one-time transition (ADR-0052 §3) is ordinary export updates: an
+    older daemon's FLATTENED export is replaced whole by the wrapped legacy
+    view, then by the per-tool mirror — same child name each time, the old
+    flattened children retired, and the parent inode (the deck bind anchor)
+    untouched throughout."""
+    export = rig.config.knowledge_export_dir
+    # What a pre-transition daemon left behind: the claude compile flattened
+    # at the tree root.
+    (export / "dev" / "skills" / "s").mkdir(parents=True)
+    (export / "dev" / "CLAUDE.md").write_text("# flattened\n")
+    (export / "dev" / "skills" / "s" / "SKILL.md").write_text("skill\n")
+    parent_inode = export.stat().st_ino
+
     a_hash, a_data = _knowledge_dist("# legacy\n")
     rig.control.config_artifacts[a_hash] = a_data
     rig.control.heartbeat_answers.append(dist_response([], a_hash))
     rig.daemon.once()
-    export = rig.config.knowledge_export_dir
-    parent_inode = export.stat().st_ino
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude"]  # flattened retired
+    assert export.stat().st_ino == parent_inode
 
     b_hash, b_data = make_config_dist(
         {
@@ -6137,8 +6172,9 @@ def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
     rig.control.config_artifacts[b_hash] = b_data
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# migrated\n"
-    assert not (export / "dev" / "codex").exists()
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# migrated\n"
+    assert (export / "dev" / "codex" / "AGENTS.md").read_text() == "# codex\n"
+    assert not (export / "dev" / "CLAUDE.md").exists()
     assert export.stat().st_ino == parent_inode
 
 
