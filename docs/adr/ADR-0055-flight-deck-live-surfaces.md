@@ -55,7 +55,7 @@ Two new worker-type-definition fields become **declared, fleet-visible, and
 deliberately not identity-bearing on a driverless type**: the **Agent Policy**
 reference and the **CLI Pin**. Both generalize the knowledge precedent; the
 Node Daemon exports, the deck mounts a stable parent, a stable env selector
-resolves the entry, and the next `claude` launch picks up the new content.
+resolves the entry, and the next agent-CLI launch picks up the new content (amended 2026-09-04: the deck's CLI is whichever registered adapter the definition names).
 
 1. **Agent Policy is a Config Repo tree, referenced by name, delivered on the
    HITL/HOTL line.** The Config Repo gains `policy/<name>/` — verbatim
@@ -211,10 +211,18 @@ resolves the entry, and the next `claude` launch picks up the new content.
    silent fallback.
 7. **Scope.** The CLI Pin is driverless-only in v1 and refused with a driver
    (the mirror of `effort` being refused on decks until a consumer exists);
-   driver types keep the base image's CLI as identity bytes. Both fields are
-   refused on a codex-adapter type until a consumer exists: codex has no
-   managed-settings tier, its config file is theozolith-owned and baked, and
-   codex decks are already refused (ADR-0052). Telemetry: per worker type
+   driver types keep the base image's CLI as identity bytes. Agent Policy is
+   refused on a codex-adapter type until a codex consumer and its own
+   classification review exist: codex's admin tier is a single system
+   `config.toml` below user config plus a constraint-typed
+   `requirements.toml`, not a drop-in directory, so a codex policy tree
+   would be a different shape under a different allowlist (amended
+   2026-09-04). The CLI Pin is open to a
+   driverless codex type (amended 2026-09-04): the codex adapter declares
+   its wrapper and per-platform package map and the archive shape the
+   Node Daemon's validator holds the tarball to, and the pin resolves,
+   installs, exports, and launches pin-strict exactly as the claude pin
+   does — the deck is the consumer this clause was waiting for. Telemetry: per worker type
    the heartbeat carries the desired CLI version, the applied (exported)
    version, the convergence state, and the last install failure as a
    redacted class + message — names, versions, and error classes only,
@@ -348,6 +356,7 @@ behavior. The implementing PRs must demonstrate at minimum:
   container before the daemon materialized secrets onto the freshly-wiped
   `/run` tmpfs, auto-vivified the missing bind source as a directory and
   wedged both the mount and the secret writer. See NODE-SUBSTRATE.md.
+- **2026-09-04 (#127 grilling)**: the codex Flight Deck exists (ADR-0052 amended), so Decision 7's codex refusal narrows to Agent Policy alone — the CLI Pin opens to codex driverless types with adapter-declared packages and archive shape, and "next `claude` launch" reads "next agent-CLI launch" throughout.
 
 ## Relevant PRs
 

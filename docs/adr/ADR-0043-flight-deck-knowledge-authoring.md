@@ -14,7 +14,8 @@ worker type should not hold divergent copies.
 
 ## Decision
 
-Split ~/.claude by class:
+Split the agent home — `~/.claude`, and `~/.codex` for a codex deck
+(amended 2026-09-04) — by class:
 - **Runtime state**: per-Flight-Deck named state volume. Never shared,
   never reaches workers.
 - **Knowledge**: workers continue to bake at pin (ADR-0009 unchanged);
@@ -55,6 +56,7 @@ Split ~/.claude by class:
 ## Amendments
 
 - **2026-08-18 (#62)**: the shared writable clone, promote workflow, and `knowledge-<worker-type>` volume are RETIRED; the Flight Deck's knowledge surface is a read-only bind-mount of the node's applied pinned knowledge tree, updated via config distribution and picked up on agent-CLI restart. Authoring moves to the Config Repo; git remains the only transport, no sync daemon as ever.
+- **2026-09-04 (#127 grilling)**: the split applies to every adapter's home, not only `~/.claude` — a codex deck's `~/.codex` holds runtime state (`auth.json`, `sessions/`, `history.jsonl`) on its per-instance state volume and links `AGENTS.md`, `skills/`, and `prompts/` into the node's read-only export of the tree's codex view; the shape is the one this ADR set, applied per tool.
 
 ## Relevant PRs
 
