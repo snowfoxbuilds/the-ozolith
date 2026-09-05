@@ -17,6 +17,27 @@ DIGEST = "a" * 64
 BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{DIGEST}"
 TAG_ONLY_BASE = "ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2"
 
+# A codex custom agent role and a hooks config (ADR-0052 §1): the two
+# codex-native sections the claude view must stay blind to.
+CODEX_ROLE = (
+    'name = "grunt"\ndescription = "Runs a named check."\n'
+    'developer_instructions = "Run it and report the exact result."\n'
+)
+# A full native role: the codex session-configuration layer (model, effort,
+# sandbox, MCP servers, skills) rides beside the metadata and ships verbatim.
+# Schema-valid is not runtime-effective: at codex 0.153.3 sandbox_mode and
+# mcp_servers are transported, never applied to the child (ADR-0052 §1).
+FULL_CODEX_ROLE = (
+    'name = "scout"\ndescription = "Reads the codebase and reports; never edits."\n'
+    'developer_instructions = "Answer from the code alone. Never edit."\n'
+    'nickname_candidates = ["lookout"]\nmodel = "gpt-6-astra"\n'
+    'model_reasoning_effort = "medium"\nsandbox_mode = "read-only"\n\n'
+    '[mcp_servers.docs]\ncommand = "npx"\n'
+    'args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]\n\n'
+    '[[skills.config]]\npath = "../skills/greet/SKILL.md"\nenabled = true\n'
+)
+HOOKS_DOC = '{"hooks": {"PreToolUse": []}}\n'
+
 
 def _git(cwd: Path, *args: str) -> str:
     proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
@@ -214,7 +235,9 @@ def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
     """The migration's no-retag proof (ADR-0052): knowledge_tree_hash is
     computed with relpaths RELATIVE TO THE TREE ROOT, so the claude compile
     moving from knowledge/dev/ to knowledge/dev/claude/ keeps the pin value
-    byte-identical — no claude worker type re-tags on the layout change."""
+    byte-identical — no claude worker type re-tags on the layout change. The
+    codex-native sections (agents/codex/*.toml roles, hooks/) are claude-blind
+    the same way: adding them moves the codex pin and nothing else."""
     src = source_repo(tmp_path)
     pinned = pinned_dir(tmp_path)
     report = ingest(str(src), pinned, log=lambda *_: None)
@@ -222,6 +245,16 @@ def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
     legacy = tmp_path / "legacy-shaped"
     shutil.copytree(pinned / "knowledge/dev/claude", legacy / "knowledge/dev")
     assert configdist.knowledge_tree_hash(legacy, "dev") == report.knowledge_pins["dev/claude"]
+
+    write(src, "knowledge/dev/agents/codex/grunt.toml", CODEX_ROLE)
+    write(src, "knowledge/dev/hooks/hooks.json", HOOKS_DOC)
+    _commit_all(src, "codex-native sections")
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.knowledge_pins["dev/claude"] == report.knowledge_pins["dev/claude"]
+    assert after.knowledge_pins["dev/codex"] != report.knowledge_pins["dev/codex"]
+    assert not (pinned / "knowledge/dev/claude/agents").exists()
+    assert not (pinned / "knowledge/dev/claude/hooks").exists()
+    assert configdist.knowledge_tree_hash(legacy, "dev") == after.knowledge_pins["dev/claude"]
 
 
 def test_per_tool_compile_skips_empty_filesets(tmp_path):
@@ -231,6 +264,7 @@ def test_per_tool_compile_skips_empty_filesets(tmp_path):
     src = source_repo(tmp_path)
     write(src, "knowledge/wf-only/workflows/pair.md", "review in pairs\n")
     write(src, "knowledge/cdx-only/agents/codex/triage.md", "triage first\n")
+    write(src, "knowledge/hooks-only/hooks/hooks.json", HOOKS_DOC)
     _commit_all(src, "single-tool trees")
     pinned = pinned_dir(tmp_path)
     report = ingest(str(src), pinned, log=lambda *_: None)
@@ -242,6 +276,127 @@ def test_per_tool_compile_skips_empty_filesets(tmp_path):
     assert "cdx-only/claude" not in report.knowledge_pins
     assert not (pinned / "knowledge/cdx-only/claude").exists()
     assert (pinned / "knowledge/cdx-only/codex/prompts/triage.md").is_file()
+    assert "hooks-only/codex" in report.knowledge_pins
+    assert "hooks-only/claude" not in report.knowledge_pins
+    assert (pinned / "knowledge/hooks-only/codex/hooks/hooks.json").is_file()
+
+
+def test_codex_native_roles_and_hooks_land_in_the_codex_view_and_its_pin(tmp_path):
+    """agents/codex/*.toml compiles to the codex view's agents/ and hooks/
+    travels verbatim, exec bits included, both folded into the codex pin
+    (ADR-0052 §1); the deprecated prompts/ surface stays beside them."""
+    src = source_repo(tmp_path, git=False)
+    write(src, "knowledge/dev/agents/codex/triage.md", "triage first\n")
+    write(src, "knowledge/dev/agents/codex/grunt.toml", CODEX_ROLE)
+    write(src, "knowledge/dev/agents/codex/scout.toml", FULL_CODEX_ROLE)
+    write(src, "knowledge/dev/hooks/hooks.json", HOOKS_DOC)
+    guard = src / "knowledge/dev/hooks/guard.sh"
+    guard.write_text("#!/bin/sh\nexit 0\n")
+    guard.chmod(0o755)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, log=lambda *_: None)
+
+    view = pinned / "knowledge/dev/codex"
+    assert (view / "prompts/triage.md").is_file()
+    assert (view / "agents/grunt.toml").read_text() == CODEX_ROLE
+    assert (view / "agents/scout.toml").read_text() == FULL_CODEX_ROLE
+    assert (view / "hooks/hooks.json").read_text() == HOOKS_DOC
+    assert (view / "hooks/guard.sh").stat().st_mode & 0o111
+    codex_pin = report.knowledge_pins["dev/codex"]
+    assert codex_pin == configdist.knowledge_tree_hash(pinned, "dev/codex")
+
+    # Dropping the hook script alone moves the pin: hooks/ is pinned content.
+    guard.unlink()
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.knowledge_pins["dev/codex"] != codex_pin
+    assert not (view / "hooks/guard.sh").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ('name = "grunt"\ndescription = "x"\n', "developer_instructions"),
+        (CODEX_ROLE + 'sandbox_mode = "yolo"\n', r"sandbox_mode: 'yolo' is not one of"),
+        (CODEX_ROLE + '[mcp_servers.docs]\ncomand = "npx"\n', r"mcp_servers\.docs: unknown field"),
+        (CODEX_ROLE + "nickname_candidates = []\n", "at least one name"),
+    ],
+)
+def test_malformed_codex_role_fails_ingest_with_nothing_committed(tmp_path, text, problem):
+    """Role validation is an ingest-time refusal (ADR-0052 §1): codex would
+    warn-and-skip the file at deck startup, silently shrinking the roster.
+    The refusal names the file and the field, and leaves the pinned build
+    exactly as it was — no commit, no dirty staging."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    write(src, "knowledge/dev/agents/codex/grunt.toml", text)
+    _commit_all(src, "a malformed role")
+    with pytest.raises(IngestError, match=r"not a valid knowledge root.*grunt\.toml.*" + problem):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
+
+
+def test_native_role_edits_move_only_the_codex_pin(tmp_path):
+    """Adding, changing, and removing a native role each re-pin the codex
+    view alone; the claude pin never moves, and removing the role returns
+    the codex pin to its earlier value (pins are pure content hashes)."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    claude_pin = before.knowledge_pins["dev/claude"]
+    codex_pin = before.knowledge_pins["dev/codex"]
+    role = src / "knowledge/dev/agents/codex/scout.toml"
+
+    write(src, "knowledge/dev/agents/codex/scout.toml", FULL_CODEX_ROLE)
+    _commit_all(src, "add a role")
+    added = ingest(str(src), pinned, log=lambda *_: None)
+    assert added.knowledge_pins["dev/claude"] == claude_pin
+    assert added.knowledge_pins["dev/codex"] != codex_pin
+    assert (pinned / "knowledge/dev/codex/agents/scout.toml").read_text() == FULL_CODEX_ROLE
+
+    role.write_text(FULL_CODEX_ROLE.replace('"medium"', '"high"'), encoding="utf-8")
+    _commit_all(src, "change the role")
+    changed = ingest(str(src), pinned, log=lambda *_: None)
+    assert changed.knowledge_pins["dev/claude"] == claude_pin
+    assert changed.knowledge_pins["dev/codex"] not in (codex_pin, added.knowledge_pins["dev/codex"])
+
+    shutil.rmtree(src / "knowledge/dev/agents")
+    _commit_all(src, "remove the role")
+    removed = ingest(str(src), pinned, log=lambda *_: None)
+    assert removed.knowledge_pins["dev/claude"] == claude_pin
+    assert removed.knowledge_pins["dev/codex"] == codex_pin
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
+    assert not (pinned / "knowledge/dev/claude/agents").exists()
+
+
+def test_symlinked_codex_namespace_fails_ingest_with_nothing_staged(tmp_path):
+    """A symlinked agents/codex/ pointing outside the tree is refused before
+    any of its content — even a perfectly valid role — can reach staging,
+    the compiled view, or a pin."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    outside = tmp_path / "outside-codex"
+    outside.mkdir()
+    (outside / "leak.toml").write_text(CODEX_ROLE, encoding="utf-8")
+    (src / "knowledge/dev/agents").mkdir(parents=True)
+    (src / "knowledge/dev/agents/codex").symlink_to(outside)
+    _commit_all(src, "symlinked namespace")
+
+    with pytest.raises(
+        IngestError,
+        match=r"knowledge/dev is not a valid knowledge root: agents/ tool namespace is a symlink",
+    ):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
+    assert "leak" not in "".join(str(p) for p in pinned.rglob("*"))
+    assert configrepo.load_pins(pinned).knowledge == before.knowledge_pins
 
 
 def test_reingest_migrates_a_legacy_layout_pinned_build(tmp_path):
@@ -344,7 +499,7 @@ def test_knowledge_that_does_not_compile_is_refused_at_ingest(tmp_path):
     start (ADR-0048). An empty knowledge root is the simplest reject."""
     src = source_repo(tmp_path, git=False)
     (src / "knowledge" / "empty").mkdir()
-    with pytest.raises(IngestError, match="is not a knowledge root"):
+    with pytest.raises(IngestError, match="not a valid knowledge root"):
         ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
 
 

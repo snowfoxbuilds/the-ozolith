@@ -18,7 +18,7 @@ TheOzolith consolidates the coding pipeline, the cluster substrate, and the agen
 theozolith/
 ├── AGENTS.md            # project index    (repo-authored)
 ├── CONTEXT.md           # domain glossary  (repo-authored)
-├── knowledge/           # agent-knowledge machinery: config format (skills, subagents, workflows), per-tool compilers (claude: AGENTS.md -> CLAUDE.md; codex: AGENTS.md verbatim, agents/codex/ -> prompts), sync engine (~/.claude, ~/.codex)
+├── knowledge/           # agent-knowledge machinery: config format (skills, subagents, workflows), per-tool compilers (claude: AGENTS.md -> CLAUDE.md; codex: AGENTS.md verbatim, agents/codex/*.toml -> agents, agents/codex/*.md -> prompts, hooks/ verbatim), sync engine (~/.claude, ~/.codex)
 ├── worker/              # Worker + Reviewer actors: node-resident drivers, agent harness + run-container Dockerfiles, per-Agent adapters, first-party gate
 ├── control/            # Control Node: dashboard, heartbeat/command + run-event API, janitor jobs
 ├── nodedaemon/          # Node Daemon: uncontainerized host daemon (systemd unit) — heartbeat, command reconciliation, local builds, stack + driver supervision

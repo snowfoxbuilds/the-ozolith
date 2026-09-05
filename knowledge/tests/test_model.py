@@ -9,6 +9,12 @@ def test_loads_sample_root(sample_knowledge):
     assert root.agents_md is not None
     assert [s.name for s in root.skills] == ["code-review", "greet"]
     assert [a.name for a in root.claude_agents] == ["planner", "reviewer"]
+    assert [a.name for a in root.codex_agents] == ["triage"]
+    assert [(r.name, r.declared_name) for r in root.codex_agent_roles] == [
+        ("grunt", "grunt"),
+        ("scout", "scout"),
+    ]
+    assert [h.relpath for h in root.hooks] == ["guard.sh", "hooks.json"]
     assert [w.name for w in root.workflows] == ["pair-review.md"]
 
 
@@ -81,7 +87,7 @@ def test_non_md_codex_agent_rejected(tmp_path):
     codex = tmp_path / "agents" / "codex"
     codex.mkdir(parents=True)
     (codex / "helper.txt").write_text("x\n")
-    with pytest.raises(KnowledgeError, match=r"not a \.md file"):
+    with pytest.raises(KnowledgeError, match=r"not a \.md or \.toml file"):
         load_knowledge_root(tmp_path)
 
 
@@ -90,4 +96,69 @@ def test_non_md_claude_agent_rejected(tmp_path):
     claude.mkdir(parents=True)
     (claude / "helper.txt").write_text("x\n")
     with pytest.raises(KnowledgeError, match=r"not a \.md file"):
+        load_knowledge_root(tmp_path)
+
+
+# -- codex hooks: hooks/ (ADR-0052 §1) -------------------------------------------
+
+HOOKS_DOC = '{"hooks": {"PreToolUse": []}}\n'
+
+
+def _hooks(tmp_path, files: dict[str, str]):
+    hooks = tmp_path / "hooks"
+    for rel, text in files.items():
+        target = hooks / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    return hooks
+
+
+def test_hooks_only_root_is_loadable(tmp_path):
+    _hooks(tmp_path, {"hooks.json": HOOKS_DOC, "scripts/guard.sh": "#!/bin/sh\n"})
+    root = load_knowledge_root(tmp_path)
+    assert [h.relpath for h in root.hooks] == ["hooks.json", "scripts/guard.sh"]
+
+
+def test_hooks_without_hooks_json_rejected(tmp_path):
+    _hooks(tmp_path, {"guard.sh": "#!/bin/sh\n"})
+    with pytest.raises(KnowledgeError, match=r"missing hooks\.json"):
+        load_knowledge_root(tmp_path)
+
+
+@pytest.mark.parametrize("text", ["not json\n", "[1, 2]\n", '"string"\n'])
+def test_hooks_json_must_be_a_json_object(tmp_path, text):
+    _hooks(tmp_path, {"hooks.json": text})
+    with pytest.raises(
+        KnowledgeError, match=r"hooks\.json (is not valid JSON|must be a JSON object)"
+    ):
+        load_knowledge_root(tmp_path)
+
+
+def test_symlink_in_hooks_rejected(tmp_path):
+    hooks = _hooks(tmp_path, {"hooks.json": HOOKS_DOC})
+    outside = tmp_path / "outside.sh"
+    outside.write_text("#!/bin/sh\n")
+    (hooks / "guard.sh").symlink_to(outside)
+    with pytest.raises(KnowledgeError, match="hooks/ entry is a symlink"):
+        load_knowledge_root(tmp_path)
+
+
+def test_symlinked_hooks_dir_rejected(tmp_path):
+    real = tmp_path / "real-hooks"
+    real.mkdir()
+    (real / "hooks.json").write_text(HOOKS_DOC)
+    (tmp_path / "hooks").symlink_to(real)
+    with pytest.raises(KnowledgeError, match="hooks/ must be a directory"):
+        load_knowledge_root(tmp_path)
+
+
+def test_hooks_as_a_file_rejected(tmp_path):
+    (tmp_path / "hooks").write_text("{}\n")
+    with pytest.raises(KnowledgeError, match="hooks/ must be a directory"):
+        load_knowledge_root(tmp_path)
+
+
+def test_dot_prefixed_hooks_entry_rejected_not_dropped(tmp_path):
+    _hooks(tmp_path, {"hooks.json": HOOKS_DOC, ".env": "SECRET=1\n"})
+    with pytest.raises(KnowledgeError, match=r"invalid hooks/ entry name '\.env'"):
         load_knowledge_root(tmp_path)

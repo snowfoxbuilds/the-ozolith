@@ -1,0 +1,22 @@
+# A full native role: the codex session-configuration layer rides beside the
+# role metadata and ships byte-for-byte, comments included. Relative paths
+# resolve against this file's directory in the compiled view ($CODEX_HOME/agents/).
+name = "scout"
+description = "Reads the codebase and reports what it finds; never edits."
+developer_instructions = """
+Answer the question you are given from the code alone, with file:line
+references. Never edit and never run the build.
+"""
+nickname_candidates = ["lookout", "ranger"]
+model = "gpt-6-astra"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+
+[mcp_servers.docs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+env = { LOG_LEVEL = "warn" }
+
+[[skills.config]]
+path = "../skills/greet/SKILL.md"
+enabled = true
