@@ -25,6 +25,8 @@ CODEX_ROLE = (
 )
 # A full native role: the codex session-configuration layer (model, effort,
 # sandbox, MCP servers, skills) rides beside the metadata and ships verbatim.
+# Schema-valid is not runtime-effective: at codex 0.153.3 sandbox_mode and
+# mcp_servers are transported, never applied to the child (ADR-0052 §1).
 FULL_CODEX_ROLE = (
     'name = "scout"\ndescription = "Reads the codebase and reports; never edits."\n'
     'developer_instructions = "Answer from the code alone. Never edit."\n'

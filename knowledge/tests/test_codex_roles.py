@@ -1,9 +1,11 @@
 """agents/codex/*.toml — native codex custom agent roles (ADR-0052 §1).
 
 A role file is a codex subagent definition: role metadata flattened over a
-config.toml layer. The loader accepts what codex-cli at the vendored schema
-baseline parses, refuses what codex would warn-and-skip, and ships the
-bytes untouched."""
+config.toml layer. The loader decides *schema validity* — the role-parser
+metadata rules plus the canonical keys of the vendored 0.153.3 config schema
+— and ships the bytes untouched. It promises no parser equivalence (codex's
+serde aliases are refused on purpose), and schema validity says nothing
+about which keys 0.153.3 applies to the child (see codexrole)."""
 
 from __future__ import annotations
 
@@ -146,6 +148,9 @@ def test_full_native_role_loads_and_compiles_byte_for_byte(tmp_path):
     ],
 )
 def test_representative_native_config_layers_load(tmp_path, layer):
+    # Schema-valid means codex can parse the layer and the view transports
+    # it. Which of these keys 0.153.3 applies to the child is a separate,
+    # narrower fact — sandbox_mode, for one, is transported, never applied.
     _role(tmp_path, "grunt.toml", VALID_ROLE + layer)
     assert load_knowledge_root(tmp_path).codex_agent_roles[0].declared_name == "grunt"
 
@@ -288,6 +293,42 @@ def test_pathological_validation_depth_is_a_data_error(tmp_path, monkeypatch):
     monkeypatch.setattr(schemacheck, "check", explode)
     path = _role(tmp_path, "grunt.toml", VALID_ROLE)
     assert str(path) in _rejects(tmp_path, "nests too deeply to validate")
+
+
+# -- schema-valid is not parser-compatible ----------------------------------------
+
+# codex's serde parser accepts these compatibility aliases; the generated
+# schema lists only the canonical keys, and so does Ozolith, on purpose.
+PARSER_ALIASES = [
+    (
+        "[agents]\nmax_threads = 4\n",
+        "[agents]\nmax_concurrent_threads_per_session = 4\n",
+        # Under the schema an unknown [agents] key is an inline role table.
+        "agents.max_threads: expected table, got integer",
+    ),
+    (
+        "[memories]\nno_memories_if_mcp_or_web_search = true\n",
+        "[memories]\ndisable_on_external_context = true\n",
+        "memories: unknown field 'no_memories_if_mcp_or_web_search'",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical", "problem"), PARSER_ALIASES, ids=["agents", "memories"]
+)
+def test_parser_aliases_are_refused_and_canonical_keys_ship_verbatim(
+    tmp_path, alias, canonical, problem
+):
+    path = _role(tmp_path, "grunt.toml", VALID_ROLE + alias)
+    assert str(path) in _rejects(tmp_path, problem)
+    # Refusal is the whole response: the file is never rewritten toward the
+    # canonical spelling, on disk or in a compiled view.
+    assert path.read_text(encoding="utf-8") == VALID_ROLE + alias
+
+    path.write_text(VALID_ROLE + canonical, encoding="utf-8")
+    files = compile_codex(load_knowledge_root(tmp_path), "global")
+    assert files["agents/grunt.toml"].content == (VALID_ROLE + canonical).encode()
 
 
 # -- codex-equivalent normalization ------------------------------------------------

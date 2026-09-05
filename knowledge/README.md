@@ -67,40 +67,55 @@ repo, whose `AGENTS.md` already sits where codex reads it (ADR-0052).
 
 A role file is what codex discovers under `$CODEX_HOME/agents/`: a native subagent definition,
 not a prompt. Its role metadata (`name`, `description`, `nickname_candidates`) sits flattened
-over a complete `config.toml` layer — `developer_instructions`, `model`,
-`model_reasoning_effort`, `sandbox_mode`, `mcp_servers`, `skills.config`, and any other
-`config.toml` key — that codex applies to the subagent it spawns with the role. `name`,
-`description`, and `developer_instructions` are required.
+over a `config.toml` layer — `developer_instructions`, `model`, `model_reasoning_effort`, and
+any other `config.toml` key. `name`, `description`, and `developer_instructions` are required.
+Files are carried byte-for-byte, never rewritten.
 
-The loader accepts what codex-cli at the supported baseline (currently **0.153.3**) accepts and
-refuses what codex would warn-and-skip, so a malformed role fails `validate` or ingest instead
-of silently shrinking a deck's roster:
+The loader validates a role against the supported codex baseline, currently **codex-cli
+0.153.3**, so a malformed role fails `validate` or ingest — naming the file and the field —
+instead of being skipped at deck startup. Three things are easy to conflate here, and the
+contract keeps them apart:
 
-- the metadata follows codex's standalone role parser: `name` is trimmed and must be non-empty
-  (the trimmed value is the role's identity and must be unique across the root), `description`
-  and `developer_instructions` must be non-blank after trimming, and nickname candidates are
+- **Schema-valid** is what Ozolith decides. The configuration layer must use only the canonical
+  keys and value shapes in codex's own `config.toml` JSON Schema at the baseline version,
+  vendored verbatim in the package (`theozolith_knowledge/codex_schema/config.schema.json`) and
+  pinned by digest: the top level is closed, nested tables are open or closed exactly as the
+  schema says, and every value must have the type codex deserializes. The metadata follows
+  codex's standalone role parser: `name` is trimmed and must be non-empty (the trimmed value is
+  the role's identity and must be unique across the root), `description` and
+  `developer_instructions` must be non-blank after trimming, and nickname candidates are
   trimmed, non-blank, unique, and limited to ASCII letters, digits, spaces, hyphens, and
-  underscores;
-- the configuration layer is validated against codex's own `config.toml` JSON Schema at the
-  baseline version, vendored verbatim in the package
-  (`theozolith_knowledge/codex_schema/config.schema.json`) and pinned by digest: the top level
-  is closed, nested tables are open or closed exactly as the schema says, and every value must
-  have the type codex deserializes.
+  underscores.
+- **Parser-compatible** is wider than schema-valid, and is not promised. Codex's parser also
+  accepts compatibility spellings the generated schema does not list — at 0.153.3 the aliases
+  `agents.max_threads` (for `agents.max_concurrent_threads_per_session`) and
+  `memories.no_memories_if_mcp_or_web_search` (for `memories.disable_on_external_context`).
+  Ozolith rejects those aliases on purpose; write the canonical keys.
+- **Runtime-effective** is narrower than schema-valid. A schema-valid key is one codex can
+  parse and the view transports, not one codex necessarily applies to the subagent. At 0.153.3
+  a role layer's effective overrides are exactly `developer_instructions`, `model`,
+  `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`, `personality`,
+  `service_tier`, the supported feature disables (`shell_tool`, `apps`, `personality`,
+  `plugins`, `memory_tool`, or `request_permissions_tool` set to `false` under `[features]`),
+  and the supported skill disables (`skills.config` entries with `enabled = false`, disabled
+  bundled skills, `skills.include_instructions = false`). `sandbox_mode`, `mcp_servers`, and
+  every other key are schema-valid and transported but are **not** effective role overrides at
+  this baseline: the subagent inherits the parent session's runtime permission authority, so
+  `sandbox_mode = "read-only"` in a role is not an enforcement boundary on 0.153.3.
 
-Validation is offline and deterministic — nothing is fetched. Files are carried byte-for-byte,
-never rewritten. Ozolith adds no policy of its own: which keys codex applies to the spawned
-subagent, and how they rank against the parent session's permissions, are codex's runtime
-concerns. Relative paths in a role (`skills.config[].path`, `model_instructions_file`, …) keep
-codex's semantics: codex resolves them against the role file's directory — `~/.codex/agents/`
-once installed — and never checks at load that they exist, so whatever they reference must
-exist in the environment the view lands in.
+Validation is offline and deterministic — nothing is fetched. Ozolith adds no allowlist of its
+own on top of the schema. Relative paths in a role (`skills.config[].path`,
+`model_instructions_file`, …) keep codex's semantics: codex resolves them against the role
+file's directory — `~/.codex/agents/` once installed — and never checks at load that they
+exist, so whatever they reference must exist in the environment the view lands in.
 
 The baseline moves only by a deliberate, versioned update; a key a newer codex adds is refused
 until then. The procedure lives in `codexrole.py`: fetch the tag's
 `codex-rs/core/config.schema.json`, replace the vendored file, record the tag, commit, and
-digest in `CODEX_SCHEMA_BASELINE`, re-read the role parser at that tag, and run the tests — the
-checker refuses schema vocabulary it does not implement, so a schema that outgrows it fails the
-suite rather than validating less.
+digest in `CODEX_SCHEMA_BASELINE`, re-read the role parser, the rejected aliases, and the
+effective override set at that tag, and run the tests — the checker refuses schema vocabulary
+it does not implement, so a schema that outgrows it fails the suite rather than validating
+less.
 
 On a fleet deployment, `theozolith config ingest` runs every registered compiler over each
 Config Repo knowledge tree, writing `knowledge/<name>/<tool>/` into the pinned build with one

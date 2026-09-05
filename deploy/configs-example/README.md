@@ -507,3 +507,9 @@ node has converged that view. A tree that ships native `agents/` roles or
 neither. A role file links verbatim, and a relative path inside one resolves
 against `~/.codex/agents/` on the deck (codex's own rule), so it must name
 something the deck actually has — the view's `../skills/<name>/SKILL.md`, say.
+A role is not a permission boundary at the pinned codex 0.153.3: `sandbox_mode`
+and `mcp_servers` in a role file are validated and transported but never
+applied to the spawned subagent, which inherits the deck session's own
+permission authority — only `developer_instructions`, the model, reasoning
+effort and summary, verbosity, personality, service tier, and feature or skill
+*disables* take effect (the knowledge README lists the exact set).

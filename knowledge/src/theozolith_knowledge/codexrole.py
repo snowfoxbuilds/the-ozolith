@@ -3,15 +3,47 @@
 A role file is what codex-cli discovers under ``$CODEX_HOME/agents/``: a
 native subagent definition, not a prompt. Three role metadata fields —
 ``name``, ``description``, ``nickname_candidates`` — sit flattened over a
-complete ``config.toml`` layer (``developer_instructions``, ``model``,
+``config.toml`` layer (``developer_instructions``, ``model``,
 ``model_reasoning_effort``, ``sandbox_mode``, ``mcp_servers``,
-``skills.config``, ...) that codex applies as a session-configuration layer
-to the subagent it spawns with the role. Which keys of that layer a given
-codex version actually applies to the child, and how they rank against the
-parent session's permissions, are codex's concerns: the file is carried
-byte-for-byte and never rewritten.
+``skills.config``, ...). The file is carried byte-for-byte and never
+rewritten.
 
-The loader mirrors codex-cli's standalone role parser
+The contract is versioned and precise, and it is three different things:
+
+- *Schema-valid* is what this loader decides. The layer must use only the
+  canonical keys and value shapes represented by the vendored
+  ``config.schema.json`` of the supported codex-cli baseline
+  (``CODEX_SCHEMA_BASELINE``) — the schema codex generates from its
+  ``ConfigToml`` type — and the metadata must satisfy the role-parser rules
+  below.
+- *Parser-compatible* is wider, and is not promised. Codex's serde parser
+  also accepts compatibility inputs the generated schema does not list — at
+  0.153.3 the aliases ``agents.max_threads`` (for
+  ``agents.max_concurrent_threads_per_session``) and
+  ``memories.no_memories_if_mcp_or_web_search`` (for
+  ``memories.disable_on_external_context``). Ozolith rejects those aliases
+  on purpose; authors write the canonical keys.
+- *Runtime-effective* is narrower. Schema validity means codex can parse
+  the setting and the view transports it, not that codex applies it to the
+  child. At 0.153.3 ``core/src/agent/role.rs`` applies a bounded override
+  set from a role's layer — ``developer_instructions``, ``model``,
+  ``model_reasoning_effort``, ``model_reasoning_summary``,
+  ``model_verbosity``, ``personality``, ``service_tier``, the supported
+  feature disables (``shell_tool``, ``apps``, ``personality``, ``plugins``,
+  ``memory_tool``, or ``request_permissions_tool`` set to ``false`` under
+  ``[features]``), and the supported skill disables (``skills.config``
+  entries with ``enabled = false``, disabled bundled skills,
+  ``skills.include_instructions = false``) — and nothing else.
+  ``sandbox_mode``, ``mcp_servers``, ``approval_policy``,
+  ``sandbox_workspace_write``, and every other key are schema-valid and
+  transported but are not effective role overrides at this baseline: the
+  child inherits the parent session's runtime permission authority (codex's
+  own ``apply_role_cannot_expand_parent_authority`` and
+  ``apply_role_preserves_parent_sandbox_permissions`` tests pin this), so
+  ``sandbox_mode = "read-only"`` in a role is not an enforcement boundary on
+  0.153.3.
+
+The metadata rules mirror codex-cli's standalone role parser
 (``codex-rs/agent-roles/src/agent_role_config.rs`` at the baseline tag):
 
 - ``name`` is trimmed (Rust ``str::trim``) and must be non-empty; the trimmed
@@ -22,10 +54,10 @@ The loader mirrors codex-cli's standalone role parser
 - ``nickname_candidates``, when present, is a non-empty array whose entries
   are trimmed, non-blank, unique after trimming, and limited to ASCII
   letters, digits, spaces, hyphens, and underscores.
-- Everything else is the configuration layer, validated against the vendored
-  codex ``config.toml`` schema: the file's top level is closed (codex denies
-  unknown fields on the role wrapper), nested tables are open or closed as
-  the schema says, and every value must have the type codex deserializes.
+- Everything else is the configuration layer, checked against the vendored
+  schema: the file's top level is closed (codex denies unknown fields on the
+  role wrapper), nested tables are open or closed as the schema says, and
+  every value must have the type codex deserializes.
 
 Relative paths in the layer (``model_instructions_file``, ``skills.config[].path``,
 ...) keep codex's own semantics: codex resolves them against the role file's
@@ -50,12 +82,15 @@ To move the baseline to codex-cli ``X.Y.Z``:
    github.com/openai/codex and replace ``codex_schema/config.schema.json``
    byte-for-byte.
 2. Record the tag, its commit, and the file's sha256 in
-   ``CODEX_SCHEMA_BASELINE``; re-read ``agent_role_config.rs`` at that tag
-   and fold any change in the metadata rules above into this module.
+   ``CODEX_SCHEMA_BASELINE``. Re-read, at that tag, ``agent_role_config.rs``
+   for the metadata rules, ``core/src/agent/role.rs`` for the effective
+   override set, and the ``#[serde(alias)]`` attributes under
+   ``codex-rs/config`` for the rejected compatibility spellings; restate the
+   three-part contract above for the new version.
 3. Run the knowledge tests: the schema test proves the digest and that the
    checker supports every keyword the new schema uses (``schemacheck``
    refuses vocabulary it does not implement), and the role tests prove the
-   representative roles still load.
+   representative roles still load and the aliases still refuse.
 4. Move the deck example's CLI Pin and the adapter floor in their own
    validated-CLI review; the baseline names what the compiler validates
    against, not what a deck may run.
@@ -142,8 +177,9 @@ def codex_config_schema() -> dict:
 
 
 def parse_codex_role(path: Path) -> CodexRole:
-    """Validate one role file the way codex-cli at the baseline would parse
-    it, refusing anything codex would warn-and-skip. Raises KnowledgeError."""
+    """Decide schema validity for one role file — the baseline's role-metadata
+    rules plus its vendored config schema — and return the trimmed identity.
+    Raises KnowledgeError."""
     what = f"codex agent role {path}"
     try:
         table = tomllib.loads(path.read_bytes().decode("utf-8"))
