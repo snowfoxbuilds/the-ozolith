@@ -5965,15 +5965,15 @@ def test_knowledge_export_is_maintained_updated_and_retired(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], a_hash))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
-    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
     parent_inode = export.stat().st_ino
 
     b_hash, b_data = _knowledge_dist("# v2\n")
     rig.control.config_artifacts[b_hash] = b_data
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v2\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v2\n"
     assert export.stat().st_ino == parent_inode  # the mount anchor never moved
 
     c_hash, c_data = make_config_dist({"drivers/custom/impl.py": "x = 1\n"})
@@ -6000,8 +6000,8 @@ def test_knowledge_only_to_empty_distribution_retires_the_export(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").is_file()
-    assert (export / "other" / "CLAUDE.md").is_file()
+    assert (export / "dev" / "claude" / "CLAUDE.md").is_file()
+    assert (export / "other" / "claude" / "CLAUDE.md").is_file()
     parent_inode = export.stat().st_ino
 
     rig.control.heartbeat_answers.append(dist_response([], ""))
@@ -6032,7 +6032,7 @@ def test_knowledge_export_survives_a_failed_convergence(rig: Rig):
     b_hash, _ = _knowledge_dist("# v2\n")  # desired but never served (409)
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
 
 
 def test_knowledge_export_repairs_local_drift(rig: Rig):
@@ -6043,12 +6043,12 @@ def test_knowledge_export_repairs_local_drift(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    (export / "dev" / "CLAUDE.md").write_text("# vandalized\n")
+    (export / "dev" / "claude" / "CLAUDE.md").write_text("# vandalized\n")
     (export / "stale-extra").mkdir()
 
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# v1\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# v1\n"
     assert not (export / "stale-extra").exists()  # not in the applied tree
 
 
@@ -6084,11 +6084,11 @@ def test_knowledge_recipe_defers_then_builds_once_converged(rig: Rig):
     assert recipe["tag"] in rig.docker.images
 
 
-def test_knowledge_export_serves_the_claude_view_of_a_per_tool_dist(rig: Rig):
-    """ADR-0052: per-tool dists keep each compile under <name>/<tool>/; the
-    deck-facing export flattens to the CLAUDE view (decks are claude-only),
-    so the deck's mount contract — CLAUDE.md at the tree root — never
-    changes across the layout migration."""
+def test_knowledge_export_mirrors_the_per_tool_layout_of_a_dist(rig: Rig):
+    """ADR-0052 §3: per-tool dists keep each compile under <name>/<tool>/ and
+    the deck-facing export mirrors that layout unflattened — every view
+    present, none chosen by the daemon; the deck's selector names one
+    (CLAUDE.md at the claude view root, AGENTS.md at the codex view root)."""
     digest, data = make_config_dist(
         {
             "knowledge/dev/claude/CLAUDE.md": "# claude view\n",
@@ -6100,33 +6100,68 @@ def test_knowledge_export_serves_the_claude_view_of_a_per_tool_dist(rig: Rig):
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# claude view\n"
-    assert (export / "dev" / "skills" / "s" / "SKILL.md").is_file()
-    assert not (export / "dev" / "claude").exists()  # flattened, not nested
-    assert not (export / "dev" / "codex").exists()  # the codex view never exports
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# claude view\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
+    assert (export / "dev" / "codex" / "AGENTS.md").read_text() == "# codex view\n"
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude", "codex"]
+    assert not (export / "dev" / "CLAUDE.md").exists()  # nested, never flattened
+
+    # A second pass over the same dist is a no-op exchange (the tree hash
+    # matches): the mounted child keeps its inode.
+    child_inode = (export / "dev").stat().st_ino
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (export / "dev").stat().st_ino == child_inode
+    assert sum("knowledge export 'dev' updated" in line for line in rig.logs) == 1
 
 
-def test_knowledge_export_keeps_the_legacy_bare_layout_working(rig: Rig):
-    """A pre-ADR-0052 dist (claude compile bare under the tree root) exports
-    exactly as before — the compat window until the operator's next ingest."""
+def test_knowledge_export_wraps_the_legacy_bare_layout_as_the_claude_view(rig: Rig):
+    """A pre-ADR-0052 dist (claude compile bare under the tree root — the
+    only legacy shape that can exist) exports under <name>/claude/, so the
+    deck's view selector resolves it exactly like a per-tool dist — the
+    compat window until the operator's next ingest migrates the layout. The
+    wrap is compared as a whole, so an up-to-date export skips the exchange
+    on later passes."""
     digest, data = _knowledge_dist("# legacy\n")
     rig.control.config_artifacts[digest] = data
     rig.control.heartbeat_answers.append(dist_response([], digest))
     rig.daemon.once()
     export = rig.config.knowledge_export_dir
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "skills" / "s" / "SKILL.md").is_file()
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude"]
+    assert not (export / "dev" / "CLAUDE.md").exists()
+    assert not list(export.glob(".*"))  # the staged wrap left no leftovers
+
+    child_inode = (export / "dev").stat().st_ino
+    rig.control.heartbeat_answers.append(dist_response([], digest))
+    rig.daemon.once()
+    assert (export / "dev").stat().st_ino == child_inode
+    assert sum("knowledge export 'dev' updated" in line for line in rig.logs) == 1
+    assert not list(export.glob(".*"))
 
 
 def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
-    """The layout migration is one ordinary export update: same child name,
-    new content, parent inode (the deck bind anchor) untouched."""
+    """The one-time transition (ADR-0052 §3) is ordinary export updates: an
+    older daemon's FLATTENED export is replaced whole by the wrapped legacy
+    view, then by the per-tool mirror — same child name each time, the old
+    flattened children retired, and the parent inode (the deck bind anchor)
+    untouched throughout."""
+    export = rig.config.knowledge_export_dir
+    # What a pre-transition daemon left behind: the claude compile flattened
+    # at the tree root.
+    (export / "dev" / "skills" / "s").mkdir(parents=True)
+    (export / "dev" / "CLAUDE.md").write_text("# flattened\n")
+    (export / "dev" / "skills" / "s" / "SKILL.md").write_text("skill\n")
+    parent_inode = export.stat().st_ino
+
     a_hash, a_data = _knowledge_dist("# legacy\n")
     rig.control.config_artifacts[a_hash] = a_data
     rig.control.heartbeat_answers.append(dist_response([], a_hash))
     rig.daemon.once()
-    export = rig.config.knowledge_export_dir
-    parent_inode = export.stat().st_ino
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# legacy\n"
+    assert sorted(p.name for p in (export / "dev").iterdir()) == ["claude"]  # flattened retired
+    assert export.stat().st_ino == parent_inode
 
     b_hash, b_data = make_config_dist(
         {
@@ -6137,8 +6172,9 @@ def test_knowledge_export_migrates_between_layouts_in_place(rig: Rig):
     rig.control.config_artifacts[b_hash] = b_data
     rig.control.heartbeat_answers.append(dist_response([], b_hash))
     rig.daemon.once()
-    assert (export / "dev" / "CLAUDE.md").read_text() == "# migrated\n"
-    assert not (export / "dev" / "codex").exists()
+    assert (export / "dev" / "claude" / "CLAUDE.md").read_text() == "# migrated\n"
+    assert (export / "dev" / "codex" / "AGENTS.md").read_text() == "# codex\n"
+    assert not (export / "dev" / "CLAUDE.md").exists()
     assert export.stat().st_ino == parent_inode
 
 
@@ -6878,6 +6914,97 @@ def test_cli_applied_evidence_refuses_symlinked_intermediate_directories(
     by_type.unlink()
     os.replace(hijacked, by_type)
     assert applied() == "2.1.260"  # every restoration re-closes the chain
+
+
+def _publish_codex_layout(cli_root: Path, name: str, version: str) -> Path:
+    """The contract's published codex set as the real installer lays it out:
+    the desired record and entry for worker type ``name``, the vendored
+    payload at its prefix-relative paths, and the daemon-created relative
+    link ``codex`` -> ``bin/codex``."""
+    tool_root = cli_root / "codex"
+    by_type = tool_root / "by-type"
+    version_dir = tool_root / version
+    for directory in (
+        tool_root,
+        by_type,
+        version_dir,
+        version_dir / "bin",
+        version_dir / "codex-path",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o755)
+    (by_type / f"{name}.desired").write_text(version + "\n")
+    (by_type / f"{name}.desired").chmod(0o644)
+    (by_type / f"{name}.current").symlink_to(f"../{version}")
+    for rel in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+        (version_dir / rel).write_text(f"binary {version}\n")
+        (version_dir / rel).chmod(0o755)
+    (version_dir / "codex-package.json").write_text("{}\n")
+    (version_dir / "codex").symlink_to("bin/codex")
+    return version_dir
+
+
+def test_cli_applied_evidence_walks_the_vendored_codex_link(rig: Rig, tmp_path):
+    """For a vendored row the published executable is the daemon-created
+    RELATIVE link ``<version>/codex`` -> ``bin/codex``: applied evidence
+    requires exactly that link (never absolute, ``..``-bearing, pointing at
+    another target as an archive-supplied link would, or a regular file in
+    its place), a real world-traversable ``bin`` directory, and a regular
+    world-r+x ``bin/codex`` behind it. An unknown tool has no evidence at all
+    (its install already failed typed)."""
+    cli_root = rig.config.cli_dir
+    version_dir = _publish_codex_layout(cli_root, "codexdeck", "0.153.3")
+    link = version_dir / "codex"
+    binary = version_dir / "bin" / "codex"
+
+    def applied() -> str:
+        return rig.daemon._cli_applied_version(cli_root, "codex", "codexdeck")
+
+    assert applied() == "0.153.3"  # the healthy baseline
+
+    def relink(target) -> None:
+        link.unlink()
+        link.symlink_to(target)
+
+    for wrong in (binary, "../0.153.3/bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+        relink(wrong)
+        assert applied() == "", wrong
+    relink("bin/codex")
+    assert applied() == "0.153.3"
+
+    # A regular file where the link belongs — even a valid-looking binary.
+    link.unlink()
+    link.write_text("binary 0.153.3\n")
+    link.chmod(0o755)
+    assert applied() == ""
+    link.unlink()
+    link.symlink_to("bin/codex")
+    assert applied() == "0.153.3"
+
+    # The target must be a regular world-r+x file; the interior directory a
+    # real world-traversable one (a symlinked bin resolves elsewhere inside
+    # the read-only mount).
+    os.chmod(binary, 0o750)
+    assert applied() == ""
+    os.chmod(binary, 0o755)
+    binary.unlink()
+    assert applied() == ""
+    binary.write_text("binary 0.153.3\n")
+    binary.chmod(0o755)
+    os.chmod(version_dir / "bin", 0o750)
+    assert applied() == ""
+    os.chmod(version_dir / "bin", 0o755)
+    moved = tmp_path / "moved-bin"
+    os.replace(version_dir / "bin", moved)
+    (version_dir / "bin").symlink_to(moved)
+    assert applied() == ""
+    (version_dir / "bin").unlink()
+    os.replace(moved, version_dir / "bin")
+    assert applied() == "0.153.3"  # every restoration re-closes the chain
+
+    # A tool outside the contract: no row, no evidence.
+    os.replace(cli_root / "codex", cli_root / "pi")
+    assert rig.daemon._cli_applied_version(cli_root, "pi", "codexdeck") == ""
 
 
 def test_cli_symlinked_tool_dir_is_repaired_without_touching_the_target(

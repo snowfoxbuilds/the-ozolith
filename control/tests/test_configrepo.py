@@ -747,8 +747,8 @@ def test_driverless_knowledge_selects_the_mount_and_stays_out_of_the_image(tmp_p
     volume-shadowed ~/.claude), the image identity ignores reference and pin
     (a content edit redistributes live, rebuilding and recreating nothing),
     and the resolved Stack carries the selection as THEOZOLITH_KNOWLEDGE_TREE
-    — part of the container spec, so changing the SELECTED TREE recreates the
-    deck."""
+    — the adapter's VIEW path `<tree>/<adapter>` (ADR-0052 §3), part of the
+    container spec, so changing the SELECTED TREE recreates the deck."""
     write_knowledge_tree(tmp_path, "dev")
     write_knowledge_tree(tmp_path, "ops")
     write_pins(tmp_path, knowledge={"dev": "a" * 64, "ops": "b" * 64})
@@ -764,14 +764,14 @@ def test_driverless_knowledge_selects_the_mount_and_stays_out_of_the_image(tmp_p
     recipe = wt.recipe_wire()
     assert recipe["knowledge"] == "" and recipe["knowledge_pin"] == ""
     stack = next(s for s in config.stacks if s.name == "deck")
-    assert stack.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev"
+    assert stack.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev/claude"
 
     # Content edit: the pin moves, the tag does not — live redistribution.
     write_pins(tmp_path, knowledge={"dev": "c" * 64, "ops": "b" * 64})
     after_content = load_config(tmp_path)
     assert after_content.worker_types["flightdeck"].tag == wt.tag
     deck = next(s for s in after_content.stacks if s.name == "deck")
-    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev"  # spec unchanged: no recreate
+    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "dev/claude"  # spec unchanged: no recreate
 
     # Selection edit: the tag still does not move (no image bytes changed),
     # but the injected env does — the container spec changes and the deck is
@@ -784,7 +784,7 @@ def test_driverless_knowledge_selects_the_mount_and_stays_out_of_the_image(tmp_p
     after_selection = load_config(tmp_path)
     assert after_selection.worker_types["flightdeck"].tag == wt.tag
     deck = next(s for s in after_selection.stacks if s.name == "deck")
-    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "ops"
+    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "ops/claude"
 
 
 def test_driverless_knowledge_validation_is_not_weakened(tmp_path):

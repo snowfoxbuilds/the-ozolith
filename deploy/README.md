@@ -958,27 +958,123 @@ lifecycle.)
 **Knowledge is the applied pinned tree, mounted read-only — not a clone, not a
 bake** (ADR-0048; the ADR-0043 writable clone and its promote workflow are
 retired). Knowledge is authored in the Config Repo's `knowledge/<name>/` trees,
-compiled by `theozolith config ingest`, and distributed to nodes with the rest
-of the config. The daemon maintains a stable export at
-`/var/lib/theozolith/knowledge/<name>/`; when the desired distribution becomes
-empty (the Config Repo dropped its last `knowledge/` tree and `drivers/`), the
-export retires with it — a deck never keeps mounting deleted knowledge. The
-deck's worker type SELECTS its tree with `knowledge = "knowledge/<name>"`
-(validated at config load exactly like a driver type's reference: ingested
-pin joined, compiled tree present — a dangling reference refuses the load;
-per-Stack overrides are rejected). Control injects the selection as
-`THEOZOLITH_KNOWLEDGE_TREE`, and `flightdeck-start` points the `~/.claude`
-knowledge directories at that compiled tree — **failing loud when the node has
-not converged it yet** (the daemon's reconcile loop recreates the deck on a
-later pass — roughly the heartbeat cadence — retrying until it has; a deck
-never silently runs without its knowledge):
+compiled by `theozolith config ingest` once per registered tool, and
+distributed to nodes with the rest of the config. The daemon maintains a
+stable export mirroring the pinned build's per-tool layout — one **view** per
+tool under each tree, `/var/lib/theozolith/knowledge/<name>/<tool>/`
+(`<name>/claude`, `<name>/codex`; a pre-per-tool distribution exports as
+`<name>/claude` until the next ingest migrates it; ADR-0052 §3). When the
+desired distribution becomes empty (the Config Repo dropped its last
+`knowledge/` tree and `drivers/`), the export retires with it — a deck never
+keeps mounting deleted knowledge. The deck's worker type SELECTS its tree with
+`knowledge = "knowledge/<name>"` (validated at config load exactly like a
+driver type's reference: ingested pin joined, compiled tree present — a
+dangling reference refuses the load; per-Stack overrides are rejected).
+Control injects the selection as `THEOZOLITH_KNOWLEDGE_TREE` naming the view
+path for the type's adapter — `<name>/claude` for a claude deck — and the
+worker type's start script (the example's `flightdeck-start`) points the
+`~/.claude` knowledge directories at that view, **failing loud unless the view
+marker (`CLAUDE.md`) is a regular file at the selected root** — not converged
+yet, retired, or a selector pointing at the views' parent (the daemon's
+reconcile loop recreates the deck on a later pass — roughly the heartbeat
+cadence — retrying until it converges; a deck never silently runs without its
+knowledge). That guard is part of YOUR Config Repo's worker type, not of the
+product — see the transition below:
 
 ```
-~/.claude/skills     -> /var/lib/theozolith/knowledge/<name>/skills
-~/.claude/agents     -> /var/lib/theozolith/knowledge/<name>/agents
-~/.claude/workflows  -> /var/lib/theozolith/knowledge/<name>/workflows
-~/.claude/CLAUDE.md  -> /var/lib/theozolith/knowledge/<name>/CLAUDE.md
+~/.claude/skills     -> /var/lib/theozolith/knowledge/<name>/claude/skills
+~/.claude/agents     -> /var/lib/theozolith/knowledge/<name>/claude/agents
+~/.claude/workflows  -> /var/lib/theozolith/knowledge/<name>/claude/workflows
+~/.claude/CLAUDE.md  -> /var/lib/theozolith/knowledge/<name>/claude/CLAUDE.md
 ```
+
+The per-tool export, the view-path selector, and the marker guard in the
+deck's start script are **one contract shipped as a one-time breaking
+transition** (ADR-0052 §3) — and only the first two arrive with a TheOzolith
+release. The start script belongs to the Flight Deck worker type in your
+Config Repo (`configs-example/worker-types/flightdeck.toml` is the reference
+copy); installing a release never edits it, and until it carries the
+`CLAUDE.md` guard the pairings are NOT all fail-closed. With the guard: a
+Control that predates the transition injects the bare `<name>` — under the new
+export that is the views' parent, which holds no `CLAUDE.md` — and a daemon
+that predates it exports the flattened claude compile, which has no
+`<name>/claude` view; either pairing refuses the deck start rather than serving
+the wrong tree. Without it, the older `-d` directory test passes on the views'
+parent, so an old Control paired with a new daemon links `~/.claude` into a
+directory that holds no knowledge, and every `claude` launched on that deck
+runs silently without it.
+
+**The ordinary updater cannot put Control ahead of the daemons.**
+`theozolith update` commits the pin and queues an `update` command for every
+node in the same call; each Node Daemon — the Control host's included —
+self-updates on its next heartbeat, while the running
+`theozolith-control.service` keeps the old code until you restart it by hand
+(ADR-0051; no product path restarts it for you). Nothing holds the daemons
+back or moves Control alone. So on the release path the daemons move first
+and Control last — the one order the guard cannot make safe: the new
+daemon's export migration leaves a running deck's old links dangling, and an
+old Control recreating a deck against the new daemon selects the views'
+parent (refused with the guard, silent without it). The supported release
+procedure therefore takes the claude decks down for the window:
+
+1. **Guard the start scripts first.** Copy or adapt the `CLAUDE.md` marker
+   guard from the example start script into every deployed claude Flight
+   Deck worker type, commit, and run `theozolith config ingest` while the
+   old flattened export is still active. Under the old selector and export
+   the marker sits at the selected root, so the guarded script starts decks
+   exactly as before — the guard is backward-compatible.
+2. **Stop the affected Flight Decks**: `theozolith command drain --node
+   <node> --target <stack>` for every claude deck Stack — always name the
+   target, a bare drain takes down every Stack on the node, drivers
+   included. The drain mark persists on the node across the daemon's
+   self-update and every reconcile pass, so the deck stays down until you
+   recycle it, and no agent-CLI launch can meet a mixed pairing. The deck's
+   state and workspace volumes are untouched.
+3. **Run the normal product update**: `theozolith update` (`--version` for
+   an explicit release; `sudo theozolith build` from a checkout), then, once
+   `theozolith status` shows the Control host's node on the pinned version,
+   `sudo systemctl restart theozolith-control.service`.
+4. **Wait for convergence**: every deck-hosting node on the pinned version
+   in `theozolith status`, the Control service restarted onto it, and for
+   each claude worker type the desired and applied CLI versions equal. The
+   daemon upgrade re-downloads each pinned claude CLI version once — a
+   version directory published by an older daemon holds only the binary,
+   not the contract's full published set — and until the pin converges a
+   new `claude` launch would refuse (ADR-0055).
+5. **Verify the selected view.** On a deck-hosting node `CLAUDE.md` is a
+   regular file at `/var/lib/theozolith/knowledge/<name>/claude/CLAUDE.md`.
+   Recycle one deck (`theozolith command recycle --node <node> --target
+   <stack>` clears its drain mark and recreates it against the new
+   selector), then confirm inside it that the `~/.claude` knowledge links
+   resolve under `<name>/claude` and that the type's desired and applied CLI
+   records agree.
+6. **Resume the decks**: recycle the rest the same way. Each deck is
+   recreated exactly once.
+
+**Control first is possible only from a source checkout.** The install-only
+step `sudo python3 build.py --no-publish` puts the new code into the Control
+host's venv without touching the pin, so `sudo systemctl restart
+theozolith-control.service` runs the new Control while every daemon stays on
+the old release; `sudo theozolith build` from the same checkout then
+publishes, pins, and fans out. In that order the guard does the draining for
+you: the new selector recreates each claude deck, which fails closed against
+its not-yet-upgraded daemon and stays down until that daemon converges (down,
+not wrong) — steps 4 and 5 still apply before use. The release path has no
+equivalent: `theozolith update` cannot pin Control without pinning the fleet.
+
+**Rollback and recovery.** Knowledge exports and CLI installs are derived
+state — a daemon re-derives both from the applied distribution, and a version
+directory published by the new daemon is a superset an older daemon still
+serves — but rolling only ONE component backward is not safe: an old Control
+against the new daemon and guarded script refuses every claude deck (down, not
+wrong); a new Control against an old daemon refuses too; an unguarded script
+against the new daemon and an old Control is the silent-no-knowledge case
+above. To roll back, drain the claude decks again, re-pin the fleet to the
+previous release (`theozolith update --version <previous>`), restart the
+Control service onto it, let the exports re-derive, and only then recycle the
+decks; the guarded start script can stay — it is backward-compatible. To
+recover a stalled transition, complete it — finish steps 3 to 6 — rather than
+back out one half.
 
 An edit lands by editing the Config Repo, committing, and running
 `theozolith config ingest`; it reaches **every deck on every node** through

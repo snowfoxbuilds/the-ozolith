@@ -115,7 +115,8 @@ class DaemonConfig:
     @property
     def cli_dir(self) -> Path:
         # The CLI Pin store (ADR-0055): per tool, fail-closed-installed
-        # version dirs (<tool>/<version>/claude) plus the per-worker-type
+        # version dirs (<tool>/<version>/<published name>, the CLI archive
+        # contract's closed published set) plus the per-worker-type
         # by-type/ records (.desired the moment config applies, .current only
         # post-install). Flight Decks read-only bind-mount this parent
         # (default /var/lib/theozolith/cli); the daemon creates it every pass

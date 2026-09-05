@@ -1425,12 +1425,13 @@ class NodeDaemon:
     def _export_knowledge(self) -> None:
         """Maintain the STABLE deck-facing knowledge export at
         ``<state>/knowledge`` from the verified applied distribution: one
-        child directory per compiled tree, each swapped whole through the
-        same crash-recoverable exchange the applied tree uses. Flight Decks
-        read-only bind-mount the stable parent (ADR-0048) — the parent inode
-        never moves, so a swap never changes the container spec (no recreate,
-        no killed tmux session); a running agent keeps what it loaded and
-        picks up the new trees on agent-CLI restart.
+        child directory per compiled tree holding its per-tool views
+        (``<name>/<tool>/``, ADR-0052 §3), each tree swapped whole through
+        the same crash-recoverable exchange the applied tree uses. Flight
+        Decks read-only bind-mount the stable parent (ADR-0048) — the parent
+        inode never moves, so a swap never changes the container spec (no
+        recreate, no killed tmux session); a running agent keeps what it
+        loaded and picks up the new trees on agent-CLI restart.
 
         Non-converged (empty applied hash while a distribution IS desired)
         leaves the existing export alone — advisory skew: the deck keeps the
@@ -1452,25 +1453,25 @@ class NodeDaemon:
             source_root = self._config.config_dist_dir / applied / configdist.KNOWLEDGE_DIR
         export = self._config.knowledge_export_dir
         try:
-            desired: dict[str, Path] = {}
+            desired: dict[str, tuple[Path, bool]] = {}  # name -> (source tree, legacy bare)
             if source_root is not None and source_root.is_dir() and not source_root.is_symlink():
                 with os.scandir(source_root) as it:
                     for entry in sorted(it, key=lambda e: e.name):
                         if not entry.is_dir(follow_symlinks=False):
                             continue
-                        # The export serves the CLAUDE view of each tree
-                        # (ADR-0052): Flight Decks bind-mount it, and decks
-                        # are claude-only. Per-tool dists keep the claude
-                        # compile under <name>/claude/; a pre-ADR-0052 dist
-                        # keeps it bare under <name>/ (exported as before).
-                        # A tree with no claude view (codex-only content)
-                        # exports its bare form too — harmless: no deck can
-                        # select it (control refuses the pin join).
-                        claude_view = Path(entry.path) / "claude"
-                        if claude_view.is_dir() and not claude_view.is_symlink():
-                            desired[entry.name] = claude_view
-                        else:
-                            desired[entry.name] = Path(entry.path)
+                        # The export MIRRORS the applied distribution's
+                        # per-tool layout (ADR-0052 §3): export/<name>/<tool>/
+                        # for every compiled view, adapter-blind — the daemon
+                        # never chooses a view; the deck's selector names one.
+                        # A pre-ADR-0052 dist keeps its claude compile bare at
+                        # the tree root (its CLAUDE.md is always there), so a
+                        # root holding any non-directory child is that legacy
+                        # shape and is wrapped under claude/ — the compat
+                        # window until the operator's next ingest migrates
+                        # the layout.
+                        with os.scandir(entry.path) as children:
+                            legacy = any(not c.is_dir(follow_symlinks=False) for c in children)
+                        desired[entry.name] = (Path(entry.path), legacy)
             if not desired and not export.is_dir():
                 return  # nothing to export and nothing stale to retire
             export.mkdir(parents=True, exist_ok=True)
@@ -1479,19 +1480,31 @@ class NodeDaemon:
         except OSError as exc:
             self._log(f"knowledge export enumeration failed: {exc}")
             return
-        for name, source in desired.items():
+        for name, (source, legacy) in desired.items():
             target = export / name
+            staging = export / f".{name}.tmp"
             try:
-                source_hash = configdist.tree_hash(source)
+                self._reclaim(staging)
+                if legacy:
+                    # The wrap is staged first and compared as a whole, so
+                    # an up-to-date legacy export skips the exchange (at the
+                    # price of one per-pass copy, bounded to the compat
+                    # window).
+                    staging.mkdir()
+                    os.chmod(staging, 0o755)
+                    shutil.copytree(source, staging / "claude", symlinks=False)
+                    source_hash = configdist.tree_hash(staging)
+                else:
+                    source_hash = configdist.tree_hash(source)
                 try:
                     up_to_date = configdist.tree_hash(target) == source_hash
                 except configdist.ConfigDistError:
                     up_to_date = False  # malformed export tree: re-export it
                 if up_to_date:
+                    self._reclaim(staging)
                     continue
-                staging = export / f".{name}.tmp"
-                self._reclaim(staging)
-                shutil.copytree(source, staging, symlinks=False)
+                if not legacy:
+                    shutil.copytree(source, staging, symlinks=False)
                 self._exchange_config_dist_tree(staging, target)
                 self._log(f"knowledge export {name!r} updated ({source_hash[:12]})")
             except (OSError, configdist.ConfigDistError) as exc:
@@ -1878,11 +1891,17 @@ class NodeDaemon:
         trailing newlines stripped, the shim's exact ``$(cat)`` parse — names
         the entry symlink's target version (the gate refuses on any mismatch,
         so mid-upgrade skew is no applied version, not the old one), and the
-        binary a regular world-r+x file. The tree mounts into containers
-        running an arbitrary non-root UID — anything less and status would
-        report a convergence launches cannot see. '' when absent, broken,
-        unreadable, malformed, or mismatched; every filesystem error is
-        evidence of absence, never an escape into the heartbeat."""
+        published executable — ``<version>/<published name>`` by the tool's
+        contract row — a regular world-r+x file, or for a vendored row a
+        RELATIVE symlink reading exactly the row's executable member (never
+        absolute, ``..``-bearing, archive-supplied to another target, or a
+        regular file) whose target is that file beneath real directories.
+        The tree mounts into containers running an arbitrary non-root UID —
+        anything less and status would report a convergence launches cannot
+        see. '' when absent, broken, unreadable, malformed, mismatched, or
+        for a tool outside the contract (its install already failed typed);
+        every filesystem error is evidence of absence, never an escape into
+        the heartbeat."""
 
         def lmode(path: Path) -> int:
             # The entry's OWN mode — lstat never follows a symlink (a link is
@@ -1924,10 +1943,32 @@ class NodeDaemon:
         version_dir = tool_root / version
         if not stat.S_ISDIR(lmode(version_dir)):
             return ""
-        binary = version_dir / cliinstall.CLI_BINARY_NAME
+        row = cliinstall.CLI_ARCHIVE_CONTRACT.get(tool)
+        if row is None:
+            return ""
+        published = version_dir / row.published_name
+        directories = [cli_root, tool_root, by_type, version_dir]
+        if row.vendored:
+            if not stat.S_ISLNK(lmode(published)):
+                return ""
+            try:
+                target = os.readlink(published)
+            except OSError:
+                return ""
+            if target != row.executable_member:
+                return ""
+            binary = version_dir
+            for part in row.executable_member.split("/")[:-1]:
+                binary = binary / part
+                if not stat.S_ISDIR(lmode(binary)):
+                    return ""
+                directories.append(binary)
+            binary = binary / row.executable_member.rsplit("/", 1)[-1]
+        else:
+            binary = published
         if not stat.S_ISREG(lmode(binary)):
             return ""
-        for directory in (cli_root, tool_root, by_type, version_dir):
+        for directory in directories:
             if not grants(directory, 0o001):
                 return ""
         if not grants(binary, 0o005):
