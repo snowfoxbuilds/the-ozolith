@@ -20,8 +20,11 @@ A *knowledge root* is a directory of pure data:
 ├── agents/
 │   ├── claude/          # subagent files, namespaced per tool
 │   │   └── <name>.md
-│   └── codex/           # codex custom-prompt sources
+│   └── codex/           # codex custom agent roles (native) and custom prompts (deprecated)
+│       ├── <name>.toml
 │       └── <name>.md
+├── hooks/               # codex hooks: hooks.json plus the scripts it references
+│   └── hooks.json
 └── workflows/
     └── <name>[.md]      # one file or folder per workflow
 ```
@@ -43,6 +46,9 @@ ADR-0052). Each tool has a default global-scope destination: `~/.claude` for cla
 | `agents/claude/<name>.md` | `<target>/agents/<name>.md` | `<target>/.claude/agents/<name>.md` |
 | `workflows/<name>` | `<target>/workflows/<name>` | `<target>/.claude/workflows/<name>` |
 
+`agents/codex/` and `hooks/` are codex-only sections: the claude view is byte-identical with
+or without them.
+
 ### Codex compiler mapping (`--tool codex`)
 
 **Global scope only** — project scope is rejected: in a project the knowledge root *is* the
@@ -52,7 +58,9 @@ repo, whose `AGENTS.md` already sits where codex reads it (ADR-0052).
 | --- | --- |
 | `AGENTS.md` | `<target>/AGENTS.md` (verbatim — it IS the canonical format; no generated marker) |
 | `skills/<name>/` | `<target>/skills/<name>/` (verbatim — codex consumes the same skills format) |
-| `agents/codex/<name>.md` | `<target>/prompts/<name>.md` (codex custom prompts) |
+| `agents/codex/<name>.toml` | `<target>/agents/<name>.toml` (codex custom agent roles, verbatim; validated at load against the codex role schema — closed field set, unique `name`s) |
+| `agents/codex/<name>.md` | `<target>/prompts/<name>.md` (codex custom prompts — deprecated upstream, kept so existing views stay byte-stable) |
+| `hooks/` | `<target>/hooks/` (verbatim; `hooks.json` is required and must be a JSON object, its scripts travel with it) |
 | `workflows/<name>` | omitted — no codex equivalent (visible in `validate`'s per-tool counts) |
 
 On a fleet deployment, `theozolith config ingest` runs every registered compiler over each
