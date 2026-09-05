@@ -56,7 +56,11 @@ that path is refused at ingest.
 `knowledge/claude-dev/` is a knowledge root (ADR-0009 layout: `AGENTS.md`,
 `skills/`, optionally `agents/<tool>/`, `workflows/`) referenced by worker
 types as `knowledge = "knowledge/claude-dev"` — the name is an arbitrary
-label. Ingest compiles the tree **once per tool** (ADR-0052): the claude
+label. This example also ships `knowledge/codex-dev/` (`AGENTS.md` + one
+skill), the tree the codex Flight Deck selects; keeping it separate from
+`claude-dev` is this example's convention, not a rule — a tree is compiled
+for every registered tool, so a codex deck could select `claude-dev` just as
+well. Ingest compiles the tree **once per tool** (ADR-0052): the claude
 view (`AGENTS.md` → `CLAUDE.md`, skills, `agents/claude/`, workflows) and
 the codex view (`AGENTS.md` verbatim, skills shared, `agents/codex/` →
 prompts; codex has no workflows target) each get their own content-hash pin
@@ -448,3 +452,40 @@ decommissioning the deck — or to deliberately revoke everything it retains.
 container-local at `~/.claude.json`, outside every volume, and is gone with
 the replaced container — it cannot be migrated. Run one deliberate `/login`
 in the first session on the new layout; every recreation after that keeps it.
+
+## Flight Deck — the codex adapter
+
+`worker-types/flightdeck-codex.toml` is the same interactive Flight Deck on the
+**codex** adapter instead of claude. It shares the whole shape of the claude
+deck above — the tmux attach session, the one-hop tailscale access, the
+GitHub machine identity and workspace clone, the read-only knowledge and CLI
+exports, and the fail-closed CLI shim — so everything in those sections applies.
+Only the codex-specific pieces differ:
+
+- **Login is a human step inside the deck.** codex authenticates with `codex
+  login --device-auth`, run once in the deck's session — there is deliberately
+  no credential secret (no `ANTHROPIC_API_KEY`, no auth-JSON slot). Device-code
+  authorization must be enabled on the ChatGPT account you log in with. Each
+  deck **instance** logs in once.
+- **The credential lives and rotates on the state volume.** The login lands in
+  `~/.codex/auth.json` on the per-deck `{stack}-codex-state` volume (the codex
+  analogue of `{stack}-claude-state`), where the CLI **rotates it in place**.
+  Treat that volume as secret-bearing durable state, exactly as the claude-state
+  volume above. **Never copy `auth.json` between decks:** a copied refresh token
+  is single-use and is invalidated the moment the original rotates.
+- **The model is a default, not a lock.** `model = "gpt-6-astra"` is written to
+  `/etc/theozolith/model` and begins every session there; the human may switch
+  models in-session, and a restart resets to the default. There is no `effort`
+  (driverless types have no effort consumer) and no Agent Policy (codex has no
+  managed-settings tier).
+- **The pinned CLI may postdate the run image's.** `cli = "0.153.3"` is what the
+  deck actually launches through the shim; the codex run image ships its own
+  pinned codex (`0.150.0`). That gap is expected — a floor move (raising the
+  adapter's enforcement floor and the image) is a separate validated-CLI review,
+  not something this pin does.
+
+Knowledge links the same way as the claude deck, into the codex view: the deck
+selects `knowledge/codex-dev` and `flightdeck-start` symlinks the view's
+`AGENTS.md`, `skills/`, and (deprecated but still searched) `prompts/` into
+`~/.codex`, plus `skills/` into `~/.agents/skills`, failing loud until the
+node has converged that view.

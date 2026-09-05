@@ -1,0 +1,406 @@
+# The codex Flight Deck worker type (ADR-0019/ADR-0043/ADR-0052): a DRIVERLESS
+# type — the absence of `driver` is the discriminator — running the CODEX
+# adapter instead of claude. It is the structural twin of flightdeck.toml: the
+# same interactive container, the same tmux/tailscale/GitHub/workspace setup,
+# the same read-only knowledge/CLI exports and the same fail-closed CLI shim.
+# Read flightdeck.toml for the full rationale of each shared piece; the
+# comments here call out ONLY the codex deltas.
+#
+# Auth (ADR-0052 §5): codex authenticates with a HUMAN `codex login
+# --device-auth` run once INSIDE the deck. The credential lands in
+# ~/.codex/auth.json on the {stack}-codex-state volume, where the CLI rotates
+# it in place — so there is deliberately NO CODEX_AUTH_JSON secret slot and no
+# ANTHROPIC_API_KEY. Never copy auth.json between decks: a copied refresh token
+# is single-use and is invalidated the moment the original rotates.
+#
+# Knowledge & state (ADR-0043/ADR-0052 amendment): ~/.codex is the per-deck
+# {stack}-codex-state volume (runtime state + the human's auth + config.toml).
+# The knowledge field selects a tree; control injects the tree's CODEX view
+# path (`<tree>/codex`) as THEOZOLITH_KNOWLEDGE_TREE and flightdeck-start
+# symlinks AGENTS.md, skills/, and the deprecated prompts/ into ~/.codex,
+# failing loud unless the view marker (AGENTS.md) is present. skills/ is also
+# linked into ~/.agents (the non-deprecated location codex also searches).
+#
+# No Agent Policy: codex has no managed-settings tier (ADR-0055), so a codex
+# type declares no `policy`. The policy export mount is still present (mirroring
+# the claude deck's volume set) but unused.
+
+# No `driver` -> Flight Deck. The codex run image ships `codex`, git, and
+# `theozolith-knowledge`; setup adds tmux and the interactive tool set.
+# Tag-only: ingest resolves and pins the digest (ADR-0048).
+base = "ghcr.io/snowfoxbuilds/theozolith-run-codex:main"
+adapter = "codex"
+
+# The knowledge SELECTION (ADR-0048/ADR-0052): control derives the CODEX view
+# path `<tree>/codex` from this type's adapter and delivers it as
+# THEOZOLITH_KNOWLEDGE_TREE. A separate codex-dev tree is this example's
+# convention, not a rule — a tree is compiled for every registered tool, so a
+# codex deck could select knowledge/claude-dev just as well.
+knowledge = "knowledge/codex-dev"
+
+# The CLI Pin (ADR-0055): an exact npm version of @openai/codex this deck
+# launches through the fail-closed shim baked below. Declared but NOT
+# identity-bearing. This MAY postdate the run image's own pinned codex (0.150.0)
+# — the pinned CLI is what the deck actually launches; a floor move (raising
+# CodexAdapter.MIN_ENFORCING_CLI and the Dockerfile) is a separate validated-CLI
+# review, out of scope here.
+cli = "0.153.3"
+
+# The deck's DEFAULT model (ADR-0045 §4/ADR-0052 §4). Control appends an
+# interactive-scope materialize step: the build validates the ID and writes it
+# to the root-owned /etc/theozolith/model (nothing else — no config.toml,
+# nothing under ~/.codex). flightdeck-start turns it into a guarded
+# `codex --model "$(cat /etc/theozolith/model)"`; the human may switch models
+# in-session, and a restart resets to this default. No `effort` — driverless
+# types have no effort consumer (ADR-0045).
+model = "gpt-6-astra"
+
+setup = [
+    # (1) tmux + curl + mosh/locales + the GitHub CLI + the interactive tool
+    #     set + passwordless sudo, IDENTICAL to the claude deck (see
+    #     flightdeck.toml step (1) for the full rationale).
+    '''apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
+apt-get update && \
+apt-get install -y --no-install-recommends tmux mosh locales gh jq ripgrep less procps vim nano unzip zip openssh-client sudo iproute2 iptables && \
+echo "ozolith ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ozolith && chmod 0440 /etc/sudoers.d/ozolith && \
+sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen && \
+rm -rf /var/lib/apt/lists/*''',
+
+    # (2) Tailscale static binaries, pinned by version AND sha256 — IDENTICAL to
+    #     the claude deck (see flightdeck.toml step (2)). FAIL-CLOSED: paste the
+    #     official checksum for your arch/version before the build will pass.
+    '''TS_VERSION=1.102.2; TS_ARCH=amd64; \
+TS_SHA256=0000000000000000000000000000000000000000000000000000000000000000; \
+curl -fsSL -o /tmp/ts.tgz "https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz" && \
+echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - && \
+tar -xzf /tmp/ts.tgz -C /tmp && \
+install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscale"  /usr/local/bin/tailscale && \
+install -m 0755 "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}/tailscaled" /usr/local/bin/tailscaled && \
+rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_${TS_ARCH}"''',
+
+    # (3) One-hop ssh username alias — IDENTICAL to the claude deck (see
+    #     flightdeck.toml step (3)): edit FLIGHTDECK_SSH_USER to your laptop
+    #     username so bare `ssh <FLIGHTDECK_TS_HOSTNAME>` lands here.
+    '''FLIGHTDECK_SSH_USER=ozolith; \
+if [ "$FLIGHTDECK_SSH_USER" != ozolith ]; then \
+  useradd --non-unique --uid "$(id -u ozolith)" --gid "$(id -g ozolith)" \
+    --home-dir /home/ozolith --no-create-home --shell /bin/bash "$FLIGHTDECK_SSH_USER"; \
+fi''',
+
+    # (4) Seed the named-volume mountpoints ozolith-owned. Same as the claude
+    #     deck, but the per-deck runtime-state volume is ~/.codex (not
+    #     ~/.claude): its ownership is what lets the session write codex state,
+    #     the auth.json a `codex login --device-auth` creates, and config.toml.
+    "mkdir -p /home/ozolith/.codex /var/lib/tailscale /workspace && chown ozolith:ozolith /home/ozolith/.codex /var/lib/tailscale /workspace",
+
+    # (5) /etc/tmux.conf, VERBATIM from snow-maker dev-dockers/tmux.conf —
+    #     IDENTICAL to the claude deck (see flightdeck.toml step (5)); the mouse
+    #     and OSC 52 lines are load-bearing for scroll/copy over mosh.
+    '''printf '%s\n' \
+'# Baked into the image as /etc/tmux.conf by the flightdeck-codex worker-type setup.' \
+'# Source: snow-maker dev-dockers/tmux.conf, kept VERBATIM below (only this' \
+'# provenance header differs) - the mouse and OSC 52 lines are load-bearing' \
+'# for scroll and copy over mosh, and easy to get subtly wrong.' \
+'' \
+'# Wheel scrolls tmux history and drag selects text. Without mouse mode the' \
+'# terminal falls back to "alternate scroll" and the wheel sends arrow keys.' \
+'set -g mouse on' \
+'' \
+'# Copy selections to the local system clipboard via OSC 52, which mosh >= 1.4' \
+'# forwards. The terminal-features line makes tmux emit OSC 52 even though' \
+"# mosh's plain xterm-256color terminfo lacks the Ms capability." \
+'set -g set-clipboard on' \
+"set -as terminal-features ',*:clipboard'" \
+'' \
+"# tmux's own copies (copy-mode, load-buffer -w) emit OSC 52 with an empty" \
+'# selection-target field ("\e]52;;..."), which mosh 1.4 discards — only an' \
+"# explicit target (\"\e]52;c;...\") survives. This Ms override prints tmux's" \
+'# flags when present and falls back to a literal "c" when they are empty.' \
+'# The simpler "Ms=\E]52;c;%p2%s\007" does NOT work: tparm silently fails on a' \
+'# format that never references %p1, and tmux then emits nothing at all.' \
+"set -as terminal-overrides ',*:Ms=\E]52;%?%p1%l%t%p1%s%ec%;;%p2%s\007'" \
+'' \
+'set -g mode-keys vi' \
+'set -g history-limit 50000' \
+'' \
+'bind -T copy-mode-vi v     send-keys -X begin-selection' \
+'bind -T copy-mode-vi y     send-keys -X copy-selection-and-cancel' \
+'bind -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel' \
+'bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel' \
+'' \
+'# Middle-click pastes the most recent tmux buffer' \
+'bind -T root MouseDown2Pane paste-buffer -p' \
+> /etc/tmux.conf''',
+
+    # (6) Interactive-shell defaults, mirroring the claude deck (see
+    #     flightdeck.toml step (6)) with the codex deltas: CODEX_HOME (=codex's
+    #     default ~/.codex, exported so login shells, the tmux server, and the
+    #     codex session agree) in place of CLAUDE_CONFIG_DIR; the shim goes
+    #     first on PATH when THEOZOLITH_WORKER_TYPE is set, but NO
+    #     DISABLE_AUTOUPDATER (codex has no such switch — check_for_update is a
+    #     config.toml key seeded by flightdeck-start); no claude-long alias.
+    '''printf '%s\n' \
+'# Baked by the flightdeck-codex worker-type setup: defaults for every' \
+'# interactive shell, so a tailscale ssh login and a tmux window see the same' \
+'# codex environment as the flightdeck-start session.' \
+'export CODEX_HOME=/home/ozolith/.codex' \
+': "${LANG:=en_US.UTF-8}"; export LANG' \
+'# CLI Pin launch path (ADR-0055), conditional on the pin: only a deck whose' \
+'# worker type declares cli gets the shim first on PATH (it enforces' \
+'# entry == desired at every launch). codex has no autoupdater env switch.' \
+'if [ -n "${THEOZOLITH_WORKER_TYPE:-}" ]; then PATH="/opt/theozolith-deck/bin:$PATH"; export PATH; fi' \
+'# Runtime values from flightdeck-start (the workspace checkout path).' \
+'[ -r /home/ozolith/.flightdeck-env ] && . /home/ozolith/.flightdeck-env' \
+'# Interactive login shells (ssh/mosh sessions) open in the workspace.' \
+'if [ -n "${WORKSPACE_DIR:-}" ] && [ -d "$WORKSPACE_DIR" ] && shopt -q login_shell 2>/dev/null; then case "$-" in *i*) cd "$WORKSPACE_DIR" ;; esac; fi' \
+> /etc/profile.d/flightdeck.sh \
+&& printf '%s\n' '. /etc/profile.d/flightdeck.sh' >> /etc/bash.bashrc''',
+
+    # (7) Write /usr/local/bin/flightdeck-start (chmod +x). Structurally the
+    #     claude deck's start script (flightdeck.toml step (7)) with the codex
+    #     deltas: the codex view marker (AGENTS.md), the ~/.codex + ~/.agents
+    #     link set, NO policy section, CLI_ROOT under cli/codex, the config.toml
+    #     seed in place of the .claude.json seed, and a `codex --sandbox
+    #     danger-full-access` launch line. The whole tailscale/GitHub/workspace
+    #     lifecycle is kept verbatim from the claude deck.
+    '''printf '%s\n' \
+'#!/bin/sh' \
+'set -eu' \
+'# ADR-0052: knowledge is the node-applied pinned tree, mounted read-only at' \
+'# /var/lib/theozolith/knowledge as one VIEW per tool (<tree>/claude,' \
+'# <tree>/codex). The worker-type knowledge field selects the tree; control' \
+'# injects the CODEX view path as THEOZOLITH_KNOWLEDGE_TREE. FAIL LOUD unless' \
+'# the codex view marker AGENTS.md is a regular file at that root: a bare' \
+'# directory test cannot tell a converged view from the views PARENT (an' \
+'# old-control selector), and linking the parent would silently give the deck' \
+'# no knowledge. The daemon reconcile loop recreates the deck on a later pass' \
+'# (~heartbeat cadence), retrying until the node converges.' \
+': "${THEOZOLITH_KNOWLEDGE_TREE:?flightdeck-start: THEOZOLITH_KNOWLEDGE_TREE is missing - the worker type must declare knowledge (ADR-0048)}"' \
+'KNOWLEDGE_TREE_DIR="/var/lib/theozolith/knowledge/${THEOZOLITH_KNOWLEDGE_TREE}"' \
+'if [ ! -f "$KNOWLEDGE_TREE_DIR/AGENTS.md" ]; then' \
+'  echo "flightdeck-start: knowledge view $KNOWLEDGE_TREE_DIR is not available on this node (AGENTS.md missing - config distribution not converged, the tree was retired, or THEOZOLITH_KNOWLEDGE_TREE=$THEOZOLITH_KNOWLEDGE_TREE points above the per-tool views) - failing loud (ADR-0052)" >&2' \
+'  exit 1' \
+'fi' \
+'# Symlink the codex knowledge set into ~/.codex (AGENTS.md, skills/, and the' \
+'# deprecated-but-still-searched prompts/). Portable replace: a stale link or' \
+'# file is removed and relinked; a REAL directory at the destination is' \
+'# refused. A prompts link that dangles (this tree ships no agents/codex/) is' \
+'# harmless, exactly as the claude deck agents/workflows links may dangle.' \
+'link_knowledge() {' \
+'  if [ -d "$2" ] && [ ! -L "$2" ]; then' \
+'    echo "flightdeck-start: $2 is a real directory; refusing to symlink over it" >&2' \
+'    exit 1' \
+'  fi' \
+'  rm -f "$2" && ln -s "$1" "$2"' \
+'}' \
+'for entry in AGENTS.md skills prompts; do' \
+'  link_knowledge "$KNOWLEDGE_TREE_DIR/$entry" "/home/ozolith/.codex/$entry"' \
+'done' \
+'# ~/.agents/skills is the non-deprecated skills location codex also searches;' \
+'# link the same view skills there. ~/.agents is NOT a volume, so it is created' \
+'# fresh in the container layer on every start.' \
+'mkdir -p /home/ozolith/.agents' \
+'link_knowledge "$KNOWLEDGE_TREE_DIR/skills" "/home/ozolith/.agents/skills"' \
+'# No Agent Policy section: codex has no managed-settings tier (ADR-0055). The' \
+'# policy export mount is present but unused.' \
+'# ADR-0055: the CLI Pin launch path. A deck whose worker type pins a CLI gets' \
+'# THEOZOLITH_WORKER_TYPE injected control-side; the container start refuses' \
+'# loudly (the daemon reconcile loop recreates the deck on a later pass,' \
+'# ~heartbeat cadence, retrying) until the export entry identifies exactly the' \
+'# desired version - the identical check the shim repeats at every later launch' \
+'# - then the shim goes first on PATH for the tmux session. Neither the' \
+'# previous export nor the image CLI is ever a fallback.' \
+'if [ -n "${THEOZOLITH_WORKER_TYPE:-}" ]; then' \
+'  CLI_ROOT="/var/lib/theozolith/cli/codex"' \
+'  CLI_DESIRED=""' \
+'  [ -r "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.desired" ] && CLI_DESIRED=$(cat "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.desired")' \
+'  if [ -z "$CLI_DESIRED" ]; then' \
+'    echo "flightdeck-start: no desired CLI record for worker type ${THEOZOLITH_WORKER_TYPE} on this node (pin not applied yet) - failing loud (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  CLI_ENTRY=$(readlink "$CLI_ROOT/by-type/${THEOZOLITH_WORKER_TYPE}.current" 2>/dev/null || true)' \
+'  if [ "$(basename "${CLI_ENTRY:-x}")" != "$CLI_DESIRED" ]; then' \
+'    echo "flightdeck-start: CLI pin not converged (desired $CLI_DESIRED, export ${CLI_ENTRY:-none}); never the previous export, never the image CLI - failing loud (ADR-0055)" >&2' \
+'    exit 1' \
+'  fi' \
+'  PATH="/opt/theozolith-deck/bin:$PATH"' \
+'  export PATH' \
+'else' \
+'  echo "flightdeck-start: no CLI pin for this deck - the image CLI stays in use (ADR-0055)"' \
+'fi' \
+'# codex session env: CODEX_HOME points ~/.codex at the per-deck state volume' \
+'# (its default location; exported so the tmux server and the codex session' \
+'# inherit it from PID 1, mirroring how the claude deck exports' \
+'# CLAUDE_CONFIG_DIR). LANG backs the UTF-8 locale mosh and tmux expect.' \
+'export CODEX_HOME=/home/ozolith/.codex' \
+'[ -n "${LANG:-}" ] || export LANG=en_US.UTF-8' \
+'# Seed check_for_update_on_startup = false into ~/.codex/config.toml ONLY when' \
+'# no config.toml exists at all: config.toml is the HUMANS file (a `codex login`' \
+'# and any settings live beside it on the state volume), so an existing regular' \
+'# file - zero-byte included - is never rewritten, and a symlink, directory, or' \
+'# other irregular object is refused loudly. Same atomic mktemp-in-the-same-dir' \
+'# + mv discipline as the claude .claude.json seed; the subshell keeps its' \
+'# cleanup trap away from the tailscaled supervision traps set below.' \
+'CODEX_CONFIG=/home/ozolith/.codex/config.toml' \
+'if [ -e "$CODEX_CONFIG" ] || [ -L "$CODEX_CONFIG" ]; then' \
+'  if [ -L "$CODEX_CONFIG" ] || [ ! -f "$CODEX_CONFIG" ]; then' \
+'    echo "flightdeck-start: $CODEX_CONFIG exists but is not a regular file (symlink, directory, ...); refusing to follow or replace it" >&2' \
+'    exit 1' \
+'  fi' \
+'else' \
+'  (' \
+'    tmp=$(mktemp "$CODEX_CONFIG.seed.XXXXXX") || exit 1' \
+'    trap "rm -f \"$tmp\"" EXIT' \
+'    chmod 0600 "$tmp" || exit 1' \
+'    printf "%s\n" "check_for_update_on_startup = false" > "$tmp" || exit 1' \
+'    mv "$tmp" "$CODEX_CONFIG" || exit 1' \
+'  ) || { echo "flightdeck-start: seeding $CODEX_CONFIG failed; leaving the state volume untouched" >&2; exit 1; }' \
+'fi' \
+'# GitHub identity (ADR-0019, snow-maker parity): authenticate gh and git as' \
+'# the dedicated NO-MERGE machine account whose fine-grained PAT rides the' \
+'# GITHUB_TOKEN secret (delivered as GITHUB_TOKEN_FILE). Verbatim from the' \
+'# claude deck.' \
+'if [ -r "${GITHUB_TOKEN_FILE:-/nonexistent}" ]; then' \
+'  gh auth login --with-token < "$GITHUB_TOKEN_FILE"' \
+'  gh auth setup-git' \
+'  gh auth status' \
+'  GH_LOGIN=$(gh api user --jq .login)' \
+'  GH_ID=$(gh api user --jq .id)' \
+'  git config --global user.name "$GH_LOGIN"' \
+'  git config --global user.email "${GH_ID}+${GH_LOGIN}@users.noreply.github.com"' \
+'elif [ -n "${THEOZOLITH_REPO:-}" ]; then' \
+'  echo "flightdeck-start: workspace $THEOZOLITH_REPO is bound but the GITHUB_TOKEN secret is not - restore the flightdeck-github-token binding (or unbind workspace) and restart" >&2' \
+'  exit 1' \
+'else' \
+'  echo "flightdeck-start: no GITHUB_TOKEN bound - gh, git identity, and the workspace stay unconfigured for this deck" >&2' \
+'fi' \
+'# Workspace (snow-maker repo-mount parity): verbatim from the claude deck.' \
+'WORKSPACE_DIR=""' \
+'if [ -n "${THEOZOLITH_REPO:-}" ]; then' \
+'  WORKSPACE_DIR="/workspace/${THEOZOLITH_REPO#*/}"' \
+'  if [ ! -e "$WORKSPACE_DIR" ]; then' \
+'    gh repo clone "$THEOZOLITH_REPO" "$WORKSPACE_DIR"' \
+'  elif [ ! -d "$WORKSPACE_DIR/.git" ]; then' \
+'    echo "flightdeck-start: $WORKSPACE_DIR exists but is not a git checkout; refusing to touch it" >&2' \
+'    exit 1' \
+'  fi' \
+'  export WORKSPACE_DIR' \
+'fi' \
+'if [ -n "$WORKSPACE_DIR" ]; then' \
+'  printf "export WORKSPACE_DIR=%s\n" "$WORKSPACE_DIR" > /home/ozolith/.flightdeck-env' \
+'else' \
+'  : > /home/ozolith/.flightdeck-env' \
+'fi' \
+'# issue #31: one tailnet machine per Flight Deck; uid-1000 userspace tailscaled.' \
+'# The entire enrollment lifecycle is verbatim from the claude deck.' \
+': "${FLIGHTDECK_TS_HOSTNAME:?flightdeck-start: set FLIGHTDECK_TS_HOSTNAME in the Stack env table}"' \
+'if [ -f /var/lib/tailscale/.theozolith-enrolled-v1 ]; then TS_ENROLL=no; else TS_ENROLL=yes; fi' \
+'if [ "$TS_ENROLL" = yes ] && [ ! -r "${TS_AUTHKEY_FILE:-/nonexistent}" ]; then' \
+'  echo "flightdeck-start: fresh tailscale enrollment needs the auth key, but TS_AUTHKEY_FILE is missing or unreadable" >&2' \
+'  echo "flightdeck-start: restore the TS_AUTHKEY binding in the worker-type or Stack [secrets], restart, then re-apply the hardening (configs README)" >&2' \
+'  exit 1' \
+'fi' \
+'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale --socket=/tmp/tailscaled.sock &' \
+'TAILSCALED_PID=$!' \
+'trap "kill $TAILSCALED_PID 2>/dev/null || true" EXIT' \
+'trap "exit 143" TERM' \
+'trap "exit 130" INT' \
+'TS_TRIES=0' \
+'until tailscale --socket=/tmp/tailscaled.sock status --json >/dev/null 2>&1; do' \
+'  kill -0 "$TAILSCALED_PID" 2>/dev/null || { echo "flightdeck-start: tailscaled exited before its LocalAPI answered" >&2; exit 1; }' \
+'  TS_TRIES=$((TS_TRIES + 1))' \
+'  [ "$TS_TRIES" -lt 30 ] || { echo "flightdeck-start: tailscaled LocalAPI not ready after 30 tries" >&2; exit 1; }' \
+'  sleep 1' \
+'done' \
+'if [ "$TS_ENROLL" = yes ]; then' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --auth-key="file:${TS_AUTHKEY_FILE}" --timeout=30s || { echo "flightdeck-start: tailscale enrollment failed (bad or expired key, rejected flags, or 30s timeout)" >&2; exit 1; }' \
+'  echo enrolled > /var/lib/tailscale/.theozolith-enrolled-v1.tmp' \
+'  mv /var/lib/tailscale/.theozolith-enrolled-v1.tmp /var/lib/tailscale/.theozolith-enrolled-v1' \
+'else' \
+'  tailscale --socket=/tmp/tailscaled.sock up --ssh --hostname="$FLIGHTDECK_TS_HOSTNAME" --timeout=30s || { echo "flightdeck-start: tailscale up on existing state failed (error or 30s timeout)" >&2; exit 1; }' \
+'fi' \
+'mkdir -p /var/log/flightdeck' \
+'# ADR-0052 §4: start the session at the image-baked default model. The build' \
+'# validated the ID; the flag begins every start at this default while the' \
+'# human can switch models in-session. --sandbox danger-full-access because the' \
+'# container IS the sandbox (ADR-0013) and codex own Landlock sandbox is' \
+'# unavailable inside it. Bare codex when no model was baked (file absent or' \
+'# empty). The session opens in the workspace checkout when one is bound.' \
+'if [ -s /etc/theozolith/model ]; then' \
+'  tmux new-session -d -s flightdeck -c "${WORKSPACE_DIR:-/home/ozolith}" "codex --model \"$(cat /etc/theozolith/model)\" --sandbox danger-full-access"' \
+'else' \
+'  tmux new-session -d -s flightdeck -c "${WORKSPACE_DIR:-/home/ozolith}" "codex --sandbox danger-full-access"' \
+'fi' \
+'tmux pipe-pane -o -t flightdeck "cat >> /var/log/flightdeck/transcript.log"' \
+'while kill -0 "$TAILSCALED_PID" 2>/dev/null && tmux has-session -t flightdeck 2>/dev/null; do' \
+'  sleep 5' \
+'done' \
+'kill -0 "$TAILSCALED_PID" 2>/dev/null || { echo "flightdeck-start: tailscaled exited; failing the container so restart recovers one-hop access" >&2; exit 1; }' \
+'exit 0' \
+> /usr/local/bin/flightdeck-start \
+&& chmod 0755 /usr/local/bin/flightdeck-start''',
+
+    # (8) The codex launch shim (ADR-0055) at /opt/theozolith-deck/bin/codex
+    #     (0755, root-owned at build — operator-authored CONFIG content like
+    #     flightdeck-start itself). The profile.d block in step (6) puts it
+    #     FIRST on PATH only when the deck has a pin, so `codex` in the tmux
+    #     command and in every shell resolves here. PIN-STRICT at EVERY launch,
+    #     and execs the VERSION-ADDRESSED published entry (never .current):
+    #     $root/$desired/codex is the daemon-published relative link
+    #     codex -> bin/codex inside the version dir; codex canonicalizes its own
+    #     path, so the vendored helpers under bin/, codex-path/, and
+    #     codex-resources/ resolve.
+    '''mkdir -p /opt/theozolith-deck/bin && printf '%s\n' \
+'#!/bin/sh' \
+'set -eu' \
+'# TheOzolith codex launch shim (ADR-0055): PIN-STRICT - every launch fails' \
+'# loudly unless the node-maintained export entry identifies exactly the' \
+'# desired version. Never the previous export, never the image CLI.' \
+'root="/var/lib/theozolith/cli/codex"' \
+'wt="${THEOZOLITH_WORKER_TYPE:?theozolith codex shim: THEOZOLITH_WORKER_TYPE is not set (ADR-0055)}"' \
+'desired=""' \
+'[ -r "$root/by-type/$wt.desired" ] && desired=$(cat "$root/by-type/$wt.desired")' \
+'[ -n "$desired" ] || { echo "codex: launch refused - no desired CLI record for worker type $wt on this node (pin not applied yet; ADR-0055)" >&2; exit 1; }' \
+'entry=$(readlink "$root/by-type/$wt.current" 2>/dev/null || true)' \
+'[ "$(basename "${entry:-x}")" = "$desired" ] || { echo "codex: launch refused - CLI pin not converged (desired $desired, export ${entry:-none}); never the previous export, never the image CLI (ADR-0055)" >&2; exit 1; }' \
+'exec "$root/$desired/codex" "$@"' \
+> /opt/theozolith-deck/bin/codex \
+&& chmod 0755 /opt/theozolith-deck/bin/codex''',
+]
+
+command = "/usr/local/bin/flightdeck-start"
+
+# Node-local volumes (ADR-0043/0052/0055), mirroring the claude deck with
+# {stack}-codex-state:/home/ozolith/.codex in place of the claude-state volume.
+# The knowledge, policy, and cli entries are READ-ONLY BINDS of the stable
+# exports the Node Daemon maintains (deliberately shared, mounted at the PARENT
+# so a tree swap or CLI re-point never recreates the container). The policy
+# export is present for volume-set parity though this codex deck uses no policy.
+volumes = [
+    "{stack}-logs:/var/log/flightdeck",              # per-instance transcript log
+    "{stack}-codex-state:/home/ozolith/.codex",      # per-instance runtime state + auth + config (never shared)
+    "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",  # applied knowledge (ADR-0052)
+    "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",        # applied Agent Policy (ADR-0055; unused by codex)
+    "/var/lib/theozolith/cli:/var/lib/theozolith/cli:ro",              # installed CLI Pins (ADR-0055)
+    "{stack}-tailscale-state:/var/lib/tailscale",    # per-instance tailnet machine identity
+    "{stack}-workspace:/workspace",                  # per-instance working tree (snow-maker repo-mount parity)
+]
+
+# tmpfs /tmp — same rationale as the claude deck (flightdeck.toml): move the
+# deck workload's temp-file churn off the overlay writable layer.
+tmpfs = ["/tmp:size=8g"]
+
+# Secret NAMES only. GITHUB_TOKEN is the dedicated no-merge machine identity.
+# There is deliberately NO ANTHROPIC_API_KEY and NO CODEX_AUTH_JSON: codex auth
+# is a HUMAN `codex login --device-auth` run once inside the deck, and the
+# credential lives and rotates on the {stack}-codex-state volume (ADR-0052 §5).
+[secrets]
+GITHUB_TOKEN = "flightdeck-github-token"
+# Tailscale enrollment key: mint a REUSABLE, TAGGED (tag:flightdeck),
+# ACL-bounded auth key once and store it as `flightdeck-tailscale-authkey`.
+# Consumed only while the enrollment completion marker is absent from the state
+# volume; delivered as TS_AUTHKEY_FILE. Per-instance hardening as in the claude
+# deck: unbind with `TS_AUTHKEY = ""` on a Stack once it has enrolled.
+TS_AUTHKEY = "flightdeck-tailscale-authkey"
