@@ -5,18 +5,22 @@ A complete, minimal Config Repo (ADR-0006/0048): copy it anywhere you like
 `theozolith config ingest <path-or-url>` on the Control Node — ingest lints
 it, resolves the mechanical pins, compiles `knowledge/`, and commits the
 machine-owned pinned build the service loads. Never edit the pinned build
-(`configs/`) itself. The example declares two pipeline workers (Implementer,
-Reviewer) as process Stacks, one **Flight Deck** as an interactive container
-Stack, and one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
+(`configs/`) itself. The example declares three pipeline workers — an
+Implementer and two Reviewers, one on each adapter — as process Stacks, two
+**Flight Decks** (one claude, one codex) as interactive container Stacks, and
+one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
 every Stack staged at `state = "stopped"`. `base` images are tag-only: this
 repo carries no computed pins (ADR-0048) — ingest resolves each tag to its
 digest and records it in the pinned build's pins.toml (digest-pin a base
 yourself only when the digest is a human decision, e.g. no registry access
-at ingest time). The four example bases are
-`ghcr.io/snowfoxbuilds/theozolith-run-claude:main`, a **private** first-party
-image CI republishes on every merge to main that touches `worker/` or
-`knowledge/` (ADR-0051) — so each ingest re-resolves the tag to the
-then-current digest, and your fleet moves bases exactly when you ingest,
+at ingest time). Every derived-image worker type here builds on one of two
+**private** first-party run images —
+`ghcr.io/snowfoxbuilds/theozolith-run-claude:main` (the claude pipeline
+workers, the `hello-logger` driver, and the claude Flight Deck) and
+`ghcr.io/snowfoxbuilds/theozolith-run-codex:main` (the codex Reviewer and the
+codex Flight Deck) — that CI republishes on every merge to main that touches
+`worker/` or `knowledge/` (ADR-0051), so each ingest re-resolves the tag to
+the then-current digest and your fleet moves bases exactly when you ingest,
 never before. Immutable `…:sha-<sha>` tags are pushed alongside for hand
 digest-pinning and rollback. Before the first ingest, store a GHCR pull
 credential so ingest can resolve the digest (and so nodes can pull the
@@ -395,10 +399,17 @@ fail-fast — a Flight Deck that cannot bring up its tailnet access exits
 non-zero immediately, and the daemon's reconcile loop owns any retry,
 recreating the deck on a later pass (roughly the heartbeat cadence).
 Daemon-managed Stack containers carry no Docker `--restart` policy, so the
-reconcile loop is the sole restarter (#114). (Knowledge never blocks a start:
-the read-only mount's symlinks may dangle until the node converges a
-distribution, ADR-0048.) There is no in-container retry loop and no "running
-but unreachable" state:
+reconcile loop is the sole restarter (#114). Knowledge is a **hard
+prerequisite**, not a best-effort mount: before `tailscaled` launches,
+`flightdeck-start` requires that the node has converged the selected per-tool
+view and that its marker is a regular file at the view root — `CLAUDE.md` for
+a claude view, `AGENTS.md` for a codex view (ADR-0052 §3). An absent or
+unconverged view — a missing `THEOZOLITH_KNOWLEDGE_TREE`, a distribution the
+node has not converged, a retired tree, or a selector pointing above the
+per-tool views — exits the container non-zero before `tailscaled`. Recovery is
+to converge the Config Distribution for that view; the daemon's reconcile loop
+then recreates the deck on a later pass. There is no in-container retry loop
+and no "running but unreachable" state:
 
 - enrollment vs. reuse is decided from the completion marker (see above)
   **before** `tailscaled` launches — the two branches cannot be misrouted by a
