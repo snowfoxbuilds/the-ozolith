@@ -67,8 +67,10 @@ for every registered tool, so a codex deck could select `claude-dev` just as
 well. Ingest compiles the tree **once per tool** (ADR-0052): the claude
 view (`AGENTS.md` → `CLAUDE.md`, skills, `agents/claude/`, workflows) and
 the codex view (`AGENTS.md` verbatim, skills shared, `agents/codex/*.toml` →
-native `agents/` roles, `agents/codex/*.md` → deprecated prompts, `hooks/`
-verbatim; codex has no workflows target) each get their own content-hash pin
+native `agents/` roles — codex subagent definitions with their `config.toml`
+layer, validated at ingest against the supported codex baseline —
+`agents/codex/*.md` → deprecated prompts, `hooks/` verbatim; codex has no
+workflows target) each get their own content-hash pin
 (covering each file's executable state too — a chmod redistributes like any
 edit), so one tree serves both adapters and an edit re-tags exactly the
 types whose view changed. Driver workers bake their adapter's view into
@@ -502,4 +504,6 @@ selects `knowledge/codex-dev` and `flightdeck-start` symlinks the view's
 `~/.codex`, plus `skills/` into `~/.agents/skills`, failing loud until the
 node has converged that view. A tree that ships native `agents/` roles or
 `hooks/` needs its start script to link those too; this example's tree ships
-neither.
+neither. A role file links verbatim, and a relative path inside one resolves
+against `~/.codex/agents/` on the deck (codex's own rule), so it must name
+something the deck actually has — the view's `../skills/<name>/SKILL.md`, say.
