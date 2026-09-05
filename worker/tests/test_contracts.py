@@ -15,6 +15,8 @@ from theozolith_worker.adapters import (
     MODEL_UNMAPPABLE,
     AgentAdapterError,
     ClaudeAdapter,
+    CodexAdapter,
+    make_agent_adapter,
     materialize_instruction,
 )
 from theozolith_worker.formatoutput import format_output_main
@@ -463,6 +465,19 @@ def test_claude_adapter_materialize_interactive_scope_never_touches_claude_confi
     assert written == [tmp_path / "etc/theozolith/model"]
     assert (tmp_path / "etc/theozolith/model").read_text() == "claude-opus-5\n"
     assert not (tmp_path / "etc/claude-code").exists()
+    assert not (tmp_path / "home").exists()
+
+
+def test_codex_adapter_materialize_interactive_scope_writes_only_the_model_file(tmp_path):
+    adapter = CodexAdapter()
+    written = adapter.materialize("gpt-5.2-codex", "", root=tmp_path, scope="interactive")
+    # A driverless (Flight Deck) codex image bakes ONLY the well-known model
+    # file: config.toml stays the human's, ~/.codex is the state volume, and
+    # the deck may switch models in-session (ADR-0052 §4, ADR-0045).
+    assert written == [tmp_path / "etc/theozolith/model"]
+    assert (tmp_path / "etc/theozolith/model").read_text() == "gpt-5.2-codex\n"
+    assert not (tmp_path / "etc/theozolith/codex").exists()
+    assert not (tmp_path / "etc/codex").exists()
     assert not (tmp_path / "home").exists()
 
 
@@ -1090,3 +1105,25 @@ def test_cli_platform_tuple_keys_match_the_daemon_detection():
     # Every package name is the scoped claude-code platform package.
     for package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.values():
         assert package.startswith("@anthropic-ai/claude-code-")
+
+
+def test_cli_archive_contract_halves_agree_across_the_package_boundary():
+    """DEV-ONLY cross-package drift lock (ADR-0055 D8): the resolution half an
+    adapter owns (wrapper, per-tuple package, tarball-version suffix) must equal
+    the install half the Node Daemon owns (CLI_ARCHIVE_CONTRACT), for every
+    adapter that declares a CLI table. The two are never imported across the
+    boundary at runtime — the daemon reads the wire-delivered pinned map — so
+    only this test holds them together; a drift would strand every node."""
+    from theozolith_nodedaemon.cliinstall import CLI_ARCHIVE_CONTRACT, supported_tuple_keys
+
+    keys = set(supported_tuple_keys())
+    for name in ("claude", "codex"):
+        adapter = make_agent_adapter(name)
+        row = CLI_ARCHIVE_CONTRACT[name]
+        assert row.wrapper == adapter.CLI_WRAPPER_PACKAGE
+        assert set(adapter.CLI_PLATFORM_PACKAGES) == keys
+        assert set(adapter.CLI_PLATFORM_VERSION_SUFFIXES) == keys
+        assert set(row.tuples) == keys
+        for key in keys:
+            assert adapter.CLI_PLATFORM_PACKAGES[key] == row.tuples[key].package
+            assert adapter.CLI_PLATFORM_VERSION_SUFFIXES[key] == row.tuples[key].version_suffix

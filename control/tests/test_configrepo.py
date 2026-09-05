@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from theozolith_control.configrepo import ConfigRepoError, load_config
 from theozolith_nodedaemon.stacks import WireStack
+from theozolith_worker.adapters import CodexAdapter
 
 DIGEST = "0" * 64
 BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{DIGEST}"
@@ -85,6 +86,19 @@ def cli_pin(version: str = "2.1.260", tuples: tuple[str, ...] | None = None) -> 
         "platforms": {
             key: {"package": f"@anthropic-ai/claude-code-{key}", "integrity": "sha512-" + "A" * 96}
             for key in tuples
+        },
+    }
+
+
+def codex_cli_pin(version: str = "0.153.3") -> dict:
+    """An ingest-shaped codex CLI pin record (ADR-0055): every supported tuple's
+    platform package is the wrapper package itself (one static musl tarball per
+    architecture, addressed by the row's version suffix at install)."""
+    return {
+        "version": version,
+        "platforms": {
+            key: {"package": "@openai/codex", "integrity": "sha512-" + "A" * 96}
+            for key in CodexAdapter.CLI_PLATFORM_PACKAGES
         },
     }
 
@@ -1052,10 +1066,17 @@ def test_cli_with_a_driver_is_refused(tmp_path):
         load_config(tmp_path)
 
 
-def test_cli_on_a_codex_adapter_is_refused(tmp_path):
-    deck_type(tmp_path, adapter='"codex"', cli='"0.150.0"')
-    with pytest.raises(ConfigRepoError, match="cannot declare a CLI Pin"):
-        load_config(tmp_path)
+def test_cli_on_a_codex_adapter_loads(tmp_path):
+    """The CLI Pin is open to a driverless codex type (ADR-0055 D7): the codex
+    adapter declares a CLI archive contract, so the pin joins and the recipe
+    carries cli_tool == 'codex' with the four-tuple platform map."""
+    write_pins(tmp_path, cli={"codex/0.153.3": codex_cli_pin()})
+    deck_type(tmp_path, adapter='"codex"', cli='"0.153.3"')
+    wt = load_config(tmp_path).worker_types["flightdeck"]
+    assert wt.cli == "0.153.3"
+    assert wt.cli_version == "0.153.3"
+    assert set(wt.cli_platforms) == set(CodexAdapter.CLI_PLATFORM_PACKAGES)
+    assert wt.recipe_wire()["cli_tool"] == "codex"
 
 
 def test_cli_without_an_ingest_pin_is_refused(tmp_path):
@@ -2421,9 +2442,11 @@ def test_codex_type_requires_the_compiled_codex_tree(tmp_path):
         load_config(tmp_path)
 
 
-def test_driverless_codex_knowledge_is_refused(tmp_path):
-    """The node's knowledge export serves the claude view only — a codex
-    Flight Deck cannot be given knowledge it could read (ADR-0052)."""
+def test_driverless_codex_knowledge_loads(tmp_path):
+    """A driverless (Flight Deck) codex type may select a knowledge tree
+    (ADR-0052): the node exports the tree's codex view (<tree>/codex) and the
+    deck's read-only mount serves it. The pin joins <tree>/codex and the
+    compiled-tree presence check finds the codex compile."""
     write(tmp_path, "knowledge/dev/codex/AGENTS.md", "# k\n")
     write_pins(tmp_path, knowledge={"dev/codex": "b" * 64})
     write(
@@ -2431,20 +2454,73 @@ def test_driverless_codex_knowledge_is_refused(tmp_path):
         "worker-types/codexdeck.toml",
         f'base = "{BASE}"\nadapter = "codex"\nknowledge = "knowledge/dev"\n',
     )
-    with pytest.raises(ConfigRepoError, match="claude view only"):
-        load_config(tmp_path)
+    wt = load_config(tmp_path).worker_types["codexdeck"]
+    assert wt.knowledge == "knowledge/dev"
+    assert wt.adapter == "codex"
 
 
-def test_driverless_codex_model_is_refused(tmp_path):
-    """No codex Flight Deck exists: a driverless codex type baking a model
-    would render an interactive-scope instruction the codex adapter refuses
-    at build — fail at config load instead (ADR-0052)."""
+def test_driverless_codex_model_loads_and_renders_interactive_setup(tmp_path):
+    """A driverless codex type may bake a default model (ADR-0052 §4): control
+    renders the interactive-scope materialize step the deck runs at build, and
+    the codex adapter writes only the well-known model file from it."""
     write(
         tmp_path,
         "worker-types/codexdeck.toml",
-        f'base = "{BASE}"\nadapter = "codex"\nmodel = "gpt-5.2-codex"\n',
+        f'base = "{BASE}"\nadapter = "codex"\nmodel = "gpt-6-astra"\n',
     )
-    with pytest.raises(ConfigRepoError, match="no codex Flight Deck exists"):
+    wt = load_config(tmp_path).worker_types["codexdeck"]
+    assert wt.model == "gpt-6-astra"
+    assert (
+        "theozolith-adapter materialize --adapter codex --model gpt-6-astra"
+        " --scope interactive" in wt.materialized_setup
+    )
+
+
+def test_driverless_codex_effort_is_refused(tmp_path):
+    """Effort stays refused on EVERY driverless type (ADR-0045) — the model
+    lift does not open effort: a codex deck declaring effort fails at load."""
+    write(
+        tmp_path,
+        "worker-types/codexdeck.toml",
+        f'base = "{BASE}"\nadapter = "codex"\nmodel = "gpt-6-astra"\neffort = "high"\n',
+    )
+    with pytest.raises(ConfigRepoError, match="rejected on driverless"):
+        load_config(tmp_path)
+
+
+def test_cli_on_a_codex_adapter_below_the_floor_is_refused(tmp_path):
+    """The floor re-check at load fires per adapter: a codex pin below
+    (0, 150, 0) is refused naming the codex adapter (ADR-0055)."""
+    write_pins(tmp_path, cli={"codex/0.149.0": codex_cli_pin("0.149.0")})
+    deck_type(tmp_path, adapter='"codex"', cli='"0.149.0"')
+    with pytest.raises(ConfigRepoError, match="below the codex adapter's enforcement floor"):
+        load_config(tmp_path)
+
+
+def test_cli_on_a_codex_adapter_without_a_pin_names_the_joined_key(tmp_path):
+    """A codex cli with no ingest pin is refused with the joined key
+    codex/<declared> and the re-run fix (ADR-0055)."""
+    deck_type(tmp_path, adapter='"codex"', cli='"0.153.3"')
+    with pytest.raises(
+        ConfigRepoError,
+        match=r"no ingest-resolved CLI pin for codex/0\.153\.3.*re-run `theozolith config ingest`",
+    ):
+        load_config(tmp_path)
+
+
+def test_cli_with_a_codex_driver_is_refused(tmp_path):
+    """cli is driverless-only in v1 for every adapter (ADR-0055): a codex
+    driver with a pin is refused with the precise message before the pin
+    join, independent of the adapter's CLI table."""
+    driver_type(
+        tmp_path,
+        name="codex-review",
+        driver='"builtin:reviewer"',
+        adapter='"codex"',
+        model='"gpt-5.2-codex"',
+        cli='"0.153.3"',
+    )
+    with pytest.raises(ConfigRepoError, match="driverless-only in v1"):
         load_config(tmp_path)
 
 

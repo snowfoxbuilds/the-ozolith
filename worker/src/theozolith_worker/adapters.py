@@ -421,6 +421,18 @@ class ClaudeAdapter:
     }
     # The npm wrapper package the CLI Pin's version/dist-tag resolves against.
     CLI_WRAPPER_PACKAGE = "@anthropic-ai/claude-code"
+    # The per-tuple suffix appended to the base version to address each
+    # platform tarball (ADR-0055 D3). Claude publishes its platform binaries
+    # as DISTINCT packages at the base <version>, so every tuple's suffix is
+    # empty. Adapter-owned like the packages above; a contract test holds it
+    # equal to the daemon-side archive row (which derives the download
+    # coordinate by appending this suffix to the resolved version).
+    CLI_PLATFORM_VERSION_SUFFIXES: ClassVar[dict[str, str]] = {
+        "linux-x64-glibc": "",
+        "linux-arm64-glibc": "",
+        "linux-x64-musl": "",
+        "linux-arm64-musl": "",
+    }
     model_shapes = "full claude-* model IDs, or the family aliases fable/haiku/opus/sonnet"
 
     def __init__(self, binary: str = "claude"):
@@ -831,6 +843,28 @@ class CodexAdapter:
     # 0.150.0, which is therefore the floor (and the base image pins the
     # same version: the schema is experimental, the pin is the policy).
     MIN_ENFORCING_CLI = (0, 150, 0)
+    # The CLI archive contract's resolution half (ADR-0055 D3/D8). codex
+    # publishes ONE static musl tarball per architecture as a
+    # <version>-linux-<arch> version of the wrapper package itself, so every
+    # tuple's platform package is the wrapper and both libc tuples of an
+    # architecture share the same tarball-version suffix. The Node Daemon
+    # never imports these — it detects its own tuple, looks it up in the
+    # wire-delivered pinned map, and derives the download coordinate by
+    # appending the suffix to the resolved version; a contract test holds
+    # these equal to the daemon-side CLI_ARCHIVE_CONTRACT row.
+    CLI_PLATFORM_PACKAGES: ClassVar[dict[str, str]] = {
+        "linux-x64-glibc": "@openai/codex",
+        "linux-arm64-glibc": "@openai/codex",
+        "linux-x64-musl": "@openai/codex",
+        "linux-arm64-musl": "@openai/codex",
+    }
+    CLI_WRAPPER_PACKAGE = "@openai/codex"
+    CLI_PLATFORM_VERSION_SUFFIXES: ClassVar[dict[str, str]] = {
+        "linux-x64-glibc": "-linux-x64",
+        "linux-arm64-glibc": "-linux-arm64",
+        "linux-x64-musl": "-linux-x64",
+        "linux-arm64-musl": "-linux-arm64",
+    }
     model_shapes = "full OpenAI model IDs (gpt-*, o*, codex-*); '-latest' IDs float"
 
     def __init__(self, binary: str = "codex"):
@@ -891,36 +925,40 @@ class CodexAdapter:
         return raw
 
     def materialize(self, model: str, effort: str, *, root: Path, scope: str) -> list[Path]:
-        """Bake ``model``/``effort`` into the image filesystem under
-        ``root``: the well-known files plus the theozolith-owned
-        ``etc/theozolith/codex/config.toml`` every session's throwaway
-        ``CODEX_HOME`` receives a copy of.
+        """Bake ``model``/``effort`` into the image filesystem under ``root``.
 
-        ``interactive`` scope is REJECTED outright: no codex Flight Deck
-        worker type exists (the deck machinery is Claude-shaped, ADR-0043),
-        and control refuses the config upstream — this is the in-image
-        backstop. A pre-existing baked config is conflict-scanned: any
-        selection key fails the build naming it (operator content is never
-        overwritten), and so does any instruction-discovery key
-        (``project_doc_fallback_filenames`` — the judge-isolation name set
-        is fixed, #82); identity keys are then emitted as a header block
-        PREPENDED before the preserved operator bytes, and the merged text
-        is re-parsed before landing. Same symlink-safe atomic write
-        discipline as the Claude bake."""
-        if scope == SCOPE_INTERACTIVE:
+        ``managed`` (driver run images) writes the well-known files plus the
+        theozolith-owned ``etc/theozolith/codex/config.toml`` every session's
+        throwaway ``CODEX_HOME`` receives a copy of. A pre-existing baked
+        config is conflict-scanned: any selection key fails the build naming
+        it (operator content is never overwritten), and so does any
+        instruction-discovery key (``project_doc_fallback_filenames`` — the
+        judge-isolation name set is fixed, #82); identity keys are then
+        emitted as a header block PREPENDED before the preserved operator
+        bytes, and the merged text is re-parsed before landing.
+
+        ``interactive`` (driverless Flight Deck images) writes ONLY
+        ``/etc/theozolith/model`` (ADR-0052 §4): no ``config.toml``, nothing
+        under ``etc/codex``, nothing under the home. The deck may switch
+        models in-session and its ``~/.codex`` is the human's state volume,
+        so the sole baked identity is the default-model file the launch shim
+        reads; ``config.toml`` stays the human's. Effort is refused —
+        driverless worker types have no effort consumer (ADR-0045).
+
+        Same symlink-safe atomic write discipline as the Claude bake."""
+        if scope == SCOPE_INTERACTIVE and effort:
             raise AgentAdapterError(
-                "the codex adapter has no interactive-scope materialization —"
-                " no codex Flight Deck worker type exists (ADR-0052)"
+                "effort is not materializable at interactive scope — driverless"
+                " (Flight Deck) worker types have no effort consumer (ADR-0045)"
             )
         pair = codexidentity.pair_error(model, effort)
         if pair:
             raise AgentAdapterError(pair)
-        if not model:
+        if scope == SCOPE_MANAGED and not model:
             raise AgentAdapterError(
                 "the codex adapter materializes nothing without a model —"
                 " effort alone is not an identity (ADR-0045)"
             )
-        config_parts = Path(codexidentity.BAKED_CONFIG_FILE).parts
         plan: list[tuple[str, str]] = []
         for relpath, value in ((WELL_KNOWN_MODEL_FILE, model), (WELL_KNOWN_EFFORT_FILE, effort)):
             if value:
@@ -933,60 +971,68 @@ class CodexAdapter:
                 dir_fd = stack.enter_context(_bake_dir(root, parts[:-1]))
                 _refuse_irregular_destination(dir_fd, parts[-1], root / relpath)
                 resolved.append((dir_fd, parts[-1], root / relpath, content))
-            config_fd = stack.enter_context(_bake_dir(root, config_parts[:-1]))
-            config_target = root / codexidentity.BAKED_CONFIG_FILE
-            _refuse_irregular_destination(config_fd, config_parts[-1], config_target)
-            existing = _read_regular_at(config_fd, config_parts[-1]) or ""
-            if existing:
+            # The baked config.toml is a MANAGED-scope artifact only: a
+            # driverless (Flight Deck) codex type bakes just the well-known
+            # model file — its ~/.codex is the human's state volume and its
+            # config.toml stays the human's (ADR-0052 §4).
+            if scope == SCOPE_MANAGED:
+                config_parts = Path(codexidentity.BAKED_CONFIG_FILE).parts
+                config_fd = stack.enter_context(_bake_dir(root, config_parts[:-1]))
+                config_target = root / codexidentity.BAKED_CONFIG_FILE
+                _refuse_irregular_destination(config_fd, config_parts[-1], config_target)
+                existing = _read_regular_at(config_fd, config_parts[-1]) or ""
+                if existing:
+                    try:
+                        document = tomllib.loads(existing)
+                    except ValueError as exc:
+                        raise AgentAdapterError(
+                            f"{config_target}: existing baked config is not valid"
+                            f" TOML ({exc}) — refusing to merge into an unknowable document"
+                        ) from exc
+                    conflicts = [
+                        key for key in codexidentity.CODEX_CONFIG_IDENTITY_KEYS if key in document
+                    ]
+                    if conflicts:
+                        raise AgentAdapterError(
+                            "existing baked codex config would supersede the baked"
+                            " identity — refusing to overwrite operator content;"
+                            f" remove the conflicting keys from {config_target}:"
+                            f" {', '.join(conflicts)}"
+                        )
+                    instruction = [
+                        key
+                        for key in codexidentity.CODEX_CONFIG_INSTRUCTION_KEYS
+                        if key in document
+                    ]
+                    if instruction:
+                        # The judge-isolation boundary (#82) removes a fixed
+                        # instruction-file name set from review checkouts; a
+                        # baked config extending the CLI's project-doc
+                        # discovery would reopen that channel under a name the
+                        # driver does not know, so the key is refused for every
+                        # codex image — the pipeline's canonical instruction
+                        # file is AGENTS.md, never a configured alias.
+                        raise AgentAdapterError(
+                            "existing baked codex config redefines instruction-file"
+                            " discovery — the review judge-isolation boundary"
+                            " depends on a fixed name set (#82); remove from"
+                            f" {config_target}: {', '.join(instruction)}"
+                        )
+                header = [
+                    "# Materialized by theozolith-adapter (ADR-0052) — the baked",
+                    "# identity every session's CODEX_HOME receives. Never hand-edit.",
+                    f'model = "{model}"',
+                ]
+                if effort:
+                    header.append(f'model_reasoning_effort = "{effort}"')
+                merged = "\n".join(header) + "\n" + (("\n" + existing) if existing else "")
                 try:
-                    document = tomllib.loads(existing)
-                except ValueError as exc:
+                    tomllib.loads(merged)
+                except ValueError as exc:  # pragma: no cover - defense in depth
                     raise AgentAdapterError(
-                        f"{config_target}: existing baked config is not valid"
-                        f" TOML ({exc}) — refusing to merge into an unknowable document"
+                        f"{config_target}: merged baked config does not parse ({exc})"
                     ) from exc
-                conflicts = [
-                    key for key in codexidentity.CODEX_CONFIG_IDENTITY_KEYS if key in document
-                ]
-                if conflicts:
-                    raise AgentAdapterError(
-                        "existing baked codex config would supersede the baked"
-                        " identity — refusing to overwrite operator content;"
-                        f" remove the conflicting keys from {config_target}:"
-                        f" {', '.join(conflicts)}"
-                    )
-                instruction = [
-                    key for key in codexidentity.CODEX_CONFIG_INSTRUCTION_KEYS if key in document
-                ]
-                if instruction:
-                    # The judge-isolation boundary (#82) removes a fixed
-                    # instruction-file name set from review checkouts; a
-                    # baked config extending the CLI's project-doc
-                    # discovery would reopen that channel under a name the
-                    # driver does not know, so the key is refused for every
-                    # codex image — the pipeline's canonical instruction
-                    # file is AGENTS.md, never a configured alias.
-                    raise AgentAdapterError(
-                        "existing baked codex config redefines instruction-file"
-                        " discovery — the review judge-isolation boundary"
-                        " depends on a fixed name set (#82); remove from"
-                        f" {config_target}: {', '.join(instruction)}"
-                    )
-            header = [
-                "# Materialized by theozolith-adapter (ADR-0052) — the baked",
-                "# identity every session's CODEX_HOME receives. Never hand-edit.",
-                f'model = "{model}"',
-            ]
-            if effort:
-                header.append(f'model_reasoning_effort = "{effort}"')
-            merged = "\n".join(header) + "\n" + (("\n" + existing) if existing else "")
-            try:
-                tomllib.loads(merged)
-            except ValueError as exc:  # pragma: no cover - defense in depth
-                raise AgentAdapterError(
-                    f"{config_target}: merged baked config does not parse ({exc})"
-                ) from exc
-            resolved.append((config_fd, config_parts[-1], config_target, merged))
+                resolved.append((config_fd, config_parts[-1], config_target, merged))
             for dir_fd, name, target, content in resolved:
                 _replace_file_at(dir_fd, name, content.encode("utf-8"), where=target)
                 written.append(target)

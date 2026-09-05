@@ -1364,8 +1364,9 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
     cli_platforms: dict[str, dict[str, str]] = {}
     if cli:
         # Field refusals fire BEFORE the pin join, so a definition ingest
-        # deliberately skipped (cli with a driver, or on a non-claude
-        # adapter) gets its precise error — never the missing-pin message.
+        # deliberately skipped (cli with a driver, or on an adapter that
+        # declares no CLI archive contract) gets its precise error — never
+        # the missing-pin message.
         if not CLI_DECLARED_NAME.fullmatch(cli):
             raise ConfigRepoError(
                 f"{context}: cli {cli!r} must be a plausible npm exact version"
@@ -1377,25 +1378,34 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
                 " driver type keeps the base image's CLI as identity bytes;"
                 " remove the field or drop the driver"
             )
-        if adapter_name != "claude":
+        # The CLI Pin is open to any adapter that declares the resolution
+        # half of the archive contract (ADR-0055 D3/D7); an adapter that
+        # declares no CLI platform table has no consumer for a pin.
+        try:
+            adapter = make_agent_adapter(adapter_name)
+        except AgentAdapterError as exc:
+            raise ConfigRepoError(f"{context}: {exc}") from exc
+        if not getattr(adapter, "CLI_PLATFORM_PACKAGES", None) or not getattr(
+            adapter, "CLI_WRAPPER_PACKAGE", ""
+        ):
             raise ConfigRepoError(
-                f"{context}: a worker type with adapter {adapter_name!r}"
-                " cannot declare a CLI Pin — refused until a consumer exists"
-                " (ADR-0055)"
+                f"{context}: a worker type with adapter {adapter_name!r} cannot"
+                " declare a CLI Pin — its adapter declares no CLI archive"
+                " contract (ADR-0055)"
             )
         pin = (pins.cli if pins else {}).get(f"{adapter_name}/{cli}")
         if not pin:
             raise ConfigRepoError(
-                f"{context}: no ingest-resolved CLI pin for {cli!r} — re-run"
-                " `theozolith config ingest`, which resolves the exact version"
-                f" and per-platform integrity map into {PINS_FILE} (ADR-0055)"
+                f"{context}: no ingest-resolved CLI pin for {adapter_name}/{cli}"
+                " — re-run `theozolith config ingest`, which resolves the exact"
+                f" version and per-platform integrity map into {PINS_FILE} (ADR-0055)"
             )
         cli_version = pin["version"]
         cli_platforms = {k: dict(v) for k, v in pin["platforms"].items()}
         # Floor re-check at load (grilling Q14): the pinned build may predate
         # a floor bump — the lint site is configrepo/ingest, never the image
         # build or the deck launch.
-        floor = make_agent_adapter(adapter_name).MIN_ENFORCING_CLI
+        floor = adapter.MIN_ENFORCING_CLI
         if _cli_version_tuple(cli_version) < tuple(floor):
             floor_text = ".".join(str(part) for part in floor)
             raise ConfigRepoError(
@@ -1406,32 +1416,17 @@ def _parse_worker_type(name: str, data: dict[str, Any], pins: Pins | None = None
             )
     # Driverless types may declare knowledge too (ADR-0048 amendment): the
     # reference selects which applied tree the deck's read-only mount serves
-    # (nothing bakes — the state volume shadows ~/.claude). The pin join and
-    # the compiled-tree presence check below apply identically to both kinds.
-    # The node's knowledge export serves the CLAUDE view of the tree
-    # (ADR-0052), so a non-claude deck cannot be given knowledge it could
-    # read — refused here, recorded as future work in ADR-0052.
-    if knowledge and not driver and adapter_name != "claude":
-        raise ConfigRepoError(
-            f"{context}: a driverless (Flight Deck) type with adapter"
-            f" {adapter_name!r} cannot declare knowledge — the node's"
-            " knowledge export serves the claude view only (ADR-0052)"
-        )
+    # (nothing bakes — the state volume shadows the adapter's home). The node
+    # exports a per-tool compile of every tree (ADR-0052), so a driverless
+    # type of any adapter selects its adapter's view; the pin join
+    # (<tree>/<adapter>, above) and the compiled-tree presence check below
+    # apply identically to both kinds and to every adapter — a tree with no
+    # <adapter>-consumable content fails there with the missing-pin message.
     if knowledge and driver and adapter_name not in _KNOWLEDGE_TARGETS:
         raise ConfigRepoError(
             f"{context}: no knowledge bake target is mapped for adapter"
             f" {adapter_name!r} — extend _KNOWLEDGE_TARGETS when adding an"
             " adapter whose worker types bake knowledge (ADR-0052)"
-        )
-    # A driverless type is a Flight Deck, and the deck machinery is
-    # Claude-shaped end to end (ADR-0043; the interactive materialize scope
-    # exists only on the Claude adapter). Refuse here rather than at the
-    # image build the daemon would fail on.
-    if not driver and adapter_name != "claude" and (data.get("model") or data.get("effort")):
-        raise ConfigRepoError(
-            f"{context}: a driverless (Flight Deck) type with adapter"
-            f" {adapter_name!r} cannot bake a model/effort — no"
-            f" {adapter_name} Flight Deck exists (ADR-0052)"
         )
     if workspace and not valid_workspace(workspace):
         raise ConfigRepoError(
