@@ -101,9 +101,10 @@ Upstream = Live | NoUpstream
 class AggregateBudget:
     """The per-Run aggregate byte budgets, atomic under their own lock so
     concurrent requests near a limit cannot overshoot it. Response bytes
-    are reserved per send at the per-request limit and settled to the
-    actual count read; request bytes are charged per request sent, the
-    original by the server and every followed hop by the chain."""
+    are reserved per send at ``response_reservation`` — the per-request
+    limit plus the overflow-probe byte the gate reads past it — and settled
+    to the actual count read; request bytes are charged per request sent,
+    the original by the server and every followed hop by the chain."""
 
     def __init__(self, budgets: Budgets):
         self._lock = threading.Lock()
@@ -326,6 +327,22 @@ def _pinned_origin(parts: uri.UriParts) -> bool:
     return authority.port is None or authority.port == str(PORT)
 
 
+@dataclass
+class _Resolution:
+    """One in-flight ``getaddrinfo`` generation, shared by every send that
+    joins it while it runs. At most one exists per client, so a resolver the
+    OS never answers costs one daemon worker for the client's life — not one
+    thread and one pipe per timed-out send. The worker sets ``done`` once and
+    with it either ``addrinfos`` or ``error``; a late result whose waiters
+    have all left is simply dropped."""
+
+    host: str
+    port: int
+    done: bool = False
+    addrinfos: list | None = None
+    error: BaseException | None = None
+
+
 class UpstreamClient:
     """Sends validated requests to the pinned origin with the credential
     attached, gates every response before a byte of it is handed back, and
@@ -333,13 +350,14 @@ class UpstreamClient:
 
     The client opens every socket itself so that the send's deadline and
     ``abort`` govern name resolution and the connect too: the blocking
-    lookup runs in a throwaway thread waited on alongside the wake pipe, then
-    a non-blocking connect awaited on a selector together with that same wake
-    pipe ``abort`` writes to, then the TLS handshake on the wrapped socket,
-    all armed with what remains of the deadline. The socket is kept here for
-    the life of the exchange because ``http.client`` forgets it once a
-    ``Connection: close`` response owns it, and every later read must still
-    be armed and abortable."""
+    lookup runs single-flight in one daemon worker per client (see
+    ``_resolve``) that concurrent and later sends share rather than each
+    starting its own, then a non-blocking connect awaited on a selector
+    together with the wake pipe ``abort`` writes to, then the TLS handshake
+    on the wrapped socket, all armed with what remains of the deadline. The
+    socket is kept here for the life of the exchange because ``http.client``
+    forgets it once a ``Connection: close`` response owns it, and every later
+    read must still be armed and abortable."""
 
     def __init__(
         self,
@@ -369,6 +387,8 @@ class UpstreamClient:
         self._aborted = False
         self._wake_r, self._wake_w = os.pipe()
         self._closed = False
+        self._resolve_cv = threading.Condition(threading.Lock())
+        self._resolution: _Resolution | None = None
 
     def _default_factory(self, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
         return http.client.HTTPSConnection(host, port, timeout=timeout, context=self._tls_context())
@@ -387,7 +407,10 @@ class UpstreamClient:
         """Agent exit: every send from now on — in flight or not yet
         started — ends ``aborted`` without touching the wire. A connect in
         progress wakes through the pipe; a blocked handshake or read wakes
-        because its socket is shut down."""
+        because its socket is shut down; a send waiting on the resolver wakes
+        through the shared condition. The blocking lookup itself is left to
+        the OS — its result is dropped, never acted on — so abort does not
+        wait on it."""
         with self._lock:
             if self._aborted:
                 return
@@ -398,6 +421,8 @@ class UpstreamClient:
             os.write(self._wake_w, b"x")
         for sock in sockets:
             _shutdown_socket(sock)
+        with self._resolve_cv:
+            self._resolve_cv.notify_all()
 
     def close(self) -> None:
         """Release the wake pipe once no send can start again."""
@@ -448,46 +473,66 @@ class UpstreamClient:
             raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
 
     def _resolve(self, host: str, port: int, deadline: float) -> list:
-        """Name resolution under the send's one deadline and abort. The
-        blocking ``getaddrinfo`` cannot be interrupted, so it runs in a
-        throwaway thread and this waits on the abort pipe and the thread's
-        completion together, bounded by what is left of the deadline. An
-        abort returns ``aborted`` at once and the deadline a timeout, each
-        without waiting for the lookup; a result that lands after either is
-        left in the daemon thread and never read, so it opens no socket. The
-        same ``deadline`` then governs every address the lookup returns."""
-        done_r, done_w = os.pipe()
-        holder: dict[str, object] = {}
+        """Name resolution under the send's one deadline and abort,
+        single-flight per client. The blocking ``getaddrinfo`` cannot be
+        interrupted, so it runs in one daemon worker (see ``_run_resolution``)
+        whose result every concurrent and later send shares; a send never
+        starts a second lookup while one is in flight, so a resolver the OS
+        never answers costs one thread for the client's life and no per-send
+        descriptor. Each waiter keeps its own deadline and returns a timeout
+        when it expires; abort releases them all at once, checked first so it
+        wins over a ready result. Only once the worker finishes does the next
+        send start a fresh generation. The same ``deadline`` then governs
+        every address the lookup returns."""
+        with self._resolve_cv:
+            resolution = self._active_resolution(host, port)
+            while not resolution.done:
+                if self._aborted:
+                    raise _Refused(Outcome.ABORTED, Reason.ABORTED)
+                self._resolve_cv.wait(self._remaining(deadline))
+            # Completion can coincide with abort or the deadline; both win over
+            # a ready result so no socket is opened once the send is over.
+            if self._aborted:
+                raise _Refused(Outcome.ABORTED, Reason.ABORTED)
+            self._remaining(deadline)
+            if resolution.error is not None:
+                raise resolution.error
+            return resolution.addrinfos
 
-        def resolve() -> None:
-            try:
-                holder["addrinfos"] = self._getaddrinfo(
-                    host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-                )
-            except BaseException as exc:  # re-raised on the caller's thread
-                holder["error"] = exc
-            finally:
-                with contextlib.suppress(OSError):
-                    os.write(done_w, b"x")
-                os.close(done_w)
+    def _active_resolution(self, host: str, port: int) -> _Resolution:
+        """The in-flight generation to wait on, started if none is running for
+        this fixed upstream. The caller holds ``_resolve_cv``."""
+        resolution = self._resolution
+        if resolution is None or (resolution.host, resolution.port) != (host, port):
+            resolution = _Resolution(host, port)
+            self._resolution = resolution
+            threading.Thread(
+                target=self._run_resolution,
+                args=(resolution,),
+                daemon=True,
+                name="relay-resolve",
+            ).start()
+        return resolution
 
-        threading.Thread(target=resolve, daemon=True, name="relay-resolve").start()
+    def _run_resolution(self, resolution: _Resolution) -> None:
+        """The one daemon worker for a generation: run the blocking lookup,
+        publish its outcome under the condition, and clear the slot so the
+        next send starts fresh. A result nobody is still waiting for is
+        dropped here — it opens no socket."""
         try:
-            remaining = self._remaining(deadline)
-            with selectors.DefaultSelector() as selector:
-                selector.register(self._wake_r, selectors.EVENT_READ)
-                selector.register(done_r, selectors.EVENT_READ)
-                ready = {key.fileobj for key, _ in selector.select(remaining)}
-        finally:
-            os.close(done_r)
-        if self._wake_r in ready or self._aborted:
-            raise _Refused(Outcome.ABORTED, Reason.ABORTED)
-        if done_r not in ready:
-            raise _Refused(Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
-        error = holder.get("error")
-        if error is not None:
-            raise error
-        return holder["addrinfos"]
+            addrinfos = self._getaddrinfo(
+                resolution.host, resolution.port, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+            error: BaseException | None = None
+        except BaseException as exc:  # surfaced on a waiting caller's thread
+            addrinfos, error = None, exc
+        with self._resolve_cv:
+            resolution.addrinfos = addrinfos
+            resolution.error = error
+            resolution.done = True
+            if self._resolution is resolution:
+                self._resolution = None
+            self._resolve_cv.notify_all()
 
     def _open_socket(
         self, connection: http.client.HTTPConnection, deadline: float

@@ -7,6 +7,7 @@ and the per-hop redirect policy — every check against a local
 from __future__ import annotations
 
 import errno
+import gc
 import http.client
 import os
 import socket
@@ -1001,6 +1002,263 @@ def test_one_deadline_spans_every_resolved_address(spool_dir):
     assert 0.6 <= elapsed < 1.2  # one deadline for both addresses, not two
     assert len(calls) == 2  # both candidate addresses were attempted
     client.close()
+
+
+# -- single-flight resolution stays bounded ----------------------------------
+
+
+def _relay_resolve_threads() -> int:
+    return sum(1 for thread in threading.enumerate() if thread.name == "relay-resolve")
+
+
+def _await_no_relay_threads(deadline_s: float = 2.0) -> None:
+    """Let any released resolver worker from an earlier test drain, so a
+    thread count taken here starts from a clean baseline."""
+    end = time.monotonic() + deadline_s
+    while _relay_resolve_threads() and time.monotonic() < end:
+        time.sleep(0.01)
+
+
+def _open_fds() -> int:
+    gc.collect()  # settle lazily-closed descriptors from earlier tests first
+    return len(os.listdir("/proc/self/fd"))
+
+
+def _counting_blocker(release: threading.Event):
+    """A ``getaddrinfo`` that records each call and blocks on ``release``
+    before answering, so a test can see how many lookups ran while the
+    resolver was stuck."""
+    calls: list[tuple] = []
+    lock = threading.Lock()
+
+    def blocking(host, port, family, kind):
+        with lock:
+            calls.append((host, port))
+        release.wait()
+        return socket.getaddrinfo("127.0.0.1", 9, family, kind)
+
+    def observed() -> list[tuple]:
+        with lock:
+            return list(calls)
+
+    return observed, blocking
+
+
+def test_repeated_timeouts_against_a_blocked_resolver_stay_bounded(spool_dir):
+    """Many sends against a resolver the OS never answers each time out on
+    their own deadline, but share one lookup: a single ``getaddrinfo``, one
+    ``relay-resolve`` thread, and no descriptor growth per waiter — the old
+    throwaway-thread-and-pipe leak is gone."""
+    release = threading.Event()
+    observed, blocking = _counting_blocker(release)
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.2)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    _await_no_relay_threads()
+    try:
+        sends = 12
+        first = send(client, "/zen", budgets=budgets)
+        assert (first.outcome, first.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        # The lookup is now stuck; measure with its one worker already running.
+        assert _relay_resolve_threads() == 1
+        fds = _open_fds()
+        for _ in range(sends - 1):
+            again = send(client, "/zen", budgets=budgets)
+            assert (again.outcome, again.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        assert observed() == [("127.0.0.1", 9)]  # consulted once, never re-run
+        assert _relay_resolve_threads() == 1  # still one worker, not one per send
+        # The old throwaway-pipe code leaked one descriptor per blocked send;
+        # the single-flight worker allocates none, so the count stays flat
+        # (bar small GC noise from earlier tests) — never near ``sends``.
+        assert _open_fds() - fds <= sends // 4
+        assert sock_calls == []  # nothing was ever connected
+    finally:
+        release.set()
+        client.close()
+
+
+def test_concurrent_waiters_share_one_lookup(spool_dir):
+    """Concurrent sends against a blocked resolver join a single generation —
+    one ``getaddrinfo`` on one worker — while each keeps its own deadline and
+    times out on it rather than being serialized."""
+    release = threading.Event()
+    observed, blocking = _counting_blocker(release)
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.4)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    _await_no_relay_threads()
+    results: list[UpstreamResult] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(send(client, "/zen", budgets=budgets)))
+        for _ in range(5)
+    ]
+    try:
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        elapsed = time.monotonic() - started
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(results) == 5
+        assert all(
+            (r.outcome, r.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT) for r in results
+        )
+        assert elapsed < 2.0  # one shared ~0.4s deadline, not five in series
+        assert observed() == [("127.0.0.1", 9)]  # one lookup for all five
+        assert _relay_resolve_threads() == 1  # a single shared worker
+        assert sock_calls == []
+    finally:
+        release.set()
+        client.close()
+
+
+def test_abort_releases_every_waiter_without_a_second_lookup(spool_dir):
+    """Agent exit during resolution wakes every waiting send at once — each
+    ``aborted``, none held to its 30s deadline — and starts no further
+    lookup."""
+    release = threading.Event()
+    observed, blocking = _counting_blocker(release)
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=30.0)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    results: list[UpstreamResult] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(send(client, "/zen", budgets=budgets)))
+        for _ in range(4)
+    ]
+    try:
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        time.sleep(0.3)
+        client.abort()
+        for thread in threads:
+            thread.join(5)
+        elapsed = time.monotonic() - started
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(results) == 4
+        assert all((r.outcome, r.reason) == (Outcome.ABORTED, Reason.ABORTED) for r in results)
+        assert elapsed < 5  # released by abort, not the 30s timeout
+        assert observed() == [("127.0.0.1", 9)]  # one lookup for all four
+        assert sock_calls == []
+    finally:
+        release.set()
+        client.close()
+
+
+def test_a_released_resolver_terminates_and_a_later_send_starts_fresh(spool_dir):
+    """After every waiter has timed out, releasing the blocked lookup lets its
+    one worker finish and drop the late result without opening a socket; only
+    once it has finished does the next send start a fresh generation — a
+    second ``getaddrinfo`` on a new worker."""
+    gate_first = threading.Event()
+    gate_second = threading.Event()
+    calls: list[tuple] = []
+    lock = threading.Lock()
+
+    def blocking(host, port, family, kind):
+        with lock:
+            generation = len(calls)
+            calls.append((host, port))
+        (gate_first if generation == 0 else gate_second).wait()
+        return socket.getaddrinfo("127.0.0.1", 9, family, kind)
+
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=0.2)
+    client = _dns_client(spool_dir, budgets, blocking, socket_factory)
+    _await_no_relay_threads()
+    try:
+        first = send(client, "/zen", budgets=budgets)
+        assert (first.outcome, first.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        with lock:
+            assert len(calls) == 1
+        # Release the first generation; its worker finishes, drops the result
+        # (no waiter remains), and clears the slot.
+        gate_first.set()
+        deadline = time.monotonic() + 3
+        while _relay_resolve_threads() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _relay_resolve_threads() == 0  # the first worker is gone
+        assert sock_calls == []  # the dropped late result opened nothing
+        # Only now does a later send start a brand-new lookup on a new worker.
+        second = send(client, "/zen", budgets=budgets)
+        assert (second.outcome, second.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        with lock:
+            assert len(calls) == 2
+        assert _relay_resolve_threads() == 1  # a fresh second worker
+        assert sock_calls == []
+    finally:
+        gate_first.set()
+        gate_second.set()
+        client.close()
+
+
+def test_a_resolution_completing_past_the_deadline_opens_no_socket(spool_dir):
+    """A lookup that finishes only after the send's deadline has passed yields
+    a timeout and opens no socket, even though it resolved a good address:
+    the deadline is rechecked before the result is consumed."""
+    now = [0.0]
+
+    def slow(host, port, family, kind):
+        now[0] += 100.0  # the lookup "outlasts" the whole 1s deadline
+        return socket.getaddrinfo("127.0.0.1", 9, family, kind)
+
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=1.0)
+    client = UpstreamClient(
+        CREDENTIAL,
+        budgets,
+        spool_dir,
+        connection_factory=lambda host, port, timeout: http.client.HTTPConnection(
+            "127.0.0.1", 9, timeout=timeout
+        ),
+        clock=lambda: now[0],
+        _getaddrinfo=slow,
+        _socket=socket_factory,
+    )
+    try:
+        result = send(client, "/zen", budgets=budgets)
+        assert (result.outcome, result.reason) == (Outcome.TIMEOUT, Reason.UPSTREAM_TIMEOUT)
+        assert sock_calls == []
+    finally:
+        client.close()
+
+
+def test_a_resolver_error_is_an_upstream_error(spool_dir):
+    """A ``getaddrinfo`` failure is an ordinary upstream error — not a timeout
+    or an abort — and opens no socket."""
+
+    def failing(host, port, family, kind):
+        raise socket.gaierror(-2, "name or service not known")
+
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=5.0)
+    client = _dns_client(spool_dir, budgets, failing, socket_factory)
+    try:
+        result = send(client, "/zen", budgets=budgets)
+        assert (result.outcome, result.reason) == (Outcome.UPSTREAM_ERROR, Reason.UPSTREAM_ERROR)
+        assert sock_calls == []
+    finally:
+        client.close()
+
+
+def test_an_empty_resolution_is_an_upstream_error(spool_dir):
+    """A lookup that resolves to no address is an upstream error: there is
+    nowhere to connect and no socket is opened."""
+
+    def empty(host, port, family, kind):
+        return []
+
+    sock_calls, socket_factory = _recording_socket()
+    budgets = Budgets(response_body_limit=LIMIT, upstream_timeout=5.0)
+    client = _dns_client(spool_dir, budgets, empty, socket_factory)
+    try:
+        result = send(client, "/zen", budgets=budgets)
+        assert (result.outcome, result.reason) == (Outcome.UPSTREAM_ERROR, Reason.UPSTREAM_ERROR)
+        assert sock_calls == []
+    finally:
+        client.close()
 
 
 # -- per-hop request-byte budgets --------------------------------------------
