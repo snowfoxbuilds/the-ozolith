@@ -11,7 +11,7 @@ def test_validate_ok(sample_knowledge, capsys):
     # drops (codex has no workflows target, ADR-0052).
     assert "claude agents: 2" in out
     assert "codex prompts: 1" in out
-    assert "codex agent roles: 1" in out
+    assert "codex agent roles: 2" in out
     assert "hooks: 2" in out
 
 

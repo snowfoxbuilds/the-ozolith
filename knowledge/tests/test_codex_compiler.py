@@ -9,6 +9,7 @@ from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
 EXPECTED_GLOBAL_PATHS = {
     "AGENTS.md",
     "agents/grunt.toml",
+    "agents/scout.toml",
     "hooks/guard.sh",
     "hooks/hooks.json",
     "prompts/triage.md",
@@ -37,12 +38,15 @@ def test_codex_agents_become_prompts(sample_knowledge):
     assert files["prompts/triage.md"].content == source.read_bytes()
 
 
-def test_codex_agent_roles_become_native_agents(sample_knowledge):
+@pytest.mark.parametrize("stem", ["grunt", "scout"])
+def test_codex_agent_roles_become_native_agents(sample_knowledge, stem):
     # The role TOML ships verbatim under agents/ — codex's own discovery dir —
-    # beside the deprecated prompts/ surface (ADR-0052 §1).
+    # beside the deprecated prompts/ surface (ADR-0052 §1); scout carries a
+    # full native config layer (model, effort, sandbox, mcp_servers, skills).
     files = compile_codex(load_knowledge_root(sample_knowledge), "global")
-    source = sample_knowledge / "agents" / "codex" / "grunt.toml"
-    assert files["agents/grunt.toml"].content == source.read_bytes()
+    source = sample_knowledge / "agents" / "codex" / f"{stem}.toml"
+    assert files[f"agents/{stem}.toml"].content == source.read_bytes()
+    assert not files[f"agents/{stem}.toml"].executable
 
 
 def test_hooks_travel_verbatim_with_their_exec_bits(sample_knowledge):

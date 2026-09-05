@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from test_ingest import CODEX_ROLE, HOOKS_DOC, FakeRegistry
+from test_ingest import CODEX_ROLE, FULL_CODEX_ROLE, HOOKS_DOC, FakeRegistry
 from theozolith_control import candidate, configrepo
 from theozolith_control import ingest as ingest_mod
 from theozolith_control.candidate import CandidateError
@@ -259,15 +259,19 @@ def test_export_codex_type_bakes_the_codex_view(tmp_path):
         adapter="codex",
         model="gpt-5.2-codex",
         name="codexreview",
-        knowledge_files={"agents/codex/grunt.toml": CODEX_ROLE, "hooks/hooks.json": HOOKS_DOC},
+        knowledge_files={
+            "agents/codex/grunt.toml": CODEX_ROLE,
+            "agents/codex/scout.toml": FULL_CODEX_ROLE,
+            "hooks/hooks.json": HOOKS_DOC,
+        },
     )
     manifest = json.loads((bundle / "candidate.json").read_text(encoding="utf-8"))
     assert manifest["knowledge_target"] == "/home/ozolith/.codex/"
     assert (bundle / "knowledge" / "AGENTS.md").is_file()
     assert not (bundle / "knowledge" / "CLAUDE.md").exists()
-    assert (bundle / "knowledge" / "agents" / "grunt.toml").read_text(
-        encoding="utf-8"
-    ) == CODEX_ROLE
+    agents = bundle / "knowledge" / "agents"
+    assert (agents / "grunt.toml").read_text(encoding="utf-8") == CODEX_ROLE
+    assert (agents / "scout.toml").read_text(encoding="utf-8") == FULL_CODEX_ROLE
     assert (bundle / "knowledge" / "hooks" / "hooks.json").read_text(encoding="utf-8") == HOOKS_DOC
     dockerfile = (bundle / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY --chown=ozolith:ozolith knowledge/ /home/ozolith/.codex/" in dockerfile

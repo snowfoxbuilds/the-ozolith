@@ -23,6 +23,17 @@ CODEX_ROLE = (
     'name = "grunt"\ndescription = "Runs a named check."\n'
     'developer_instructions = "Run it and report the exact result."\n'
 )
+# A full native role: the codex session-configuration layer (model, effort,
+# sandbox, MCP servers, skills) rides beside the metadata and ships verbatim.
+FULL_CODEX_ROLE = (
+    'name = "scout"\ndescription = "Reads the codebase and reports; never edits."\n'
+    'developer_instructions = "Answer from the code alone. Never edit."\n'
+    'nickname_candidates = ["lookout"]\nmodel = "gpt-6-astra"\n'
+    'model_reasoning_effort = "medium"\nsandbox_mode = "read-only"\n\n'
+    '[mcp_servers.docs]\ncommand = "npx"\n'
+    'args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]\n\n'
+    '[[skills.config]]\npath = "../skills/greet/SKILL.md"\nenabled = true\n'
+)
 HOOKS_DOC = '{"hooks": {"PreToolUse": []}}\n'
 
 
@@ -275,6 +286,7 @@ def test_codex_native_roles_and_hooks_land_in_the_codex_view_and_its_pin(tmp_pat
     src = source_repo(tmp_path, git=False)
     write(src, "knowledge/dev/agents/codex/triage.md", "triage first\n")
     write(src, "knowledge/dev/agents/codex/grunt.toml", CODEX_ROLE)
+    write(src, "knowledge/dev/agents/codex/scout.toml", FULL_CODEX_ROLE)
     write(src, "knowledge/dev/hooks/hooks.json", HOOKS_DOC)
     guard = src / "knowledge/dev/hooks/guard.sh"
     guard.write_text("#!/bin/sh\nexit 0\n")
@@ -285,6 +297,7 @@ def test_codex_native_roles_and_hooks_land_in_the_codex_view_and_its_pin(tmp_pat
     view = pinned / "knowledge/dev/codex"
     assert (view / "prompts/triage.md").is_file()
     assert (view / "agents/grunt.toml").read_text() == CODEX_ROLE
+    assert (view / "agents/scout.toml").read_text() == FULL_CODEX_ROLE
     assert (view / "hooks/hooks.json").read_text() == HOOKS_DOC
     assert (view / "hooks/guard.sh").stat().st_mode & 0o111
     codex_pin = report.knowledge_pins["dev/codex"]
@@ -297,20 +310,91 @@ def test_codex_native_roles_and_hooks_land_in_the_codex_view_and_its_pin(tmp_pat
     assert not (view / "hooks/guard.sh").exists()
 
 
-def test_malformed_codex_role_fails_ingest_with_nothing_committed(tmp_path):
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ('name = "grunt"\ndescription = "x"\n', "developer_instructions"),
+        (CODEX_ROLE + 'sandbox_mode = "yolo"\n', r"sandbox_mode: 'yolo' is not one of"),
+        (CODEX_ROLE + '[mcp_servers.docs]\ncomand = "npx"\n', r"mcp_servers\.docs: unknown field"),
+        (CODEX_ROLE + "nickname_candidates = []\n", "at least one name"),
+    ],
+)
+def test_malformed_codex_role_fails_ingest_with_nothing_committed(tmp_path, text, problem):
     """Role validation is an ingest-time refusal (ADR-0052 §1): codex would
-    warn-and-skip the file at deck startup, silently shrinking the roster."""
+    warn-and-skip the file at deck startup, silently shrinking the roster.
+    The refusal names the file and the field, and leaves the pinned build
+    exactly as it was — no commit, no dirty staging."""
     src = source_repo(tmp_path)
     pinned = pinned_dir(tmp_path)
     ingest(str(src), pinned, log=lambda *_: None)
     head = _git(pinned, "rev-parse", "HEAD")
-    write(src, "knowledge/dev/agents/codex/grunt.toml", 'name = "grunt"\ndescription = "x"\n')
-    _commit_all(src, "half a role")
-    with pytest.raises(IngestError, match=r"not a valid knowledge root.*developer_instructions"):
+    write(src, "knowledge/dev/agents/codex/grunt.toml", text)
+    _commit_all(src, "a malformed role")
+    with pytest.raises(IngestError, match=r"not a valid knowledge root.*grunt\.toml.*" + problem):
         ingest(str(src), pinned, log=lambda *_: None)
     assert _git(pinned, "rev-parse", "HEAD") == head
     assert _git(pinned, "status", "--porcelain") == ""
     assert not (pinned / "knowledge/dev/codex/agents").exists()
+
+
+def test_native_role_edits_move_only_the_codex_pin(tmp_path):
+    """Adding, changing, and removing a native role each re-pin the codex
+    view alone; the claude pin never moves, and removing the role returns
+    the codex pin to its earlier value (pins are pure content hashes)."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    claude_pin = before.knowledge_pins["dev/claude"]
+    codex_pin = before.knowledge_pins["dev/codex"]
+    role = src / "knowledge/dev/agents/codex/scout.toml"
+
+    write(src, "knowledge/dev/agents/codex/scout.toml", FULL_CODEX_ROLE)
+    _commit_all(src, "add a role")
+    added = ingest(str(src), pinned, log=lambda *_: None)
+    assert added.knowledge_pins["dev/claude"] == claude_pin
+    assert added.knowledge_pins["dev/codex"] != codex_pin
+    assert (pinned / "knowledge/dev/codex/agents/scout.toml").read_text() == FULL_CODEX_ROLE
+
+    role.write_text(FULL_CODEX_ROLE.replace('"medium"', '"high"'), encoding="utf-8")
+    _commit_all(src, "change the role")
+    changed = ingest(str(src), pinned, log=lambda *_: None)
+    assert changed.knowledge_pins["dev/claude"] == claude_pin
+    assert changed.knowledge_pins["dev/codex"] not in (codex_pin, added.knowledge_pins["dev/codex"])
+
+    shutil.rmtree(src / "knowledge/dev/agents")
+    _commit_all(src, "remove the role")
+    removed = ingest(str(src), pinned, log=lambda *_: None)
+    assert removed.knowledge_pins["dev/claude"] == claude_pin
+    assert removed.knowledge_pins["dev/codex"] == codex_pin
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
+    assert not (pinned / "knowledge/dev/claude/agents").exists()
+
+
+def test_symlinked_codex_namespace_fails_ingest_with_nothing_staged(tmp_path):
+    """A symlinked agents/codex/ pointing outside the tree is refused before
+    any of its content — even a perfectly valid role — can reach staging,
+    the compiled view, or a pin."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    before = ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    outside = tmp_path / "outside-codex"
+    outside.mkdir()
+    (outside / "leak.toml").write_text(CODEX_ROLE, encoding="utf-8")
+    (src / "knowledge/dev/agents").mkdir(parents=True)
+    (src / "knowledge/dev/agents/codex").symlink_to(outside)
+    _commit_all(src, "symlinked namespace")
+
+    with pytest.raises(
+        IngestError,
+        match=r"knowledge/dev is not a valid knowledge root: agents/ tool namespace is a symlink",
+    ):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
+    assert "leak" not in "".join(str(p) for p in pinned.rglob("*"))
+    assert configrepo.load_pins(pinned).knowledge == before.knowledge_pins
 
 
 def test_reingest_migrates_a_legacy_layout_pinned_build(tmp_path):
