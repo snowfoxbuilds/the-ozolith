@@ -39,7 +39,9 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         f"AGENTS.md: {'yes' if root.agents_md else 'no'}, "
         f"skills: {len(root.skills)}, "
         f"claude agents: {len(root.claude_agents)}, "
-        f"codex agents: {len(root.codex_agents)}, "
+        f"codex prompts: {len(root.codex_agents)}, "
+        f"codex agent roles: {len(root.codex_agent_roles)}, "
+        f"hooks: {len(root.hooks)}, "
         f"workflows: {len(root.workflows)}"
     )
     return 0

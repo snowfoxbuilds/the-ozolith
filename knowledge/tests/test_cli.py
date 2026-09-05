@@ -10,7 +10,9 @@ def test_validate_ok(sample_knowledge, capsys):
     # Per-tool section counts are the visibility for content a compiler
     # drops (codex has no workflows target, ADR-0052).
     assert "claude agents: 2" in out
-    assert "codex agents: 1" in out
+    assert "codex prompts: 1" in out
+    assert "codex agent roles: 1" in out
+    assert "hooks: 2" in out
 
 
 def test_sync_tool_codex(tmp_path, sample_knowledge):
@@ -29,6 +31,8 @@ def test_sync_tool_codex(tmp_path, sample_knowledge):
     assert main(args) == 0
     assert (target / "AGENTS.md").is_file()
     assert (target / "prompts" / "triage.md").is_file()
+    assert (target / "agents" / "grunt.toml").is_file()
+    assert (target / "hooks" / "hooks.json").is_file()
     assert not (target / "CLAUDE.md").exists()
 
 

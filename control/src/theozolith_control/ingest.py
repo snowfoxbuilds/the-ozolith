@@ -500,7 +500,9 @@ def _compile_knowledge(source_dir: Path, staging: Path) -> dict[str, str]:
         try:
             root = load_knowledge_root(entry)
         except KnowledgeError as exc:
-            raise IngestError(f"knowledge/{entry.name} is not a knowledge root: {exc}") from exc
+            raise IngestError(
+                f"knowledge/{entry.name} is not a valid knowledge root: {exc}"
+            ) from exc
         for tool, compiler in sorted(COMPILERS.items()):
             try:
                 fileset = compiler(root, "global")

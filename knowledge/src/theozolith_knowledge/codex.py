@@ -4,7 +4,9 @@ Mapping rules (ADR-0052, extending ADR-0009's per-tool namespacing):
 
     AGENTS.md              -> <target>/AGENTS.md          (verbatim, NO marker)
     skills/<name>/         -> <target>/skills/<name>/     (verbatim)
-    agents/codex/<n>.md    -> <target>/prompts/<n>.md     (Codex custom prompts)
+    agents/codex/<n>.toml  -> <target>/agents/<n>.toml    (Codex custom agent roles)
+    agents/codex/<n>.md    -> <target>/prompts/<n>.md     (Codex custom prompts, deprecated)
+    hooks/                 -> <target>/hooks/             (verbatim: hooks.json + scripts)
     workflows/<name>       -> dropped (no Codex equivalent)
 
 where <target> is the Codex home itself (e.g. ~/.codex). AGENTS.md carries no
@@ -12,8 +14,11 @@ generated marker: Claude's CLAUDE.md is a derivative of AGENTS.md and the
 marker records that, but for Codex the vendor format IS the canonical source
 format — managed-ness is carried by the sync manifest (and, in the pinned
 build, by the per-tree pins), not by a comment that would burn context every
-session. Skills map verbatim: Codex consumes the same skills format
-(skills/<name>/SKILL.md) natively.
+session. Skills, agent roles, and hooks map verbatim: Codex consumes the same
+skills format (skills/<name>/SKILL.md) natively, and the role TOML and
+hooks.json are validated by the loader before they get here. The prompts/
+surface is deprecated upstream and kept only so existing compiled views stay
+byte-stable.
 
 V1 is GLOBAL SCOPE ONLY. In project scope the knowledge root *is* the project
 repo, whose AGENTS.md already sits exactly where Codex reads it — the
@@ -50,6 +55,10 @@ def compile_codex(root: KnowledgeRoot, scope: str) -> FileSet:
     for skill in root.skills:
         for rel, entry in _walk_files(skill.path):
             files[f"skills/{skill.name}/{rel}"] = entry
+    for role in root.codex_agent_roles:
+        files[f"agents/{role.name}.toml"] = _entry(role.path)
     for agent in root.codex_agents:
         files[f"prompts/{agent.name}.md"] = _entry(agent.path)
+    for hook in root.hooks:
+        files[f"hooks/{hook.relpath}"] = _entry(hook.path)
     return files

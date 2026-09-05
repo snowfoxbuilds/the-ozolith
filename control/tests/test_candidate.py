@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from test_ingest import FakeRegistry
+from test_ingest import CODEX_ROLE, HOOKS_DOC, FakeRegistry
 from theozolith_control import candidate, configrepo
 from theozolith_control import ingest as ingest_mod
 from theozolith_control.candidate import CandidateError
@@ -57,6 +57,7 @@ def make_source(
     knowledge: str = "knowledge/gold",
     policy: str = "",
     name: str = "goldtype",
+    knowledge_files: dict[str, str] | None = None,
 ) -> Path:
     source = tmp_path / "config-src"
     (source / "worker-types").mkdir(parents=True, exist_ok=True)
@@ -64,6 +65,10 @@ def make_source(
     (source / "knowledge" / "gold" / "AGENTS.md").write_text(
         "# golden knowledge\n", encoding="utf-8"
     )
+    for relpath, text in (knowledge_files or {}).items():
+        target = source / "knowledge" / "gold" / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
     if policy:
         tree = source / "policy" / policy.removeprefix("policy/")
         tree.mkdir(parents=True, exist_ok=True)
@@ -243,8 +248,10 @@ def test_export_writes_a_verifiable_bundle(tmp_path):
 
 def test_export_codex_type_bakes_the_codex_view(tmp_path):
     """Per-tool compile reuse (ADR-0052): a codex candidate bundles the codex
-    compile of the tree (AGENTS.md verbatim, no claude marker) and the
-    non-default COPY target."""
+    compile of the tree (AGENTS.md verbatim, no claude marker; native agent
+    roles under agents/ and hooks/ verbatim) and the non-default COPY target.
+    verify_bundle recomputing the pin over the bundle proves both sections
+    are pinned content."""
     bundle, summary = export_gold(
         tmp_path,
         base="ghcr.io/acme/theozolith-run-codex:1.2.3",
@@ -252,11 +259,16 @@ def test_export_codex_type_bakes_the_codex_view(tmp_path):
         adapter="codex",
         model="gpt-5.2-codex",
         name="codexreview",
+        knowledge_files={"agents/codex/grunt.toml": CODEX_ROLE, "hooks/hooks.json": HOOKS_DOC},
     )
     manifest = json.loads((bundle / "candidate.json").read_text(encoding="utf-8"))
     assert manifest["knowledge_target"] == "/home/ozolith/.codex/"
     assert (bundle / "knowledge" / "AGENTS.md").is_file()
     assert not (bundle / "knowledge" / "CLAUDE.md").exists()
+    assert (bundle / "knowledge" / "agents" / "grunt.toml").read_text(
+        encoding="utf-8"
+    ) == CODEX_ROLE
+    assert (bundle / "knowledge" / "hooks" / "hooks.json").read_text(encoding="utf-8") == HOOKS_DOC
     dockerfile = (bundle / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY --chown=ozolith:ozolith knowledge/ /home/ozolith/.codex/" in dockerfile
     assert candidate.verify_bundle(bundle) == summary

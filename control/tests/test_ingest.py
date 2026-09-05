@@ -17,6 +17,14 @@ DIGEST = "a" * 64
 BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2@sha256:{DIGEST}"
 TAG_ONLY_BASE = "ghcr.io/snowfoxbuilds/theozolith-run-claude:1.2"
 
+# A codex custom agent role and a hooks config (ADR-0052 §1): the two
+# codex-native sections the claude view must stay blind to.
+CODEX_ROLE = (
+    'name = "grunt"\ndescription = "Runs a named check."\n'
+    'developer_instructions = "Run it and report the exact result."\n'
+)
+HOOKS_DOC = '{"hooks": {"PreToolUse": []}}\n'
+
 
 def _git(cwd: Path, *args: str) -> str:
     proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
@@ -214,7 +222,9 @@ def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
     """The migration's no-retag proof (ADR-0052): knowledge_tree_hash is
     computed with relpaths RELATIVE TO THE TREE ROOT, so the claude compile
     moving from knowledge/dev/ to knowledge/dev/claude/ keeps the pin value
-    byte-identical — no claude worker type re-tags on the layout change."""
+    byte-identical — no claude worker type re-tags on the layout change. The
+    codex-native sections (agents/codex/*.toml roles, hooks/) are claude-blind
+    the same way: adding them moves the codex pin and nothing else."""
     src = source_repo(tmp_path)
     pinned = pinned_dir(tmp_path)
     report = ingest(str(src), pinned, log=lambda *_: None)
@@ -222,6 +232,16 @@ def test_claude_pin_values_survive_the_per_tool_layout(tmp_path):
     legacy = tmp_path / "legacy-shaped"
     shutil.copytree(pinned / "knowledge/dev/claude", legacy / "knowledge/dev")
     assert configdist.knowledge_tree_hash(legacy, "dev") == report.knowledge_pins["dev/claude"]
+
+    write(src, "knowledge/dev/agents/codex/grunt.toml", CODEX_ROLE)
+    write(src, "knowledge/dev/hooks/hooks.json", HOOKS_DOC)
+    _commit_all(src, "codex-native sections")
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.knowledge_pins["dev/claude"] == report.knowledge_pins["dev/claude"]
+    assert after.knowledge_pins["dev/codex"] != report.knowledge_pins["dev/codex"]
+    assert not (pinned / "knowledge/dev/claude/agents").exists()
+    assert not (pinned / "knowledge/dev/claude/hooks").exists()
+    assert configdist.knowledge_tree_hash(legacy, "dev") == after.knowledge_pins["dev/claude"]
 
 
 def test_per_tool_compile_skips_empty_filesets(tmp_path):
@@ -231,6 +251,7 @@ def test_per_tool_compile_skips_empty_filesets(tmp_path):
     src = source_repo(tmp_path)
     write(src, "knowledge/wf-only/workflows/pair.md", "review in pairs\n")
     write(src, "knowledge/cdx-only/agents/codex/triage.md", "triage first\n")
+    write(src, "knowledge/hooks-only/hooks/hooks.json", HOOKS_DOC)
     _commit_all(src, "single-tool trees")
     pinned = pinned_dir(tmp_path)
     report = ingest(str(src), pinned, log=lambda *_: None)
@@ -242,6 +263,54 @@ def test_per_tool_compile_skips_empty_filesets(tmp_path):
     assert "cdx-only/claude" not in report.knowledge_pins
     assert not (pinned / "knowledge/cdx-only/claude").exists()
     assert (pinned / "knowledge/cdx-only/codex/prompts/triage.md").is_file()
+    assert "hooks-only/codex" in report.knowledge_pins
+    assert "hooks-only/claude" not in report.knowledge_pins
+    assert (pinned / "knowledge/hooks-only/codex/hooks/hooks.json").is_file()
+
+
+def test_codex_native_roles_and_hooks_land_in_the_codex_view_and_its_pin(tmp_path):
+    """agents/codex/*.toml compiles to the codex view's agents/ and hooks/
+    travels verbatim, exec bits included, both folded into the codex pin
+    (ADR-0052 §1); the deprecated prompts/ surface stays beside them."""
+    src = source_repo(tmp_path, git=False)
+    write(src, "knowledge/dev/agents/codex/triage.md", "triage first\n")
+    write(src, "knowledge/dev/agents/codex/grunt.toml", CODEX_ROLE)
+    write(src, "knowledge/dev/hooks/hooks.json", HOOKS_DOC)
+    guard = src / "knowledge/dev/hooks/guard.sh"
+    guard.write_text("#!/bin/sh\nexit 0\n")
+    guard.chmod(0o755)
+    pinned = pinned_dir(tmp_path)
+    report = ingest(str(src), pinned, log=lambda *_: None)
+
+    view = pinned / "knowledge/dev/codex"
+    assert (view / "prompts/triage.md").is_file()
+    assert (view / "agents/grunt.toml").read_text() == CODEX_ROLE
+    assert (view / "hooks/hooks.json").read_text() == HOOKS_DOC
+    assert (view / "hooks/guard.sh").stat().st_mode & 0o111
+    codex_pin = report.knowledge_pins["dev/codex"]
+    assert codex_pin == configdist.knowledge_tree_hash(pinned, "dev/codex")
+
+    # Dropping the hook script alone moves the pin: hooks/ is pinned content.
+    guard.unlink()
+    after = ingest(str(src), pinned, log=lambda *_: None)
+    assert after.knowledge_pins["dev/codex"] != codex_pin
+    assert not (view / "hooks/guard.sh").exists()
+
+
+def test_malformed_codex_role_fails_ingest_with_nothing_committed(tmp_path):
+    """Role validation is an ingest-time refusal (ADR-0052 §1): codex would
+    warn-and-skip the file at deck startup, silently shrinking the roster."""
+    src = source_repo(tmp_path)
+    pinned = pinned_dir(tmp_path)
+    ingest(str(src), pinned, log=lambda *_: None)
+    head = _git(pinned, "rev-parse", "HEAD")
+    write(src, "knowledge/dev/agents/codex/grunt.toml", 'name = "grunt"\ndescription = "x"\n')
+    _commit_all(src, "half a role")
+    with pytest.raises(IngestError, match=r"not a valid knowledge root.*developer_instructions"):
+        ingest(str(src), pinned, log=lambda *_: None)
+    assert _git(pinned, "rev-parse", "HEAD") == head
+    assert _git(pinned, "status", "--porcelain") == ""
+    assert not (pinned / "knowledge/dev/codex/agents").exists()
 
 
 def test_reingest_migrates_a_legacy_layout_pinned_build(tmp_path):
@@ -344,7 +413,7 @@ def test_knowledge_that_does_not_compile_is_refused_at_ingest(tmp_path):
     start (ADR-0048). An empty knowledge root is the simplest reject."""
     src = source_repo(tmp_path, git=False)
     (src / "knowledge" / "empty").mkdir()
-    with pytest.raises(IngestError, match="is not a knowledge root"):
+    with pytest.raises(IngestError, match="not a valid knowledge root"):
         ingest(str(src), pinned_dir(tmp_path), log=lambda *_: None)
 
 

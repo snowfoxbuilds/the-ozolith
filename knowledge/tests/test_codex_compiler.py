@@ -8,6 +8,9 @@ from theozolith_knowledge.model import KnowledgeError, load_knowledge_root
 
 EXPECTED_GLOBAL_PATHS = {
     "AGENTS.md",
+    "agents/grunt.toml",
+    "hooks/guard.sh",
+    "hooks/hooks.json",
     "prompts/triage.md",
     "skills/code-review/SKILL.md",
     "skills/code-review/references/checklist.md",
@@ -34,6 +37,23 @@ def test_codex_agents_become_prompts(sample_knowledge):
     assert files["prompts/triage.md"].content == source.read_bytes()
 
 
+def test_codex_agent_roles_become_native_agents(sample_knowledge):
+    # The role TOML ships verbatim under agents/ — codex's own discovery dir —
+    # beside the deprecated prompts/ surface (ADR-0052 §1).
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    source = sample_knowledge / "agents" / "codex" / "grunt.toml"
+    assert files["agents/grunt.toml"].content == source.read_bytes()
+
+
+def test_hooks_travel_verbatim_with_their_exec_bits(sample_knowledge):
+    files = compile_codex(load_knowledge_root(sample_knowledge), "global")
+    hooks = sample_knowledge / "hooks"
+    assert files["hooks/hooks.json"].content == (hooks / "hooks.json").read_bytes()
+    assert files["hooks/guard.sh"].content == (hooks / "guard.sh").read_bytes()
+    assert files["hooks/guard.sh"].executable
+    assert not files["hooks/hooks.json"].executable
+
+
 def test_workflows_are_dropped(sample_knowledge):
     files = compile_codex(load_knowledge_root(sample_knowledge), "global")
     assert not any(path.startswith("workflows/") for path in files)
@@ -56,10 +76,14 @@ def test_unknown_scope_is_rejected(sample_knowledge):
 
 
 def test_claude_output_is_codex_blind(sample_knowledge):
-    # Adding agents/codex/ to a tree must not change what the claude compiler
-    # emits (per-tool selective retag depends on this).
+    # Adding agents/codex/ (prompts or native roles) or hooks/ to a tree must
+    # not change what the claude compiler emits (per-tool selective retag
+    # depends on this).
     files = compile_claude(load_knowledge_root(sample_knowledge), "global")
-    assert not any("triage" in path or path.startswith("prompts/") for path in files)
+    assert not any(
+        "triage" in path or path.startswith(("prompts/", "hooks/")) or path.endswith(".toml")
+        for path in files
+    )
 
 
 def test_registry_dispatch():
