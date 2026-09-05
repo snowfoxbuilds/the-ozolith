@@ -112,7 +112,7 @@ from theozolith_worker import policy as agentpolicy
 # the supported platform-package table both live on the adapter, so control
 # resolves against the SAME registry of capability the identity machinery
 # enforces (control already carries theozolith-worker, ADR-0015 amendment).
-from theozolith_worker.adapters import make_agent_adapter
+from theozolith_worker.adapters import AgentAdapterError, make_agent_adapter
 
 from theozolith_control import configdist, configrepo, controltoml, repolock
 
@@ -636,13 +636,15 @@ def _resolve_bases(staging: Path, resolve_digest: Callable[[str], str]) -> dict[
     return resolved
 
 
-def _resolve_cli_pins(staging: Path, resolve_cli: Callable[[str], dict]) -> dict[str, dict]:
-    """CLI Pin resolutions for every driverless claude worker type declaring
-    ``cli`` (ADR-0055), keyed ``claude/<declared>`` — the ``_resolve_bases``
-    twin. Each distinct declared value resolves once. Definitions carrying
-    ``cli`` with a driver or a non-claude adapter are deliberately skipped
-    here: the staged config load refuses them with the precise error, which
-    the ingest LINT step surfaces before anything commits."""
+def _resolve_cli_pins(staging: Path, resolve_cli: Callable[..., dict]) -> dict[str, dict]:
+    """CLI Pin resolutions for every driverless worker type whose adapter
+    declares a CLI archive contract (ADR-0055), keyed ``<adapter>/<declared>``
+    — the ``_resolve_bases`` twin. Each distinct ``<adapter>/<declared>`` pair
+    resolves once, against that adapter's platform table. Definitions carrying
+    ``cli`` with a driver, or on an adapter that declares no CLI table, are
+    deliberately skipped here: the staged config load refuses them with the
+    precise error, which the ingest LINT step surfaces before anything
+    commits."""
     resolved: dict[str, dict] = {}
     for path in sorted((staging / "worker-types").glob("*.toml")):
         try:
@@ -653,13 +655,19 @@ def _resolve_cli_pins(staging: Path, resolve_cli: Callable[[str], dict]) -> dict
         if not isinstance(declared, str) or not declared:
             continue
         adapter = data.get("adapter", "claude")
-        if data.get("driver") or adapter != "claude":
+        if data.get("driver"):
             continue  # refused by the load lint with the precise message
-        key = f"claude/{declared}"
+        try:
+            adapter_obj = make_agent_adapter(adapter)
+        except AgentAdapterError:
+            continue  # unknown adapter — the load lint fails loudly
+        if not getattr(adapter_obj, "CLI_PLATFORM_PACKAGES", None):
+            continue  # adapter declares no CLI table — refused by the load lint
+        key = f"{adapter}/{declared}"
         if key in resolved:
             continue
         try:
-            pin = resolve_cli(declared)
+            pin = resolve_cli(declared, tool=adapter)
         except IngestError:
             raise
         except Exception as exc:
@@ -853,7 +861,7 @@ def ingest(
     pinned_dir: Path,
     *,
     resolve_digest: Callable[[str], str] | None = None,
-    resolve_cli: Callable[[str], dict] | None = None,
+    resolve_cli: Callable[..., dict] | None = None,
     registry_credentials: dict[str, str] | None = None,
     dry_run: bool = False,
     runner=None,
@@ -920,7 +928,7 @@ def _ingest_locked(
     log,
     dry_run: bool = False,
     registry_credentials: dict[str, str] | None = None,
-    resolve_cli: Callable[[str], dict] | None = None,
+    resolve_cli: Callable[..., dict] | None = None,
 ) -> IngestReport:
     report = IngestReport(dry_run=dry_run)
     # The injected resolver seam is untouched (every existing fake keeps
@@ -1362,7 +1370,8 @@ def resolve_cli_pin(declared: str, *, tool: str = "claude") -> dict:
     adapter = make_agent_adapter(tool)
     packages = getattr(adapter, "CLI_PLATFORM_PACKAGES", None)
     wrapper = getattr(adapter, "CLI_WRAPPER_PACKAGE", "")
-    if not packages or not wrapper:
+    suffixes = getattr(adapter, "CLI_PLATFORM_VERSION_SUFFIXES", None)
+    if not packages or not wrapper or not suffixes:
         raise IngestError(
             f"cannot resolve CLI pin {declared!r}: adapter {tool!r} declares no"
             " supported CLI platform table (ADR-0055)"
@@ -1390,13 +1399,21 @@ def resolve_cli_pin(declared: str, *, tool: str = "claude") -> dict:
         )
     platforms: dict[str, dict[str, str]] = {}
     for tuple_key, package in sorted(packages.items()):
+        # The tarball basename appends the tuple's version suffix to the
+        # resolved base version (ADR-0055 D3): claude's is empty (its
+        # platform binaries are distinct packages at <version>); codex's is
+        # "-linux-<arch>" (one static musl tarball per architecture, a
+        # version of the wrapper). The recorded wire shape stays the base
+        # {package, integrity} — the daemon re-derives the coordinate by
+        # appending the row's own suffix.
+        suffix = suffixes[tuple_key]
         # A supported tuple the registry cannot supply fails the ingest
         # (ADR-0055): the pinned map must be COMPLETE, or a node of that
         # platform would discover the gap only at install time.
         entry = _npm_document(
-            f"{_NPM_REGISTRY}/{urllib.parse.quote(package, safe='')}/{version}",
+            f"{_NPM_REGISTRY}/{urllib.parse.quote(package, safe='')}/{version}{suffix}",
             declared,
-            f"platform package {package} ({tuple_key}) at {version}",
+            f"platform package {package} ({tuple_key}) at {version}{suffix}",
         )
         dist = entry.get("dist")
         integrity = dist.get("integrity", "") if isinstance(dist, dict) else ""

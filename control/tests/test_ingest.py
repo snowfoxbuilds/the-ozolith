@@ -1382,19 +1382,38 @@ import json  # noqa: E402
 import urllib.parse  # noqa: E402
 
 from theozolith_control.ingest import resolve_cli_pin  # noqa: E402
-from theozolith_worker.adapters import ClaudeAdapter  # noqa: E402
+from theozolith_worker.adapters import (  # noqa: E402
+    ClaudeAdapter,
+    CodexAdapter,
+    make_agent_adapter,
+)
 
 _SRI = "sha512-" + base64.b64encode(b"x" * 64).decode()
+CODEX_BASE = f"ghcr.io/snowfoxbuilds/theozolith-run-codex:main@sha256:{DIGEST}"
 
 
 class FakeNpm:
     """A scripted npm registry over the shared ingest._urlopen seam: the
     wrapper package's version document (exact versions echo, dist-tags map
-    through ``tags``) and one document per platform package. ``missing``
-    packages 404; ``bad_integrity`` overrides per package; ``raw`` replaces
-    every body verbatim (the malformed-response shapes)."""
+    through ``tags``) and one document per platform coordinate. ``missing``
+    coordinates 404; ``bad_integrity`` overrides per coordinate; ``raw``
+    replaces every body verbatim (the malformed-response shapes). A
+    coordinate is a platform PACKAGE (claude publishes distinct platform
+    packages) or a suffixed platform SELECTOR ``<version>-linux-<arch>``
+    (codex publishes one static tarball per architecture as a version of the
+    wrapper itself) — both are accepted so codex and claude tests key the
+    same way."""
 
-    def __init__(self, *, tags=None, missing=(), bad_integrity=None, raw=None):
+    def __init__(
+        self,
+        *,
+        wrapper=ClaudeAdapter.CLI_WRAPPER_PACKAGE,
+        tags=None,
+        missing=(),
+        bad_integrity=None,
+        raw=None,
+    ):
+        self.wrapper = wrapper
         self.tags = dict(tags or {})
         self.missing = set(missing)
         self.bad_integrity = dict(bad_integrity or {})
@@ -1409,13 +1428,17 @@ class FakeNpm:
         package = urllib.parse.unquote(package_enc)
         if self.raw is not None:
             return _FakeResp(body=self.raw)
-        if package == ClaudeAdapter.CLI_WRAPPER_PACKAGE:
+        # The wrapper VERSION document is the wrapper package at a bare
+        # version/dist-tag; a codex platform document is the SAME package at
+        # "<version>-linux-<arch>", told apart by the platform suffix.
+        if package == self.wrapper and "-linux-" not in selector:
             declared = urllib.parse.unquote(selector)
             version = self.tags.get(declared, declared)
             return _FakeResp(body=json.dumps({"version": version}).encode())
-        if package in self.missing:
+        if package in self.missing or selector in self.missing:
             raise urllib.error.HTTPError(url, 404, "Not Found", email.message.Message(), None)
-        integrity = self.bad_integrity.get(package, _SRI)
+        coord = selector if selector in self.bad_integrity else package
+        integrity = self.bad_integrity.get(coord, _SRI)
         dist = {} if integrity is None else {"integrity": integrity}
         return _FakeResp(body=json.dumps({"version": selector, "dist": dist}).encode())
 
@@ -1475,6 +1498,66 @@ def test_cli_pin_malformed_registry_answers_fail_actionably(monkeypatch):
         resolve_cli_pin("latest")
 
 
+def _codex_npm(**kwargs) -> FakeNpm:
+    return FakeNpm(wrapper=CodexAdapter.CLI_WRAPPER_PACKAGE, **kwargs)
+
+
+def test_codex_cli_pin_exact_version_resolves_every_supported_tuple(monkeypatch):
+    """codex resolves the wrapper version once, then one suffixed platform
+    document per tuple (<version>-linux-<arch>); every tuple's package is the
+    wrapper itself (ADR-0055 D3)."""
+    npm = _codex_npm()
+    monkeypatch.setattr(ingest_mod, "_urlopen", npm)
+    pin = resolve_cli_pin("0.153.3", tool="codex")
+    assert pin["version"] == "0.153.3"
+    assert pin["platforms"] == {
+        key: {"package": "@openai/codex", "integrity": _SRI}
+        for key in CodexAdapter.CLI_PLATFORM_PACKAGES
+    }
+    assert npm.calls[0] == "https://registry.npmjs.org/%40openai%2Fcodex/0.153.3"
+    # x64 tuples resolve at -linux-x64, arm64 tuples at -linux-arm64.
+    assert any(c.endswith("/0.153.3-linux-x64") for c in npm.calls)
+    assert any(c.endswith("/0.153.3-linux-arm64") for c in npm.calls)
+    assert len(npm.calls) == 1 + len(CodexAdapter.CLI_PLATFORM_PACKAGES)
+
+
+def test_codex_cli_pin_dist_tag_resolves_and_reresolves(monkeypatch):
+    npm = _codex_npm(tags={"latest": "0.153.3"})
+    monkeypatch.setattr(ingest_mod, "_urlopen", npm)
+    assert resolve_cli_pin("latest", tool="codex")["version"] == "0.153.3"
+    npm.tags["latest"] = "0.153.4"
+    assert resolve_cli_pin("latest", tool="codex")["version"] == "0.153.4"
+
+
+def test_codex_cli_pin_unsuppliable_tuple_fails_naming_it(monkeypatch):
+    """A suffixed platform document the registry cannot supply fails the
+    ingest naming the first tuple that addresses it (ADR-0055)."""
+    for npm in (
+        _codex_npm(missing={"0.153.3-linux-arm64"}),
+        _codex_npm(bad_integrity={"0.153.3-linux-arm64": None}),
+        _codex_npm(bad_integrity={"0.153.3-linux-arm64": "sha256-" + "a" * 32}),
+    ):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ingest_mod, "_urlopen", npm)
+            with pytest.raises(IngestError, match=r"linux-arm64-glibc"):
+                resolve_cli_pin("0.153.3", tool="codex")
+
+
+def test_codex_cli_pin_below_the_floor_fails(monkeypatch):
+    monkeypatch.setattr(ingest_mod, "_urlopen", _codex_npm(tags={"old": "0.149.0"}))
+    with pytest.raises(IngestError, match="below the codex adapter's enforcement floor"):
+        resolve_cli_pin("old", tool="codex")
+
+
+def test_codex_cli_pin_malformed_registry_answers_fail_actionably(monkeypatch):
+    monkeypatch.setattr(ingest_mod, "_urlopen", _codex_npm(raw=b"not json"))
+    with pytest.raises(IngestError, match="malformed response"):
+        resolve_cli_pin("0.153.3", tool="codex")
+    monkeypatch.setattr(ingest_mod, "_urlopen", _codex_npm(tags={"latest": "not-semver"}))
+    with pytest.raises(IngestError, match="not an exact"):
+        resolve_cli_pin("latest", tool="codex")
+
+
 def _deck_source(tmp_path, declared: str = "latest") -> Path:
     """source_repo plus a driverless claude deck declaring a CLI Pin."""
     src = source_repo(tmp_path)
@@ -1488,12 +1571,13 @@ def _deck_source(tmp_path, declared: str = "latest") -> Path:
 
 
 def _fake_cli_resolver(version_cell: list[str]):
-    def resolve_cli(declared: str) -> dict:
+    def resolve_cli(declared: str, *, tool: str = "claude") -> dict:
+        adapter = make_agent_adapter(tool)
         return {
             "version": version_cell[0],
             "platforms": {
                 key: {"package": package, "integrity": _SRI}
-                for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
+                for key, package in adapter.CLI_PLATFORM_PACKAGES.items()
             },
         }
 
@@ -1538,6 +1622,34 @@ def test_reingest_with_a_moved_dist_tag_reresolves(tmp_path):
     assert report.changed  # the moved pin alone recommits the pinned build
     assert 'version = "2.1.261"' in (pinned / "pins.toml").read_text()
     assert configrepo.load_config(pinned).worker_types["deck"].cli_version == "2.1.261"
+
+
+def test_ingest_writes_a_codex_cli_pin_end_to_end(tmp_path):
+    """A driverless codex deck declaring cli resolves against the codex table
+    (keyed codex/<declared>): pins.toml carries [cli."codex/0.153.3"] with the
+    four-tuple platform map (every package the wrapper), and the pinned build
+    loads with the pin joined onto the codex type carrying cli_tool == 'codex'."""
+    src = source_repo(tmp_path)
+    write(
+        src,
+        "worker-types/codexdeck.toml",
+        f'base = "{CODEX_BASE}"\ncommand = "flightdeck-start"\n'
+        'adapter = "codex"\ncli = "0.153.3"\n',
+    )
+    _commit_all(src, "codex deck with cli pin")
+    pinned = pinned_dir(tmp_path)
+    report = ingest(
+        str(src), pinned, resolve_cli=_fake_cli_resolver(["0.153.3"]), log=lambda *_: None
+    )
+    assert report.cli_pins["codex/0.153.3"]["version"] == "0.153.3"
+    pins_text = (pinned / "pins.toml").read_text()
+    assert '[cli."codex/0.153.3"]' in pins_text
+    for key in CodexAdapter.CLI_PLATFORM_PACKAGES:
+        assert f'"{key}" = {{ package = "@openai/codex", integrity = "{_SRI}" }}' in pins_text
+    wt = configrepo.load_config(pinned).worker_types["codexdeck"]
+    assert wt.cli == "0.153.3" and wt.cli_version == "0.153.3"
+    assert set(wt.cli_platforms) == set(CodexAdapter.CLI_PLATFORM_PACKAGES)
+    assert wt.recipe_wire()["cli_tool"] == "codex"
 
 
 def test_cli_on_a_driver_type_is_skipped_at_resolution_and_refused_by_the_lint(tmp_path):

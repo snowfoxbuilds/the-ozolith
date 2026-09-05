@@ -21,20 +21,22 @@ CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
 CLI_PIN_VERSION = "2.1.260"  # what the example's `cli` declares (flightdeck.toml)
+CODEX_CLI_PIN_VERSION = "0.153.3"  # what flightdeck-codex.toml declares
 
 
-def fake_resolve_cli(declared: str) -> dict:
+def fake_resolve_cli(declared: str, *, tool: str = "claude") -> dict:
     """The injected CLI Pin resolver seam (ADR-0055) — the npm twin of the
     faked registry digest resolver: the declared value resolves to itself
-    (the example pins an exact version) with the full supported-platform
-    map, keeping the suite hermetic."""
-    from theozolith_worker.adapters import ClaudeAdapter
+    (the example pins an exact version) with the full supported-platform map
+    of the adapter named by ``tool``, keeping the suite hermetic."""
+    from theozolith_worker.adapters import make_agent_adapter
 
+    adapter = make_agent_adapter(tool)
     return {
         "version": declared,
         "platforms": {
             key: {"package": package, "integrity": "sha512-" + "A" * 96}
-            for key, package in ClaudeAdapter.CLI_PLATFORM_PACKAGES.items()
+            for key, package in adapter.CLI_PLATFORM_PACKAGES.items()
         },
     }
 
@@ -668,6 +670,9 @@ def test_configs_example_parses_and_places_the_builtin_stacks(example_config):
         # claude one (the pr_ready race is documented, not routed).
         "codex-review": "process",
         "flightdeck": "container",
+        # The codex Flight Deck (ADR-0052), the interactive twin of the claude
+        # deck on the codex adapter, staged stopped as a container Stack.
+        "flightdeck-codex": "container",
         # The custom-driver example (ADR-0042): a drivers/<name> worker type
         # resolves to process kind and the generic launcher, staged stopped.
         "hello-logger": "process",
@@ -794,17 +799,20 @@ def test_configs_example_flightdeck_knowledge_wiring(example_config):
     assert "for entry in skills agents workflows CLAUDE.md; do" in script
     assert '"/home/ozolith/.claude/$entry"' in script
 
-    # The carve-out is Flight-Deck-only: no OTHER stack or worker type mounts
-    # the knowledge or policy exports, any .claude path, or a tailnet identity.
+    # The carve-out is Flight-Decks-only: no OTHER stack or worker type mounts
+    # the knowledge or policy exports, an agent-home state path, or a tailnet
+    # identity. Both flight decks legitimately mount them (the codex deck's
+    # own wiring is asserted in its dedicated test).
+    flight_decks = {"flightdeck", "flightdeck-codex"}
     for stack in config.stacks:
-        if stack.name == "flightdeck":
+        if stack.name in flight_decks:
             continue
         for volume in stack.volumes:
             assert "knowledge" not in volume and ".claude" not in volume, (stack.name, volume)
             assert "policy" not in volume, (stack.name, volume)
             assert "tailscale" not in volume, (stack.name, volume)
     for name, other in config.worker_types.items():
-        if name == "flightdeck":
+        if name in flight_decks:
             continue
         for volume in other.volumes:
             assert "knowledge" not in volume and ".claude" not in volume, (name, volume)
@@ -844,6 +852,63 @@ def test_configs_example_flightdeck_policy_wiring(example_config):
     claude_dev = config.worker_types["claude-dev"].recipe_wire()
     assert claude_dev["policy"] == "policy/claude-defaults"
     assert claude_dev["policy_pin"] == config.worker_types["claude-dev"].policy_pin
+
+
+def test_configs_example_flightdeck_codex_knowledge_wiring(example_config):
+    """ADR-0052: the codex Flight Deck wires the same read-only knowledge
+    export as the claude deck but selects its adapter's CODEX view. State rides
+    a codex-state volume (~/.codex), the pin joins <tree>/codex (never baked),
+    the injected selector is <tree>/codex, and the start script links the codex
+    set (AGENTS.md/skills/prompts into ~/.codex plus skills into ~/.agents)."""
+    config = example_config
+    deck = next(s for s in config.stacks if s.name == "flightdeck-codex")
+    assert set(deck.volumes) == {
+        "flightdeck-codex-logs:/var/log/flightdeck",
+        "flightdeck-codex-codex-state:/home/ozolith/.codex",
+        "/var/lib/theozolith/knowledge:/var/lib/theozolith/knowledge:ro",
+        "/var/lib/theozolith/policy:/var/lib/theozolith/policy:ro",
+        "/var/lib/theozolith/cli:/var/lib/theozolith/cli:ro",
+        "flightdeck-codex-tailscale-state:/var/lib/tailscale",
+        "flightdeck-codex-workspace:/workspace",
+    }
+    wt = config.worker_types["flightdeck-codex"]
+    assert wt.knowledge == "knowledge/codex-dev"
+    # The CODEX view's pin (joined <tree>/codex), non-empty and NOT the claude
+    # view's pin of any tree.
+    assert wt.knowledge_pin not in ("", config.worker_types["codex-review"].knowledge_pin)
+    assert wt.knowledge_pin != config.worker_types["flightdeck"].knowledge_pin
+    recipe = wt.recipe_wire()
+    assert recipe["knowledge"] == "" and recipe["knowledge_pin"] == ""
+    assert deck.env["THEOZOLITH_KNOWLEDGE_TREE"] == "codex-dev/codex"
+    assert deck.env.get("THEOZOLITH_POLICY_TREE") is None  # codex has no policy tier
+
+    script = "\n".join(wt.setup)
+    assert "knowledge/codex-dev" not in script  # the selection is env, not a literal
+    assert "codex-dev/codex" not in script
+    assert 'if [ ! -f "$KNOWLEDGE_TREE_DIR/AGENTS.md" ]; then' in script
+    assert "for entry in AGENTS.md skills prompts; do" in script
+    assert '"/home/ozolith/.codex/$entry"' in script
+    assert 'link_knowledge "$KNOWLEDGE_TREE_DIR/skills" "/home/ozolith/.agents/skills"' in script
+
+
+def test_configs_example_flightdeck_codex_cli_wiring(example_config):
+    """ADR-0055/ADR-0052: the codex deck pins @openai/codex, the pin resolves
+    through the injected seam to the four-tuple platform map, the Stack carries
+    the control-injected worker-type selection, the shim is the codex one, and
+    codex has no autoupdater switch."""
+    from theozolith_worker.adapters import CodexAdapter
+
+    wt = example_config.worker_types["flightdeck-codex"]
+    assert wt.cli == CODEX_CLI_PIN_VERSION
+    assert wt.cli_version == CODEX_CLI_PIN_VERSION
+    assert set(wt.cli_platforms) == set(CodexAdapter.CLI_PLATFORM_PACKAGES)
+    recipe = wt.recipe_wire()
+    assert recipe["cli_tool"] == "codex" and recipe["cli_version"] == CODEX_CLI_PIN_VERSION
+    deck = next(s for s in example_config.stacks if s.name == "flightdeck-codex")
+    assert deck.env["THEOZOLITH_WORKER_TYPE"] == "flightdeck-codex"
+    script = "\n".join(wt.setup)
+    assert "/opt/theozolith-deck/bin/codex" in script
+    assert "DISABLE_AUTOUPDATER" not in script  # codex has no such env switch
 
 
 def test_configs_example_flightdeck_tmpfs_mount(example_config):
@@ -1107,11 +1172,11 @@ def test_flightdeck_tailscale_version_matches_the_gate_harness(example_config):
 # -- flightdeck-start: the generated script is EXECUTED, not just grepped ---------
 
 
-def _generate_flightdeck_start(tmp_path: Path, config) -> Path:
+def _generate_flightdeck_start(tmp_path: Path, config, wt_name: str = "flightdeck") -> Path:
     """Run the worker type's script-writing setup entry in a real /bin/sh —
     exactly what the image build does — with the baked destination redirected
     into tmp_path, and return the generated script."""
-    wt = config.worker_types["flightdeck"]
+    wt = config.worker_types[wt_name]
     generators = [s for s in wt.setup if "/usr/local/bin/flightdeck-start" in s]
     assert len(generators) == 1
     dest = tmp_path / "flightdeck-start"
@@ -1173,8 +1238,10 @@ def _lay_out_per_tool_export(tree: Path) -> None:
     (claude_view / "CLAUDE.md").write_text("# claude view\n")
     for entry in ("skills", "agents", "workflows"):
         (claude_view / entry).mkdir()
-    (tree / "codex").mkdir()
-    (tree / "codex" / "AGENTS.md").write_text("# codex view\n")
+    codex_view = tree / "codex"
+    codex_view.mkdir()
+    (codex_view / "AGENTS.md").write_text("# codex view\n")
+    (codex_view / "skills").mkdir()
 
 
 def _lay_out_flattened_export(tree: Path) -> None:
@@ -2711,46 +2778,66 @@ def test_profile_prepends_the_shim_path_only_when_pinned(tmp_path, example_confi
     assert pinned.stdout.endswith(":1")
 
 
-def _generate_deck_shim(tmp_path: Path, config, sandbox: Path) -> Path:
+def _generate_deck_shim(
+    tmp_path: Path, config, sandbox: Path, *, wt_name: str = "flightdeck", tool: str = "claude"
+) -> Path:
     """Run the shim-baking setup entry in a real /bin/sh with the baked
     destination and the cli store redirected into the sandbox."""
-    wt = config.worker_types["flightdeck"]
-    generators = [s for s in wt.setup if "/opt/theozolith-deck/bin/claude" in s]
+    wt = config.worker_types[wt_name]
+    generators = [s for s in wt.setup if f"/opt/theozolith-deck/bin/{tool}" in s]
     assert len(generators) == 1
     deck_bin = sandbox / "deck-bin"
     command = generators[0].replace("/opt/theozolith-deck/bin", str(deck_bin))
     command = command.replace("/var/lib/theozolith/cli", str(sandbox / "cli"))
     subprocess.run(["/bin/sh", "-c", command], check=True, capture_output=True, text=True)
-    shim = deck_bin / "claude"
-    assert shim.stat().st_mode & 0o111, "the claude shim must be executable"
+    shim = deck_bin / tool
+    assert shim.stat().st_mode & 0o111, f"the {tool} shim must be executable"
     return shim
 
 
-def _cli_version_binary(store: Path, version: str, *, body: str | None = None) -> Path:
-    """A fake installed CLI at <store>/claude/<version>/claude, recording its
-    argv boundary-preserving into <store>/<version>.argv."""
+def _cli_version_binary(
+    store: Path, version: str, *, tool: str = "claude", body: str | None = None
+) -> Path:
+    """A fake installed CLI recording its argv boundary-preserving into
+    <store>/<version>.argv. claude's executable is <store>/claude/<version>/
+    claude; codex's is the daemon-published layout <store>/codex/<version>/
+    bin/codex plus the relative link codex -> bin/codex the shim execs."""
     record = store / f"{version}.argv"
-    target = store / "claude" / version / "claude"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        body
-        or (
-            "#!/bin/sh\n"
-            f'echo "argc $#" >> "{record}"\n'
-            f'for a in "$@"; do echo "arg $a" >> "{record}"; done\n'
-            "exit 0\n"
-        )
+    default_body = (
+        "#!/bin/sh\n"
+        f'echo "argc $#" >> "{record}"\n'
+        f'for a in "$@"; do echo "arg $a" >> "{record}"; done\n'
+        "exit 0\n"
     )
-    target.chmod(0o755)
+    version_dir = store / tool / version
+    if tool == "codex":
+        target = version_dir / "bin" / "codex"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body or default_body)
+        target.chmod(0o755)
+        link = version_dir / "codex"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to("bin/codex")  # the published relative link the shim resolves
+    else:
+        target = version_dir / tool
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body or default_body)
+        target.chmod(0o755)
     return record
 
 
 def _cli_records(
-    store: Path, *, wt: str = "flightdeck", desired: str | None = None, entry: str | None = None
+    store: Path,
+    *,
+    wt: str = "flightdeck",
+    tool: str = "claude",
+    desired: str | None = None,
+    entry: str | None = None,
 ) -> None:
     """The daemon-maintained pin records: a .desired text record and/or a
     .current relative symlink (ADR-0055 export contract)."""
-    by_type = store / "claude" / "by-type"
+    by_type = store / tool / "by-type"
     by_type.mkdir(parents=True, exist_ok=True)
     if desired is not None:
         (by_type / f"{wt}.desired").write_text(desired + "\n")
@@ -2761,8 +2848,8 @@ def _cli_records(
         link.symlink_to(f"../{entry}")
 
 
-def _run_shim(shim: Path, *args: str, **env_over):
-    env = {**os.environ, "THEOZOLITH_WORKER_TYPE": "flightdeck"}
+def _run_shim(shim: Path, *args: str, wt: str = "flightdeck", **env_over):
+    env = {**os.environ, "THEOZOLITH_WORKER_TYPE": wt}
     for key, value in env_over.items():
         if value is None:
             env.pop(key, None)
@@ -2968,3 +3055,390 @@ def test_flightdeck_start_pinless_deck_keeps_todays_behavior(tmp_path, example_c
     )
     assert daemon_calls.exists()  # the skip is not a failure
     assert "no CLI pin for this deck" in proc.stdout + proc.stderr
+
+
+# -- the codex Flight Deck: flightdeck-start + shim, EXECUTED (ADR-0052) ----------
+
+
+def _sandboxed_codex_script(script: Path, sandbox: Path) -> Path:
+    """Rewrite the codex deck's generated start script into a sandbox: the same
+    path rewrites as _sandboxed_script, laying out the applied codex VIEW the
+    deck selects (`codex-dev/codex/AGENTS.md` + `skills/`), the ~/.codex state
+    mountpoint, and NO policy tree (codex has no managed-settings tier)."""
+    content = script.read_text()
+    content = content.replace("/home/ozolith", str(sandbox / "home"))
+    content = content.replace("/var/log/flightdeck", str(sandbox / "log"))
+    content = content.replace("/var/lib/tailscale", str(sandbox / "tsstate"))
+    content = content.replace("/var/lib/theozolith/knowledge", str(sandbox / "knowledge"))
+    content = content.replace("/var/lib/theozolith/policy", str(sandbox / "policy"))
+    content = content.replace("/var/lib/theozolith/cli", str(sandbox / "cli"))
+    content = content.replace("/opt/theozolith-deck/bin", str(sandbox / "deck-bin"))
+    content = content.replace("/etc/theozolith", str(sandbox / "etc"))
+    content = content.replace("/workspace", str(sandbox / "workspace"))
+    rewritten = sandbox / "start"
+    rewritten.write_text(content)
+    rewritten.chmod(0o755)
+    (sandbox / "home" / ".codex").mkdir(parents=True)  # the codex state-volume mountpoint
+    (sandbox / "tsstate").mkdir()
+    (sandbox / "workspace").mkdir()
+    _lay_out_per_tool_export(sandbox / "knowledge" / "codex-dev")  # the deck's tree, both views
+    return rewritten
+
+
+def _run_codex_start(
+    script: Path, bin_dir: Path, *, timeout: float | None = None, **extra_env: str | None
+) -> subprocess.CompletedProcess:
+    """The codex container-start env: the knowledge selection rides as the
+    control-injected THEOZOLITH_KNOWLEDGE_TREE naming the CODEX view path
+    ``<tree>/codex`` (ADR-0052 §3); no policy tree (codex has none). Pass
+    ``None`` to UNSET a variable."""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "THEOZOLITH_KNOWLEDGE_TREE": "codex-dev/codex",
+    }
+    for key in (
+        "TS_AUTHKEY_FILE",
+        "GITHUB_TOKEN_FILE",
+        "THEOZOLITH_REPO",
+        "THEOZOLITH_WORKER_TYPE",
+        "THEOZOLITH_POLICY_TREE",
+    ):
+        env.pop(key, None)
+    for key, value in extra_env.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return subprocess.run([str(script)], env=env, capture_output=True, text=True, timeout=timeout)
+
+
+def _codex_run(tmp_path, example_config):
+    """A sandboxed codex start script plus the deliberately dying daemon stub —
+    the knowledge/config wiring runs strictly before tailscaled, so a refusal
+    there leaves the daemon untouched."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_codex_script(
+        _generate_flightdeck_start(tmp_path, example_config, "flightdeck-codex"), sandbox
+    )
+    daemon_calls, _ = _tailscaled_stub(bin_dir, lifespan=None)
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    return sandbox, bin_dir, script, daemon_calls, key_file
+
+
+def test_flightdeck_codex_start_missing_selection_fails_before_the_daemon(tmp_path, example_config):
+    """Without the control-injected THEOZOLITH_KNOWLEDGE_TREE the codex deck
+    refuses to guess, before tailscaled launches."""
+    _sandbox, bin_dir, script, daemon_calls, _key_file = _codex_run(tmp_path, example_config)
+    proc = _run_codex_start(
+        script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", THEOZOLITH_KNOWLEDGE_TREE=None
+    )
+    assert proc.returncode != 0
+    assert "THEOZOLITH_KNOWLEDGE_TREE" in proc.stderr
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_codex_start_unavailable_view_fails_before_the_daemon(tmp_path, example_config):
+    """ADR-0052: the codex view marker (AGENTS.md) is a HARD prerequisite —
+    when the node has not converged it, the deck fails loud naming the selector
+    BEFORE tailscaled, and links nothing into ~/.codex."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _codex_run(tmp_path, example_config)
+    shutil.rmtree(sandbox / "knowledge" / "codex-dev")  # not converged yet
+    proc = _run_codex_start(
+        script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", TS_AUTHKEY_FILE=str(key_file)
+    )
+    assert proc.returncode == 1
+    assert "not available on this node" in proc.stderr and "AGENTS.md missing" in proc.stderr
+    assert "THEOZOLITH_KNOWLEDGE_TREE=codex-dev/codex" in proc.stderr
+    assert not daemon_calls.exists()
+    assert not (sandbox / "home" / ".codex" / "skills").exists()
+
+
+def test_flightdeck_codex_start_links_the_codex_view(tmp_path, example_config):
+    """A converged codex view links AGENTS.md/skills/prompts into ~/.codex and
+    skills into ~/.agents; the prompts link may dangle (no agents/codex/ here)
+    exactly as the claude deck's agents/workflows links may. The links land
+    before the (deliberately dying) stub daemon fails the container."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _codex_run(tmp_path, example_config)
+    proc = _run_codex_start(
+        script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", TS_AUTHKEY_FILE=str(key_file)
+    )
+    assert daemon_calls.exists()  # past the knowledge gate
+    view = sandbox / "knowledge" / "codex-dev" / "codex"
+    home = sandbox / "home" / ".codex"
+    for entry in ("AGENTS.md", "skills", "prompts"):
+        assert os.readlink(home / entry) == str(view / entry), entry
+    assert (home / "AGENTS.md").read_text() == "# codex view\n"
+    assert os.readlink(sandbox / "home" / ".agents" / "skills") == str(view / "skills")
+    assert "not available on this node" not in proc.stderr
+
+
+def test_flightdeck_codex_start_refuses_a_real_directory_at_a_link_dest(tmp_path, example_config):
+    """A REAL directory at a ~/.codex link destination (state-volume debris)
+    fails the start loudly instead of being deleted, before tailscaled."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _codex_run(tmp_path, example_config)
+    (sandbox / "home" / ".codex" / "skills").mkdir()  # a real directory, not a link
+    proc = _run_codex_start(
+        script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", TS_AUTHKEY_FILE=str(key_file)
+    )
+    assert proc.returncode == 1
+    assert "refusing to symlink over it" in proc.stderr
+    skills = sandbox / "home" / ".codex" / "skills"
+    assert skills.is_dir() and not skills.is_symlink()
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_codex_start_seeds_config_only_when_absent(tmp_path, example_config):
+    """ADR-0052: check_for_update_on_startup = false is seeded into
+    ~/.codex/config.toml ONLY when no config.toml exists — PRIVATE (0600
+    regardless of umask), one line, atomic — while an existing file (the
+    human's, a `codex login` beside it) is NEVER rewritten. CODEX_HOME is
+    exported for the session."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_codex_script(
+        _generate_flightdeck_start(tmp_path, example_config, "flightdeck-codex"), sandbox
+    )
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    env_file = bin_dir / "tmux.env"
+    stub = bin_dir / "tmux"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in new-session) env > "{env_file}" ;; has-session) exit 1 ;; esac\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    config = sandbox / "home" / ".codex" / "config.toml"
+
+    old_umask = os.umask(0)
+    try:
+        proc = _run_codex_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    finally:
+        os.umask(old_umask)
+    assert proc.returncode == 0, proc.stderr
+    assert config.read_text() == "check_for_update_on_startup = false\n"
+    assert config.stat().st_mode & 0o777 == 0o600
+    assert list(config.parent.glob("config.toml.seed.*")) == []  # temp published, not left
+    assert f"CODEX_HOME={sandbox / 'home' / '.codex'}" in env_file.read_text().splitlines()
+    _assert_daemon_reaped(daemon_pid)
+
+    # Second start over the same volume: an existing config.toml (the human's)
+    # survives byte-for-byte with its mode.
+    raw = 'model = "the-humans-choice"\n'
+    config.write_text(raw)
+    config.chmod(0o640)
+    proc = _run_codex_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert config.read_text() == raw
+    assert config.stat().st_mode & 0o777 == 0o640
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_codex_start_config_seed_refuses_irregular_paths(tmp_path, example_config):
+    """A pre-existing symlink, dangling symlink, or directory at the
+    config.toml path fails the start non-zero BEFORE tailscaled — never
+    followed, never replaced."""
+    sandbox, bin_dir, script, daemon_calls, _key_file = _codex_run(tmp_path, example_config)
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    tmux_calls = _stub(bin_dir, "tmux", exit_code=0)
+    config = sandbox / "home" / ".codex" / "config.toml"
+    target = sandbox / "elsewhere.toml"
+    target.write_text("innocent bystander")
+
+    def clear() -> None:
+        if config.is_symlink():
+            config.unlink()
+        elif config.is_dir():
+            config.rmdir()
+
+    for shape in ("symlink", "dangling-symlink", "directory"):
+        clear()
+        if shape == "symlink":
+            config.symlink_to(target)
+        elif shape == "dangling-symlink":
+            config.symlink_to(sandbox / "nonexistent")
+        else:
+            config.mkdir()
+        proc = _run_codex_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+        assert proc.returncode == 1, shape
+        assert "is not a regular file" in proc.stderr, shape
+    assert target.read_text() == "innocent bystander"  # never written through
+    assert not daemon_calls.exists()
+    assert not tmux_calls.exists()
+
+
+def test_flightdeck_codex_start_unconverged_cli_pin_fails_before_the_daemon(
+    tmp_path, example_config
+):
+    """ADR-0055 §6: a pinned codex deck whose node has not converged the CLI
+    export refuses the start loudly — before tailscaled — both when no desired
+    record exists and when the export entry is stale; neither the previous
+    export nor the image CLI ever runs."""
+    sandbox, bin_dir, script, daemon_calls, key_file = _codex_run(tmp_path, example_config)
+    proc = _run_codex_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_WORKER_TYPE="flightdeck-codex",
+    )
+    assert proc.returncode == 1
+    assert "no desired CLI record" in proc.stderr
+    assert not daemon_calls.exists()
+
+    _cli_records(
+        sandbox / "cli", wt="flightdeck-codex", tool="codex", desired="0.153.3", entry="0.152.0"
+    )
+    _cli_version_binary(sandbox / "cli", "0.152.0", tool="codex")
+    proc = _run_codex_start(
+        script,
+        bin_dir,
+        FLIGHTDECK_TS_HOSTNAME="flightdeck-test",
+        TS_AUTHKEY_FILE=str(key_file),
+        THEOZOLITH_WORKER_TYPE="flightdeck-codex",
+    )
+    assert proc.returncode == 1
+    assert "CLI pin not converged" in proc.stderr
+    assert "never the previous export, never the image CLI" in proc.stderr
+    assert not daemon_calls.exists()
+
+
+def test_flightdeck_codex_start_launches_codex_with_model_and_sandbox(tmp_path, example_config):
+    """ADR-0052 §4 end-to-end: with the baked model file present, the generated
+    script launches the session as exactly ONE tmux command argument
+    ``codex --model "gpt-6-astra" --sandbox danger-full-access`` — the sandbox
+    flag because the container IS the sandbox and codex's Landlock is
+    unavailable inside it."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_codex_script(
+        _generate_flightdeck_start(tmp_path, example_config, "flightdeck-codex"), sandbox
+    )
+    (sandbox / "etc").mkdir()  # the sandboxed /etc/theozolith
+    (sandbox / "etc" / "model").write_text("gpt-6-astra\n")
+    key_file = sandbox / "authkey"
+    key_file.write_text("tskey-auth-x\n")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_codex_start(
+        script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test", TS_AUTHKEY_FILE=str(key_file)
+    )
+    assert proc.returncode == 0, proc.stderr
+    invocations = _tmux_invocations(bin_dir)
+    assert invocations[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        "-c",
+        str(sandbox / "home"),
+        'codex --model "gpt-6-astra" --sandbox danger-full-access',
+    ]
+    assert invocations[1][:4] == ["pipe-pane", "-o", "-t", "flightdeck"]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_flightdeck_codex_start_bare_launch_when_no_model(tmp_path, example_config):
+    """No baked model file -> the bare-launch branch is still codex under the
+    sandbox flag: ``codex --sandbox danger-full-access`` as ONE tmux argument,
+    never a stray empty ``--model``."""
+    sandbox = tmp_path / "sandbox"
+    bin_dir = sandbox / "bin"
+    bin_dir.mkdir(parents=True)
+    script = _sandboxed_codex_script(
+        _generate_flightdeck_start(tmp_path, example_config, "flightdeck-codex"), sandbox
+    )
+    (sandbox / "tsstate" / "tailscaled.state").write_text("{}")
+    (sandbox / "tsstate" / ".theozolith-enrolled-v1").write_text("enrolled")
+    _, daemon_pid = _tailscaled_stub(bin_dir, lifespan="60")
+    _tailscale_stub(bin_dir, status_code=0, up_code=0)
+    _tmux_stub(bin_dir, has_session_code=1)
+
+    proc = _run_codex_start(script, bin_dir, FLIGHTDECK_TS_HOSTNAME="flightdeck-test")
+    assert proc.returncode == 0, proc.stderr
+    assert _tmux_invocations(bin_dir)[0] == [
+        "new-session",
+        "-d",
+        "-s",
+        "flightdeck",
+        "-c",
+        str(sandbox / "home"),
+        "codex --sandbox danger-full-access",
+    ]
+    _assert_daemon_reaped(daemon_pid)
+
+
+def test_codex_deck_shim_refuses_every_preconvergence_state_with_no_fallback(
+    tmp_path, example_config
+):
+    """PIN-STRICT at every launch (ADR-0055): a missing selection, missing
+    desired, missing entry, and stale entry each refuse loudly — and neither
+    the previous export's binary nor a later-on-PATH decoy `codex` ever runs."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    store = sandbox / "cli"
+    shim = _generate_deck_shim(
+        tmp_path, example_config, sandbox, wt_name="flightdeck-codex", tool="codex"
+    )
+    previous = _cli_version_binary(store, "0.152.0", tool="codex")  # the previous export
+    decoy_dir = sandbox / "decoy-bin"
+    decoy_dir.mkdir()
+    decoy_calls = decoy_dir / "codex.calls"
+    decoy = decoy_dir / "codex"
+    decoy.write_text(f'#!/bin/sh\necho "$@" >> "{decoy_calls}"\nexit 0\n')
+    decoy.chmod(0o755)
+    path_with_decoy = f"{shim.parent}:{decoy_dir}:{os.environ['PATH']}"
+
+    proc = _run_shim(shim, wt="flightdeck-codex", THEOZOLITH_WORKER_TYPE=None, PATH=path_with_decoy)
+    assert proc.returncode != 0 and "THEOZOLITH_WORKER_TYPE" in proc.stderr
+
+    proc = _run_shim(shim, wt="flightdeck-codex", PATH=path_with_decoy)  # no records at all
+    assert proc.returncode == 1 and "no desired CLI record" in proc.stderr
+
+    _cli_records(store, wt="flightdeck-codex", tool="codex", desired="0.153.3")  # not installed
+    proc = _run_shim(shim, wt="flightdeck-codex", PATH=path_with_decoy)
+    assert proc.returncode == 1
+    assert "not converged" in proc.stderr and "desired 0.153.3" in proc.stderr
+
+    _cli_records(
+        store, wt="flightdeck-codex", tool="codex", desired="0.153.3", entry="0.152.0"
+    )  # stale
+    proc = _run_shim(shim, wt="flightdeck-codex", PATH=path_with_decoy)
+    assert proc.returncode == 1
+    assert "never the previous export, never the image CLI" in proc.stderr
+    assert not previous.exists()  # the entry-target binary was never invoked
+    assert not decoy_calls.exists()  # ...and neither was the decoy
+
+
+def test_codex_deck_shim_execs_exactly_the_desired_version_with_argv(tmp_path, example_config):
+    """Post-convergence the codex shim execs the version-addressed published
+    entry through the relative link ``codex -> bin/codex`` inside the version
+    directory, argv passed through boundary-preserving."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    store = sandbox / "cli"
+    shim = _generate_deck_shim(
+        tmp_path, example_config, sandbox, wt_name="flightdeck-codex", tool="codex"
+    )
+    record = _cli_version_binary(store, "0.153.3", tool="codex")
+    _cli_records(store, wt="flightdeck-codex", tool="codex", desired="0.153.3", entry="0.153.3")
+    assert os.readlink(store / "codex" / "0.153.3" / "codex") == "bin/codex"
+
+    proc = _run_shim(shim, "--model", "gpt-6-astra", "two words", wt="flightdeck-codex")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == [
+        "argc 3",
+        "arg --model",
+        "arg gpt-6-astra",
+        "arg two words",
+    ]

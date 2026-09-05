@@ -381,10 +381,11 @@ def test_codex_materialize_managed_writes_the_baked_config(tmp_path, capsys, cod
     assert re.search(r"agent CLI: codex-cli \d+\.\d+\.\d+", capsys.readouterr().out)
 
 
-def test_codex_materialize_interactive_scope_fails_the_build(tmp_path, capsys, codex_cli_version):
-    """The in-image backstop (ADR-0052): control refuses driverless codex
-    types upstream, and an instruction that reaches the build anyway fails
-    it loudly with nothing written."""
+def test_codex_materialize_interactive_scope_writes_only_the_model_file(
+    tmp_path, capsys, codex_cli_version
+):
+    """A driverless (Flight Deck) codex type materializes ONLY the well-known
+    model file: no baked config.toml, nothing under etc/codex (ADR-0052 §4)."""
     rc = adaptercli.main(
         [
             "materialize",
@@ -398,9 +399,9 @@ def test_codex_materialize_interactive_scope_fails_the_build(tmp_path, capsys, c
             str(tmp_path),
         ]
     )
-    assert rc == 1
-    assert "no interactive-scope" in capsys.readouterr().err
-    assert not (tmp_path / "etc").exists()
+    assert rc == 0
+    assert (tmp_path / "etc/theozolith/model").read_text() == "gpt-5.2-codex\n"
+    assert not (tmp_path / "etc/theozolith/codex").exists()
 
 
 def test_codex_materialize_unproven_effort_exits_2(tmp_path, capsys, codex_cli_version):

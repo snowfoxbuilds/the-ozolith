@@ -1,0 +1,33 @@
+# The codex Flight Deck as a thin Stack (ADR-0044): the driverless codex worker
+# type (worker-types/flightdeck-codex.toml) resolves to a container-kind Stack —
+# the interactive, human-driven codex container and a web-terminal attach
+# target. The image, start command, volumes, and the default binding of its
+# no-merge machine-identity secret live in the worker type; bindings are
+# rebindable per Stack (ADR-0047). See stacks/flightdeck.toml for the shared
+# rationale — this Stack differs only in the worker type and tailnet hostname.
+
+worker_type = "flightdeck-codex"
+node = "box1"
+# Staged at "stopped": the worker-type ships the tailscale sha256 as a
+# fail-closed placeholder that ingest refuses for a RUNNING Stack (ADR-0048) —
+# paste the vendor's checksum, flip to "running", commit, ingest.
+state = "stopped"
+
+# The repo THIS deck works on (per-placement binding, ADR-0047): cloned on
+# first start to /workspace/<name> on the deck's {stack}-workspace volume.
+workspace = "acme/sandbox"
+
+# Web-terminal attach command (session name flightdeck, so a `tmux attach`
+# lands in the codex session flightdeck-start launches).
+attach = ["ssh", "{host}", "-t", "docker", "exec", "-it", "{container}", "tmux", "attach", "-t", "flightdeck"]
+
+# One-hop target name on the tailnet: distinct per Flight Deck Stack.
+# THEOZOLITH_WORKER_TYPE (the CLI Pin selection) and THEOZOLITH_KNOWLEDGE_TREE
+# are injected control-side and refused here in [env].
+[env]
+FLIGHTDECK_TS_HOSTNAME = "flightdeck-codex-box1"
+
+# Per-instance enrollment hardening (ADR-0047): once THIS deck has enrolled,
+# unbind the auth key here. (Keep this table last.)
+# [secrets]
+# TS_AUTHKEY = ""

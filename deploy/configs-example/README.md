@@ -5,18 +5,22 @@ A complete, minimal Config Repo (ADR-0006/0048): copy it anywhere you like
 `theozolith config ingest <path-or-url>` on the Control Node — ingest lints
 it, resolves the mechanical pins, compiles `knowledge/`, and commits the
 machine-owned pinned build the service loads. Never edit the pinned build
-(`configs/`) itself. The example declares two pipeline workers (Implementer,
-Reviewer) as process Stacks, one **Flight Deck** as an interactive container
-Stack, and one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
+(`configs/`) itself. The example declares three pipeline workers — an
+Implementer and two Reviewers, one on each adapter — as process Stacks, two
+**Flight Decks** (one claude, one codex) as interactive container Stacks, and
+one **custom driver** (`hello-logger`) demonstrating ADR-0042 —
 every Stack staged at `state = "stopped"`. `base` images are tag-only: this
 repo carries no computed pins (ADR-0048) — ingest resolves each tag to its
 digest and records it in the pinned build's pins.toml (digest-pin a base
 yourself only when the digest is a human decision, e.g. no registry access
-at ingest time). The four example bases are
-`ghcr.io/snowfoxbuilds/theozolith-run-claude:main`, a **private** first-party
-image CI republishes on every merge to main that touches `worker/` or
-`knowledge/` (ADR-0051) — so each ingest re-resolves the tag to the
-then-current digest, and your fleet moves bases exactly when you ingest,
+at ingest time). Every derived-image worker type here builds on one of two
+**private** first-party run images —
+`ghcr.io/snowfoxbuilds/theozolith-run-claude:main` (the claude pipeline
+workers, the `hello-logger` driver, and the claude Flight Deck) and
+`ghcr.io/snowfoxbuilds/theozolith-run-codex:main` (the codex Reviewer and the
+codex Flight Deck) — that CI republishes on every merge to main that touches
+`worker/` or `knowledge/` (ADR-0051), so each ingest re-resolves the tag to
+the then-current digest and your fleet moves bases exactly when you ingest,
 never before. Immutable `…:sha-<sha>` tags are pushed alongside for hand
 digest-pinning and rollback. Before the first ingest, store a GHCR pull
 credential so ingest can resolve the digest (and so nodes can pull the
@@ -56,7 +60,11 @@ that path is refused at ingest.
 `knowledge/claude-dev/` is a knowledge root (ADR-0009 layout: `AGENTS.md`,
 `skills/`, optionally `agents/<tool>/`, `workflows/`) referenced by worker
 types as `knowledge = "knowledge/claude-dev"` — the name is an arbitrary
-label. Ingest compiles the tree **once per tool** (ADR-0052): the claude
+label. This example also ships `knowledge/codex-dev/` (`AGENTS.md` + one
+skill), the tree the codex Flight Deck selects; keeping it separate from
+`claude-dev` is this example's convention, not a rule — a tree is compiled
+for every registered tool, so a codex deck could select `claude-dev` just as
+well. Ingest compiles the tree **once per tool** (ADR-0052): the claude
 view (`AGENTS.md` → `CLAUDE.md`, skills, `agents/claude/`, workflows) and
 the codex view (`AGENTS.md` verbatim, skills shared, `agents/codex/` →
 prompts; codex has no workflows target) each get their own content-hash pin
@@ -391,10 +399,17 @@ fail-fast — a Flight Deck that cannot bring up its tailnet access exits
 non-zero immediately, and the daemon's reconcile loop owns any retry,
 recreating the deck on a later pass (roughly the heartbeat cadence).
 Daemon-managed Stack containers carry no Docker `--restart` policy, so the
-reconcile loop is the sole restarter (#114). (Knowledge never blocks a start:
-the read-only mount's symlinks may dangle until the node converges a
-distribution, ADR-0048.) There is no in-container retry loop and no "running
-but unreachable" state:
+reconcile loop is the sole restarter (#114). Knowledge is a **hard
+prerequisite**, not a best-effort mount: before `tailscaled` launches,
+`flightdeck-start` requires that the node has converged the selected per-tool
+view and that its marker is a regular file at the view root — `CLAUDE.md` for
+a claude view, `AGENTS.md` for a codex view (ADR-0052 §3). An absent or
+unconverged view — a missing `THEOZOLITH_KNOWLEDGE_TREE`, a distribution the
+node has not converged, a retired tree, or a selector pointing above the
+per-tool views — exits the container non-zero before `tailscaled`. Recovery is
+to converge the Config Distribution for that view; the daemon's reconcile loop
+then recreates the deck on a later pass. There is no in-container retry loop
+and no "running but unreachable" state:
 
 - enrollment vs. reuse is decided from the completion marker (see above)
   **before** `tailscaled` launches — the two branches cannot be misrouted by a
@@ -448,3 +463,40 @@ decommissioning the deck — or to deliberately revoke everything it retains.
 container-local at `~/.claude.json`, outside every volume, and is gone with
 the replaced container — it cannot be migrated. Run one deliberate `/login`
 in the first session on the new layout; every recreation after that keeps it.
+
+## Flight Deck — the codex adapter
+
+`worker-types/flightdeck-codex.toml` is the same interactive Flight Deck on the
+**codex** adapter instead of claude. It shares the whole shape of the claude
+deck above — the tmux attach session, the one-hop tailscale access, the
+GitHub machine identity and workspace clone, the read-only knowledge and CLI
+exports, and the fail-closed CLI shim — so everything in those sections applies.
+Only the codex-specific pieces differ:
+
+- **Login is a human step inside the deck.** codex authenticates with `codex
+  login --device-auth`, run once in the deck's session — there is deliberately
+  no credential secret (no `ANTHROPIC_API_KEY`, no auth-JSON slot). Device-code
+  authorization must be enabled on the ChatGPT account you log in with. Each
+  deck **instance** logs in once.
+- **The credential lives and rotates on the state volume.** The login lands in
+  `~/.codex/auth.json` on the per-deck `{stack}-codex-state` volume (the codex
+  analogue of `{stack}-claude-state`), where the CLI **rotates it in place**.
+  Treat that volume as secret-bearing durable state, exactly as the claude-state
+  volume above. **Never copy `auth.json` between decks:** a copied refresh token
+  is single-use and is invalidated the moment the original rotates.
+- **The model is a default, not a lock.** `model = "gpt-6-astra"` is written to
+  `/etc/theozolith/model` and begins every session there; the human may switch
+  models in-session, and a restart resets to the default. There is no `effort`
+  (driverless types have no effort consumer) and no Agent Policy (codex has no
+  managed-settings tier).
+- **The pinned CLI may postdate the run image's.** `cli = "0.153.3"` is what the
+  deck actually launches through the shim; the codex run image ships its own
+  pinned codex (`0.150.0`). That gap is expected — a floor move (raising the
+  adapter's enforcement floor and the image) is a separate validated-CLI review,
+  not something this pin does.
+
+Knowledge links the same way as the claude deck, into the codex view: the deck
+selects `knowledge/codex-dev` and `flightdeck-start` symlinks the view's
+`AGENTS.md`, `skills/`, and (deprecated but still searched) `prompts/` into
+`~/.codex`, plus `skills/` into `~/.agents/skills`, failing loud until the
+node has converged that view.

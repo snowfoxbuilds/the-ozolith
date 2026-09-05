@@ -102,9 +102,20 @@ def test_codex_adapter_materialize_writes_the_baked_selection(tmp_path):
     assert not (tmp_path / "home").exists()
 
 
-def test_codex_adapter_materialize_rejects_interactive_scope(tmp_path):
-    with pytest.raises(AgentAdapterError, match="no interactive-scope"):
-        CodexAdapter().materialize("gpt-5.2-codex", "", root=tmp_path, scope="interactive")
+def test_codex_adapter_materialize_interactive_scope_writes_only_the_model_file(tmp_path):
+    """A driverless (Flight Deck) codex type bakes ONLY the well-known model
+    file — no config.toml, nothing under etc/codex, nothing under the home
+    (its ~/.codex is the human's state volume; ADR-0052 §4)."""
+    written = CodexAdapter().materialize("gpt-5.2-codex", "", root=tmp_path, scope="interactive")
+    assert written == [tmp_path / "etc/theozolith/model"]
+    assert (tmp_path / "etc/theozolith/model").read_text() == "gpt-5.2-codex\n"
+    assert not (tmp_path / "etc/theozolith/codex").exists()
+    assert not (tmp_path / "home").exists()
+
+
+def test_codex_adapter_materialize_interactive_scope_refuses_effort(tmp_path):
+    with pytest.raises(AgentAdapterError, match="interactive scope"):
+        CodexAdapter().materialize("gpt-5.2-codex", "high", root=tmp_path, scope="interactive")
     assert not (tmp_path / "etc").exists()
 
 
